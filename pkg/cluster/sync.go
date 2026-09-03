@@ -845,9 +845,41 @@ type SessionSync struct {
 	// IsPrimaryFn reports whether the local node is primary for the default sync scope.
 	IsPrimaryFn func() bool
 	// IsPrimaryForRGFn reports whether the local node is primary for a given RG.
-	IsPrimaryForRGFn   func(rgID int) bool
-	lastSweepTime      uint64
-	syncBackfillNeeded atomic.Bool
+	IsPrimaryForRGFn func(rgID int) bool
+	// PeerBootEpochFn reports the peer's across-reboot boot-epoch floor and
+	// whether the peer has PROVED it emits boot epochs (#7762).
+	//
+	// An injected callback rather than a clusterRuntime method, deliberately.
+	// clusterRuntime is the DATAPLANE-BACKEND surface — its implementors are
+	// *dataplane.Manager and *userspace.LegacyDataPlaneAdapter, and its own doc
+	// warns that adding a method there gives SessionSync a new runtime
+	// dependency. The boot epoch is cluster-Manager state on a different axis
+	// (`d.cluster`, not `d.dataplane()`), so a dataplane backend cannot answer
+	// it: every implementor would have to return 0, and 0 is exactly the silent
+	// fail-open this classification must not have. Nineteen types implement
+	// that method set, seventeen of them test doubles — seventeen new sites
+	// defaulting to "no reboot" that no reader would recognise as a
+	// classification input. This mirrors IsPrimaryFn/IsPrimaryForRGFn above,
+	// which ask the same kind of cross-layer question of the same object.
+	//
+	// TWO return values, not one. An unlatched epoch reads as 0, and 0 is a
+	// legal floor value ("none accepted yet"), so a single uint64 collapses
+	// "the peer has not proved it emits epochs" into "no reboot has happened" —
+	// silently, which is precisely what would make a broken fix here
+	// indistinguishable from a working one. With the nil check the caller has
+	// THREE states and must name each: nil (not wired), !latched (the peer
+	// reboot race window, before its heartbeat has landed), and latched (the
+	// ordered floor is usable).
+	PeerBootEpochFn func() (epoch uint64, latched bool)
+	// peerEpochAtIncarnation is the boot-epoch floor observed when the current
+	// peerIncarnation was established (#7762), guarded by s.mu like the
+	// incarnation itself. A LATER install seeing a strictly higher floor is
+	// positive evidence that the peer process was replaced — the evidence the
+	// EMPTY-alternate-slot reboot otherwise leaves no local trace of. Zero
+	// means "never recorded", which is why the first observation only records.
+	peerEpochAtIncarnation uint64
+	lastSweepTime          uint64
+	syncBackfillNeeded     atomic.Bool
 	// forceResync arms a full authoritative bulk resync after a delete-journal
 	// overflow dropped session-delete records the standby still needs (#5450).
 	// It is DISTINCT from syncBackfillNeeded: that flag re-drives the INSTALL

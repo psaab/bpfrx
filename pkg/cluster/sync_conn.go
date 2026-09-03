@@ -262,6 +262,20 @@ func (s *SessionSync) connIsCurrentIncarnationLocked(conn net.Conn) bool {
 func (s *SessionSync) applyPeerIncarnationSwitchLocked(keepIdx int) bool {
 	s.peerIncarnation++
 	s.peerHeartbeatAckEver.Store(false)
+	// #7762: rebase the boot-epoch baseline onto THIS incarnation.
+	//
+	// This path retires an incarnation on #5084 boot-id evidence without going
+	// through installConn, so without the rebase it leaves the baseline holding
+	// the PREVIOUS floor. The peer's second fabric coming up afterwards then
+	// reads a raise that was already consumed here, advances the incarnation a
+	// SECOND time, and evicts the connection this switch just established —
+	// turning a healthy second fabric into an eviction of the first, which is
+	// the very thing installConn's comment says must not happen for "a fabric
+	// link coming up into an EMPTY slot beside a surviving one".
+	//
+	// The two reboot signals must therefore share one baseline: whichever
+	// observes the reboot first consumes it.
+	s.rebaseEpochBaselineLocked()
 	evicted := s.evictStaleIncarnationConnsLocked(keepIdx)
 	// Stamp AFTER the advance, exactly as installConn does, so the priming
 	// connection belongs to the incarnation it established rather than to the
@@ -273,6 +287,60 @@ func (s *SessionSync) applyPeerIncarnationSwitchLocked(keepIdx int) bool {
 		s.conn1Gen = s.peerIncarnation
 	}
 	return evicted
+}
+
+// peerEpochRebootLocked reports whether the peer's boot epoch has RAISED since
+// the current peerIncarnation was established, and records the observation
+// (#7762). Caller must hold s.mu.
+//
+// This is the evidence the EMPTY-alternate-slot reboot otherwise leaves no local
+// trace of. It is NOT a heuristic — the installConn comment's prohibition stands
+// and this does not violate it. A heuristic would guess a reboot from local slot
+// shape, which cannot separate a replacement from the same peer bringing up its
+// second fabric. The boot epoch is positive PEER-SUPPLIED evidence carried on an
+// independent channel (the authenticated UDP heartbeat), and it is ORDERED,
+// which #5084's equality-only boot id is not.
+//
+// THREE states, each named, because collapsing any two is the defect this
+// guards against:
+//
+//   - PeerBootEpochFn == nil — not wired (test doubles, and any embedder that
+//     does not run a heartbeat). Behaves exactly as before this change.
+//   - latched == false — wired, but the peer has not yet proved it emits
+//     epochs. This is the RACE WINDOW: on a peer reboot its heartbeat and its
+//     fabric connect race, and until the heartbeat lands the floor is 0 and
+//     means nothing. Report no reboot AND record nothing — recording an
+//     unlatched floor would poison the baseline the next comparison uses.
+//   - latched == true — the ordered floor is usable. Record it, and report a
+//     reboot only on a STRICT raise above a previously recorded non-zero
+//     baseline. The first observation records without classifying: there is
+//     nothing to compare against, and treating "first ever epoch" as a reboot
+//     would evict a healthy peer's second fabric on the first heartbeat.
+//
+// rebaseEpochBaselineLocked records the current boot-epoch floor as the baseline
+// for the incarnation now current (#7762). A no-op when the source is unwired or
+// the floor is not yet latched — an unlatched floor is 0 and recording it would
+// poison the comparison, exactly as in peerEpochRebootLocked. Caller holds s.mu.
+func (s *SessionSync) rebaseEpochBaselineLocked() {
+	if s.PeerBootEpochFn == nil {
+		return
+	}
+	if epoch, latched := s.PeerBootEpochFn(); latched {
+		s.peerEpochAtIncarnation = epoch
+	}
+}
+
+func (s *SessionSync) peerEpochRebootLocked() bool {
+	if s.PeerBootEpochFn == nil {
+		return false
+	}
+	epoch, latched := s.PeerBootEpochFn()
+	if !latched {
+		return false
+	}
+	prev := s.peerEpochAtIncarnation
+	s.peerEpochAtIncarnation = epoch
+	return prev != 0 && epoch > prev
 }
 
 // fabricIdxForConnLocked reports which slot holds conn, or -1.
@@ -689,7 +757,19 @@ func (s *SessionSync) installConn(fabricIdx int, conn net.Conn) connColdPrimeDec
 	// what several other paths read. Evict it — see
 	// evictStaleIncarnationConnsLocked for the three readers that otherwise
 	// keep believing in a process that no longer exists.
-	if supersededCurrent {
+	//
+	// #7762: supersededCurrent is not the only evidence any more. A replacement
+	// dialling the EMPTY alternate slot supersedes nothing and leaves the
+	// registry non-empty, so it satisfies neither that flag nor
+	// d.wasDisconnected — the residual documented above. A RAISED peer boot
+	// epoch is independent evidence of the same event, arriving on the
+	// heartbeat rather than on this socket, and it fires the identical
+	// retirement: advance the incarnation, drop the ack capability, evict the
+	// corpse. Evaluated unconditionally (not short-circuited behind
+	// supersededCurrent) so the observation is RECORDED on every install,
+	// which is what keeps the next comparison's baseline current.
+	epochReboot := s.peerEpochRebootLocked()
+	if supersededCurrent || epochReboot {
 		s.peerIncarnation++
 		s.peerHeartbeatAckEver.Store(false)
 		s.evictStaleIncarnationConnsLocked(fabricIdx)

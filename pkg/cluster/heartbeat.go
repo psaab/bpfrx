@@ -1179,6 +1179,26 @@ func (s *heartbeatAuthState) peerEpochLatched() bool {
 	return s.epochSeen
 }
 
+// peerBootEpoch reports the across-reboot floor AND whether the peer has proved
+// it emits epochs, read under ONE acquisition of s.mu (#7762).
+//
+// The pairing is the point. `peerEpochFloor` and `peerEpochLatched` each take
+// s.mu separately, and admitAuthed sets `epochSeen = true` and raises
+// `highEpoch` inside a SINGLE critical section — so a caller taking the two
+// locks in sequence can interleave between them and observe (floor=0,
+// latched=true). That pair is incoherent: it says "the peer emits epochs" and
+// "the highest epoch ever accepted is none" at once, and a classifier acting on
+// it would read a reboot where there is none. One lock, one snapshot.
+//
+// Returns (floor, latched). A caller must treat `latched == false` as its own
+// case rather than as floor 0: they are different states, and only the second
+// says the floor means anything.
+func (s *heartbeatAuthState) peerBootEpoch() (uint64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.highEpoch, s.epochSeen
+}
+
 // peerAuthenticated reports whether the peer has ever sent a valid
 // HMAC-authenticated heartbeat (sticky for the life of the process).
 func (s *heartbeatAuthState) peerAuthenticated() bool {
