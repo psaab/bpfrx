@@ -21,6 +21,7 @@
 //   `xpf_userspace_worker_command_queue_poison_recoveries_total`.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, TryLockError};
 
@@ -256,3 +257,127 @@ pub(in crate::afxdp) fn try_lock_recover(
 // second copy of comment-blanking is exactly where a source-scanning gate
 // quietly stops seeing what it is meant to.
 pub(crate) mod tests;
+
+/// #7699: broadcast a PPTP association install to EVERY worker.
+///
+/// The control channel (TCP/1723) and the GRE data channel are not reliably
+/// co-located — RSS hashes the flow tuple, so they share a worker only by
+/// chance — which is why this is a broadcast rather than a send to one worker.
+///
+/// Returns the number of queues that ACCEPTED the command. A short count is not
+/// an error but it is not nothing either: a worker that missed the install
+/// resolves that call's packets as UNASSOCIATED until it is re-published, which
+/// is the forward-and-count path rather than a drop. Callers that can retry
+/// should; callers that cannot should surface the shortfall rather than treat a
+/// partial broadcast as a complete one.
+pub(in crate::afxdp) fn broadcast_pptp_install(
+    queues: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
+    call: crate::session::pptp::PptpCall,
+) -> usize {
+    let mut accepted = 0;
+    for q in queues {
+        let mut pending = lock_recover(q);
+        if push_bounded(&mut pending, WorkerCommand::InstallPptpCall(call)) {
+            accepted += 1;
+        }
+    }
+    accepted
+}
+
+/// #7699: broadcast a PPTP association teardown to every worker.
+///
+/// Same broadcast reasoning as the install, and a stronger reason to notice a
+/// shortfall: a worker that misses a teardown keeps a stale association, and
+/// PPTP call IDs are 16-bit and REUSED — so a later call can pair onto the dead
+/// handle. That is a mis-attribution, not a leak, which is why the association
+/// must also expire on its own rather than relying on this reaching everyone.
+pub(in crate::afxdp) fn broadcast_pptp_forget(
+    queues: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
+    handle: u32,
+) -> usize {
+    let mut accepted = 0;
+    for q in queues {
+        let mut pending = lock_recover(q);
+        if push_bounded(&mut pending, WorkerCommand::ForgetPptpCall(handle)) {
+            accepted += 1;
+        }
+    }
+    accepted
+}
+
+#[cfg(test)]
+mod pptp_broadcast_tests_7699 {
+    use super::*;
+    use crate::session::pptp::PptpCall;
+
+    fn queues(n: usize) -> Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> {
+        (0..n).map(|_| Arc::new(Mutex::new(VecDeque::new()))).collect()
+    }
+
+    fn a_call() -> PptpCall {
+        PptpCall::new(
+            "198.51.100.7".parse().unwrap(),
+            0x1111,
+            "203.0.113.9".parse().unwrap(),
+            0x2222,
+        )
+    }
+
+    /// EVERY worker must get the install, not just one.
+    ///
+    /// This is the property the whole broadcast exists for: RSS lands a call's
+    /// data packets on a worker chosen by the flow hash, which is generally not
+    /// the one that saw its control channel. A send-to-one would leave the call
+    /// unresolvable on N-1 workers, and a fixture with a single queue would not
+    /// notice — so this asserts over several.
+    #[test]
+    fn an_install_reaches_every_worker_7699() {
+        let qs = queues(4);
+        assert_eq!(broadcast_pptp_install(&qs, a_call()), 4);
+        for (i, q) in qs.iter().enumerate() {
+            let pending = q.lock().expect("queue");
+            assert_eq!(pending.len(), 1, "worker {i} did not receive the install");
+            assert!(matches!(pending[0], WorkerCommand::InstallPptpCall(_)));
+        }
+    }
+
+    /// A teardown must reach every worker too.
+    ///
+    /// Asserted separately rather than assumed symmetric with the install: a
+    /// worker that keeps a stale association re-pairs a REUSED 16-bit call id
+    /// onto a dead handle, which is a mis-attribution rather than a leak.
+    #[test]
+    fn a_teardown_reaches_every_worker_7699() {
+        let qs = queues(3);
+        assert_eq!(broadcast_pptp_forget(&qs, 0xdead_beef), 3);
+        for q in &qs {
+            let pending = q.lock().expect("queue");
+            assert!(matches!(pending[0], WorkerCommand::ForgetPptpCall(0xdead_beef)));
+        }
+    }
+
+    /// A FULL queue is reported, not swallowed.
+    ///
+    /// `push_bounded` drops when the queue is at capacity, so a broadcast can
+    /// be partial. That is survivable — the missed worker resolves those
+    /// packets as unassociated and forwards them — but it must be VISIBLE, or a
+    /// caller cannot tell a complete broadcast from one that reached half the
+    /// dataplane. The count is the signal.
+    #[test]
+    fn a_full_queue_makes_the_broadcast_report_short_7699() {
+        let qs = queues(2);
+        {
+            let mut full = qs[1].lock().expect("queue");
+            for _ in 0..MAX_PENDING_WORKER_COMMANDS {
+                full.push_back(WorkerCommand::VacateAllSharedExactSlots);
+            }
+        }
+        assert_eq!(
+            broadcast_pptp_install(&qs, a_call()),
+            1,
+            "a broadcast that reached only one of two workers must report 1; \
+             reporting 2 would let a caller treat a half-delivered association \
+             as installed"
+        );
+    }
+}

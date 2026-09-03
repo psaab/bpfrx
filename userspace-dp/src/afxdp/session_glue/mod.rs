@@ -897,6 +897,19 @@ pub(super) fn apply_worker_commands(
                 // Trivial variant — kept inline (#1346 plan v2 §4.1).
                 shaped_tx_requests.push(req);
             }
+            WorkerCommand::InstallPptpCall(call) => {
+                // #7699: learn the association on THIS worker. A collision is
+                // refused rather than merged (two calls sharing one handle
+                // share one session), and counted so a refusal is not silent.
+                if let Err(e) = sessions.pptp_mut().install(call) {
+                    debug_log!("PPTP association refused: {:?}", e);
+                }
+            }
+            WorkerCommand::ForgetPptpCall(handle) => {
+                // #7699: a stale association re-pairs a REUSED 16-bit call id
+                // onto a dead handle, so teardown must land on every worker.
+                sessions.pptp_mut().remove(handle);
+            }
             WorkerCommand::VacateAllSharedExactSlots => {
                 // Trivial variant — kept inline (#1346 plan v2 §4.1).
                 // #941 Work item C: signal the outer poll loop to vacate
