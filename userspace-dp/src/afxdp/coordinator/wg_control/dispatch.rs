@@ -236,36 +236,27 @@ pub(super) fn dispatch_inbound(
                     // multi-peer included.
                     InboundOutcome::Authenticated(pk)
                 }
-                Err(crate::afxdp::wg::DecapError::MalformedInner) => {
+                Err(crate::afxdp::wg::DecapError::MalformedInner(pk)) => {
                     // POST-AEAD, so the sender provably holds the session
-                    // keys and this counts for endpoint learning.
+                    // keys and this counts for endpoint learning — the #1865
+                    // basis, and the reason this arm was never a plain drop.
                     //
-                    // #7230 RETRACTION. The comment that stood here
-                    // claimed xpf "cannot attribute a bare keepalive to a
-                    // specific peer" on a multi-peer interface. That was
-                    // FALSE, and false in the direction that stops anyone
-                    // looking: the identity was in hand at the error's
-                    // construction site the whole time — try_decap
-                    // resolves the session by receiver index BEFORE any
-                    // crypto — and was simply discarded with the Err.
-                    // Keepalives now carry it out (the arm above).
+                    // #7686: the peer identity now comes OUT of the error
+                    // rather than being guessed after it. Both construction
+                    // sites in `try_decap` have the session in hand (it is
+                    // demuxed from `hdr.receiver_index` before any AEAD work),
+                    // so this attribution is proven.
                     //
-                    // WHAT IS STILL UNATTRIBUTED, stated precisely so the
-                    // next reader is not misled a second time: a
-                    // MALFORMED-but-authenticated inner packet reaches
-                    // here without a peer, and its identity is available
-                    // at its construction sites too. That is the same
-                    // discard, unfixed — scoped out of #7230 rather than
-                    // overlooked, because widening the variant touches 13
-                    // assertion sites for a case that is anomalous rather
-                    // than continuous. Filed as #7686.
-                    //
-                    // So the single-peer fallback below is now reached
-                    // ONLY by malformed-inner, never by a keepalive.
-                    match engine.single_peer_pubkey() {
-                        Some(pk) => InboundOutcome::Authenticated(pk),
-                        None => InboundOutcome::Unauthenticated,
-                    }
+                    // This closes the discard #7230 fixed for keepalives and
+                    // deliberately left here. The `single_peer_pubkey()`
+                    // fallback that stood at this site returned None on any
+                    // MULTI-PEER interface, so a malformed-but-authenticated
+                    // inner packet did not roam its peer's endpoint there —
+                    // the same defect, one variant over. That fallback is gone
+                    // rather than narrowed: it was the mechanism by which a
+                    // discarded identity got guessed, and nothing reaches it
+                    // any more.
+                    InboundOutcome::Authenticated(pk)
                 }
                 Err(_e) => {
                     debug_log!("WG[{}]: drop transport reason={:?}", tunnel_name, _e);

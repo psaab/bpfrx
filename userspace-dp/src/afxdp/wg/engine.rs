@@ -159,8 +159,27 @@ pub(crate) enum DecapError {
     /// Counter is at or above `REJECT_AFTER_MESSAGES`. Per WG spec
     /// §6.5 the receiver MUST reject these without attempting AEAD.
     CounterRejectAfterMessages,
-    /// Decrypted plaintext did not parse as IPv4/IPv6.
-    MalformedInner,
+    /// Decrypted plaintext did not parse as IPv4/IPv6, tagged with the
+    /// peer that sent it (#7686).
+    ///
+    /// It stays an ERROR: there is no deliverable inner packet, so the
+    /// "no TUN write" contract is unchanged. What changes is that the
+    /// peer identity no longer dies with the error.
+    ///
+    /// The record is POST-AEAD, so the sender provably holds the session
+    /// keys — the same basis on which #1865 made these datagrams count
+    /// for endpoint learning. The identity is available at both
+    /// construction sites because `try_decap` demuxes the session from
+    /// `hdr.receiver_index` BEFORE any AEAD work, so attribution here is
+    /// proven, not inferred.
+    ///
+    /// Before #7686 this discarded the identity and the caller tried to
+    /// recover it with a single-peer identity guess, which could not
+    /// attribute anything on a MULTI-PEER interface — so a malformed-but-authenticated inner
+    /// packet never roamed its peer's endpoint there. Same discard #7230
+    /// fixed for keepalives; scoped out of that change rather than
+    /// overlooked, and its dispatch comment said so at the site.
+    MalformedInner([u8; WG_KEY_LEN]),
     /// Inner src IP is not in this peer's AllowedIPs — cryptokey-
     /// routing violation; drop per WG spec §5.4.6.
     AllowedIpsViolation,
@@ -189,8 +208,9 @@ pub(crate) enum DecapError {
     ///
     /// Before #7230 this collapsed into `MalformedInner`, which discarded
     /// the identity; the caller then tried to recover it with
-    /// `single_peer_pubkey()`, which returns None on any MULTI-PEER
-    /// interface. A peer whose only traffic is keepalives — a roaming
+    /// a single-peer identity guess (`single_peer_pubkey()`, deleted in
+    /// #7686 once nothing called it), which could attribute nothing on a
+    /// MULTI-PEER interface. A peer whose only traffic is keepalives — a roaming
     /// client, or one behind a NAT that rebinds — therefore never roamed
     /// its endpoint and was blackholed until its next handshake
     /// (~120-180s, bounded, not indefinite).
@@ -696,19 +716,6 @@ impl WgEngine {
             .collect()
     }
 
-    /// The pubkey iff the engine has EXACTLY one peer (#1434). Used by
-    /// the control thread's bare-keepalive endpoint-learning fallback,
-    /// where try_decap's MalformedInner/keepalive arm does not surface
-    /// the peer: with one peer the attribution is unambiguous, with
-    /// many it is not. Slow path.
-    pub(crate) fn single_peer_pubkey(&self) -> Option<[u8; WG_KEY_LEN]> {
-        let table = self.load_table();
-        if table.peers.len() == 1 {
-            table.peers.first().map(|e| e.peer.pubkey)
-        } else {
-            None
-        }
-    }
 
     /// #1434 B1b cryptokey routing on EGRESS: longest-prefix-match the
     /// inner destination IP against the AllowedIPs trie and return the
@@ -1617,7 +1624,8 @@ impl WgEngine {
         // `total_length` / IPv6 `payload_length` math. The caller
         // sees only the un-padded inner-IP packet.
         let outcome = (|| -> Result<(IpAddr, u32, usize), DecapError> {
-            let inner_src = inner_src_ip(&out[..n]).ok_or(DecapError::MalformedInner)?;
+            let inner_src = inner_src_ip(&out[..n])
+                .ok_or(DecapError::MalformedInner(session.peer_pubkey))?;
             // Single atomic snapshot for both peer-index lookup and
             // AllowedIPs gate. Taking these from separate ArcSwap
             // loads would re-introduce the reconcile race window
@@ -1633,7 +1641,7 @@ impl WgEngine {
                 return Err(DecapError::AllowedIpsViolation);
             }
             let inner_len = inner_ip_len_after_decap(&out[..n])
-                .ok_or(DecapError::MalformedInner)?;
+                .ok_or(DecapError::MalformedInner(session.peer_pubkey))?;
             Ok((inner_src, peer_idx, inner_len))
         })();
         match outcome {
