@@ -578,6 +578,9 @@ func (d *Daemon) relinquishClusterForBootstrap() []bootstrapTeardownStep {
 	// runs the peer keeps seeing a healthy node and keeps syncing sessions to
 	// one whose dataplane is about to be detached.
 	d.stopClusterComms()
+	// #7901: this teardown does NOT restart. Without the mark, recovery depends
+	// on the corrected commit happening to move a transport endpoint.
+	d.markClusterCommsRestartNeeded()
 	slog.Info("bootstrap rollback: cluster comms stopped and redundancy groups resigned",
 		"redundancy_groups", len(rgIDs))
 	return steps

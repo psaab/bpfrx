@@ -1083,6 +1083,11 @@ type Daemon struct {
 	// an unguarded access here is a real data race, not a theoretical one.
 	activeClusterTransport clusterTransportKey
 
+	// clusterCommsRestartNeeded is set by a teardown that does NOT restart
+	// (bootstrap rollback) and consumed by step 20 (#7901). Guarded by
+	// clusterCommsMu.
+	clusterCommsRestartNeeded bool
+
 	// startClusterCommsFn is the startClusterComms entry point used by
 	// applyTailReconciles step 20; overridable in tests (#6878).
 	//

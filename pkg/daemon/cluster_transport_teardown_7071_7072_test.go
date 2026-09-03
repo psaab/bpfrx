@@ -240,3 +240,76 @@ func TestSupersededEpochPublishIsRefused_7071(t *testing.T) {
 			"superseded epochs")
 	}
 }
+
+// #7901: the row the #7072 pair does not cover — a corrected commit whose
+// transport key is IDENTICAL.
+//
+// The existing two cells bracket step 20's `active != zero` conjunct: it must
+// act after comms have run, and must not before. Neither exercises the recovery
+// disjunct, because both move the transport or never start comms at all. So the
+// measured defect fell exactly between them:
+//
+//	corrected commit, key DIFFERS:    restarts=1  -> comms recover
+//	corrected commit, key IDENTICAL:  restarts=0  -> comms stay DOWN
+//
+// The fixture commits a change that is NOT a transport change and asserts the
+// key is identical as a precondition, so a repair that merely widened the key
+// comparison cannot pass it.
+func TestStepTwentyRestartsWhenATeardownOwesOne_7901(t *testing.T) {
+	store := clusteredStore7066(t)
+	d := &Daemon{
+		store:     store,
+		networkd:  networkd.NewInDir(t.TempDir()),
+		vrrpMgr:   vrrp.NewManager(),
+		cluster:   cluster.NewManager(0, 1),
+		daemonCtx: context.Background(),
+		opts:      Options{NoDataplane: true},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.startClusterComms(ctx)
+	if d.activeTransport() == (clusterTransportKey{}) {
+		t.Fatal("premise: comms must publish a NON-ZERO transport, or step 20's " +
+			"`active != zero` conjunct is false for a reason unrelated to teardown")
+	}
+	started := d.activeTransport()
+
+	// The bootstrap-rollback shape: stop, mark the owed restart, do NOT start.
+	d.stopClusterComms()
+	d.markClusterCommsRestartNeeded()
+
+	restarts := 0
+	d.startClusterCommsFn = func(context.Context) { restarts++ }
+
+	corrected := store.ActiveConfig()
+	corrected.Chassis.Cluster.HeartbeatInterval = 250
+	if got := clusterTransportFromConfig(corrected); got != started {
+		t.Fatalf("premise: this fixture must leave the transport key IDENTICAL "+
+			"(started=%+v corrected=%+v); otherwise it re-tests the key-moved row "+
+			"the #7072 cell already covers", started, got)
+	}
+	_ = d.applyTailReconciles(corrected, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+
+	if restarts != 1 {
+		t.Errorf("comms stayed DOWN after a corrected commit with an identical "+
+			"transport key (restarts=%d). Recovery must not depend on the correction "+
+			"happening to move an endpoint: bootstrap.go's rollback teardown is a "+
+			"stop-without-start and the only other production startClusterComms site "+
+			"is the daemon_run.go boot path, so the node holds a valid cluster config "+
+			"with no heartbeat, no session sync and no fabric refresh until the "+
+			"process restarts (#7901)", restarts)
+	}
+
+	// The recovery is ONE-SHOT. A second apply must not restart again: the flag
+	// is consumed, not read. Without this the cell above passes equally for a
+	// live "are comms down?" predicate, which fires on every apply and breaks
+	// #5078 (a key commit must not restart comms) and #6878 (an unchanged
+	// transport must not restart) — measured, three cells across those two.
+	_ = d.applyTailReconciles(corrected, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	if restarts != 1 {
+		t.Errorf("a SECOND apply restarted comms again (restarts=%d, want 1). The "+
+			"owed restart must be consumed, not re-read: a live down-predicate fires "+
+			"on every apply and reintroduces #5078/#6878 (#7901)", restarts)
+	}
+}
