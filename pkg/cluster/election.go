@@ -779,7 +779,19 @@ func (m *Manager) reconcileMonitorDebtsLocked(cfg *config.ClusterConfig) {
 		// debt on any unrelated config change, recompute the RG weight without
 		// it, and fail open (a node with a dead monitored uplink could win
 		// election). Skip every ip key (#5080 fold).
-		if isIPMonitorName(key.iface) {
+		// #8338: skip every key this reconciler does not OWN, not just the IP
+		// class. The previous shape exempted only `isIPMonitorName`, so the
+		// reserved `__dataplane-arm__` debt — which is never in `desired`,
+		// because `desired` is built solely from `InterfaceMonitors` — was
+		// deleted by every commit that reached here. `applyDataplaneArmTrack`
+		// is edge-triggered from the three arm-transition helpers, so a commit
+		// taken while the node was ALREADY unarmed reinstalled nothing: the
+		// node kept forwarding nothing and lost the penalty that expressed it,
+		// and could then win an election and hold the RG as a blackhole.
+		//
+		// Ownership is now POSITIVE. A future reserved debt is safe by default
+		// rather than requiring someone to remember a third exemption here.
+		if isReservedMonitorName(key.iface) {
 			continue
 		}
 		if _, ok := desired[key]; ok {
