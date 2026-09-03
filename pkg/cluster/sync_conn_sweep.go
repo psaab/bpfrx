@@ -100,8 +100,11 @@ func (s *SessionSync) syncSweep() int {
 	// on success), preserves the encoded #2170/#2221 delete generation, and
 	// re-journals any un-sent tail if sendCh is still full (retried next tick,
 	// #2121). The delete backpressure that journaled the entry set
-	// syncBackfillNeeded, which holds the sweep at the 1s active cadence, so
-	// convergence is bounded by one active sweep interval. This flush is
+	// syncBackfillNeeded, which holds the sweep at the ACTIVE cadence, so
+	// convergence is bounded by one active sweep interval. (#7842: that cadence
+	// is 1s only for the eBPF default; under the userspace dataplane
+	// SessionSyncSweepProfile makes it 15s, so the bound is the profile's
+	// active interval rather than a fixed second.) This flush is
 	// independent of the kernel session iteration below and runs even when
 	// s.sessions is nil.
 	s.flushDeleteJournal()

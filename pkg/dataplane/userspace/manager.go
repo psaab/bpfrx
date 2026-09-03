@@ -612,9 +612,29 @@ func (m *Manager) SessionSyncSweepProfile() (bool, time.Duration, time.Duration)
 	if !m.lastStatus.Enabled || !m.lastStatus.ForwardingArmed || !m.lastStatus.Capabilities.ForwardingSupported {
 		return false, 0, 0
 	}
-	// Userspace forwarding already streams authoritative open/close deltas.
-	// Keep a periodic refresh for long-lived flows, but avoid the 1s batch walk
-	// that was tuned for the eBPF session tables.
+	// Userspace forwarding already streams authoritative open/close deltas, so
+	// the walk is not the primary path; slow it from the 1s cadence that was
+	// tuned for the eBPF session tables.
+	//
+	// #7842: this used to say "keep a periodic refresh for long-lived flows",
+	// which the sweep does NOT do and structurally cannot. Its filter is
+	// `val.Created >= s.lastSweepTime` (`cluster/sync_conn_sweep.go`), so it
+	// only ever queues sessions created SINCE the last sweep; a long-lived flow
+	// has `Created < threshold` and is never re-sent. That file says so itself:
+	// "every session that existed before the sweep started is permanently
+	// invisible to it". The sentence mattered because it was cited as the
+	// justification for narrowing the walk to a refresh it was never doing.
+	//
+	// What the walk IS: the recovery path for a `queueMessage` send-queue
+	// overflow. That branch arms `syncBackfillNeeded`, whose only consumers are
+	// in the sweep, and an overflowing sweep declines to advance
+	// `lastSweepTime` so the next one replays the same window. Both the delta
+	// stream and the sweep queue through that one bounded channel, so this is
+	// the repair for a DROPPED DELTA, not merely a second copy of one.
+	//
+	// The `enabled` bool below is NOT an on/off switch for the sweep --
+	// `sweepIntervalsForDataPlane` consults it only to decide whether to adopt
+	// these intervals, and false falls through to the 1s/10s defaults.
 	return true, 15 * time.Second, 60 * time.Second
 }
 
