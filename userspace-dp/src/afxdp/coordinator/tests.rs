@@ -5324,7 +5324,11 @@ fn committed_reconcile_prunes_zone_counters_for_removed_zones_6832() {
     // stub every reconcile here fails at `WorkerBindIncomplete` and this
     // direction would be untestable. Reds if the `bringup_result.is_ok()`
     // call in `coordinator/reconcile/mod.rs` is deleted.
-    let mut coordinator = Coordinator::new();
+    // #7810: StoppedCoordinator, not a trailing `coordinator.stop()`. A panic
+    // anywhere below skips a trailing call and leaks this test's
+    // neigh-monitor into the process-wide #6637 gates, which then red
+    // alongside it and read as a real monitor leak.
+    let mut coordinator = StoppedCoordinator::new();
     zone_counter_live_coordinator(&mut coordinator);
     let live_store = coordinator.forwarding.zone_counter_store.clone();
 
@@ -5356,7 +5360,6 @@ fn committed_reconcile_prunes_zone_counters_for_removed_zones_6832() {
         "the surviving zone must keep its CARRIED-FORWARD totals across the \
          commit, not restart from zero"
     );
-    coordinator.stop();
 }
 
 #[test]
