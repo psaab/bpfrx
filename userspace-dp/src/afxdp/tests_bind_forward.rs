@@ -2445,3 +2445,81 @@ fn measure_c19_flowless_reaches_cached_filter_7174() {
     );
     let _ = FilterAction::Accept;
 }
+
+/// #8061: a subnet-directed broadcast is NEVER locally delivered.
+///
+/// The asymmetry is real: `should_fallback_early` (`userspace-xdp/src/lib.rs`)
+/// hands `255.255.255.255`, multicast and link-local to the kernel, and a
+/// subnet-directed broadcast is none of those — so unlike the limited broadcast
+/// it enters the AF_XDP dataplane. The question #8061 asks is what happens next,
+/// because the feared consequence chain (L2-less delivery on `xpf-usp0`,
+/// invisible to an `AF_PACKET` consumer, subject to the fail-closed host-inbound
+/// gate) is conditional on it resolving to `LocalDelivery`.
+///
+/// It does not. Every `LocalDelivery` return site is gated on membership this
+/// address cannot have — `fib.rs` on `local_tables_v4` / `local_nat_any_table_v4`,
+/// `forwarding/local_delivery.rs` on `iface.primary_v4 == Some(ip)` — and those
+/// sets are populated from each interface's HOST address
+/// (`forwarding_build/interfaces.rs`, `local_v4.insert(v4.addr())`), never its
+/// broadcast. So the packet is dropped before the gate is ever consulted.
+///
+/// This cell exists so that stays true. The disposition is currently an
+/// unwritten consequence of two membership sets; a future change that added the
+/// directed broadcast to either — say, while implementing the accepted-only
+/// `family inet targeted-broadcast` knob (#4308) — would silently turn on
+/// L2-less local delivery for the class, which is exactly what #8061 asked
+/// someone to check for.
+///
+/// The interface address is asserted FIRST as a positive control: it proves this
+/// fixture can produce `LocalDelivery` at all, so the negative assertion below
+/// cannot pass merely because nothing in this state ever resolves locally.
+#[test]
+fn subnet_directed_broadcast_is_never_locally_delivered_8061() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "ge-0-0-0".into(),
+            ifindex: 7,
+            addresses: vec![InterfaceAddressSnapshot {
+                family: "inet".into(),
+                address: "192.168.1.1/24".into(),
+                scope: 0,
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+
+    let iface_addr: IpAddr = "192.168.1.1".parse().unwrap();
+    let directed_bcast: IpAddr = "192.168.1.255".parse().unwrap();
+
+    // Positive control — the fixture CAN resolve locally.
+    assert_eq!(
+        crate::afxdp::forwarding::lookup_forwarding_for_ip(&state, iface_addr),
+        ForwardingDisposition::LocalDelivery,
+        "the interface's own address must resolve LocalDelivery; without this the \
+         negative assertion below would pass vacuously on a state that resolves \
+         nothing locally"
+    );
+
+    // The membership the LocalDelivery gate actually reads.
+    assert!(
+        !state
+            .local_v4
+            .contains(&"192.168.1.255".parse::<Ipv4Addr>().unwrap()),
+        "the subnet-directed broadcast must not be in local_v4 — that set is built \
+         from each interface's HOST address, and membership is what the fib.rs \
+         LocalDelivery arm gates on"
+    );
+
+    // The disposition itself.
+    assert_ne!(
+        crate::afxdp::forwarding::lookup_forwarding_for_ip(&state, directed_bcast),
+        ForwardingDisposition::LocalDelivery,
+        "a subnet-directed broadcast must not resolve LocalDelivery — local delivery \
+         writes a bare L3 packet to the xpf-usp0 TUN, which no AF_PACKET consumer on \
+         the physical NIC can see, and would put the class under the fail-closed \
+         host-inbound gate that the limited broadcast (kernel early-fallback) never \
+         reaches (#8061)"
+    );
+}
