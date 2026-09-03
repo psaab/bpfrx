@@ -992,3 +992,87 @@ fn write_all_clamps_every_sqe_to_the_len_cap() {
         "each SQE must be clamped to the 4-byte cap"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #7944 — in-flight registry capacity
+// ---------------------------------------------------------------------------
+
+/// At capacity, `write_all` REFUSES rather than parking another buffer: nothing
+/// is submitted and the buffer goes back to the caller. That is not a drop —
+/// `NothingWritten` is the rescue arm on both callers (the slow path hands it to
+/// `sync_fallback`, the state writer to `IoUringPersist::Retry`).
+#[test]
+fn write_all_refuses_once_the_registry_is_at_capacity() {
+    let mut ring = FakeRing::new(vec![], vec![]).with_repeat_err(libc::EAGAIN);
+    let mut reg = InflightRegistry::with_max_inflight_for_test(2);
+    for i in 0..2 {
+        match write_all(&mut ring, &mut reg, vec![0u8; 4], false, "slow-path") {
+            WriteResult::Deferred { .. } => {}
+            other => panic!("storm write {i} should defer, got {other:?}"),
+        }
+    }
+    assert_eq!(reg.inflight_len(), 2, "two storm writes park two buffers");
+
+    let pushes_before = ring.push_calls;
+    match write_all(&mut ring, &mut reg, vec![0u8; 4], false, "slow-path") {
+        WriteResult::NothingWritten(bytes, msg) => {
+            assert_eq!(bytes.len(), 4, "the buffer must come back to the caller");
+            assert!(msg.contains("at capacity"), "got {msg}");
+        }
+        other => panic!("at capacity write_all must refuse, got {other:?}"),
+    }
+    assert_eq!(reg.inflight_len(), 2, "a refused write must not park");
+    assert_eq!(
+        ring.push_calls, pushes_before,
+        "a refused write must not submit an SQE"
+    );
+}
+
+/// Self-healing: the cap is checked AFTER `reap_ready`, so once the storm ends
+/// and completions surface the registry drains and io_uring resumes. A
+/// transient storm costs sync writes, not the ring.
+#[test]
+fn a_drained_registry_accepts_writes_again() {
+    let mut ring = FakeRing::new(vec![], vec![]).with_repeat_err(libc::EAGAIN);
+    let mut reg = InflightRegistry::with_max_inflight_for_test(1);
+    assert!(matches!(
+        write_all(&mut ring, &mut reg, vec![0u8; 4], false, "slow-path"),
+        WriteResult::Deferred { .. }
+    ));
+    assert!(
+        matches!(
+            write_all(&mut ring, &mut reg, vec![0u8; 4], false, "slow-path"),
+            WriteResult::NothingWritten(..)
+        ),
+        "at capacity the second write is refused"
+    );
+
+    // The storm ends: the parked write's terminal CQE surfaces.
+    ring.complete_inflight_now(4);
+
+    match write_all(&mut ring, &mut reg, vec![0u8; 4], false, "slow-path") {
+        WriteResult::Deferred { .. } => {}
+        other => panic!("a drained registry must accept again, got {other:?}"),
+    }
+    assert_eq!(reg.inflight_len(), 1, "the reclaimed slot was reused");
+}
+
+/// The refusal is COUNTED, not silent — the condition is otherwise invisible by
+/// construction. Asserted against a private sink so the two refusing cells above
+/// cannot perturb it.
+#[test]
+fn a_capacity_refusal_is_counted() {
+    let sink = std::sync::Arc::new(super::RetainedCounters::new());
+    let mut ring = FakeRing::new(vec![], vec![]).with_repeat_err(libc::EAGAIN);
+    let mut reg =
+        InflightRegistry::with_max_inflight_and_retained_for_test(1, std::sync::Arc::clone(&sink));
+    assert!(matches!(
+        write_all(&mut ring, &mut reg, vec![0u8; 4], false, "slow-path"),
+        WriteResult::Deferred { .. }
+    ));
+    assert_eq!(sink.refused_writes(), 0, "control: no refusal yet");
+
+    let _ = write_all(&mut ring, &mut reg, vec![0u8; 7], false, "slow-path");
+    assert_eq!(sink.refused_writes(), 1, "the refusal must be counted");
+    assert_eq!(sink.refused_bytes(), 7, "and sized");
+}

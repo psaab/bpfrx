@@ -481,6 +481,30 @@ also used by the state writer. Its `WriteMode` (`IoUring(RingWriter)` |
   behaviour. The old code returned at the ceiling and let the caller free the
   buffer with the SQE possibly still in flight (a UAF-class
   disclosure/corruption); the fix moves ownership instead of weakening lifetime.
+- **In-flight registry capacity (#7944).** The registry is independent of the
+  submission-queue depth — a parked entry is one whose CQE never surfaced within
+  `MAX_WAIT_RETRIES`, long after the kernel drained the SQ slot (measured: 32
+  parked entries on a ring built with depth 8). Without a cap a sustained
+  wait-retry storm parks one owned buffer per write indefinitely. `write_all`
+  therefore refuses past `MAX_INFLIGHT_RETAINED` (256): it returns
+  `NothingWritten` with the buffer handed back, having submitted nothing.
+
+  That is a bounded degradation, not a drop. `NothingWritten` is the RESCUE arm
+  on both callers — the slow path passes the buffer to `sync_fallback`, the state
+  writer returns `IoUringPersist::Retry` — so the data is still written
+  synchronously; what is refused is the io_uring submission, not the I/O. The cap
+  is checked AFTER `reap_ready`, which makes it self-healing: once completions
+  surface the registry drains and io_uring resumes, so a transient storm costs
+  sync writes rather than the ring. Refusals are counted
+  (`io_uring_write_refused_total` / `_bytes_total`) because the condition is
+  otherwise invisible.
+
+  Note the two callers differ in exposure. The state writer demotes to
+  `SyncFallback` PERMANENTLY on its FIRST deferral (`apply_outcome`, via
+  `io_uring_failed: true`), so its registry never exceeds one entry regardless of
+  this cap. Only the slow path, which deliberately keeps io_uring across a
+  non-fatal retry-ceiling storm, can actually accumulate.
+
 - **Per-SQE length clamp (#7751 row 12).** `io_uring_sqe.len` is a `u32`, so one
   `Write` SQE cannot describe more than `MAX_SQE_WRITE_LEN` (`u32::MAX`) bytes.
   `write_all` CLAMPS each SQE to that ceiling rather than narrowing the length

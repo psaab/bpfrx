@@ -213,6 +213,9 @@ pub(crate) struct InflightRegistry {
     /// [`process_retained`]; a test may hand in a private sink so its
     /// assertions do not sample state every other test writes to.
     retained: std::sync::Arc<RetainedCounters>,
+    /// #7944: cap on parked entries. Injected so a test can drive the refusal
+    /// path with a small cap instead of storming 256 writes.
+    max_inflight: usize,
 }
 
 /// #7106: buffers a registry RETAINED rather than freed, because the teardown
@@ -241,6 +244,12 @@ pub(crate) struct InflightRegistry {
 pub(crate) struct RetainedCounters {
     buffers: AtomicU64,
     bytes: AtomicU64,
+    /// #7944: writes REFUSED because the in-flight registry was at capacity.
+    /// Distinct from `buffers`: nothing was submitted and nothing is retained —
+    /// the buffer went back to the caller, which writes it synchronously. This
+    /// is the signal that a ring is parking faster than it reaps.
+    refused_writes: AtomicU64,
+    refused_bytes: AtomicU64,
 }
 
 impl RetainedCounters {
@@ -248,6 +257,8 @@ impl RetainedCounters {
         Self {
             buffers: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
+            refused_writes: AtomicU64::new(0),
+            refused_bytes: AtomicU64::new(0),
         }
     }
 
@@ -263,6 +274,20 @@ impl RetainedCounters {
 
     pub(crate) fn bytes(&self) -> u64 {
         self.bytes.load(Ordering::Relaxed)
+    }
+
+    /// #7944: account one capacity refusal.
+    fn record_refusal(&self, bytes: u64) {
+        self.refused_writes.fetch_add(1, Ordering::Relaxed);
+        self.refused_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn refused_writes(&self) -> u64 {
+        self.refused_writes.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn refused_bytes(&self) -> u64 {
+        self.refused_bytes.load(Ordering::Relaxed)
     }
 }
 
@@ -333,6 +358,21 @@ impl Drop for InflightRegistry {
 /// retries; this ceiling is generous.
 const MAX_WAIT_RETRIES: u32 = 4096;
 
+/// #7944: most entries `InflightRegistry` will park before `write_all` stops
+/// submitting.
+///
+/// The registry is independent of the submission-queue depth — a parked entry is
+/// one whose CQE never surfaced within `MAX_WAIT_RETRIES` waits, and the kernel
+/// has long since drained the SQ slot. Measured: 32 parked entries on a ring
+/// built with depth 8. So the SQ depth bounds nothing here, and without a cap a
+/// sustained wait-retry storm parks one owned buffer per write indefinitely.
+///
+/// 256 is the slow-path ring depth (`slowpath.rs`), which is the only caller
+/// that can actually accumulate: the state writer demotes to sync on its FIRST
+/// deferral, so its registry never exceeds one entry. At the slow path's MTU
+/// buffers this bounds retained memory at roughly 384 KiB.
+const MAX_INFLIGHT_RETAINED: usize = 256;
+
 impl InflightRegistry {
     pub(crate) fn new() -> Self {
         Self::with_retained(std::sync::Arc::clone(process_retained()))
@@ -349,6 +389,7 @@ impl InflightRegistry {
     fn with_retained(retained: std::sync::Arc<RetainedCounters>) -> Self {
         Self {
             next_id: 1,
+            max_inflight: MAX_INFLIGHT_RETAINED,
             inflight: Vec::new(),
             retained,
         }
@@ -372,7 +413,39 @@ impl InflightRegistry {
     /// Move an owned buffer into the registry (it stays owned until a terminal
     /// state releases it). Called only on the deferral path.
     fn defer(&mut self, slot: InFlightWrite) {
+        debug_assert!(
+            self.inflight.len() < self.max_inflight,
+            "write_all must refuse at capacity before parking (#7944)"
+        );
         self.inflight.push(slot);
+    }
+
+    /// #7944: true when the registry may not park another buffer. Checked AFTER
+    /// `reap_ready`, so a registry that can drain does drain first.
+    fn at_capacity(&self) -> bool {
+        self.inflight.len() >= self.max_inflight
+    }
+
+    /// Test hook: build a registry with a small cap so the refusal path is
+    /// reachable without storming `MAX_INFLIGHT_RETAINED` writes.
+    #[cfg(test)]
+    pub(crate) fn with_max_inflight_for_test(max_inflight: usize) -> Self {
+        let mut reg = Self::new();
+        reg.max_inflight = max_inflight;
+        reg
+    }
+
+    /// Test hook: small cap AND a private counter sink, so a test can assert the
+    /// refusal counters without sampling the process sink every other refusing
+    /// test also writes to (#8291's isolation rationale).
+    #[cfg(test)]
+    pub(crate) fn with_max_inflight_and_retained_for_test(
+        max_inflight: usize,
+        retained: std::sync::Arc<RetainedCounters>,
+    ) -> Self {
+        let mut reg = Self::with_retained(retained);
+        reg.max_inflight = max_inflight;
+        reg
     }
 
     /// Number of buffers still owned (in flight) — a test observability hook for
@@ -679,6 +752,26 @@ pub(crate) fn write_all_capped(
 ) -> WriteResult {
     // Reclaim any previously-deferred buffers whose terminal CQE has surfaced.
     reg.reap_ready(port);
+
+    // #7944: refuse rather than park past the cap. Reaping FIRST is what makes
+    // this self-healing — once completions surface the registry drains and
+    // io_uring resumes, so a transient storm costs sync writes, not the ring.
+    //
+    // `NothingWritten` is the correct disposition and NOT a drop: it is the
+    // rescue arm on both callers. The slow path hands the buffer to
+    // `sync_fallback` and keeps the ring live; the state writer returns
+    // `IoUringPersist::Retry`, which rewrites synchronously. So the data is
+    // still written — what is refused is the io_uring submission, not the I/O.
+    if reg.at_capacity() {
+        reg.retained.record_refusal(data.len() as u64);
+        let cap = reg.max_inflight;
+        return WriteResult::NothingWritten(
+            data,
+            format!(
+                "{label} io_uring in-flight registry at capacity ({cap} buffers); not submitted"
+            ),
+        );
+    }
 
     let mut offset = 0usize;
     // Park the owned buffer so the SQE points at the exact allocation we can

@@ -224,6 +224,17 @@ pub(crate) struct ProcessStatus {
     /// Bytes held by `io_uring_retained_buffers_total`.
     #[serde(rename = "io_uring_retained_bytes_total", default)]
     pub io_uring_retained_bytes_total: u64,
+    /// #7944: writes REFUSED because the io_uring in-flight registry was at
+    /// capacity. Distinct from the retained counters above: nothing was
+    /// submitted and nothing is retained — the buffer went back to the caller,
+    /// which wrote it synchronously. Non-zero means a ring is parking buffers
+    /// faster than it reaps them (a sustained wait-retry storm), which without
+    /// the cap was an unbounded memory vector.
+    #[serde(rename = "io_uring_write_refused_total", default)]
+    pub io_uring_write_refused_total: u64,
+    /// Bytes belonging to `io_uring_write_refused_total`.
+    #[serde(rename = "io_uring_write_refused_bytes_total", default)]
+    pub io_uring_write_refused_bytes_total: u64,
     /// #2375: MissingNeighbor packets for a NEW distinct
     /// `(egress_ifindex, next_hop)` refused because `pending_neigh` is at
     /// `MAX_PENDING_NEIGH` distinct hops (distinct-hop neighbor
