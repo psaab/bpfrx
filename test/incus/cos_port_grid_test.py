@@ -14,6 +14,8 @@ HARNESS = (ROOT / "fairness-harness.sh").read_text()
 SWEEP = (ROOT / "fairness-cos-class-sweep.sh").read_text()
 MOUSE = (ROOT / "test-mouse-latency.sh").read_text()
 MOUSE_SAME_CLASS = (ROOT / "test-mouse-latency-same-class.sh").read_text()
+MATRIX = (ROOT / "test-mouse-latency-matrix.sh").read_text()
+LIB = (ROOT / "mouse-elephant-lib.sh").read_text()
 HEADROOM = ROOT / "fairness-cos-throughput-headroom.sh"
 
 
@@ -85,10 +87,39 @@ class CoSPortGridTests(unittest.TestCase):
                 self.assertIn(f" {iperf_port} {queue} {rate_bps}", SWEEP)
 
     def test_mouse_latency_defaults_use_620x_echo_ports(self):
-        self.assertIn('ELEPHANT_PORT="${ELEPHANT_PORT:-5202}"', MOUSE)
-        self.assertIn('MOUSE_PORT="${MOUSE_PORT:-6200}"', MOUSE)
+        # #8244: the defaults were declared independently in the rep script and
+        # the matrix, and this test pinned only one of the two spellings — so a
+        # change to the other could not red it. They now live once, in
+        # mouse-elephant-lib.sh, and BOTH scripts must reference that.
+        for script in (MOUSE, MATRIX):
+            self.assertIn('MOUSE_PORT="${MOUSE_PORT:-$MOUSE_DEFAULT_ECHO_PORT}"', script)
+            self.assertIn(
+                'ELEPHANT_PORT="${ELEPHANT_PORT:-$MOUSE_DEFAULT_IPERF_PORT}"', script
+            )
+            # A script that substitutes the variable without sourcing the file
+            # that defines it expands to EMPTY, which is worse than a wrong
+            # port and passes every string pin above.
+            self.assertIn('. "${SCRIPT_DIR}/mouse-elephant-lib.sh"', script)
         self.assertIn("MOUSE_PORT=6202", MOUSE_SAME_CLASS)
         self.assertIn("MOUSE_CLASS=iperf-1g", MOUSE_SAME_CLASS)
+
+    def test_the_shared_defaults_AGREE_with_the_port_grid(self):
+        """Assert the agreement, not a literal.
+
+        Pinning `6200` in a second file is what let the two copies drift. The
+        durable property is that the default IS the grid's best-effort echo
+        port — if the grid moves, this follows; if the default drifts off the
+        grid, this reds.
+        """
+        best_effort = next(row for row in PORT_GRID if row[0] == 0)
+        _, _, _, iperf_port, echo_port, _, _ = best_effort
+        self.assertIn(f"MOUSE_DEFAULT_ECHO_PORT={echo_port}", LIB)
+        # The elephant default is the 1 Gbps exact class, not queue 0 — the
+        # mice are deliberately best-effort so they share no class with the
+        # elephants by default.
+        one_gig = next(row for row in PORT_GRID if row[1] == "iperf-1g")
+        self.assertIn(f"MOUSE_DEFAULT_IPERF_PORT={one_gig[3]}", LIB)
+        self.assertNotEqual(echo_port, iperf_port)
 
     def test_same_class_fixture_preserves_legacy_port_7_override(self):
         for family in ("inet", "inet6"):

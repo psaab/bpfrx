@@ -51,17 +51,74 @@ fi
 # invocations with different TMPDIR env values would lock
 # different files and bypass the mutex. The CoS state being
 # protected is per-host, so the lock must be per-host.
+# #8244: OUT_ROOT and SCRIPT_DIR are resolved BEFORE the mutex so that a
+# lock-contention abort can write its artifact too. A run that never started
+# because another holds the lock is precisely the "never ran" case that used
+# to be indistinguishable from a gate FAIL.
+OUT_ROOT="$1"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
 LOCK_FILE="/tmp/test-mouse-latency-matrix.lock"
 exec 9>"$LOCK_FILE"
 flock -n 9 || {
-    echo "ABORT: another mouse-latency matrix is already running" >&2
-    echo "       (lock held on $LOCK_FILE)" >&2
-    echo "       wait for it to finish or kill it before retrying" >&2
-    exit 1
+    abort_matrix ABORTED-LOCK-CONTENTION \
+        "another mouse-latency matrix holds $LOCK_FILE; wait for it or stop it"
 }
 
-OUT_ROOT="$1"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=test/incus/mouse-elephant-lib.sh
+# #8244: for MOUSE_DEFAULT_ECHO_PORT / MOUSE_DEFAULT_IPERF_PORT. This script
+# did not source the library, so the port defaults had to be re-declared here
+# and drifted from the rep script's copy by construction.
+. "${SCRIPT_DIR}/mouse-elephant-lib.sh"
+
+# #8244: an abort must be DISTINGUISHABLE from a gate failure, in the
+# artifact, by field name.
+#
+# Every abort path here used to `exit 1` and write no summary.json at all, so
+# the only signal was an ABSENCE — and rc=1 is also what a measured gate FAIL
+# returns. "Never ran" and "ran and failed" were the same observation. On
+# #7100 the same rc=1 meant one with 0 JSON files and the other with 62, and
+# the run was read as the lab being unprovisioned when eleven of twelve echo
+# listeners were up.
+#
+# This is the same defect as #8259's void verdict, one layer out: a state the
+# harness could not measure, reported as though it had measured it. Same
+# remedy — a named outcome a consumer reads by field name, and an exit code
+# that is neither PASS(0) nor FAIL(1).
+#
+# The shape matches what mouse_latency_aggregate.py writes, so a reader that
+# already parses summary.json["verdict"]["verdict"] needs no change.
+abort_matrix() {
+    local code="$1"; shift
+    local reason="$*"
+    echo "ABORT [$code]: $reason" >&2
+    if [[ -n "${OUT_ROOT:-}" ]]; then
+        mkdir -p "$OUT_ROOT" 2>/dev/null || true
+        # The whole-grid scan is what turns "the lab is down" into "one port is
+        # down". target-services.sh already knows how to produce it; the abort
+        # simply stops throwing it away.
+        local scan
+        scan="$("${SCRIPT_DIR}/target-services.sh" status 2>&1 || true)"
+        # `|| true` so a broken writer can never stop the abort from
+        # aborting — but NOT `2>/dev/null`: swallowing stderr here hid a
+        # missing ABORT_OUT (KeyError) during development, and an artifact
+        # that silently fails to be written is the very defect being fixed.
+        ABORT_CODE="$code" ABORT_REASON="$reason" ABORT_SCAN="$scan" \
+        ABORT_OUT="${OUT_ROOT}/summary.json" \
+        python3 -c '
+import json, os
+json.dump({
+    "verdict": {
+        "verdict": os.environ["ABORT_CODE"],
+        "reason": os.environ["ABORT_REASON"],
+        "target_services_scan": os.environ["ABORT_SCAN"],
+    },
+    "summaries": {},
+}, open(os.environ["ABORT_OUT"], "w"), indent=2)
+' || true
+    fi
+    exit 2
+}
 DURATION=${MOUSE_LATENCY_DURATION:-60} # per-rep probe seconds
 WALL_CAP=$((6*3600)) # seconds, plan §4.7
 
@@ -90,11 +147,11 @@ start_t=$(date +%s)
 #
 # Scoped to the ports this run needs, not all 24: an unrelated class being
 # down must not block a matrix that never sends to it.
-MOUSE_PORT="${MOUSE_PORT:-6200}"
-ELEPHANT_PORT="${ELEPHANT_PORT:-5202}"
+MOUSE_PORT="${MOUSE_PORT:-$MOUSE_DEFAULT_ECHO_PORT}"
+ELEPHANT_PORT="${ELEPHANT_PORT:-$MOUSE_DEFAULT_IPERF_PORT}"
 if ! "${SCRIPT_DIR}/target-services.sh" check "$MOUSE_PORT" "$ELEPHANT_PORT"; then
-    echo "aborting matrix: the target services this run needs are not up (#8040)" >&2
-    exit 1
+    abort_matrix ABORTED-TARGET-SERVICES-DOWN \
+        "the target services this run needs are not up: echo $MOUSE_PORT / iperf3 $ELEPHANT_PORT (#8040)"
 fi
 
 # ---- echo-server preflight (plan §4.6)
@@ -112,13 +169,11 @@ echo "Running echo-server preflight..."
 # and exiting 0; preflight must check the marker file too, not just
 # the orchestrator exit code.
 if compgen -G "${PREFLIGHT_DIR}/INVALID-*" > /dev/null 2>&1; then
-    echo "preflight invalidated; aborting matrix" >&2
     ls "$PREFLIGHT_DIR" >&2
-    exit 1
+    abort_matrix ABORTED-PREFLIGHT-INVALID "preflight rep was invalidated"
 fi
 if [[ ! -f "$PREFLIGHT_DIR/probe.json" ]]; then
-    echo "preflight produced no probe.json; aborting" >&2
-    exit 1
+    abort_matrix ABORTED-PREFLIGHT-NO-PROBE "preflight produced no probe.json"
 fi
 preflight=$(python3 -c '
 import json, sys
@@ -162,8 +217,7 @@ else:
     print("OK")
 ' "$PREFLIGHT_DIR/probe.json")
 if [[ "$preflight" != "OK" ]]; then
-    echo "preflight failed: $preflight" >&2
-    exit 1
+    abort_matrix ABORTED-PREFLIGHT-FAILED "preflight failed: $preflight"
 fi
 echo "preflight OK"
 

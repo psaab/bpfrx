@@ -380,6 +380,32 @@ A measurement run **PASSES** iff ALL of:
    reads `verdict`, which is how the confound survived to be cited. It exits
    2 (undetermined), never 0.
 
+   **An ABORT is distinguishable from a gate FAIL (#8244).** Every abort path
+   in `test-mouse-latency-matrix.sh` used to `exit 1` and write no
+   `summary.json` at all, so the only signal was an ABSENCE — and `rc=1` is
+   also what a measured gate FAIL returns. On #7100 the same `rc=1` meant
+   "never ran" (0 JSON files) once and "ran and failed" (62) the other time.
+   Aborts now write a `summary.json` whose `verdict.verdict` is one of
+   `ABORTED-LOCK-CONTENTION`, `ABORTED-TARGET-SERVICES-DOWN`,
+   `ABORTED-PREFLIGHT-INVALID`, `ABORTED-PREFLIGHT-NO-PROBE` or
+   `ABORTED-PREFLIGHT-FAILED`, carry the whole-grid `target_services_scan`,
+   and exit 2 rather than 1. The shape matches what the reducer emits, so a
+   consumer reading `summary.json["verdict"]["verdict"]` needs no change. This
+   is the same defect as the void verdict above, one layer out: a state the
+   harness could not measure, reported as though it had measured it.
+
+   **The port defaults live once**, in `mouse-elephant-lib.sh`
+   (`MOUSE_DEFAULT_ECHO_PORT` / `MOUSE_DEFAULT_IPERF_PORT`). They were declared
+   independently in the rep script and the matrix, and `cos_port_grid_test.py`
+   pinned only one of the two spellings. The echo default stays **6200**
+   (queue 0 / best-effort in the canonical grid) even though that is the one
+   listener currently down on the loss cluster: the echo port DETERMINES the
+   forwarding class, so silently substituting an open 6201 would move the mice
+   from best-effort into `iperf-100m` and change what the run measures, with
+   nothing in the output saying so. The provisioning gap is reported instead —
+   the abort carries the whole-grid scan, so a one-port gap reads as a one-port
+   gap rather than a dead lab.
+
    `MOUSE_TARGET_V4` and `ELEPHANT_TARGET_V4` are separate knobs that default
    to the same address, so the check passes the moment a second host exists:
    point `ELEPHANT_TARGET_V4` at it and the gate resumes producing
