@@ -59,7 +59,13 @@ func compileFirewallFilters(dp DataPlane, cfg *config.Config, result *CompileRes
 			}
 			policerIDs[name] = polID
 			slog.Info("compiled policer",
-				"name", name, "rate_bps", pol.BandwidthLimit,
+				// #8429: BandwidthLimit is BYTES/sec, so the old "rate_bps"
+				// key named this value wrongly by a factor of 8. This leg's
+				// ENFORCEMENT is correct (RateBytesSec above is byte-named);
+				// only the log label was lying, and it lied in the same
+				// direction as the userspace defect — an operator reading it to
+				// check a policer saw a rate 8x too low.
+				"name", name, "rate_bytes_sec", pol.BandwidthLimit,
 				"burst", pol.BurstSizeLimit, "id", polID)
 		}
 	}

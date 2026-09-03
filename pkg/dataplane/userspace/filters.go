@@ -731,8 +731,29 @@ func buildPolicerSnapshots(cfg *config.Config) []PolicerSnapshot {
 			continue
 		}
 		snap := PolicerSnapshot{
-			Name:         name,
-			BandwidthBps: pol.BandwidthLimit,
+			Name: name,
+			// #8429: pol.BandwidthLimit is BYTES per second —
+			// parseBandwidthLimit is literally `parseScaledDecimalUnit(s) / 8`.
+			// The wire field is bits per second and the helper divides by 8
+			// again (`filter/compiler.rs`, committed_rate_bytes_per_sec), so
+			// shipping the byte value straight across enforced ONE EIGHTH of
+			// the configured rate: `bandwidth-limit 8m` metered at 1 Mbit/s.
+			//
+			// With `then discard` that drops conforming customer traffic and
+			// the policer counters attribute it to the customer, so the surface
+			// an operator checks confirms the wrong story.
+			//
+			// Converted HERE rather than by removing the helper's divisor,
+			// because this is the only leg that crosses units. The three-color
+			// leg below parses through the SAME function and is correct — it
+			// emits into `committed_rate_bytes_per_sec`, a byte-NAMED field the
+			// helper does not re-divide — and the eBPF leg
+			// (`dataplane/compiler_filter.go`, RateBytesSec) is byte-named too.
+			// Changing parseBandwidthLimit would break both.
+			//
+			// Cannot overflow: the value is `scaled/8` for a `scaled` that
+			// already fit a uint64, so multiplying back is bounded by it.
+			BandwidthBps: pol.BandwidthLimit * 8,
 			BurstBytes:   pol.BurstSizeLimit,
 		}
 		if pol.ThenAction == "discard" {
