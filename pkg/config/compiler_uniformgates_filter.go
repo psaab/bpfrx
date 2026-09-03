@@ -244,6 +244,21 @@ func runUniformGatesFilter(tree *ConfigTree, cfg *Config, opts compileOpts) erro
 		}
 	}
 
+	// #8445 policer `then` terminal-vs-marking gate. A policer whose `then`
+	// carries both `discard` and a marking action keeps only the last, and with
+	// `discard` written first the compiled policer meters and drops NOTHING —
+	// an authored rate limit that commits clean and is entirely unenforced.
+	// Reads the AUTHORED action set (ThenActions) rather than the last-wins
+	// survivor, which is the only place the conflict is visible.
+	if err := validateFirewallPolicerThenConflictStrict(cfg); err != nil {
+		if opts.lenientPolicerThenConflict {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("firewall policer then-action conflict (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #3309 firewall-filter DSCP / traffic-class range gate. Strict on commit /
 	// commit-check (hard-reject a `from dscp`/`from traffic-class` match or a
 	// `then dscp`/`then traffic-class` rewrite token that is neither a known

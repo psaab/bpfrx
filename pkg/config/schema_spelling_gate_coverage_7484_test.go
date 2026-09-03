@@ -230,7 +230,15 @@ var gateBlindCeiling = map[gateBlindClass]int{
 	// only describe: a new row must tighten gateCoverageFloor, and a regression
 	// cannot pass. The issue's own count rotted four times (228 -> 215 -> 144
 	// -> 137); a number that lives beside the code it measures cannot.
-	gateBlindUnreachable: 137,
+	// #8445 tightened this 137 -> 136. `firewall policer <*> then discard` was
+	// in this class because reading the leaf set `ThenAction = "discard"`,
+	// which is ALSO the field's default — so mutating the leaf's spelling
+	// changed nothing observable and the differential could not see it.
+	// Recording the AUTHORED action set (`ThenActions`) for the #8445 gate made
+	// the leaf observable, so it left this class. Tightening rather than
+	// leaving it loose is the point of the ratchet: the slack would otherwise
+	// be room for the next regression to hide in.
+	gateBlindUnreachable: 136,
 	// #7132 raised this 175 -> 176 for `system ntp server ... prefer`.
 	//
 	// Raised deliberately, and it is the one kind of raise that is not a
@@ -263,7 +271,18 @@ var gateBlindCeiling = map[gateBlindClass]int{
 	// hazard for this shape), the config-mode grammar offers it
 	// (TestStrictSessionAuthIsInTheSetSchema7441), and the strict/tolerant
 	// split is pinned by its own two cells.
-	gateBlindFlag:       177,
+	// #8445 raised this 177 -> 178, and it is the SAME leaf as the -1 above,
+	// not a new blind spot: `firewall policer <*> then discard` moved out of
+	// "unreachable" and into this class. It is a value-less flag, so the
+	// spelling differential — which works by VARYING a leaf's value — has
+	// nothing to vary, exactly like the `chassis cluster` flags this number
+	// already holds. No change to the gate or the schema can rescue it.
+	//
+	// It is not untested: both orders of the conflicting `then` are rejected at
+	// `configstore.CheckText` and every valid form still commits
+	// (policer_then_conflict_8445_test.go), and the compiled ThenAction /
+	// ThenActions are asserted directly on the tolerant path.
+	gateBlindFlag:       178,
 	gateBlindErr:        43,
 	gateBlindValueMoves: 1,
 }

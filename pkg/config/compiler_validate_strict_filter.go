@@ -1835,3 +1835,122 @@ func ProtocolIsPortBearing(token string) bool {
 func FilterProtocolResolvable(token string) bool {
 	return filterProtocolResolvable(token)
 }
+
+// validateFirewallPolicerThenConflictStrict hard-rejects a policer or
+// three-color-policer whose `then` block carries BOTH the terminal action
+// `discard` and a marking action (`loss-priority` / `forwarding-class`) —
+// #8445.
+//
+// # Why reject rather than compose
+//
+// Composing them is not available, and not merely inconvenient. The dataplane
+// enforces exactly one policer action: `then discard`, which maps the excess
+// colours to a drop treatment. A marking action is METERED BUT NOT ACTED UPON —
+// `build_single_rate_policer_state` selects `ThreeColorTreatments::default()`
+// for any non-discard policer and its own doc says "the marking action is not
+// wired here". So "drop the excess AND mark it" has no representation to
+// compile to; a composing fix would have to invent the half that does not
+// exist.
+//
+// It is also contradictory on its own terms: a discarded packet is not marked.
+// Junos treats a policer `then` as one action on the out-of-profile traffic.
+//
+// # Why silently keeping one is worse than it looks
+//
+// PolicerConfig.ThenAction is single-valued and last-write-wins, so SOURCE
+// ORDER decides which statement survives, and the two orders do not merely
+// differ — they differ in whether the rate limit exists at all:
+//
+//	then { discard; loss-priority high; }  -> ThenAction "loss-priority high"
+//	                                       -> DiscardExcess false
+//	                                       -> policer METERS AND DOES NOTHING
+//	then { loss-priority high; discard; }  -> ThenAction "discard"
+//	                                       -> DiscardExcess true, rate enforced
+//
+// The first is the dangerous one: the operator authored a rate limit, the
+// commit succeeded, and the limit is entirely unenforced. It does not degrade
+// to mark-and-forward — it becomes a complete no-op.
+//
+// # What this gate reads, and why it cannot read ThenAction
+//
+// The AUTHORED set (`ThenActions`), not the survivor. A check on ThenAction
+// cannot see the conflict: the compiled value IS what was authored, for one of
+// the two statements. That is the trap this gate exists to avoid, and it is why
+// recording the set was part of the fix rather than an implementation detail.
+//
+// Repeating the SAME action is a redundancy, not a conflict, and is allowed —
+// mirroring validateFilterTerminalConflictStrict (#4375), whose shape this
+// follows. `forwarding-class` is recorded and rejected alongside `discard` even
+// though the compiler never acted on it: it is an action the operator wrote and
+// the config silently dropped.
+//
+// Strict on commit / commit-check; lenient on load / peer-sync (warn — #1960
+// no-brick: an already-persisted or peer-synced config still boots, and the
+// last-wins ThenAction drives the dataplane exactly as it did before, so a
+// leniently-loaded config is no worse off than before the gate). Deterministic:
+// policers then three-color-policers, each sorted by name.
+func validateFirewallPolicerThenConflictStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	// A policer `then` action is either TERMINAL (acts on the packet and ends
+	// the decision) or a MARKING action (rewrites a field and forwards). One of
+	// each is the contradiction.
+	isMarking := func(a string) bool {
+		return a == "loss-priority" || a == "forwarding-class"
+	}
+	check := func(kind string, actionsByName map[string][]string) error {
+		names := make([]string, 0, len(actionsByName))
+		for name := range actionsByName {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			var terminal, marking []string
+			seen := map[string]bool{}
+			for _, a := range actionsByName[name] {
+				if seen[a] {
+					continue
+				}
+				seen[a] = true
+				if a == "discard" {
+					terminal = append(terminal, a)
+				} else if isMarking(a) {
+					marking = append(marking, a)
+				}
+			}
+			if len(terminal) > 0 && len(marking) > 0 {
+				return fmt.Errorf(
+					"firewall %s %q: `then` carries both the terminal action %s and "+
+						"the marking action %s — a policer applies ONE action to "+
+						"out-of-profile traffic, and keeping whichever was written last "+
+						"silently changed the rate limit (with `discard` first the "+
+						"policer meters and drops nothing at all). Supported: `then "+
+						"discard` alone, which enforces the limit by dropping the "+
+						"excess; or `then loss-priority <level>` / `then "+
+						"forwarding-class <class>` alone, which METERS ONLY — this "+
+						"dataplane does not yet act on a policer marking action",
+					kind, name,
+					strings.Join(terminal, " and "), strings.Join(marking, " and "))
+			}
+		}
+		return nil
+	}
+
+	policers := make(map[string][]string, len(cfg.Firewall.Policers))
+	for name, pol := range cfg.Firewall.Policers {
+		if pol != nil {
+			policers[name] = pol.ThenActions
+		}
+	}
+	if err := check("policer", policers); err != nil {
+		return err
+	}
+	tcps := make(map[string][]string, len(cfg.Firewall.ThreeColorPolicers))
+	for name, tcp := range cfg.Firewall.ThreeColorPolicers {
+		if tcp != nil {
+			tcps[name] = tcp.ThenActions
+		}
+	}
+	return check("three-color-policer", tcps)
+}
