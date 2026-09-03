@@ -964,6 +964,22 @@ var walkRuleAxisExemptions6812 = mergeAxisExemptions6812(
 		"Rule.Then.Interface", "Rule.Then.Off",
 	),
 	fixtureConstantAxes6812(
+		"#8430 compile-time diagnostic state: whether the rule AUTHORED a `match` "+
+			"container at all, as opposed to omitting it. The compiled NATMatch cannot "+
+			"tell those apart, and they are different intentions: a scope-only rule "+
+			"(`from zone` / `to zone` with no match) deliberately translates everything "+
+			"in that scope and is legitimate, while `match { }` or "+
+			"`match { source-address; }` is an operator whose constraint evaporated and "+
+			"whose rule the dataplane then reads as UNCONSTRAINED. Constant true here "+
+			"because every rule in this fixture authors a match; in production it is "+
+			"false for every scope-only rule, so this is a real blind spot and NOT "+
+			"production-constant. Registered rather than varied for the same reason as "+
+			"thenAuthored below: nothing sorts or compares on it — it is read once by "+
+			"validateNATRuleMatchConstrainedStrict and never reaches the dataplane. If "+
+			"that ever changes, vary it instead.",
+		"Rule.matchAuthored",
+	),
+	fixtureConstantAxes6812(
 		"#7013 compile-time diagnostic state: what ONE `then` container authored, kept "+
 			"so validateNATTerminalActionCardinalityStrict can see a pool the resolved "+
 			"NATThen scalar already discarded. Constant at exactly one authored pool "+

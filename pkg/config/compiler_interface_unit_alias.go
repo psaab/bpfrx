@@ -121,7 +121,7 @@ import (
 // is the collision the gate rejects. A malformed / out-of-range unit token is
 // dropped (the compiler drops it too), mirroring the pre-#5878 strconv.Atoi
 // skip so detection matches what compileInterfaces actually consumes.
-func collectInterfaceUnitSpellingsAST(ifacesNode *Node, perIface map[string]map[int]map[string]bool) {
+func collectInterfaceUnitSpellingsAST(ifacesNode *Node, perIface map[string]map[int]map[string]int) {
 	if ifacesNode == nil {
 		return
 	}
@@ -136,12 +136,21 @@ func collectInterfaceUnitSpellingsAST(ifacesNode *Node, perIface map[string]map[
 				continue
 			}
 			if perIface[ifName] == nil {
-				perIface[ifName] = make(map[int]map[string]bool)
+				perIface[ifName] = make(map[int]map[string]int)
 			}
 			if perIface[ifName][num] == nil {
-				perIface[ifName][num] = make(map[string]bool)
+				perIface[ifName][num] = make(map[string]int)
 			}
-			perIface[ifName][num][inst.name] = true
+			// #8427: COUNT the instances, do not just record presence. Two
+			// hierarchical `unit 0 { ... }` blocks are the SAME spelling, so a
+			// presence set has size 1 and the #5631/#5878 alias gate — which
+			// fires on two DISTINCT spellings — cannot see them. They are
+			// nonetheless two AST instances that collide on one ifc.Units key,
+			// with exactly the last-writer-wins / append-only split this gate
+			// exists to reject. Counting is per-PASS; the caller folds views
+			// with max, never sum, so the same unit seen by the pre-expansion
+			// and both post-expansion views is not counted three times.
+			perIface[ifName][num][inst.name]++
 		}
 	}
 }
@@ -156,7 +165,7 @@ func collectInterfaceUnitSpellingsAST(ifacesNode *Node, perIface map[string]map[
 // are NON-FATAL and contribute the empty set (View 1 still covers a collision
 // inside an un-expandable group), so the verdict stays a pure function of the
 // candidate config and is identical on both nodes.
-func collectNodeExpandedInterfaceUnitSpellings(tree *ConfigTree, nodeID int, perIface map[string]map[int]map[string]bool) {
+func collectNodeExpandedInterfaceUnitSpellings(tree *ConfigTree, nodeID int, perIface map[string]map[int]map[string]int) {
 	clone := tree.Clone()
 	vars := map[string]string{"node": fmt.Sprintf("node%d", nodeID)}
 	if err := clone.ExpandGroupsWithVars(vars); err != nil {
@@ -170,16 +179,60 @@ func collectNodeExpandedInterfaceUnitSpellings(tree *ConfigTree, nodeID int, per
 	}
 }
 
+// foldMaxUnitCounts folds one VIEW's per-interface unit-spelling counts into the
+// accumulator, taking the MAX per spelling rather than the sum (#8427).
+//
+// The three views deliberately overlap: View 1 collects pre-expansion and Views
+// 2/3 collect the same tree expanded for node0 and node1, so a single authored
+// `unit 0` appears in all three. Summing would count it three times and reject
+// every config in the tree. Max keeps the union semantics the alias gate was
+// built on while letting a count ABOVE ONE mean what it says — two AST
+// instances of the same spelling under one interface, within a single view.
+//
+// Within View 1 the counts DO accumulate across sibling `interfaces { }` roots
+// and groups, which is correct: #5744 established that a split config can
+// declare one interface's units across two roots and compileSections compiles
+// them all, so two `unit 0` declarations there collide on one ifc.Units key
+// exactly as two blocks under one root do.
+func foldMaxUnitCounts(dst, src map[string]map[int]map[string]int) {
+	for ifName, byUnit := range src {
+		if dst[ifName] == nil {
+			dst[ifName] = make(map[int]map[string]int, len(byUnit))
+		}
+		for num, bySpelling := range byUnit {
+			if dst[ifName][num] == nil {
+				dst[ifName][num] = make(map[string]int, len(bySpelling))
+			}
+			for spelling, n := range bySpelling {
+				if n > dst[ifName][num][spelling] {
+					dst[ifName][num][spelling] = n
+				}
+			}
+		}
+	}
+}
+
 func validateInterfaceUnitAliasCollisionsAST(tree *ConfigTree, lenient bool) ([]string, error) {
-	// perIface[ifName][canonicalUnit] = set of raw spellings.
-	perIface := make(map[string]map[int]map[string]bool)
+	// perIface[ifName][canonicalUnit][rawSpelling] = occurrence count, folded
+	// across views with MAX (#8427 — see foldMaxUnitCounts).
+	perIface := make(map[string]map[int]map[string]int)
 
 	// View 1 — pre-expansion presence union across every top-level `interfaces`
 	// root (#5744: a split config can declare an interface's units across two
 	// sibling `interfaces { }` stanzas, and compileSections compiles them all)
 	// AND every `groups` block. Modeled on validateTunnelEndpointIDCollisionAST.
+	// #8427: each `interfaces` root and each group body is its OWN collection
+	// pass, folded with MAX. Counting ACROSS them would read the normal HA
+	// pattern — `groups node0` and `groups node1` each declaring `em0 unit 0`
+	// with that node's own address — as a duplicate. Measured: accumulating
+	// across groups rejected all four shipped cluster configs
+	// (docs/ha-cluster*.conf, examples/deploy/ha-pair.conf), which are correct.
+	// Two `unit 0` blocks in two SIBLING `interfaces { }` roots are a different
+	// shape and are already rejected by the duplicate-container gate.
 	for _, ifaces := range tree.FindChildren("interfaces") {
-		collectInterfaceUnitSpellingsAST(ifaces, perIface)
+		pass := make(map[string]map[int]map[string]int)
+		collectInterfaceUnitSpellingsAST(ifaces, pass)
+		foldMaxUnitCounts(perIface, pass)
 	}
 	for _, child := range tree.Children {
 		if child.Name() != "groups" {
@@ -190,12 +243,16 @@ func validateInterfaceUnitAliasCollisionsAST(tree *ConfigTree, lenient bool) ([]
 			// Keys[1]; the children are then the group body directly.
 			if len(child.Keys) >= 2 {
 				for _, ifaces := range child.FindChildren("interfaces") {
-					collectInterfaceUnitSpellingsAST(ifaces, perIface)
+					pass := make(map[string]map[int]map[string]int)
+					collectInterfaceUnitSpellingsAST(ifaces, pass)
+					foldMaxUnitCounts(perIface, pass)
 				}
 				break
 			}
 			for _, ifaces := range group.FindChildren("interfaces") {
-				collectInterfaceUnitSpellingsAST(ifaces, perIface)
+				pass := make(map[string]map[int]map[string]int)
+				collectInterfaceUnitSpellingsAST(ifaces, pass)
+				foldMaxUnitCounts(perIface, pass)
 			}
 		}
 	}
@@ -204,8 +261,12 @@ func validateInterfaceUnitAliasCollisionsAST(tree *ConfigTree, lenient bool) ([]
 	// node1. Both computed on both nodes from the shared candidate, so the
 	// union stays HA-symmetric; per-node expansion errors contribute the empty
 	// set (non-fatal).
-	collectNodeExpandedInterfaceUnitSpellings(tree, 0, perIface)
-	collectNodeExpandedInterfaceUnitSpellings(tree, 1, perIface)
+	view2 := make(map[string]map[int]map[string]int)
+	view3 := make(map[string]map[int]map[string]int)
+	collectNodeExpandedInterfaceUnitSpellings(tree, 0, view2)
+	collectNodeExpandedInterfaceUnitSpellings(tree, 1, view3)
+	foldMaxUnitCounts(perIface, view2)
+	foldMaxUnitCounts(perIface, view3)
 
 	var warnings []string
 	emit := func(format string, args ...any) error {
@@ -227,15 +288,54 @@ func validateInterfaceUnitAliasCollisionsAST(tree *ConfigTree, lenient bool) ([]
 
 	for _, ifName := range ifNames {
 		byUnit := perIface[ifName]
+		// #5631/#5878: two or more DISTINCT spellings of one canonical unit.
+		// #8427: OR one spelling declared more than once — two hierarchical
+		// `unit 0 { ... }` blocks under one interface. Both reach the same
+		// ifc.Units key with the same last-writer-wins / append-only split; the
+		// only difference is the diagnostic, so they share this loop.
 		nums := make([]int, 0, len(byUnit))
+		dupSpelling := make(map[int]string, len(byUnit))
 		for num := range byUnit {
 			if len(byUnit[num]) >= 2 {
 				nums = append(nums, num)
+				continue
+			}
+			// Exactly one spelling: flag it when that spelling occurs more than
+			// once in any single view. Sorted so the message is deterministic
+			// even though the map has one entry (a later refactor could add
+			// more).
+			only := make([]string, 0, len(byUnit[num]))
+			for sp := range byUnit[num] {
+				only = append(only, sp)
+			}
+			sort.Strings(only)
+			for _, sp := range only {
+				if byUnit[num][sp] >= 2 {
+					nums = append(nums, num)
+					dupSpelling[num] = sp
+					break
+				}
 			}
 		}
 		sort.Ints(nums)
 
 		for _, num := range nums {
+			if sp, isDup := dupSpelling[num]; isDup {
+				if err := emit(
+					"interfaces %s: `unit %s` is declared %d times — the later block "+
+						"REPLACES the earlier one in ifc.Units[%d] (its firewall "+
+						"filter, its addresses, its flags), while the interface-level "+
+						"tunnel-address collection APPENDS from every block, so the "+
+						"unit's security filter is decided by config order and its "+
+						"addresses are not. The #5631/#5878 alias gate cannot see this "+
+						"case: it fires on two DISTINCT spellings that canonicalize to "+
+						"one unit, and these are the SAME spelling. Merge the blocks "+
+						"into one `unit %s { ... }` (#8427)",
+					ifName, sp, byUnit[num][sp], num, sp); err != nil {
+					return nil, err
+				}
+				continue
+			}
 			spellings := make([]string, 0, len(byUnit[num]))
 			for s := range byUnit[num] {
 				spellings = append(spellings, s)

@@ -1290,6 +1290,16 @@ type PolicerConfig struct {
 	BurstSizeLimit          uint64 // burst bucket size in bytes
 	ThenAction              string // "discard" or "loss-priority high/medium-high/medium-low/low"
 	LogicalInterfacePolicer bool   // shared across protocol families on the interface
+	// ThenActions records EVERY action keyword authored in the policer's
+	// `then` block, in source order (#8445).
+	//
+	// ThenAction above is single-valued and last-write-wins, so it is the
+	// SURVIVOR, not the intent. A gate that reads it cannot see that two
+	// actions were written: `then { discard; loss-priority high; }` compiles to
+	// exactly what was authored — for one of the two statements — which is why
+	// a cell asserting "ThenAction is what was authored" passes today.
+	// validateFirewallPolicerThenConflictStrict reads this instead.
+	ThenActions []string
 }
 
 // ThreeColorPolicerConfig defines a three-color policer (RFC 2697/2698).
@@ -1308,6 +1318,9 @@ type ThreeColorPolicerConfig struct {
 	PIR                  uint64 // peak information rate (bytes/sec, two-rate only)
 	PBS                  uint64 // peak/excess burst size (bytes)
 	ThenAction           string // action on exceed/violate: "discard" or "loss-priority"
+	// ThenActions: the authored set, for the same reason as PolicerConfig's
+	// (#8445). The three-color `then` loop is the identical last-wins switch.
+	ThenActions []string
 }
 
 // FirewallFilter defines a named firewall filter with ordered terms.

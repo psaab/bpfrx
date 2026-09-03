@@ -95,6 +95,30 @@ func runUniformGatesNAT(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 		}
 	}
 
+	// #8430 unconstrained-match gate. An empty NAT match set is read by the
+	// dataplane as UNCONSTRAINED (`if !constrained { return true }`), so a rule
+	// that constrains nothing translates EVERY packet reaching it rather than
+	// none — a fail-OPEN. Two routes reach that empty set: an unknown or
+	// misspelled leaf, now closed by the closedWorld flip on the three `match`
+	// subtrees in setSchema, and a VALUELESS supported leaf or an empty
+	// `match { }`, which no allowlist can see because the leaf IS recognised.
+	//
+	// Written against the COMPILED match rather than the AST on purpose: that
+	// is what binds the harm, and it catches every route into the empty set
+	// including ones nobody has enumerated. An explicit catch-all
+	// (`source-address 0.0.0.0/0`) is constrained and passes.
+	//
+	// Strict on commit / commit-check; lenient on load / peer-sync so a config
+	// persisted before this gate existed still boots (#1960 no-brick).
+	if err := validateNATRuleMatchConstrainedStrict(cfg); err != nil {
+		if opts.lenientDestNATAddresses {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("nat rule match (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #3450 destination-NAT pool port/address gate. The DNAT pool `port` parser
 	// used a bare strconv.Atoi with no bound check and the snapshot builder cast
 	// straight to uint16, so `port 70000` wrapped to 4464 / `-1` to 65535 (wrong

@@ -902,6 +902,9 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 			// unaffected: SetPath merges duplicate containers into one node
 			// (ast_edit.go), so this only changes the hierarchical/parser shape.
 			for _, matchNode := range ruleInst.node.FindChildren("match") {
+				// #8430: the rule authored a match container. Recorded before
+				// the leaves are read, so an EMPTY `match { }` is still marked.
+				rule.matchAuthored = true
 				for _, m := range matchNode.Children {
 					switch m.Name() {
 					case "source-address":

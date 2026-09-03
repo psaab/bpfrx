@@ -110,6 +110,7 @@ func compileNATDestination(node *Node, sec *SecurityConfig) error {
 			// unaffected: SetPath merges duplicate containers into one node
 			// (ast_edit.go), so this only changes the hierarchical/parser shape.
 			for _, matchNode := range ruleInst.node.FindChildren("match") {
+				rule.matchAuthored = true // #8430, see compiler_nat_source.go
 				for _, m := range matchNode.Children {
 					switch m.Name() {
 					case "destination-address":

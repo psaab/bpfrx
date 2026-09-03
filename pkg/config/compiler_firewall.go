@@ -43,6 +43,15 @@ func compileFirewall(node *Node, fw *FirewallConfig) error {
 		thenNode := polInst.node.FindChild("then")
 		if thenNode != nil {
 			for _, child := range thenNode.Children {
+				// #8445: record what was AUTHORED before applying last-wins.
+				// `forwarding-class` is recorded even though no arm below acts
+				// on it: it is an action the operator wrote, and the gate's
+				// question is which actions were written, not which one
+				// survived.
+				switch child.Name() {
+				case "discard", "loss-priority", "forwarding-class":
+					pol.ThenActions = append(pol.ThenActions, child.Name())
+				}
 				switch child.Name() {
 				case "discard":
 					pol.ThenAction = "discard"
@@ -144,6 +153,12 @@ func compileFirewall(node *Node, fw *FirewallConfig) error {
 
 		if thenNode := tcpInst.node.FindChild("then"); thenNode != nil {
 			for _, child := range thenNode.Children {
+				// #8445: see the policer arm above — identical last-wins switch,
+				// identical loss of the authored set.
+				switch child.Name() {
+				case "discard", "loss-priority", "forwarding-class":
+					tcp.ThenActions = append(tcp.ThenActions, child.Name())
+				}
 				switch child.Name() {
 				case "discard":
 					tcp.ThenAction = "discard"

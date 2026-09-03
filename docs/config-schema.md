@@ -376,6 +376,48 @@ Putting `gre` first makes the dropped value and the fallback identical, so a rea
 divergence reads as EQUIVALENT and the #2419 inventory entry looks stale. A
 fixture must never use the value the bug falls back to.
 
+### `protocols isis interface <if> level` — the PER-INTERFACE circuit type (#8450)
+
+A different leaf and a different defect from the router-wide one below, in the
+same direction. It parsed, compiled into `ISISInterface.Level`, and was **never
+rendered** — `pkg/frr` emitted no `isis circuit-type` line anywhere, so an
+interface an operator restricted to one level kept forming adjacencies at the
+ROUTER-WIDE `is-type`. Dead config that fails OPEN.
+
+`CanonicalISISCircuitType` is a **separate** canonicalizer from
+`CanonicalISISLevel`, deliberately. The per-interface spelling domain is wider:
+Junos writes a bare digit here (`level 1`) while FRR's `circuit-type` takes the
+`level-N` forms, so both must be accepted. Sharing the router-wide function
+would have to widen its domain too, and `is-type 2` is a value #8446
+deliberately **rejects**. Two canonicalizers with different domains is the right
+answer here; one shared function would silently relax the stricter leaf.
+
+Accepted: `1`, `2`, `1-2`, `level-1`, `level-2`, `level-1-2`, `level-2-only`.
+
+**An UNSET level renders NO line.** That is how an interface inherits the
+router-wide `is-type` in both FRR and Junos, and a fix that emitted a default
+would silently NARROW every interface in every existing config.
+`TestISISInterfaceUnsetLevelRendersNoCircuitType_8450` carries a control that the
+interface block IS rendered, so its absence assertion is not vacuous.
+
+**An unrecognised value also renders no line**, which is the opposite belt
+direction from #8446 and for a specific reason: `isis circuit-type <junk>` is a
+line vtysh REJECTS, and one rejected line fails the WHOLE managed-section reload
+(#1880/#2223). Omitting is recoverable — it is the pre-#8450 behaviour — where
+emitting a broken line takes down all of dynamic routing.
+
+**Block scope is load-bearing.** `isis circuit-type` is interface-scoped;
+emitted after `exit` it lands at global config scope and vtysh rejects it. Same
+ordering hazard #2942 recorded for per-interface BFD, and
+`TestISISCircuitTypeIsInsideTheInterfaceBlock_8450` pins it.
+
+**Also fixed in the same change:** the interface block emitted only
+`ip router isis xpf`, so isisd ran IPv4-only and IS-IS carried **no IPv6 routes
+at all**. It now emits `ipv6 router isis xpf` alongside. This is a behaviour
+change on a dual-stack deployment with an IPv6-capable neighbour — IPv6 routes
+appear where previously none did — and it matches FRR's own defaults, which
+enable both address families for a configured `router isis`.
+
 ### `protocols isis level` / `is-type` — the enum mirrors what the RENDERER can express (#8446)
 
 Both leaves spell one concept and both compile into `ISISConfig.Level`. Neither
@@ -702,6 +744,119 @@ compiled to an EMPTY member list. The correct spelling is
 `community c1 { members X; }`. The positive control is what caught it; without
 it the cell would have passed against a gate that never ran, on a config that
 never carried the value.
+
+### NAT rule `match` — closed-world plus an UNCONSTRAINED-set gate (#8430)
+
+An empty NAT match set is read by the dataplane as **unconstrained**:
+
+```rust
+nets_match_v4:  if !constrained { return true }
+source_constrained = !snap.source_addresses.is_empty()
+```
+
+So an empty match does not match nothing — it matches **everything**, and a
+one-letter typo widened a source-NAT rule from an authored prefix to every
+source. Two routes reach that empty set and they need different mechanisms.
+
+**Unknown leaves → `closedWorld: true` on the three `match` subtrees.** The match
+switches in `compiler_nat_{source,static,destination}.go` have no `default:`
+arm. Rather than a fourth hand-rolled allowlist, the schema closes the subtree —
+the #4313 mechanism already used for the DNAT `then`, `nat64`, `natv6v4` and the
+IKE/IPsec proposals. The schema's declared match children were checked against
+each compiler's switch arms **first** and agree exactly, so closing cannot
+false-reject a leaf a compiler reads.
+
+**Valueless and empty → `validateNATRuleMatchConstrainedStrict`.** A recognised
+leaf with no value (`source-address;`) and an empty `match { }` land in the same
+empty set and no allowlist can see either, because the leaf IS recognised. The
+gate reads the **compiled** match rather than the AST, which is what binds the
+harm: a cell asserting the typo is rejected proves the allowlist and stays green
+for a fix that leaves the valueless route open.
+
+**`matchAuthored`, and why the first version of that gate was wrong.** It
+rejected any rule with an empty match, and false-rejected the **scope-only**
+rule — `from zone trust; to zone untrust;` with no `match` at all — which is
+legitimate and common, because the rule-set's own from/to is the constraint.
+Nine existing cells across `compiler_nat_scope_3079`,
+`compiler_nat_mixed_scope_4881` and `dup_names_6455` caught it. The compiled
+`NATMatch` cannot tell "no match authored" from "match authored and empty", so
+`NATRule` carries an **unexported** `matchAuthored`, following `thenAuthored`'s
+precedent: compile-time diagnostic state, read only by the strict gate, kept off
+the dataplane contract and out of config-sync payloads. It is registered in the
+#6812 axis census as an admitted **blind spot**, not production-constant — it
+genuinely varies (false for every scope-only rule) and nothing sorts on it.
+
+Static NAT is not gated: its rule shape is a different struct with no comparable
+authored flag, and the closed-world flip on its `match` subtree already closes
+the typo route.
+
+### Closed-world does NOT descend into a multi-value leaf (#8430)
+
+`walkSchemaNode` stops the `childClosed` fold at a `multi: true` leaf with no
+schema children. **Its children are VALUES, not keywords.** The hierarchical
+mixed shape `source-address <v1> { <v2>; }` — the spelling #6693 fixed the
+compiler to accumulate — presents `<v2>` as an AST child, and inheriting
+closed-world there read it as an unknown keyword and rejected a valid config.
+
+Worth recording how that was found: **by a control, not by review.** Flipping the
+three `match` subtrees left the entire `pkg/config` and `pkg/configstore` suites
+GREEN through the false reject, because no existing cell authors the mixed shape
+under a closed subtree. Any future `closedWorld` flip over a subtree containing
+`multi` leaves should carry a mixed-shape control for the same reason.
+
+### A FUSED statement — the missing-semicolon gate (#8437)
+
+A missing semicolon fuses two hierarchical statements. The lexer has no
+terminator to stop at, so the next statement's keyword and its value are
+absorbed onto this node's `Keys`, and the compiler — reading only the tokens its
+own grammar declares — **silently drops the second statement**.
+
+```
+route-filter 10.0.0.0/8 orlonger protocol static;     # `;` after orlonger omitted
+```
+
+parses with zero errors, commits strict-clean, and compiles to
+`FromProtocols = []`. With the semicolon present it is `[static]`. **One
+character apart, both green.**
+
+It is worse than an ordinary parse bug because `FormatSet` renders the fused
+line back: `show configuration` **displays** a constraint the compiled policy
+does not carry, so the operator's verification step confirms the config they
+intended while the dataplane enforces a wider one. The reverse direction (an
+extra semicolon) errors, so the asymmetry is entirely in the dangerous
+direction.
+
+**The discriminator is that an absorbed token NAMES A SIBLING** of this leaf in
+the enclosing container — the same test #3673 uses for
+`security policies … match` (`emitSwallowed`), generalised to every container.
+Only tokens past the declared identity span are considered.
+
+Two sharper-looking checks were tried first and both were wrong, which is the
+part worth keeping:
+
+- **A plain arity check** ("a bare flag takes no trailing tokens") condemned
+  `then static-nat prefix 10.0.0.5/32`. Several leaves are **under-declared** in
+  `setSchema` — no `args`, no `children` — and keep their grammar in the
+  compiler. The walker's own comment states the contract that check violates:
+  *"tokens past it are keywords/ignored per the compiler-faithful contract"*.
+  `TestSchema2008_StaticNATMatch_AcceptsValid` caught it.
+- **The sibling test alone** then fired on
+  `system login user bob class super-user`, where `class` names both a sibling
+  of `user` under `login` **and** a child of `user`. That input was already
+  rejected — by #6706's packed-spelling gate, with a targeted message. So the
+  check **defers when the token also names a child of this node**. A second gate
+  firing first on the same input replaces a specific diagnostic with a generic
+  one, which is a regression even though the verdict is unchanged.
+
+**Scope, narrower than #8437 states.** `system { host-name p domain-name x; }`
+is already rejected by the existing typed-leaf trailing-token gate. The gap this
+closes is specifically **untyped** and **`multi`** leaves.
+
+**Testing it binds the WIDENING, not the parse.** A cell asserting the
+route-filter prefix and match-type survived stays GREEN on the defective input —
+both *are* intact. What is lost is the `protocol` dimension. The cell asserts
+the control's own `FromProtocols` is `[static]` first, so a failure
+distinguishes "fusion happened" from "this fixture never reached the compiler".
 
 ### `security zones` interface-defined reference (ps-review-002 F6, #4515)
 
@@ -1454,6 +1609,118 @@ inline peer) as ACCEPT so a future group-authored detector cannot reintroduce th
 false-reject. Plus the top-level no-false-positive accepts (apply-groups
 deep-merge carrying both rules, cross-group coalescing, #3096 bracket-list
 expansion).
+
+### Empty forwarding-class identity (#8442) — and why it is NOT in the #6455 family gate
+
+`class-of-service forwarding-classes queue 5 ""` committed GREEN and then made
+the helper refuse the whole snapshot. Measured at master by dumping the emitted
+snapshot:
+
+```json
+{"forwarding_classes":[{"name":"","queue":5},{"name":"realfc","queue":6}],
+ "scheduler_maps":[{"name":"sm1","entries":[{"forwarding_class":""},{"forwarding_class":"realfc"}]}]}
+```
+
+**The fault is a Go/Rust SET DISAGREEMENT, and each side is reasonable alone.**
+The Go emitter KEEPS an empty class — in `forwarding_classes` *and* in the
+scheduler-map entries, because `CoSForwardingClassUndefined(cos, "")` is false
+(the entry exists), so the #6534/#2409 exclusion filter retains it. The Rust
+`build_cos_classifier_tables` SKIPS an empty name when building
+`class_to_queue`. So the scheduler-map entry's lookup misses and
+`build_cos_iface_config` fails the snapshot closed with
+`SchedulerMapUnknownClass { forwarding_class: "" }`.
+
+**The blast radius is the point.** The apply preflight keeps the previous live
+forwarding state, so *every* forwarding change in that commit silently does not
+apply — not just the CoS stanza, and not just the offending class — while the
+CLI reports a successful commit. The empty class even DENIES a real one: the
+FC↔queue bijection gate reports `forwarding-class "realfc" conflicts with ""`.
+
+**Why not the #6455 quoted-empty-name family gate.** That family
+(`rule ""`, `group ""`, `interface ""`, `ids-option ""`) is enforced by the
+pre-expansion duplicate-name scanners, which walk
+`namedInstances(FindChildren(keyword))` — NAMED BLOCKS. A forwarding-class name
+is not one. It is a positional VALUE token: arg 1 of
+`forwarding-classes queue <id> <name>`, or the identity arg of a
+`forwarding-class <name>` reference. The `namedDupRules` registry cannot see
+it, so extending it would have meant reshaping that scanner around a different
+grammar. Typed-leaf validators are where value slots are gated, so that is where
+this lives.
+
+`ValidateForwardingClassName` (`schema_validators_cos.go`) is attached to every
+slot that names a forwarding class:
+
+- the DEFINITION slot, via `keyValidatorPos: ValidateForwardingClassQueueArg` on
+  `forwarding-classes queue` (positional because arg 0 is the queue id and arg 1
+  the name — only the name slot carries this identity);
+- all eight `forwarding-class <class-name>` REFERENCE slots (classifiers dscp /
+  ieee-802.1 / inet-precedence, rewrite-rules, scheduler-maps).
+
+The two firewall-filter `then forwarding-class` slots already carry a stricter
+`treeValidator: validateForwardingClassRef`, which requires the reference to
+resolve — and after this gate no empty class can be defined, so an empty
+reference cannot resolve.
+
+**It cannot false-reject a shorter authoring.** The schema walker clamps the
+declared-arg span to `len(node.Keys)`, so arg 1 is only visited when the
+operator actually wrote a second token; a bare `queue 5` never reaches the name
+validator. Only a present-but-empty token is rejected.
+
+Strict on commit / commit-check; the tolerant load / peer-sync path is unchanged
+(#1960 no-brick) — which is also where the harm remains observable, and where
+`TestEmptyForwardingClassWouldReachTheWire_8442` pins that the emitter still
+produces the empty name so the gate has something to prevent.
+
+This also repaired two in-tree claims that had gone stale. The Rust skip
+described an empty class as *"the legitimate placeholder case"*, and the
+`SchedulerMapUnknownClass` test called that error a backstop that *"never fires
+on a fresh operator config"* — both false while this hole was open, both true
+again only because the Go gate now exists.
+
+### Duplicate hierarchical `unit N` blocks (#8427)
+
+`compileInterfaces` writes `ifc.Units[unitNum] = unit` unconditionally, so two
+hierarchical `unit 0 { … }` blocks under one interface are **last-writer-wins**
+for the unit's filter, addresses and flags, while the interface-level
+tunnel-address collection **appends** from every block. The unit's security
+filter is decided by config order and its addresses are not.
+
+The #5631/#5878 alias gate cannot see it, and says so in its own doc: detection
+is scoped to **distinct spellings** that canonicalize to one unit. Two
+hierarchical `unit 0` blocks are the *same* spelling, and being hierarchical they
+do not take the flat-set merge path that makes same-spelling `set` lines safe.
+
+The detection therefore counts **instances** rather than recording presence —
+one diagnostic path for one consequence, rather than a second gate. An alias
+still gets #5631's message; a same-spelling duplicate gets one naming the count
+and saying why the alias gate did not fire.
+
+**The fold is the whole safety argument, and it has two traps.** The alias gate
+unions three deliberately overlapping views (pre-expansion, plus the tree
+expanded for node0 and node1), because a peer-only alias must be caught at either
+node's commit. A presence *set* collapses that overlap for free; a count does
+not.
+
+1. **Fold views with MAX, never sum.** Summing makes one authored `unit 0` count
+   three times and rejects essentially every config.
+2. **Do not accumulate across `groups` bodies either.** `groups node0` and
+   `groups node1` each declaring `em0 unit 0` with that node's own address is the
+   *normal* HA pattern — only one applies per node. Measured: accumulating there
+   rejected **all four** shipped cluster configs (`docs/ha-cluster.conf`,
+   `docs/ha-cluster-loss.conf`, `docs/ha-cluster-userspace.conf`,
+   `examples/deploy/ha-pair.conf`). Each `interfaces` root and each group body is
+   its own collection pass.
+
+Two `unit 0` blocks in two **sibling** `interfaces { }` roots are a different
+shape, already rejected by the duplicate-container gate, so scoping the count per
+pass loses nothing.
+
+**The per-node-groups control is load-bearing**, not decoration: it is the shape
+that caught trap 2, and it lives in the test file so a later tightening cannot
+silently re-break every shipped cluster config. A separate cell pins that the
+#5631 alias case still gets **its** message — a shared loop that reclassified an
+alias as a duplicate would lose the diagnostic telling the operator the two
+spellings are one unit.
 
 ### Non-numeric logical-unit identity fail-closed (#5829)
 
@@ -9715,6 +9982,67 @@ unit test. FAIL-ON-REVERT: dropping the validators makes the reject cases
 commit clean again; reverting the `parseBurstSizeLimit` delegation makes
 the overflow test go RED (the old inline multiply returned a wrapped
 nonzero, e.g. `20000000000000g` → `3729424098846048256`).
+
+### #8445 — firewall policer `then` terminal-vs-marking conflict (commit fail-closed)
+
+A policer's `then` block compiles into the SINGLE-VALUED
+`PolicerConfig.ThenAction`, last-write-wins. So a `then` carrying both
+`discard` and a marking action kept only whichever was written last, and
+the two orders do not merely differ in the marking — they differ in
+whether the rate limit exists at all:
+
+```
+then { discard; loss-priority high; }  ->  ThenAction "loss-priority high"
+                                       ->  DiscardExcess false
+                                       ->  policer METERS AND DROPS NOTHING
+then { loss-priority high; discard; }  ->  ThenAction "discard"
+                                       ->  DiscardExcess true, limit enforced
+```
+
+`buildPolicerSnapshots` (`pkg/dataplane/userspace/filters.go`) sets
+`DiscardExcess` only for exactly `"discard"`, and the Rust
+`build_single_rate_policer_state` then selects
+`ThreeColorTreatments::default()` — no drop — for everything else. So the
+first form is not a degraded rate limit; it is a **complete no-op that
+commits clean**.
+
+**Why reject rather than compose.** The dataplane enforces exactly one
+policer action. A marking action is METERED BUT NOT ACTED UPON — that
+function's own doc says "the marking action is not wired here" — so
+"drop the excess AND mark it" has no representation to compile to; a
+composing fix would have to invent the half that does not exist. It is
+also contradictory on its own terms: a discarded packet is not marked.
+
+**What the gate reads.** The AUTHORED action set
+(`PolicerConfig.ThenActions`, recorded in source order by the compile
+loop), not the survivor. A check on `ThenAction` cannot see the conflict
+— the compiled value IS what was authored, for one of the two
+statements. Recording the set was part of the fix, not an implementation
+detail.
+
+`validateFirewallPolicerThenConflictStrict` rejects a policer or
+three-color-policer whose `then` carries both `discard` and
+`loss-priority` / `forwarding-class`. Repeating the SAME action is a
+redundancy, not a conflict, and is allowed — mirroring
+`validateFilterTerminalConflictStrict` (#4375), whose shape this follows.
+`forwarding-class` is rejected alongside `discard` even though the
+compiler never acted on it: it is an action the operator wrote and the
+config silently dropped.
+
+Supported forms, named in the rejection message:
+
+- `then discard` alone — enforces the limit by dropping the excess.
+- `then loss-priority <level>` / `then forwarding-class <class>` alone —
+  **meters only**; this dataplane does not yet act on a policer marking
+  action. That limitation is pre-existing and out of scope here, but the
+  error names it so an operator is not left believing the marking-only
+  form rate-limits.
+
+Strict on commit / commit-check; lenient on load / peer-sync
+(`lenientPolicerThenConflict`, #1960 no-brick — the last-wins
+`ThenAction` drives the dataplane exactly as it did before the gate, so a
+leniently-loaded config is no worse off than before).
+
 
 ### #3043 — Security-policy missing/conflicting terminal action (commit fail-closed)
 

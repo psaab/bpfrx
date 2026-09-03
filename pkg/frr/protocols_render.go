@@ -673,6 +673,30 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 		for _, iface := range isis.Interfaces {
 			fmt.Fprintf(&b, "interface %s\n", iface.Name)
 			fmt.Fprintf(&b, " ip router isis xpf\n")
+			// #8450: enable the IPv6 topology too. Only `ip router isis` was
+			// emitted, so isisd ran IPv4-only on every interface and IS-IS
+			// learned and advertised NO IPv6 routes — on a dual-stack product,
+			// with the compiler happily accepting IS-IS on dual-stack
+			// interfaces and knownRedistProtocols extended for IPv6 IGPs
+			// (#2943). FRR itself enables both address families for a
+			// configured `router isis`, so emitting both matches its defaults;
+			// on an interface with no IPv6 address there is nothing to
+			// advertise and the line is inert.
+			fmt.Fprintf(&b, " ipv6 router isis xpf\n")
+			// #8450: the per-interface circuit type. ISISInterface.Level was
+			// compiled and stored and then never rendered, so an interface an
+			// operator restricted to one level kept forming adjacencies at the
+			// ROUTER-WIDE is-type — dead config that fails OPEN. An empty value
+			// renders no line, which is the correct "inherit the router-wide
+			// is-type" behaviour in both FRR and Junos. An unrecognised value
+			// also renders no line rather than a broken one: the strict commit
+			// gate rejects it, and on the tolerant Load / peer-sync path
+			// (#1960) an omitted circuit-type is the pre-#8450 behaviour, which
+			// is recoverable, where an invalid `isis circuit-type <junk>` line
+			// would fail the WHOLE frr-reload (#1880/#2223).
+			if ct, ok := config.CanonicalISISCircuitType(iface.Level); ok && ct != "" {
+				fmt.Fprintf(&b, " isis circuit-type %s\n", ct)
+			}
 			if iface.Passive {
 				b.WriteString(" isis passive\n")
 			}
