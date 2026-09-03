@@ -410,7 +410,7 @@ func (m *Manager) buildHeartbeat() *HeartbeatPacket {
 	}
 	for _, rg := range m.groups {
 		pkt.Groups = append(pkt.Groups, HeartbeatGroup{
-			GroupID:  uint8(rg.GroupID),
+			GroupID:  wireRGID(rg.GroupID),
 			Priority: uint16(rg.LocalPriority),
 			Weight:   clampWireWeight(rg.Weight),
 			State:    uint8(rg.State),
@@ -420,13 +420,71 @@ func (m *Manager) buildHeartbeat() *HeartbeatPacket {
 	// Include local interface monitor statuses.
 	for _, ls := range localStatuses {
 		pkt.Monitors = append(pkt.Monitors, HeartbeatMonitor{
-			RGID:      uint8(ls.RedundancyGroup),
+			RGID:      wireRGID(ls.RedundancyGroup),
 			Weight:    clampWireWeight(ls.Weight),
 			Up:        ls.Up,
 			Interface: ls.Interface,
 		})
 	}
 	return pkt
+}
+
+// wireRGID narrows a redundancy-group id onto the single-byte heartbeat RG
+// fields (`HeartbeatGroup.GroupID`, `HeartbeatMonitor.RGID`).
+//
+// #8337: SATURATING, like its neighbour clampWireWeight, and for a sharper
+// reason than a wrong number. A bare `uint8(id)` wraps, and the peer-group map
+// is keyed by whatever byte arrives while every reader looks the map up by the
+// RAW config id (election.go, status.go, failover.go, upgrade_drain.go,
+// group_state.go). For any id whose low byte differs, those keys never meet,
+// and `election.go` turns a missing entry into `peerAlive && peerGroup == nil
+// -> electLocalPrimary, "Peer has no RG info"`. A node that is receiving and
+// parsing its peer's heartbeats concludes the peer has no RG info and elects
+// itself primary — a SECOND primary, not a display glitch.
+//
+// Saturation is deliberately not a refusal. Declining to advertise the group
+// would leave the peer with no entry for it, which is the same
+// `peerGroup == nil` the wrap produces — the fix would reproduce the bug.
+//
+// Two config ids above the ceiling collapse onto 255 and become
+// indistinguishable on the wire. That is inherent to a single-byte field, not
+// introduced here, and it is unreachable from a strict commit: `MaxRedundancyGroups`
+// bounds an operator-typed config to 16. It is reachable through
+// `Store.Load` / `Store.SyncApply`, which compile leniently — a strict gate
+// bounds what an operator can TYPE, not what the runtime can hold.
+func wireRGID(id int) uint8 {
+	if id < 0 {
+		return 0
+	}
+	if id > 255 {
+		return 255
+	}
+	return uint8(id)
+}
+
+// localRGIDForWireByte maps a received wire RG byte back to the LOCAL config's
+// redundancy-group id.
+//
+// #8337: this is what makes the peer-group map agree with its readers BY
+// CONSTRUCTION rather than by a comment claiming it does. Every consumer of
+// `m.peerGroups` indexes it with a raw config id; keying it by the wire byte
+// was the disagreement. Resolving here — at the single producer — fixes all of
+// them at once and leaves the ~8 call sites untouched, because they were
+// already right.
+//
+// The two directions share one function: an entry matches when
+// `wireRGID(local id) == received byte`, which is exactly what the sender
+// computed. Nothing can drift between them without changing `wireRGID` itself.
+//
+// Falls back to `int(b)` when no local group matches, preserving today's
+// behaviour for a group this node does not configure.
+func (m *Manager) localRGIDForWireByte(b uint8) int {
+	for id := range m.groups {
+		if wireRGID(id) == b {
+			return id
+		}
+	}
+	return int(b)
 }
 
 // clampWireWeight narrows a weight onto the single-byte heartbeat weight field
@@ -467,8 +525,11 @@ func (m *Manager) handlePeerHeartbeat(pkt *HeartbeatPacket) {
 	// the peer no longer reports (fix #92).
 	newPeerGroups := make(map[int]PeerGroupState, len(pkt.Groups))
 	for _, g := range pkt.Groups {
-		newPeerGroups[int(g.GroupID)] = PeerGroupState{
-			GroupID:  int(g.GroupID),
+		// #8337: key by the LOCAL config id the wire byte resolves to, which is
+		// how every reader of m.peerGroups indexes it.
+		localID := m.localRGIDForWireByte(g.GroupID)
+		newPeerGroups[localID] = PeerGroupState{
+			GroupID:  localID,
 			Priority: int(g.Priority),
 			Weight:   int(g.Weight),
 			State:    NodeState(g.State),
@@ -492,7 +553,7 @@ func (m *Manager) handlePeerHeartbeat(pkt *HeartbeatPacket) {
 				Interface:       mon.Interface,
 				Weight:          int(mon.Weight),
 				Up:              mon.Up,
-				RedundancyGroup: int(mon.RGID),
+				RedundancyGroup: m.localRGIDForWireByte(mon.RGID),
 			}
 		}
 	} else {
