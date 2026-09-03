@@ -211,8 +211,8 @@ func TestMergeDNSInputPrecedenceAndDedup(t *testing.T) {
 	in := mergeDNSInput(cfg, leases)
 	want := []string{
 		"1.1.1.1", "8.8.8.8", // static first
-		"9.9.9.9",                // v4 DHCP (8.8.8.8 de-duped)
-		"2606:4700:4700::1111",   // v6 DHCP last
+		"9.9.9.9",              // v4 DHCP (8.8.8.8 de-duped)
+		"2606:4700:4700::1111", // v6 DHCP last
 	}
 	if len(in.NameServers) != len(want) {
 		t.Fatalf("servers = %v, want %v", in.NameServers, want)

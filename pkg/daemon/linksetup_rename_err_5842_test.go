@@ -206,7 +206,6 @@ func TestWriteLinkFileDistinguishesUnchangedFromFailure_5842(t *testing.T) {
 	}
 }
 
-
 // TestPositionalNamingVerifiesLiveNames_7205 is the #7205 item-1 fail-on-revert.
 //
 // THE SEAM LIES: it reports success and does not rename. That is the whole

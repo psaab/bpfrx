@@ -399,12 +399,12 @@ func userspaceSessionFromDeltaV4(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 		// the session into the sibling's routing domain — a cross-tenant
 		// mis-file, and a confident one.
 		RoutingDomain: delta.RoutingDomain,
-		Created:         now,
-		LastSeen:        now,
-		Timeout:         userspaceSessionTimeout(delta.Protocol),
-		IngressZone:     ingressZone,
-		EgressZone:      egressZone,
-		ReverseKey:      userspaceReverseKeyV4(key, delta),
+		Created:       now,
+		LastSeen:      now,
+		Timeout:       userspaceSessionTimeout(delta.Protocol),
+		IngressZone:   ingressZone,
+		EgressZone:    egressZone,
+		ReverseKey:    userspaceReverseKeyV4(key, delta),
 	}
 	if delta.TunnelEndpointID != 0 {
 		val.LogFlags |= dataplane.LogFlagUserspaceTunnelEndpoint
@@ -524,12 +524,12 @@ func userspaceSessionFromDeltaV6(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 		// the session into the sibling's routing domain — a cross-tenant
 		// mis-file, and a confident one.
 		RoutingDomain: delta.RoutingDomain,
-		Created:         now,
-		LastSeen:        now,
-		Timeout:         userspaceSessionTimeout(delta.Protocol),
-		IngressZone:     ingressZone,
-		EgressZone:      egressZone,
-		ReverseKey:      userspaceReverseKeyV6(key, delta),
+		Created:       now,
+		LastSeen:      now,
+		Timeout:       userspaceSessionTimeout(delta.Protocol),
+		IngressZone:   ingressZone,
+		EgressZone:    egressZone,
+		ReverseKey:    userspaceReverseKeyV6(key, delta),
 	}
 	if delta.TunnelEndpointID != 0 {
 		val.LogFlags |= dataplane.LogFlagUserspaceTunnelEndpoint

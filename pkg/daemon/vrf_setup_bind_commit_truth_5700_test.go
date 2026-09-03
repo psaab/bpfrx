@@ -241,8 +241,8 @@ func TestApplyVRFReconcileMemberBindStaysBestEffort_5700(t *testing.T) {
 	cfg.RoutingInstances = []*config.RoutingInstanceConfig{
 		{
 			Name:         "blue",
-			InstanceType: "vrf",         // non-forwarding -> reconciled + member-bound
-			TableID:      100,           // vrf-blue LinkAdd succeeds (no addFail)
+			InstanceType: "vrf",                // non-forwarding -> reconciled + member-bound
+			TableID:      100,                  // vrf-blue LinkAdd succeeds (no addFail)
 			Interfaces:   []string{"ge-0/0/5"}, // ge-0-0-5: absent from ops.links -> bind fails
 		},
 	}

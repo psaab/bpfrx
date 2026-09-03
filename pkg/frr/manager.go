@@ -140,6 +140,9 @@ type Manager struct {
 	// describes the CURRENT rendered section: a commit that reduces the
 	// policy clears it without needing a separate clear path.
 	quarantined map[string]struct{}
+	// #8363: narrowing set + its lock. See resetNarrowed/recordNarrowed.
+	narrowedMu sync.Mutex
+	narrowed   []narrowedChainSite
 
 	// retryMu guards the degraded-retry episode fields below. Lock
 	// order: reloadMu → retryMu (retryMu is a leaf).
@@ -226,6 +229,64 @@ func (m *Manager) resetQuarantined() {
 }
 
 // noteQuarantined records that name was replaced by the bounded explicit deny.
+// narrowedMu guards narrowed. Leaf lock, same discipline as quarantinedMu:
+// never taken while any other manager lock is held.
+//
+// narrowed is the set of BGP policy-chain attachments whose resolved chain is a
+// strict, non-empty subset of what the operator authored, as of the LAST
+// rendered managed section (#8363). Unlike quarantined this is NOT a
+// withdrawal: those neighbors still forward, they are simply filtered by less
+// than was configured. It is deliberately a separate set from quarantined,
+// whose documented meaning ("every route on the neighbors carrying those
+// attachments is being WITHDRAWN — alert on > 0") a narrowing would falsify.
+
+// resetNarrowed clears the narrowing set at the start of a render so an
+// operator who defines the missing policy-statements and reloads stops being
+// reported — a signal that keeps firing after the fix gets muted.
+func (m *Manager) resetNarrowed() {
+	m.narrowedMu.Lock()
+	m.narrowed = nil
+	m.narrowedMu.Unlock()
+}
+
+// recordNarrowed replaces the narrowing set with this render's findings.
+func (m *Manager) recordNarrowed(sites []narrowedChainSite) {
+	m.narrowedMu.Lock()
+	m.narrowed = append([]narrowedChainSite(nil), sites...)
+	m.narrowedMu.Unlock()
+}
+
+// NarrowedPolicyChains returns the attachments whose applied chain is narrower
+// than authored, as "<where> (<applied>|<discarded>)" descriptors sorted for
+// deterministic output. Exported for the xpf_frr_policy_chains_narrowed gauges.
+func (m *Manager) NarrowedPolicyChains() []string {
+	return m.narrowedDescriptors(func(narrowedChainSite) bool { return true })
+}
+
+// NarrowedPolicyChainsSuffixShape returns only those narrowed attachments whose
+// undefined members form a SUFFIX of the authored chain — the subset for which
+// a synthesized deny would be safe (#8363). Its complement is the subset for
+// which a deny would delete surviving members and cause a routing outage, so the
+// two counts together size that decision on measurement rather than argument.
+func (m *Manager) NarrowedPolicyChainsSuffixShape() []string {
+	return m.narrowedDescriptors(func(s narrowedChainSite) bool { return s.GhostsAreSuffix })
+}
+
+func (m *Manager) narrowedDescriptors(keep func(narrowedChainSite) bool) []string {
+	m.narrowedMu.Lock()
+	defer m.narrowedMu.Unlock()
+	out := make([]string, 0, len(m.narrowed))
+	for _, s := range m.narrowed {
+		if !keep(s) {
+			continue
+		}
+		out = append(out, fmt.Sprintf("%s (applied=%s discarded=%s)",
+			s.Where, strings.Join(s.Kept, ","), strings.Join(s.Dropped, ",")))
+	}
+	sort.Strings(out)
+	return out
+}
+
 func (m *Manager) noteQuarantined(name string) {
 	m.quarantinedMu.Lock()
 	if m.quarantined == nil {
@@ -583,6 +644,10 @@ func (m *Manager) buildManagedSection(fc *FullConfig) string {
 	// policy name a ghost, which is exactly when the deny is referenced and when
 	// skipping its definition would leave that reference dangling.
 	b.WriteString(m.renderEmptiedChainDeny(fc))
+	// #8363: a NARROWED chain keeps today's behaviour (the synthesized deny is
+	// only safe when the undefined members form a suffix — see the measurement
+	// in policy_chain_narrowed_eval_8363_test.go), but it is no longer silent.
+	m.warnNarrowedChains(fc)
 
 	// Resolve forwarding-table export policy for ECMP. Sets fc.ConsistentHash
 	// as a side effect when the policy uses "load-balance consistent-hash".

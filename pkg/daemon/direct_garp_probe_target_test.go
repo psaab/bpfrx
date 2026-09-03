@@ -65,7 +65,7 @@ func directProbeTestDaemon(t *testing.T, vipCIDR string) *Daemon {
 	}
 	if _, err := s.LoadSet(
 		"set chassis cluster cluster-id 1\n" +
-		"set chassis cluster authentication-key test-cluster-psk-6611\n" +
+			"set chassis cluster authentication-key test-cluster-psk-6611\n" +
 			"set interfaces reth0 redundant-ether-options redundancy-group 1\n" +
 			"set interfaces reth0 unit 0 family inet address " + vipCIDR + "\n",
 	); err != nil {

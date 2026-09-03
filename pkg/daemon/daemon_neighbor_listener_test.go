@@ -45,8 +45,8 @@ func TestProbeTierClassification(t *testing.T) {
 
 func TestUsableNUDMask(t *testing.T) {
 	cases := []struct {
-		name  string
-		state int
+		name   string
+		state  int
 		usable bool
 	}{
 		{"REACHABLE usable", netlink.NUD_REACHABLE, true},
@@ -120,9 +120,9 @@ type neighborProbeKey struct {
 	ip      string
 }
 
-func (s *stubProviderForListener) RegenerateNeighborSnapshot()  { s.regenCount++ }
-func (s *stubProviderForListener) SnapshotHasIfindex(int) bool  { return true }
-func (s *stubProviderForListener) IsMonitoredIfindex(int) bool  { return true }
+func (s *stubProviderForListener) RegenerateNeighborSnapshot() { s.regenCount++ }
+func (s *stubProviderForListener) SnapshotHasIfindex(int) bool { return true }
+func (s *stubProviderForListener) IsMonitoredIfindex(int) bool { return true }
 func (s *stubProviderForListener) LookupSnapshotNeighbor(ifindex int, ip net.IP) *userspace.NeighborSnapshot {
 	if s.entries == nil {
 		return nil

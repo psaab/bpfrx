@@ -6,13 +6,13 @@ import (
 )
 
 // TestCompileHealth_RecordFailure pins the #758 state transitions:
-// - recordCompileFailure increments the counter and captures the error
-// - recordCompileSuccess flips EverSucceeded and clears LastError, but
-//   preserves the failure count so operators can see past transience
-// - counter-factual: before recording any failure, the snapshot shows
-//   EverSucceeded=false with FailureCount=0 — /health treats this as
-//   healthy (the "never tried" case matches the "succeeded once" path
-//   rather than the "persistent failure" path).
+//   - recordCompileFailure increments the counter and captures the error
+//   - recordCompileSuccess flips EverSucceeded and clears LastError, but
+//     preserves the failure count so operators can see past transience
+//   - counter-factual: before recording any failure, the snapshot shows
+//     EverSucceeded=false with FailureCount=0 — /health treats this as
+//     healthy (the "never tried" case matches the "succeeded once" path
+//     rather than the "persistent failure" path).
 func TestCompileHealth_RecordFailure(t *testing.T) {
 	d := &Daemon{}
 
