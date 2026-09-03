@@ -61,6 +61,19 @@ func (c *xpfCollector) initNATDescriptors() {
 		"Total source NAT pool live or persistent lease reuses by the userspace dataplane.",
 		[]string{"pool", "rule"}, nil,
 	)
+	// #8447: the persistent-NAT admission PAIR. Exported together because a
+	// decline count of zero cannot be told from "this path never ran" on its
+	// own, and separating those is the entire question the counters answer.
+	c.userspaceSNATPoolPersistentAdmittedTotal = prometheus.NewDesc(
+		"xpf_userspace_source_nat_pool_persistent_admitted_total",
+		"Total persistent-NAT admissions that produced a translation in the userspace dataplane.",
+		[]string{"pool", "rule"}, nil,
+	)
+	c.userspaceSNATPoolPersistentDeclinedTotal = prometheus.NewDesc(
+		"xpf_userspace_source_nat_pool_persistent_declined_total",
+		"Total persistent-NAT admissions that returned a failure in the userspace dataplane.",
+		[]string{"pool", "rule"}, nil,
+	)
 	c.userspaceSNATPoolExhaustionsTotal = prometheus.NewDesc(
 		"xpf_userspace_source_nat_pool_exhaustions_total",
 		"Total source NAT pool allocator exhaustion events in the userspace dataplane.",

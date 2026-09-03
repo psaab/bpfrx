@@ -392,6 +392,18 @@ func (c *xpfCollector) emitUserspaceSourceNATPoolMetrics(ch chan<- prometheus.Me
 			labels...,
 		)
 		ch <- prometheus.MustNewConstMetric(
+			c.userspaceSNATPoolPersistentAdmittedTotal,
+			prometheus.CounterValue,
+			float64(pool.PersistentAdmittedTotal),
+			labels...,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			c.userspaceSNATPoolPersistentDeclinedTotal,
+			prometheus.CounterValue,
+			float64(pool.PersistentDeclinedTotal),
+			labels...,
+		)
+		ch <- prometheus.MustNewConstMetric(
 			c.userspaceSNATPoolExhaustionsTotal,
 			prometheus.CounterValue,
 			float64(pool.ExhaustionTotal),

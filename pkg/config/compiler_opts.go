@@ -2453,6 +2453,17 @@ type compileOpts struct {
 	// with its interface-range members simply not materialized.
 	lenientInterfaceRangeBudget bool
 
+	// lenientFabricMemberDefined (#8444) downgrades the chassis-cluster fabric
+	// member-interface existence gate (a typo'd `interfaces fabN fabric-options
+	// member-interfaces` entry for THIS node's slot) from a hard compile error to
+	// a cfg.Warnings entry. Strict commit / commit-check hard-reject because the
+	// typo commits clean today and leaves cc.FabricInterface empty, which silently
+	// skips every fabric bring-up — the node runs with NO fabric link. Set ONLY on
+	// the tolerant load / peer-sync paths so a config an older binary already
+	// persisted still BOOTS (#1960 no-brick); the fabric is already down in that
+	// case, so warning rather than refusing to start strictly improves it.
+	lenientFabricMemberDefined bool
+
 	// lenientLoginClassDeny (#5831) downgrades the custom-login-class
 	// restrictive-regex gate (deny-commands / deny-configuration, which xpf's
 	// coarse RBAC does not enforce) from a hard compile error to a
@@ -2668,5 +2679,6 @@ func lenientCompileOpts() compileOpts {
 		lenientInterfaceUnitRef:                true,
 		lenientLoginClassDeny:                  true,
 		lenientInterfaceRangeBudget:            true,
+		lenientFabricMemberDefined:             true,
 	}
 }

@@ -1295,6 +1295,52 @@ Deliberately NOT applied to `system login class`: #6838 already made the class
 cohort reader-independent by folding permissions across the whole same-named
 set, and a merge here would fight that design.
 
+### The duplicate-block CONSERVATION census (#8436)
+
+#8436's argument, which this implements: every duplicate-block instance so far
+(#3884, #4287, #5180, #5631/#5878, #5649, #8426, #8427, #8433) was closed by
+adding a `namedDupRules` row or a bespoke gate. **That is an opt-in pattern whose
+opt-ins were being discovered one review at a time.** A registry-row test proves
+the row exists; it cannot see the next uncovered container, and the uncovered set
+was written down nowhere.
+
+The census binds the **conservation** property instead:
+
+```
+<kw> NAME { A; }   <kw> NAME { B; }        (two hierarchical blocks)
+                  ==
+<kw> NAME { A; B; }                        (what flat-set `set` produces)
+```
+
+Flat-set merges correctly in every measured case, so the merged form is the
+reference. Where the duplicate form does not equal it, configuration the operator
+authored is silently lost.
+
+**Measured: 29 named containers checked, 25 do not conserve, of which 16 are
+SILENT** — no commit gate at all. The other 9 are rejected at commit
+(conservation by *refusal*); the census compiles **leniently** so it still sees
+the reduction, which is why a rejected container stays listed. A second, strict
+compile is what separates the two, and that column is what makes the inventory a
+candidate list rather than a wall of names.
+
+**Reachability narrows the class usefully**: none of it is reachable through
+`set` commands — only a hierarchical config file, `load merge` or
+`load override`.
+
+Two design points that decide whether the census measures anything:
+
+- **Two different leaves, not two values of one leaf.** A `multi` leaf
+  legitimately accumulates, so a single-leaf probe would measure the leaf's list
+  semantics rather than the block's reduction.
+- **A vacuity guard** drops any site where the second leaf is not observable in
+  the typed config — otherwise the two spellings agree for a reason that has
+  nothing to do with conservation.
+
+`checked = 29` is a FLOOR, not a census of the whole schema: the walk is
+depth-limited and needs a container with two simple single-value leaves. Sites it
+cannot reach are unruled, not clean — the same honesty the #2419 census applies
+to its own skip buckets.
+
 ### Duplicate containers beyond the original four (#6768)
 
 #### IKE and IPsec proposals (#8433)
@@ -1888,6 +1934,81 @@ too, the FC simply did not bind). A VALID queue still binds unchanged. Covered b
 `pkg/config/cos_fc_queue_5973_test.go` (strict reject of non-numeric/overflow
 naming the token, valid `queue 0`/`7`/`255` binds, lenient warn-and-drop leaving
 the FC inert), RED on revert of the parse-site gate.
+
+### chassis-cluster fabric `member-interfaces` name validation (#8444)
+
+A one-character typo in `interfaces fabN fabric-options member-interfaces`
+committed clean and left the node with **no fabric link at all**.
+
+`deriveFabricInterface` (`compiler_derivations.go`) auto-populates
+`cc.FabricInterface` only from a member for which `InterfaceSlot(member) >= 0`
+**and** `SlotToNodeID(slot) == cc.NodeID`. A name that does not parse to an FPC
+slot matches nothing, so `cc.FabricInterface` stays EMPTY — and every fabric
+bring-up in `pkg/daemon/daemon_run_bringup.go` is gated on it, so cross-chassis
+forwarding, session sync and config sync are all silently skipped. The operator
+sees a connectivity failure, never a config one.
+
+Measured through `configstore.CheckText` on the canonical two-fab shape from
+`docs/ha-cluster-userspace.conf`:
+
+| `fab0` member | `fab1` member | node | derived `cc.FabricInterface` |
+|---|---|---|---|
+| `ge-0/0/0` | `ge-7/0/0` | 0 | `fab0` |
+| `ge-0/0/0` | `ge-7/0/0` | 1 | `fab1` |
+| `fabster`  | `ge-7/0/0` | 0 | **`""` — outage** |
+| `ge-0-0-0` | `ge-7-0-0` | 0 | **`""` — outage** |
+| `ge-0-0-0` | `ge-7-0-0` | 1 | **`""` — outage** |
+| `ge-0/0/99` | `ge-7/0/99` | 0 | `fab0` (derives; see scope below) |
+
+Note the member LIST is populated in every row, including the outage rows — an
+assertion that `FabricMembers` is non-empty stays green straight through the
+failure. The gate and its tests bind the DERIVED interface instead.
+
+**Why this is not an existence check.** The obvious gate — require the member to
+be defined under `interfaces`, reusing `zoneReferenceableInterfaceBases` the way
+`validateZoneInterfaceDefinedStrict` does one stanza over — is **unsound here**,
+and reading the canonical config is what shows it: neither `ge-0/0/0` nor
+`ge-7/0/0` has an `interfaces` stanza in `docs/ha-cluster-userspace.conf`. Each
+appears exactly once, as the member entry itself. A fabric member is a bare
+physical NIC — unlike a zone member it carries no unit, address or family, so it
+has no reason to be declared separately. An existence gate would hard-reject the
+working production config on BOTH nodes (the #4191 over-rejection class, with a
+cluster outage attached).
+
+The property that actually separates the good name from the typo is the one the
+derivation itself consumes: **does the name parse to an FPC slot**
+(`validateFabricMemberDefinedStrict`, `compiler_validate_strict_fabric_member_8444.go`,
+dispatched from `runUniformGates` after the zone-interface-defined gate so the
+more specific zone diagnostic still wins the first-error slot).
+
+**This is also why the gate is node-agnostic.** One config text describes both
+nodes and is synced verbatim between them, so a check whose answer depended on
+which node evaluated it would accept on one node and reject on its peer,
+wedging the sync. `ge-0/0/0` and `ge-7/0/0` parse on both nodes; `fabster` and
+`ge-0-0-0` parse on neither. The gate therefore rejects the typo on either node,
+which is what an operator wants at the terminal they typed it on.
+
+Not to be confused with the `.unit`-reference validation (#5933) above: that
+gate validates the `.unit` SUFFIX of a `<if>.<unit>` reference via
+`ValidateLogicalUnit`, not whether an interface name is resolvable. Fabric
+members carry no unit suffix, so #5933 never looked at them.
+
+**Deliberately out of scope:** a member that parses but names a port that does
+not exist (`ge-0/0/99`). Measured, that one DOES derive — bring-up runs and
+fails at netlink with a visible error. It is a different, non-silent defect, and
+catching it would need exactly the existence check shown unsound above.
+
+`lenientFabricMemberDefined` downgrades the rejection to a `cfg.Warnings` entry
+on the tolerant load / peer-sync paths (#1960 no-brick — the fabric is already
+down in such a config, so refusing to boot would add an outage to an outage).
+That flag is set in `lenientCompileOpts()`, which is what `Store.Load` and
+`Store.SyncApply` reach through `compileTreeLenient`, so the no-brick behaviour
+is bound at the STORE INGRESS, not only at the validator. Covered by
+`pkg/configstore/fabric_member_8444_test.go` (strict reject of the typo and of
+the dash form on both nodes; positive control asserting a correct config still
+commits AND still derives `fab0`/`ge-0/0/0` and `fab1`/`ge-7/0/0`;
+anti-over-rejection rows for `xe-` and the absent port; lenient store-ingress
+warn). RED on revert of either the dispatch or the lenient opt.
 
 ### `interface-range` total expansion budget (#8438)
 

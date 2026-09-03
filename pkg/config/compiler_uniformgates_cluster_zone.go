@@ -258,6 +258,32 @@ func runUniformGatesClusterZone(tree *ConfigTree, cfg *Config, opts compileOpts)
 		}
 	}
 
+	// #8444 chassis-cluster FABRIC MEMBER-INTERFACE gate. Strict on commit /
+	// commit-check (hard-reject a `interfaces fabN fabric-options
+	// member-interfaces` entry naming an interface THIS node cannot resolve).
+	// A typo there commits clean today: the member list is still populated, but
+	// `compiler_derivations.go` only sets cc.FabricInterface from the member
+	// matching this node's FPC slot, so it stays EMPTY and every fabric
+	// bring-up in daemon_run_bringup.go — which is gated on it — is silently
+	// skipped. The node comes up with no fabric link at all.
+	// Lenient on load / peer-sync (warn so an already-persisted or peer-synced
+	// config still boots — #1960 no-brick; the fabric is already down in that
+	// case, so refusing to start would only add an outage to an outage).
+	// Node-scoped by construction: one config describes BOTH nodes, so the gate
+	// requires only the LOCAL member to resolve — see the doc comment on
+	// validateFabricMemberDefinedStrict for why "all members must be defined"
+	// would false-reject a correct config on whichever node ran it.
+	// Runs AFTER the zone-interface gate so the more specific zone diagnostic
+	// still wins the first-error slot when the same interface is bad in both.
+	if err := validateFabricMemberDefinedStrict(cfg); err != nil {
+		if opts.lenientFabricMemberDefined {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("fabric member interface (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #6735 zone-interface PACKED-TAIL gate. Strict on commit / commit-check
 	// (hard-reject a member statement in which `host-inbound-traffic` is
 	// followed by more tokens on the same Keys — bracket-list and packed-body

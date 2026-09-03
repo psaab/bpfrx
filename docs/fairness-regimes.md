@@ -1290,6 +1290,31 @@ the sweep exit `2`; they do not produce a false-green fairness verdict.
   NOT a fix for an observed runaway throttle. SHAPED queues
   (`transmit_rate_bytes > 0`) are byte-identical — threshold and gating
   decision unchanged.
+  #8428 adds two more NOT-APPLICABLE arms to the same brake, and unlike
+  the #2981 one these were reachable and fatal. `cos_queue_v_min_continue`
+  is gated on `shared_exact()`, and since #1598
+  `queue_uses_shared_exact_service` admits on RATE ALONE — a NON-exact
+  queue at or above `COS_SHARED_EXACT_MIN_RATE_BYTES` is routed into the
+  shared-exact flow-fair drain. But neither of the things the brake reads
+  is allocated for such a queue: `promote_cos_queue_flow_fair` builds
+  `flow_fair_state` only `if queue.config.exact` (non-exact queues
+  promote LAZILY on their second distinct flow), and
+  `build_shared_cos_queue_vtime_floors_reusing_existing` skips
+  `!queue.exact` DELIBERATELY — its own comment states the divergence:
+  "V_min coordination is an exact-only concept ... both gates keep their
+  own predicate: shared_exact-routing is broader, V_min-floor is
+  exact-only." The brake `.expect()`ed both, so an ordinary
+  high-rate uncapped class PANICKED the worker thread — the worker dies,
+  its bindings stall, and there is no auto-recovery. Both are now
+  `if let` with the same continue-unthrottled disposition as the
+  `!shared_exact()` and unshaped arms: a queue with no peer slots has
+  nothing to compare against, and one with no virtual time has nothing to
+  compare. The fix is deliberately on the CONSUMER side — allocating
+  floors for every routed queue would contradict the allocator's stated
+  design and, in its words, be "useless work". The containment
+  (floor-eligible ⇒ shared_exact-routed, never the reverse) is pinned by
+  `a_non_exact_high_rate_queue_gets_no_vtime_floor_8428` so the
+  divergence cannot be closed from the producer side unnoticed.
 - **`xpf_userspace_binding_v_min_throttle_hard_cap_overrides_total{binding_slot=..., queue_id=..., worker_id=..., iface=...}`**
   counter (#1831): V_MIN_CONSECUTIVE_SKIP_HARD_CAP escape-hatch
   activations — after that many back-to-back throttle decisions the

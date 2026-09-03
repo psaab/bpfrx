@@ -421,6 +421,15 @@ pub(crate) struct SourceNatPoolStatus {
     pub reuses_total: u64,
     #[serde(rename = "exhaustion_total", default)]
     pub exhaustion_total: u64,
+    /// #8447: persistent-NAT admissions that produced a translation. Reported
+    /// as a PAIR with the decline counter below — a zero decline count is
+    /// equally consistent with "nothing declined" and "this path never ran",
+    /// and only the admitted count separates them.
+    #[serde(rename = "persistent_admitted_total", default)]
+    pub persistent_admitted_total: u64,
+    /// #8447: persistent-NAT admissions that returned a failure instead.
+    #[serde(rename = "persistent_declined_total", default)]
+    pub persistent_declined_total: u64,
     /// #4800: acquisitions of this pool's residual `live` map mutex on the
     /// production allocate/reserve/release/rollback/GC paths, and the
     /// subset of those that found it already held. The connection-rate
