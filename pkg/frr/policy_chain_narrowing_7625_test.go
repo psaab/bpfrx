@@ -556,3 +556,70 @@ func TestAuthoredChainAgreesWithResolvedChain7625(t *testing.T) {
 		})
 	}
 }
+
+// The reserved deny name is FORGEABLE by a composed chain, which the original
+// #7625 comment denied. ReservedChainSuffix stops a policy-statement from being
+// NAMED that; it does not stop several legally named policies from JOINING into
+// it. composedChainName(["xpf","emptied","chain"]) is byte-identical to
+// emptiedChainDenyName, and FRR merges same-named route-maps — so without a
+// guard the composed chain's permits fuse into the deny and reopen the very hole
+// #7625 closed, while the chain's own filter is corrupted by the deny's sequence.
+//
+// This is the derivation, asserted directly rather than assumed, so a future
+// change to either name construction fails here instead of silently making the
+// guard unreachable.
+func TestComposedChainCanForgeTheReservedDenyName7625(t *testing.T) {
+	forged := composedChainName([]string{"xpf", "emptied", "chain"})
+	if forged != emptiedChainDenyName {
+		t.Fatalf("the collision this guard exists for is no longer derivable: "+
+			"composedChainName gives %q, reserved name is %q. If a name construction "+
+			"changed, re-derive whether the guard below is still reachable — an "+
+			"unreachable guard passes its test and protects nothing",
+			forged, emptiedChainDenyName)
+	}
+}
+
+// FAIL CLOSED. A config carrying both a chain that derives the reserved name and
+// an emptied chain that references it must be refused, not rendered.
+func TestForgedDenyNameFailsTheApplyClosed7625(t *testing.T) {
+	mk := func(n string) *config.PolicyStatement {
+		return &config.PolicyStatement{Name: n, DefaultAction: "accept",
+			Terms: []*config.PolicyTerm{{Name: "t1", PrefixList: []string{"PL"}}}}
+	}
+	po := &config.PolicyOptionsConfig{
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"xpf": mk("xpf"), "emptied": mk("emptied"), "chain": mk("chain"),
+		},
+		PrefixLists: map[string]*config.PrefixList{"PL": {Name: "PL", Prefixes: []string{"10.0.0.0/8"}}},
+		Communities: map[string]*config.CommunityDef{},
+		ASPaths:     map[string]*config.ASPathDef{},
+	}
+	fc := &FullConfig{
+		PolicyOptions: po,
+		BGP: &config.BGPConfig{
+			LocalAS: 65001, RouterID: "1.1.1.1",
+			Neighbors: []*config.BGPNeighbor{
+				{Address: "10.0.2.1", PeerAS: 65002, FamilyInet: true,
+					Import: []string{"xpf", "emptied", "chain"}},
+			},
+		},
+	}
+	err := bgpComposedChainCollision(fc)
+	if err == nil {
+		t.Fatal("a composed chain deriving the reserved emptied-chain deny name must " +
+			"fail the apply closed; FRR would merge it with the deny")
+	}
+	if !strings.Contains(err.Error(), emptiedChainDenyName) {
+		t.Errorf("the error does not name the collision: %v", err)
+	}
+
+	// NEGATIVE CONTROL: an ordinary composed chain must still render. A guard
+	// that refuses every composed chain would pass the assertion above and be
+	// indistinguishable from a correct one.
+	po.PolicyStatements["A"] = mk("A")
+	po.PolicyStatements["B"] = mk("B")
+	fc.BGP.Neighbors[0].Import = []string{"A", "B"}
+	if err := bgpComposedChainCollision(fc); err != nil {
+		t.Errorf("guard fired on an ordinary composed chain: %v", err)
+	}
+}

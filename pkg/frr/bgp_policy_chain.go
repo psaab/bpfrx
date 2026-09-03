@@ -262,6 +262,29 @@ func bgpComposedChainCollision(fc *FullConfig) error {
 				return
 			}
 			name := composedChainName(chain)
+			// #8362 follow-up: a composed name can also collide with the
+			// RESERVED emptied-chain deny (emptiedChainDenyName). The reserved
+			// ReservedChainSuffix does NOT make that name unforgeable, which the
+			// #7625 comment wrongly claimed: strict rejects a policy-statement
+			// whose name ENDS in the suffix, but nothing stops several legally
+			// named policies from JOINING into it —
+			// composedChainName(["xpf","emptied","chain"]) is byte-identical to
+			// "xpf-emptied-chain" + ReservedChainSuffix. FRR merges same-named
+			// route-maps, so the composed chain's permits would fuse into the
+			// deny and reopen the unfiltered-direction hole #7625 closed, while
+			// the composed chain's own filter is corrupted by the deny's
+			// sequence. Fail the apply CLOSED, same posture as the two
+			// collisions below.
+			if name == emptiedChainDenyName {
+				firstErr = fmt.Errorf(
+					"composed BGP policy-chain route-map %q (from chain %v) collides "+
+						"with the reserved emptied-chain deny route-map of that exact "+
+						"name; FRR merges same-named route-maps, so this would fuse "+
+						"operator permits into the deny that closes an unfiltered "+
+						"direction — refusing to render (rename a chain member, #7625)",
+					name, chain)
+				return
+			}
 			if _, ok := fc.PolicyOptions.PolicyStatements[name]; ok {
 				firstErr = fmt.Errorf(
 					"composed BGP policy-chain route-map %q (from chain %v) "+
