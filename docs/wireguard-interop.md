@@ -18,7 +18,7 @@ therefore staged by capability, not by vendor.
 | #1434 | Multi-PEER per WG interface (N peers on one listen port) | **DONE (#1434 B1a+B1b)** — Go config `TunnelConfig.WgPeers []WgPeerConfig` (named-instance `peer <pubkey>` schema + dual-AST compiler + commit gate; the commit gate also validates the tunnel's LOCAL identity — `listen-port` in `[1,65535]` and a 64-hex `private-key` — so a value the Rust `hydrate_wg_identity` would drop the WHOLE row on can never commit clean into a silent dead tunnel, #3863), wire slice `wg_peers`, Rust engine fed N peers (RX/decap already multi-peer), egress generalized: encap LPM-selects the peer by inner-dst AllowedIPs (`frame/wg.rs` + `engine.peer_for_dest`), the WG control thread keeps per-peer effective-endpoint + per-peer handshake attempt + per-peer keepalive/rekey timers (`timer_pass_for_peer`), and per-peer status rows. The LIVE multi-peer handshake / Ubiquiti interop validation is #1703. KNOWN LIMITATION: the worker-driven NoSession/rekey REQUEST edges are still engine-wide (single edge), not per-peer — the per-peer T6/T7/T8 timers ARE per-peer; per-peer request edges ride #1703. |
 | S5 | Persistent-keepalive + REKEY/REJECT-AFTER timers + endpoint roaming + empty-record (keepalive/key-confirm) handling + TAI64N disk persistence | **timers + keepalives DONE (#1888/#1889)** — full whitepaper §6.1 timer machine (REKEY_AFTER_TIME 120s initiator-only, 165s receive horizon, REJECT_AFTER_TIME 180s per-use + expiry teardown, 5s/90s retry discipline, 10s passive + configured persistent keepalives, post-msg2 key-confirmation keepalive) on a blocking-poll(2) control loop; design of record `docs/research/1888-wg-timers/plan.md`. Authenticated-datagram endpoint LEARNING shipped in S2a/#1888 (keepalives now count); engine-level roam API + TAI64N disk persistence remain pending. **#7230 correction — this row overstated keepalive learning for two years of commits.** "Keepalives now count" was true only on a SINGLE-peer interface. `try_decap` returned the zero-length keepalive as `MalformedInner`, which discarded the peer identity, and the caller recovered it with `single_peer_pubkey()` — `None` on any multi-peer tunnel. So a peer whose only traffic is keepalives (a roaming client, or one behind a NAT that rebinds) did NOT roam its endpoint and was blackholed until its next handshake: bounded at roughly 120-180s, degraded rather than an outage. The comments in that path asserted the attribution was ambiguous; it was not — `try_decap` demuxes the session from `hdr.receiver_index` BEFORE any AEAD work, so the identity was in hand at the moment the error was built and was simply thrown away with it. #7230 adds `DecapError::Keepalive(peer_pubkey)`, so keepalive endpoint learning now holds on **any** interface, multi-peer included. **#7686 closes the residue this row named.** A MALFORMED-but-authenticated inner packet had the same discard one variant over: it reached the caller without a peer and fell back to `single_peer_pubkey()`, so on a multi-peer interface it roamed nothing. `DecapError::MalformedInner` now carries the peer pubkey, from both post-AEAD construction sites (the inner-source-IP parse and the inner-length parse), which have the session in hand for the same reason the keepalive arm does. It stays an ERROR and still counts as a malformed-inner DROP — carrying the identity does not make it deliverable, and the "no TUN write" contract is unchanged. With that, `single_peer_pubkey()` had no production caller and was DELETED: it was the mechanism by which a discarded identity got guessed, and removing it means the class cannot recur through that path. Endpoint learning for authenticated datagrams now holds on any interface for both the keepalive and malformed-inner arms. #2961: the handshake attempt machine's GIVE-UP branch (`drive_attempt_machine`, after the 90s `REKEY_ATTEMPT_TIME` window) now advances the T8 pacing anchor (`note_t8_attempt(now)`), so a permanently-unreachable persistent-keepalive peer waits a full keepalive interval before the next `KeepaliveNoSession` initiation instead of re-firing a fresh 90s window every ~1s tick — the gap between failed-handshake windows is now ≥ keepalive_interval (matching wireguard-go, which stops re-initiating after `REKEY_ATTEMPT_TIME` until a new send/keepalive is due). A peer that comes back to life re-anchors T8 on fresh authenticated traffic (`anchor = max(last_send_any, last_recv_any, t8_last_attempt)`), so the cooldown is a floor, not a penalty on the live/successful path. #4546: REJECT_AFTER_TIME is now honored CONSISTENTLY across all four session-liveness sites — `try_encap`'s T3 encrypt gate, `expire_sessions`' ~1s GC teardown, `peer_has_usable_session` (keepalive emission), AND `peer_has_confirmed_session` (the NoSession-edge rekey gate the control loop consults). Previously the last was age-blind: a confirmed session aged past 180s but not yet GC'd still reported `confirmed`, so the `wg_control::drive_attempt_machine` NoSession-edge rekey was SKIPPED until the next GC tick — a bounded ~0-1s rekey blackhole at the expiry boundary. The gate now reads the same mock-aware `now_ns()` clock and returns false for an expired session so the rekey fires promptly; `session_confirmed` in the per-peer status row (`coordinator/status.rs`) inherits the same non-stale semantics |
 | S6 | Junos config surface (grammar + compiler + snapshot population, base64↔hex keys) | pending |
-| S7 | Type-3 CookieReply + MAC2 generation/verification + IPv6 outer encap + DSCP/ECN | **DSCP/ECN encap DONE (#2303)** — inner DSCP+ECN copied onto the outer header (uniform DSCP + RFC 6040 ECN ingress copy). RFC 6040 §4.2 decap-side ECN *combine* shipped for GRE (#2315) AND WG (#2317) — WG captures the outer ECN via `recvmsg` + `IP_RECVTOS`/`IPV6_RECVTCLASS` cmsg and folds it into the decrypted inner via the shared `apply_decap_ecn_combine` (live ECN-propagation verification lab-deferred to #1703-class interop). **RESPONDER CookieReply + MAC2 under-load DoS mitigation DONE (#4094 PR-A)** — a per-tunnel rotating secret `Rm` (120 s, one-window previous-secret carry), an inbound-initiation fixed-window load gate, and MAC2 verification bind an initiation to the source that received the responder's type-3 CookieReply, so a valid-MAC1 flood (attacker knows our public key) no longer forces a Noise handshake per forged datagram. See "Responder cookie / MAC2 under-load DoS mitigation" below. **INITIATOR-side CookieReply *consume* DONE (#4094 PR-B)** — an inbound type-3 is decrypted (responder pubkey-derived key + our last-sent MAC1 as AAD), the cookie stored per-peer, and our NEXT initiation carries a real MAC2 (honoring the 120 s cookie TTL), so xpf-as-initiator now completes a handshake against a peer that is itself under load. IPv6 outer encap still pending |
+| S7 | Type-3 CookieReply + MAC2 generation/verification + IPv6 outer encap + DSCP/ECN | **DSCP/ECN encap DONE (#2303 transit, #7758 host-originated)** — inner DSCP+ECN copied onto the outer header (uniform DSCP + RFC 6040 ECN ingress copy). This row read simply "DONE (#2303)" until #7758 and was half true: #2303 wired the TRANSIT encap path only, and the host-originated path (inner read from the wgN TUN) still sent an unmarked outer, so the outer DSCP depended on which of the two WG encap paths a packet took. RFC 6040 §4.2 decap-side ECN *combine* shipped for GRE (#2315) AND WG (#2317) — WG captures the outer ECN via `recvmsg` + `IP_RECVTOS`/`IPV6_RECVTCLASS` cmsg and folds it into the decrypted inner via the shared `apply_decap_ecn_combine` (live ECN-propagation verification lab-deferred to #1703-class interop). **RESPONDER CookieReply + MAC2 under-load DoS mitigation DONE (#4094 PR-A)** — a per-tunnel rotating secret `Rm` (120 s, one-window previous-secret carry), an inbound-initiation fixed-window load gate, and MAC2 verification bind an initiation to the source that received the responder's type-3 CookieReply, so a valid-MAC1 flood (attacker knows our public key) no longer forces a Noise handshake per forged datagram. See "Responder cookie / MAC2 under-load DoS mitigation" below. **INITIATOR-side CookieReply *consume* DONE (#4094 PR-B)** — an inbound type-3 is decrypted (responder pubkey-derived key + our last-sent MAC1 as AAD), the cookie stored per-peer, and our NEXT initiation carries a real MAC2 (honoring the 120 s cookie TTL), so xpf-as-initiator now completes a handshake against a peer that is itself under load. IPv6 outer encap still pending |
 | S8 | HA RG WG-session migration | pending |
 
 ## Config shape: interface-level tunnel with per-unit peers (#7786)
@@ -559,15 +559,41 @@ the route at the tunnel-manager layer, so a non-1500 underlay relies on
 either the operator `mtu` statement or the Rust egress guard as the
 authoritative backstop.
 
-### DSCP/ECN propagation (#2303 encap, #2315 GRE decap)
+### DSCP/ECN propagation (#2303 encap, #2315 GRE decap, #7758 WG host encap)
 
-**Encap (#2303).** GRE and WG encap copy the inner packet's full TOS /
-IPv6 Traffic-Class byte (DSCP 6 bits + ECN 2 bits) onto the outer header
-via `gre::inner_tos_byte`, instead of hardcoding 0. This is the uniform
-DSCP model (RFC 2983) — per-hop QoS classification survives the tunnel —
-plus the RFC 6040 normal-mode ECN ingress COPY (inner ECN → outer ECN).
-`wg::dscp::tos_from_dscp` (which clears ECN) is retained for the
-DSCP-only case but is NOT the encap reader.
+**Encap (#2303, completed for WG in #7758).** GRE and WG encap copy the
+inner packet's full TOS / IPv6 Traffic-Class byte (DSCP 6 bits + ECN 2
+bits) onto the outer header via `gre::inner_tos_byte`, instead of
+hardcoding 0. This is the uniform DSCP model (RFC 2983) — per-hop QoS
+classification survives the tunnel — plus the RFC 6040 normal-mode ECN
+ingress COPY (inner ECN → outer ECN). `wg::dscp::tos_from_dscp` (which
+clears ECN) is retained for the DSCP-only case but is NOT the encap
+reader.
+
+**WireGuard has TWO encap paths, and until #7758 only one copied.**
+#2303 wired the TRANSIT path (`frame/wg.rs`, inner arriving on AF_XDP).
+The HOST-ORIGINATED path (`wg_control::encap_and_send`, inner read from
+the wgN TUN) ended at a bare `send_to` with no per-datagram control
+message, so its outer DS byte stayed 0. The same inner marking therefore
+produced a different outer DSCP depending on which path a packet took —
+an internal routing detail no operator can see, while a downstream
+classifier sees WG traffic marked or unmarked accordingly. #7758 gives
+the host path the same copy, through `sendmsg` with `IP_TOS` /
+`IPV6_TCLASS` ancillary data because the value is per-packet.
+
+The cmsg level follows the destination's WIRE family, not the socket
+family: a v4-mapped destination on the dual-stack AF_INET6 socket emits
+an IPv4 datagram and takes `IP_TOS`, mirroring the receive side where
+`IP_RECVTOS` governs both native v4 and v4-mapped delivery. The
+loopback round-trip test asserts the DS byte as RECEIVED rather than
+trusting that mapping.
+
+Sends that carry NO inner packet — handshake initiation, handshake
+response, cookie reply, keepalive — are deliberately exempt and go out
+unmarked: there is no inner DS byte to propagate, and a keepalive
+inheriting some other packet's DSCP is exactly what a per-datagram cmsg
+exists to prevent. `wg_send_to` takes the TOS as an explicit
+`Option<u8>` so a new send site has to decide rather than inherit.
 
 **Decap (#2315 GRE / #2317 WG).** The RFC 6040 §4.2 decap-side ECN
 *combine* (outer ECN → inner ECN) — the half that actually reflects a CE
