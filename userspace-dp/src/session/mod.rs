@@ -49,6 +49,7 @@ type SeededReverseTranslatedIndex = HashMap<SessionKey, NatIndexBucket, FxSeeded
 // reply_matches_forward_session) live in session/key.rs. Re-exporting
 // at pub(crate) keeps the existing crate::session::* surface intact.
 pub(crate) mod pptp;
+pub(crate) mod pptp_control;
 mod discriminator;
 mod key;
 // #7188: `WireDiscriminator` is exported alongside the class enum because the

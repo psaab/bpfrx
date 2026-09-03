@@ -8266,3 +8266,97 @@ fn worker_commands_install_and_forget_pptp_associations_7699() {
     );
     assert_eq!(sessions.pptp().resolve(a, 0x1111), None);
 }
+
+/// #7699 stage 2 END-TO-END: control-channel BYTES through to an association a
+/// data packet resolves against.
+///
+/// # What this binds, and what it does NOT
+///
+/// Every other PPTP cell tests one hop: the parser cells build a segment and
+/// assert a parse, the table cells install a `PptpCall` and assert a resolve,
+/// the drain cell pushes a `WorkerCommand` and asserts it lands. This one
+/// composes parse -> broadcast -> drain -> resolve starting from the wire
+/// BYTES, so it binds both ends together and the shape of their composition:
+/// the call ids must be attributed to the right peers, survive the broadcast,
+/// and resolve in BOTH directions to one handle. Breaking the parser reds this
+/// cell along with two unit cells; swapping `src`/`dst` in
+/// `learn_from_control_segment` reds this one and the attribution cell.
+///
+/// **It does NOT bind production wiring, because there is none yet.** Nothing
+/// in the running dataplane calls `learn_from_control_segment` or
+/// `broadcast_pptp_install` — the packet-path dispatch that recognises a
+/// TCP/1723 segment and routes it to this parser off the hot path is stage 2's
+/// remaining half, tracked in #7699's body. This cell chains the two at the
+/// TEST level, which is a hand-chained pair, and a hand-chained pair cannot
+/// notice that production never chains them.
+///
+/// That is stated rather than left implicit because the earlier version of this
+/// comment claimed the opposite — it named "delete the call from the publish
+/// path" as the falsifying mutation, and there is no publish path to delete it
+/// from. The claim was unfalsifiable, which is worse than silence: it would be
+/// believed exactly as long as nobody tried it. Written, ironically, in the act
+/// of citing #7685 and #8392 as the two-correct-halves-and-no-join cases —
+/// knowing the failure mode by name did not prevent writing an instance of it.
+/// When the dispatch lands, the production join needs its own cell.
+#[test]
+fn a_control_segment_becomes_a_resolvable_association_7699() {
+    use crate::session::pptp_control::{
+        fixtures_7699::outgoing_call_reply, learn_from_control_segment,
+    };
+
+    // The PAC answers the PNS's Outgoing-Call-Request. Its own Call ID is
+    // 0xAAAA; it echoes the PNS's 0xBBBB.
+    let (pac, pns): (std::net::IpAddr, std::net::IpAddr) = (
+        "198.51.100.7".parse().unwrap(),
+        "203.0.113.9".parse().unwrap(),
+    );
+    let segment = outgoing_call_reply(0xAAAA, 0xBBBB, 1);
+
+    // 1. the control channel, off the data path
+    let call = learn_from_control_segment(pac, pns, &segment)
+        .expect("a connected Outgoing-Call-Reply must yield the pair");
+    let handle = call.handle();
+
+    // 2. published to every worker
+    let queues: Vec<_> = (0..2)
+        .map(|_| Arc::new(Mutex::new(VecDeque::new())))
+        .collect();
+    assert_eq!(
+        crate::afxdp::worker_queue::broadcast_pptp_install(&queues, call),
+        2,
+        "the association must reach every worker; the control channel and the \
+         GRE data channel are not co-located"
+    );
+
+    // 3. drained by a worker
+    let mut sessions = SessionTable::new();
+    let forwarding = test_forwarding_state();
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+    apply_worker_commands(
+        &queues[1],
+        &mut sessions,
+        -1,
+        -1,
+        -1,
+        &forwarding,
+        &BTreeMap::new(),
+        &dynamic_neighbors,
+        0,
+        &mut VecDeque::new(),
+    );
+
+    // 4. and a data packet in EITHER direction resolves to one handle.
+    //    A packet to the PAC carries the PAC's call id; to the PNS, the PNS's.
+    assert_eq!(
+        sessions.pptp().resolve(pac, 0xAAAA),
+        Some(handle),
+        "a data packet toward the PAC must resolve the call learned from the \
+         control channel"
+    );
+    assert_eq!(
+        sessions.pptp().resolve(pns, 0xBBBB),
+        Some(handle),
+        "and the reverse direction must resolve to the SAME handle — that is \
+         what makes the reverse companion match and the reply find its session"
+    );
+}
