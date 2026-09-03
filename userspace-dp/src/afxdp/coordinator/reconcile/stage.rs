@@ -236,12 +236,6 @@ mod tests {
     use super::*;
     use crate::afxdp::types::BindingSetupPhase;
 
-    /// #6245: the explicit-failure renderer is deterministic and never blank —
-    /// empty input yields a "no explicit cause" marker, and populated input
-    /// renders `phase:slot=<n>:<reason>` per failure joined by "; " in the
-    /// caller-supplied (slot-sorted) order. Fail-on-revert: drop the phase or
-    /// reason from the render and these assertions fail.
-    #[test]
     /// #7497: the coordinate capture copies every field from the plan's status.
     ///
     /// This is what the renderer cell below CANNOT check. That one builds a
@@ -315,6 +309,12 @@ mod tests {
         }
     }
 
+    /// #6245: the explicit-failure renderer is deterministic and never blank —
+    /// empty input yields a "no explicit cause" marker, and populated input
+    /// renders `phase:slot=<n>:<reason>` per failure joined by "; " in the
+    /// caller-supplied (slot-sorted) order. Fail-on-revert: drop the phase or
+    /// reason from the render and these assertions fail.
+    #[test]
     fn render_binding_setup_failures_is_deterministic() {
         assert_eq!(
             render_binding_setup_failures(&[]),
