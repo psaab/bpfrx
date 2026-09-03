@@ -928,6 +928,19 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 			nil,
 			nil,
 		),
+		// #8447: source-NAT rule-match outcome quartet.
+		userspaceSourceNATMatchConsulted: prometheus.NewDesc(
+			"xpf_userspace_source_nat_match_consulted_total", "consulted", nil, nil,
+		),
+		userspaceSourceNATMatchMatched: prometheus.NewDesc(
+			"xpf_userspace_source_nat_match_matched_total", "matched", nil, nil,
+		),
+		userspaceSourceNATMatchUnavailable: prometheus.NewDesc(
+			"xpf_userspace_source_nat_match_unavailable_total", "unavailable", nil, nil,
+		),
+		userspaceSourceNATMatchNoMatch: prometheus.NewDesc(
+			"xpf_userspace_source_nat_match_no_match_total", "no match", nil, nil,
+		),
 		userspaceNatReverseKeyCollisions: prometheus.NewDesc(
 			"xpf_userspace_session_nat_reverse_key_collisions_total",
 			"nat reverse-key collisions",
@@ -1232,8 +1245,13 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 		),
 	}
 	status := dpuserspace.ProcessStatus{
-		SessionTableEntries: 77,
-		MaxSessions:         100,
+		// #8447: distinct values so a swapped emission fails rather than passing.
+		SourceNATMatchConsultedTotal:   41,
+		SourceNATMatchMatchedTotal:     23,
+		SourceNATMatchUnavailableTotal: 5,
+		SourceNATMatchNoMatchTotal:     13,
+		SessionTableEntries:            77,
+		MaxSessions:                    100,
 		// #1789: publish-error counter emitted unconditionally.
 		SessionPublishErrorsTotal: 6,
 		// #4800: publish + replication contention surface. Seven values,
@@ -1411,10 +1429,19 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	// that one means the import was published with a degraded reservation,
 	// this one means it was not published at all while still being answered
 	// to Go as installed.
-	if len(got) != 54 {
-		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 54 metrics, got %d", len(got))
+	// +4 for the #8447 source-NAT rule-match quartet.
+	if len(got) != 58 {
+		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 58 metrics, got %d", len(got))
 	}
 
+	// #8447: DISTINCT values, so a collector that emitted one of the quartet
+	// into another's series fails here rather than passing on equal fixtures.
+	// That matters most for `consulted`, whose whole job is being readable
+	// beside a zero in the other three.
+	assertCounterClose(t, got, c.userspaceSourceNATMatchConsulted, nil, 41)
+	assertCounterClose(t, got, c.userspaceSourceNATMatchMatched, nil, 23)
+	assertCounterClose(t, got, c.userspaceSourceNATMatchUnavailable, nil, 5)
+	assertCounterClose(t, got, c.userspaceSourceNATMatchNoMatch, nil, 13)
 	assertGaugeClose(t, got, c.userspaceSessionTableEntries, nil, 77)
 	assertGaugeClose(t, got, c.userspaceSessionTableCapacity, nil, 100)
 	// #1760: collision counter emitted unconditionally (0 with no

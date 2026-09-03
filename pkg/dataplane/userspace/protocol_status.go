@@ -250,8 +250,18 @@ type ProcessStatus struct {
 	// them. Normally 0; non-zero means a ring was retired with writes it could
 	// not prove terminal, and their buffers were deliberately not freed rather
 	// than risk the kernel writing into a freed allocation.
-	IoUringRetainedBuffersTotal uint64 `json:"io_uring_retained_buffers_total,omitempty"`
-	IoUringRetainedBytesTotal   uint64 `json:"io_uring_retained_bytes_total,omitempty"`
+	// #8447: source-NAT rule-match outcomes. Consulted counts every packet that
+	// REACHED the match path, including ones that matched nothing — it is what
+	// makes a zero in the other three readable, because without it "nothing
+	// matched" and "nothing arrived" are the same number. Zero from an older
+	// helper that predates the counters; JSON tags MUST match the Rust serde
+	// names.
+	SourceNATMatchConsultedTotal   uint64 `json:"source_nat_match_consulted_total,omitempty"`
+	SourceNATMatchMatchedTotal     uint64 `json:"source_nat_match_matched_total,omitempty"`
+	SourceNATMatchUnavailableTotal uint64 `json:"source_nat_match_unavailable_total,omitempty"`
+	SourceNATMatchNoMatchTotal     uint64 `json:"source_nat_match_no_match_total,omitempty"`
+	IoUringRetainedBuffersTotal    uint64 `json:"io_uring_retained_buffers_total,omitempty"`
+	IoUringRetainedBytesTotal      uint64 `json:"io_uring_retained_bytes_total,omitempty"`
 	// #2375: MissingNeighbor packets for a NEW distinct (egress_ifindex,
 	// next_hop) refused because pending_neigh is at MAX_PENDING_NEIGH
 	// distinct hops (distinct-hop neighbor exhaustion — the
