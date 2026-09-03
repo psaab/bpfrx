@@ -924,9 +924,23 @@ the NAT module applies it:
   forwarding, and record recent-exception reasons such as
   `source_nat_pool_missing`, `source_nat_pool_empty`,
   `source_nat_pool_invalid_port_range`, and `source_nat_pool_exhausted`.
-  **A LOCAL PAT allocation that lands on an identity another pool's occupancy
-  bitmap already holds is rolled back and refused (#6979 F6,
-  `source_nat_pool_peer_address_overlap`).** Two source-NAT pools whose
+  **A LOCAL allocation that lands on a wire identity another pool already owns
+  is rolled back and refused (#6979 F6 + #8115 R1,
+  `source_nat_pool_peer_address_overlap`).** The allocator issues TWO ownership
+  tokens and the check asks about both: the per-address occupancy BITMAP for a
+  port-translating (PAT) allocation, and the `address_only_owners`
+  reverse-identity entry a `port no-translation` / port-less flow claims
+  INSTEAD of a bit. #6979 F6 wired only the bitmap, which left the address-only
+  route open in both directions — a peer preserving `X:P` toward a remote did
+  not stop a PAT mint of `X:P` toward it, and two address-only flows in
+  different pools collided whenever protocol and remote matched. The two
+  sub-questions differ in precision, deliberately: the bitmap is
+  REMOTE-AGNOSTIC (it means "this allocator may publish `X:P`"), so refusing on
+  it can decline a flow whose remote differs, which for a PAT mint costs one
+  port rotation; the address-only key carries `dst_ip`/`dst_port`, so a match
+  there is an exact duplicate of the wire 5-tuple and over-rejects nothing. All
+  three address-only mint arms — v4 round-robin/persistent, v6, and
+  deterministic-v4 — carry the check, each bound by its own cell. Two source-NAT pools whose
   addresses overlap are two independent occupancy bitmaps — the allocator key
   carries the pool NAME — so each is blind to the other's live translations and
   both would publish one `(pool address, port)` for two live flows. One
