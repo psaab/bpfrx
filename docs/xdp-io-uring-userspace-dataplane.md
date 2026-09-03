@@ -345,15 +345,25 @@ Rules:
 - each worker owns one queue index per participating interface
 - a worker never touches another worker's AF_XDP rings in the fast path
 - each flow must map to the same worker on ingress and on the standby node
-- queue ownership must be configured from the smallest queue count across the active
-  dataplane interfaces in a forwarding group
+- queue ownership is configured per interface: each active dataplane interface
+  contributes its own `min(rx_queues, 16)` queues (#7497). It was previously
+  derived from the SMALLEST queue count across the group, which left every
+  queue above that minimum unbound on an asymmetric box — and an unbound queue
+  drops the transit traffic RSS steers to it rather than idling
 
 Example:
 
-- if LAN has 8 queues and WAN has 4 queues, the userspace fast path should use 4
-  worker shards unless there is an explicit remapping layer
-- the remaining LAN queues should either be disabled for AF_XDP or remain on the
-  existing dataplane
+- if LAN has 8 queues and WAN has 4 queues, the plan binds **12** rows: all 8
+  LAN queues and all 4 WAN queues. Worker shards are `min(workers, 8)` — the
+  widest interface sets the queue-id range, and `worker_id = queue_id %
+  workers` maps the rows onto them
+- no LAN queue is left out. Before #7497 this example bound 4 queues per
+  interface and the remaining 4 LAN queues were unbound — which is not the same
+  as disabled: an unbound queue that RSS still steers to drops every transit
+  packet it receives (`drop_degraded_transit` on `BINDING_MISSING`), while the
+  interface reads up and the loss appears in no counter
+- a queue is only genuinely out of the fast path if RSS is also kept off it;
+  the binding plan and the RSS indirection table have to agree
 
 This is stricter than "one worker per core", but it avoids hidden cross-queue
 forwarding costs.

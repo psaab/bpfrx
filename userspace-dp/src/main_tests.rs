@@ -1378,7 +1378,7 @@ fn queue_planner_keeps_queue_zero_available_for_userspace() {
 }
 
 #[test]
-fn queue_planner_uses_smallest_queue_count() {
+fn queue_planner_binds_each_interfaces_own_queue_count_7497() {
     let snapshot = ConfigSnapshot {
         interfaces: vec![
             InterfaceSnapshot {
@@ -1399,14 +1399,31 @@ fn queue_planner_uses_smallest_queue_count() {
         ..Default::default()
     };
     let bindings = replan_queues(Some(&snapshot), 2, &[], true);
-    assert_eq!(bindings.len(), 4);
+    // #7497: 4 + 2 = 6, not min(4,2) x 2 = 4. Under the old global-minimum rule
+    // ge-0-0-1's queues 2 and 3 were left UNBOUND, and an unbound queue is not
+    // idle — the shim takes `drop_degraded_transit` on BINDING_MISSING, so every
+    // transit packet RSS steered there was dropped.
+    assert_eq!(
+        bindings.len(),
+        6,
+        "each interface must contribute its own queue count (4 + 2), not the \
+         global minimum applied to both (2 x 2)"
+    );
     let queues = summarize_queues(&bindings);
-    assert_eq!(queues.len(), 2);
+    assert_eq!(queues.len(), 4, "the widest interface sets the queue-id range");
+    // The plan is RAGGED: rows 0-1 carry both interfaces, rows 2-3 carry only
+    // the 4-queue one. Asserting the ragged shape rather than just the count is
+    // what distinguishes per-interface planning from "bind 6 things".
     for (idx, q) in queues.iter().enumerate() {
         assert_eq!(q.queue_id, idx as u32);
-        assert_eq!(
-            q.interfaces,
+        let want = if idx < 2 {
             vec!["ge-0-0-1".to_string(), "ge-0-0-2".to_string()]
+        } else {
+            vec!["ge-0-0-1".to_string()]
+        };
+        assert_eq!(
+            q.interfaces, want,
+            "queue {idx} membership: only interfaces that HAVE queue {idx}"
         );
         assert!(!q.registered);
     }
@@ -4352,48 +4369,133 @@ fn synced_session_rejects_unresolved_ipv6_ext_protocol_6923() {
 // This is the ONLY bound. A cap on the raw `--workers` value would be wrong, and
 // the third case below is the control that proves it.
 #[test]
-fn replan_refuses_worker_ids_beyond_the_nat_holder_mask_6211_f2() {
-    let queues = crate::nat::MAX_NAT_HOLDER_WORKERS as usize + 1;
-    let bindings = replan_bindings_from_candidates(
-        queues,
+fn no_plan_can_mint_a_worker_id_beyond_the_nat_holder_mask_6211_f2() {
+    use std::collections::BTreeSet;
+    // #7497 changed which LAYER enforces this. The two cells this replaces drove
+    // 128- and 129-queue candidate lists through the planner to reach the
+    // runtime refusal directly. That is no longer possible: every candidate is
+    // capped at BINDING_QUEUES_PER_IFACE on the way in, so the minted queue-id
+    // range is 0..=15 and `worker_id = queue_id % workers` cannot reach 128 by
+    // any candidate list. Their fixtures could not be repaired — the gate is
+    // unreachable from the entry point — so they became this: the PROPERTY they
+    // protected, asserted over the inputs that are now expressible.
+    //
+    // Read the coverage honestly. This asserts an invariant with THREE
+    // enforcers, so no single mutation reds it:
+    //   1. by construction, upstream — the stride cap (this is what makes the
+    //      runtime check unreachable today);
+    //   2. at the point of use — `allocator.rs:2278` returns 0 for
+    //      `worker_id >= MAX_NAT_HOLDER_WORKERS`, so a wide id sets no holder
+    //      bit even if one were minted;
+    //   3. the planner's own #6211 refusal, which becomes load-bearing again
+    //      the moment anyone raises the stride.
+    // The mask WIDTH itself is pinned to the constant by a compile-time assert
+    // (`allocator.rs:217`, `u128::BITS == MAX_NAT_HOLDER_WORKERS`).
+    //
+    // An editor removing layer 1 or 3 will NOT see this go red. That is a
+    // property of the design, not an oversight, and it is written down here so
+    // the next reader does not mistake a green run for single-layer coverage.
+    for workers in [1usize, 2, 15, 16, 17, 127, 128, 129, 200] {
+        for rx in [1usize, 2, 15, 16, 17, 128, 129, 200] {
+            let mut cands = Vec::new();
+            let mut ifidx = BTreeMap::new();
+            for i in 0..3usize {
+                let n = format!("ge-0-0-{i}");
+                ifidx.insert(n.clone(), (i + 2) as i32);
+                cands.push((n, rx));
+            }
+            let plan = replan_bindings_from_candidates(workers, &[], cands, ifidx, true);
+            for b in &plan {
+                assert!(
+                    b.worker_id < crate::nat::MAX_NAT_HOLDER_WORKERS,
+                    "workers={workers} rx={rx} minted worker_id={} — at or beyond \
+                     the {}-bit NAT holder mask, whose bit would silently not \
+                     exist (#6211 F2)",
+                    b.worker_id,
+                    crate::nat::MAX_NAT_HOLDER_WORKERS
+                );
+            }
+            // Non-vacuity: an empty plan satisfies the assertion above for free,
+            // and after #7497 every input here is expected to PLAN. If a future
+            // change starts refusing these, the loop above stops testing
+            // anything and this is what says so.
+            assert!(
+                !plan.is_empty(),
+                "workers={workers} rx={rx} produced an EMPTY plan; the worker-id \
+                 assertion above is then vacuous"
+            );
+            let ids: BTreeSet<u32> = plan.iter().map(|b| b.worker_id).collect();
+            assert_eq!(
+                ids.len(),
+                workers.min(rx.min(BINDING_QUEUES_PER_IFACE)),
+                "workers={workers} rx={rx}: distinct worker ids must be \
+                 min(workers, capped queues)"
+            );
+        }
+    }
+}
+
+/// #7497: each interface contributes `min(rx, BINDING_QUEUES_PER_IFACE)` rows.
+///
+/// This is the cell that actually binds the cap: deleting the `.min(...)` makes
+/// a 200-queue NIC plan 200 rows and this goes red immediately. The invariant
+/// test above cannot do that job, because the #6211 refusal absorbs an
+/// over-cap plan by returning nothing.
+#[test]
+fn per_interface_queue_count_is_capped_at_the_stride_7497() {
+    let plan = replan_bindings_from_candidates(
+        4,
         &[],
-        vec![("ge-0-0-1".to_string(), queues)],
+        vec![("ge-0-0-1".to_string(), 200)],
         BTreeMap::from([("ge-0-0-1".to_string(), 11)]),
         true,
     );
-    assert!(
-        bindings.is_empty(),
-        "#6211 F2: {queues} queues x {queues} workers mints worker_id {} — wider \
-         than the {}-bit NAT holder mask — so the plan must be REFUSED, not \
-         planned with a worker whose holder bit silently does not exist",
-        queues - 1,
-        crate::nat::MAX_NAT_HOLDER_WORKERS
+    assert_eq!(
+        plan.len(),
+        BINDING_QUEUES_PER_IFACE,
+        "a 200-queue NIC must contribute exactly BINDING_QUEUES_PER_IFACE rows"
+    );
+    let max_q = plan.iter().map(|b| b.queue_id).max().unwrap();
+    assert_eq!(
+        max_q as usize,
+        BINDING_QUEUES_PER_IFACE - 1,
+        "the highest minted queue id must be the last addressable one; a queue \
+         id at the stride would alias the adjacent ifindex's queue-0 row (#4894)"
     );
 }
 
-// #6211 F2 boundary control: the widest id the mask CAN represent is accepted.
-// Without this, "refuse everything" would satisfy the cell above.
+/// #7497 blocker 3 regression: the operator's worker knob still caps the number
+/// of worker groups, which is the number of spawned worker threads —
+/// `plan_workers` keys its `BTreeMap<u32, Vec<BindingPlan>>` by `worker_id` and
+/// spawns one worker per key.
+///
+/// Measured before this change went in: `distinct_worker_ids == min(workers,
+/// queues)` across the matrix, with `workers 1` giving exactly one group at
+/// every queue count. Nothing else in the suite would notice if that stopped
+/// holding, and the field symptom is a CPU graph nobody attributes to a config
+/// knob.
 #[test]
-fn replan_accepts_the_widest_representable_worker_id_6211_f2() {
-    let queues = crate::nat::MAX_NAT_HOLDER_WORKERS as usize;
-    let bindings = replan_bindings_from_candidates(
-        queues,
-        &[],
-        vec![("ge-0-0-1".to_string(), queues)],
-        BTreeMap::from([("ge-0-0-1".to_string(), 11)]),
-        true,
-    );
-    assert_eq!(
-        bindings.len(),
-        queues,
-        "worker ids 0..{} all fit the holder mask and must be planned",
-        queues - 1
-    );
-    assert_eq!(
-        bindings.iter().map(|b| b.worker_id).max(),
-        Some(crate::nat::MAX_NAT_HOLDER_WORKERS - 1),
-        "the boundary id itself is representable"
-    );
+fn worker_knob_still_caps_worker_groups_7497() {
+    use std::collections::BTreeSet;
+    for workers in [1usize, 2, 3, 6, 8, 64] {
+        for rx in [1usize, 2, 6, 16] {
+            let mut cands = Vec::new();
+            let mut ifidx = BTreeMap::new();
+            for i in 0..2usize {
+                let n = format!("ge-0-0-{i}");
+                ifidx.insert(n.clone(), (i + 2) as i32);
+                cands.push((n, rx));
+            }
+            let plan = replan_bindings_from_candidates(workers, &[], cands, ifidx, true);
+            let ids: BTreeSet<u32> = plan.iter().map(|b| b.worker_id).collect();
+            assert_eq!(
+                ids.len(),
+                workers.min(rx),
+                "workers={workers} rx={rx}: worker groups must be \
+                 min(workers, queues) — the knob must still bind"
+            );
+        }
+    }
 }
 
 // #6211 F2 FALSE-REFUSAL control — the reason the check lives at the MINT site
@@ -5597,6 +5699,23 @@ fn shim_and_helper_agree_on_binding_slot_capacity_7497() {
          MAX_BINDING_SLOTS disagree; the planner would cap against a capacity \
          the heartbeat/XSK maps do not have (#7497)"
     );
+    // Same rule for the stride. #7497 gave the planner its own
+    // BINDING_QUEUES_PER_IFACE so it can cap each interface's queue count, which
+    // made a SECOND literal of a fact the shim already owns. Asserted as an
+    // agreement, not pinned to 16 on either side, so it reds whichever one moves.
+    //
+    // Drift here is not cosmetic: if the shim strides by 32 while the planner
+    // caps at 16 the plan silently loses half of every interface's queues, and
+    // if the planner caps HIGHER than the shim's stride it mints queue ids that
+    // resolve into the adjacent ifindex's row — the aliasing class #4894 and
+    // #5173 exist to prevent.
+    assert_eq!(
+        shim_binding_index::BINDING_QUEUES_PER_IFACE as usize,
+        crate::server::helpers::BINDING_QUEUES_PER_IFACE,
+        "userspace-xdp BINDING_QUEUES_PER_IFACE and userspace-dp \
+         BINDING_QUEUES_PER_IFACE disagree; the planner would cap each \
+         interface's queue count against a stride the shim does not use (#7497)"
+    );
 }
 
 /// The capacity of the slot-keyed maps is NOT the capacity of the binding array,
@@ -5701,5 +5820,97 @@ fn every_minted_slot_is_addressable_7497() {
                 MAX_BINDING_SLOTS
             );
         }
+    }
+}
+
+/// #7497 blocker 6: prior state follows the binding's IDENTITY
+/// (`interface`, `queue_id`), not its slot.
+///
+/// Slot is a position in the minted sequence. Change one interface's queue
+/// count and the sequence reshuffles: `[A(rx=4), B(rx=2)]` mints slot 5 as
+/// `(A,q3)`, and after B grows to 4 queues slot 5 is `(B,q2)`. Carrying
+/// `registered`/`armed`/`ready`/counters across that reshuffle attaches one
+/// interface's state to a different interface's queue, and a later
+/// `binding slot 5 unregister` retargets whichever row now holds the slot.
+///
+/// The fixture is the issue's own example, and it is chosen so the two keyings
+/// DISAGREE: with slot-keyed carry-forward at least one row inherits another
+/// row's tag, so the assertion below fails. A fixture where the queue counts
+/// did not change would be satisfied by either keying.
+#[test]
+fn carry_forward_follows_binding_identity_not_slot_7497() {
+    // A unique, decodable tag per (interface, queue) so a misattribution names
+    // both the row that received it and the row it belonged to.
+    fn tag(iface: &str, queue: u32) -> u64 {
+        let iface_code = iface.bytes().last().unwrap_or(b'?') as u64;
+        iface_code * 1000 + queue as u64 + 1
+    }
+
+    let ifidx = BTreeMap::from([
+        ("ge-0-0-1".to_string(), 11),
+        ("ge-0-0-2".to_string(), 12),
+    ]);
+
+    // Generation 1: A has 4 queues, B has 2.
+    let mut gen1 = replan_bindings_from_candidates(
+        4,
+        &[],
+        vec![("ge-0-0-1".to_string(), 4), ("ge-0-0-2".to_string(), 2)],
+        ifidx.clone(),
+        true,
+    );
+    assert_eq!(gen1.len(), 6, "4 + 2 rows");
+    for b in gen1.iter_mut() {
+        b.rx_packets = tag(&b.interface, b.queue_id);
+    }
+    // The reshuffle the issue names: slot 5 belongs to (A,q3) here.
+    let slot5_before = gen1
+        .iter()
+        .find(|b| b.slot == 5)
+        .map(|b| (b.interface.clone(), b.queue_id))
+        .expect("slot 5 exists in generation 1");
+    assert_eq!(
+        slot5_before,
+        ("ge-0-0-1".to_string(), 3),
+        "fixture precondition: slot 5 is (A,q3) before B grows"
+    );
+
+    // Generation 2: B grows to 4 queues (`ethtool -L ge-0-0-2 combined 4`).
+    let gen2 = replan_bindings_from_candidates(
+        4,
+        &gen1,
+        vec![("ge-0-0-1".to_string(), 4), ("ge-0-0-2".to_string(), 4)],
+        ifidx,
+        true,
+    );
+    assert_eq!(gen2.len(), 8, "4 + 4 rows after B grows");
+
+    // The reshuffle actually happened — otherwise the two keyings agree and this
+    // test proves nothing.
+    let slot5_after = gen2
+        .iter()
+        .find(|b| b.slot == 5)
+        .map(|b| (b.interface.clone(), b.queue_id))
+        .expect("slot 5 exists in generation 2");
+    assert_ne!(
+        slot5_before, slot5_after,
+        "fixture is inert: slot 5 addresses the same (interface, queue) in both \
+         generations, so slot-keyed and identity-keyed carry-forward agree"
+    );
+
+    for b in &gen2 {
+        let had_predecessor = (b.interface == "ge-0-0-1" && b.queue_id < 4)
+            || (b.interface == "ge-0-0-2" && b.queue_id < 2);
+        let want = if had_predecessor {
+            tag(&b.interface, b.queue_id)
+        } else {
+            0
+        };
+        assert_eq!(
+            b.rx_packets, want,
+            "slot {} ({} q{}) carried tag {} but its identity's tag is {}; state \
+             was carried by SLOT and landed on the wrong (interface, queue)",
+            b.slot, b.interface, b.queue_id, b.rx_packets, want
+        );
     }
 }
