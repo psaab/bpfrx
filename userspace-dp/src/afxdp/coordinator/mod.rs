@@ -3,6 +3,7 @@ mod bpf_maps;
 mod cos_leases;
 mod cos_state;
 mod ha_state;
+mod idle_lease_sync_8121;
 mod inject;
 mod neighbor_manager;
 mod reconcile;
@@ -16,6 +17,7 @@ mod tunnel_supervision;
 mod wg_control;
 mod worker_manager;
 pub(crate) use bpf_maps::BpfMaps;
+pub(crate) use idle_lease_sync_8121::PoolIdleLease;
 // #3789: the full-`reconcile` abort outcome, so `server/helpers.rs`
 // (`reconcile_status_bindings`) and the control-socket handler can name
 // the fallible return type.

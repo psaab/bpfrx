@@ -24,6 +24,7 @@ mod binding;
 mod export;
 mod forwarding;
 mod ha;
+mod idle_leases;
 mod inject_packet;
 mod neighbors;
 mod queue;
@@ -93,6 +94,7 @@ pub(crate) fn handle_stream(
         error: String::new(),
         status: None,
         session_deltas: Vec::new(),
+        idle_leases: Vec::new(),
     };
     let mut persist_state = false;
     // Capture suppress_status before the match — bool is Copy so this
@@ -260,6 +262,12 @@ pub(crate) fn handle_stream(
                 &mut persist_state,
             ),
             "sync_session" => sync_session::handle(&mut guard, request.session_sync, &mut response),
+            // #8121 part 2: the idle persistent-NAT lease channel. Both verbs
+            // take the clock from the coordinator, never from the request.
+            "export_idle_leases" => idle_leases::export(&mut guard, &mut response),
+            "import_idle_leases" => {
+                idle_leases::import(&mut guard, &request.idle_leases, &mut response)
+            }
             "drain_session_deltas" => session_deltas::drain(
                 &mut guard,
                 request.session_deltas.as_ref(),

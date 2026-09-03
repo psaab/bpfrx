@@ -176,6 +176,36 @@ const (
 	MaxInjectPacketLength = 4096
 )
 
+// IdleLeaseWire is one idle persistent-NAT lease crossing the helper control
+// socket and, in the same shape, the cluster sync channel (#8121).
+//
+// Three fields are deliberately NOT what the helper holds internally, and each
+// for the same reason — the internal form is node-local and means something
+// different on the peer:
+//
+//   - RemainingNs is a LIFETIME, not a deadline. The helper's expires_at_ns is
+//     CLOCK_MONOTONIC and boot-relative, so a node up ten days would read a
+//     value from a node up one hour as long expired.
+//   - TranslatedIP is an address, not a pool index. An index means the same
+//     address only while both sides agree on the pool ordering.
+//   - Pool is a name, not a rule index, for that same reason one level up.
+//
+// Go never interprets these beyond carrying them; the meanings live in the
+// helper (userspace-dp nat/idle_lease_sync_8121.rs).
+type IdleLeaseWire struct {
+	Pool           string `json:"pool"`
+	Protocol       uint8  `json:"protocol"`
+	SrcIP          string `json:"src_ip"`
+	SrcPort        uint16 `json:"src_port"`
+	RemoteIP       string `json:"remote_ip,omitempty"`
+	RemotePort     uint16 `json:"remote_port,omitempty"`
+	TranslatedIP   string `json:"translated_ip"`
+	TranslatedPort uint16 `json:"translated_port"`
+	AddressOnly    bool   `json:"address_only,omitempty"`
+	RemainingNs    uint64 `json:"remaining_ns"`
+	TimeoutNs      uint64 `json:"timeout_ns"`
+}
+
 type ControlRequest struct {
 	Type           string                    `json:"type"`
 	SuppressStatus bool                      `json:"suppress_status,omitempty"`
@@ -188,6 +218,11 @@ type ControlRequest struct {
 	SessionSync    *SessionSyncRequest       `json:"session_sync,omitempty"`
 	SessionDeltas  *SessionDeltaDrainRequest `json:"session_deltas,omitempty"`
 	SessionExport  *SessionExportRequest     `json:"session_export,omitempty"`
+	// IdleLeases carries idle persistent-NAT leases for the import_idle_leases
+	// verb (#8121). omitempty so every other request is byte-identical to
+	// before — the control socket is shared with the 1/s status poll and with
+	// session installs, and an empty array on every request is waste there.
+	IdleLeases []IdleLeaseWire `json:"idle_leases,omitempty"`
 	// Neighbors carries the manager-neighbor set for an update_neighbors
 	// request. It deliberately does NOT use omitempty (#5864): when the
 	// authoritative publishable set transitions to EMPTY, the send path
@@ -212,6 +247,8 @@ type ControlResponse struct {
 	Error         string             `json:"error,omitempty"`
 	Status        *ProcessStatus     `json:"status,omitempty"`
 	SessionDeltas []SessionDeltaInfo `json:"session_deltas,omitempty"`
+	// IdleLeases is the export_idle_leases result (#8121).
+	IdleLeases []IdleLeaseWire `json:"idle_leases,omitempty"`
 }
 
 type ConfigSnapshot struct {
