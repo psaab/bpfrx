@@ -314,6 +314,16 @@ impl BindingLiveState {
         // consumer — the owner worker — which is also the sole caller
         // of `take_pending_tx_into`. Enforced by convention (see the doc
         // comment on `pending_tx` in `BindingLiveState`).
+        //
+        // #7750 row 05: this is the ONE boundary in the inbox where that
+        // obligation is discharged inside a SAFE signature. `pop` is an
+        // `unsafe fn`, so every other caller is forced to acknowledge the
+        // contract; here it is absorbed, and a second caller on a
+        // non-owner thread would be UB with no `unsafe` at the call site.
+        // Production callers today are exactly the two owner-worker drains
+        // in `afxdp::tx::drain` (`take_pending_tx_requests` and the #709
+        // owner/peer split). BEFORE ADDING A THIRD, establish that it runs
+        // on the binding's owner worker.
         while let Some(req) = unsafe { self.pending_tx.pop() } {
             self.release_pending_tx_admission();
             out.push_back(req);

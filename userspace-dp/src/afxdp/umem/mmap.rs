@@ -134,6 +134,20 @@ impl MmapArea {
     /// Returns a `&mut [u8]` view into the UMEM region from a
     /// shared `&self` reference.
     ///
+    /// ## What `_unchecked` does and does NOT mean here
+    ///
+    /// It refers to ALIASING ONLY. The range itself IS checked: `offset +
+    /// len` is computed with `checked_add` (so it cannot wrap) and is
+    /// rejected when it exceeds `self.len`, returning `None` — every call
+    /// site therefore already handles an out-of-range request. There is no
+    /// bounds hole here and no "bounds-checked variant" to add; #7750 row 07
+    /// proposed one on the strength of the name, which is why this paragraph
+    /// exists.
+    ///
+    /// What is genuinely unchecked is the exclusivity of the returned `&mut`,
+    /// which is produced from a shared `&self` and so cannot be enforced by
+    /// the borrow checker. That is the caller's obligation, below.
+    ///
     /// # Safety
     ///
     /// The caller must guarantee that no other borrow (mutable or
