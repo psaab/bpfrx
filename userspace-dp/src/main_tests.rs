@@ -5699,6 +5699,23 @@ fn shim_and_helper_agree_on_binding_slot_capacity_7497() {
          MAX_BINDING_SLOTS disagree; the planner would cap against a capacity \
          the heartbeat/XSK maps do not have (#7497)"
     );
+    // Same rule for the stride. #7497 gave the planner its own
+    // BINDING_QUEUES_PER_IFACE so it can cap each interface's queue count, which
+    // made a SECOND literal of a fact the shim already owns. Asserted as an
+    // agreement, not pinned to 16 on either side, so it reds whichever one moves.
+    //
+    // Drift here is not cosmetic: if the shim strides by 32 while the planner
+    // caps at 16 the plan silently loses half of every interface's queues, and
+    // if the planner caps HIGHER than the shim's stride it mints queue ids that
+    // resolve into the adjacent ifindex's row — the aliasing class #4894 and
+    // #5173 exist to prevent.
+    assert_eq!(
+        shim_binding_index::BINDING_QUEUES_PER_IFACE as usize,
+        crate::server::helpers::BINDING_QUEUES_PER_IFACE,
+        "userspace-xdp BINDING_QUEUES_PER_IFACE and userspace-dp \
+         BINDING_QUEUES_PER_IFACE disagree; the planner would cap each \
+         interface's queue count against a stride the shim does not use (#7497)"
+    );
 }
 
 /// The capacity of the slot-keyed maps is NOT the capacity of the binding array,
