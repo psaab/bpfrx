@@ -31,6 +31,24 @@ PRIMARY="xpf-userspace-fw0"
 SECONDARY="xpf-userspace-fw1"
 SOURCE="cluster-userspace-host"
 TARGET_V4="172.16.80.200"
+# #8259: the mouse and elephant targets are SEPARATE knobs that happen to
+# default to the same address, because on the standing loss cluster there is
+# only one host on VLAN 80 to point them at.
+#
+# They used to be one variable, and that is the whole defect: the gate ratios a
+# loaded cell against an idle cell, and when both flows terminate on one host
+# the loaded cell adds ~8.6 Gbit/s of receive load to the very machine whose
+# service time is inside every mouse sample. The verdict then attributes that
+# difference entirely to firewall queueing. `mouse_latency_aggregate.decide()`
+# now refuses to emit PASS/FAIL when these two are equal.
+#
+# Splitting them here is what makes that check meaningful rather than
+# permanently true: stand up a second host on VLAN 80, set
+# ELEPHANT_TARGET_V4 to it, and the gate starts producing attributable numbers
+# with no further change. See target-services.sh on why there is no second host
+# today (the current one is external lab hardware with no management path).
+MOUSE_TARGET_V4="${MOUSE_TARGET_V4:-$TARGET_V4}"
+ELEPHANT_TARGET_V4="${ELEPHANT_TARGET_V4:-$TARGET_V4}"
 # Env-var overridable so test-mouse-latency-same-class.sh can run a
 # same-class variant by selecting the matching 520x elephant port and
 # 620x TCP echo port. The canonical CoS fixture maps 6200..6211 to the
@@ -186,6 +204,7 @@ write_invalid_manifest() {
     INVALID_REASON="$reason" STARTED_AT="$started_at" \
     N="$N" M="$M" DURATION="$DURATION" \
     ELEPHANT_PORT="$ELEPHANT_PORT" MOUSE_PORT="$MOUSE_PORT" \
+    MOUSE_TARGET_V4="$MOUSE_TARGET_V4" ELEPHANT_TARGET_V4="$ELEPHANT_TARGET_V4" \
     MOUSE_CLASS="$MOUSE_CLASS" MOUSE_COS_SURPLUS_SHARING="$MOUSE_COS_SURPLUS_SHARING" \
     MOUSE_PROBE_CONNECTION_MODE="$MOUSE_PROBE_CONNECTION_MODE" \
     MOUSE_PROBE_MIN_INTERVAL_MS="$MOUSE_PROBE_MIN_INTERVAL_MS" \
@@ -210,6 +229,9 @@ manifest = {
     "invalid_reason": os.environ["INVALID_REASON"],
     "elephant_port": int(os.environ["ELEPHANT_PORT"]),
     "mouse_port": int(os.environ["MOUSE_PORT"]),
+    # #8259: the gate cannot attribute its verdict when these are equal.
+    "mouse_target": os.environ["MOUSE_TARGET_V4"],
+    "elephant_target": os.environ["ELEPHANT_TARGET_V4"],
     "mouse_class": os.environ["MOUSE_CLASS"],
     "cos_surplus_sharing": os.environ["MOUSE_COS_SURPLUS_SHARING"] == "1",
     "mouse_probe_connection_mode": os.environ["MOUSE_PROBE_CONNECTION_MODE"],
@@ -292,9 +314,9 @@ incus_run file push "${SCRIPT_DIR}/mouse_latency_probe.py" \
 # Uses bash /dev/tcp rather than `nc -zw1` because the source
 # container doesn't ship netcat by default.
 if ! incus_exec "$SOURCE" timeout 2 bash -c \
-        "exec 3<>/dev/tcp/${TARGET_V4}/${MOUSE_PORT}" \
+        "exec 3<>/dev/tcp/${MOUSE_TARGET_V4}/${MOUSE_PORT}" \
         > /dev/null 2>&1; then
-    echo "ABORT: mouse echo not reachable on ${TARGET_V4}:${MOUSE_PORT}" >&2
+    echo "ABORT: mouse echo not reachable on ${MOUSE_TARGET_V4}:${MOUSE_PORT}" >&2
     echo "       (set MOUSE_PORT or stand up the echo daemon)" >&2
     exit 1
 fi
@@ -391,7 +413,7 @@ IPERF_DURATION=$((SETTLE_BUDGET + DURATION + SLACK))
 
 if [[ "$N" -gt 0 ]]; then
     incus_exec "$SOURCE" sh -c \
-        "$(mouse_elephant_start_cmd "$REP_TAG" "$TARGET_V4" "$ELEPHANT_PORT" \
+        "$(mouse_elephant_start_cmd "$REP_TAG" "$ELEPHANT_TARGET_V4" "$ELEPHANT_PORT" \
                                     "$N" "$IPERF_DURATION")" \
         < /dev/null > /dev/null 2>&1 &
     IPERF_PID=$!
@@ -455,7 +477,7 @@ MPSTAT_PID=$!
 
 # ---- step 6: probe driver (M coroutines, closed-loop)
 incus_exec "$SOURCE" python3 /tmp/mouse_latency_probe.py \
-    --target "$TARGET_V4" --port "$MOUSE_PORT" \
+    --target "$MOUSE_TARGET_V4" --port "$MOUSE_PORT" \
     --concurrency "$M" --duration "$DURATION" \
     --payload-bytes 64 --connection-mode "$MOUSE_PROBE_CONNECTION_MODE" \
     --min-interval-ms "$MOUSE_PROBE_MIN_INTERVAL_MS" \
@@ -643,6 +665,7 @@ N="$N" M="$M" DURATION="$DURATION" STARTED_AT="$STARTED_AT" \
 SCREEN_ENGAGED="$screen_engaged" HA_TRANSITION_SEEN="$ha_seen" \
 MPSTAT_AVG_BUSY="${mpstat_busy:-0}" \
 ELEPHANT_PORT="$ELEPHANT_PORT" MOUSE_PORT="$MOUSE_PORT" \
+MOUSE_TARGET_V4="$MOUSE_TARGET_V4" ELEPHANT_TARGET_V4="$ELEPHANT_TARGET_V4" \
 MOUSE_CLASS="$MOUSE_CLASS" MOUSE_COS_SURPLUS_SHARING="$MOUSE_COS_SURPLUS_SHARING" \
 MOUSE_PROBE_CONNECTION_MODE="$MOUSE_PROBE_CONNECTION_MODE" \
 MOUSE_PROBE_MIN_INTERVAL_MS="$MOUSE_PROBE_MIN_INTERVAL_MS" \
@@ -667,6 +690,9 @@ manifest = {
     "mpstat_avg_busy": os.environ["MPSTAT_AVG_BUSY"],
     "elephant_port": int(os.environ["ELEPHANT_PORT"]),
     "mouse_port": int(os.environ["MOUSE_PORT"]),
+    # #8259: the gate cannot attribute its verdict when these are equal.
+    "mouse_target": os.environ["MOUSE_TARGET_V4"],
+    "elephant_target": os.environ["ELEPHANT_TARGET_V4"],
     "mouse_class": os.environ["MOUSE_CLASS"],
     "cos_surplus_sharing": os.environ["MOUSE_COS_SURPLUS_SHARING"] == "1",
     "mouse_probe_connection_mode": os.environ["MOUSE_PROBE_CONNECTION_MODE"],
