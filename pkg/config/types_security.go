@@ -857,6 +857,19 @@ type NATRule struct {
 	// payloads. Unexported it stays inside the compiler, where the only thing
 	// that reads it lives.
 	thenAuthored natThenAuthored
+	// matchAuthored records that the rule AUTHORED a `match` container, as
+	// opposed to omitting it entirely (#8430). The two are different
+	// intentions and the compiled NATMatch cannot tell them apart: a
+	// scope-only rule (`from zone trust; to zone untrust;` with no `match`)
+	// deliberately translates everything in that scope and is a common,
+	// legitimate shape, while `match { }` or `match { source-address; }` is an
+	// operator who meant to constrain and whose constraint evaporated.
+	//
+	// UNEXPORTED for the same reason thenAuthored is: it is compile-time
+	// diagnostic state read only by validateNATRuleMatchConstrainedStrict, it
+	// is not part of the dataplane contract, and exported it would join the
+	// typed Config's JSON and travel in config-sync payloads.
+	matchAuthored bool
 }
 
 // NATMatch defines what traffic a NAT rule matches.
