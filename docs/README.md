@@ -85,6 +85,8 @@ docs.
   discipline, hot-path rules, review severity.
 - [`testing-procedures.md`](testing-procedures.md) /
   [`testing.md`](testing.md) — test categories and procedures.
+- [`firewall-validation-harness-design.md`](firewall-validation-harness-design.md)
+  — comprehensive dataplane firewall test & failure injection harness design.
 - [`phases.md`](phases.md) — development phase history.
 - [`bugs.md`](bugs.md) — bug tracker with root-cause analysis.
 

@@ -80,7 +80,7 @@ DECLARED_HA_SMOKES=(
 	test-restart-connectivity
 	test-private-rg
 )
-DECLARED_OTHER_SUMMARY_GATES=(test-connectivity)
+DECLARED_OTHER_SUMMARY_GATES=(test-connectivity test-wire-properties)
 
 summary_echo_of() {
 	grep -oE 'echo "[^"]*passed, [^"]*failed[^"]*"' "$1" 2>/dev/null | head -1
