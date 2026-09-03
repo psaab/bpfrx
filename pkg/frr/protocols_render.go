@@ -623,17 +623,33 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 		if isis.NET != "" {
 			fmt.Fprintf(&b, " net %s\n", isis.NET)
 		}
-		level := isis.Level
-		if level == "" {
-			level = "level-2"
+		// #8446: canonicalize through the SHARED predicate the commit gate
+		// uses (config.CanonicalISISLevel) rather than switching on the raw
+		// stored string. This switch previously had no `default` arm, so a
+		// value outside the three it named emitted NO is-type line and FRR
+		// silently fell back to its own default, level-1-2 — WIDENING the
+		// router's adjacency scope. `level-2-only` (the spelling emitted
+		// three lines below) hit that path, so feeding our own output back
+		// in turned a Level-2-only router into a Level-1-2 one.
+		//
+		// The strict commit gate rejects a non-canonical value, but the
+		// tolerant Load / peer-sync paths only warn (#1960 no-brick), so the
+		// renderer keeps its own belt: an unrecognized value renders the
+		// SAFE default rather than nothing. Narrower than authored is a
+		// recoverable misconfiguration; wider than authored is a silent
+		// security regression. Same shape as the #6686 as-path belt.
+		level, ok := config.CanonicalISISLevel(isis.Level)
+		if !ok {
+			level = config.DefaultISISLevel
 		}
 		switch level {
 		case "level-1":
 			b.WriteString(" is-type level-1\n")
-		case "level-2":
-			b.WriteString(" is-type level-2-only\n")
 		case "level-1-2":
 			b.WriteString(" is-type level-1-2\n")
+		default:
+			// level-2 and every unrecognized value: the narrow default.
+			b.WriteString(" is-type level-2-only\n")
 		}
 		for _, export := range isis.Export {
 			b.WriteString(m.resolveRedistribute(export, policyOptions, "isis", bgpAcceptDefault))

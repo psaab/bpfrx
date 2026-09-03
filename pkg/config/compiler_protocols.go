@@ -797,13 +797,23 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 				if len(child.Keys) >= 2 {
 					proto.ISIS.NET = child.Keys[1]
 				}
-			case "level":
+			// #8446: `level` and `is-type` are two spellings of ONE
+			// concept and both land on ISISConfig.Level, so authoring
+			// both is last-write-wins. Store the CANONICAL form so
+			// every consumer sees one spelling — `level-2-only` (what
+			// the FRR renderer emits, and therefore what an operator
+			// copying our own output writes) collapses onto `level-2`.
+			// A value no spelling matches is kept verbatim rather than
+			// dropped: the strict commit gate rejects it, and on the
+			// tolerant Load / peer-sync path the renderer's own belt
+			// turns it into the narrow default (#1960 no-brick).
+			case "level", "is-type":
 				if len(child.Keys) >= 2 {
-					proto.ISIS.Level = child.Keys[1]
-				}
-			case "is-type":
-				if len(child.Keys) >= 2 {
-					proto.ISIS.Level = child.Keys[1]
+					if c, ok := CanonicalISISLevel(child.Keys[1]); ok {
+						proto.ISIS.Level = c
+					} else {
+						proto.ISIS.Level = child.Keys[1]
+					}
 				}
 			case "export":
 				// Multi-value leaf (#2587): accumulate ALL policies across

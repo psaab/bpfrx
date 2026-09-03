@@ -376,6 +376,82 @@ Putting `gre` first makes the dropped value and the fallback identical, so a rea
 divergence reads as EQUIVALENT and the #2419 inventory entry looks stale. A
 fixture must never use the value the bug falls back to.
 
+### `protocols isis level` / `is-type` — the enum mirrors what the RENDERER can express (#8446)
+
+Both leaves spell one concept and both compile into `ISISConfig.Level`. Neither
+carried a validator, and the FRR renderer switched on the stored string with **no
+`default` arm** — so a value outside the three cases emitted **no `is-type` line
+at all** and FRR applied its own default, `level-1-2`. The router formed Level-1
+adjacencies it had been configured to exclude, with no diagnostic anywhere.
+
+Neither half is a defect alone. An untyped leaf whose consumer has a safe default
+merely stores junk; a switch with no `default` is fine if nothing outside its
+cases can reach it. **The composition is what widened the adjacency scope**, which
+is why reading either file on its own reads as correct.
+
+The sharpest input was self-inflicted: `is-type level-2-only` is the exact string
+the renderer *emits* into `frr.conf`, so an operator copying our own output back
+into the config turned a Level-2-only router into a Level-1-2 one. And because an
+unset leaf rendered `level-2-only`, **configuring the level explicitly was less
+restrictive than not configuring it**.
+
+`pkg/config/isis_level.go` is the single canonicalizer both sides bind to —
+`CanonicalISISLevel`, `ValidateISISLevel`, `DefaultISISLevel` — the pattern #6686
+established for as-path regexes (same predicate, one definition, so the gate and
+the renderer cannot drift).
+
+Accepted: `level-1`, `level-2`, `level-1-2`, and `level-2-only` as a **synonym**
+for `level-2`. The synonym is deliberate: rejecting the spelling our own renderer
+produces would be a surprising failure mode, and it is the spelling an operator is
+most likely to copy. The compiler stores the canonical form, so every consumer
+sees one spelling.
+
+**Both schema copies.** `schemaProtocols` and `schemaRoutingInstances` each carry
+an `isis` subtree. `TestISISLevelTypedInRoutingInstanceCopyToo_8446` exists because
+stripping the validator from the routing-instance copy alone is otherwise a
+SURVIVING mutation — measured, not assumed — and it leads with a positive control
+so a rejection means the validator fired rather than the stanza being unreachable.
+
+**#1960 no-brick.** The validator runs only on the strict path. On the tolerant
+`Store.Load` / `SyncApply` path the compiler keeps an unrecognised value verbatim
+rather than dropping it, and the **renderer keeps its own belt**: an unrecognised
+value renders the NARROW default instead of nothing. Narrower than authored is a
+recoverable misconfiguration; wider than authored is a silent security regression,
+so the belt is aimed in that direction on purpose.
+`TestDefaultISISLevelIsNarrow_8446` fails if `DefaultISISLevel` is ever changed to
+`level-1-2`, which would turn the belt back into the bug.
+
+**Its #2419 census verdict is unchanged, and it was already DIVERGENT.**
+`protocols isis level` and `is-type` are rows 139-140 of
+`testdata/compact_block_divergences_2419.txt`. They were already probed before
+this change — `ValueAny` is the zero `valueType`, so an untyped leaf still gets
+the generic `xpfaaa`/`xpfbbb` pair from `synthPair` rather than being skipped —
+and the census counts are identical either side of it (553 checked / 335
+divergent / 11 unsynthesizable). So typing the leaves neither introduced nor
+resolved a divergence; measured, not assumed.
+
+What that divergence IS, is worth knowing before anyone treats the row as a
+value-drop: in the compact hierarchical spelling `protocols isis level level-1;`
+the **entire `isis` stanza vanishes** (`cfg.Protocols.ISIS == nil`), where the
+block spelling yields `Level="level-1"`. Not a dropped value — a dropped
+subsystem. Flat-set `set protocols isis level level-1` is a different path and is
+unaffected.
+
+The `valueExamples` are `ISISLevelSpellings()`, sorted, so the census probes with
+`level-1` and `level-1-2`. Neither is `level-2`, the constructor default this
+site would fall back to if the divergence were ever narrowed to a value-drop — a
+fixture must never use the value the bug falls back to.
+
+**Not fixed here:** authoring *both* `level` and `is-type` with different values
+is still last-write-wins. With the leaves typed, both values are now canonical, so
+the residual is a surprising precedence rather than a silent widening — but it can
+still widen (`level level-1; is-type level-1-2;` yields `level-1-2`) and wants a
+conflict diagnostic. Making it an error needs a `compileOpts` lenient flag, since
+`compileProtocols` errors are NOT blanket-downgraded on the tolerant path.
+
+The per-interface `isis interface <if> level` leaf is a different concept and a
+different defect — accepted, stored, and never rendered at all (#8450).
+
 ## Strict commit-time validators → `pkg/config/compiler_validate_strict_*.go`
 
 The typed per-leaf `SchemaValidate` walk (4) cannot express cross-field or
