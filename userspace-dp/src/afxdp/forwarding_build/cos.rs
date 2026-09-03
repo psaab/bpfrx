@@ -636,8 +636,21 @@ pub(super) fn build_cos_classifier_tables(
     // #2410: a forwarding-class queue id outside 0..=255 fails the snapshot
     // CLOSED. The pre-fix `filter_map` SILENTLY DROPPED the class, so every
     // classifier / scheduler-map entry referencing it lost its queue mapping
-    // (a silent fail-open at the second trust boundary). An EMPTY class name
-    // is the legitimate placeholder case and is still skipped, not an error.
+    // (a silent fail-open at the second trust boundary).
+    //
+    // An EMPTY class name is skipped rather than rejected. #8442 corrected what
+    // that skip MEANS: it used to say "the legitimate placeholder case", which
+    // was wrong in a way that cost a whole commit. The Go emitter KEPT an empty
+    // class — in `forwarding_classes` and in the scheduler-map entries — while
+    // this loop dropped it, so the entry's `class_to_queue` lookup missed and
+    // `build_cos_iface_config` refused the ENTIRE snapshot. An empty name was
+    // never a placeholder; it was a Go/Rust set disagreement, and both sides
+    // looked reasonable alone.
+    //
+    // The commit gate (`ValidateForwardingClassName`, pkg/config) now rejects an
+    // empty forwarding-class identity at every slot that names one, so this skip
+    // is once again what it claims to be: unreachable from an operator config,
+    // retained only for a drifted or handcrafted snapshot.
     let mut class_to_queue: FastMap<String, u8> = FastMap::default();
     for class in &cos.forwarding_classes {
         if class.name.is_empty() {

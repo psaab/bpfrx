@@ -27,6 +27,8 @@ xpf_enter_destructive_cluster_cell "pnat-catchall-outage-check-8341 $*" "$0" "$@
 source "${SCRIPT_DIR}/cluster-env.sh"
 # shellcheck source=test/incus/deploy-lib.sh
 source "${SCRIPT_DIR}/deploy-lib.sh"
+# shellcheck source=test/incus/cos-apply-lib.sh
+source "${SCRIPT_DIR}/cos-apply-lib.sh"
 
 LAN_CLIENT="${LAN_CLIENT:-$CLUSTER_LAN_HOST}"
 TARGET="${TARGET:-$IPERF_TARGET4}"
@@ -132,7 +134,9 @@ commit
 exit
 quit
 EOF
-grep -q "commit complete" /tmp/pnat8341o.out || {
+# #6440: marker gate, not exit status — the piped CLI is a REPL that prints
+# "error: ..." and still exits 0.
+cos_require_markers "pool apply on $PRIMARY" /tmp/pnat8341o.out "$COS_MARKER_COMMIT" || {
 	echo "FATAL: the pool config did not commit; not reporting an outage from a config never applied" >&2
 	sed -n '1,30p' /tmp/pnat8341o.out >&2; exit 2; }
 
