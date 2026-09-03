@@ -283,6 +283,17 @@ pub(super) fn build_live_forward_request_from_frame(
     let tx_selection_wire_key =
         tx_selection_flow.map(|flow| forward_wire_key(&flow.forward_key, decision.nat));
     let ingress_flow_key = tx_selection_flow.map(|flow| &flow.forward_key);
+    // #7656: the FLOWLESS arm has no wire key to read the egress family from, so
+    // every downstream read fell back to the ingress `meta` — and under NAT64
+    // the packet changes family in flight. Synthesize the post-NAT L3 tuple from
+    // `meta` + this packet's NAT decision (which does NOT depend on there being a
+    // flow) so the output filter is selected AND matched on what actually leaves
+    // the box. `None` for a flow-bearing packet, which already has the wire key.
+    let flowless_wire_flow = if tx_selection_flow.is_none() {
+        l3_wire_session_flow_from_meta(meta, decision.nat)
+    } else {
+        None
+    };
     let cos = precomputed_tx_selection
         .map(|selection| CoSTxSelection {
             queue_id: selection.queue_id,
@@ -312,6 +323,7 @@ pub(super) fn build_live_forward_request_from_frame(
                 // TX-selection / CoS leg, not every packet of the flow.
                 crate::afxdp::frame::term_match_extra_from_frame(frame, meta),
                 now_ns,
+                flowless_wire_flow.as_ref().map(|f| &f.forward_key),
             )
         });
     // #7176 (C179-001): the reject-reply + filter-log side effects of a
@@ -329,6 +341,7 @@ pub(super) fn build_live_forward_request_from_frame(
             egress_ifindex: decision.resolution.egress_ifindex,
             fabric_ingress_zone,
             now_ns,
+            flowless_wire_flow,
         },
         frame,
         tx_selection_flow,
@@ -387,6 +400,42 @@ pub(super) fn build_live_forward_request_from_frame(
 ///
 /// Returns whether a reject reply was actually enqueued, which the filter-log
 /// event reports as the truthful action.
+/// #7656: the flowless POST-NAT L3 flow.
+///
+/// A flowless packet (non-first fragment / non-query ICMP) has no
+/// `tx_selection_flow`, so every downstream consumer fell back to reading the
+/// INGRESS `meta` — its family, its addresses and its protocol. Under NAT64 the
+/// packet CHANGES family in flight, so those three are the pre-translation
+/// values for a packet that leaves the box as IPv4: the egress output filter was
+/// selected from the wrong family, matched against the wrong addresses, and the
+/// filter-log event recorded the wrong tuple.
+///
+/// This rebuilds the L3-only flow from `meta` and then puts it through the SAME
+/// `forward_wire_key` the flow-bearing path uses, so family, addresses and
+/// protocol (including the NAT64 `ICMPV6`<->`ICMP` swap) move together BY
+/// CONSTRUCTION. That is the property that makes this the right shape: the
+/// alternative — patching each of the four pre-NAT reads independently — is
+/// correct only while four edits stay in agreement, and a partial version of it
+/// selects the right filter family and then evaluates it against the wrong
+/// addresses, which no address-less test fixture can see.
+///
+/// Returns `None` exactly where `l3_session_flow_from_meta` does (unparsed or
+/// unspecified addresses), so a non-NAT flowless packet is unaffected:
+/// `forward_wire_key` leaves family and protocol alone when `nat.nat64` is
+/// false and rewrites addresses only where the decision set one.
+pub(super) fn l3_wire_session_flow_from_meta(
+    meta: UserspaceDpMeta,
+    nat: NatDecision,
+) -> Option<SessionFlow> {
+    let pre = crate::afxdp::frame::l3_session_flow_from_meta(meta)?;
+    let key = forward_wire_key(&pre.forward_key, nat);
+    Some(SessionFlow {
+        src_ip: key.src_ip,
+        dst_ip: key.dst_ip,
+        forward_key: key,
+    })
+}
+
 pub(super) struct CoSDropSideEffects<'a> {
     pub(super) forwarding: &'a ForwardingState,
     pub(super) meta: UserspaceDpMeta,
@@ -394,6 +443,14 @@ pub(super) struct CoSDropSideEffects<'a> {
     pub(super) egress_ifindex: i32,
     pub(super) fabric_ingress_zone: Option<u16>,
     pub(super) now_ns: u64,
+    /// #7656: the POST-NAT L3 flow for a FLOWLESS packet, or `None` when the
+    /// packet has a `tx_selection_flow` (which already carries the post-NAT wire
+    /// tuple) or when no L3 flow could be rebuilt. Used to attribute the
+    /// filter-log event to the tuple that actually left the box: without it a
+    /// NAT64 fragment logs its pre-translation IPv6 addresses for a packet that
+    /// egressed as IPv4 — a WRONG record rather than a missing one, which is
+    /// worse for anyone reading logs to reconstruct a flow.
+    pub(super) flowless_wire_flow: Option<SessionFlow>,
 }
 
 pub(super) fn apply_cos_drop_side_effects(
@@ -445,7 +502,12 @@ pub(super) fn apply_cos_drop_side_effects(
     // reject reply above stays gated on `tx_selection_flow`, so a flowless deny
     // remains a silent drop (#3615 — no L4 header to synthesize a reply from).
     let flowless_log_flow = if tx_selection_flow.is_none() && cos.filter_log.is_some() {
-        crate::afxdp::frame::l3_session_flow_from_meta(ctx.meta)
+        // #7656: prefer the POST-NAT tuple when the caller resolved one. The
+        // pre-NAT fallback is kept for callers that cannot supply it (and for
+        // the non-NAT case, where the two are identical anyway).
+        ctx.flowless_wire_flow
+            .clone()
+            .or_else(|| crate::afxdp::frame::l3_session_flow_from_meta(ctx.meta))
     } else {
         None
     };

@@ -1289,3 +1289,52 @@ Regression tests live in `userspace-dp/src/afxdp/tests.rs`
 `fabric_queue_hash_non_first_fragment_is_port_independent_3tuple`,
 `pending_neigh_fragment_buffers_no_flow_key`) and fail if the gate is
 reverted.
+
+### The flowless tuple must be POST-NAT (#7656)
+
+The `flow_key = None` path above answers "which ports" (none). It did not
+answer **which family, which addresses, which protocol** — those fell back
+to the ingress `meta`. For every NAT that rewrites addresses that fallback
+is stale, and under **NAT64** it is a different address family: the packet
+arrives IPv6 and leaves IPv4.
+
+The consequence was operator-visible and audit-relevant. An interface
+`filter output` is applied on the egress interface AFTER NAT (#3642), so
+family and tuple must both be post-NAT. On the flowless arm they were not:
+
+    first fragment  (has a flow_key)  -> egress v4 filter, post-NAT tuple
+    non-first frag  (flowless)        -> ingress v6 filter, PRE-NAT tuple
+
+Both leave as IPv4 on the same interface, so a v4 output filter saw the
+first fragment and not the rest — and a v6 filter matched a packet that
+left as IPv4, which is a *wrong* record rather than a missing one.
+
+The fix synthesizes an L3-only post-NAT wire key
+(`forward_request::l3_wire_session_flow_from_meta`) from `meta` + this
+packet's `decision.nat`, put through the same `forward_wire_key` the
+flow-bearing path uses. The NAT decision does not depend on there being a
+flow, so the egress family is derivable exactly where it was previously
+guessed. Family, addresses and protocol — including the NAT64
+`ICMPV6`<->`ICMP` swap — therefore move **together by construction**,
+across all four consumers: the per-family tx-selection enable gate, the
+output-filter family lookup, the term match inputs, and the filter-log
+event's attributed tuple. The same key is threaded through the
+`neighbor_dispatch` buffered-frame retransmit, which had the identical
+defect.
+
+**Do not reduce this to a family-only change.** Selecting the v4 filter
+while still matching pre-NAT v6 addresses makes every `from
+source-address` / `destination-address` term stop matching, so the filter
+is *less* correct than before while an address-less fixture stays green.
+That was measured: the half-fix passes
+`nat64_flowless_fragment_uses_the_egress_family_output_filter_7656` (whose
+terms are address-less) and reds
+`nat64_flowless_fragment_output_filter_matches_the_postnat_tuple_7656`,
+which carries a v4 `destination-address 8.8.8.8/32` term precisely to bind
+it.
+
+Scope: the flow **cache** replay arm is unaffected for NAT64 —
+`flow_cache::should_cache` excludes NAT64 (`&& !decision.nat.nat64`), so a
+NAT64 flow is never cached. Its equivalent pre-NAT address staleness under
+plain SNAT/DNAT (a v4 SNAT'd fragment logging its pre-translation source)
+is real but family-invariant, and is tracked separately.

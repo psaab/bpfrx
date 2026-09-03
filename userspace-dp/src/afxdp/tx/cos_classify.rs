@@ -519,6 +519,7 @@ pub(in crate::afxdp) fn resolve_cos_tx_selection(
         flow_key,
         extra,
         None,
+        None,
     )
 }
 
@@ -538,6 +539,7 @@ pub(in crate::afxdp) fn resolve_cos_tx_selection_at(
         flow_key,
         extra,
         Some(now_ns),
+        None,
     )
 }
 
@@ -559,6 +561,8 @@ pub(in crate::afxdp) fn resolve_cos_tx_selection_at_prenat(
     ingress_flow_key: Option<&SessionKey>,
     extra: crate::filter::TermMatchExtra,
     now_ns: u64,
+    // #7656: post-NAT L3 wire key for the flowless arm; see the internal fn.
+    flowless_wire: Option<&SessionKey>,
 ) -> CoSTxSelection {
     resolve_cos_tx_selection_internal(
         forwarding,
@@ -568,6 +572,7 @@ pub(in crate::afxdp) fn resolve_cos_tx_selection_at_prenat(
         ingress_flow_key,
         extra,
         Some(now_ns),
+        flowless_wire,
     )
 }
 
@@ -579,6 +584,12 @@ fn resolve_cos_tx_selection_internal(
     ingress_flow_key: Option<&SessionKey>,
     extra: crate::filter::TermMatchExtra,
     now_ns: Option<u64>,
+    // #7656: the POST-NAT L3 wire key for a FLOWLESS packet (no `flow_key`).
+    // Under NAT64 the packet changes family in flight, so the ingress `meta`
+    // fallbacks below select the wrong output-filter family AND match it against
+    // the pre-translation addresses and protocol. When the caller can supply the
+    // post-NAT tuple, all three reads come from it.
+    flowless_wire: Option<&SessionKey>,
 ) -> CoSTxSelection {
     let meta = meta.into();
     // #3642: an interface `filter output` is applied on the EGRESS interface
@@ -590,7 +601,13 @@ fn resolve_cos_tx_selection_internal(
     // filter family from that key so a NAT64 flow evaluates the correct-family
     // output filter against the correct-family tuple. Fall back to the ingress
     // meta family only on the flowless / default-queue path (`flow_key` None).
+    // #7656: on the flowless path prefer the POST-NAT wire family over the
+    // ingress meta family. This gate selects the per-family tx-selection enable,
+    // so a box with v4 tx-selection enabled and v6 not would otherwise
+    // short-circuit a NAT64 fragment out of enforcement entirely, before the
+    // flowless arm below is ever reached.
     let is_v6 = flow_key
+        .or(flowless_wire)
         .map(|key| key.addr_family as i32 == libc::AF_INET6)
         .unwrap_or(meta.addr_family as i32 == libc::AF_INET6);
     let tx_selection_enabled = if is_v6 {
@@ -650,7 +667,25 @@ fn resolve_cos_tx_selection_internal(
         // result is `drop:false` — the pass-through case is unchanged. Queue
         // and DSCP-rewrite selection stay exactly as computed above; this gate
         // ADDS enforcement only, it does not re-classify the fragment's queue.
-        let is_v6 = meta.addr_family as i32 == libc::AF_INET6;
+        //
+        // #7656: family, addresses and protocol all come from the POST-NAT wire
+        // key when the caller resolved one, and all from `meta` when it did not.
+        // They are read as ONE choice rather than three: a mixture — egress
+        // family with ingress addresses — selects the right filter and then
+        // cannot match any address-bearing term in it, which is invisible to a
+        // fixture whose terms are address-less.
+        let (is_v6, wire_l3_addrs, wire_protocol) = match flowless_wire {
+            Some(key) => (
+                key.addr_family as i32 == libc::AF_INET6,
+                Some((key.src_ip, key.dst_ip)),
+                key.protocol,
+            ),
+            None => (
+                meta.addr_family as i32 == libc::AF_INET6,
+                meta.l3_addrs(),
+                meta.protocol,
+            ),
+        };
         let mut drop = false;
         let mut reject = false;
         // #6854: meaningless unless `reject`; see CoSTxSelection.reject_message.
@@ -662,7 +697,7 @@ fn resolve_cos_tx_selection_internal(
             &forwarding.filter_state,
             egress_ifindex,
             is_v6,
-        ) && let Some((src_ip, dst_ip)) = meta.l3_addrs()
+        ) && let Some((src_ip, dst_ip)) = wire_l3_addrs
         {
             // Mirror the flow-keyed eval entry points below: ports are 0
             // (L4 absent), `extra` carries the frame-derived is-fragment /
@@ -674,7 +709,7 @@ fn resolve_cos_tx_selection_internal(
                     output_filter,
                     src_ip,
                     dst_ip,
-                    meta.protocol,
+                    wire_protocol,
                     0,
                     0,
                     meta.dscp,
@@ -687,7 +722,7 @@ fn resolve_cos_tx_selection_internal(
                     output_filter,
                     src_ip,
                     dst_ip,
-                    meta.protocol,
+                    wire_protocol,
                     0,
                     0,
                     meta.dscp,
