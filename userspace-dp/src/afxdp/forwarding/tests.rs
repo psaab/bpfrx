@@ -5505,11 +5505,19 @@ fn assert_ambiguous_ifindex_preconditions_6722(
         "precondition: ifindex {ifindex} must have NO egress row -- without that \
          the #6713 fallback never fires and nothing here is exercised"
     );
-    assert_ne!(
-        expect_ingress_zone, 0,
-        "precondition: the competing zone must be NONZERO, or 'to-zone is 0' \
-         would be indistinguishable from an empty state"
-    );
+    // #7509: `expect_ingress_zone` now means WHAT INGRESS SHOULD SAY, so each
+    // caller states its class. 0 = the rows carry DIFFERENT zones and ingress
+    // refuses to pick, matching egress. Nonzero = the rows carry a zone and NO
+    // zone (`vpnb` vs none); ingress still inherits, because separating an
+    // unzoned SIBLING UNIT that must not inherit from an unzoned TRUNK PARENT
+    // that legitimately does needs the authored-vs-inherited fact, which is not
+    // on the wire. #7509 stays open for that case.
+    //
+    // The old `assert_ne!(expect_ingress_zone, 0)` guarded "to-zone 0 must not be
+    // indistinguishable from an empty state". 0 is now a legitimate expectation,
+    // so that protection moves to the control below, which is stronger: a
+    // sibling ifindex in the SAME state must still be zoned, so a build that
+    // lost zoning entirely reds here rather than passing everywhere.
     assert_eq!(
         state
             .ifindex_to_zone_id
@@ -5517,9 +5525,19 @@ fn assert_ambiguous_ifindex_preconditions_6722(
             .copied()
             .unwrap_or(0),
         expect_ingress_zone,
-        "precondition: `ifindex_to_zone_id` (the from-zone source, and the map \
-         the egress half must NOT read) carries a real zone for ifindex \
-         {ifindex} -- that divergence is the whole subject of this test"
+        "precondition: ingress zone for ifindex {ifindex} must be \
+         {expect_ingress_zone} for this cell's class (#7509)"
+    );
+    assert_ne!(
+        state
+            .ifindex_to_zone_id
+            .get(&LAN_IFINDEX_6722)
+            .copied()
+            .unwrap_or(0),
+        0,
+        "control: the UNCONTESTED lan ifindex must still carry its own zone, or \
+         the assertion above passes on a state with no zones at all and the cell \
+         cannot tell 'contested is refused' from 'nothing is zoned'"
     );
     assert!(
         !state.ifindex_unambiguous_zone_id.contains_key(&ifindex),
@@ -5589,7 +5607,11 @@ fn divergently_zoned_sibling_units_do_not_pick_a_zone_6722() {
     assert_ambiguous_ifindex_preconditions_6722(
         &state,
         SHARED_TUNNEL_IFINDEX_6722,
-        TEST_SIBLING_VPN_ZONE_ID_6722,
+        // #7509: BOTH sibling units are zoned and they DISAGREE, so ingress now
+        // refuses to pick one exactly as egress already did. Was
+        // TEST_SIBLING_VPN_ZONE_ID_6722 -- the arbitrary pick this cell used to
+        // pin as its own precondition.
+        0,
     );
 
     let (to_id, result) =
@@ -5673,15 +5695,33 @@ fn reused_ifindex_across_two_zoned_interfaces_resolves_no_zone_6722() {
         !state.egress.contains_key(&SHARED_TUNNEL_IFINDEX_6722),
         "precondition: both rows are MAC-less, so there is no egress row"
     );
-    assert_ne!(
+    // #7509 RETARGET. This pinned the ARBITRARY PICK as a precondition -- two
+    // zoned interfaces reusing one ifindex, `ifindex_to_zone_id` keeping
+    // whichever row was walked last -- to assert the pick did not reach the
+    // to-zone. Ingress no longer picks, so the precondition inverts: both halves
+    // now refuse, which is the #6727 symmetry.
+    //
+    // The control keeps it from going vacuous: with the pick gone, "ingress is
+    // 0" is satisfied by a state with no zones at all.
+    assert_eq!(
         state
             .ifindex_to_zone_id
             .get(&SHARED_TUNNEL_IFINDEX_6722)
             .copied()
             .unwrap_or(0),
         0,
-        "precondition: `ifindex_to_zone_id` picked ONE of the two zones (last \
-         row wins) -- that arbitrary pick is what must not reach the to-zone"
+        "two zoned interfaces reusing one ifindex must leave it UNZONED on the \
+         ingress side too -- the arbitrary last-row-wins pick is gone (#7509)"
+    );
+    assert_ne!(
+        state
+            .ifindex_to_zone_id
+            .get(&LAN_IFINDEX_6722)
+            .copied()
+            .unwrap_or(0),
+        0,
+        "control: an UNCONTESTED ifindex in the same state must still be zoned, \
+         or the assertion above passes on a state with no zones at all"
     );
     assert_eq!(
         zone_pair_ids_for_flow(&state, LAN_IFINDEX_6722, SHARED_TUNNEL_IFINDEX_6722).1,

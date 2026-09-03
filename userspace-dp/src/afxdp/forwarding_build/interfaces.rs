@@ -234,7 +234,30 @@ pub(super) fn populate_interfaces(
         // already returned `InterfaceUnknownZone` above. `ifindex_to_zone_id`
         // therefore receives the identical entries it did before this change.
         if row_zone_id != 0 {
-            state.ifindex_to_zone_id.insert(iface.ifindex, row_zone_id);
+            // #7509: the SAME-IFINDEX contest. Two rows can carry one ifindex
+            // directly — the Go builder's `out[base]` write puts `st0.0` and
+            // `st0.1` on one base ifindex — and this insert was unconditional,
+            // so the LAST row walked won. That is the case #7509 actually
+            // reports, and it is a different arm from the parent fan-UP below
+            // (which was FIRST-wins). Both are guesses; both are now refused.
+            //
+            // Caught by retargeting `unzoned_macless_unit_does_not_inherit_a_
+            // zoned_siblings_zone_6722`: fixing only the fan-UP left this arm
+            // handing out a sibling's zone, and the retarget is what exposed it.
+            if contested_parent_ifindexes.contains(&iface.ifindex) {
+                // Already contested by an earlier row: stay unzoned. Re-inserting
+                // would make the outcome depend on walk order again.
+            } else if let Some(existing) = state.ifindex_to_zone_id.get(&iface.ifindex).copied() {
+                if existing != row_zone_id {
+                    contested_parent_ifindexes.insert(iface.ifindex);
+                    let entry = contested_parent_zones.entry(iface.ifindex).or_default();
+                    entry.insert(existing);
+                    entry.insert(row_zone_id);
+                    state.ifindex_to_zone_id.remove(&iface.ifindex);
+                }
+            } else {
+                state.ifindex_to_zone_id.insert(iface.ifindex, row_zone_id);
+            }
             // Propagate a zoned child unit's zone onto its parent's ifindex so
             // a packet ARRIVING on a trunk parent with no zone of its own is
             // attributed to its unit's zone (#921/#3618). This is REACHABLE for
