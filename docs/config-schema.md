@@ -376,6 +376,67 @@ Putting `gre` first makes the dropped value and the fallback identical, so a rea
 divergence reads as EQUIVALENT and the #2419 inventory entry looks stale. A
 fixture must never use the value the bug falls back to.
 
+### `protocols {isis,rip} authentication-type` — a typo DOWNGRADES md5 to plaintext (#8443)
+
+Untyped in `setSchema` across **five** copies (RIP, IS-IS router-level, IS-IS
+per-interface, and both routing-instance copies), so any string committed. The
+FRR renderers act on the literal `"md5"` and treat everything else as the weak
+arm:
+
+| site | recognised | anything else |
+|---|---|---|
+| RIP | `ip rip authentication mode md5` | `mode text` |
+| IS-IS area/domain | `area-password md5` | `area-password clear` |
+| IS-IS per-interface | `isis password md5` | `isis password clear` |
+
+So a one-character typo does not remove authentication — it **silently
+downgrades md5 to plaintext**, putting the operator's key on the wire in the
+clear while `show configuration` still says `md5`. The issue that filed this
+claimed the adjacency came up unauthenticated; it does not, and the `else` arms
+predate the commit that issue verified against. The defect is a downgrade.
+
+Accepted: `md5`, `simple`, `text` (FRR's spelling for the plaintext arm, and
+the one this product emits — refusing the vocabulary of our own output is a
+surprising failure mode). **Case-sensitive**, matching `CanonicalISISLevel` and
+Junos.
+
+**The belt renders plaintext, not md5, for an unrecognised value**, and the
+direction is deliberate. On the tolerant load path (#1960) a persisted config
+can still carry a value the strict gate now rejects. Promoting it to md5 would
+flip a box running plaintext today into md5 against a peer expecting plaintext
+and drop the adjacency **on upgrade** — trading a silent downgrade for a silent
+outage, on the path whose entire purpose is that a persisted config still boots.
+The commit gate stops every new instance; a `slog.Warn` at each render site
+tells the operator about the existing one.
+
+Note this is the opposite direction from #8450's belt, and for the opposite
+reason: there the bad output was a line vtysh rejects, so omitting was safer;
+here the bad output is a valid line that is merely weaker, so preserving it is
+safer than changing a running adjacency's mechanism.
+
+**OSPF is deliberately NOT served by this canonicalizer.** It uses a different
+grammar — `authentication { md5 <id> { key ...; } | simple-password ...; }` —
+whose `AuthType` is assigned only from matched keywords
+(`compiler_protocols.go:147,159`), so it cannot hold a free-form value at all.
+None of the five `authentication-type` schema copies is OSPF. Widening this
+domain to cover OSPF's spellings would relax the strict one for no gain.
+
+**OSPF had a separate, higher-severity defect fixed in the same change**: its
+auth block had no `AuthKey != ""` guard, unlike RIP and IS-IS. So
+`authentication { md5 1; }` — a clean commit — rendered
+`ip ospf message-digest-key 1 md5` and `authentication { simple-password; }`
+rendered `ip ospf authentication-key`, both a **keyword with no argument**.
+vtysh rejects those, and one rejected line fails the WHOLE managed-section
+reload (#1880/#2223) — taking down all dynamic routing, not just OSPF.
+
+`TestNoAuthLineEndsInADanglingKeyword8443` is the census that catches it, and it
+varies **both** axes — every accepted type × key present/absent. A one-axis
+census cannot see this: varying the type with a key always present never
+produces the empty-key line, and varying the key with a recognised type never
+produces the downgrade. It also asserts on what the line **became** (its field
+count) rather than on whether an auth line was emitted at all — the malformed
+line is *present* and looks well-formed, so an existence check passes on it.
+
 ### `protocols isis interface <if> level` — the PER-INTERFACE circuit type (#8450)
 
 A different leaf and a different defect from the router-wide one below, in the

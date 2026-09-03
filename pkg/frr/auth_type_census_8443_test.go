@@ -1,0 +1,155 @@
+package frr
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/psaab/xpf/pkg/config"
+)
+
+// #8443: the authentication render census, varying BOTH axes.
+//
+// Two independent defects hid behind one-axis checks:
+//
+//   - varying the TYPE with a key always present cannot see that OSPF emitted
+//     `ip ospf message-digest-key 1 md5` with no argument when the key was
+//     empty — a keyword missing its argument, which vtysh rejects, and one
+//     rejected line fails the ENTIRE managed-section reload (#1880/#2223);
+//   - varying the KEY with a recognized type always set cannot see that an
+//     unrecognized type silently downgrades md5 to plaintext.
+//
+// So the census walks {every accepted type, plus an unrecognized one} x {key
+// present, key absent} across all four render sites.
+
+// keyBearingLines maps a rendered line PREFIX to the minimum number of
+// whitespace-separated fields a well-formed instance must have.
+//
+// Keyed by prefix rather than by last token, because the same word plays both
+// roles: `ip rip authentication mode md5` legitimately ENDS in `md5` (there it
+// is the value of `mode`), while `area-password md5` ending there is malformed
+// (there `md5` names the algorithm and the key must follow). An earlier version
+// of this cell used a last-token set and reported that correct RIP line as a
+// defect — the distinction is the line's shape, not the word.
+var keyBearingLines = map[string]int{
+	"ip ospf message-digest-key":   6, // ip ospf message-digest-key <id> md5 <key>
+	"ip ospf authentication-key":   4, // ip ospf authentication-key <key>
+	"ip rip authentication string": 5, // ip rip authentication string <key>
+	"area-password":                3, // area-password <alg> <key>
+	"domain-password":              3, // domain-password <alg> <key>
+	"isis password":                4, // isis password <alg> <key>
+}
+
+// No rendered authentication line may end in a keyword that expects an
+// argument — for ANY combination of type and key presence.
+//
+// This is the half my own and the review's censuses both missed, and it is the
+// one that catches the OSPF empty-key defect.
+func TestNoAuthLineEndsInADanglingKeyword8443(t *testing.T) {
+	types := append(config.AuthTypeSpellings(), "", "md5-typo", "MD5")
+	keys := []string{"s3cret", ""}
+
+	for _, at := range types {
+		for _, key := range keys {
+			m := New()
+			isis := &config.ISISConfig{
+				NET:        "49.0001.0100.0000.0001.00",
+				Level:      "level-2",
+				AuthType:   at,
+				AuthKey:    config.Secret(key),
+				Interfaces: []*config.ISISInterface{{Name: "trust0", AuthType: at, AuthKey: config.Secret(key)}},
+			}
+			rip := &config.RIPConfig{
+				AuthType:   at,
+				AuthKey:    config.Secret(key),
+				Interfaces: []string{"trust0"},
+			}
+			ospf := &config.OSPFConfig{
+				Areas: []*config.OSPFArea{{
+					ID: "0.0.0.0",
+					Interfaces: []*config.OSPFInterface{
+						{Name: "trust0", AuthType: at, AuthKey: config.Secret(key)},
+					},
+				}},
+			}
+			got := m.generateProtocols(ospf, nil, nil, rip, isis, "", 0, nil, nil)
+
+			for _, line := range strings.Split(got, "\n") {
+				l := strings.TrimSpace(line)
+				for prefix, minFields := range keyBearingLines {
+					if !strings.HasPrefix(l, prefix) {
+						continue
+					}
+					if n := len(strings.Fields(l)); n < minFields {
+						t.Fatalf("type=%q key=%q rendered a key-bearing line with "+
+							"%d fields, want at least %d: %q\n"+
+							"vtysh rejects a keyword missing its argument, and ONE "+
+							"rejected line fails the whole managed-section reload "+
+							"(#1880/#2223)", at, key, n, minFields, l)
+					}
+				}
+			}
+		}
+	}
+}
+
+// A recognized type with a key must render md5 for md5 and the plaintext arm
+// for the plaintext spellings — the control that keeps the cell above from
+// being satisfied by rendering nothing at all.
+func TestRecognizedAuthTypesStillRender8443(t *testing.T) {
+	cases := []struct {
+		authType string
+		wantISIS string
+		wantRIP  string
+	}{
+		{"md5", "area-password md5 s3cret", "ip rip authentication mode md5"},
+		{"simple", "area-password clear s3cret", "ip rip authentication mode text"},
+		{"text", "area-password clear s3cret", "ip rip authentication mode text"},
+	}
+	for _, tc := range cases {
+		m := New()
+		isis := &config.ISISConfig{
+			NET: "49.0001.0100.0000.0001.00", Level: "level-2",
+			AuthType: tc.authType, AuthKey: "s3cret",
+			Interfaces: []*config.ISISInterface{{Name: "trust0"}},
+		}
+		rip := &config.RIPConfig{
+			AuthType: tc.authType, AuthKey: "s3cret", Interfaces: []string{"trust0"},
+		}
+		got := m.generateProtocols(nil, nil, nil, rip, isis, "", 0, nil, nil)
+		for _, want := range []string{tc.wantISIS, tc.wantRIP} {
+			if !strings.Contains(got, want) {
+				t.Errorf("authentication-type %q: missing %q in:\n%s", tc.authType, want, got)
+			}
+		}
+	}
+}
+
+// An UNRECOGNIZED type takes the plaintext arm, not md5 and not silence.
+//
+// Pinned deliberately: this is the tolerant-path behaviour, and it is the
+// behaviour a persisted config gets after the strict gate starts rejecting new
+// instances. Promoting it to md5 would flip a box running plaintext today into
+// md5 against a peer expecting plaintext and drop the adjacency on upgrade —
+// a silent downgrade traded for a silent outage, on the path (#1960) whose
+// purpose is that a persisted config still boots.
+func TestUnrecognizedAuthTypeRendersPlaintextNotMD5OrSilence8443(t *testing.T) {
+	m := New()
+	isis := &config.ISISConfig{
+		NET: "49.0001.0100.0000.0001.00", Level: "level-2",
+		AuthType: "md5-typo", AuthKey: "s3cret",
+		Interfaces: []*config.ISISInterface{{Name: "trust0"}},
+	}
+	rip := &config.RIPConfig{AuthType: "md5-typo", AuthKey: "s3cret", Interfaces: []string{"trust0"}}
+	got := m.generateProtocols(nil, nil, nil, rip, isis, "", 0, nil, nil)
+
+	if strings.Contains(got, "area-password md5") || strings.Contains(got, "mode md5") {
+		t.Fatalf("an unrecognized type was promoted to md5; that drops adjacencies "+
+			"on upgrade against a peer expecting plaintext:\n%s", got)
+	}
+	for _, want := range []string{"area-password clear s3cret", "ip rip authentication mode text"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("an unrecognized type rendered NO authentication (%q missing); "+
+				"silence is the one outcome that leaves the adjacency open:\n%s", want, got)
+		}
+	}
+}
