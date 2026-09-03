@@ -39,7 +39,14 @@ import (
 // community member is a free-form verbatim string slot (no value
 // validation; the compiler copies it straight through), so a legitimate
 // bound operator like `65000:1{2,3}` must route to an expanded list too.
-const communityRegexChars = `*.+?^$[]()|\{}`
+//
+// #8449: this is now an ALIAS of the shared SSOT in pkg/config, not a second
+// copy of the literal. The commit gate that rejects an uncompilable member has
+// to make the SAME expanded/standard classification the renderer does, and two
+// literals in two packages is exactly the pair that drifts. Kept as a named
+// constant here so the existing pkg/frr tests that reference it keep binding
+// the real value rather than being quietly decommissioned.
+const communityRegexChars = config.CommunityRegexChars
 
 // communityMemberIsRegex reports whether a Junos community member value
 // contains regex / wildcard metacharacters and must be rendered into an
@@ -47,7 +54,10 @@ const communityRegexChars = `*.+?^$[]()|\{}`
 // well-known name ("no-export", "no-advertise", "internet", "local-AS")
 // contains none of these and stays a `standard` member.
 func communityMemberIsRegex(member string) bool {
-	return strings.ContainsAny(member, communityRegexChars)
+	// #8449: delegate to the shared predicate so the render-side list-kind
+	// decision and the commit gate cannot disagree about which members FRR
+	// will run through regcomp.
+	return config.CommunityMemberIsRegex(member)
 }
 
 // redistFailClosedRouteMap derives the per-use-site route-map name that IGP
@@ -278,6 +288,34 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig, bgpAccep
 				listKind = "expanded"
 				break
 			}
+		}
+		// #8449 render-side belt, the community sibling of the #6686 as-path
+		// belt below. A member that forces the expanded list kind but is not a
+		// valid POSIX ERE fails FRR's regcomp — a CMD_WARNING_CONFIG_FAILED
+		// that exits the whole vtysh add-batch non-zero and fails the ENTIRE
+		// frr-reload, leaving every dynamic routing change stale. The strict
+		// commit gate (validatePolicyCommunityRegexStrict) hard-rejects it, but
+		// the tolerant Load / peer-sync paths only warn (#1960 no-brick), so the
+		// renderer must keep a leniently-loaded definition out of frr.conf.
+		//
+		// Omitting the list is strictly better than poisoning the reload: FRR
+		// resolves a `match community <name>` with no such list to NO MATCH,
+		// which confines the damage to the terms that reference it instead of
+		// stalling all of routing.
+		//
+		// The omission is per-DEFINITION, not per-member, because FRR does not
+		// allow one list name to be both standard and expanded — a half-rendered
+		// list would change the kind decision made above. Same predicate as the
+		// commit gate: ValidCommunityMember is shared so the two cannot drift.
+		unrenderable := false
+		for _, member := range cd.Members {
+			if err := config.ValidCommunityMember(member); err != nil {
+				unrenderable = true
+				break
+			}
+		}
+		if unrenderable {
+			continue
 		}
 		for _, member := range cd.Members {
 			// #4097: sanitize the member so an embedded newline (from a

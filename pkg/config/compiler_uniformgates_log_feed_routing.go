@@ -244,6 +244,23 @@ func runUniformGatesLogFeedRouting(tree *ConfigTree, cfg *Config, opts compileOp
 		}
 	}
 
+	// #8449: the community sibling of the as-path gate above. A community
+	// member carrying a regex metacharacter renders into an FRR `expanded`
+	// community-list and is compiled by regcomp; one that does not compile is
+	// a CMD_WARNING_CONFIG_FAILED, which fails the ENTIRE frr-reload. Same
+	// strict/lenient split and the same reasoning as the as-path gate — the
+	// render path carries the matching ValidCommunityMember belt so a
+	// leniently-loaded definition is kept out of frr.conf rather than
+	// poisoning the reload.
+	if err := validatePolicyCommunityRegexStrict(cfg); err != nil {
+		if opts.lenientPolicyCommunityRegex {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("policy community member (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #5116: reserved route-map-suffix gate. The FRR renderer derives a
 	// per-use-site fail-closed redistribute alias `name + "-xpf-redist"`
 	// (redistFailClosedRouteMap) into FRR's GLOBAL name-keyed route-map

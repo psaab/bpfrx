@@ -2173,7 +2173,8 @@ type compileOpts struct {
 	// of frr.conf on that path so the reload survives. Runs on the
 	// fully-compiled *Config so the as-path map is populated regardless of
 	// authoring order. Same doctrine as lenientPolicyCommunityRef.
-	lenientPolicyASPathRegex bool
+	lenientPolicyASPathRegex    bool
+	lenientPolicyCommunityRegex bool // #8449: sibling of the as-path gate; see lenientPolicyASPathRegex
 	// lenientPolicyReservedRedistName (#5116) downgrades the reserved
 	// route-map-suffix gate (validatePolicyReservedRedistNameStrict) from a
 	// hard compile error to a cfg.Warnings entry. An operator policy-statement
@@ -2627,6 +2628,7 @@ func lenientCompileOpts() compileOpts {
 		lenientSNMPv3KeyMaterial:               true,
 		lenientPolicyASPathRef:                 true,
 		lenientPolicyASPathRegex:               true,
+		lenientPolicyCommunityRegex:            true,
 		lenientPolicyReservedRedistName:        true,
 		lenientPolicyReservedChainName:         true,
 		lenientVRRPVirtualAddress:              true,
