@@ -14,6 +14,17 @@
 //! the MPMC algorithm keeps the push side trivially lock-free with one CAS
 //! per slot acquire.
 //!
+//! That invariant is NOT carried by this comment. `pop` is an `unsafe fn`
+//! with a `SAFETY` contract, so the compiler forces every caller into an
+//! `unsafe` block that must discharge it; and the `get_unchecked` indexing in
+//! `push`/`pop` is in range BY CONSTRUCTION, not by convention — `mask = cap -
+//! 1` where `cap` is a power of two, so `pos & mask < cap` for every `pos`.
+//! Of the two production `pop` sites, `Drop` upholds the contract through the
+//! type system (`&mut self` is exclusive access). The single place the
+//! obligation rests on discipline rather than on a type is
+//! `BindingLiveState::take_pending_tx_into`, a SAFE wrapper that discharges it
+//! internally — see its `SAFETY` comment before adding a caller.
+//!
 //! Overflow semantics: `push` returns `Err(val)` when the ring is full. The
 //! caller in `BindingLiveState` treats that as drop-newest and bumps the
 //! `redirect_inbox_overflow_drops` / `tx_errors` counters. This replaces the
