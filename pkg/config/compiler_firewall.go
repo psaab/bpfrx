@@ -364,6 +364,40 @@ func validateFirewallFilterFamilyCollisionsAST(nodes []*Node, lenient bool) ([]s
 	// FiltersInet6 — tracked here and flagged below.
 	inet6Names := map[string]bool{}
 
+	// #8426: definitions per (family, name). `filterFamilies` above is a set of
+	// DISTINCT families and therefore CANNOT see a second definition inside one
+	// family — the `return` below is what discards it, deliberately, because the
+	// #3884 gate it feeds is about cross-family reuse. That leaves the
+	// same-family duplicate unguarded, and it reaches the same unconditional
+	// `dest[filter.Name] = filter` with the same consequence the #3884 message
+	// describes: the later block replaces the earlier WHOLE, so a `then discard`
+	// can silently become accept-all.
+	//
+	// Tracked for inet6 too. inet6 filters live in their own FiltersInet6 pool
+	// so they cannot collide cross-family — but the write into that pool is the
+	// same last-writer-wins, and `inet6Names` is a bool set that cannot count.
+	seenInFamily := map[string]map[string]bool{}
+	dupFamilies := map[string][]string{}
+	dupOrder := []string{}
+	noteDup := func(name, fam string) {
+		if seenInFamily[fam] == nil {
+			seenInFamily[fam] = map[string]bool{}
+		}
+		if !seenInFamily[fam][name] {
+			seenInFamily[fam][name] = true
+			return
+		}
+		for _, f := range dupFamilies[name] {
+			if f == fam {
+				return // this (name, family) duplicate already recorded
+			}
+		}
+		if len(dupFamilies[name]) == 0 {
+			dupOrder = append(dupOrder, name)
+		}
+		dupFamilies[name] = append(dupFamilies[name], fam)
+	}
+
 	record := func(name, fam string) {
 		for _, f := range filterFamilies[name] {
 			if f == fam {
@@ -416,6 +450,7 @@ func validateFirewallFilterFamilyCollisionsAST(nodes []*Node, lenient bool) ([]s
 					// any+inet6 cross-check below.
 					for _, filterInst := range namedInstances(afNode.FindChildren("filter")) {
 						if filterInst.name != "" {
+							noteDup(filterInst.name, "inet6")
 							inet6Names[filterInst.name] = true
 						}
 					}
@@ -425,6 +460,7 @@ func validateFirewallFilterFamilyCollisionsAST(nodes []*Node, lenient bool) ([]s
 					if filterInst.name == "" {
 						continue
 					}
+					noteDup(filterInst.name, af)
 					record(filterInst.name, af)
 				}
 			}
@@ -432,6 +468,24 @@ func validateFirewallFilterFamilyCollisionsAST(nodes []*Node, lenient bool) ([]s
 	}
 
 	var warnings []string
+	// #8426: same-family duplicates first — a name defined twice under ONE
+	// family is a strictly more local error than a cross-family reuse, and
+	// reporting it first gives the operator the smaller edit.
+	for _, name := range dupOrder {
+		fams := dupFamilies[name]
+		msg := fmt.Sprintf(
+			"firewall filter %q is defined more than once under the same family "+
+				"(%s) — the later block REPLACES the earlier one whole (its terms, "+
+				"its `then discard`), because compileFirewall writes "+
+				"`dest[filter.Name] = filter` unconditionally; Junos merges "+
+				"same-name blocks, xpf does not, so combine them into one filter "+
+				"(#8426)",
+			name, strings.Join(fams, ", "))
+		if !lenient {
+			return nil, fmt.Errorf("%s", msg)
+		}
+		warnings = append(warnings, msg)
+	}
 	for _, name := range order {
 		fams := filterFamilies[name]
 		if len(fams) < 2 {
