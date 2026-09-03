@@ -5209,6 +5209,17 @@ fn build_cos_state_skips_interface_with_resolvable_but_empty_scheduler_map() {
 /// produces) and with the #2391/#2212/#2240 precedents (all have a Go gate
 /// upstream so their Rust backstop never fires on a fresh operator config).
 ///
+/// #8442: that "never fires on a fresh operator config" claim was FALSE when it
+/// was written, and an ordinary commit reached this error. `forwarding-classes
+/// queue 5 ""` committed green; the emitter kept the empty class AND its
+/// scheduler-map entry; `build_cos_classifier_tables` skipped the empty name
+/// building `class_to_queue`; and the entry's lookup landed here, refusing the
+/// whole snapshot. The claim is true again only because #8442 added the missing
+/// Go gate — which is the upstream half the sentence above assumed already
+/// existed. See `an_empty_forwarding_class_refuses_the_whole_snapshot_8442`,
+/// which pins the blast radius that made it worth fixing rather than the one
+/// bad entry.
+///
 /// fail-on-revert: restoring the `continue` at the `class_to_queue.get`
 /// lookup makes the build succeed (silently dropping the entry) and this
 /// `expect_err` red.
@@ -8541,4 +8552,127 @@ fn undefined_screen_profiles_do_not_leak_into_the_inert_map_7888() {
         state.screen_inert_profiles.is_empty(),
         "an undefined ref must not appear in the inert map"
     );
+}
+
+// #8442 — THE BLAST RADIUS. An empty forwarding-class name does not break one
+// class; it refuses the ENTIRE snapshot, so every forwarding change in the same
+// commit silently fails to apply while the CLI reports success.
+//
+// The Go emitter keeps an empty class (in `forwarding_classes` AND in the
+// scheduler-map entries); `build_cos_classifier_tables` deliberately SKIPS an
+// empty name when building `class_to_queue`. Each side is reasonable alone —
+// the disagreement is the fault.
+//
+// This cell is deliberately at the FORWARDING-STATE level rather than
+// `build_cos_state`, because the value of the #8442 gate is not "one CoS entry
+// is wrong". It is that an unrelated neighbour in the same commit does not
+// reach the dataplane either. A `build_cos_state`-level cell cannot say that.
+#[test]
+fn an_empty_forwarding_class_refuses_the_whole_snapshot_8442() {
+    // One CoS stanza carrying an empty class, and ONE completely unrelated
+    // forwarding change: a neighbour. The neighbour is the witness.
+    let unrelated_neighbor = || crate::NeighborSnapshot {
+        interface: "ge-0/0/0".into(),
+        ifindex: 402,
+        family: "inet".into(),
+        ip: "10.0.1.2".into(),
+        mac: "aa:bb:cc:dd:ee:02".into(),
+        state: "reachable".into(),
+        ..Default::default()
+    };
+    let cos = |include_empty: bool| {
+        let mut forwarding_classes = vec![CoSForwardingClassSnapshot {
+            name: "realfc".into(),
+            queue: 6,
+        }];
+        let mut entries = vec![CoSSchedulerMapEntrySnapshot {
+            forwarding_class: "realfc".into(),
+            scheduler: String::new(),
+        }];
+        if include_empty {
+            // Exactly what the Go emitter produced for `queue 5 ""` before the
+            // commit gate — measured, not imagined.
+            forwarding_classes.insert(
+                0,
+                CoSForwardingClassSnapshot {
+                    name: String::new(),
+                    queue: 5,
+                },
+            );
+            entries.insert(
+                0,
+                CoSSchedulerMapEntrySnapshot {
+                    forwarding_class: String::new(),
+                    scheduler: String::new(),
+                },
+            );
+        }
+        ClassOfServiceSnapshot {
+            forwarding_classes,
+            schedulers: vec![],
+            scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                name: "sm1".into(),
+                entries,
+            }],
+            dscp_classifiers: vec![],
+            ieee8021_classifiers: vec![],
+            dscp_rewrite_rules: vec![],
+            inet_precedence_classifiers: vec![],
+        }
+    };
+    let snapshot = |include_empty: bool| ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            ifindex: 402,
+            cos_shaping_rate_bytes_per_sec: 0,
+            cos_scheduler_map: "sm1".into(),
+            ..Default::default()
+        }],
+        neighbors: vec![unrelated_neighbor()],
+        class_of_service: Some(cos(include_empty)),
+        ..Default::default()
+    };
+
+    // CONTROL FIRST, so a failure below cannot be blamed on the fixture: with no
+    // empty class the identical snapshot builds AND the unrelated neighbour is
+    // installed.
+    let ok_state = try_build_forwarding_state_with_policy_counters(
+        &snapshot(false),
+        &crate::policy::PolicyCounterStore::default(),
+    )
+    .expect("control: the same snapshot without the empty class must build");
+    assert!(
+        !ok_state.neighbors.is_empty(),
+        "control: the unrelated neighbour must be installed when the CoS stanza \
+         is clean — if it is not, this cell cannot show that the empty class is \
+         what removes it"
+    );
+
+    // THE DEFECT: one empty class name, and the WHOLE build is refused.
+    let err = try_build_forwarding_state_with_policy_counters(
+        &snapshot(true),
+        &crate::policy::PolicyCounterStore::default(),
+    )
+    .expect_err(
+        "an empty forwarding-class name must refuse the snapshot — if this builds, \
+         the Go/Rust set disagreement has been closed on the Rust side and the \
+         #8442 commit gate's rationale needs re-reading",
+    );
+    match err {
+        crate::policy::SnapshotIntegrityError::SchedulerMapUnknownClass {
+            ref scheduler_map,
+            ref forwarding_class,
+        } => {
+            assert_eq!(scheduler_map, "sm1");
+            assert_eq!(
+                forwarding_class, "",
+                "the refusal must be attributed to the EMPTY class — any other \
+                 name means this cell is measuring a different miss"
+            );
+        }
+        other => panic!("expected SchedulerMapUnknownClass, got {other:?}"),
+    }
+    // And that is the whole point: the refusal is snapshot-wide. There is no
+    // partially-applied state to inspect — the caller keeps the PREVIOUS live
+    // forwarding state, so the neighbour that the control proved installable is
+    // simply not installed, and nothing tells the operator.
 }
