@@ -267,6 +267,7 @@ func liveSyncMessageTypesExcept(under int) []syncMessageType {
 		{syncMsgAuthUpgradeConfirm, "AuthUpgradeConfirm"},
 		{syncMsgAuthUpgradeRequest, "AuthUpgradeRequest"},
 		{syncMsgFenceAck, "FenceAck"},
+		{syncMsgPersistentNatLease, "PersistentNatLease"},
 	}
 	out := make([]syncMessageType, 0, len(all))
 	for _, m := range all {

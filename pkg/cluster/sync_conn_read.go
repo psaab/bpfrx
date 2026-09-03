@@ -489,6 +489,33 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		if s.OnIPsecSAReceived != nil {
 			s.OnIPsecSAReceived(names)
 		}
+	case syncMsgPersistentNatLease:
+		// #8121: a full IDLE persistent-NAT lease set. Same two refusals the
+		// DHCP full-set arms make, and for the same reason: a full set
+		// REPLACES, so installing a stale or truncated one is worse than
+		// installing nothing. The standby simply keeps rebuilding leases from
+		// sessions (#7360) until a good set arrives.
+		base, incarnation, seq := stripFullSetSeq(payload)
+		s.recvSeqMu.Lock()
+		admit := s.persistentNatLeaseRecvSeq.admit(incarnation, seq)
+		s.recvSeqMu.Unlock()
+		if !admit {
+			slog.Warn("cluster sync: dropping out-of-order persistent-NAT lease set (stale sequence)",
+				"incarnation", incarnation, "seq", seq)
+			return
+		}
+		leases, ok := decodePersistentNatLeasePayload(base)
+		if !ok {
+			s.stats.MalformedRecordsDropped.Add(1)
+			slog.Warn("cluster sync: dropping malformed persistent-NAT lease set",
+				"incarnation", incarnation, "seq", seq, "bytes", len(base))
+			return
+		}
+		slog.Debug("cluster sync: received persistent-NAT idle lease set",
+			"count", len(leases), "incarnation", incarnation, "seq", seq)
+		if s.OnPersistentNatLeasesReceived != nil {
+			s.OnPersistentNatLeasesReceived(leases)
+		}
 	case syncMsgDHCPLeaseV4:
 		s.stats.DHCPLeasesReceived.Add(1)
 		base, incarnation, seq := stripFullSetSeq(payload)

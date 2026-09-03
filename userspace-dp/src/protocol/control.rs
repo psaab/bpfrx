@@ -206,6 +206,10 @@ pub(crate) struct ControlRequest {
     pub session_deltas: Option<SessionDeltaDrainRequest>,
     #[serde(rename = "session_export", default)]
     pub session_export: Option<SessionExportRequest>,
+    /// #8121: idle persistent-NAT leases to install (the `import_idle_leases`
+    /// verb). Absent for every other verb.
+    #[serde(rename = "idle_leases", default, skip_serializing_if = "Vec::is_empty")]
+    pub idle_leases: Vec<IdleLeaseWire>,
     #[serde(default)]
     pub neighbors: Option<Vec<NeighborSnapshot>>,
     #[serde(rename = "neighbor_generation", default)]
@@ -497,6 +501,9 @@ pub(crate) struct ControlResponse {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub session_deltas: Vec<SessionDeltaInfo>,
+    /// #8121: the `export_idle_leases` result.
+    #[serde(rename = "idle_leases", default, skip_serializing_if = "Vec::is_empty")]
+    pub idle_leases: Vec<IdleLeaseWire>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -772,6 +779,53 @@ pub(crate) struct SessionSyncRequest {
 pub(crate) struct SessionDeltaDrainRequest {
     #[serde(default)]
     pub max: u32,
+}
+
+/// #8121: one idle persistent-NAT lease on the wire.
+///
+/// Addresses are strings and the lifetime is REMAINING, not a deadline —
+/// `expires_at_ns` is `CLOCK_MONOTONIC` and boot-relative, so carrying it
+/// verbatim would read as long-expired on a node with a different uptime. The
+/// pool is named rather than indexed for the same reason an address is carried
+/// rather than a pool index: a position means the same thing only while both
+/// sides agree on the list.
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub(crate) struct IdleLeaseWire {
+    #[serde(rename = "pool", default)]
+    pub pool_name: String,
+    #[serde(default)]
+    pub protocol: u8,
+    #[serde(rename = "src_ip", default)]
+    pub src_ip: String,
+    #[serde(rename = "src_port", default)]
+    pub src_port: u16,
+    /// Empty => `permit-any-remote-host`.
+    #[serde(
+        rename = "remote_ip",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub remote_ip: String,
+    #[serde(rename = "remote_port", default, skip_serializing_if = "is_zero_u16")]
+    pub remote_port: u16,
+    #[serde(rename = "translated_ip", default)]
+    pub translated_ip: String,
+    #[serde(rename = "translated_port", default)]
+    pub translated_port: u16,
+    #[serde(rename = "address_only", default, skip_serializing_if = "is_false")]
+    pub address_only: bool,
+    #[serde(rename = "remaining_ns", default)]
+    pub remaining_ns: u64,
+    #[serde(rename = "timeout_ns", default)]
+    pub timeout_ns: u64,
+}
+
+fn is_zero_u16(v: &u16) -> bool {
+    *v == 0
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

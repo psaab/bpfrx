@@ -43,6 +43,7 @@ mod destination;
 // #8121: idle persistent-NAT lease export/import — the population session
 // sync provably cannot reach (a lease with zero flows has no session).
 mod idle_lease_sync_8121;
+pub(crate) use idle_lease_sync_8121::{IdleLeaseImport, IdleLeaseRecord};
 // #6751 PR 2/3: the node-lifetime interface-mode translated-identity registry.
 mod iface_registry;
 mod source;

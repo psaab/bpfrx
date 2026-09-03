@@ -180,6 +180,11 @@ func (d *Daemon) startFabricGRPCListeners(commsCtx context.Context, syncIP, sync
 // Order contract: every ss.On* callback MUST be installed before ss.Start,
 // which spawns the accept/connect goroutines that invoke them.
 func (d *Daemon) wireSessionSyncConfigCallbacks(ss *cluster.SessionSync) {
+	// #8121: the standby installs the peer's IDLE persistent-NAT leases —
+	// the population session sync cannot carry, because a lease with no
+	// flows has no session to be derived from.
+	d.wirePersistentNatLeaseCallbacks(ss)
+
 	// Wire config sync callback: when secondary receives config from primary.
 	ss.OnConfigReceived = func(configText string) error {
 		d.cluster.RecordEvent(cluster.EventConfigSync, -1, fmt.Sprintf("Config received (%d bytes)", len(configText)))
@@ -540,6 +545,11 @@ func (d *Daemon) startClusterSyncAuxLoops(commsCtx context.Context, cc *config.C
 	// toggle from the apply path shares this same launch/stop path
 	// (and cannot double-launch).
 	d.ensureDHCPLeaseSyncLoop(cc.DHCPLeaseSync)
+
+	// #8121: push idle persistent-NAT leases on a slow tick. Gated on RG
+	// master inside the loop, so a standby never echoes back what it
+	// imported. Scoped to the comms context like the loops above.
+	go d.runPersistentNatLeaseSyncLoop(commsCtx)
 }
 
 // startFabricForwardingLoops starts the fabric_fwd population loops (fab0 and,

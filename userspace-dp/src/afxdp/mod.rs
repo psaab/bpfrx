@@ -521,6 +521,8 @@ mod coordinator;
 /// re-exported so every spawner across both test modules takes the SAME lock.
 #[cfg(test)]
 pub(crate) use coordinator::neigh_monitor_test_serial;
+// #8121 part 2: idle persistent-NAT lease sync records.
+pub(crate) use coordinator::PoolIdleLease;
 // afxdp/tests.rs (14k-LOC catch-all) was split into cohesive per-subsystem
 // sibling test modules plus a shared support module in #4840. Pure test
 // code-motion; each file carries the union use-block and reaches production

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/dataplane"
+	"github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/dhcpserver"
 )
 
@@ -725,6 +726,10 @@ type SessionSync struct {
 	// the peer (#2239). family is 4 or 6; the standby holds these so it can
 	// seed Kea on takeover. Fires after the peer*DHCPLeases store is updated.
 	OnDHCPLeasesReceived func(family int, leases []dhcpserver.SyncLease)
+	// OnPersistentNatLeasesReceived is called when a peer's full IDLE
+	// persistent-NAT lease set arrives (#8121). The daemon installs it into the
+	// local helper; nothing here interprets the records.
+	OnPersistentNatLeasesReceived func(leases []userspace.IdleLeaseWire)
 	// OnRemoteFailover is called when the peer requests a transfer-out for one RG.
 	// reqID is the request-scoped identifier carried on the wire; the demoted
 	// owner binds its auto-restore lease to it so a stale commit cannot clear a
@@ -1247,11 +1252,16 @@ type SessionSync struct {
 	ipsecSeqCounter  atomic.Uint64
 	dhcpV4SeqCounter atomic.Uint64
 	dhcpV6SeqCounter atomic.Uint64
+	// #8121: idle persistent-NAT leases are a full-set push like the two
+	// above, and draw from their OWN counter so a lease push never gates a
+	// DHCP one (or vice versa).
+	persistentNatLeaseSeqCounter atomic.Uint64
 
-	recvSeqMu     sync.Mutex
-	ipsecRecvSeq  fullSetSeqGuard
-	dhcpV4RecvSeq fullSetSeqGuard
-	dhcpV6RecvSeq fullSetSeqGuard
+	recvSeqMu                 sync.Mutex
+	ipsecRecvSeq              fullSetSeqGuard
+	dhcpV4RecvSeq             fullSetSeqGuard
+	dhcpV6RecvSeq             fullSetSeqGuard
+	persistentNatLeaseRecvSeq fullSetSeqGuard
 }
 
 // configApplyItem is one config-sync payload queued for ordered apply by the
