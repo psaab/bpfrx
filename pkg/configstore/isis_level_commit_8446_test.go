@@ -73,3 +73,28 @@ func TestISISLevelRejectionNamesTheSpellings_8446(t *testing.T) {
 		}
 	}
 }
+
+// setSchema carries TWO copies of the isis subtree — schemaProtocols (the
+// top-level `protocols` stanza) and schemaRoutingInstances (`routing-instances
+// <name> protocols isis`). Every cell above exercises only the first. Without
+// this one, stripping the validator from the routing-instance copy alone is a
+// SURVIVING mutation and the second copy is unguarded — which is how a leaf
+// ends up accepted in one context and rejected in the other.
+func TestISISLevelTypedInRoutingInstanceCopyToo_8446(t *testing.T) {
+	ri := func(stanza string) error {
+		_, err := CheckText(isisBase8446+
+			"routing-instances { vrf-a { instance-type virtual-router; protocols { isis { "+
+			"net 49.0001.1921.6800.1001.00; "+stanza+" } } } }\n", 0)
+		return err
+	}
+	// POSITIVE CONTROL: a canonical value must COMMIT here, so a rejection
+	// below is the validator firing and not the stanza being unreachable.
+	if err := ri("is-type level-1;"); err != nil {
+		t.Fatalf("control: a canonical `is-type level-1` was rejected in a routing-instance: %v", err)
+	}
+	for _, stanza := range []string{"is-type garbage;", "is-type 2;", "level level-3;"} {
+		if err := ri(stanza); err == nil {
+			t.Errorf("routing-instances copy: %q committed clean — the second schema copy is unguarded", stanza)
+		}
+	}
+}
