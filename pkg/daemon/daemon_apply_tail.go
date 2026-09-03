@@ -345,13 +345,32 @@ func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, 
 		// before that write — see setActiveTransportIfCurrent for the full
 		// ordering.
 		active := d.activeTransport()
-		if active != (clusterTransportKey{}) && newTransport != active {
+		// #7901: also restart when a teardown left comms down without one. The
+		// flag is CONSUMED here, so the recovery happens once per teardown --
+		// deliberately not a live "are comms down?" predicate, which would fire
+		// on every apply in that state and break #5078 (a key commit must not
+		// restart: it drops session-sync exactly when the primary becomes keyed)
+		// and #6878 (an unchanged transport must not restart).
+		//
+		// `active != zero` is UNCHANGED and still load-bearing: the boot
+		// applyConfig runs before daemon_run.go's startClusterComms, so step 20
+		// runs during boot with the field still zero
+		// (TestStepTwentyIgnoresANeverStartedNode_7072 brackets it).
+		restartOwed := d.takeClusterCommsRestartNeeded()
+		if active != (clusterTransportKey{}) && (newTransport != active || restartOwed) {
 			// #7073: the pairs are derived from clusterTransportKey, the same
 			// struct the comparison above compares whole. Writing them out by
 			// hand had already dropped the two fab1 fields, so a fab1-only
 			// change logged four identical old/new pairs.
-			slog.Info("cluster: transport config changed, restarting comms",
-				transportChangeLogArgs(active, newTransport)...)
+			// #7901: say WHICH disjunct fired. "transport config changed" on an
+			// identical key sends an operator looking for a delta that is not there.
+			if newTransport != active {
+				slog.Info("cluster: transport config changed, restarting comms",
+					transportChangeLogArgs(active, newTransport)...)
+			} else {
+				slog.Info("cluster: restarting comms owed by a teardown that did not "+
+					"restart them (#7901)", transportChangeLogArgs(active, newTransport)...)
+			}
 			d.stopClusterComms()
 			// #6878: through the seam so a test can bind restart COMPLETION.
 			// stopClusterComms bumps clusterCommsGen first, so the generation
