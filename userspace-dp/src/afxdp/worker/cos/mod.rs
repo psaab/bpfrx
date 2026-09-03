@@ -163,9 +163,19 @@ fn queue_uses_shared_exact_service(_iface: &CoSInterfaceConfig, queue: &CoSQueue
     // design that targeted shared-exact V_min / per-queue-lease coordination
     // (which DO require `queue.exact`). Those mechanisms remain
     // exact-gated at coordinator/mod.rs:1058 (`SharedCoSQueueLease`) and
-    // ~1145 (`SharedCoSQueueVtimeFloor`), so the only effect of admitting
-    // non-exact queues to the `shared_exact` execution policy is to
-    // bypass the single-owner funnel in `resolve_local_routing_decision`.
+    // ~1145 (`SharedCoSQueueVtimeFloor`).
+    //
+    // #8428: this used to conclude "so the ONLY effect of admitting non-exact
+    // queues to the `shared_exact` execution policy is to bypass the
+    // single-owner funnel in `resolve_local_routing_decision`". That was
+    // false. Admitting them ALSO routes them into `cos_queue_v_min_continue`,
+    // which is gated on `shared_exact()` and not on `exact` — and which then
+    // `.expect()`ed the very floor those exact-gated allocators had
+    // deliberately not built. Two panics, on ordinary traffic, on a config the
+    // commit path accepts. The consumer now treats a missing floor or
+    // flow-fair state as not-applicable, so widening this gate is once again
+    // only a routing change — but that is a property of the fix, not of the
+    // exact-gating cited above.
     //
     // The rate threshold (`COS_SHARED_EXACT_MIN_RATE_BYTES`, 312 MB/s ≈
     // 2.5 Gbps) is intentionally preserved: queues with a small explicit
