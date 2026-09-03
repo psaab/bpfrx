@@ -115,6 +115,30 @@ quit
 EOF
 	cos_require_markers "arm apply on $PRIMARY" /tmp/cnt8447.out "$COS_MARKER_COMMIT" \
 		|| { echo "COMMIT-FAILED 0 0 0"; return; }
+	# ASSERT THE FIXTURE IS WHAT WE THINK IT IS. A passing commit marker says
+	# the session committed, NOT that this arm's stanza is in the running
+	# config -- and an arm whose persistent-nat did not take looks exactly like
+	# "persistent-nat works fine": a session installs and the counters stay 0,
+	# because the allocation went down the non-persistent path. Measured: one
+	# run reported precisely that and contradicted every earlier arm.
+	local seen
+	# Brace-counted, not indentation-guessed. Measured: a `^        }` guess
+	# terminated the scan at the end of the pool's nested `port { ... }` block,
+	# before reaching `persistent-nat`, and reported the fixture as not applied
+	# on a config that had applied correctly -- a false negative that would
+	# have been read as a defect in the feature.
+	seen="$(fw_cli "$PRIMARY" "show configuration security nat source" \
+		| awk -v p="pool ${POOL_NAME} {" '
+			index($0,p) { f=1 }
+			f { d += gsub(/{/,"{"); d -= gsub(/}/,"}") }
+			f && /persistent-nat/ { print "yes"; exit }
+			f && d <= 0 { exit }')"
+	if [ "$persistent" = 1 ] && [ "$seen" != yes ]; then
+		echo "FIXTURE-NOT-APPLIED 0 0 0"; return
+	fi
+	if [ "$persistent" = 0 ] && [ "$seen" = yes ]; then
+		echo "FIXTURE-CONTAMINATED 0 0 0"; return
+	fi
 	fw_cli "$PRIMARY" "clear security flow session" >/dev/null 2>&1 || true
 	incus exec "$LAN_CLIENT" -- bash -c \
 		"nohup iperf3 --forceflush --connect-timeout 5000 -B ${POOL_SRC} -t 20 -c ${TARGET} -p ${POOL_PORT} -P 2 >/tmp/cnt-iperf.log 2>&1 &" || true
@@ -137,6 +161,9 @@ echo "======================================"
 if [ "${c_pn:-0}" -eq 0 ] 2>/dev/null; then
 	echo "VOID: the PLAIN-pool control installed no pool-translated session, so traffic"
 	echo "  did not reach the NAT path at all and 'both zero' below would say nothing."
+elif [ "${p_n}" = FIXTURE-NOT-APPLIED ] || [ "${c_n}" = FIXTURE-CONTAMINATED ]; then
+	echo "VOID: the arm's config was not what it claimed (${p_n}/${c_n}). An arm whose"
+	echo "  persistent-nat did not take is indistinguishable from persistent-nat working."
 elif [ "${p_adm}" = ERR ] || [ "${p_adm}" = ABSENT ]; then
 	echo "VOID: could not read the counters (${p_adm}). The deployed helper may predate"
 	echo "  them, or the pool row is absent from the REST surface."
