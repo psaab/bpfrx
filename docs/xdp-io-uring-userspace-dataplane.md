@@ -363,7 +363,10 @@ Example:
   packet it receives (`drop_degraded_transit` on `BINDING_MISSING`), while the
   interface reads up and the loss appears in no counter
 - a queue is only genuinely out of the fast path if RSS is also kept off it;
-  the binding plan and the RSS indirection table have to agree
+  the binding plan and the RSS indirection table have to agree. #7497 makes
+  that an enforced property rather than an expectation: the fed set is
+  `[0, min(workers, min(rx, 16)))`, so it can no longer overrun the bound set
+  (`computeWeightVector`, `pkg/daemon/rss_indirection.go`)
 
 This is stricter than "one worker per core", but it avoids hidden cross-queue
 forwarding costs.

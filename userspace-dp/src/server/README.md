@@ -695,14 +695,33 @@ binding.worker_id = (queue_id % workers.max(1)) as u32;
 so modulo assignment can map multiple queues onto the same worker
 when `queues > workers`. The Go side's
 `pkg/daemon/rss_indirection.go` reshapes RSS indirection only on
-**mlx5** drivers and only when `workers > 1 && workers < queues`,
-concentrating traffic onto queues `0..workers-1` (it does not change
-the Rust planner's `queue_count`). With `workers == 1` it leaves the
-live RSS table untouched (single worker drains all queues), and on
+**mlx5** drivers, concentrating traffic onto queues `0..active-1`
+where `active = min(workers, bound)` and `bound = min(queues,
+BindingQueuesPerIface)` (it does not change the Rust planner's
+per-interface queue count).
+
+`active` is bounded by BOUND queues and not by `workers` alone (#7497).
+The planner binds `min(rx_queues, 16)` per interface, so a NIC with more
+RX queues than the stride has queues with no AF_XDP socket at all, and
+feeding one is not merely wasteful: the shim resolves no binding and
+takes `drop_degraded_transit`, so every transit packet steered there is
+dropped while the interface reads up. Before that fix the fed set was
+`[0, workers)` and could overrun the bound set — measured at
+`workers=20, hwq=32` feeding 20 queues with 16 bound. Two of the wrong
+cases never reached vector construction at all: `workers >= queues` took
+the skip branch and left the kernel default feeding every hardware
+queue, and so did `workers == 1`.
+
+With `workers == 1` it still spreads rather than concentrating onto
+queue 0 (#5124 — pinning would serialize the worker on one IRQ), but it
+spreads across the BOUND queues, not every hardware queue. When
+`active == queues` — everything bound and worker-served — it leaves the
+live RSS table untouched, since the round-robin default already feeds
+exactly that set. On
 non-mlx5 drivers (i40e, etc.) it doesn't reshape at all. The default
 RSS table is restored either when the kill switch fires
 (`enabled == false`), or via `maybeRestoreDefault()` on the
-`workers > 1 && workers >= queues > 1` path — there to undo a
+`active >= queues > 1` skip path — there to undo a
 concentrated table left by an earlier `workers < queues`
 configuration (#805). On non-mlx5 + `workers > 1 && workers <
 queues`, modulo collision can leave one worker bound to multiple
