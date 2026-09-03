@@ -485,6 +485,18 @@ pub(super) fn retry_pending_neigh(
             .flow_key
             .as_ref()
             .map(|key| crate::session::forward_wire_key(key, decision.nat));
+        // #7656: the buffered frame can also be FLOWLESS (a non-first fragment
+        // whose association carried no key). It has the same defect as the
+        // immediate path — every downstream read falls back to the ingress meta,
+        // which under NAT64 is the pre-translation family/addresses/protocol —
+        // and `decision.nat` is available here just as it is there, so it gets
+        // the same synthesized post-NAT tuple rather than a `None` that would
+        // leave this path quietly wrong.
+        let flowless_wire_flow = if pkt.flow_key.is_none() {
+            crate::afxdp::forward_request::l3_wire_session_flow_from_meta(pkt.meta, decision.nat)
+        } else {
+            None
+        };
         let cos = resolve_cos_tx_selection_at_prenat(
             forwarding,
             decision.resolution.egress_ifindex,
@@ -493,6 +505,7 @@ pub(super) fn retry_pending_neigh(
             pkt.flow_key.as_ref(),
             cos_extra,
             now_ns,
+            flowless_wire_flow.as_ref().map(|f| &f.forward_key),
         );
         if cos.drop {
             // #7176 (C179-001): apply the SAME reject-reply / filter-log side
@@ -526,6 +539,7 @@ pub(super) fn retry_pending_neigh(
                     // redirect path forwards immediately and never buffers.
                     fabric_ingress_zone: None,
                     now_ns,
+                    flowless_wire_flow,
                 },
                 source_frame,
                 deferred_flow.as_ref(),

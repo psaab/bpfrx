@@ -2497,44 +2497,50 @@ fn nat64_frag_assoc_miss_must_drop_with_default_route_6927() {
     );
 }
 
-/// #6836: the flowless egress filter-log path, exercised for the first time —
-/// and what it actually shows is a FAMILY asymmetry, not a missing log.
+/// #7656 (was #6836): the flowless egress output filter is selected AND matched
+/// on the POST-NAT tuple.
 ///
-/// `forward_request.rs`'s flowless branch (#5467) rebuilds an L3-only flow
-/// solely to attribute a filter-log event for a packet with no
-/// `tx_selection_flow`. It had never run under a NAT64 fixture, because two
-/// independent conditions gate it and no NAT64 fixture satisfied either: the
-/// meta fixtures left the flow addresses zeroed, and none ever set an output
-/// filter.
+/// # History, because this cell has been wrong twice
 ///
-/// # The asymmetry, measured
-///
-/// `resolve_cos_tx_selection_at` picks the output-filter family from the
-/// egress `flow_key` when there is one, and falls back to the INGRESS
-/// `meta.addr_family` when there is not (`cos_classify.rs`, "Fall back to the
-/// ingress meta family only on the flowless / default-queue path"). Under NAT64
-/// the packet CHANGES family, so:
-///
-///     first fragment  (has a flow_key)  -> evaluated against the egress V4 filter
-///     non-first frag  (flowless)        -> evaluated against the egress V6 filter
-///
-/// Both leave the box as IPv4 on the same interface. An operator who applies a
-/// v4 output filter to that v4 egress sees the first fragment and not the rest.
-///
-/// # This test asserts the behaviour, not a gap
-///
-/// An earlier version of this cell attached only a v4 filter, observed
-/// `filter_log.sent == 0` for the flowless packet, and concluded the branch did
-/// not run. That was wrong, and wrong in the way this whole issue is about:
-/// zero is also what you get when no filter of the looked-up family exists, so
+/// It was first written to show that `forward_request.rs`'s flowless branch
+/// (#5467) never ran under NAT64 — it attached only a v4 filter, saw
+/// `filter_log.sent == 0`, and concluded the branch was dark. That was wrong:
+/// zero is also what you get when no filter of the LOOKED-UP family exists, so
 /// the assertion could not tell "the branch is broken" from "nothing matched".
 /// Deleting the entire #5467 branch left it green.
 ///
-/// Both arms are now asserted, which is what makes either mean anything: with
-/// the v6 filter the flowless packet IS logged, and with only the v4 filter it
-/// is not.
+/// It was then rewritten to assert the real finding — a FAMILY asymmetry, with
+/// the flowless packet evaluated against the INGRESS (v6) family because it had
+/// no egress `flow_key` to read the family from, while the flow-bearing first
+/// fragment used the egress (v4) family. Both leave the box as IPv4 on the same
+/// interface, so an operator's v4 output filter saw the first fragment and not
+/// the rest.
+///
+/// # What #7656 fixed, and why it is not just the family
+///
+/// The flowless arm now receives a synthesized POST-NAT L3 wire key
+/// (`l3_wire_session_flow_from_meta`), put through the same `forward_wire_key`
+/// the flow-bearing path uses. Family, addresses and protocol therefore move
+/// together BY CONSTRUCTION, including the NAT64 `ICMPV6`<->`ICMP` swap.
+///
+/// Fixing only the FAMILY would have been worse than the bug and invisible here:
+/// it selects the v4 filter and then evaluates it against the pre-NAT v6
+/// addresses, so every `from source-address` / `destination-address` term stops
+/// matching and only address-less terms still fire — and every term in THIS
+/// cell is address-less. That half-fix was measured on master: it reds arm 2
+/// below, and leaves the address-bearing arm B of
+/// `nat64_flowless_fragment_output_filter_matches_the_postnat_tuple_7656` at 0,
+/// which is what actually binds it. Do not "simplify" this to a family-only
+/// change; that test is the guard.
+///
+/// # The arms
+///
+/// Both packets now select the SAME (v4 egress) family, so arms 1 and 2 agree
+/// and arm 3 goes to all-zero. Arm 3's zeros are meaningful ONLY because arm 2
+/// shows the same two packets DO log when the v4 filter logs — without that
+/// pairing an all-zero arm would be indistinguishable from a dead fixture.
 #[test]
-fn nat64_flowless_fragment_uses_the_ingress_family_output_filter_6836() {
+fn nat64_flowless_fragment_uses_the_egress_family_output_filter_7656() {
     // Each arm attaches filters to the SAME v4 egress interface and states the
     // expected event count for BOTH packets: the flow-bearing first fragment
     // (which has an egress flow_key, so it selects the v4 egress family) and
@@ -2562,18 +2568,24 @@ fn nat64_flowless_fragment_uses_the_ingress_family_output_filter_6836() {
             1u64,
         ),
         (
-            "v4 filter only: the flowless arm looks up v6 and finds nothing",
+            // #7656 inversion: the flowless packet now finds the v4 filter,
+            // because it leaves as IPv4. Was flowless=0.
+            "v4 filter only: the flowless arm now looks up v4 and finds it",
             false,
             true,
             1u64,
-            0u64,
+            1u64,
         ),
         (
-            "ONLY the v6 filter logs: the selected FAMILY is the sole difference",
+            // #7656 inversion: with the v4 filter present but not logging,
+            // NEITHER packet logs, because both now select v4. Was
+            // first=0/flowless=1, the old family asymmetry. These zeros are
+            // read against arm 2 above, where the same packets both log.
+            "ONLY the v6 filter logs: neither packet selects v6 any more",
             true,
             false,
             0u64,
-            1u64,
+            0u64,
         ),
     ] {
         let (name, attach_v6, v4_logs, want_first, want_flowless) = tc;
@@ -2900,6 +2912,167 @@ fn frag_authority_routing_table_is_inert_in_production_7051() {
              is LIVE. See this test's doc comment for what to update — this is \
              not a defect, it is the trigger #6927 r2 wrote down (#7051)",
             line.trim()
+        );
+    }
+}
+
+
+/// #7656: the flowless output filter must match the POST-NAT TUPLE, not just be
+/// selected from the post-NAT family.
+///
+/// This is the cell that distinguishes the real fix from the half-fix, and the
+/// sibling cell above cannot do it: every term there is address-less, so it
+/// fires whichever addresses the evaluator was handed. A change that fixed only
+/// the FAMILY would select the v4 filter and then evaluate it against the
+/// pre-NAT v6 addresses — every `from source-address` / `destination-address`
+/// term would silently stop matching, the suite would go green, and the feature
+/// would be LESS correct than before the fix.
+///
+/// Measured on master before the fix, so the expectations below are not derived
+/// from the implementation:
+///
+///     arm            master   family-only half-fix   correct fix
+///     A (v6 addr)      1              0                   0
+///     B (v4 addr)      0              0                   1
+///
+/// Arm B is the binder. It is the only value the half-fix cannot produce.
+#[test]
+fn nat64_flowless_fragment_output_filter_matches_the_postnat_tuple_7656() {
+    // (label, address term on the v4 filter, address term on the v6 filter,
+    //  want_first, want_flowless)
+    for (label, v4_has_term, v6_has_term, want_first, want_flowless) in [
+        // The pre-NAT v6 SOURCE. Before #7656 the flowless packet matched this,
+        // which is precisely the bug: it was evaluated on the tuple it arrived
+        // with rather than the one it left with.
+        (
+            "v6 source-address term: the pre-NAT tuple must no longer match",
+            false,
+            true,
+            0u64,
+            0u64,
+        ),
+        // The post-NAT v4 DESTINATION (8.8.8.8, extracted from the 64:ff9b::
+        // prefix). The flow-bearing first fragment has always matched this —
+        // that 1 is the positive control proving the term is well-formed and
+        // reachable on this path, so the flowless value next to it is about the
+        // flowless packet and not about a broken fixture.
+        (
+            "v4 destination-address term: the post-NAT tuple must match",
+            true,
+            false,
+            1u64,
+            1u64,
+        ),
+    ] {
+        let mut snapshot = nat64_frag_snapshot();
+        let egress = snapshot
+            .interfaces
+            .iter_mut()
+            .find(|i| i.name == "reth0.80")
+            .expect("#7656 premise: the NAT64 fixture must have the reth0.80 v4 egress");
+        // BOTH families are attached in both arms, so neither per-family
+        // aggregate short-circuits before a lookup happens and a zero always
+        // means "did not match", never "nothing was configured".
+        egress.filter_output_v4 = "pnat-v4".to_string();
+        egress.filter_output_v6 = "pnat-v6".to_string();
+
+        let mut term_v4 = crate::protocol::FirewallTermSnapshot {
+            name: "addr".to_string(),
+            action: "accept".to_string(),
+            log: v4_has_term,
+            protocols: vec!["tcp".to_string()],
+            ..Default::default()
+        };
+        if v4_has_term {
+            term_v4.destination_addresses = vec!["8.8.8.8/32".to_string()];
+            term_v4.destination_constrained = true;
+        }
+        let mut term_v6 = crate::protocol::FirewallTermSnapshot {
+            name: "addr".to_string(),
+            action: "accept".to_string(),
+            log: v6_has_term,
+            protocols: vec!["tcp".to_string()],
+            ..Default::default()
+        };
+        if v6_has_term {
+            term_v6.source_addresses = vec!["2001:559:8585:ef00::102/128".to_string()];
+            term_v6.source_constrained = true;
+        }
+        snapshot.filters = vec![
+            crate::protocol::FirewallFilterSnapshot {
+                name: "pnat-v4".to_string(),
+                family: "inet".to_string(),
+                terms: vec![term_v4],
+            },
+            crate::protocol::FirewallFilterSnapshot {
+                name: "pnat-v6".to_string(),
+                family: "inet6".to_string(),
+                terms: vec![term_v6],
+            },
+        ];
+
+        let forwarding = build_forwarding_state(&snapshot);
+        let ha_state = txn_ha_state();
+        let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+        binding.interface = Arc::<str>::from("reth1.0");
+        let mut sessions = SessionTable::new();
+        sessions.set_max_sessions_for_test(16);
+
+        let src: Ipv6Addr = "2001:559:8585:ef00::102".parse().expect("src v6");
+        let dst: Ipv6Addr = "64:ff9b::808:808"
+            .parse()
+            .expect("nat64 dst (extracts 8.8.8.8)");
+
+        // Both packets go through the CAPTURING runner for the clock reason
+        // documented on t_run_6836 — mixing runners silently breaks the
+        // fragment association and the non-first fragment does not forward.
+        let first = nat64_v6_frag_frame(0x0001, 0x1234_5678, src, dst, 12345, 443);
+        let (b1, dbg1, first_handle, _rx1) = txn_run_descriptor_capturing_events(
+            &mut binding,
+            &mut sessions,
+            &forwarding,
+            &ha_state,
+            &first,
+            nat64_v6_frag_meta(first.len(), src, dst),
+        );
+        assert_eq!(dbg1.tx, 1, "{label}: the first fragment must forward");
+        assert_eq!(
+            b1.nat64_translations, 1,
+            "{label}: the first fragment must be NAT64-translated, or the v4 \
+             address term below is being matched against a packet that never \
+             became IPv4"
+        );
+        assert_eq!(
+            first_handle.dataplane_event_stats().filter_log.sent,
+            want_first,
+            "{label}: flow-bearing first fragment"
+        );
+
+        let non_first = nat64_v6_frag_frame(0x0008, 0x1234_5678, src, dst, 0, 0);
+        let (b2, dbg2, second_handle, _rx2) = txn_run_descriptor_capturing_events(
+            &mut binding,
+            &mut sessions,
+            &forwarding,
+            &ha_state,
+            &non_first,
+            nat64_v6_frag_meta(non_first.len(), src, dst),
+        );
+        assert_eq!(dbg2.tx, 1, "{label}: the non-first fragment must forward");
+        assert_eq!(
+            b2.nat64_translations, 1,
+            "{label}: the non-first fragment must ALSO be NAT64-translated -- it \
+             is the packet under test and must leave as IPv4 for the tuple \
+             question to mean anything"
+        );
+        assert_eq!(
+            second_handle.dataplane_event_stats().filter_log.sent,
+            want_flowless,
+            "{label}: FLOWLESS non-first fragment. If this is 0 on the v4 \
+             destination-address arm, the output filter is being selected from \
+             the post-NAT family but still MATCHED against the pre-NAT v6 \
+             addresses -- the family-only half-fix. Family, tuple and protocol \
+             must all come from the synthesized post-NAT wire key \
+             (l3_wire_session_flow_from_meta), not three separate reads"
         );
     }
 }

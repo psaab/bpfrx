@@ -1655,6 +1655,7 @@ fn ingress_input_filter_rewalk_uses_prenat_key_5158() {
         Some(&ingress_key),
         TermMatchExtra::default(),
         now_ns,
+        None,
     );
     assert_eq!(
         runtime.queue_id,
@@ -1687,6 +1688,7 @@ fn ingress_input_filter_rewalk_uses_prenat_key_5158() {
         Some(&egress_wire_key),
         TermMatchExtra::default(),
         now_ns,
+        None,
     );
     assert_eq!(
         reverted_runtime.queue_id,
