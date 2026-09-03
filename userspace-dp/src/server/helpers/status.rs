@@ -80,6 +80,11 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
         crate::io_uring_write::process_retained().buffers();
     state.status.io_uring_retained_bytes_total =
         crate::io_uring_write::process_retained().bytes();
+    // #7944: capacity refusals, same process-global sink.
+    state.status.io_uring_write_refused_total =
+        crate::io_uring_write::process_retained().refused_writes();
+    state.status.io_uring_write_refused_bytes_total =
+        crate::io_uring_write::process_retained().refused_bytes();
     // #2375: distinct-hop capacity-drop gate at pending_neigh admission
     // (a NEW unresolved hop refused because the map is at
     // MAX_PENDING_NEIGH) — the scan/upstream-outage failure mode, kept

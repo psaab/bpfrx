@@ -893,6 +893,8 @@
     "io_uring_planned": false,
     "io_uring_retained_buffers_total": 0,
     "io_uring_retained_bytes_total": 0,
+    "io_uring_write_refused_bytes_total": 0,
+    "io_uring_write_refused_total": 0,
     "last_cache_flush_at": 0,
     "last_fib_generation": 0,
     "last_snapshot_generation": 0,
