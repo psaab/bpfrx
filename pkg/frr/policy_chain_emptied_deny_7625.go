@@ -45,10 +45,20 @@ import (
 
 // emptiedChainDenyName is the reserved route-map name carrying the bounded deny
 // that an emptied policy chain attaches. It ends in ReservedChainSuffix, the
-// namespace the strict commit path forbids operator policy-statements from
-// using (compiler_validate_strict_routing.go) — FRR keys route-maps by name in
-// one global namespace and MERGES same-named definitions, so a forgeable name
-// could fuse operator permits into this deny and reopen the hole.
+// namespace the strict commit path forbids operator POLICY-STATEMENTS from
+// using (compiler_validate_strict_routing.go).
+//
+// That namespace is NOT sufficient on its own, and an earlier version of this
+// comment wrongly said it was. Strict rejects a policy-statement whose name ENDS
+// in the suffix; it does not stop several legally named policies from JOINING
+// into this name. composedChainName(["xpf","emptied","chain"]) is byte-identical
+// to it. FRR keys route-maps by name in one global namespace and MERGES
+// same-named definitions, so such a chain would fuse its permits into this deny
+// — reopening the unfiltered-direction hole — and have its own filter corrupted
+// by the deny's sequence in the same merge. bgpComposedChainCollision fails the
+// apply CLOSED on that derivation; emptiedChainDenyCollision covers the direct
+// operator-policy-statement spelling. Both are required: neither sees the other's
+// case.
 const emptiedChainDenyName = "xpf-emptied-chain" + ReservedChainSuffix
 
 // chainEmptiedByUndefinedPolicies reports whether authored is a non-empty policy

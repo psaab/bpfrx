@@ -435,9 +435,19 @@ wrote.
 direction (`config.TestBGPNeighborImportTypoRejected`), so no commit-time
 surface was added: these configs reach the renderer only on the lenient load /
 HA peer-sync / rollback path (#1960), having committed on an older binary or
-arrived from a peer. A render-side collision guard fails the apply **closed** if
-an operator policy-statement carries the reserved deny name, since FRR merges
-same-named route-maps and the merge could fuse permits into the deny.
+arrived from a peer. Two render-side collision guards fail the apply **closed**, because
+FRR merges same-named route-maps and a merge would fuse permits into the deny
+(reopening the hole) while corrupting the other object's filter in the same
+step. Both are required — neither sees the other's case:
+
+- `emptiedChainDenyCollision` — an operator policy-statement **named** the
+  reserved name.
+- `bgpComposedChainCollision` — a composed chain that **derives** it. The
+  reserved suffix does *not* make the name unforgeable, which an earlier version
+  of this section wrongly implied: strict rejects a policy-statement whose name
+  *ends* in `-xpf-chain`, but nothing stops several legally named policies from
+  joining into it — `composedChainName(["xpf","emptied","chain"])` is
+  byte-identical to `xpf-emptied-chain-xpf-chain`.
 
 ## Gotchas
 
