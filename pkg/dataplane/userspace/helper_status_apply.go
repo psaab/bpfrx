@@ -443,6 +443,27 @@ func (m *Manager) applyRuntimeModeLocked(ctrl *userspaceCtrlValue) {
 // partial inventory back only so no information is lost — the caller returns
 // on a non-nil error without touching m.lastBindingIndices, which is the
 // pre-#6429 behaviour.
+// bindingSlotOutOfRangeError reports a helper-supplied binding slot that the
+// slot-keyed shim maps cannot address.
+//
+// This is a DIFFERENT guard from the map-ABI drift check added with the
+// plan-time cap (`validateUserspaceShimSpecWith`), and the two must not be
+// conflated: that one verifies the maps are the size we believe at load, this
+// one verifies a row we are about to write can actually be addressed in them.
+// A correct map size does not make an out-of-range slot writable.
+//
+// It is also NOT redundant with the helper's own plan-time refusal
+// (`MAX_BINDING_SLOTS` in userspace-dp). They are separate trust boundaries:
+// during a rolling HA upgrade the two nodes run different binaries, so a peer
+// helper predating that cap can hand this manager a slot at or above the map
+// capacity, and without this check the manager would write it (#7497 blocker 8).
+func bindingSlotOutOfRangeError(slot uint32, ifindex int, queue uint32) error {
+	return fmt.Errorf(
+		"update userspace_bindings: slot=%d exceeds the %d-entry userspace_heartbeat/userspace_xsk_map capacity (ifindex=%d queue=%d); the shim indexes BOTH by binding slot, so this row could never be redirected to or heartbeat-checked (#7497)",
+		slot, dataplane.BindingSlotMapMaxEntries, ifindex, queue,
+	)
+}
+
 func (m *Manager) applyPrimaryBindingRowsLocked(
 	status *ProcessStatus,
 	ctrlMap ctrlMapUpdater,
@@ -452,6 +473,13 @@ func (m *Manager) applyPrimaryBindingRowsLocked(
 	newBindingIndices []uint32,
 	newBindingIndexSet map[uint32]struct{},
 ) ([]uint32, error) {
+	// #7497 blocker 8: the helper's binding list is accepted on trust today.
+	// These two maps are LOCAL to this call deliberately — the shared
+	// newBindingIndexSet accumulator also carries the alias path's rows, and a
+	// VLAN alias legitimately REUSES its parent's slot at a different index, so
+	// a uniqueness check spanning both paths would reject correct configs.
+	seenSlotIfindex := make(map[uint32]int, len(status.Bindings))
+	seenCoordSlot := make(map[uint32]uint32, len(status.Bindings))
 	for _, binding := range status.Bindings {
 		if binding.Ifindex <= 0 {
 			continue
@@ -495,6 +523,36 @@ func (m *Manager) applyPrimaryBindingRowsLocked(
 				idx, dataplane.BindingArrayMaxEntries, binding.Ifindex, binding.QueueID,
 			))
 		}
+		// Slot-dimension bound (#7497 blocker 8). The two guards above bound
+		// the COMPOSED index into userspace_bindings; neither bounds `Slot`,
+		// which is what indexes userspace_heartbeat and userspace_xsk_map —
+		// maps 256x smaller than BindingArrayMaxEntries.
+		if binding.Slot >= dataplane.BindingSlotMapMaxEntries {
+			return newBindingIndices, m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl,
+				bindingSlotOutOfRangeError(binding.Slot, binding.Ifindex, binding.QueueID))
+		}
+		// Duplicate (ifindex, queue): two rows resolving to one composed index.
+		// Without this the second Update silently overwrites the first and the
+		// first row's XSK is orphaned — registered and heartbeating, but no
+		// longer reachable by any redirect. Nothing counts that.
+		if prevSlot, dup := seenCoordSlot[idx]; dup {
+			return newBindingIndices, m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, fmt.Errorf(
+				"update userspace_bindings: duplicate (ifindex=%d queue=%d) from the helper — slot=%d would overwrite slot=%d at idx=%d and orphan the first slot's XSK (#7497)",
+				binding.Ifindex, binding.QueueID, binding.Slot, prevSlot, idx,
+			))
+		}
+		// Duplicate slot across DIFFERENT coordinates: two RX queues steering
+		// into one XSK. The redirect would succeed and the packets would be
+		// adjudicated, so this is invisible downstream — but one of the two
+		// queues has no socket of its own and the plan is not what it claims.
+		if prevIfindex, dup := seenSlotIfindex[binding.Slot]; dup {
+			return newBindingIndices, m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, fmt.Errorf(
+				"update userspace_bindings: slot=%d claimed twice by the helper (ifindex=%d queue=%d and ifindex=%d) — binding slots are minted densely and must be unique per row (#7497)",
+				binding.Slot, binding.Ifindex, binding.QueueID, prevIfindex,
+			))
+		}
+		seenCoordSlot[idx] = binding.Slot
+		seenSlotIfindex[binding.Slot] = binding.Ifindex
 		val := userspaceBindingValue{
 			Slot:  binding.Slot,
 			Flags: flags,
@@ -550,6 +608,16 @@ func (m *Manager) applyAliasBindingRowsLocked(
 					"update aliased userspace_bindings: idx=%d exceeds cap=%d (child=%d parent=%d queue=%d; raise MAX_INTERFACES in bpf/headers/xpf_common.h)",
 					idx, dataplane.BindingArrayMaxEntries, childIfindex, parentIfindex, binding.QueueID,
 				))
+			}
+			// Slot-dimension bound (#7497 blocker 8), repeated here rather
+			// than relied upon from the primary pass. Every binding this
+			// loop mirrors is one the primary pass already validated, so
+			// today this is unreachable — but that is a property of the
+			// CALL ORDER in applyUserspaceHelperStatusLocked, not of this
+			// function, and an ordering assumption is not a guard.
+			if binding.Slot >= dataplane.BindingSlotMapMaxEntries {
+				return newBindingIndices, m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl,
+					bindingSlotOutOfRangeError(binding.Slot, int(childIfindex), binding.QueueID))
 			}
 			val := userspaceBindingValue{
 				Slot:  binding.Slot,

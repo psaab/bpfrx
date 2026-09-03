@@ -88,6 +88,30 @@ The shim checks several conditions before redirecting a packet to userspace:
      #4894), and an `ifindex >= MAX_INTERFACES` would overflow the array cap
      (#814). The apply path disables `userspace_ctrl` and the watchdog logs and
      skips.
+
+     It also fails closed on three properties of the ROW ITSELF, which the two
+     dimension guards above cannot see because they only constrain the index
+     (#7497): a `Slot` at or above the slot-keyed map capacity (see the slot
+     axis below — the composed-index guards are checked against a bound 256x
+     larger and do not stand in for it); a duplicate `(ifindex, queue)`, where
+     the second write would silently overwrite the first and orphan its XSK —
+     registered and heartbeating, but unreachable by any redirect, and counted
+     nowhere; and one `Slot` claimed by two different coordinates, where both
+     redirects succeed and one queue has no socket of its own.
+
+     The slot bound is **not** redundant with the helper's own plan-time
+     refusal. They are separate trust boundaries: during a rolling HA upgrade
+     the two nodes run different binaries, so a peer helper predating that cap
+     can hand this manager an out-of-range slot. It is also a different guard
+     from the map-ABI drift check in `validateUserspaceShimSpecWith`, which
+     verifies the maps are the size we believe at load — not that a row we are
+     about to write can be addressed in them.
+
+     Slot uniqueness is scoped to the primary pass alone, and deliberately so:
+     `applyAliasBindingRowsLocked` mirrors each VLAN child onto its parent's
+     rows carrying the PARENT's slot, so one slot legitimately appears at
+     several indices. A uniqueness check spanning both passes would reject
+     every VLAN-aliased config.
    - **Read side (shim).** `binding_slot()` returns no slot at all for a
      `queue_id >= 16`, so the shim takes its binding-missing path — local and
      control traffic passes, transit takes the explicit degraded drop. This is
