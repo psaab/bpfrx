@@ -308,6 +308,15 @@ def decide(
     # is discarded by every consumer that reads `verdict`, which is what let
     # the confound survive to be cited.
     #
+    # ORDERING: this runs BEFORE the cell-status check, so a cell that is BOTH
+    # short of valid reps AND on a shared target reports VOID rather than
+    # INSUFFICIENT-DATA. That is the more useful of the two, and deliberate:
+    # INSUFFICIENT-DATA says "collect more reps", and more reps cannot make an
+    # unattributable comparison attributable. Attribution is the prior
+    # question. A cell with NO valid reps has no targets recorded and still
+    # reports INSUFFICIENT-DATA, which is also right — there is nothing to
+    # attribute yet.
+    #
     # The check passes the moment the two targets differ, so standing up a
     # second host on VLAN 80 and pointing ELEPHANT_TARGET_V4 at it turns the
     # gate back on with no further change. See target-services.sh for why

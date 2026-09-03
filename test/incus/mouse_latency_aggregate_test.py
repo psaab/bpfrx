@@ -457,3 +457,30 @@ class VoidNotAttributableTests(unittest.TestCase):
         )
         self.assertEqual(v["verdict"], "VOID-NOT-ATTRIBUTABLE")
         self.assertIn("idle cell", v["reason"])
+
+    def test_void_takes_precedence_over_insufficient_data(self):
+        """Attribution is the prior question.
+
+        INSUFFICIENT-DATA says "collect more reps"; more reps cannot make an
+        unattributable comparison attributable. Reporting it here would send
+        someone to spend a cluster lock gathering data that still could not
+        mean anything.
+        """
+        short = {
+            "status": "INSUFFICIENT-VALID-REPS",
+            "mouse_target": "172.16.80.200",
+            "elephant_target": "172.16.80.200",
+            "median_rep": None,
+        }
+        v = self._decide(short, self._cell("172.16.80.200", "172.16.80.200", 6765))
+        self.assertEqual(v["verdict"], "VOID-NOT-ATTRIBUTABLE")
+
+    def test_a_cell_with_no_valid_reps_still_reports_insufficient_data(self):
+        """The other side of that ordering: nothing to attribute yet.
+
+        A cell with zero valid reps records no targets at all, so the void
+        cannot fire and INSUFFICIENT-DATA is the correct, more specific answer.
+        """
+        empty = {"status": "INSUFFICIENT-VALID-REPS", "median_rep": None}
+        v = self._decide(empty, {"status": "OK", "median_rep": {"p999_us": 6765}})
+        self.assertEqual(v["verdict"], "INSUFFICIENT-DATA")
