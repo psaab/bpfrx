@@ -248,6 +248,17 @@ func (c *xpfCollector) collectSystemMetrics(ch chan<- prometheus.Metric) {
 	// otherwise-silent #3757 self-heal retry loop so a stuck overlay
 	// actuation (degraded failover) is observable. Independent of
 	// ipmonStatusFn: it is meaningful even with zero FAILED policies.
+	// #7437: the route-listener pair. Emitted independently so a nil fn on
+	// one does not suppress the other -- they are read together and a missing
+	// half is worse than an absent pair.
+	if c.srv.routeListenerMarksFn != nil {
+		ch <- prometheus.MustNewConstMetric(c.routeListenerMarks,
+			prometheus.CounterValue, float64(c.srv.routeListenerMarksFn()))
+	}
+	if c.srv.routeListenerRepublishesFn != nil {
+		ch <- prometheus.MustNewConstMetric(c.routeListenerRepublishes,
+			prometheus.CounterValue, float64(c.srv.routeListenerRepublishesFn()))
+	}
 	if c.srv.ipmonActuationFailuresFn != nil {
 		ch <- prometheus.MustNewConstMetric(c.ipmonActuationFailures,
 			prometheus.CounterValue, float64(c.srv.ipmonActuationFailuresFn()))

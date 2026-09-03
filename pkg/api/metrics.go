@@ -299,12 +299,14 @@ type xpfCollector struct {
 	// unresolved interface-typed next-hop gauge (preferred routes of
 	// FAILED policies skipped from the overlay for lack of a
 	// DHCP-learned gateway).
-	ipmonPolicyFailed       *prometheus.Desc
-	ipmonPolicyTransitions  *prometheus.Desc
-	ipmonRoutesApplied      *prometheus.Desc
-	ipmonRoutesDesired      *prometheus.Desc
-	ipmonUnresolvedNextHops *prometheus.Desc
-	ipmonActuationFailures  *prometheus.Desc
+	ipmonPolicyFailed        *prometheus.Desc
+	ipmonPolicyTransitions   *prometheus.Desc
+	ipmonRoutesApplied       *prometheus.Desc
+	ipmonRoutesDesired       *prometheus.Desc
+	ipmonUnresolvedNextHops  *prometheus.Desc
+	ipmonActuationFailures   *prometheus.Desc
+	routeListenerMarks       *prometheus.Desc
+	routeListenerRepublishes *prometheus.Desc
 
 	// #1895: count of RPM next-hop probe pins whose kernel fwmark
 	// rule / pinned route failed to install (affected tests hold

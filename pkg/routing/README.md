@@ -928,6 +928,30 @@ which paths a prefix load-balances over.
 
 ## Kernel-learned route import (#7409)
 
+**Refresh trigger (#7437).** The import is re-run whenever the routes-only
+snapshot is republished. Until #7437 that happened on an operator commit or an
+ip-monitoring actuation only, so a route the kernel learned in between stayed
+absent from the helper FIB until the next push — a window bounded by "time to
+the next commit", which on a quiet box with a flapping BGP peer is unbounded in
+practice.
+
+`pkg/daemon/daemon_route_listener.go` now subscribes to kernel route events and
+drives that republish. It **marks only**: the actuation is coalesced through
+`pkg/coalesce` (debounce 1 s, throttle 3 s, the `pkg/ipmon` precedent) because
+every publish is a full snapshot replace over a control socket whose deadline
+scales with payload size, and a per-event push under route churn would starve
+session installs rather than merely add latency.
+
+The listener's imported-table predicate calls `LearnedRouteTableIDs` — this
+package's own function — rather than keeping a second copy of which tables are
+imported, so the listener and the importer cannot disagree about which events
+matter.
+
+**The window is narrower, not closed.** A route learned at *t* reaches the
+helper FIB some seconds later, and on a fresh boot the first push still bounds
+it. The `NoRoute` disposition therefore **remains** slow-path eligible; #6664's
+proposal to drop it is not made safe by #7437 alone.
+
 `fibimport.go` reads the kernel FIB and hands the *learned* routes to the
 userspace dataplane's snapshot builder
 (`pkg/dataplane/userspace` `buildRouteSnapshots`).
