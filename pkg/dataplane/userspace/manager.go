@@ -262,8 +262,13 @@ type Manager struct {
 	lastStandbyNeighResolve time.Time
 	bindingsBusySince       time.Time
 	lastBindingsAutoRebind  time.Time
-	publishedSnapshot       uint64
-	publishedPlanKey        string
+	// consecutiveFailedAutoRebinds counts auto-rebind attempts that did not
+	// clear the wedge (#7497 blocker 5). Reset to 0 the moment no wedge is
+	// detected. Guarded by the same mutex as the two fields above — every
+	// reader and writer is on a ...Locked path reached from the status poll.
+	consecutiveFailedAutoRebinds int
+	publishedSnapshot            uint64
+	publishedPlanKey             string
 	// appliedSnapshot is the config + generation the helper has
 	// ACTUALLY applied via a successful full apply_snapshot — the
 	// generation the helper echoes back as

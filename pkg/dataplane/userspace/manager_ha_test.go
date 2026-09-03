@@ -929,7 +929,10 @@ func TestHasBusyBindingsWedgeLocked(t *testing.T) {
 	}
 	m.lastStatus.Bindings[0].Bound = true
 	if m.hasBusyBindingsWedgeLocked(false) {
-		t.Fatal("hasBusyBindingsWedgeLocked(false) = true, want false once any binding is bound")
+		t.Fatal("hasBusyBindingsWedgeLocked(false) = true, want false once EVERY " +
+			"registered+armed binding is bound (#7497: this fixture has one " +
+			"binding, so \"every\" and \"any\" coincide here — the partial case " +
+			"is covered by TestWedgeFiresOnPartialBindFailure7497)")
 	}
 }
 

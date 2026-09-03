@@ -343,6 +343,7 @@ func (m *Manager) stopLocked() {
 		m.clearLastStatusLocked()
 		m.bindingsBusySince = time.Time{}
 		m.lastBindingsAutoRebind = time.Time{}
+		m.consecutiveFailedAutoRebinds = 0
 		m.sessionMirrorFailed = false
 		m.sessionMirrorErr = ""
 		return
@@ -430,6 +431,7 @@ func (m *Manager) resetAfterHelperGoneLocked() {
 	m.lastStandbyNeighResolve = time.Time{}
 	m.bindingsBusySince = time.Time{}
 	m.lastBindingsAutoRebind = time.Time{}
+	m.consecutiveFailedAutoRebinds = 0
 	m.publishedSnapshot = 0
 	// #7465: a new helper starts with an EMPTY HA inventory, so the fact that the
 	// previous process had been told says nothing about this one. Without this
