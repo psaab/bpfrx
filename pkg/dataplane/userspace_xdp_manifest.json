@@ -40,7 +40,7 @@
     },
     {
       "path": "userspace-xdp/src/binding_index.rs",
-      "sha256": "3f150efc08c71b694280af91d441b265e69da514f02a88022165f824bcec3a01"
+      "sha256": "1e15d1798eda2ea38fe28dfe1333e14aa237b1badd8d701181e6bee30d773ae7"
     },
     {
       "path": "userspace-xdp/src/ipv6_ext_walk.rs",
@@ -48,7 +48,7 @@
     },
     {
       "path": "userspace-xdp/src/lib.rs",
-      "sha256": "97b15a4002f7eb4213e3e85770d64e7ed86098e5438edb5ee14d3b44f356efbe"
+      "sha256": "f54626cad38ff3109e98a82cf81de19ce28a60d015ddc69cc17f37e9b707730c"
     }
   ]
 }

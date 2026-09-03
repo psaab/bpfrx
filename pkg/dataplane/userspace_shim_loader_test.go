@@ -138,8 +138,67 @@ func validABIBaseSpec() *ebpf.CollectionSpec {
 			"userspace_ingress_ifaces": {Type: ebpf.Hash, KeySize: 4, ValueSize: 1, MaxEntries: MaxInterfaces},
 			"dnat_table":               {Type: ebpf.Hash, KeySize: 12, ValueSize: 8, MaxEntries: userspaceShimMaxSessions, Flags: unix.BPF_F_NO_PREALLOC},
 			"userspace_ctrl":           {Type: ebpf.Array, KeySize: 4, ValueSize: 40, MaxEntries: 1},
+			// #7497: the slot-keyed maps. Present here so the base spec still
+			// reaches the checks that follow them; their own drift arm is
+			// exercised by TestValidateUserspaceShimSpecSlotMapDrift.
+			"userspace_heartbeat": {Type: ebpf.Array, KeySize: 4, ValueSize: 8, MaxEntries: BindingSlotMapMaxEntries},
+			"userspace_xsk_map":   {Type: ebpf.XSKMap, KeySize: 4, ValueSize: 4, MaxEntries: BindingSlotMapMaxEntries},
 		},
 	}
+}
+
+// TestValidateUserspaceShimSpecSlotMapDrift covers the #7497 arm: the two maps
+// keyed by the binding VALUE's slot field must match BindingSlotMapMaxEntries.
+//
+// Each case drifts ONE map and leaves the other correct, because a single case
+// that drifted both would stay green if the loop only ever checked its first
+// element. The base spec is otherwise valid, so the slot-map arm is the only
+// thing that can reject it.
+func TestValidateUserspaceShimSpecSlotMapDrift(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range []string{"userspace_heartbeat", "userspace_xsk_map"} {
+		name := name
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			spec := validABIBaseSpec()
+			spec.Maps[name] = &ebpf.MapSpec{
+				Type:       spec.Maps[name].Type,
+				KeySize:    spec.Maps[name].KeySize,
+				ValueSize:  spec.Maps[name].ValueSize,
+				MaxEntries: BindingSlotMapMaxEntries / 2,
+			}
+
+			err := validateUserspaceShimSpec(spec)
+			if err == nil {
+				t.Fatalf("validateUserspaceShimSpec(%s drifted) succeeded, want drift error", name)
+			}
+			if !strings.Contains(err.Error(), name) {
+				t.Fatalf("err = %v, want the drifted map named", err)
+			}
+			// The message must name the LIMIT, not just report a mismatch:
+			// an operator reading it has to know what value to restore.
+			if !strings.Contains(err.Error(), fmt.Sprintf("expected=%d", BindingSlotMapMaxEntries)) {
+				t.Fatalf("err = %v, want expected=%d named", err, BindingSlotMapMaxEntries)
+			}
+			if !strings.Contains(err.Error(), "binding_index.rs") {
+				t.Fatalf("err = %v, want the authoritative constant's file named", err)
+			}
+		})
+	}
+
+	// Control: the undrifted base spec must NOT be rejected by this arm. Without
+	// it, an arm that rejected every spec would pass both cases above.
+	t.Run("valid-spec-not-rejected", func(t *testing.T) {
+		t.Parallel()
+
+		if err := validateUserspaceShimSpec(validABIBaseSpec()); err != nil {
+			if strings.Contains(err.Error(), "userspace_heartbeat") || strings.Contains(err.Error(), "userspace_xsk_map") {
+				t.Fatalf("slot-map arm rejected a valid spec: %v", err)
+			}
+		}
+	})
 }
 
 // pinReaderWithOverride returns a fake live-pin reader that reports each map's

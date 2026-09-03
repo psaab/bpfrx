@@ -5573,3 +5573,133 @@ fn shim_ingress_test_precedes_the_l3_parse_8279() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// #7497: the binding-slot capacity cap.
+// ---------------------------------------------------------------------------
+
+/// The helper's `MAX_BINDING_SLOTS` and the shim's `BINDING_SLOT_MAP_MAX_ENTRIES`
+/// must be the same number, and this ASSERTS THE AGREEMENT rather than pinning
+/// either side to a literal.
+///
+/// The distinction matters. A test that pinned `MAX_BINDING_SLOTS == 4096` would
+/// encode which of the two spellings is trusted, and would stay green if the
+/// shim's map were resized underneath it — which is precisely the drift that
+/// makes the plan-time cap admit slots the XSK map cannot address. Because
+/// `binding_index.rs` is `#[path]`-included above, the value on the shim side of
+/// this comparison is read out of the source the BPF object is built from.
+#[test]
+fn shim_and_helper_agree_on_binding_slot_capacity_7497() {
+    assert_eq!(
+        shim_binding_index::BINDING_SLOT_MAP_MAX_ENTRIES,
+        crate::server::helpers::MAX_BINDING_SLOTS,
+        "userspace-xdp BINDING_SLOT_MAP_MAX_ENTRIES and userspace-dp \
+         MAX_BINDING_SLOTS disagree; the planner would cap against a capacity \
+         the heartbeat/XSK maps do not have (#7497)"
+    );
+}
+
+/// The capacity of the slot-keyed maps is NOT the capacity of the binding array,
+/// and conflating them is the #7497 defect. Pinning the ratio keeps a future
+/// author from "unifying" the two constants: the write-side guards check the
+/// composed index against the larger value, which does not protect the smaller
+/// maps.
+#[test]
+fn binding_slot_capacity_is_far_below_the_binding_array_7497() {
+    use shim_binding_index::{BINDING_QUEUES_PER_IFACE, BINDING_SLOT_MAP_MAX_ENTRIES};
+    // The binding ARRAY is MAX_INTERFACES * stride = 65536 * 16 = 1,048,576.
+    let binding_array_max: u64 = 65_536u64 * BINDING_QUEUES_PER_IFACE as u64;
+    assert!(
+        (BINDING_SLOT_MAP_MAX_ENTRIES as u64) < binding_array_max,
+        "slot-map capacity {} must be strictly below the binding array {}",
+        BINDING_SLOT_MAP_MAX_ENTRIES,
+        binding_array_max
+    );
+    assert_eq!(
+        binding_array_max / BINDING_SLOT_MAP_MAX_ENTRIES as u64,
+        256,
+        "a bound checked against the binding array admits 256x what the \
+         slot-keyed maps can address (#7497)"
+    );
+}
+
+/// Build `n` candidate interfaces each advertising `rx` RX queues.
+fn slot_cap_candidates_7497(n: usize, rx: usize) -> (Vec<(String, usize)>, BTreeMap<String, i32>) {
+    let mut candidates = Vec::with_capacity(n);
+    let mut ifindex_by_name = BTreeMap::new();
+    for i in 0..n {
+        let name = format!("ge-0-0-{i}");
+        ifindex_by_name.insert(name.clone(), (i + 2) as i32);
+        candidates.push((name, rx));
+    }
+    (candidates, ifindex_by_name)
+}
+
+/// A plan whose binding count exceeds the slot-keyed map capacity is REFUSED
+/// whole, not truncated.
+///
+/// The fixture straddles the boundary rather than sitting far past it: at 16
+/// queues, 256 interfaces is exactly `MAX_BINDING_SLOTS` and must be admitted,
+/// while 257 is one binding over and must be refused. A fixture that only
+/// tested a wildly oversized plan would stay green against an off-by-one in the
+/// comparison, and a `>=` there would refuse a configuration that binds cleanly.
+#[test]
+fn plan_exceeding_binding_slot_capacity_is_refused_7497() {
+    use crate::server::helpers::{MAX_BINDING_SLOTS, replan_bindings_from_candidates};
+
+    let stride = 16usize;
+    let exact = MAX_BINDING_SLOTS as usize / stride; // 256 interfaces x 16 queues
+
+    // Control: exactly at capacity must still plan. If this goes red the cap is
+    // refusing safe boxes, which is the failure direction a one-sided test
+    // cannot see.
+    let (candidates, ifindex_by_name) = slot_cap_candidates_7497(exact, stride);
+    let at_cap = replan_bindings_from_candidates(4, &[], candidates, ifindex_by_name, true);
+    assert_eq!(
+        at_cap.len(),
+        MAX_BINDING_SLOTS as usize,
+        "a plan of exactly MAX_BINDING_SLOTS bindings must be admitted"
+    );
+    let max_slot = at_cap.iter().map(|b| b.slot).max().unwrap();
+    assert_eq!(
+        max_slot,
+        MAX_BINDING_SLOTS - 1,
+        "the densest admitted plan must still mint its highest slot inside the maps"
+    );
+
+    // One binding over the capacity: refused whole.
+    let (candidates, ifindex_by_name) = slot_cap_candidates_7497(exact + 1, stride);
+    let over = replan_bindings_from_candidates(4, &[], candidates, ifindex_by_name, true);
+    assert!(
+        over.is_empty(),
+        "a plan of {} bindings exceeds MAX_BINDING_SLOTS ({}) and must be refused \
+         whole, not truncated — got {} bindings",
+        (exact + 1) * stride,
+        MAX_BINDING_SLOTS,
+        over.len()
+    );
+}
+
+/// Every slot an admitted plan mints is addressable in the slot-keyed maps.
+///
+/// This is the property the cap exists to guarantee, asserted over the plan's
+/// OUTPUT rather than over the arithmetic that produced it — so it still holds
+/// if the minting loop changes shape.
+#[test]
+fn every_minted_slot_is_addressable_7497() {
+    use crate::server::helpers::{MAX_BINDING_SLOTS, replan_bindings_from_candidates};
+
+    for (ifaces, rx) in [(1usize, 1usize), (3, 6), (17, 16), (256, 16)] {
+        let (candidates, ifindex_by_name) = slot_cap_candidates_7497(ifaces, rx);
+        let plan = replan_bindings_from_candidates(6, &[], candidates, ifindex_by_name, true);
+        for b in &plan {
+            assert!(
+                b.slot < MAX_BINDING_SLOTS,
+                "{ifaces} ifaces x {rx} queues minted slot {} outside the \
+                 heartbeat/XSK maps ({} entries)",
+                b.slot,
+                MAX_BINDING_SLOTS
+            );
+        }
+    }
+}

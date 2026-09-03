@@ -775,6 +775,20 @@ pub(crate) fn replan_queues(
     replan_bindings_from_candidates(workers, existing, candidates, ifindex_by_name, forwarding_armed)
 }
 
+/// Capacity of the two shim maps keyed by `BindingStatus::slot` —
+/// `userspace_heartbeat` and `userspace_xsk_map`. Mirrors
+/// `BINDING_SLOT_MAP_MAX_ENTRIES` in `userspace-xdp/src/binding_index.rs`, which
+/// is the authority; Go pins the pair against the compiled shim in
+/// `validateUserspaceShimSpecWith` (`pkg/dataplane/loader_userspace_shim.go`) so
+/// a drift fails the load rather than surfacing here.
+///
+/// This is NOT `BINDING_ARRAY_MAX_ENTRIES` (1,048,576) and must not be confused
+/// with it. That value bounds the composed index `ifindex * 16 + queue` into the
+/// binding ARRAY; this one bounds `slot`, which is assigned densely below. It is
+/// 256x smaller, so the write-side guards that check the composed index against
+/// the larger value do not protect these two maps (#7497).
+pub(crate) const MAX_BINDING_SLOTS: u32 = 4096;
+
 pub(crate) fn replan_bindings_from_candidates(
     workers: usize,
     existing: &[BindingStatus],
@@ -790,6 +804,11 @@ pub(crate) fn replan_bindings_from_candidates(
         return Vec::new();
     }
     let queue_count = candidates.iter().map(|(_, rx)| *rx).min().unwrap_or(0);
+    let interfaces = candidates
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    let interfaces_len = interfaces.len();
     // #6211 F2: worker ids are MINTED below as `queue_id % workers`, and the NAT
     // allocator records one holder BIT per worker id
     // (`nat::MAX_NAT_HOLDER_WORKERS`). An id too wide for that mask would set no
@@ -818,10 +837,47 @@ pub(crate) fn replan_bindings_from_candidates(
         );
         return Vec::new();
     }
-    let interfaces = candidates
-        .iter()
-        .map(|(name, _)| name.clone())
-        .collect::<Vec<_>>();
+
+    // #7497: `slot` is minted DENSELY below — a plain counter over
+    // `queue_count * interfaces.len()` — and indexes `userspace_heartbeat` and
+    // `userspace_xsk_map`, which hold MAX_BINDING_SLOTS entries. Refuse a plan
+    // that would mint a slot those maps cannot address.
+    //
+    // Checked on the PRODUCT actually minted, not on the interface count or the
+    // queue count alone, for the same reason the NAT check above is: either
+    // operand can be large on a box whose product is safe, so bounding one
+    // would refuse a configuration that binds cleanly.
+    //
+    // Refusing the WHOLE plan is deliberate and matches the sibling. Note the
+    // minting order below is queue-MAJOR (`for queue_id { for iface {`), so
+    // `slot == queue_id * interfaces.len() + iface_index`. Truncating at the
+    // capacity would therefore not sacrifice some identifiable interface — it
+    // would strand the HIGHEST queue ids across EVERY interface at once, which
+    // is also why this refusal names counts rather than a culprit interface:
+    // there isn't one.
+    //
+    // And capping to the first MAX_BINDING_SLOTS bindings would leave those
+    // queues unbound, and an unbound queue does not degrade throughput — the shim takes
+    // `drop_degraded_transit` on BINDING_MISSING, so every transit packet
+    // arriving there is dropped while the interface still reads up and most
+    // traffic still flows. That is an availability failure indistinguishable
+    // from healthy. A refusal is loud and diagnosable; a partial plan is not.
+    //
+    // It is enforced HERE, at plan time, and not at XSK registration: by the
+    // time `register_xsk_slot` runs (`crate::afxdp::bpf_map::ha`) bringup has
+    // already torn down the previous bindings, so a failure there takes
+    // forwarding down instead of declining to change it.
+    let planned_bindings = (queue_count as u64) * (interfaces_len as u64);
+    if planned_bindings > MAX_BINDING_SLOTS as u64 {
+        eprintln!(
+            "replan_bindings: REFUSING plan — {} interfaces x {} queues = {} bindings, \
+             but userspace_heartbeat/userspace_xsk_map address only {} slots \
+             (MAX_BINDING_SLOTS); the excess bindings could not be registered and \
+             their RX queues would drop all transit traffic",
+            interfaces_len, queue_count, planned_bindings, MAX_BINDING_SLOTS
+        );
+        return Vec::new();
+    }
     let mut out = Vec::with_capacity(queue_count * interfaces.len());
     let mut slot = 0u32;
     for queue_id in 0..queue_count {

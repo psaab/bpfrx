@@ -84,6 +84,8 @@ const (
 		"pkg/dataplane/README.md (#1864)."
 	userspaceBindingsMapName           = "userspace_bindings"
 	userspaceIngressIfacesMapName      = "userspace_ingress_ifaces"
+	userspaceHeartbeatMapName          = "userspace_heartbeat"
+	userspaceXskMapName                = "userspace_xsk_map"
 	userspaceShimCompatibilityDNATName = "dnat_table"
 	// userspaceShimCompatibilityDNATV6Name is the IPv6 reverse-NAT steering
 	// table. Like dnat_table it is BOTH declared by the shim ELF and replaced at
@@ -246,6 +248,15 @@ func validateUserspaceShimSpecWith(userspaceSpec *ebpf.CollectionSpec, readPin u
 		return fmt.Errorf("Rust xdp_userspace spec missing map userspace_ingress_ifaces")
 	} else if ms.MaxEntries != MaxInterfaces {
 		return userspaceIngressIfacesMaxEntriesDriftError(ms.MaxEntries)
+	}
+	for _, name := range []string{userspaceHeartbeatMapName, userspaceXskMapName} {
+		ms, ok := userspaceSpec.Maps[name]
+		if !ok {
+			return fmt.Errorf("Rust xdp_userspace spec missing map %s", name)
+		}
+		if ms.MaxEntries != BindingSlotMapMaxEntries {
+			return userspaceSlotMapMaxEntriesDriftError(name, ms.MaxEntries)
+		}
 	}
 	if ms, ok := userspaceSpec.Maps[userspaceShimCompatibilityDNATName]; !ok {
 		return fmt.Errorf("Rust xdp_userspace spec missing map dnat_table")
@@ -568,6 +579,22 @@ func userspaceBindingsMaxEntriesDriftError(got uint32) error {
 	return fmt.Errorf(
 		"userspace_bindings max_entries drift: embedded=%d, expected=%d (MaxInterfaces=%d * BindingQueuesPerIface=%d in bpf/headers/xpf_common.h). %s",
 		got, BindingArrayMaxEntries, MaxInterfaces, BindingQueuesPerIface, userspaceShimGenerateRemediation,
+	)
+}
+
+// userspaceSlotMapMaxEntriesDriftError reports a slot-keyed map whose embedded
+// max_entries disagrees with BindingSlotMapMaxEntries.
+//
+// This is a separate arm from the userspace_bindings check on purpose (#7497).
+// The two maps are on different axes, and a shim that resized ONLY the
+// slot-keyed maps would leave the bindings check green while the helper's
+// plan-time cap (MAX_BINDING_SLOTS in userspace-dp) went on admitting slots the
+// XSK map can no longer address — a silent regression to the failure this cap
+// exists to prevent: an unregisterable binding whose RX queue drops all transit.
+func userspaceSlotMapMaxEntriesDriftError(name string, got uint32) error {
+	return fmt.Errorf(
+		"%s max_entries drift: embedded=%d, expected=%d (BINDING_SLOT_MAP_MAX_ENTRIES in userspace-xdp/src/binding_index.rs, mirrored by MAX_BINDING_SLOTS in userspace-dp/src/server/helpers/planning.rs). %s",
+		name, got, BindingSlotMapMaxEntries, userspaceShimGenerateRemediation,
 	)
 }
 

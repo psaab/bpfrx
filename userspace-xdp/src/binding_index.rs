@@ -164,6 +164,31 @@
 /// higher queue id (#4894).
 pub const BINDING_QUEUES_PER_IFACE: u32 = 16;
 
+/// Capacity of the two maps keyed by `UserspaceBindingValue::slot`:
+/// `userspace_heartbeat` and `userspace_xsk_map`.
+///
+/// This is a DIFFERENT axis from [`BINDING_QUEUES_PER_IFACE`] and from
+/// `BINDING_ARRAY_MAX_ENTRIES`, and conflating them is the trap. The binding
+/// ARRAY is addressed by the composed index `ifindex * BINDING_QUEUES_PER_IFACE
+/// + queue`, so its capacity scales with the ifindex axis (`MAX_INTERFACES *
+/// BINDING_QUEUES_PER_IFACE`). The heartbeat and XSK maps are addressed by
+/// `binding.slot`, which the helper's planner assigns DENSELY — a plain counter
+/// over the bindings it actually planned (`replan_bindings_from_candidates` in
+/// `userspace-dp/src/server/helpers/planning.rs`). So this constant is a
+/// ceiling on the TOTAL NUMBER OF BINDINGS, not on any ifindex or queue id.
+///
+/// It is 256x smaller than `BINDING_ARRAY_MAX_ENTRIES`. A bound checked against
+/// the larger value therefore does NOT protect these two maps (#7497): a slot
+/// admitted by it can still be unaddressable here.
+///
+/// The helper mirrors this as `MAX_BINDING_SLOTS` and REFUSES a plan that would
+/// mint a slot at or above it, because the alternative is a failure at XSK
+/// registration (`register_xsk_slot`, `userspace-dp/src/afxdp/bpf_map/ha.rs`)
+/// which happens during bringup, after the previous bindings have been torn
+/// down. Go pins the value against the compiled shim in
+/// `validateUserspaceShimSpecWith` so the two spellings cannot drift silently.
+pub const BINDING_SLOT_MAP_MAX_ENTRIES: u32 = 4096;
+
 /// The packet's own RX queue index, as reported by the hardware.
 ///
 /// The field is private and there are no arithmetic impls, so the coordinate
