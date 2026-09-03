@@ -105,20 +105,34 @@ func TestAutoRebindGivesUpAfterCap7497(t *testing.T) {
 		busyUnboundBinding7497(6, 1),
 	})
 
+	// Driven to the BOUNDARY directly rather than looped up to it from zero.
+	//
+	// The loop form ran `maxConsecutiveAutoRebinds * 3` iterations, so this
+	// cell's RUNTIME scaled with the constant: raising the cap to 1,000,000
+	// made the cell take ~6s against a 0.007s control while still passing —
+	// slow, silently, and green. Asserting the boundary is O(1) in the
+	// constant and checks the same mechanism.
 	now := time.Now()
-	fired := 0
-	// Drive well past the cap. Each iteration advances past both the 5s dwell
-	// and the 15s rate limit so neither of those is what stops it — otherwise
-	// this cell would pass with no cap at all.
-	for i := 0; i < maxConsecutiveAutoRebinds*3; i++ {
+	m.bindingsBusySince = now.Add(-time.Minute) // past the 5s dwell
+	m.consecutiveFailedAutoRebinds = maxConsecutiveAutoRebinds - 1
+
+	// The attempt that REACHES the cap must still fire — the cap is a ceiling
+	// on attempts, not one attempt short of it.
+	now = now.Add(30 * time.Second)
+	if !m.shouldAutoRebindBusyBindingsLocked(now, false) {
+		t.Fatal("the attempt that reaches the cap did not fire; recovery gives up " +
+			"one attempt early")
+	}
+
+	// Everything past it must be refused. Several polls, each advancing past
+	// both the 5s dwell and the 15s rate limit, so neither of those is what
+	// stops it — otherwise this would pass with no cap at all.
+	for i := 0; i < 3; i++ {
 		now = now.Add(30 * time.Second)
 		if m.shouldAutoRebindBusyBindingsLocked(now, false) {
-			fired++
+			t.Fatalf("auto-rebind fired past the cap (poll %d); an unbounded count "+
+				"is the EBUSY/rebind loop handlers/rebind.rs warns about", i+1)
 		}
-	}
-	if fired != maxConsecutiveAutoRebinds {
-		t.Fatalf("auto-rebind fired %d times for an unclearing wedge, want exactly %d "+
-			"(the cap); an unbounded count is the EBUSY/rebind loop", fired, maxConsecutiveAutoRebinds)
 	}
 }
 
@@ -132,10 +146,14 @@ func TestAutoRebindBudgetResetsWhenWedgeClears7497(t *testing.T) {
 		busyUnboundBinding7497(6, 1),
 	})
 
+	// Budget exhausted directly rather than looped to exhaustion — same
+	// runtime reason as the cell above.
 	now := time.Now()
-	for i := 0; i < maxConsecutiveAutoRebinds*2; i++ {
-		now = now.Add(30 * time.Second)
-		m.shouldAutoRebindBusyBindingsLocked(now, false)
+	m.bindingsBusySince = now.Add(-time.Minute)
+	m.consecutiveFailedAutoRebinds = maxConsecutiveAutoRebinds
+	now = now.Add(30 * time.Second)
+	if m.shouldAutoRebindBusyBindingsLocked(now, false) {
+		t.Fatal("fired with the budget already exhausted")
 	}
 
 	// Wedge clears.
@@ -147,17 +165,18 @@ func TestAutoRebindBudgetResetsWhenWedgeClears7497(t *testing.T) {
 		t.Fatal("fired with no wedge present")
 	}
 
-	// A NEW wedge must get a fresh budget.
+	// A NEW wedge must get a fresh budget. One firing attempt proves the
+	// counter was reset; whether it then stops at the cap is the cell above.
 	m.lastStatus.Bindings[1] = busyUnboundBinding7497(6, 1)
-	fired := 0
-	for i := 0; i < maxConsecutiveAutoRebinds*2; i++ {
-		now = now.Add(30 * time.Second)
-		if m.shouldAutoRebindBusyBindingsLocked(now, false) {
-			fired++
-		}
+	m.bindingsBusySince = now.Add(-time.Minute)
+	now = now.Add(30 * time.Second)
+	if !m.shouldAutoRebindBusyBindingsLocked(now, false) {
+		t.Fatal("after the wedge cleared, a NEW wedge got no attempts; the cap " +
+			"must be per-wedge or one exhausted wedge kills recovery for the " +
+			"life of the daemon")
 	}
-	if fired != maxConsecutiveAutoRebinds {
-		t.Fatalf("after the wedge cleared, a new wedge got %d attempts, want %d; "+
-			"the cap must be per-wedge or recovery dies permanently", fired, maxConsecutiveAutoRebinds)
+	if m.consecutiveFailedAutoRebinds != 1 {
+		t.Fatalf("new wedge started at attempt %d, want 1 (a fresh budget)",
+			m.consecutiveFailedAutoRebinds)
 	}
 }
