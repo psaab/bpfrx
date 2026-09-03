@@ -38,6 +38,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/psaab/xpf/pkg/dataplane"
 )
 
 const (
@@ -540,12 +542,36 @@ func indirectionTableIsDefault(output []byte, queueCount int) bool {
 //
 // Cases:
 //   - workers <= 0 or queues <= 0: skip (misconfigured).
-//   - workers == 1: skip (single worker — keep default RSS spreading load
-//     across all HW queues / IRQ lines; pinning to queue 0 would serialize
-//     the worker on one IRQ).
-//   - workers >= queues: skip (default table already delivers to every
-//     queue; no reshaping possible or useful).
-//   - workers < queues: produce `[1]*workers + [0]*(queues - workers)`.
+//   - otherwise the fed set is `[0, active)` where `active` is bounded by the
+//     number of queues that actually HAVE an AF_XDP binding, and the vector is
+//     `[1]*active + [0]*(queues - active)` — or nil, when `active == queues`
+//     and the default round-robin table already feeds exactly that set.
+//
+// #7497: `active` is bounded by BOUND queues, not by `workers` alone.
+//
+// This function's purpose, per the file header, is that hash outputs land only
+// on queues a userspace worker consumes. It expressed that as `[1]*workers`,
+// which was equivalent while the planner bound one queue per worker id across
+// every interface. It is no longer: the planner now binds
+// `min(rx_queues, BindingQueuesPerIface)` queues per interface, so a NIC with
+// more RX queues than the stride has queues with NO socket at all, and feeding
+// them is not merely wasteful — the shim resolves no binding and takes
+// `drop_degraded_transit`, so every transit packet steered there is dropped
+// while the interface reads up.
+//
+// Measured before the change, with the planner capping bindings at 16:
+//
+//	workers=20 hwq=32 -> fed 20, bound 16   (queues 16-19 fed, no socket)
+//	workers=17 hwq=32 -> fed 17, bound 16   (queue 16 fed, no socket)
+//	workers=20 hwq=20 -> SKIPPED, fed 20    (the skip branch, not the vector)
+//	workers=1  hwq=32 -> SKIPPED, fed 32    (the workers==1 branch)
+//
+// The last two matter for how this is fixed: they never reach vector
+// construction, so bounding only the vector would leave them wrong.
+//
+// The single-worker case keeps its #5124 intent — do not concentrate onto one
+// queue and serialize the worker on one IRQ — but spreads across the BOUND
+// queues rather than every hardware queue.
 func computeWeightVector(workers, queues int) ([]int, string) {
 	if workers <= 0 {
 		return nil, "workers <= 0"
@@ -553,14 +579,28 @@ func computeWeightVector(workers, queues int) ([]int, string) {
 	if queues <= 0 {
 		return nil, "queue count unknown"
 	}
-	if workers == 1 {
-		return nil, "workers == 1 (keep default RSS)"
+	// Queues the planner can bind on this interface. Imported rather than
+	// re-spelled: `dataplane.BindingQueuesPerIface` is already pinned to the
+	// shim through the binding-array size check at load, so importing inherits
+	// that pin instead of creating a fourth unchecked literal (#7497).
+	bound := queues
+	if stride := int(dataplane.BindingQueuesPerIface); bound > stride {
+		bound = stride
 	}
-	if workers >= queues {
-		return nil, fmt.Sprintf("workers (%d) >= queues (%d)", workers, queues)
+	active := workers
+	if workers == 1 {
+		// #5124: a single worker still wants RSS spread, not queue 0 only.
+		active = bound
+	} else if active > bound {
+		active = bound
+	}
+	if active >= queues {
+		return nil, fmt.Sprintf(
+			"active (%d) >= queues (%d) — default table already feeds exactly the bound set",
+			active, queues)
 	}
 	v := make([]int, queues)
-	for i := 0; i < workers; i++ {
+	for i := 0; i < active; i++ {
 		v[i] = 1
 	}
 	return v, ""
