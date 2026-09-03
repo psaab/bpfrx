@@ -622,8 +622,25 @@ tick is the *reconcile* — the status loop stops skipping its body, so the ctrl
 re-enable is available on the next pass, ~1s. Restoring *forwarding* is slower:
 the busy-binding auto-rebind that recreates workers is gated by
 `shouldAutoRebindBusyBindingsLocked` on a wedge observed for >= 5s, a 15s
-rate limit, and `lastStatus.ForwardingArmed`. So the honest figure is **seconds**,
-not one tick. An earlier revision implied the latter (#6871 round 9).
+rate limit, `lastStatus.ForwardingArmed`, and (#7497) a cap of
+`maxConsecutiveAutoRebinds` attempts per wedge. So the honest figure is
+**seconds**, not one tick. An earlier revision implied the latter (#6871
+round 9).
+
+**And recovery can now give up.** #7497 changed the wedge predicate from
+`bound == 0 && ready == 0` — every binding down — to "any registered and armed
+binding is unbound", because with per-interface queue counts the realistic
+failure is PARTIAL (fifteen bind, one EBUSY) and the old predicate meant
+recovery never fired for it at all. Firing on a partial wedge means firing on a
+fault already proven durable — a transient EBUSY is absorbed by the bind's own
+5s retry (`BIND_RETRY_ATTEMPTS` x `BIND_RETRY_DELAY`, `afxdp/bind.rs`) and never
+reaches the predicate — so a global rebind that re-EBUSYs would re-trigger every
+cycle. The attempt cap bounds that into a finite series plus a loud
+`auto-rebind GAVE UP` log. After it fires, **nothing else recovers the binding
+and nothing else reports it**: per #8384 binding readiness is defined over
+socket setup only, so a bound-but-dead queue reads `Ready`. That log is the
+only signal. The disproportion itself — one wedged binding costing a global
+teardown — is #8388.
 
 **The TTL does not back an out-of-extent acquisition up at all**, and an earlier
 revision of this paragraph claimed the opposite — that the TTL "is now a backstop
