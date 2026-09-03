@@ -86,11 +86,43 @@ var ifaceIndexByName = func(name string) (int, error) {
 // Before #6536 the resolution failure was logged and dropped, and those two
 // conditions were indistinguishable to every downstream consumer.
 func proxyARPIfaceMap(cfg *config.Config) (byJunos map[string]int, names map[int]string, unresolved []string) {
+	return proxyARPIfaceMapFiltered(cfg, nil)
+}
+
+// proxyARPIfaceMapFiltered is proxyARPIfaceMap with the #8297 ownership gate.
+//
+// `suppress` reports whether THIS node must not answer for an entry's
+// interface; a nil predicate keeps the pre-#8297 behaviour (answer for
+// everything), which is what the non-daemon callers want.
+//
+// A suppressed entry is dropped from `byJunos`/`names` and NOT added to
+// `unresolved`: the two mean different things and conflating them would be the
+// #6536 bug. Unresolved means "we could not find the netdev, retain its
+// responder state as debt"; suppressed means "we found it and this node must
+// not answer", so its entry must be actively torn down by the reconcile sweep
+// rather than retained.
+func proxyARPIfaceMapFiltered(
+	cfg *config.Config,
+	suppress func(ifaceRef string) bool,
+) (byJunos map[string]int, names map[int]string, unresolved []string) {
 	byJunos = make(map[string]int)
 	names = make(map[int]string)
 	seenUnresolved := make(map[string]bool)
 	for _, entry := range cfg.Security.NAT.ProxyARP {
 		if _, ok := byJunos[entry.Interface]; ok {
+			continue
+		}
+		// #8297: the standby must not answer for a pool address on an RG it
+		// does not own — the upstream otherwise sees one IP at two RETH virtual
+		// MACs and pool-mode return traffic lands on the wrong node. Measured:
+		// owner TX +7, standby helper RX +7, all seven a session miss there.
+		//
+		// This suppresses ONLY on an affirmative not-owner. #8314 suppressed on
+		// !AllVRRPMaster, which also fires when ownership is UNKNOWN, and
+		// silenced both nodes (#8342: fw0=0 fw1=0).
+		if suppress != nil && suppress(entry.Interface) {
+			slog.Info("proxy-arp: suppressing responder for an interface this node does not own",
+				"iface", entry.Interface, "issue", "#8297")
 			continue
 		}
 		linuxName := cfg.ResolveKernelIfName(entry.Interface)
@@ -185,7 +217,9 @@ func (d *Daemon) reconcileProxyARP(cfg *config.Config) {
 	ifaceNames := map[int]string{}
 	var unresolved []string
 	if hasEntries {
-		ifaceMap, ifaceNames, unresolved = proxyARPIfaceMap(cfg)
+		ifaceMap, ifaceNames, unresolved = proxyARPIfaceMapFiltered(cfg, func(ref string) bool {
+			return d.proxyARPEntrySuppressed(cfg, ref)
+		})
 	}
 	// #7685: retain the debt this pass observed. Set on EVERY completing pass,
 	// including the teardown pass where hasEntries is false and unresolved is
