@@ -787,6 +787,34 @@ func (m *Manager) HeartbeatStats() HeartbeatStats {
 	return s
 }
 
+// PeerBootEpoch reports the peer's across-reboot boot-epoch floor and whether
+// the peer has proved it emits boot epochs, as one coherent snapshot (#7762).
+//
+// PROMOTION FROM DIAGNOSTIC TO CLASSIFICATION INPUT. The underlying accessors
+// are documented "Diagnostics and tests only", which is a statement about who
+// consumes them, not a ceiling. What a correctness consumer needs is that the
+// UPDATE path be safe for one, and it is:
+//
+//   - Both writes (`epochSeen = true`, `highEpoch = epoch`) happen inside
+//     admitAuthed under s.mu, and the read takes the same mutex — so no torn or
+//     half-updated pair is observable.
+//   - The floor is monotonically non-decreasing: the sole assignment is guarded
+//     by `epoch > s.highEpoch`, and the `epoch < s.highEpoch` case is a refusal
+//     arm that writes nothing. A classifier can never see the floor go
+//     backwards.
+//   - The latch is one-way: `epochSeen = true` is the only production
+//     assignment, nothing sets it false, and hbAuth is an embedded value on
+//     Manager that survives heartbeat restart, VRF rebind and UpdateConfig.
+//
+// NOT promoted: `peerEpochLatched`'s own doc warns it is "A FACT ABOUT THIS
+// STATE, NOT ABOUT CURRENT ENFORCEMENT" — it does not mean epochless frames are
+// being refused right now, because a cleared PSK decouples the two. This
+// accessor's consumer uses it only as a VALIDITY flag for the floor, which is
+// the fact it does assert.
+func (m *Manager) PeerBootEpoch() (uint64, bool) {
+	return m.hbAuth.peerBootEpoch()
+}
+
 // HeartbeatStats holds heartbeat send/receive counters.
 type HeartbeatStats struct {
 	Sent       uint64

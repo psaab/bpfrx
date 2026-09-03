@@ -1023,6 +1023,23 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 					ss.IsPrimaryForRGFn = func(rgID int) bool {
 						return d.cluster != nil && d.cluster.IsLocalPrimary(rgID)
 					}
+					// #7762: the peer boot epoch reaches the connection
+					// classifier through this callback, NOT through
+					// clusterRuntime. clusterRuntime is the dataplane-backend
+					// surface (Sessions()/Telemetry(), implemented by the eBPF
+					// Manager and the userspace adapter); the epoch is cluster
+					// state on d.cluster, which no dataplane backend can see.
+					// Wiring it here — beside the two siblings above, over the
+					// object that actually holds it — keeps that boundary
+					// intact. Nil-safe like they are: an unwired daemon leaves
+					// the classifier on its pre-#7762 behaviour rather than
+					// reading a fabricated zero.
+					ss.PeerBootEpochFn = func() (uint64, bool) {
+						if d.cluster == nil {
+							return 0, false
+						}
+						return d.cluster.PeerBootEpoch()
+					}
 				}
 				if err := ss.Start(commsCtx); err != nil {
 					if i < 5 {
