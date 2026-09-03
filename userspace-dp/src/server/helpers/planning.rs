@@ -26,6 +26,7 @@ use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) fn same_plan_apply_needs_binding_reconcile(
     state: &ServerState,
@@ -789,6 +790,17 @@ pub(crate) fn replan_queues(
 /// the larger value do not protect these two maps (#7497).
 pub(crate) const MAX_BINDING_SLOTS: u32 = 4096;
 
+/// Per-interface queue stride of the binding array. Mirrors
+/// `BINDING_QUEUES_PER_IFACE` in `userspace-xdp/src/binding_index.rs`, which is
+/// the authority, and `BindingQueuesPerIface` in `pkg/dataplane/constants.go`.
+///
+/// A queue id at or above this would make `ifindex * stride + queue` land in the
+/// NEXT ifindex's row, so the Go publisher refuses one (#4894) and the shim
+/// resolves no slot at all for one (#5173). The planner caps each interface's
+/// queue count at it rather than refusing, so a NIC with more combined channels
+/// than the stride stays usable on its first `BINDING_QUEUES_PER_IFACE` queues.
+pub(crate) const BINDING_QUEUES_PER_IFACE: usize = 16;
+
 pub(crate) fn replan_bindings_from_candidates(
     workers: usize,
     existing: &[BindingStatus],
@@ -796,14 +808,56 @@ pub(crate) fn replan_bindings_from_candidates(
     ifindex_by_name: BTreeMap<String, i32>,
     forwarding_armed: bool,
 ) -> Vec<BindingStatus> {
-    let mut existing_by_slot = BTreeMap::new();
+    // #7497 blocker 6: prior state is carried forward keyed by the binding's
+    // STABLE IDENTITY — `(interface, queue_id)` — and not by slot.
+    //
+    // Slot is a position in the minted sequence, not an identity. Under the old
+    // global-minimum rule every interface contributed the same number of rows,
+    // so the mapping happened to be stable for the cases that occurred; with a
+    // per-interface queue count it is not. `[A(rx=4), B(rx=2)]` mints slot 5 as
+    // `(A,q3)`; after `ethtool -L B combined 4`, slot 5 is `(B,q2)`. Carrying
+    // `registered`/`armed`/`ready`/`last_error` across that reshuffle attaches
+    // one interface's state to a different interface's queue, and a subsequent
+    // `binding slot 5 unregister` retargets whichever row now holds the slot.
+    // Since #6676 the shim no longer reduces the coordinate, so that queue's
+    // packets then have nowhere to go.
+    //
+    // `(interface, queue_id)` is stable across a queue-count change on ANY
+    // interface, across interfaces entering or leaving the candidate set, and
+    // across a reordering of the candidate list.
+    let mut existing_by_identity: BTreeMap<(String, u32), BindingStatus> = BTreeMap::new();
     for binding in existing {
-        existing_by_slot.insert(binding.slot, binding.clone());
+        existing_by_identity.insert(
+            (binding.interface.clone(), binding.queue_id),
+            binding.clone(),
+        );
     }
     if candidates.is_empty() {
         return Vec::new();
     }
-    let queue_count = candidates.iter().map(|(_, rx)| *rx).min().unwrap_or(0);
+    // #7497: per-interface queue counts. Each interface contributes
+    // `min(rx_queues, BINDING_QUEUES_PER_IFACE)` rows instead of every
+    // interface contributing the GLOBAL minimum.
+    //
+    // The old rule bound `min(rx) x interfaces` queues, which on an asymmetric
+    // box left every queue above the global minimum unbound — and an unbound
+    // queue is not merely idle: the shim takes `drop_degraded_transit` on
+    // BINDING_MISSING, so it drops every transit packet RSS steers to it while
+    // the interface still reads up.
+    //
+    // The 16 is the binding array's per-interface stride
+    // (`BINDING_QUEUES_PER_IFACE`); a queue id at or above it would alias the
+    // adjacent ifindex's queue-0 row, which the Go publisher already refuses
+    // (#4894). Capping here rather than refusing keeps a NIC with more than 16
+    // combined channels usable on its first 16.
+    let per_interface: Vec<(String, usize)> = candidates
+        .iter()
+        .map(|(name, rx)| (name.clone(), (*rx).min(BINDING_QUEUES_PER_IFACE)))
+        .collect();
+    // The widest interface. This is what bounds the minted queue-id range, and
+    // therefore the worker-id range, so it replaces the global minimum in the
+    // #6211 check below.
+    let queue_count = per_interface.iter().map(|(_, q)| *q).max().unwrap_or(0);
     let interfaces = candidates
         .iter()
         .map(|(name, _)| name.clone())
@@ -867,22 +921,70 @@ pub(crate) fn replan_bindings_from_candidates(
     // time `register_xsk_slot` runs (`crate::afxdp::bpf_map::ha`) bringup has
     // already torn down the previous bindings, so a failure there takes
     // forwarding down instead of declining to change it.
-    let planned_bindings = (queue_count as u64) * (interfaces_len as u64);
+    // #7497: the SUM of the per-interface counts, not `queue_count x
+    // interfaces`. Under the old rule those were the same number; they are not
+    // once each interface contributes its own count, and using the product here
+    // would refuse plans that fit.
+    let planned_bindings: u64 = per_interface.iter().map(|(_, q)| *q as u64).sum();
     if planned_bindings > MAX_BINDING_SLOTS as u64 {
         eprintln!(
-            "replan_bindings: REFUSING plan — {} interfaces x {} queues = {} bindings, \
-             but userspace_heartbeat/userspace_xsk_map address only {} slots \
+            "replan_bindings: REFUSING plan — {} interfaces contributing {} bindings \
+             in total (widest interface has {} queues), but \
+             userspace_heartbeat/userspace_xsk_map address only {} slots \
              (MAX_BINDING_SLOTS); the excess bindings could not be registered and \
              their RX queues would drop all transit traffic",
-            interfaces_len, queue_count, planned_bindings, MAX_BINDING_SLOTS
+            interfaces_len, planned_bindings, queue_count, MAX_BINDING_SLOTS
         );
         return Vec::new();
     }
-    let mut out = Vec::with_capacity(queue_count * interfaces.len());
+    // #7497 blocker 3: an operator upgrading onto per-interface queue counts can
+    // go from ONE worker thread to as many as the widest interface has queues,
+    // with no config change. `plan_workers` keys its map by `worker_id` and
+    // spawns one worker per key, so the group count IS the thread count, and the
+    // default poll mode is busy-poll (`pkg/dataplane/userspace/process.go`),
+    // which means each of those threads spins. That must not be discovered from
+    // a CPU graph.
+    //
+    // Report BOTH numbers and the knob that caps them. The knob does cap them:
+    // `worker_id = queue_id % workers`, so the group count is
+    // `min(workers, queues)` — measured across a (workers x queues) matrix and
+    // pinned by `worker_knob_still_caps_worker_groups_7497`.
+    let old_rule_queues = candidates.iter().map(|(_, rx)| *rx).min().unwrap_or(0);
+    let old_groups = old_rule_queues.min(workers.max(1));
+    let new_groups = queue_count.min(workers.max(1));
+    if new_groups != old_groups {
+        // Deduped so a re-applied snapshot does not repeat it. The static gates
+        // a LOG LINE only — a lost race re-emits at worst, and never affects the
+        // plan, which is why a global is acceptable here and would not be for
+        // anything the returned bindings depend on.
+        static LAST_REPORTED: AtomicU64 = AtomicU64::new(u64::MAX);
+        let packed = ((old_groups as u64) << 32) | new_groups as u64;
+        if LAST_REPORTED.swap(packed, Ordering::Relaxed) != packed {
+            eprintln!(
+                "replan_bindings: worker groups {} -> {} (#7497 per-interface queue \
+                 counts; the widest interface has {} queues, the global minimum was \
+                 {}). Each group is one worker thread, and under the default \
+                 busy-poll mode each spins. Cap them with `workers <n>` under \
+                 `system userspace-dataplane` — the plan mints \
+                 min(workers, queues) groups.",
+                old_groups, new_groups, queue_count, old_rule_queues
+            );
+        }
+    }
+    let mut out = Vec::with_capacity(planned_bindings as usize);
     let mut slot = 0u32;
+    // Queue-major with per-row skipping: row `q` contains one entry for every
+    // interface that HAS a queue `q`. Kept queue-major (rather than switching to
+    // interface-major) so this change moves one thing — which queues exist — and
+    // not also the order they are minted in.
     for queue_id in 0..queue_count {
-        for iface in &interfaces {
-            let mut binding = existing_by_slot.remove(&slot).unwrap_or_default();
+        for (iface, iface_queues) in &per_interface {
+            if queue_id >= *iface_queues {
+                continue;
+            }
+            let mut binding = existing_by_identity
+                .remove(&(iface.clone(), queue_id as u32))
+                .unwrap_or_default();
             let had_existing = binding.last_change.is_some()
                 || binding.registered
                 || binding.armed

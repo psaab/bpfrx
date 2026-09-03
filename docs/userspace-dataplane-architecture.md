@@ -2683,21 +2683,30 @@ binding admission: `include_userspace_binding_interface`
 (`userspace-dp/src/server/helpers/planning.rs`) refuses a candidate on
 it, so a route-based IPsec xfrmi never becomes a binding candidate. A
 helper that predates the field leaves it `false` and plans the xfrmi
-anyway — and that is not a lost optimisation. The planner's queue count
-is the GLOBAL MINIMUM across candidates
+anyway — and that is not a lost optimisation. Before #7497 the planner's
+queue count was the GLOBAL MINIMUM across candidates
 (`replan_bindings_from_candidates`), and an xfrm interface has exactly
 ONE RX queue: `ip -d link` reports `numrxqueues 1` and
 `/sys/class/net/<if>/queues` holds a single `rx-0`, which is the entry
 BOTH `userspaceRXQueueCount` (Go, `interfaces.go`) and `rx_queue_count`
-(Rust) count. So one ignored flag re-plans EVERY physical interface on
-the box onto one queue and one worker — the #3091 single-worker
-regression, arriving through a door #3091 did not name (it named the
-1-queue VLAN child, which the same function already re-keys onto its
-parent for exactly this reason). Nothing about the bytes is malformed,
-so neither the version-equality check nor the snapshot content hash can
+(Rust) count. Before #7497 one ignored flag therefore re-planned EVERY physical
+interface on the box onto one queue and one worker — the #3091
+single-worker regression, arriving through a door #3091 did not name (it
+named the 1-queue VLAN child, which the same function already re-keys
+onto its parent for exactly this reason). Nothing about the bytes is
+malformed, so neither the version-equality check nor the snapshot content hash can
 see it; only the reader is wrong. That is the same shape as the v4 case
 — a new field that changes how existing bytes behave needs the version,
 not just a new JSON tag.
+
+**#7497 removed that amplification, and it is worth being precise about
+what survives.** Each interface now contributes its own
+`min(rx_queues, 16)`, so a spurious 1-queue xfrmi candidate costs exactly
+one spurious binding instead of collapsing every other interface to one
+queue. The flag still matters — that binding is on a netdev the dataplane
+should never have bound, and it consumes a slot against the 4096-entry
+slot-keyed map capacity — but the failure is now local to the offending
+interface rather than global to the box.
 
 **The bump is paired with a fail-closed gate.** On its own, a bump only
 makes an old helper *refuse* the snapshot — and a refused snapshot leaves

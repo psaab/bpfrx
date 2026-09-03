@@ -51,15 +51,31 @@ decision → forwarding build → enqueue TX or recycle.
 
 `server::helpers::replan_queues` derives the AF_XDP binding plan from the
 config snapshot. It builds a candidate list of binding-eligible Linux
-netdevs, takes `queue_count = min(rx_queues)` across all candidates, and
-emits one binding per `(netdev, queue_id)` — so `planned_workers` equals
-that per-interface RX-queue minimum. The candidate set is the shared
+netdevs, and emits one binding per `(netdev, queue_id)` for each of that
+netdev's own `min(rx_queues, 16)` queues — so the plan is `Σ min(rx, 16)`
+and `planned_workers` equals `min(workers, widest interface's queues)`.
+
+Until #7497 this took `queue_count = min(rx_queues)` across ALL candidates
+and applied that one number to every interface. On a symmetric box the two
+rules agree; on an asymmetric one the old rule left every queue above the
+global minimum **unbound**, and an unbound queue is not idle — the shim
+takes `drop_degraded_transit` on `BINDING_MISSING`, so it drops every
+transit packet RSS steers to it while the interface still reads up. The 16
+is the binding array's per-interface stride (`BINDING_QUEUES_PER_IFACE`);
+a queue id at or above it would alias the adjacent ifindex's row (#4894).
+
+The candidate set is the shared
 binding-exclusion contract (`include_userspace_binding_interface`, the
 Rust mirror of the Go `UserspaceBoundLinuxInterfaces` allowlist): zoned,
 non-tunnel, non-local-fabric netdevs, excluding `fxp*`/`em*`/`fab*`/`lo0`
 and the mgmt/control zones.
 
-Two dedup rules keep the `queue_count` min from collapsing:
+Two dedup rules govern which netdev owns a queue. Before #7497 they also
+kept the global `queue_count` minimum from COLLAPSING — a single 1-queue
+candidate dragged every interface down to one queue. Per-interface counts
+remove that amplification, but both rules are still required: the first
+prevents a double bind on one `(netdev, queue)`, and the second attributes
+a VLAN child's traffic to the hardware queues it actually arrives on.
 
 - **#1921 (`seen_linux`)**: the snapshot lists both a physical interface
   (`ge-0/0/0`) and its non-VLAN unit (`ge-0/0/0.0`); both resolve to the
@@ -75,10 +91,15 @@ Two dedup rules keep the `queue_count` min from collapsing:
   therefore deduped onto its parent: when the parent is itself a
   candidate it is skipped entirely; an orphan VLAN child (parent not a
   candidate) is re-keyed onto the parent netdev using the parent's
-  hardware queue count, never the child's lone software queue. Without
-  this, `min(6, 1, 1, 6) = 1` forced a single worker (~6-7 Gbps; the
-  #3091 regression). With it the WAN parent binds all 6 hardware queues
-  and forwards at ~23 Gbps multi-worker.
+  hardware queue count, never the child's lone software queue. Before
+  #7497 the cost of missing this was global: `min(6, 1, 1, 6) = 1` forced
+  a single worker across the whole box (~6-7 Gbps; the #3091 regression).
+  Under per-interface counts a missed re-key no longer collapses other
+  interfaces — but it still binds the child's single software queue
+  instead of the parent's six hardware ones, so the parent's traffic
+  arrives on queues nothing is bound to and is dropped as
+  `BINDING_MISSING`. The rule is no less load-bearing; only its blast
+  radius changed.
 
 Both `vlan_id` and `parent_linux_name` are hashed into the binding
 plan key (`update_snapshot_binding_plan_key`) so a re-parenting or VLAN
