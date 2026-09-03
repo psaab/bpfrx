@@ -1,7 +1,7 @@
 # Dataplane Firewall Validation: Agentic Feature & Wire Verification Specification
 
 ## 1. Purpose
-This specification defines an agentic validation harness for the `xpf` firewall dataplane. While the repository carries 5,225 in-process unit tests proving that isolated functions (e.g. `evaluate_policy`) compute correct verdicts in memory, unit tests structurally cannot prove that a live daemon configured through CLI/REST enforces those verdicts on the wire. This harness enables autonomous agents to drive deterministic, falsifiable verification on running systems, producing definitive `PASS`, `FAIL`, or `VOID` verdicts recorded directly in `test/results/ledger.jsonl` via `test/incus/harness-result.sh` (#8332).
+This specification defines an agentic validation harness for the `xpf` firewall dataplane. While the repository carries 5,225 in-process unit tests proving that isolated functions (e.g. `evaluate_policy`) compute correct verdicts in memory, unit tests structurally cannot prove that a live daemon configured through CLI/REST enforces those verdicts on the wire. This harness enables autonomous agents to drive deterministic, falsifiable verification on running systems, producing definitive `PASS`, `FAIL`, or `VOID` verdicts recorded directly in `test/results/ledger.d` via `test/incus/harness-result.sh` (#8332).
 
 ## 2. Feature Validation Matrix
 The primary deliverable is out-of-process wire verification across live Incus endpoints (`trust-host`, `untrust-host`, `dmz-host`). Every row requires positive execution evidence before checking invariants and defines an explicit observable failure:
@@ -40,7 +40,7 @@ Daemon crash fail-closed (#68): `test/incus/test-ha-crash.sh` Phase 2. Superviso
 ## 5. Grounded Infrastructure & Tooling
 - **Deterministic Provisioning:** `test/incus/setup.sh up` provisions Layer 2 bridges (`xpf-trust`, `xpf-untrust`, `xpf-dmz`) and endpoints (`trust-host`, `untrust-host`, `dmz-host`), enforcing DUT isolation via `assert_sole_dataplane_owner()` (#1992/#1961).
 - **Cluster Mutex:** Destructive runs serialize under flock `/tmp/xpf-cluster.lock` via `test/incus/cluster-cell.sh` (#1875/#4020).
-- **Ledger Recording:** Gate executions record structured envelopes in `test/results/ledger.jsonl` using `test/incus/harness-result.sh run` (#8332).
+- **Ledger Recording:** Gate executions record structured envelopes in `test/results/ledger.d` using `test/incus/harness-result.sh run` (#8332).
 - **Census Enforcement:** Every harness must classify as `reached` under `make harness-census` (#8330).
 - **Owed Benchmark:** Connection-rate CPS ceiling is measured by `test/incus/newflow-ceiling-harness.sh` using in-tree `newflow-gen` (#4800) and `newflow_ceiling_analyze.py`.
 
