@@ -112,7 +112,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 mod key;
-pub(crate) use key::{nat64_first_fragment_key, nat64_nonfirst_fragment_key};
+pub(crate) use key::{first_fragment_key, nonfirst_fragment_key};
 
 /// Number of independent shards. Power of two so the shard index is a mask.
 /// #7056 (#5798 required-fix #5): fragment-association misses caused by the
@@ -143,23 +143,29 @@ pub(crate) use key::{nat64_first_fragment_key, nat64_nonfirst_fragment_key};
 ///
 /// Cumulative and process-global, like `INTERFACE_SNAT_PAT_COLLISIONS`, so tests
 /// read them as a delta.
+// #7899: these two keep their `NAT64_FRAG_` names while every other item in
+// this module dropped the prefix. They are not mislabelled -- they ARE the
+// shipped Prometheus series `xpf_userspace_nat64_frag_cross_domain_misses_total`
+// and `..._protocol_alias_misses_total`, so the identifier is the grep path
+// from an alert to the code that moves it. Renaming them would break that
+// path to make a module read tidier.
 pub(crate) static NAT64_FRAG_CROSS_DOMAIN_MISSES: AtomicU64 = AtomicU64::new(0);
 
 /// See `NAT64_FRAG_CROSS_DOMAIN_MISSES`.
 pub(crate) static NAT64_FRAG_PROTOCOL_ALIAS_MISSES: AtomicU64 = AtomicU64::new(0);
 
-pub(crate) const NAT64_FRAG_SHARDS: usize = 16;
+pub(crate) const FRAG_SHARDS: usize = 16;
 /// Fixed per-shard entry cap (LRU eviction on overflow). Total ceiling is
-/// `NAT64_FRAG_SHARDS * NAT64_FRAG_CAP_PER_SHARD` = 1024 entries; each entry is
+/// `FRAG_SHARDS * FRAG_CAP_PER_SHARD` = 1024 entries; each entry is
 /// a `Copy` `SessionDecision` + an optional `Nat64ReverseInfo` + a deadline —
 /// a few hundred bytes, so a few hundred KB fixed ceiling. No payload bytes are
 /// stored (no amplification by datagram size).
-pub(crate) const NAT64_FRAG_CAP_PER_SHARD: usize = 64;
+pub(crate) const FRAG_CAP_PER_SHARD: usize = 64;
 /// Association lifetime. Deliberately SHORT (2s, not the RFC-6864 60s
 /// reassembly timeout): we associate a first fragment's decision with its
 /// non-first fragments, which arrive on the fast path within
 /// microseconds-milliseconds. Refreshed on every hit.
-pub(crate) const NAT64_FRAG_TTL_NS: u64 = 2_000_000_000;
+pub(crate) const FRAG_TTL_NS: u64 = 2_000_000_000;
 
 /// #5798: the INGRESS SECURITY AUTHORITY a fragment association was minted
 /// under — the part of the key that makes "same key" mean "same enforcement
@@ -217,7 +223,7 @@ pub(crate) const NAT64_FRAG_TTL_NS: u64 = 2_000_000_000;
 /// fail-closed, never a false inherit. If it is ever made live, relabel that
 /// test's fabricated case and drive it from a real ingress.
 ///
-/// NOT included: the config/FIB generation, which `Nat64FragEntry.generation`
+/// NOT included: the config/FIB generation, which `FragEntry.generation`
 /// already fences (#5624), and direction, which is constant — the cache is
 /// forward-install / forward-consult only.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -259,8 +265,8 @@ pub(crate) struct FragAuthority {
     /// policy change between fragments is not re-applied.
     ///
     /// Be precise about the WINDOW, because the obvious reading is wrong and an
-    /// earlier revision of this paragraph got it wrong. `NAT64_FRAG_TTL_NS` is
-    /// 2s, but `Nat64FragAssoc::lookup` RE-STAMPS `deadline_ns` on every hit
+    /// earlier revision of this paragraph got it wrong. `FRAG_TTL_NS` is
+    /// 2s, but `FragAssoc::lookup` RE-STAMPS `deadline_ns` on every hit
     /// (pre-existing, #2562/#5624 — not introduced here), so it is an IDLE
     /// timeout, not an absolute lifetime. A stream of non-first fragments
     /// carrying the same (src, dst, ident, protocol, authority) spaced under
@@ -305,7 +311,7 @@ pub(crate) struct FragAuthority {
 /// security authority (see [`FragAuthority`]) so a datagram can only inherit a
 /// decision minted for the SAME protocol in the SAME enforcement domain.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) struct Nat64FragKey {
+pub(crate) struct FragKey {
     pub(crate) addr_family: u8,
     pub(crate) src: IpAddr,
     pub(crate) dst: IpAddr,
@@ -325,8 +331,8 @@ pub(crate) struct Nat64FragKey {
 }
 
 #[derive(Clone, Copy)]
-struct Nat64FragEntry {
-    key: Nat64FragKey,
+struct FragEntry {
+    key: FragKey,
     decision: SessionDecision,
     reverse: Option<Nat64ReverseInfo>,
     deadline_ns: u64,
@@ -359,17 +365,17 @@ struct Nat64FragEntry {
 /// that translates on any worker is visible to a non-first fragment that lands
 /// on any other worker.
 #[derive(Clone)]
-pub(crate) struct Nat64FragAssoc {
-    shards: Arc<Vec<Mutex<Vec<Nat64FragEntry>>>>,
+pub(crate) struct FragAssoc {
+    shards: Arc<Vec<Mutex<Vec<FragEntry>>>>,
 }
 
-impl std::fmt::Debug for Nat64FragAssoc {
+impl std::fmt::Debug for FragAssoc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Nat64FragAssoc")
+        f.write_str("FragAssoc")
     }
 }
 
-impl Default for Nat64FragAssoc {
+impl Default for FragAssoc {
     fn default() -> Self {
         Self::new()
     }
@@ -401,8 +407,8 @@ fn ip_octets(ip: IpAddr, out: &mut [u8; 16]) -> usize {
 ///     key, and misses cleanly — which is exactly the fail-closed outcome.
 ///  2. It keeps same-datagram candidates CO-LOCATED, so a cross-domain
 ///     aliasing attempt is observable with a single-shard scan rather than a
-///     walk of all `NAT64_FRAG_SHARDS` buckets.
-pub(crate) fn nat64_frag_shard_index(key: &Nat64FragKey) -> usize {
+///     walk of all `FRAG_SHARDS` buckets.
+pub(crate) fn frag_shard_index(key: &FragKey) -> usize {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let mut mix = |b: u8| {
         h ^= u64::from(b);
@@ -421,14 +427,14 @@ pub(crate) fn nat64_frag_shard_index(key: &Nat64FragKey) -> usize {
     for b in key.ident.to_be_bytes() {
         mix(b);
     }
-    (h as usize) & (NAT64_FRAG_SHARDS - 1)
+    (h as usize) & (FRAG_SHARDS - 1)
 }
 
-impl Nat64FragAssoc {
+impl FragAssoc {
     pub(crate) fn new() -> Self {
-        let mut shards = Vec::with_capacity(NAT64_FRAG_SHARDS);
-        for _ in 0..NAT64_FRAG_SHARDS {
-            shards.push(Mutex::new(Vec::with_capacity(NAT64_FRAG_CAP_PER_SHARD)));
+        let mut shards = Vec::with_capacity(FRAG_SHARDS);
+        for _ in 0..FRAG_SHARDS {
+            shards.push(Mutex::new(Vec::with_capacity(FRAG_CAP_PER_SHARD)));
         }
         Self {
             shards: Arc::new(shards),
@@ -453,7 +459,7 @@ impl Nat64FragAssoc {
     /// deny/NAT64 rules.
     pub(crate) fn install(
         &self,
-        key: Nat64FragKey,
+        key: FragKey,
         decision: SessionDecision,
         reverse: Option<Nat64ReverseInfo>,
         now_ns: u64,
@@ -462,11 +468,11 @@ impl Nat64FragAssoc {
         // 0 when no RG-bound interface owns it.
         owner_rg: i32,
     ) -> bool {
-        let deadline_ns = now_ns.saturating_add(NAT64_FRAG_TTL_NS);
+        let deadline_ns = now_ns.saturating_add(FRAG_TTL_NS);
         // #7054: did this install sacrifice a LIVE association? Reported to the
         // caller so the condition is observable; see the note above the eviction.
         let mut evicted_live = false;
-        let idx = nat64_frag_shard_index(&key);
+        let idx = frag_shard_index(&key);
         let mut shard = self.shards[idx]
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -489,7 +495,7 @@ impl Nat64FragAssoc {
             shard.push(e);
             return false;
         }
-        if shard.len() >= NAT64_FRAG_CAP_PER_SHARD {
+        if shard.len() >= FRAG_CAP_PER_SHARD {
             // Reclaim EXPIRED slots before touching a live one. Under a flood of
             // first fragments (each a distinct ident -> a fresh install) the
             // shard fills with entries, some already past their (short) TTL. A
@@ -501,12 +507,12 @@ impl Nat64FragAssoc {
             // live) do we fall back to evicting the oldest live entry — the
             // unavoidable hard capacity bound.
             shard.retain(|e| e.deadline_ns > now_ns);
-            if shard.len() >= NAT64_FRAG_CAP_PER_SHARD {
+            if shard.len() >= FRAG_CAP_PER_SHARD {
                 shard.remove(0);
                 evicted_live = true;
             }
         }
-        shard.push(Nat64FragEntry {
+        shard.push(FragEntry {
             key,
             decision,
             reverse,
@@ -532,7 +538,7 @@ impl Nat64FragAssoc {
     /// flow-cache `config_generation` guard (afxdp/flow_cache.rs).
     pub(crate) fn lookup(
         &self,
-        key: &Nat64FragKey,
+        key: &FragKey,
         now_ns: u64,
         generation: u64,
         // #6857: "is this owner RG forwarding-active locally right now?".
@@ -545,7 +551,7 @@ impl Nat64FragAssoc {
         // keeps the HA vocabulary on the afxdp side of the boundary.
         owner_rg_forwarding_active: impl Fn(i32) -> bool,
     ) -> Option<(SessionDecision, Option<Nat64ReverseInfo>)> {
-        let idx = nat64_frag_shard_index(key);
+        let idx = frag_shard_index(key);
         let mut shard = self.shards[idx]
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -563,7 +569,7 @@ impl Nat64FragAssoc {
             // to be distinguishable.
             //
             // The scan is single-shard BY CONSTRUCTION, which is why it belongs
-            // here rather than at a call site: `nat64_frag_shard_index`
+            // here rather than at a call site: `frag_shard_index`
             // deliberately digests only `(family, src, dst, ident)`, excluding
             // `authority` and `protocol` precisely so same-datagram candidates
             // stay CO-LOCATED. Every alias candidate is already in the bucket
@@ -615,7 +621,7 @@ impl Nat64FragAssoc {
             return None;
         }
         let mut e = shard.remove(pos);
-        e.deadline_ns = now_ns.saturating_add(NAT64_FRAG_TTL_NS);
+        e.deadline_ns = now_ns.saturating_add(FRAG_TTL_NS);
         let value = (e.decision, e.reverse);
         shard.push(e);
         Some(value)

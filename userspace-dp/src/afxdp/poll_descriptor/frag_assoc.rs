@@ -73,7 +73,7 @@ pub(in crate::afxdp) fn frag_ingress_authority(
 /// #2562: on a FIRST NAT64 fragment that translated and will forward, install
 /// the fragment association keyed by `(family, src, dst, ip_id, protocol,
 /// authority)` (#5798 widened the original `(family, src, dst, ip_id)`) so its
-/// non-first fragments inherit `decision` (see `nat64::Nat64FragAssoc`). Gated
+/// non-first fragments inherit `decision` (see `nat64::FragAssoc`). Gated
 /// on a resolved ForwardCandidate — a decision that will NOT forward (no route,
 /// missing neighbor) is never cached, so a non-first fragment then misses and
 /// drops fail-closed. Only a first fragment (offset 0, MF=1) installs; a
@@ -112,7 +112,7 @@ pub(super) fn nat64_install_forward_fragment_assoc(
     {
         return false;
     }
-    if let Some(key) = crate::fragment_assoc::nat64_first_fragment_key(l3_packet, addr_family, authority) {
+    if let Some(key) = crate::fragment_assoc::first_fragment_key(l3_packet, addr_family, authority) {
         // #5624: stamp the association with the generation of the forwarding
         // state that admitted this first fragment. `build_generation` advances
         // on every config reload, so an association installed here is rejected
@@ -155,7 +155,7 @@ pub(super) fn nat64_consult_forward_fragment_assoc(
     if addr_family != libc::AF_INET6 {
         return None;
     }
-    let key = crate::fragment_assoc::nat64_nonfirst_fragment_key(l3_packet, addr_family, authority)?;
+    let key = crate::fragment_assoc::nonfirst_fragment_key(l3_packet, addr_family, authority)?;
     // #5624: consult under the CURRENT forwarding state's generation. An
     // association installed under a prior generation (before a config commit
     // changed deny/NAT64 rules) is treated as a miss + evicted here, so the
@@ -186,7 +186,7 @@ pub(super) fn nat64_consult_forward_fragment_assoc(
 /// and translate L3-only (address-only rewrite) instead of being forwarded
 /// UNTRANSLATED (the #5689 leak). Mirrors [`nat64_install_forward_fragment_assoc`]
 /// but for the SNAT / DNAT / static-NAT / NPTv6 path. It REUSES the generic
-/// `Nat64FragAssoc` cache: the key + value are family-agnostic and the `nat64`
+/// `FragAssoc` cache: the key + value are family-agnostic and the `nat64`
 /// flag on the cached decision distinguishes a NAT64 entry from an ordinary one
 /// (a given datagram installs exactly one entry, so the two never alias). The
 /// shared cache is stamped with `build_generation` — which advances on EVERY
@@ -195,7 +195,7 @@ pub(super) fn nat64_consult_forward_fragment_assoc(
 ///
 /// Only a first fragment (offset 0, MF=1) carrying a same-family address
 /// rewrite whose resolution is a ForwardCandidate with a resolved neighbor
-/// installs; a NAT64 decision (its own install stamps reverse info), a decision
+/// installs; a NAT64 decision (it has its own install), a decision
 /// with no address rewrite, or one that will not forward is never cached, so an
 /// unassociated non-first fragment still falls to the flowless default policy.
 #[inline]
@@ -207,8 +207,16 @@ pub(super) fn nat_install_forward_fragment_assoc(
     decision: &SessionDecision,
     now_ns: u64,
 ) -> bool {
-    // Cross-family NAT64 has its own install (which also stamps the reverse
-    // info); here we cache only an ordinary same-family address rewrite.
+    // Cross-family NAT64 has its own install; here we cache only an ordinary
+    // same-family address rewrite.
+    //
+    // #7899: this used to read "(which also stamps the reverse info)". It does
+    // not, and has not: BOTH installs pass `reverse: None`, no caller anywhere
+    // in the tree passes `Some(..)`, and both consults bind `_reverse` and
+    // discard it. The reverse (v4->v6) direction is the deferred increment
+    // documented on the consult helpers above. The sentence was the stated
+    // reason the cache's entry type was "already shared enough to move"
+    // (#7899), so it was load-bearing for a design argument while being false.
     if decision.nat.nat64
         || (decision.nat.rewrite_src.is_none() && decision.nat.rewrite_dst.is_none())
     {
@@ -219,7 +227,7 @@ pub(super) fn nat_install_forward_fragment_assoc(
     {
         return false;
     }
-    if let Some(key) = crate::fragment_assoc::nat64_first_fragment_key(l3_packet, addr_family, authority) {
+    if let Some(key) = crate::fragment_assoc::first_fragment_key(l3_packet, addr_family, authority) {
         return forwarding.nat64.frag_assoc.install(
             key,
             *decision,
@@ -250,7 +258,7 @@ pub(super) fn nat_install_forward_fragment_assoc(
 ///
 /// FAIL-CLOSED MISS (#6122, closing the #5689 residual). On a consult MISS —
 /// fragment reorder (non-first before first), TTL straddle (> the ~2s
-/// `Nat64FragAssoc` TTL between first and non-first), shard-cap eviction under a
+/// `FragAssoc` TTL between first and non-first), shard-cap eviction under a
 /// first-fragment flood, a config-generation bump between first and non-first, or
 /// a first fragment that never forwarded (MissingNeighbor/NoRoute → no install) —
 /// the caller does NOT blindly forward the fragment untranslated. Instead the
@@ -279,7 +287,7 @@ pub(super) fn nat_consult_forward_fragment_assoc(
     ha_state: &std::collections::BTreeMap<i32, crate::afxdp::types::HAGroupRuntime>,
     now_secs: u64,
 ) -> Option<SessionDecision> {
-    let key = crate::fragment_assoc::nat64_nonfirst_fragment_key(l3_packet, addr_family, authority)?;
+    let key = crate::fragment_assoc::nonfirst_fragment_key(l3_packet, addr_family, authority)?;
     let (decision, _reverse) = forwarding.nat64.frag_assoc.lookup(
         &key,
         now_ns,

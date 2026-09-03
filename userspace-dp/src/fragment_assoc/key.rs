@@ -6,7 +6,7 @@ use super::*;
 
 /// Parse the port-free fragment fields from an L3-relative packet: the
 /// `(key, more, offset_units)` triple. `addr_family` selects the family. Shared
-/// by [`nat64_first_fragment_key`] and [`nat64_nonfirst_fragment_key`] so the
+/// by [`first_fragment_key`] and [`nonfirst_fragment_key`] so the
 /// install and consult key derivations are byte-identical.
 ///
 /// #5798: `authority` is the ingress security domain the caller resolved for
@@ -15,11 +15,11 @@ use super::*;
 /// both derivations, so the two can never drift into keying on different
 /// dimensions. Every other field is read from the packet's L3 headers only —
 /// no payload byte is interpreted as L4.
-fn nat64_fragment_fields(
+fn fragment_fields(
     packet: &[u8],
     addr_family: i32,
     authority: FragAuthority,
-) -> Option<(Nat64FragKey, bool, u16)> {
+) -> Option<(FragKey, bool, u16)> {
     match addr_family {
         libc::AF_INET6 => {
             if packet.len() < 40 {
@@ -28,7 +28,7 @@ fn nat64_fragment_fields(
             let frag = ipv6_fragment_header(packet)?;
             let src = Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).ok()?);
             let dst = Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).ok()?);
-            let key = Nat64FragKey {
+            let key = FragKey {
                 addr_family: libc::AF_INET6 as u8,
                 src: IpAddr::V6(src),
                 dst: IpAddr::V6(dst),
@@ -50,7 +50,7 @@ fn nat64_fragment_fields(
             let ident = u16::from_be_bytes([packet[4], packet[5]]);
             let src = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
             let dst = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
-            let key = Nat64FragKey {
+            let key = FragKey {
                 addr_family: libc::AF_INET as u8,
                 src: IpAddr::V4(src),
                 dst: IpAddr::V4(dst),
@@ -73,12 +73,12 @@ fn nat64_fragment_fields(
 /// #5798: `authority` is the ingress security domain that admitted this first
 /// fragment; a non-first fragment can only inherit the entry by presenting the
 /// SAME authority.
-pub(crate) fn nat64_first_fragment_key(
+pub(crate) fn first_fragment_key(
     packet: &[u8],
     addr_family: i32,
     authority: FragAuthority,
-) -> Option<Nat64FragKey> {
-    let (key, more, offset_units) = nat64_fragment_fields(packet, addr_family, authority)?;
+) -> Option<FragKey> {
+    let (key, more, offset_units) = fragment_fields(packet, addr_family, authority)?;
     if more && offset_units == 0 {
         Some(key)
     } else {
@@ -94,11 +94,11 @@ pub(crate) fn nat64_first_fragment_key(
 /// different domain therefore builds a different key and MISSES, falling
 /// through to full flowless enforcement under its real identity instead of
 /// inheriting the first fragment's permit.
-pub(crate) fn nat64_nonfirst_fragment_key(
+pub(crate) fn nonfirst_fragment_key(
     packet: &[u8],
     addr_family: i32,
     authority: FragAuthority,
-) -> Option<Nat64FragKey> {
-    let (key, _more, offset_units) = nat64_fragment_fields(packet, addr_family, authority)?;
+) -> Option<FragKey> {
+    let (key, _more, offset_units) = fragment_fields(packet, addr_family, authority)?;
     if offset_units != 0 { Some(key) } else { None }
 }

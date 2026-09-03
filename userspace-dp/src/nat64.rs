@@ -294,7 +294,7 @@ pub(crate) struct Nat64State {
     /// one cache (cross-worker visible) and it survives a config reload (the
     /// Arc is threaded in `from_snapshots_with_previous`). NOT rebuilt from the
     /// snapshot — fragment associations are runtime state, not config.
-    pub(crate) frag_assoc: crate::fragment_assoc::Nat64FragAssoc,
+    pub(crate) frag_assoc: crate::fragment_assoc::FragAssoc,
     /// #5624: the config-snapshot generation THIS state was built under. The
     /// `frag_assoc` cache is Arc-shared across config reloads (so in-flight
     /// datagrams keep translating), but each association is a per-flow
@@ -302,7 +302,7 @@ pub(crate) struct Nat64State {
     /// changes deny/NAT64 rules bumps `snapshot.generation`, rebuilding this
     /// `Nat64State` with the new value while the shared cache still holds
     /// PRIOR-generation associations. Stamping every install and re-checking it
-    /// on lookup (see `Nat64FragAssoc::install`/`lookup`) invalidates a stale
+    /// on lookup (see `FragAssoc::install`/`lookup`) invalidates a stale
     /// association whose generation != the current one — mirroring the
     /// flow-cache `config_generation` guard (afxdp/flow_cache.rs). Lives on
     /// `Nat64State` (NOT inside the shared Arc) precisely because it must change
@@ -3466,7 +3466,7 @@ fn adjust_l4_checksum_v4_to_v6_incremental(
 /// verbatim, and recomputes ONLY the IPv4 header checksum.
 ///
 /// The `snat_v4`/`dst_v4` come from the FIRST fragment's cached association
-/// (`Nat64FragAssoc`), so all fragments translate to the same source and
+/// (`FragAssoc`), so all fragments translate to the same source and
 /// reassemble. Fragmented ICMPv6 is NOT handled here (the ICMP checksum covers
 /// the whole datagram and cannot be recomputed from a fragment) — it stays the
 /// #4617 fail-closed drop, so only TCP/UDP are accepted.
