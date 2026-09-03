@@ -406,8 +406,27 @@ objection and found a different one:
 So a synthesized deny is safe **iff the undefined members form a suffix** of the
 authored chain. Ghost-last is safe; ghost-first or ghost-middle is a routing
 outage. Rather than take that behaviour change on a working config, the narrowing
-is made **visible**: `warnNarrowedChains` logs each site with what was authored,
-what is applied, and what was discarded. Before this it was completely silent —
+is made **visible** — and operationally, not at commit time, because the affected
+population never commits: strict rejects an undefined reference in both
+directions, so these configs arrive via `Store.Load` / `SyncApply` on a reboot,
+peer sync or rollback. A commit-time warning would reach nobody in it.
+
+`warnNarrowedChains` logs each site with what was authored, what is applied, and
+what was discarded, and two gauges carry it:
+
+| gauge | meaning |
+|---|---|
+| `xpf_frr_policy_chains_narrowed` | attachments filtered by less than authored. Alert on > 0. |
+| `xpf_frr_policy_chains_narrowed_deny_safe` | the subset whose ghosts form a suffix — where a deny *would* be safe |
+
+They are deliberately **separate** from `xpf_frr_route_maps_quarantined`, whose
+documented meaning is that every route on those neighbors is being *withdrawn*.
+A narrowed chain withdraws nothing, so folding it in would fire that alert for
+non-withdrawals. Both sets are rebuilt per render, so a config that stops
+narrowing stops reporting. The `deny_safe` split exists so the decision on
+whether to ever synthesize a deny here is sized on how often the safe shape
+actually occurs, rather than on argument — which is what this measurement just
+had to overturn. Before this it was completely silent —
 the rendered section is self-consistent, the session works, and `show route-map`
 displays a real well-formed policy that is simply not the one the operator
 wrote.

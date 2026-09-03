@@ -19,6 +19,27 @@ func (c *xpfCollector) initControlPlaneDescriptors() {
 			"removal is deferred while set (#1880).",
 		nil, nil,
 	)
+	c.frrPolicyChainsNarrowed = prometheus.NewDesc(
+		"xpf_frr_policy_chains_narrowed",
+		"Number of BGP policy-chain attachments in the last rendered FRR "+
+			"managed section whose applied chain is a strict, non-empty subset "+
+			"of what the operator authored, because some member names an "+
+			"undefined policy-statement (#8363). Non-zero means those neighbors "+
+			"are still filtered but by LESS than was configured — routes are "+
+			"NOT withdrawn, which is why this is separate from "+
+			"xpf_frr_route_maps_quarantined. Alert on > 0.",
+		nil, nil,
+	)
+	c.frrPolicyChainsNarrowedDenySafe = prometheus.NewDesc(
+		"xpf_frr_policy_chains_narrowed_deny_safe",
+		"Subset of xpf_frr_policy_chains_narrowed whose undefined members form "+
+			"a SUFFIX of the authored chain. For those a synthesized deny would "+
+			"be safe; for the complement it would DELETE the surviving members, "+
+			"because FRR's composed route-map stops at the first member with a "+
+			"terminating default action (#8363). Published to size that decision "+
+			"on how often the safe shape occurs. Not an alert on its own.",
+		nil, nil,
+	)
 	c.frrRouteMapsQuarantined = prometheus.NewDesc(
 		"xpf_frr_route_maps_quarantined",
 		"Number of route-maps in the last rendered FRR managed section that "+

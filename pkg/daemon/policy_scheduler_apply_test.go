@@ -125,8 +125,8 @@ func (noopLinkController) NotifyLinkCycle() error  { return nil }
 // #7007: the repair-without-release variant. A no-op fake has no lease to keep;
 // the separation is asserted by leaseTracingLinkController.
 func (noopLinkController) NotifyLinkCycleKeepingLease() error { return nil }
-func (noopLinkController) RenewLinkCycle()         {}
-func (noopLinkController) AbandonLinkCycle() bool  { return false }
+func (noopLinkController) RenewLinkCycle()                    {}
+func (noopLinkController) AbandonLinkCycle() bool             { return false }
 
 type runtimeOnlyPolicyUpdaterTestDP struct {
 	runtimeOnlyApplyTestDP

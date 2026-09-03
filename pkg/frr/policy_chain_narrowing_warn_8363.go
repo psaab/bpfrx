@@ -32,6 +32,14 @@ type narrowedChainSite struct {
 	Authored []string
 	Kept     []string
 	Dropped  []string
+	// GhostsAreSuffix reports whether every undefined member sits AFTER every
+	// surviving one. That is the #8363 safety condition for ever synthesizing a
+	// deny here: renderComposedRouteMap breaks on the first member with a
+	// terminating default action, so a deny at a non-final ghost position does
+	// not shadow the rest of the chain, it DELETES it. Recorded now, while
+	// behaviour is unchanged, so the decision on whether to synthesize is sized
+	// on how often the safe shape actually occurs rather than on argument.
+	GhostsAreSuffix bool
 }
 
 // narrowedChainSites reports every BGP attachment in bgp whose authored chain
@@ -58,21 +66,33 @@ func narrowedChainSites(bgp *config.BGPConfig, po *config.PolicyOptionsConfig) [
 			return
 		}
 		var dropped []string
+		suffix := true
+		sawGhost := false
 		for _, n := range authored {
-			if n == "" || isDefinedPolicyStatement(n, po) {
+			if n == "" {
 				continue
 			}
-			if protocolTokensAreRedistribute &&
-				(knownRedistProtocol(n) || knownRedistProtocol(junosProtocolToFRR7625(n))) {
+			ghost := !isDefinedPolicyStatement(n, po) &&
+				!(protocolTokensAreRedistribute &&
+					(knownRedistProtocol(n) || knownRedistProtocol(junosProtocolToFRR7625(n))))
+			if ghost {
+				dropped = append(dropped, n)
+				sawGhost = true
 				continue
 			}
-			dropped = append(dropped, n)
+			// A member that SURVIVES and appears after a ghost breaks the suffix
+			// property: a deny synthesized at that ghost's position would delete
+			// this member entirely (#8363).
+			if sawGhost {
+				suffix = false
+			}
 		}
 		if len(dropped) == 0 {
 			return
 		}
 		out = append(out, narrowedChainSite{
 			Where: where, Authored: authored, Kept: kept, Dropped: dropped,
+			GhostsAreSuffix: suffix,
 		})
 	}
 
@@ -93,7 +113,8 @@ func narrowedChainSites(bgp *config.BGPConfig, po *config.PolicyOptionsConfig) [
 // warnNarrowedChains emits one warning per narrowed attachment across fc. It
 // changes no rendered output — it is the operator-visible signal that a filter
 // is weaker than authored.
-func warnNarrowedChains(fc *FullConfig) {
+func (m *Manager) warnNarrowedChains(fc *FullConfig) {
+	m.resetNarrowed()
 	if fc == nil {
 		return
 	}
@@ -101,6 +122,7 @@ func warnNarrowedChains(fc *FullConfig) {
 	for _, inst := range fc.Instances {
 		sites = append(sites, narrowedChainSites(inst.BGP, fc.PolicyOptions)...)
 	}
+	m.recordNarrowed(sites)
 	for _, s := range sites {
 		slog.Warn("BGP policy chain is NARROWER than configured: part of the authored chain "+
 			"names policy-statements that are not defined, so the direction is still filtered "+
@@ -109,6 +131,7 @@ func warnNarrowedChains(fc *FullConfig) {
 			"where", s.Where,
 			"authored", strings.Join(s.Authored, ","),
 			"applied", strings.Join(s.Kept, ","),
-			"discarded", strings.Join(s.Dropped, ","))
+			"discarded", strings.Join(s.Dropped, ","),
+			"ghosts-are-suffix", s.GhostsAreSuffix)
 	}
 }

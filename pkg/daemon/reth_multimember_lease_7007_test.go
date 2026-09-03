@@ -10,8 +10,8 @@ import (
 	"testing"
 
 	"github.com/psaab/xpf/pkg/cluster"
-	"github.com/psaab/xpf/pkg/dataplane"
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/dataplane"
 	"github.com/psaab/xpf/pkg/vrrp"
 	"github.com/vishvananda/netlink"
 )

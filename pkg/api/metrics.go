@@ -222,7 +222,9 @@ type xpfCollector struct {
 	// section replaced with the bounded explicit deny because their
 	// expansion would overflow FRR's sequence ceiling. Non-zero is an
 	// ongoing route withdrawal on every neighbor carrying one.
-	frrRouteMapsQuarantined *prometheus.Desc
+	frrRouteMapsQuarantined         *prometheus.Desc
+	frrPolicyChainsNarrowed         *prometheus.Desc
+	frrPolicyChainsNarrowedDenySafe *prometheus.Desc
 	// #4899: 0/1 gauge — 1 while the last DHCP-lease-change IPsec rebind
 	// failed and swanctl local_addrs are still bound to a stale lease
 	// address (the retry loop has not yet reconverged).
@@ -838,6 +840,8 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.neighborPeriodicAge
 	ch <- c.frrReloadDegraded
 	ch <- c.frrRouteMapsQuarantined
+	ch <- c.frrPolicyChainsNarrowed
+	ch <- c.frrPolicyChainsNarrowedDenySafe
 	ch <- c.natRulesLenientTerminalAction
 	ch <- c.ipsecRebindPending
 	ch <- c.schedulerRepublishFailed
@@ -1186,6 +1190,18 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	if c.srv.frrQuarantinedRouteMapsFn != nil {
 		ch <- prometheus.MustNewConstMetric(c.frrRouteMapsQuarantined,
 			prometheus.GaugeValue, float64(len(c.srv.frrQuarantinedRouteMapsFn())))
+	}
+	// #8363: same publish-an-explicit-0 discipline. A narrowed chain is not a
+	// withdrawal, so it gets its own series rather than inflating the
+	// quarantine gauge, whose documented meaning is that routes are being
+	// DENIED.
+	if c.srv.frrNarrowedPolicyChainsFn != nil {
+		ch <- prometheus.MustNewConstMetric(c.frrPolicyChainsNarrowed,
+			prometheus.GaugeValue, float64(len(c.srv.frrNarrowedPolicyChainsFn())))
+	}
+	if c.srv.frrNarrowedPolicyChainsDenySafeFn != nil {
+		ch <- prometheus.MustNewConstMetric(c.frrPolicyChainsNarrowedDenySafe,
+			prometheus.GaugeValue, float64(len(c.srv.frrNarrowedPolicyChainsDenySafeFn())))
 	}
 
 	// #4899: IPsec DHCP-lease-change rebind-pending is a control-plane

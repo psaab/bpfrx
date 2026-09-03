@@ -261,4 +261,3 @@ func TestInvalidateAppliedKeepsStructInvariant(t *testing.T) {
 		}
 	}
 }
-

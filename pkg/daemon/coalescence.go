@@ -287,4 +287,3 @@ func coalescenceMatches(wantAdaptive bool, wantRX, wantTX int,
 	}
 	return true
 }
-

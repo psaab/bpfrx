@@ -260,6 +260,14 @@ type Config struct {
 	// the gauge is not published.
 	FRRQuarantinedRouteMapsFn func() []string
 
+	// FRRNarrowedPolicyChainsFn returns the BGP policy-chain attachments whose
+	// applied chain is narrower than authored in the last rendered FRR managed
+	// section (#8363). Its LENGTH feeds xpf_frr_policy_chains_narrowed.
+	// FRRNarrowedPolicyChainsDenySafeFn returns the subset whose undefined
+	// members form a suffix. Optional; if nil the gauges are not published.
+	FRRNarrowedPolicyChainsFn         func() []string
+	FRRNarrowedPolicyChainsDenySafeFn func() []string
+
 	// NATLenientTerminalActionRulesFn returns the identities of NAT rules in
 	// the ACTIVE config that the tolerant path admitted despite the strict
 	// terminal-action cardinality gate (#7640). Its LENGTH feeds the
@@ -452,20 +460,20 @@ type Server struct {
 	peerLookupFn func(client, server net.Addr) authz.PeerIdentity
 	// peerLocalityFn is Config.PeerLocalityFn; nil means
 	// authz.PeerCouldBeLocalNow (#5561).
-	peerLocalityFn                       func(client, server net.Addr) bool
-	store                                *configstore.Store
-	dp                                   apiRuntimeDataPlane
-	eventBuf                             *logging.EventBuffer
-	gc                                   *conntrack.GC
-	routing                              *routing.Manager
-	frr                                  *frr.Manager
-	ipsec                                *ipsec.Manager
-	dhcp                                 *dhcp.Manager
-	vrrpMgr                              *vrrp.Manager
-	commitFn                             func(ctx context.Context, authority configstore.CommitAuthority, comment string) (*config.Config, error)
-	commitConfirmedFn                    func(ctx context.Context, authority configstore.CommitAuthority, minutes int) (*config.Config, error)
-	compileHealthFn                      func() CompileHealthSnapshot
-	bootstrapImportFn                    func() BootstrapImportSnapshot
+	peerLocalityFn    func(client, server net.Addr) bool
+	store             *configstore.Store
+	dp                apiRuntimeDataPlane
+	eventBuf          *logging.EventBuffer
+	gc                *conntrack.GC
+	routing           *routing.Manager
+	frr               *frr.Manager
+	ipsec             *ipsec.Manager
+	dhcp              *dhcp.Manager
+	vrrpMgr           *vrrp.Manager
+	commitFn          func(ctx context.Context, authority configstore.CommitAuthority, comment string) (*config.Config, error)
+	commitConfirmedFn func(ctx context.Context, authority configstore.CommitAuthority, minutes int) (*config.Config, error)
+	compileHealthFn   func() CompileHealthSnapshot
+	bootstrapImportFn func() BootstrapImportSnapshot
 	// #7181: applied state of the host-inbound nft surface; nil = unwired.
 	hostInboundAppliedFn                 func() HostInboundAppliedSnapshot
 	configPersistDegradedFn              func() bool
@@ -473,6 +481,8 @@ type Server struct {
 	neighborPhaseAgeFn                   func() map[string]float64
 	frrReloadDegradedFn                  func() bool
 	frrQuarantinedRouteMapsFn            func() []string
+	frrNarrowedPolicyChainsFn            func() []string
+	frrNarrowedPolicyChainsDenySafeFn    func() []string
 	natLenientTerminalActionRulesFn      func() []string
 	ipsecRebindPendingFn                 func() bool
 	hostInboundConntrackRevocationOwedFn func() bool
@@ -586,6 +596,8 @@ func NewServer(cfg Config) *Server {
 		neighborPhaseAgeFn:                   cfg.NeighborPhaseAgeFn,
 		frrReloadDegradedFn:                  cfg.FRRReloadDegradedFn,
 		frrQuarantinedRouteMapsFn:            cfg.FRRQuarantinedRouteMapsFn,
+		frrNarrowedPolicyChainsFn:            cfg.FRRNarrowedPolicyChainsFn,
+		frrNarrowedPolicyChainsDenySafeFn:    cfg.FRRNarrowedPolicyChainsDenySafeFn,
 		natLenientTerminalActionRulesFn:      cfg.NATLenientTerminalActionRulesFn,
 		ipsecRebindPendingFn:                 cfg.IPsecRebindPendingFn,
 		hostInboundConntrackRevocationOwedFn: cfg.HostInboundConntrackRevocationOwedFn,

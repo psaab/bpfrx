@@ -398,6 +398,25 @@ func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventB
 			}
 			return d.frr.QuarantinedRouteMaps()
 		},
+		// #8363: BGP policy-chain attachments filtered by LESS than the
+		// operator authored, because a chain member names an undefined
+		// policy-statement. Not a withdrawal, so it is its own series rather
+		// than part of the quarantine gauge. The DenySafe subset is the shape
+		// for which a synthesized deny would be safe (undefined members form a
+		// suffix); the complement is the shape where a deny would delete the
+		// surviving members outright.
+		FRRNarrowedPolicyChainsFn: func() []string {
+			if d.frr == nil {
+				return nil
+			}
+			return d.frr.NarrowedPolicyChains()
+		},
+		FRRNarrowedPolicyChainsDenySafeFn: func() []string {
+			if d.frr == nil {
+				return nil
+			}
+			return d.frr.NarrowedPolicyChainsSuffixShape()
+		},
 		// #7640: NAT rules the tolerant load / peer-sync / rollback path
 		// admitted despite the strict terminal-action cardinality gate. Read
 		// from the ACTIVE config, so it tracks what the node is actually

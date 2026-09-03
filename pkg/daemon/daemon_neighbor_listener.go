@@ -6,19 +6,19 @@
 //
 // Design (per docs/pr/1197-neighbor-snapshot/plan.md v7):
 //
-//   1. neighborListener subscribes to RTM_NEWNEIGH/DELNEIGH netlink
-//      events; on relevant changes (MAC change, eviction, transition
-//      to unusable) triggers Manager.RegenerateNeighborSnapshot()
-//      via a 100ms debouncer.
+//  1. neighborListener subscribes to RTM_NEWNEIGH/DELNEIGH netlink
+//     events; on relevant changes (MAC change, eviction, transition
+//     to unusable) triggers Manager.RegenerateNeighborSnapshot()
+//     via a 100ms debouncer.
 //
-//   2. forceProbeNeighbors periodically (15s tick) sends ARP/NS
-//      probes for all monitored neighbors INCLUDING those in
-//      NUD_STALE/PROBE/DELAY (unlike resolveNeighbors which skips
-//      them). Probe replies update kernel ARP → RTM_NEWNEIGH fires
-//      → listener regenerates snapshot.
+//  2. forceProbeNeighbors periodically (15s tick) sends ARP/NS
+//     probes for all monitored neighbors INCLUDING those in
+//     NUD_STALE/PROBE/DELAY (unlike resolveNeighbors which skips
+//     them). Probe replies update kernel ARP → RTM_NEWNEIGH fires
+//     → listener regenerates snapshot.
 //
-//   3. On RG takeover (VRRP MASTER), forceProbeNeighbors is called
-//      to re-validate stale entries on the new active.
+//  3. On RG takeover (VRRP MASTER), forceProbeNeighbors is called
+//     to re-validate stale entries on the new active.
 //
 // Trust model: kernel ARP/NDP is authoritative; xpfd listens and
 // proactively probes. xpfd no longer pushes neighbor entries into
@@ -323,9 +323,9 @@ func (d *Daemon) neighborProvider() neighborSnapshotProvider {
 // hosts with real next-hops, so under cap pressure a large
 // address-book could crowd out gateways and fabric peers.
 const (
-	criticalityNormal    = 0 // snapshot-only entries (already-resolved peers)
-	criticalityNextHop   = 1 // configured next-hops, NAT destinations
-	criticalityFabric    = 2 // cluster fabric peers (highest)
+	criticalityNormal  = 0 // snapshot-only entries (already-resolved peers)
+	criticalityNextHop = 1 // configured next-hops, NAT destinations
+	criticalityFabric  = 2 // cluster fabric peers (highest)
 )
 
 // probeTarget is one entry in the force-probe target list.
@@ -340,7 +340,9 @@ type probeTarget struct {
 // probing: tier1 (most likely to need re-validation) → tier3.
 //
 // Tier 1: states at risk of stale forwarding
-//         (STALE, PROBE, DELAY, FAILED, INCOMPLETE, NONE/missing)
+//
+//	(STALE, PROBE, DELAY, FAILED, INCOMPLETE, NONE/missing)
+//
 // Tier 2: REACHABLE on fabric/next-hop targets (criticality > Normal)
 // Tier 3: everything else
 func probeTier(state uint16, criticality int) int {
@@ -401,10 +403,10 @@ func (d *Daemon) forceProbeNeighbors(cfg *config.Config) {
 
 // collectMonitoredNeighbors returns the deduped union of all
 // targets we want to keep ARP/NDP-warm:
-//   1. Snapshot keys (entries we've published to userspace-dp)
-//   2. Configured next-hops, NAT destinations, address-book hosts
-//      (the resolveNeighborsInner target set)
-//   3. Fabric peer IPs
+//  1. Snapshot keys (entries we've published to userspace-dp)
+//  2. Configured next-hops, NAT destinations, address-book hosts
+//     (the resolveNeighborsInner target set)
+//  3. Fabric peer IPs
 //
 // Returned in PRIORITY ORDER (tier1 → tier2 → tier3) where
 // tiering is annotated by current kernel NUD state per target.

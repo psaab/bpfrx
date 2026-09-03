@@ -35,8 +35,8 @@ func TestApplyStep0Tunables_OptInFalse_SkipsHostScope(t *testing.T) {
 
 	// claim=false, governor=performance, budget=600 → host-scope skipped.
 	d.applyStep0TunablesWith(
-		true,         // userspaceDP
-		false,        // claimHostTunables — THE GATE
+		true,  // userspaceDP
+		false, // claimHostTunables — THE GATE
 		"performance", 600,
 		true, false, 8, 8,
 		[]string{"mlx0"},

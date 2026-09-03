@@ -61,8 +61,8 @@ func TestArmFailureDemotesRedundancyGroupWeight7178(t *testing.T) {
 			"attracting traffic it drops (#7178)", got, full)
 	}
 	if got == 0 {
-		t.Errorf("the arm failure drove the weight to 0, which also demotes a STANDALONE "+
-			"node — nothing takes its VIPs and the operator may lose the address they reach "+
+		t.Errorf("the arm failure drove the weight to 0, which also demotes a STANDALONE " +
+			"node — nothing takes its VIPs and the operator may lose the address they reach " +
 			"it on. The cost is sub-total on purpose")
 	}
 }

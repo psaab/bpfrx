@@ -63,7 +63,7 @@ func (d *wiringExporterDP) HA() dataplane.HAController { return noopHAController
 
 type noopHAController7350 struct{}
 
-func (noopHAController7350) SetRGActive(context.Context, int, bool) error { return nil }
+func (noopHAController7350) SetRGActive(context.Context, int, bool) error     { return nil }
 func (noopHAController7350) SetHAWatchdog(context.Context, int, uint64) error { return nil }
 func (noopHAController7350) SetFabricForwarding(context.Context, dataplane.FabricID, dataplane.FabricFwdInfo) error {
 	return nil

@@ -259,3 +259,88 @@ func TestNarrowingWarningChangesNoRenderedOutput8363(t *testing.T) {
 		t.Fatalf("fixture did not actually narrow: %+v", s)
 	}
 }
+
+// The suffix split is the data the deny decision will be sized on, so it must be
+// right for both shapes — and a single-shape fixture cannot show it is a
+// DISCRIMINATOR rather than a constant.
+func TestNarrowedSuffixShapeIsClassified8363(t *testing.T) {
+	po := &config.PolicyOptionsConfig{
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"A": {Name: "A", Terms: []*config.PolicyTerm{{Name: "t", PrefixList: []string{"PL"}}}},
+			"B": {Name: "B", Terms: []*config.PolicyTerm{{Name: "t", PrefixList: []string{"PL"}}}},
+		},
+		PrefixLists: map[string]*config.PrefixList{"PL": {Name: "PL", Prefixes: []string{"10.0.0.0/8"}}},
+		Communities: map[string]*config.CommunityDef{},
+		ASPaths:     map[string]*config.ASPathDef{},
+	}
+	cases := []struct {
+		name       string
+		authored   []string
+		wantSuffix bool
+	}{
+		{"ghost last: a deny would append harmlessly", []string{"A", "GHOST"}, true},
+		{"ghosts trailing: still a suffix", []string{"A", "G1", "G2"}, true},
+		{"ghost FIRST: a deny would delete A", []string{"GHOST", "A"}, false},
+		{"ghost MIDDLE: a deny would delete B", []string{"A", "GHOST", "B"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			bgp := &config.BGPConfig{
+				LocalAS: 65001, RouterID: "1.1.1.1",
+				Neighbors: []*config.BGPNeighbor{
+					{Address: "10.0.2.1", PeerAS: 65002, FamilyInet: true, Import: tc.authored},
+				},
+			}
+			sites := narrowedChainSites(bgp, po)
+			if len(sites) != 1 {
+				t.Fatalf("want exactly one narrowed site, got %+v", sites)
+			}
+			if sites[0].GhostsAreSuffix != tc.wantSuffix {
+				t.Errorf("GhostsAreSuffix = %v, want %v for authored %v",
+					sites[0].GhostsAreSuffix, tc.wantSuffix, tc.authored)
+			}
+		})
+	}
+}
+
+// The gauge-facing sets must be rebuilt per render, or an operator who fixes the
+// config keeps being reported and the signal gets muted.
+func TestNarrowedSetsAreRebuiltPerRender8363(t *testing.T) {
+	po := &config.PolicyOptionsConfig{
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"A": {Name: "A", Terms: []*config.PolicyTerm{{Name: "t", PrefixList: []string{"PL"}}}},
+		},
+		PrefixLists: map[string]*config.PrefixList{"PL": {Name: "PL", Prefixes: []string{"10.0.0.0/8"}}},
+		Communities: map[string]*config.CommunityDef{},
+		ASPaths:     map[string]*config.ASPathDef{},
+	}
+	mk := func(imp []string) *FullConfig {
+		return &FullConfig{PolicyOptions: po, BGP: &config.BGPConfig{
+			LocalAS: 65001, RouterID: "1.1.1.1",
+			Neighbors: []*config.BGPNeighbor{
+				{Address: "10.0.2.1", PeerAS: 65002, FamilyInet: true, Import: imp},
+			},
+		}}
+	}
+	m := New()
+	m.buildManagedSection(mk([]string{"A", "GHOST"}))
+	if got := m.NarrowedPolicyChains(); len(got) != 1 {
+		t.Fatalf("narrowed set = %v, want one entry", got)
+	}
+	if got := m.NarrowedPolicyChainsSuffixShape(); len(got) != 1 {
+		t.Errorf("ghost-last must classify as the safe suffix shape, got %v", got)
+	}
+	// Ghost-first: still narrowed, but NOT the safe shape.
+	m.buildManagedSection(mk([]string{"GHOST", "A"}))
+	if got := m.NarrowedPolicyChains(); len(got) != 1 {
+		t.Fatalf("narrowed set = %v, want one entry", got)
+	}
+	if got := m.NarrowedPolicyChainsSuffixShape(); len(got) != 0 {
+		t.Errorf("ghost-first must NOT count as the safe suffix shape, got %v", got)
+	}
+	// Fixed config: both sets must clear.
+	m.buildManagedSection(mk([]string{"A"}))
+	if got := m.NarrowedPolicyChains(); len(got) != 0 {
+		t.Errorf("narrowing stayed latched after the config was fixed: %v", got)
+	}
+}

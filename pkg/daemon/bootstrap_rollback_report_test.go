@@ -98,8 +98,8 @@ func TestEnterBootstrapMode_DegradedOnTeardownFailure(t *testing.T) {
 	d := &Daemon{}
 	d.bootstrapTeardownForTest = func() []bootstrapTeardownStep {
 		return []bootstrapTeardownStep{
-			{name: "remove takeover .network files"},   // succeeded
-			{name: "clear FRR managed section"},         // succeeded
+			{name: "remove takeover .network files"},                                      // succeeded
+			{name: "clear FRR managed section"},                                           // succeeded
 			{name: "dataplane teardown", err: errors.New("helper control socket closed")}, // FAILED
 		}
 	}

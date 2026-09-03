@@ -140,7 +140,7 @@ func TestSyncAndApplyRunsInvalidatorsOnNonFatalApplyError(t *testing.T) {
 	}
 	// The invalidator's session scan must have actually run.
 	if dp.iterateCalls == 0 {
-		t.Errorf("the session table was never scanned on a non-fatal tail error; the three "+
+		t.Errorf("the session table was never scanned on a non-fatal tail error; the three " +
 			"invalidators must run once the config reached active+armed")
 	}
 	// The peer config is still active locally (promoted before the tail hiccup),
@@ -180,7 +180,7 @@ func TestSyncAndApplySkipsInvalidatorsOnFatalApplyError(t *testing.T) {
 	// No spurious invalidation: the dataplane is disarmed (fail-closed), so the
 	// sessions must NOT be swept and the session table must not even be scanned.
 	if _, ok := dp.v4[v4]; !ok {
-		t.Errorf("v4 session was invalidated on a FATAL (dataplane-disarmed) apply; the "+
+		t.Errorf("v4 session was invalidated on a FATAL (dataplane-disarmed) apply; the " +
 			"invalidators must NOT run when the config never went live-forwarding")
 	}
 	if _, ok := dp.v6[v6]; !ok {
