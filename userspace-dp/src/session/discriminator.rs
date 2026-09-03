@@ -32,7 +32,25 @@ pub(crate) enum TunnelDiscriminator {
     Unkeyed,
     /// RFC 2890 Key, including the legal value 0.
     Keyed(u32),
-    /// The header could not be read. Fails closed: never merges with anything.
+    /// The header could not be read.
+    ///
+    /// Fail-closed ACROSS classes, NOT splitting WITHIN this one (#8380). The
+    /// distinction decides what a caller may rely on:
+    ///
+    /// - it is distinct from `None`, `Unkeyed` and every `Keyed(_)`, so an
+    ///   unreadable header can never be taken for a legitimate unkeyed tunnel
+    ///   — the failure this class exists to prevent, and what the paragraph
+    ///   above is about;
+    /// - it is EQUAL to itself, and hashes equal, so two sessions sharing an
+    ///   outer 5-tuple whose headers BOTH failed to parse resolve to the same
+    ///   `SessionKey` and merge into one session.
+    ///
+    /// This said "never merges with anything", which is the second half
+    /// inverted. Anyone reasoning about aliasing from that sentence reasoned
+    /// wrongly — including about #7699's criterion 4, where two PPTP calls
+    /// between one endpoint pair are both `Unparseable` and therefore alias.
+    /// If a caller needs two unreadable headers kept apart, it needs its own
+    /// discriminating class; this one cannot do it.
     Unparseable,
 }
 
@@ -158,6 +176,63 @@ mod tests {
                 "{class:?} must round-trip through the wire encoding"
             );
         }
+    }
+
+    /// What `Unparseable` actually guarantees (#8380).
+    ///
+    /// Its doc said "Fails closed: never merges with anything." That is true
+    /// ACROSS classes and false WITHIN one, and the difference is the whole
+    /// question a caller asks of it. Both halves are pinned here because a
+    /// corrected comment with no cell is one edit from regressing to the
+    /// comfortable version.
+    ///
+    /// The intra-class half asserts the HASH as well as equality: a session
+    /// map keys on `Hash`, so equality alone would not pin what callers
+    /// actually depend on.
+    #[test]
+    fn unparseable_fails_closed_across_classes_but_does_not_split_within_8380() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        fn hash_of(d: TunnelDiscriminator) -> u64 {
+            let mut h = DefaultHasher::new();
+            d.hash(&mut h);
+            h.finish()
+        }
+
+        // ACROSS: never aliases onto a legitimate class. This is the property
+        // the class exists for.
+        for other in [
+            TunnelDiscriminator::None,
+            TunnelDiscriminator::Unkeyed,
+            TunnelDiscriminator::Keyed(0),
+            TunnelDiscriminator::Keyed(1),
+            TunnelDiscriminator::Keyed(u32::MAX),
+        ] {
+            assert_ne!(
+                TunnelDiscriminator::Unparseable,
+                other,
+                "an unreadable header must never be taken for {other:?}; that \
+                 aliasing is what this class exists to prevent"
+            );
+        }
+
+        // WITHIN: two unreadable headers are the SAME discriminator. This is
+        // the half the old comment denied — and the reason #7699's criterion 4
+        // is NOT satisfied by this class alone.
+        assert_eq!(
+            TunnelDiscriminator::Unparseable,
+            TunnelDiscriminator::Unparseable,
+            "two Unparseable discriminators must compare equal; if this ever \
+             fails, the class started splitting and every caller relying on it \
+             to MERGE unreadable headers changed behaviour"
+        );
+        assert_eq!(
+            hash_of(TunnelDiscriminator::Unparseable),
+            hash_of(TunnelDiscriminator::Unparseable),
+            "hashes must agree too — a session map keys on Hash, so equality \
+             alone does not pin what callers depend on"
+        );
     }
 
     /// The pair decision 6 singles out: an unkeyed tunnel and a tunnel whose
