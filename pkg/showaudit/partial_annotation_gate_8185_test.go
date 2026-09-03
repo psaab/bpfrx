@@ -1,7 +1,9 @@
 package showaudit
 
 import (
+	"fmt"
 	"go/ast"
+	"go/parser"
 	"go/token"
 	"path/filepath"
 	"regexp"
@@ -45,23 +47,28 @@ import (
 // spot is undocumented gets trusted past its range.
 //
 // Shape A requires the counter read to sit in the SAME BLOCK as the verdict
-// binding. A renderer that COLLECTS usage in one loop and RENDERS it, gated, in
-// another is therefore invisible to it — and so is the same renderer with its
-// gate removed. `showNATSourceSummary` is exactly that shape: it reads the
-// counter at :255 while building its `pools` slice and gates the emit on
-// `poolDisarm` at :327. Reverting that gate ESCAPES this detector, measured.
+// binding, and that requirement is not an oversight — it is the price of not
+// crying wolf. Without it the detector flags a renderer that COLLECTS usage in
+// one loop and RENDERS it, correctly gated, in another, because no enclosing
+// condition of the READ mentions the verdict.
 //
-// The scope requirement is not an oversight; it is the price of not crying
-// wolf. Without it the detector flags `showNATSourceSummary` in its CORRECT
-// form, because the read and the (correct) gate live in different loops and no
-// enclosing condition of the read mentions the verdict. A gate that reds on
-// correct code gets loosened or ignored, and either outcome is worse than a
-// documented blind spot.
+// SHAPE C now covers that case (#8185 remainder), and it does so by changing
+// the question rather than loosening the scope. The discriminator is the EMIT,
+// not the read: follow the counter into the struct field it is stored into and
+// require every FORMATTED use of that field to be dominated by a verdict. The
+// correct form of `showNATSourceSummary` passes, the same function with its
+// #7473 gate reverted is flagged, and no scope setting of Shape A can separate
+// those two — measured both ways.
 //
-// Closing that case needs the read's RESULT followed to its emit — real
-// dataflow, which #8185 itself judges materially harder and out of scope for
-// the weaker-but-honest signal it asks for. Two of the issue's three instances
-// are covered (one by Shape A, one by Shape B); the third is this one.
+// So all three of the issue's instances are now covered: one by Shape A, one
+// by Shape B, and the collect/render split by Shape C.
+//
+// WHAT REMAINS OUT OF RANGE. Shape C matches the store field by NAME and looks
+// only inside `fmt.*` arguments. A renderer that copies the value into a
+// differently-named local before formatting it, or that emits through a
+// non-`fmt` writer, is invisible to it. That is real dataflow, which #8185
+// judges materially harder, and it is a narrower gap than the one it replaces —
+// but it is a gap.
 
 // dataplaneCounterReads are the live-counter accessors whose result is a
 // MEASUREMENT. Emitting one for an object the builder refused is the defect:
@@ -257,14 +264,6 @@ func counterReadsOutsideVerdictGuard(fset *token.FileSet, fd *ast.FuncDecl, verd
 // It fails in BOTH directions (TestPartialAnnotationExemptionsAreLive_8185), so
 // an entry whose renderer is fixed reds and must be deleted — the list cannot
 // rot into permanent permission.
-//
-// Both current entries are REAL instances, adjudicated rather than waved
-// through: each discards a fail-closed verdict and then emits live port usage
-// for a pool the builder refused. Neither is fixed here because the fix is a
-// STRUCTURED-SURFACE field (protobuf + JSON), which is the open #7473 work —
-// fixing them here would collide with it. They are listed so this gate can
-// merge in either order relative to that PR, and the liveness test deletes them
-// the moment it lands.
 var partiallyAnnotatedExemptions = map[string]string{
 	// EMPTY, and it got here the right way. This list carried two entries
 	// while #7473 was open — GetNATPoolStats and natPoolStatsHandler, both real
@@ -358,7 +357,25 @@ func detectPartialAnnotations(t *testing.T) []string {
 						flagged = append(flagged, site+
 							"  [shape A: binds the verdict as "+strings.Join(bound, "/")+
 							" but emits "+in[0]+" ungated in the same block]")
+						continue
 					}
+				}
+			}
+			// SHAPE C (#8185 remainder). The verdict is bound, a counter read
+			// is STORED into a struct field, and that field is formatted for
+			// output under no condition mentioning the verdict.
+			//
+			// This is the collect-in-one-loop / render-in-another shape Shape A
+			// cannot see at any scope setting, because the discriminator is the
+			// EMIT rather than the read. See the long note at the head of the
+			// Shape C section.
+			if len(bound) > 0 && !reportsVerdictAsData(rec.fd) {
+				fields := counterDerivedFields(rec.fd)
+				if emits := counterFieldEmitsOutsideVerdictGuard(
+					p.fset, rec.fd, bound, fields); len(emits) > 0 {
+					flagged = append(flagged, site+
+						"  [shape C: binds the verdict as "+strings.Join(bound, "/")+
+						" but formats counter-derived "+emits[0]+"]")
 				}
 			}
 		}
@@ -488,3 +505,279 @@ func readsInAnyBindingScope(fset *token.FileSet, reads []string, spans [][2]toke
 // readPos maps a formatted counter-read finding back to its position, recorded
 // as the findings are produced.
 var readPos = map[string]token.Pos{}
+
+// ---------------------------------------------------------------------------
+// SHAPE C — the counter's STORE FIELD, emitted without verdict domination.
+//
+// #8185's third instance, and the one the gate's own blind-spot note at the top
+// of this file said was left open. `showNATSourceSummary` COLLECTS the counter
+// in one loop and RENDERS it, gated, in another:
+//
+//	for i := range pools {                      // collect loop
+//	    cnt, err := c.dp.ReadNATPortCounter(uint32(id))
+//	    if err == nil { pools[i].used = int(cnt) }
+//	}
+//	...
+//	used := "N/A"                               // emit loop
+//	if poolDisarm == "" { used = fmt.Sprintf("%d", p.used) }
+//
+// Shape A cannot see it: the read at the collect site is nowhere near the
+// verdict binding, and the same-block requirement that makes Shape A safe is
+// exactly what blinds it here.
+//
+// The naive fix — dropping the same-block requirement — was measured and is
+// WRONG: it flags this function in its CORRECT form, because the read and the
+// correct gate live in different loops and no enclosing condition of the READ
+// mentions the verdict. A gate that reds on correct code gets loosened or
+// ignored.
+//
+// The discriminator is not scope, and it is not the read. It is the EMIT.
+// Follow the counter's result to the struct field it is stored into, then ask
+// whether every FORMATTED use of that field is dominated by a verdict. In the
+// correct form `p.used` is formatted inside `if poolDisarm == ""`; with the
+// gate reverted it is formatted under no verdict condition at all. Same
+// function, same loops, opposite answers — which is what Shape A could not
+// achieve at any scope setting.
+//
+// WHY THIS IS NOT THE DATAFLOW #8185 SCOPED OUT. It does not track values. It
+// matches the FIELD NAME the counter was stored into and looks only at uses
+// inside `fmt.*` arguments, so the store site itself (an assignment LHS) is
+// excluded structurally rather than by a special case.
+//
+// FALSE-POSITIVE EXCLUSION, structural as the rest of this file requires:
+// the rule is gated on the function BINDING a verdict at all, which is the
+// same precondition Shape A uses and the reason `RenderSourceRuleDetail`
+// escapes — it calls the verdict inline inside the branch that consumes it and
+// never binds one.
+
+// counterDerivedFields returns the struct-field names that a dataplane counter
+// read's result is stored into within `fd`.
+//
+// Two steps, both syntactic: bind the identifiers a counter read assigns, then
+// find `X.field = <expr mentioning one of them>`.
+func counterDerivedFields(fd *ast.FuncDecl) []string {
+	readVars := map[string]bool{}
+	ast.Inspect(fd.Body, func(n ast.Node) bool {
+		as, ok := n.(*ast.AssignStmt)
+		if !ok || len(as.Rhs) != 1 {
+			return true
+		}
+		ce, ok := as.Rhs[0].(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		se, ok := ce.Fun.(*ast.SelectorExpr)
+		if !ok || !contains(dataplaneCounterReads, se.Sel.Name) {
+			return true
+		}
+		// The VALUE is the first result; a trailing `err` is not the counter.
+		if id, ok := as.Lhs[0].(*ast.Ident); ok && id.Name != "_" {
+			readVars[id.Name] = true
+		}
+		return true
+	})
+	if len(readVars) == 0 {
+		return nil
+	}
+	fields := map[string]bool{}
+	ast.Inspect(fd.Body, func(n ast.Node) bool {
+		as, ok := n.(*ast.AssignStmt)
+		if !ok || len(as.Lhs) != 1 || len(as.Rhs) != 1 {
+			return true
+		}
+		sel, ok := as.Lhs[0].(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		mentions := false
+		ast.Inspect(as.Rhs[0], func(c ast.Node) bool {
+			if id, ok := c.(*ast.Ident); ok && readVars[id.Name] {
+				mentions = true
+			}
+			return true
+		})
+		if mentions {
+			fields[sel.Sel.Name] = true
+		}
+		return true
+	})
+	var out []string
+	for f := range fields {
+		out = append(out, f)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// counterFieldEmitsOutsideVerdictGuard returns the FORMATTED uses of a
+// counter-derived field that no enclosing `if` gates on a bound verdict.
+func counterFieldEmitsOutsideVerdictGuard(
+	fset *token.FileSet, fd *ast.FuncDecl, verdictVars, fields []string,
+) []string {
+	if len(verdictVars) == 0 || len(fields) == 0 {
+		return nil
+	}
+	var out []string
+	var guards []string
+
+	mentionsVerdict := func() bool {
+		for _, g := range guards {
+			for _, v := range verdictVars {
+				for _, tok := range strings.FieldsFunc(g, func(r rune) bool {
+					return !(r == '_' || r == '.' ||
+						(r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'))
+				}) {
+					if tok == v {
+						return true
+					}
+				}
+			}
+		}
+		return false
+	}
+
+	// A formatted use: a `fmt.*` call one of whose arguments selects the field.
+	flagFormatCall := func(ce *ast.CallExpr) {
+		se, ok := ce.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return
+		}
+		if pkg, ok := se.X.(*ast.Ident); !ok || pkg.Name != "fmt" {
+			return
+		}
+		for _, arg := range ce.Args {
+			ast.Inspect(arg, func(c ast.Node) bool {
+				sel, ok := c.(*ast.SelectorExpr)
+				if !ok || !contains(fields, sel.Sel.Name) {
+					return true
+				}
+				if mentionsVerdict() {
+					return true
+				}
+				out = append(out, "."+sel.Sel.Name+" formatted at "+
+					fset.Position(sel.Pos()).String())
+				return true
+			})
+		}
+	}
+
+	var walk func(n ast.Node)
+	walk = func(n ast.Node) {
+		switch node := n.(type) {
+		case *ast.IfStmt:
+			guards = append(guards, exprString(fset, node.Cond))
+			if node.Body != nil {
+				for _, s := range node.Body.List {
+					walk(s)
+				}
+			}
+			guards = guards[:len(guards)-1]
+			if node.Else != nil {
+				walk(node.Else)
+			}
+			return
+		case *ast.CallExpr:
+			flagFormatCall(node)
+		}
+		ast.Inspect(n, func(c ast.Node) bool {
+			if c == n {
+				return true
+			}
+			switch c.(type) {
+			case *ast.IfStmt:
+				walk(c)
+				return false
+			case *ast.CallExpr:
+				walk(c)
+				return false
+			}
+			return true
+		})
+	}
+	walk(fd.Body)
+	return out
+}
+
+// TestShapeCSeesTheCollectRenderSplit_8185 binds Shape C against the exact
+// shape the blind-spot note said was out of range: the counter is read in one
+// loop, stored into a struct field, and formatted in another.
+//
+// Synthetic rather than a revert of `showNATSourceSummary`, for two reasons.
+// A test that mutates production source cannot run in CI, and — more to the
+// point — the property being bound is the DETECTOR's, not that one function's.
+// The fixture is the minimum shape where gating and not gating differ.
+func TestShapeCSeesTheCollectRenderSplit_8185(t *testing.T) {
+	const tmpl = `package p
+
+import "fmt"
+
+type row struct{ used, total int }
+
+func render(c *client, pools []row) {
+	for i := range pools {
+		cnt, err := c.dp.ReadNATPortCounter(uint32(i))
+		if err == nil {
+			pools[i].used = int(cnt)
+		}
+	}
+	for _, p := range pools {
+		poolDisarm := ""
+		if p.total == 0 {
+			poolDisarm = sourceNATPoolNotInstalled(p)
+		}
+		%s
+	}
+}
+`
+	cases := []struct {
+		name string
+		emit string
+		want bool
+	}{
+		{
+			name: "ungated emit of the counter field is FLAGGED",
+			emit: `fmt.Printf("%d\n", p.used)`,
+			want: true,
+		},
+		{
+			name: "the same emit gated on the verdict is NOT flagged",
+			emit: "used := \"N/A\"\n\t\tif poolDisarm == \"\" {\n\t\t\tused = fmt.Sprintf(\"%d\", p.used)\n\t\t}\n\t\tfmt.Println(used)",
+			want: false,
+		},
+		{
+			name: "a field that is NOT counter-derived is never flagged",
+			emit: `fmt.Printf("%d\n", p.total)`,
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fset := token.NewFileSet()
+			f, err := parser.ParseFile(fset, "x.go", fmt.Sprintf(tmpl, tc.emit), 0)
+			if err != nil {
+				t.Fatalf("fixture does not parse: %v", err)
+			}
+			var fd *ast.FuncDecl
+			for _, d := range f.Decls {
+				if g, ok := d.(*ast.FuncDecl); ok && g.Name.Name == "render" {
+					fd = g
+				}
+			}
+			if fd == nil {
+				t.Fatal("fixture lost its render func")
+			}
+			fields := counterDerivedFields(fd)
+			// Guard the guard: if the fixture stops looking like a counter
+			// store, every assertion below passes vacuously.
+			if tc.name != "a field that is NOT counter-derived is never flagged" &&
+				!contains(fields, "used") {
+				t.Fatalf("fixture premise: the counter store must be found, got %v", fields)
+			}
+			emits := counterFieldEmitsOutsideVerdictGuard(
+				fset, fd, []string{"poolDisarm"}, fields)
+			if got := len(emits) > 0; got != tc.want {
+				t.Errorf("flagged=%v want=%v (emits=%v)", got, tc.want, emits)
+			}
+		})
+	}
+}

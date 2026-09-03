@@ -305,7 +305,21 @@ func (c *CLI) showNATSourceSummary(cfg *config.Config) error {
 		ports := "N/A"
 		avail := "N/A"
 		util := "N/A"
-		if p.total > 0 {
+		// #8185: `poolDisarm == ""` is part of this condition EXPLICITLY.
+		//
+		// The #7473 note below already claims "Ports/Available/Utilization
+		// already render N/A for a disarmed pool" — but that was true only
+		// INCIDENTALLY, resting on an unstated invariant that a refused pool
+		// carries `total == 0`. Nothing in this function establishes it, and
+		// `Utilization` divides by `p.total` while multiplying `p.used`, which
+		// is the same counter the USED column had to be gated on. If the
+		// invariant ever failed, this row would print a measured-looking
+		// utilization for a pool the builder refused — the exact defect #7473
+		// fixed one column to the right.
+		//
+		// Making it explicit is behaviour-preserving while the invariant holds
+		// and fail-closed if it stops holding.
+		if p.total > 0 && poolDisarm == "" {
 			ports = fmt.Sprintf("%d", p.total)
 			a := p.total - p.used
 			if a < 0 {
