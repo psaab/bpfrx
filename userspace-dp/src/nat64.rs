@@ -1145,6 +1145,10 @@ impl Nat64State {
         dst_port: u16,
         now_ns: u64,
     ) -> Result<(Ipv4Addr, u16), SourceNatFailureReason> {
+        // #7799: no draining-rule context at this entry point. It has no
+        // production callers — every caller is a test — so the runtime drain
+        // quarantine is threaded through `allocate_source_for_worker`, which
+        // the poll path actually uses.
         self.allocate_source_with_holder(
             prefix_idx,
             protocol,
@@ -1154,6 +1158,7 @@ impl Nat64State {
             dst_port,
             now_ns,
             crate::nat::NatHolder::Untracked,
+            &[],
         )
     }
 
@@ -1174,6 +1179,9 @@ impl Nat64State {
         dst_port: u16,
         now_ns: u64,
         worker_id: u32,
+        // #7799: the live source-NAT rules, so a NAT64 mint can refuse an
+        // address a DRAINING pool still holds allocations on.
+        draining_rules: &[crate::nat::SourceNatRule],
     ) -> Result<(Ipv4Addr, u16), SourceNatFailureReason> {
         self.allocate_source_with_holder(
             prefix_idx,
@@ -1184,6 +1192,7 @@ impl Nat64State {
             dst_port,
             now_ns,
             crate::nat::NatHolder::Worker(worker_id),
+            draining_rules,
         )
     }
 
@@ -1218,11 +1227,34 @@ impl Nat64State {
         // holds every worker EXCEPT the one forwarding, and the last sibling
         // replica to age-reap frees a live `(pool_v4, port)`.
         holder: crate::nat::NatHolder,
+        // #7799: see `Nat64OverlapDraining`.
+        draining_rules: &[crate::nat::SourceNatRule],
     ) -> Result<(Ipv4Addr, u16), SourceNatFailureReason> {
         let prefix = self
             .prefixes
             .get(prefix_idx)
             .ok_or(SourceNatFailureReason::AllocatorExhausted)?;
+        // #7799 RUNTIME MINT QUARANTINE for NAT64, the third occupancy domain.
+        //
+        // The gate is checked over the WHOLE pool rather than the single
+        // address the allocator is about to pick, because the pick happens
+        // inside `allocate_translation` and `occupancy` is indexed by the
+        // address's POSITION in `pool_v4` — filtering the slice would shift
+        // every index and corrupt the bitmap. Refusing the mint is also the
+        // posture #7717 settled on for a domain whose reservations this one
+        // cannot enumerate, and it is self-limiting: it lifts when the last
+        // draining flow closes.
+        //
+        // Placed BEFORE the deterministic branch so both mint paths are
+        // covered. The deterministic (NAPT64 mode 2) path allocates from the
+        // same `pool_v4` and has the same collision.
+        if !draining_rules.is_empty()
+            && prefix.pool_v4.iter().any(|addr| {
+                crate::nat::address_has_draining_pool_occupancy(draining_rules, IpAddr::V4(*addr))
+            })
+        {
+            return Err(SourceNatFailureReason::Nat64OverlapDraining);
+        }
         let flow = SourceNatFlowKey {
             protocol,
             src_ip: IpAddr::V6(src_v6),

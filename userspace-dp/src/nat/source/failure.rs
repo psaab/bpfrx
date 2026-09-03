@@ -105,6 +105,20 @@ pub(crate) enum SourceNatFailureReason {
     /// draining flow closes, so an operator seeing this counter climb should
     /// look at the overlap, not at pool sizing.
     InterfaceOverlapDraining,
+    /// #7799: the NAT64 pool this mint would allocate from carries an address
+    /// that a DRAINING source-NAT pool still holds live allocations on. NAT64
+    /// mints from its own `PortAllocator` on `Nat64Prefix`, a THIRD occupancy
+    /// domain disjoint from both the interface registry and the source-NAT pool
+    /// allocators, so neither can see the other's reservations and the mint can
+    /// hand out an identity the draining pool still owns — the same misdelivery
+    /// `InterfaceOverlapDraining` describes, reached one domain over.
+    ///
+    /// A distinct variant rather than reusing `InterfaceOverlapDraining`
+    /// because that name and its counter (`source_nat_interface_overlap_draining`)
+    /// both say INTERFACE. An operator watching it climb would look at
+    /// interface-mode SNAT, which is not where this refusal came from. Same
+    /// remedy (correct the overlap) and same self-limiting duration.
+    Nat64OverlapDraining,
     /// #7717: this POOL is quarantined because one of its addresses is also an
     /// interface-mode SNAT egress address, which the snapshot builder can only
     /// see for a runtime-resolved (DHCP/netlink) address. New pool mints are
@@ -155,6 +169,7 @@ impl SourceNatFailureReason {
             Self::InterfaceIdentityExhausted => "source_nat_interface_identity_exhausted",
             Self::InterfaceRegistryCap => "source_nat_interface_registry_cap",
             Self::InterfaceOverlapDraining => "source_nat_interface_overlap_draining",
+            Self::Nat64OverlapDraining => "source_nat_nat64_overlap_draining",
             Self::PoolIfaceEgressOverlap => "source_nat_pool_iface_egress_overlap",
             Self::PoolPeerAddressOverlap => "source_nat_pool_peer_address_overlap",
         }

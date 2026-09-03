@@ -2323,6 +2323,12 @@ pub(super) fn poll_binding_process_descriptor(
                                         // age-reap from freeing a live
                                         // `(pool_v4, port)`.
                                         worker_id,
+                                        // #7799: the runtime drain quarantine.
+                                        // NAT64 mints from its own allocator, a
+                                        // third occupancy domain, so it must be
+                                        // told which addresses a DRAINING
+                                        // source-NAT pool still holds.
+                                        &worker_ctx.forwarding.source_nat_rules,
                                     ) {
                                         Ok((snat_v4, translated_port)) => {
                                             decision.nat = Nat64State::forward_decision(
