@@ -376,6 +376,48 @@ Putting `gre` first makes the dropped value and the fallback identical, so a rea
 divergence reads as EQUIVALENT and the #2419 inventory entry looks stale. A
 fixture must never use the value the bug falls back to.
 
+### `protocols isis interface <if> level` — the PER-INTERFACE circuit type (#8450)
+
+A different leaf and a different defect from the router-wide one below, in the
+same direction. It parsed, compiled into `ISISInterface.Level`, and was **never
+rendered** — `pkg/frr` emitted no `isis circuit-type` line anywhere, so an
+interface an operator restricted to one level kept forming adjacencies at the
+ROUTER-WIDE `is-type`. Dead config that fails OPEN.
+
+`CanonicalISISCircuitType` is a **separate** canonicalizer from
+`CanonicalISISLevel`, deliberately. The per-interface spelling domain is wider:
+Junos writes a bare digit here (`level 1`) while FRR's `circuit-type` takes the
+`level-N` forms, so both must be accepted. Sharing the router-wide function
+would have to widen its domain too, and `is-type 2` is a value #8446
+deliberately **rejects**. Two canonicalizers with different domains is the right
+answer here; one shared function would silently relax the stricter leaf.
+
+Accepted: `1`, `2`, `1-2`, `level-1`, `level-2`, `level-1-2`, `level-2-only`.
+
+**An UNSET level renders NO line.** That is how an interface inherits the
+router-wide `is-type` in both FRR and Junos, and a fix that emitted a default
+would silently NARROW every interface in every existing config.
+`TestISISInterfaceUnsetLevelRendersNoCircuitType_8450` carries a control that the
+interface block IS rendered, so its absence assertion is not vacuous.
+
+**An unrecognised value also renders no line**, which is the opposite belt
+direction from #8446 and for a specific reason: `isis circuit-type <junk>` is a
+line vtysh REJECTS, and one rejected line fails the WHOLE managed-section reload
+(#1880/#2223). Omitting is recoverable — it is the pre-#8450 behaviour — where
+emitting a broken line takes down all of dynamic routing.
+
+**Block scope is load-bearing.** `isis circuit-type` is interface-scoped;
+emitted after `exit` it lands at global config scope and vtysh rejects it. Same
+ordering hazard #2942 recorded for per-interface BFD, and
+`TestISISCircuitTypeIsInsideTheInterfaceBlock_8450` pins it.
+
+**Also fixed in the same change:** the interface block emitted only
+`ip router isis xpf`, so isisd ran IPv4-only and IS-IS carried **no IPv6 routes
+at all**. It now emits `ipv6 router isis xpf` alongside. This is a behaviour
+change on a dual-stack deployment with an IPv6-capable neighbour — IPv6 routes
+appear where previously none did — and it matches FRR's own defaults, which
+enable both address families for a configured `router isis`.
+
 ### `protocols isis level` / `is-type` — the enum mirrors what the RENDERER can express (#8446)
 
 Both leaves spell one concept and both compile into `ISISConfig.Level`. Neither

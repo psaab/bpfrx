@@ -1123,6 +1123,10 @@ evidence, not as active eBPF source-removal blockers.
 - OSPF (v2) BFD with interval/multiplier via FRR profiles
 - OSPFv3 BFD with interval/multiplier via FRR profiles (renders `ipv6 ospf6 bfd`, #2474)
 - IS-IS BFD support with optional interval/multiplier
+- IS-IS per-interface circuit type (`protocols isis interface <if> level <n>`
+  renders `isis circuit-type`) and the IPv6 topology (`ipv6 router isis`)
+  alongside IPv4 — both were accepted-and-inert before #8450, so IS-IS was
+  IPv4-only and per-interface level restrictions had no effect
 - BGP BFD multiplier configurable (was hardcoded to 3)
 
 ### NETCONF (Tier 1)
