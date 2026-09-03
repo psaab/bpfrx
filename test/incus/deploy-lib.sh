@@ -345,6 +345,12 @@ DEPLOY_REASSERT_READ_TRIES="${DEPLOY_REASSERT_READ_TRIES:-30}"
 DEPLOY_REASSERT_READ_DELAY="${DEPLOY_REASSERT_READ_DELAY:-2}"
 DEPLOY_REASSERT_VERIFY_TRIES="${DEPLOY_REASSERT_VERIFY_TRIES:-15}"
 DEPLOY_REASSERT_VERIFY_DELAY="${DEPLOY_REASSERT_VERIFY_DELAY:-2}"
+# #7771: budget for the transfer to COMMIT before the pin that drove it is
+# cleared. Defaults track the verify tunables so the self-test's DELAY=0 (which
+# makes the retry COUNT the thing under test) applies here too without a second
+# knob to remember.
+DEPLOY_REASSERT_TRANSFER_TRIES="${DEPLOY_REASSERT_TRANSFER_TRIES:-$DEPLOY_REASSERT_VERIFY_TRIES}"
+DEPLOY_REASSERT_TRANSFER_DELAY="${DEPLOY_REASSERT_TRANSFER_DELAY:-$DEPLOY_REASSERT_VERIFY_DELAY}"
 
 # #7962: the verify budget when the degraded-promotion FALLBACK is the only path
 # to convergence.
@@ -458,6 +464,37 @@ deploy_reassert_primary_node0() {
 		fi
 		incus exec "$rinst" -- cli -c "request chassis cluster failover reset redundancy-group $rg" >/dev/null 2>&1 || true
 		incus exec "$rinst" -- cli -c "request chassis cluster failover redundancy-group $rg node 0" >/dev/null 2>&1 || true
+	done <<<"$rgs"
+
+	# #7771: WAIT for the transfers to commit before clearing the pins. The
+	# `failover ... node 0` above IS a manual pin, and it is the only thing
+	# driving the transfer; the pre-#7771 code cleared it on the very next line.
+	# When the reset won that race the RG fell back to the natural election and
+	# stayed on node1 -- correct behaviour for a non-preempting cluster
+	# (`Preempt: no` on every row) and exactly the state the deploy must not
+	# leave. Measured: the same commands by hand WITH a wait between them fixed
+	# it on the first attempt.
+	#
+	# Once the transfer has actually committed, clearing the pin is safe for the
+	# same reason the race was fatal: a non-preempting cluster leaves the new
+	# primary in place. So the wait is not a settling heuristic -- it is the
+	# precondition that makes the reset non-destructive.
+	#
+	# Bounded, and the pins are cleared BELOW whether or not this converges. A
+	# left-behind pin is #7688's failure and is not traded away for this one:
+	# the verify loop after it is still the verdict.
+	for (( try = 0; try < DEPLOY_REASSERT_TRANSFER_TRIES; try++ )); do
+		status=$(incus exec "$rinst" -- cli -c "show chassis cluster status" 2>/dev/null || true)
+		if printf '%s\n' "$status" | deploy_reassert_node0_primary_ok; then
+			break
+		fi
+		(( DEPLOY_REASSERT_TRANSFER_DELAY > 0 )) && sleep "$DEPLOY_REASSERT_TRANSFER_DELAY"
+	done
+
+	# Clear the pins. UNCONDITIONAL: see above -- an un-cleared pin blocks the
+	# next election and is what #7688 was filed about.
+	while read -r rg; do
+		[[ -n "$rg" ]] || continue
 		incus exec "$rinst" -- cli -c "request chassis cluster failover reset redundancy-group $rg" >/dev/null 2>&1 || true
 	done <<<"$rgs"
 

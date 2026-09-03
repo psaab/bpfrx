@@ -893,17 +893,49 @@ test_reassert_issues_reset_transfer_reset_per_rg() {
 	reset_cli_mock
 	CLI_STATUS_RESPONSES=("$STATUS_BOTH_RG_NODE0_PRIMARY")
 	( deploy_reassert_primary_node0 "fake:vm0" ) >/dev/null 2>&1 || true
-	local seq
-	seq=$(grep -v '^show chassis cluster status$' "$CLI_LOG" | tr '\n' '|')
-	local want="request chassis cluster failover reset redundancy-group 0|request chassis cluster failover redundancy-group 0 node 0|request chassis cluster failover reset redundancy-group 0|request chassis cluster failover reset redundancy-group 1|request chassis cluster failover redundancy-group 1 node 0|request chassis cluster failover reset redundancy-group 1|"
-	if [[ "$seq" == "$want" ]]; then
-		ok "reassert: issues reset -> TRANSFER -> reset for every RG"
-	else
-		bad "reassert: wrong command sequence.
-  got:  $seq
-  want: $want
-(the original #6591 report was that only 'failover reset' was issued — that clears the manual flag and never MOVES ownership)"
+
+	# #6591: a TRANSFER must be issued per RG, not just a reset. A reset alone
+	# clears the manual flag and never MOVES ownership, which was the original
+	# report.
+	local rg missing=""
+	for rg in 0 1; do
+		grep -qx "request chassis cluster failover redundancy-group $rg node 0" "$CLI_LOG" \
+			|| missing="$missing rg$rg"
+		grep -qx "request chassis cluster failover reset redundancy-group $rg" "$CLI_LOG" \
+			|| missing="$missing rg${rg}-reset"
+	done
+	if [[ -n "$missing" ]]; then
+		bad "reassert: missing transfer/reset for:$missing (#6591 -- a reset alone never moves ownership)"
+		return
 	fi
+
+	# #7771: the pin-clearing reset must come AFTER a status read that FOLLOWS
+	# the transfer. The transfer IS the pin; clearing it before the transfer
+	# commits loses the RG to the natural election on a non-preempting cluster.
+	#
+	# Asserted as an ORDERING over the full log, deliberately NOT as a literal
+	# sequence: the previous version of this cell pinned the exact byte string
+	# `reset|transfer|reset` per RG, which is the RACE written down as the
+	# expected answer. It also `grep -v`'d the status reads out of the log, so
+	# it could not have expressed this property even if someone had thought to
+	# ask -- it discarded the evidence first.
+	local n_lines
+	n_lines=$(wc -l <"$CLI_LOG")
+	for rg in 0 1; do
+		local xfer_ln clear_ln status_between
+		xfer_ln=$(grep -nx "request chassis cluster failover redundancy-group $rg node 0" "$CLI_LOG" | tail -1 | cut -d: -f1)
+		clear_ln=$(grep -nx "request chassis cluster failover reset redundancy-group $rg" "$CLI_LOG" | tail -1 | cut -d: -f1)
+		if (( clear_ln <= xfer_ln )); then
+			bad "reassert rg$rg: the pin-clearing reset (line $clear_ln) does not come after the transfer (line $xfer_ln)"
+			return
+		fi
+		status_between=$(sed -n "$((xfer_ln+1)),$((clear_ln-1))p" "$CLI_LOG" | grep -cx 'show chassis cluster status')
+		if (( status_between < 1 )); then
+			bad "reassert rg$rg: pin cleared at line $clear_ln with NO status read between it and the transfer at line $xfer_ln (of $n_lines). That is the #7771 race: the reset wins and the RG falls back to the natural election."
+			return
+		fi
+	done
+	ok "reassert: transfer per RG, and the pin is cleared only after a status read confirms it (#6591 + #7771)"
 }
 
 test_reassert_clears_the_peer_manual_pin() {
