@@ -2617,6 +2617,128 @@ fn sync_session_is_served_while_the_state_lock_is_held_7209() {
     );
 }
 
+/// #7209: the SECOND contention cell, driving a REAL payload.
+///
+/// WHY THE CELL ABOVE IS NOT ENOUGH, and why it is nonetheless correct. That
+/// one sends `req("sync_session")` with no `session_sync`, so the handler
+/// returns at its first `let Some(sync_req) = session_sync else { ... }`
+/// (handlers/sync_session.rs). Its doc says so and calls the rejection
+/// irrelevant, which is right for the property IT binds: the request was
+/// DISPATCHED promptly rather than queued behind the global mutex. That
+/// property is real and this cell does not replace it.
+///
+/// What it cannot see is the verb BODY. A fix that moves only the dispatch off
+/// the snapshot-wide mutex — taking it again inside `sync_session::handle`, or
+/// leaving the coordinator calls behind it — turns that cell GREEN while a real
+/// peer session mirror still blocks for the whole reconcile. The distinction is
+/// exactly the fail-open this issue is about, one level up: an instrument that
+/// certifies a partial fix.
+///
+/// So this drives a real UPSERT and a real DELETE, and asserts two things per
+/// operation:
+///
+///   1. it was served inside the bar (the timing property), and
+///   2. it got PAST the payload guard — proving the verb body actually ran,
+///      rather than the cell having silently degenerated into a copy of the one
+///      above. Without (2) a future edit that drops the payload would leave
+///      this cell passing for the first cell's reason.
+///
+/// Both operations, because #5380 aborts the remainder of a bulk batch on the
+/// first transport failure and a batch carries both verbs; a fix that freed
+/// only one would still drop mirrors.
+#[test]
+#[ignore = "#7209: reds until the sync_session VERB, not merely its dispatch, is off the snapshot-wide ServerState mutex"]
+fn sync_session_real_payload_is_served_while_the_state_lock_is_held_7209() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    const HOLD_MS: u64 = 1_200;
+    const SERVED_WITHIN_MS: u64 = 500;
+
+    fn upsert_request() -> ControlRequest {
+        let mut request = req("sync_session");
+        request.session_sync = Some(SessionSyncRequest {
+            operation: "upsert".to_string(),
+            addr_family: 2,
+            protocol: 6,
+            src_ip: "10.0.0.1".to_string(),
+            dst_ip: "10.0.0.2".to_string(),
+            src_port: 1234,
+            dst_port: 80,
+            egress_ifindex: 7,
+            neighbor_mac: "02:bf:72:01:02:03".to_string(),
+            src_mac: "02:bf:72:0a:0b:0c".to_string(),
+            ..SessionSyncRequest::default()
+        });
+        request
+    }
+
+    fn delete_request() -> ControlRequest {
+        let mut request = req("sync_session");
+        request.session_sync = Some(SessionSyncRequest {
+            operation: "delete".to_string(),
+            addr_family: 2,
+            protocol: 6,
+            src_ip: "10.0.0.1".to_string(),
+            dst_ip: "10.0.0.2".to_string(),
+            src_port: 1234,
+            dst_port: 80,
+            ..SessionSyncRequest::default()
+        });
+        request
+    }
+
+    for (op, build) in [
+        ("upsert", upsert_request as fn() -> ControlRequest),
+        ("delete", delete_request as fn() -> ControlRequest),
+    ] {
+        let state = never_settling_state();
+
+        // Same holder shape as the cell above: `holding` reports that the lock
+        // is actually taken, so the measurement cannot start before contention
+        // exists and time an UNCONTENDED request.
+        let (holding_tx, holding_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let holder_state = state.clone();
+        let holder = std::thread::spawn(move || {
+            let _guard = holder_state.lock().expect("state lock");
+            holding_tx.send(()).expect("signal holding");
+            let _ = release_rx.recv_timeout(Duration::from_millis(HOLD_MS));
+        });
+        holding_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("holder never acquired the state lock");
+
+        let t0 = Instant::now();
+        let resp = run_request(state.clone(), build());
+        let elapsed = t0.elapsed();
+        let _ = release_tx.send(());
+        holder.join().expect("holder thread");
+
+        // (2) first: a cell that measured promptly but never entered the verb
+        // would otherwise report success for the wrong reason.
+        assert!(
+            !resp.error.contains("missing session sync request"),
+            "the {op} payload did not reach the verb body — this cell has \
+             degenerated into a copy of the empty-payload cell above and can no \
+             longer distinguish a dispatch-only fix. error={}",
+            resp.error
+        );
+
+        // (1) the contention property.
+        assert!(
+            elapsed < Duration::from_millis(SERVED_WITHIN_MS),
+            "a sync_session {op} carrying a REAL payload waited {elapsed:?} behind a \
+             thread holding the global ServerState mutex. Moving only the DISPATCH \
+             off that mutex turns the empty-payload cell green while a real peer \
+             session mirror still blocks for the whole reconcile — which is what \
+             drops up to 255 mirrors in one #5380 batch during a failover (#7209). \
+             error={}",
+            resp.error
+        );
+    }
+}
+
 #[test]
 fn stop_workers_clears_socket_fields_on_all_bindings() {
     // stop_workers must tear down per-binding socket state so the
