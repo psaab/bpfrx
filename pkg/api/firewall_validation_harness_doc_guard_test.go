@@ -32,18 +32,18 @@ func TestFirewallValidationHarnessDocGuard(t *testing.T) {
 
 	// 2. Required anchors in the design doc
 	requiredAnchors := []string{
-		"#68 Fail-Closed Mandate",
-		"Clustering Cold-Boot Overlap",
-		"DEFAULT_MAX_SESSIONS = 131,072",
+		"#68 fail-closed",
+		"DEFAULT_MAX_SESSIONS 131,072",
 		"UmemInflightFrames",
 		"/tmp/xpf-cluster.lock",
-		"The Positive-Evidence Precondition",
-		"Exit `77`",
-		"Gate 1: Out-of-Process On-Wire Properties",
-		"Gate 2: Two-Plane Observability Parity",
-		"Gate 3: Live Link Carrier Flap Recovery",
-		"Gate 4: Single-IP NAT Port Exhaustion Under Load",
-		"Gate 5: Owed Connection-Rate Benchmark",
+		"wire_policy_deny",
+		"wire_nat_snat",
+		"wire_screen_drop",
+		"fault_carrier_flap",
+		"fault_nat_exhaustion",
+		"parity_wire_vs_control",
+		"test/results/ledger.jsonl",
+		"100GbE line-rate",
 	}
 	for _, anchor := range requiredAnchors {
 		if !strings.Contains(doc, anchor) {
