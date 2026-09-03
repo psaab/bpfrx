@@ -8270,17 +8270,34 @@ fn worker_commands_install_and_forget_pptp_associations_7699() {
 /// #7699 stage 2 END-TO-END: control-channel BYTES through to an association a
 /// data packet resolves against.
 ///
-/// Every other PPTP cell tests one hop. The parser cells build a segment and
-/// assert a parse; the table cells install a `PptpCall` and assert a resolve;
-/// the drain cell pushes a `WorkerCommand` and asserts it lands. **All of them
-/// stay green against a build where nothing calls the parser**, because each
-/// end works and nothing joins them — the same two-correct-halves-and-no-join
-/// shape that hid the missing `ProxyARPUnresolvedFn` behind a green suite
-/// (#7685) and the missing install arm behind green table cells (#8392).
+/// # What this binds, and what it does NOT
 ///
-/// So this one starts at the wire bytes and ends at `resolve`, with nothing
-/// hand-constructed in between: delete the `learn_from_control_segment` call
-/// from the publish path and this reds while every single-hop cell passes.
+/// Every other PPTP cell tests one hop: the parser cells build a segment and
+/// assert a parse, the table cells install a `PptpCall` and assert a resolve,
+/// the drain cell pushes a `WorkerCommand` and asserts it lands. This one
+/// composes parse -> broadcast -> drain -> resolve starting from the wire
+/// BYTES, so it binds both ends together and the shape of their composition:
+/// the call ids must be attributed to the right peers, survive the broadcast,
+/// and resolve in BOTH directions to one handle. Breaking the parser reds this
+/// cell along with two unit cells; swapping `src`/`dst` in
+/// `learn_from_control_segment` reds this one and the attribution cell.
+///
+/// **It does NOT bind production wiring, because there is none yet.** Nothing
+/// in the running dataplane calls `learn_from_control_segment` or
+/// `broadcast_pptp_install` — the packet-path dispatch that recognises a
+/// TCP/1723 segment and routes it to this parser off the hot path is stage 2's
+/// remaining half, tracked in #7699's body. This cell chains the two at the
+/// TEST level, which is a hand-chained pair, and a hand-chained pair cannot
+/// notice that production never chains them.
+///
+/// That is stated rather than left implicit because the earlier version of this
+/// comment claimed the opposite — it named "delete the call from the publish
+/// path" as the falsifying mutation, and there is no publish path to delete it
+/// from. The claim was unfalsifiable, which is worse than silence: it would be
+/// believed exactly as long as nobody tried it. Written, ironically, in the act
+/// of citing #7685 and #8392 as the two-correct-halves-and-no-join cases —
+/// knowing the failure mode by name did not prevent writing an instance of it.
+/// When the dispatch lands, the production join needs its own cell.
 #[test]
 fn a_control_segment_becomes_a_resolvable_association_7699() {
     use crate::session::pptp_control::{
