@@ -1556,6 +1556,74 @@ false-reject. Plus the top-level no-false-positive accepts (apply-groups
 deep-merge carrying both rules, cross-group coalescing, #3096 bracket-list
 expansion).
 
+### Empty forwarding-class identity (#8442) — and why it is NOT in the #6455 family gate
+
+`class-of-service forwarding-classes queue 5 ""` committed GREEN and then made
+the helper refuse the whole snapshot. Measured at master by dumping the emitted
+snapshot:
+
+```json
+{"forwarding_classes":[{"name":"","queue":5},{"name":"realfc","queue":6}],
+ "scheduler_maps":[{"name":"sm1","entries":[{"forwarding_class":""},{"forwarding_class":"realfc"}]}]}
+```
+
+**The fault is a Go/Rust SET DISAGREEMENT, and each side is reasonable alone.**
+The Go emitter KEEPS an empty class — in `forwarding_classes` *and* in the
+scheduler-map entries, because `CoSForwardingClassUndefined(cos, "")` is false
+(the entry exists), so the #6534/#2409 exclusion filter retains it. The Rust
+`build_cos_classifier_tables` SKIPS an empty name when building
+`class_to_queue`. So the scheduler-map entry's lookup misses and
+`build_cos_iface_config` fails the snapshot closed with
+`SchedulerMapUnknownClass { forwarding_class: "" }`.
+
+**The blast radius is the point.** The apply preflight keeps the previous live
+forwarding state, so *every* forwarding change in that commit silently does not
+apply — not just the CoS stanza, and not just the offending class — while the
+CLI reports a successful commit. The empty class even DENIES a real one: the
+FC↔queue bijection gate reports `forwarding-class "realfc" conflicts with ""`.
+
+**Why not the #6455 quoted-empty-name family gate.** That family
+(`rule ""`, `group ""`, `interface ""`, `ids-option ""`) is enforced by the
+pre-expansion duplicate-name scanners, which walk
+`namedInstances(FindChildren(keyword))` — NAMED BLOCKS. A forwarding-class name
+is not one. It is a positional VALUE token: arg 1 of
+`forwarding-classes queue <id> <name>`, or the identity arg of a
+`forwarding-class <name>` reference. The `namedDupRules` registry cannot see
+it, so extending it would have meant reshaping that scanner around a different
+grammar. Typed-leaf validators are where value slots are gated, so that is where
+this lives.
+
+`ValidateForwardingClassName` (`schema_validators_cos.go`) is attached to every
+slot that names a forwarding class:
+
+- the DEFINITION slot, via `keyValidatorPos: ValidateForwardingClassQueueArg` on
+  `forwarding-classes queue` (positional because arg 0 is the queue id and arg 1
+  the name — only the name slot carries this identity);
+- all eight `forwarding-class <class-name>` REFERENCE slots (classifiers dscp /
+  ieee-802.1 / inet-precedence, rewrite-rules, scheduler-maps).
+
+The two firewall-filter `then forwarding-class` slots already carry a stricter
+`treeValidator: validateForwardingClassRef`, which requires the reference to
+resolve — and after this gate no empty class can be defined, so an empty
+reference cannot resolve.
+
+**It cannot false-reject a shorter authoring.** The schema walker clamps the
+declared-arg span to `len(node.Keys)`, so arg 1 is only visited when the
+operator actually wrote a second token; a bare `queue 5` never reaches the name
+validator. Only a present-but-empty token is rejected.
+
+Strict on commit / commit-check; the tolerant load / peer-sync path is unchanged
+(#1960 no-brick) — which is also where the harm remains observable, and where
+`TestEmptyForwardingClassWouldReachTheWire_8442` pins that the emitter still
+produces the empty name so the gate has something to prevent.
+
+This also repaired two in-tree claims that had gone stale. The Rust skip
+described an empty class as *"the legitimate placeholder case"*, and the
+`SchedulerMapUnknownClass` test called that error a backstop that *"never fires
+on a fresh operator config"* — both false while this hole was open, both true
+again only because the Go gate now exists.
+
+
 ### Non-numeric logical-unit identity fail-closed (#5829)
 
 `interfaces <if> unit <identity>` had NO positional key validation: the `unit`

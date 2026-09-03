@@ -317,3 +317,70 @@ func validateForwardingClassRef(raw string, refs *schemaRefs) error {
 	}
 	return fmt.Errorf("forwarding-class %q is not defined; add `set class-of-service forwarding-classes queue <queue-id> %s` in the same commit (xpf does not implicitly define the Junos default classes other than best-effort)", raw, raw)
 }
+
+// ValidateForwardingClassName rejects an EMPTY forwarding-class identity at any
+// slot that names one — #8442.
+//
+// # The defect this closes is a Go/Rust SET DISAGREEMENT, not a bad name
+//
+// An empty name committed clean and crossed the wire. Measured at master by
+// dumping the emitted snapshot:
+//
+//	{"forwarding_classes":[{"name":"","queue":5},{"name":"realfc","queue":6}],
+//	 "scheduler_maps":[{"name":"sm1","entries":[{"forwarding_class":""},...]}]}
+//
+// The Rust `build_cos_classifier_tables` then SKIPS an empty class name when
+// building `class_to_queue` — deliberately, as "the legitimate placeholder
+// case" — while the Go emitter KEEPS it in both `forwarding_classes` and the
+// scheduler-map entries. Each side is reasonable alone. Their disagreement is
+// the fault: the scheduler-map entry's lookup misses, and
+// `build_cos_iface_config` fails the WHOLE snapshot closed with
+// `SchedulerMapUnknownClass { forwarding_class: "" }`.
+//
+// So the apply preflight keeps the previous live forwarding state and EVERY
+// forwarding change in that commit silently does not apply — not just the CoS
+// stanza, and not just the offending class. The operator sees a successful
+// commit. That blast radius, not the bad name, is what this gate is worth.
+//
+// # Why here rather than in the #6455 family gate
+//
+// The quoted-empty-name family (`rule ""`, `group ""`, `interface ""`,
+// `ids-option ""`) is handled by the pre-expansion duplicate-name scanners,
+// which walk `namedInstances(FindChildren(keyword))` — NAMED BLOCKS. A
+// forwarding-class name is not one: it is a positional VALUE token, either
+// arg 1 of `forwarding-classes queue <id> <name>` or the identity arg of a
+// `forwarding-class <name>` reference. That registry cannot see it, so
+// extending it would have meant reshaping the scanner around a different
+// grammar. The typed-leaf validators are where value slots are gated.
+func ValidateForwardingClassName(raw string, _ *Config) error {
+	if strings.TrimSpace(raw) == "" {
+		return fmt.Errorf(
+			"empty forwarding-class name — a forwarding class is an identity the " +
+				"dataplane resolves by name (scheduler-map entries, classifiers and " +
+				"rewrite rules all reference it), and the helper drops an empty one " +
+				"from its class-to-queue map. The resulting snapshot is rejected " +
+				"WHOLE, so every forwarding change in the commit silently fails to " +
+				"apply while the commit reports success (#8442)")
+	}
+	return nil
+}
+
+// ValidateForwardingClassQueueArg gates
+// `class-of-service forwarding-classes queue <queue-id> <class-name>` — #8442.
+//
+// Positional because the leaf is `args: 2` with two different grammars: arg 0
+// is the queue id and arg 1 is the class NAME, and only the name slot carries
+// the identity this gate is about.
+//
+// It cannot false-reject a shorter authoring. The walker's declared-arg span is
+// clamped to `len(node.Keys)`, so arg 1 is only ever visited when the operator
+// actually wrote a second token — a bare `queue 5` never reaches this at index
+// 1. Only a present-but-empty token (`queue 5 ""`) is rejected.
+func ValidateForwardingClassQueueArg(argIdx int, raw string, cfg *Config) error {
+	if argIdx != 1 {
+		// The queue-id slot keeps its existing compiler-side handling; this gate
+		// deliberately adds no new grammar there.
+		return nil
+	}
+	return ValidateForwardingClassName(raw, cfg)
+}
