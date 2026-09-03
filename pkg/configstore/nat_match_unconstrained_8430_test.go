@@ -142,3 +142,40 @@ func TestNATUnconstrainedMatchNoBrickOnTolerantPath_8430(t *testing.T) {
 		t.Fatalf("tolerant compile refused a NAT config: %v", err)
 	}
 }
+
+// M1 FOUND THIS. Un-flipping the closed-world subtrees was a SURVIVING mutation
+// against every cell above, because the unconstrained gate catches a lone typo
+// too: the match is authored and empty either way. It does NOT catch a typo
+// BESIDE a valid leaf — the rule is then constrained by the valid leaf, the
+// gate passes, and the typo'd leaf is silently dropped, so the rule matches
+// only PART of what was authored.
+//
+// That is the same widening one notch narrower, and it is the only shape that
+// distinguishes the two mechanisms. A test population built from "the leaf
+// alone" could not see it.
+func TestNATTypoBesideAValidLeafIsRejected_8430(t *testing.T) {
+	cases := map[string]string{
+		"typo beside a valid source-address": "source-address 10.0.61.0/24; soruce-address 10.0.99.0/24;",
+		"unknown leaf beside a valid one":    "source-address 10.0.61.0/24; source-port 1024;",
+		"garbage beside a valid one":         "source-address 10.0.61.0/24; flooby wibble;",
+	}
+	for name, match := range cases {
+		got, err := snatSourceAddrs8430(t, snatWithMatch8430(match))
+		if err != nil {
+			continue // rejected, which is the point
+		}
+		t.Errorf("%s: COMMITTED with SourceAddresses=%v — the unrecognised leaf was "+
+			"silently dropped, so the rule matches only part of what was authored",
+			name, got)
+	}
+	// CONTROL: two VALID leaves together must still commit, and keep both.
+	got, err := snatSourceAddrs8430(t,
+		snatWithMatch8430("source-address 10.0.61.0/24; destination-address 10.0.70.0/24;"))
+	if err != nil {
+		t.Fatalf("two valid match leaves were rejected: %v", err)
+	}
+	if len(got) != 1 {
+		t.Errorf("valid two-leaf match kept SourceAddresses=%v, want exactly the one "+
+			"authored source prefix", got)
+	}
+}
