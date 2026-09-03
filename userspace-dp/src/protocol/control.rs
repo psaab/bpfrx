@@ -744,6 +744,28 @@ pub(crate) struct SessionSyncRequest {
     /// Full contract: `docs/session-sync-architecture.md`.
     #[serde(rename = "tunnel_discriminator", default)]
     pub tunnel_discriminator: u64,
+
+    /// #7699: the learned PPTP call-id pair, for a session whose discriminator
+    /// is `Pptp(handle)`.
+    ///
+    /// The handle in the discriminator is DERIVED from this pair, so a peer
+    /// that sends the handle without the pair sends a session the receiver can
+    /// never match a packet against: the receiver resolves an incoming PPTP
+    /// packet by looking its call id up in the association table, and without
+    /// the pair it cannot build that entry. Such a record is WITHHELD rather
+    /// than imported — the #7188 withhold-not-downgrade discipline, for the
+    /// same reason: a downgraded record is worse than an absent one, because
+    /// the peer believes it has state it cannot use.
+    ///
+    /// `0` is RESERVED for "not carried", exactly as `tunnel_discriminator`
+    /// reserves it, and is NOT the encoding of the call-id pair `(0, 0)`. PPTP
+    /// call id 0 is not obviously illegal, so a raw pair of u16s would make an
+    /// older peer's `serde(default)` zeros indistinguishable from a real call —
+    /// which is the absent-vs-zero collapse #7188 exists to avoid. The present
+    /// form is `PPTP_CALL_IDS_PRESENT | (lo << 16) | hi`, where `lo`/`hi` are
+    /// the call ids of the canonically-lower and -higher peer address.
+    #[serde(rename = "pptp_call_ids", default)]
+    pub pptp_call_ids: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

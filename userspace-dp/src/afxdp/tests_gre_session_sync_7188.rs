@@ -244,3 +244,86 @@ fn every_discriminator_class_survives_the_sync_path_distinctly_7188() {
         );
     }
 }
+
+/// #7699: a PPTP record whose call-id pair was not carried is WITHHELD.
+///
+/// The handle in the discriminator is derived from the pair, so a record with
+/// the handle and no pair is one this node can never match a packet against: it
+/// cannot build the association its workers resolve through. Importing it would
+/// leave a session in the table while every packet for that call resolves
+/// unassociated — present-and-unusable, which is worse than absent.
+///
+/// Same discipline as
+/// `a_peer_that_cannot_express_the_discriminator_has_its_gre_session_withheld_7188`,
+/// and the refusal carries the same machine-readable prefix because it is the
+/// CORRECT answer from a healthy helper, not a transport failure.
+#[test]
+fn a_pptp_record_without_its_call_id_pair_is_withheld_7699() {
+    use crate::session::pptp::PptpCall;
+
+    let (a, b): (std::net::IpAddr, std::net::IpAddr) = (
+        "198.51.100.7".parse().unwrap(),
+        "203.0.113.9".parse().unwrap(),
+    );
+    let call = PptpCall::new(a, 0x1111, b, 0x2222);
+    let zones = rustc_hash::FxHashMap::default();
+
+    // The peer states the handle but carries no pair — an older daemon, or one
+    // that lost the association.
+    let mut req = gre_sync_req(PROTO_GRE, TunnelDiscriminator::Pptp(call.handle()).to_wire());
+    req.src_ip = a.to_string();
+    req.dst_ip = b.to_string();
+    req.pptp_call_ids = crate::session::pptp::PPTP_CALL_IDS_ABSENT;
+    let err = build_synced_session_entry(&req, &zones, 0)
+        .expect_err("a PPTP record with no call-id pair must be withheld");
+    assert!(
+        err.contains("pptp-call-ids-not-carried"),
+        "the refusal must name the reason so Go can discriminate it from a \
+         transport failure (#5247); got {err}"
+    );
+
+    // POSITIVE CONTROL: the SAME record with the pair carried imports cleanly.
+    // Without this the assertion above is satisfied by a build that withholds
+    // every PPTP record, which would be indistinguishable from not supporting
+    // the class at all.
+    req.pptp_call_ids = call.to_wire_call_ids();
+    let entry = build_synced_session_entry(&req, &zones, 0)
+        .expect("a PPTP record carrying its pair must import");
+    assert_eq!(entry.key.discriminator, TunnelDiscriminator::Pptp(call.handle()));
+}
+
+/// #7699: a handle that does not match the carried pair is WITHHELD, not
+/// repaired.
+///
+/// Both nodes derive the handle with the same pure function, so a mismatch
+/// means they disagree about the derivation — version skew or a corrupted
+/// record. Recomputing it locally and importing under the local value would
+/// make the two tables disagree SILENTLY, which is the failure this check
+/// exists to catch rather than paper over.
+#[test]
+fn a_pptp_handle_that_disagrees_with_its_pair_is_withheld_7699() {
+    use crate::session::pptp::PptpCall;
+
+    let (a, b): (std::net::IpAddr, std::net::IpAddr) = (
+        "198.51.100.7".parse().unwrap(),
+        "203.0.113.9".parse().unwrap(),
+    );
+    let call = PptpCall::new(a, 0x1111, b, 0x2222);
+    let other = PptpCall::new(a, 0x3333, b, 0x4444);
+    assert_ne!(call.handle(), other.handle(), "fixture: the two must differ");
+
+    let zones = rustc_hash::FxHashMap::default();
+    let mut req = gre_sync_req(PROTO_GRE, TunnelDiscriminator::Pptp(other.handle()).to_wire());
+    req.src_ip = a.to_string();
+    req.dst_ip = b.to_string();
+    // The pair belongs to `call`; the handle claims `other`.
+    req.pptp_call_ids = call.to_wire_call_ids();
+
+    let err = build_synced_session_entry(&req, &zones, 0)
+        .expect_err("a handle that disagrees with its pair must be withheld");
+    assert!(
+        err.contains("pptp-handle-mismatch"),
+        "the refusal must name the disagreement rather than silently importing \
+         under a locally recomputed handle; got {err}"
+    );
+}

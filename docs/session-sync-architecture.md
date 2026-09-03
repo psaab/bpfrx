@@ -1192,6 +1192,38 @@ VALUE field and needs no `CurrentHAProtocolVersion` bump. The path is:
 Go never interprets the tag — it carries it — so the encoding is defined in
 exactly one place.
 
+### The PPTP call-id pair rides beside it (#7699)
+
+`SessionSyncRequest.pptp_call_ids` carries the learned `(call-id lo, call-id
+hi)` for a session whose discriminator is `Pptp(handle)` — the pair the handle
+was **derived** from.
+
+**Why it must travel at all.** The handle is a pure function of the association,
+and a receiver resolves an incoming PPTP packet by looking its call id up in the
+association table. A peer that sends the handle without the pair therefore sends
+a session the receiver **can never match a packet against**: it cannot build the
+table entry, so every packet for that call resolves unassociated while a session
+for it sits in the table. Present-and-unusable is worse than absent.
+
+**So such a record is WITHHELD**, carrying the same
+`SYNCED_IMPORT_REFUSED_PREFIX` as the #7188 discriminator refusal and for the
+same reason — it is the correct answer from a healthy helper, not a transport
+failure, and Go discriminates on the token so a transport-class failure does not
+gate takeover-readiness (#5247). Two refusals exist:
+`pptp-call-ids-not-carried` and `pptp-handle-mismatch`.
+
+**A mismatch is refused, not repaired.** Both nodes derive the handle with the
+same pure function, so a handle that disagrees with its pair means they disagree
+about the derivation — version skew or corruption. Recomputing it locally and
+importing under the local value would make the two nodes' tables disagree
+**silently**, which is the failure the check exists to catch.
+
+**`0` is RESERVED for "not carried" here too**, and is NOT the pair `(0, 0)`.
+PPTP call id 0 is not obviously illegal, so a raw pair of `u16`s would make an
+older peer's `serde(default)` zeros indistinguishable from a real call — the
+absent-vs-zero collapse this section is about, one field over. The present form
+is `PPTP_CALL_IDS_PRESENT | (lo << 16) | hi`.
+
 **`0` is RESERVED for "not carried", and is NOT the encoding of `None`.** This
 is the load-bearing detail. `serde(default)` and a short length-gated record
 both yield `0`, so `0` is the one value a peer produces WITHOUT meaning to; a

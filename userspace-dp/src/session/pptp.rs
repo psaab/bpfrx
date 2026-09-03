@@ -63,6 +63,31 @@ impl PptpCall {
         }
     }
 
+    /// Encode the call-id pair for the HA sync wire (#7699).
+    ///
+    /// Never returns [`PPTP_CALL_IDS_ABSENT`], so a receiver can read `0` as
+    /// "the peer could not state this" rather than as a call.
+    pub(crate) fn to_wire_call_ids(&self) -> u64 {
+        PPTP_CALL_IDS_PRESENT | (u64::from(self.lo_call_id) << 16) | u64::from(self.hi_call_id)
+    }
+
+    /// Rebuild an association from the wire pair and the two peer addresses.
+    ///
+    /// `None` means the peer did not carry the field, which is a WITHHOLD on
+    /// the import path rather than a default — a session whose handle the
+    /// receiver cannot reproduce is one it can never match a packet against.
+    /// The addresses come from the session key, and re-canonicalizing through
+    /// [`Self::new`] keeps the ordering identical to the sender's.
+    pub(crate) fn from_wire_call_ids(wire: u64, a: IpAddr, b: IpAddr) -> Option<Self> {
+        if wire & PPTP_CALL_IDS_PRESENT == 0 || wire >> 33 != 0 {
+            return None;
+        }
+        let lo_call_id = ((wire >> 16) & 0xFFFF) as u16;
+        let hi_call_id = (wire & 0xFFFF) as u16;
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        Some(Self::new(lo, lo_call_id, hi, hi_call_id))
+    }
+
     /// The deterministic call handle.
     ///
     /// FNV-1a over the canonical association, written out so it is auditable
@@ -92,6 +117,15 @@ impl PptpCall {
         if h == 0 { 1 } else { h }
     }
 }
+
+/// Reserved: the call-id pair was not carried on the HA sync wire.
+///
+/// Not the encoding of the pair `(0, 0)` — PPTP call id 0 is not obviously
+/// illegal, so an older peer's `serde(default)` zero must not be readable as a
+/// real call. Same reasoning as `WIRE_ABSENT` in the discriminator codec.
+pub(crate) const PPTP_CALL_IDS_ABSENT: u64 = 0;
+/// Present-form tag; the pair rides in the low 32 bits as `(lo << 16) | hi`.
+pub(crate) const PPTP_CALL_IDS_PRESENT: u64 = 1 << 32;
 
 /// Why an association was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
