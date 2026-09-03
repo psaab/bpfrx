@@ -1297,6 +1297,35 @@ set, and a merge here would fight that design.
 
 ### Duplicate containers beyond the original four (#6768)
 
+#### IKE and IPsec proposals (#8433)
+
+Two more rows on the same table, added by the same predicate rather than by a
+new gate. `security ike proposal <n>` and `security ipsec proposal <n>` are
+stored as `IKEProposals[name]` / `Proposals[name]`, so a second hierarchical
+block **replaces** the first. Measured at master before the rows were added:
+
+```
+ike proposal P1 { authentication-method pre-shared-keys; dh-group group14; }
+ike proposal P1 { authentication-algorithm sha-256; encryption-algorithm aes-256-cbc; }
+   ->  method=""  dh=0
+
+ipsec proposal Q1 { protocol esp; }
+ipsec proposal Q1 { authentication-algorithm hmac-sha-256-128; encryption-algorithm aes-256-cbc; }
+   ->  protocol=""
+```
+
+**These are worse than the average last-wins row on this table.** What survives is
+not a weaker tunnel — it is an **incomplete crypto proposal**: no
+authentication-method, no DH group, or no ESP selection, every part of which the
+operator authored. The flat `set` spelling merges the two blocks correctly, so
+the reachable route is a hierarchical config file or `load merge`.
+
+Adding them cost two rows and nothing else: no new diagnostic path, and the
+strict/lenient #1960 split comes from the table. `TestEveryDuplicateContainerRuleHasAFixture_6768`
+then **refused the change** until each row had a fixture — the registry guarding
+itself, which is why adding a row is cheap but not free.
+
+
 The #5180 gate started as four hand-written copies of one walk. #6768 turned
 the walk into a registry — `namedDupRules` / `singletonDupRules` in
 `pkg/config/dup_named_blocks.go` — so adding a container is one row and the
