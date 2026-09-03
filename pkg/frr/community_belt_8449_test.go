@@ -78,3 +78,24 @@ func TestCommunityRenderBeltDoesNotNarrowValidMembers_8449(t *testing.T) {
 		}
 	}
 }
+
+// #8449. `communityRegexChars` is an ALIAS of config.CommunityRegexChars, so
+// today this assertion is true by construction — and that is precisely its job.
+// It fires the moment someone turns the alias back into a second literal, which
+// is a SURVIVING mutation against every other cell in this package: measured,
+// drifting the copy to `*.+?^$()|\` (dropping the brackets and braces) left the
+// whole pkg/frr suite green while the renderer and the commit gate disagreed
+// about which members FRR compiles.
+//
+// The render side decides standard-vs-expanded; the commit gate decides what to
+// reject. If they read different character sets, a member the gate waves through
+// as "standard, not compiled" is rendered into an EXPANDED list and compiled
+// after all — poisoning the reload the gate exists to prevent.
+func TestCommunityRegexCharsIsTheSharedConstant_8449(t *testing.T) {
+	if communityRegexChars != config.CommunityRegexChars {
+		t.Fatalf("pkg/frr communityRegexChars = %q but config.CommunityRegexChars = %q; "+
+			"the renderer's list-kind decision and the commit gate now disagree about "+
+			"which members FRR runs through regcomp",
+			communityRegexChars, config.CommunityRegexChars)
+	}
+}

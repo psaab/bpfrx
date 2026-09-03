@@ -650,6 +650,59 @@ TTL to `[0, 0xffff]` as a defensive backstop so even the in-range IEEE extreme
 (32768 × 10) — and any constructed caller — cannot wrap, matching the standard's
 own `txTTL = min(65535, msgTxInterval × msgTxHold)`.
 
+### `policy-options community` members that would poison the frr-reload (#8449)
+
+The community sibling of the #6686 as-path gate. A member carrying a regex
+metacharacter renders into an FRR **expanded** community-list, where FRR runs it
+through `regcomp`; one that does not compile is a `CMD_WARNING_CONFIG_FAILED`,
+and a single such failure exits the whole `vtysh` add-batch non-zero — failing
+the **entire** frr-reload of the managed section, not just this one list, and
+leaving every dynamic routing change stale.
+
+`ValidCommunityMember` (`pkg/config/community_member.go`) is the shared
+predicate. `validatePolicyCommunityRegexStrict` hard-rejects on the strict path;
+`lenientPolicyCommunityRegex` downgrades it to a warning on Load / SyncApply
+(#1960); and `generatePolicyOptions` carries the render-side belt for that
+tolerant path. Omitting the list is strictly better than poisoning the reload —
+FRR resolves a `match community <name>` with no such list to NO MATCH, confining
+the damage to the terms that reference it.
+
+**The omission is per-DEFINITION, not per-member.** FRR does not allow one list
+name to be both standard and expanded, so a half-rendered list would change the
+kind decision `communityMemberIsRegex` made over the raw members.
+
+**Scope is deliberately narrow.** The gate rejects only what provably breaks the
+reload: an empty member, and a regex-kind member that does not compile. It does
+NOT check that a standard-kind member is a well-formed community literal
+(`ASN:VALUE` or a well-known name). FRR would reject a bogus literal too, but
+enumerating the well-known names is a second, independent claim, and a gate that
+over-approximates false-rejects working configs — a worse failure than the one
+being fixed.
+
+**`pkg/frr`'s `communityRegexChars` is an ALIAS, not a copy.**
+`config.CommunityRegexChars` is the SSOT for the standard-vs-expanded
+classification, because the renderer's kind decision and the gate's reject
+decision must read the same character set: if they diverge, a member the gate
+waves through as "standard, not compiled" is rendered into an expanded list and
+compiled after all. It was left as a named constant in `pkg/frr` so the
+pre-existing tests referencing it keep binding the real value rather than being
+quietly decommissioned. `TestCommunityRegexCharsIsTheSharedConstant_8449` asserts
+the **agreement** — it is true by construction today, and that is its job:
+measured, drifting the copy to `*.+?^$()|\` left the entire `pkg/frr` suite
+green.
+
+**A residual that is NOT this gate's.** An unquoted `65000:[` is truncated by the
+bracketed-list lexer to `65000:` before any validation sees it — a #2419-class
+value mangling. The cells use the QUOTED spelling so they measure this gate
+rather than the lexer.
+
+**A fixture note worth keeping.** The first version of the commit cell authored
+`community c1 members X;`, and every member — including the valid control —
+compiled to an EMPTY member list. The correct spelling is
+`community c1 { members X; }`. The positive control is what caught it; without
+it the cell would have passed against a gate that never ran, on a config that
+never carried the value.
+
 ### `security zones` interface-defined reference (ps-review-002 F6, #4515)
 
 `validateZoneInterfaceDefinedStrict` (`compiler_validate_strict_zones.go`, gated
