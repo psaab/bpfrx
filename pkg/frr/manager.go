@@ -467,6 +467,13 @@ func (m *Manager) ApplyFull(fc *FullConfig) error {
 		if err := routeFilterACLNameCollision(fc.PolicyOptions); err != nil {
 			return err
 		}
+		// #7625 render-side belt, same posture: the reserved emptied-chain deny
+		// route-map must not fuse with an operator policy-statement of that exact
+		// name — a merge could pull permit sequences into the deny and reopen the
+		// unfiltered-direction hole the deny exists to close.
+		if err := emptiedChainDenyCollision(fc); err != nil {
+			return err
+		}
 	}
 
 	return m.commitManagedSection(m.buildManagedSection(fc))
@@ -571,6 +578,11 @@ func (m *Manager) buildManagedSection(fc *FullConfig) string {
 		// `route-map <name>` reference regardless of definition order.
 		b.WriteString(m.renderComposedBGPChains(fc))
 	}
+	// #7625: the bounded deny an EMPTIED policy chain attaches. Emitted OUTSIDE
+	// the PolicyOptions guard above — a nil PolicyOptions makes every authored
+	// policy name a ghost, which is exactly when the deny is referenced and when
+	// skipping its definition would leave that reference dangling.
+	b.WriteString(m.renderEmptiedChainDeny(fc))
 
 	// Resolve forwarding-table export policy for ECMP. Sets fc.ConsistentHash
 	// as a side effect when the policy uses "load-balance consistent-hash".

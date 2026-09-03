@@ -358,16 +358,48 @@ Two properties the metric depends on, both bound by tests:
 One oversized policy can quarantine **two** names — itself and its
 `-xpf-redist` alias — so the gauge is a count, not a boolean.
 
-### Known asymmetry, deliberately left alone
+### The undefined-policy asymmetry (#7625) — emptied half resolved
 
 The `#2473`/`#2490`/`#2539` guards drop a reference to an **undefined**
 (never-authored) policy. Under the corrected semantics that drop *produces*
-permit-all — the leak those guards were written to prevent. Their behaviour
-is **unchanged** here: whether an undefined reference should deny is a
-behaviour choice about configs that should not exist, distinct from #6807's
-case where the policy IS authored and the RENDERER omitted it. Tracked as
-**#7625**; the comments at those sites now state the real direction so no
-one re-derives intent from the old sentence.
+permit-all — the leak those guards were written to prevent. #7625 splits that
+into two shapes, because they are not the same defect:
+
+| authored chain | after the drop | before #7625 | now |
+|---|---|---|---|
+| `[GHOST]` | `[]` | no attachment → **permit-all** | bounded deny |
+| `[REAL, GHOST]` | `[REAL]` | attachment to `REAL` | unchanged |
+
+**Emptied → bounded deny.** Every member unresolvable meant no `route-map`
+line at all, and an *absent* attachment is the one shape FRR permits. So the
+direction the operator filtered hardest ended up unfiltered — a hole, not a
+degradation. The attachment sites now resolve through `bgpNeighborImportRef` /
+`bgpNeighborExportRef` (`policy_chain_emptied_deny_7625.go`), which reference a
+reserved `xpf-emptied-chain-xpf-chain` deny. Reference and definition are
+emitted together, so #6807's "every referenced name is defined in this section"
+property holds **by construction** rather than by the reference being dropped.
+The name is quarantine-counted, so it shows up in
+`xpf_frr_route_maps_quarantined` like the oversized cases.
+
+**The direction asymmetry is real.** A bare protocol token (`static`, `direct`)
+in an `export` list means `redistribute <proto>` on a separate path, so such a
+list also filters to empty — but attaching a deny there would withdraw every
+route to the peer, a worse outage than the bug. On **import** there is no
+redistribute construct, so the same token is just a name that resolves to
+nothing and must deny. The exclusion is therefore export-only.
+
+**Narrowed → unchanged.** A chain that keeps some members still renders the
+surviving subset. Whether that should instead deny depends on how FRR evaluates
+a chain whose earlier member accepts, which #7625 tracks as a separate
+measurement — it is not assumed here.
+
+**Reachability.** Strict commit rejects an undefined policy reference in either
+direction (`config.TestBGPNeighborImportTypoRejected`), so no commit-time
+surface was added: these configs reach the renderer only on the lenient load /
+HA peer-sync / rollback path (#1960), having committed on an older binary or
+arrived from a peer. A render-side collision guard fails the apply **closed** if
+an operator policy-statement carries the reserved deny name, since FRR merges
+same-named route-maps and the merge could fuse permits into the deny.
 
 ## Gotchas
 
