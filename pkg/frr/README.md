@@ -388,10 +388,29 @@ route to the peer, a worse outage than the bug. On **import** there is no
 redistribute construct, so the same token is just a name that resolves to
 nothing and must deny. The exclusion is therefore export-only.
 
-**Narrowed → unchanged.** A chain that keeps some members still renders the
-surviving subset. Whether that should instead deny depends on how FRR evaluates
-a chain whose earlier member accepts, which #7625 tracks as a separate
-measurement — it is not assumed here.
+**Narrowed → unchanged, but no longer silent (#8363).** A chain that keeps some
+members still renders the surviving subset, byte-identically. The measurement
+that gated this (`policy_chain_narrowed_eval_8363_test.go`) refuted the stated
+objection and found a different one:
+
+- An **accepting member terminates** evaluation — xpf emits `on-match next` only
+  for non-terminating terms, so a `then accept` term is a bare `permit` and FRR
+  stops there. A route the surviving member accepts never reaches a later deny.
+  The feared "works-but-narrowed goes deny-all" does not happen that way.
+- **Position does.** A synthesized deny is a chain member with a terminating
+  *default* action, and `renderComposedRouteMap` breaks on the first such member,
+  so every later member is never emitted. `[GHOST, REAL]` renders as a lone
+  `deny 10` — deny-all, invisible in the output because nothing is left to look
+  wrong.
+
+So a synthesized deny is safe **iff the undefined members form a suffix** of the
+authored chain. Ghost-last is safe; ghost-first or ghost-middle is a routing
+outage. Rather than take that behaviour change on a working config, the narrowing
+is made **visible**: `warnNarrowedChains` logs each site with what was authored,
+what is applied, and what was discarded. Before this it was completely silent —
+the rendered section is self-consistent, the session works, and `show route-map`
+displays a real well-formed policy that is simply not the one the operator
+wrote.
 
 **Reachability.** Strict commit rejects an undefined policy reference in either
 direction (`config.TestBGPNeighborImportTypoRejected`), so no commit-time

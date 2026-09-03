@@ -36,6 +36,7 @@ package frr
 // fact 2 instead of rediscovering it in production.
 
 import (
+	"sort"
 	"strings"
 	"testing"
 
@@ -168,5 +169,93 @@ func TestDenyBeforeASurvivingMemberDeletesTheRestOfTheChain8363(t *testing.T) {
 	// render as deny-all.
 	if n := strings.Count(got, "route-map C3-xpf-chain "); n != 1 {
 		t.Errorf("ghost-first chain rendered %d sequences, want exactly 1 (deny-all):\n%s", n, got)
+	}
+}
+
+// --- Visibility (#8363). Behaviour is unchanged for a narrowed chain; what
+// changes is that it is no longer silent. ---
+
+func narrowedWhere8363(sites []narrowedChainSite) []string {
+	out := make([]string, 0, len(sites))
+	for _, s := range sites {
+		out = append(out, s.Where)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// The detector must report a narrowed site, and must NOT report the three
+// shapes that look similar but are not narrowing.
+func TestNarrowedChainSitesReportsOnlyRealNarrowing8363(t *testing.T) {
+	po := &config.PolicyOptionsConfig{
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"REAL": {Name: "REAL", Terms: []*config.PolicyTerm{{Name: "t1", PrefixList: []string{"PL"}}}},
+		},
+		PrefixLists: map[string]*config.PrefixList{"PL": {Name: "PL", Prefixes: []string{"10.0.0.0/8"}}},
+		Communities: map[string]*config.CommunityDef{},
+		ASPaths:     map[string]*config.ASPathDef{},
+	}
+	bgp := &config.BGPConfig{
+		LocalAS: 65001, RouterID: "1.1.1.1",
+		Neighbors: []*config.BGPNeighbor{
+			// NARROWED — the one site that must be reported.
+			{Address: "10.0.2.1", PeerAS: 65002, FamilyInet: true, Import: []string{"REAL", "GHOST"}},
+			// INTACT — nothing was discarded.
+			{Address: "10.0.2.2", PeerAS: 65003, FamilyInet: true, Import: []string{"REAL"}},
+			// EMPTIED — already reported by the #7625 deny path; reporting it
+			// here too would describe one config error twice.
+			{Address: "10.0.2.3", PeerAS: 65004, FamilyInet: true, Import: []string{"GHOST"}},
+			// EXPORT with a bare protocol token — `static` is a redistribute
+			// verb, not a failed policy reference, so this chain lost nothing.
+			{Address: "10.0.2.4", PeerAS: 65005, FamilyInet: true, Export: []string{"REAL", "static"}},
+		},
+	}
+	got := narrowedWhere8363(narrowedChainSites(bgp, po))
+	want := []string{"neighbor 10.0.2.1 import"}
+	if !equalStringSlice(got, want) {
+		t.Fatalf("narrowed sites = %v, want %v", got, want)
+	}
+	// The report must name what was discarded, not just that something was.
+	sites := narrowedChainSites(bgp, po)
+	if len(sites) != 1 || len(sites[0].Dropped) != 1 || sites[0].Dropped[0] != "GHOST" {
+		t.Errorf("the finding does not name the discarded member: %+v", sites)
+	}
+	if !equalStringSlice(sites[0].Kept, []string{"REAL"}) {
+		t.Errorf("the finding does not name what is actually applied: %+v", sites[0])
+	}
+}
+
+// Visibility must not come at the cost of a behaviour change: the rendered
+// section for a narrowed chain is byte-identical to what it was.
+func TestNarrowingWarningChangesNoRenderedOutput8363(t *testing.T) {
+	po := &config.PolicyOptionsConfig{
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"REAL": {Name: "REAL", Terms: []*config.PolicyTerm{{Name: "t1", PrefixList: []string{"PL"}}}},
+		},
+		PrefixLists: map[string]*config.PrefixList{"PL": {Name: "PL", Prefixes: []string{"10.0.0.0/8"}}},
+		Communities: map[string]*config.CommunityDef{},
+		ASPaths:     map[string]*config.ASPathDef{},
+	}
+	mk := func(imp []string) *FullConfig {
+		return &FullConfig{
+			PolicyOptions: po,
+			BGP: &config.BGPConfig{
+				LocalAS: 65001, RouterID: "1.1.1.1",
+				Neighbors: []*config.BGPNeighbor{
+					{Address: "10.0.2.1", PeerAS: 65002, FamilyInet: true, Import: imp},
+				},
+			},
+		}
+	}
+	narrowed := New().buildManagedSection(mk([]string{"REAL", "GHOST"}))
+	intact := New().buildManagedSection(mk([]string{"REAL"}))
+	if narrowed != intact {
+		t.Errorf("a narrowed chain must render exactly as its surviving subset "+
+			"(behaviour unchanged; only the log differs)\n--- narrowed ---\n%s\n--- intact ---\n%s",
+			narrowed, intact)
+	}
+	// Anti-vacuity: that equality is only meaningful if the narrowing was real.
+	if s := narrowedChainSites(mk([]string{"REAL", "GHOST"}).BGP, po); len(s) != 1 {
+		t.Fatalf("fixture did not actually narrow: %+v", s)
 	}
 }

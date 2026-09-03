@@ -583,6 +583,10 @@ func (m *Manager) buildManagedSection(fc *FullConfig) string {
 	// policy name a ghost, which is exactly when the deny is referenced and when
 	// skipping its definition would leave that reference dangling.
 	b.WriteString(m.renderEmptiedChainDeny(fc))
+	// #8363: a NARROWED chain keeps today's behaviour (the synthesized deny is
+	// only safe when the undefined members form a suffix — see the measurement
+	// in policy_chain_narrowed_eval_8363_test.go), but it is no longer silent.
+	warnNarrowedChains(fc)
 
 	// Resolve forwarding-table export policy for ECMP. Sets fc.ConsistentHash
 	// as a side effect when the policy uses "load-balance consistent-hash".
