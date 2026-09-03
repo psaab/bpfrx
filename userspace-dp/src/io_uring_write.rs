@@ -503,7 +503,11 @@ impl RingPort for IoUringPort<'_> {
         buf: &[u8],
         offset: Option<u64>,
     ) -> Result<(), String> {
-        let mut entry = opcode::Write::new(types::Fd(self.fd), buf.as_ptr(), buf.len() as _);
+        debug_assert!(
+            buf.len() <= MAX_SQE_WRITE_LEN,
+            "write_all must clamp to MAX_SQE_WRITE_LEN before the ring (#7751)"
+        );
+        let mut entry = opcode::Write::new(types::Fd(self.fd), buf.as_ptr(), buf.len() as u32);
         if let Some(off) = offset {
             entry = entry.offset(off);
         }
@@ -632,12 +636,46 @@ struct ReapError {
 /// the op cannot be proven terminal before we must return (#5800). No return
 /// path frees a buffer while an SQE may reference it: a reaped terminal state
 /// hands the buffer back; a non-terminal state moves it into `reg`.
+/// Maximum bytes a single `Write` SQE can carry: `io_uring_sqe.len` is a `u32`,
+/// so a longer slice simply cannot be described to the kernel.
+///
+/// #7751 row 12: this length was previously narrowed with `buf.len() as _`. A
+/// silent `usize -> u32` truncation is not merely a short write — for a
+/// remaining length that is an exact multiple of 2^32 it yields **0**. The
+/// kernel then completes a 0-byte write, `offset += 0`, and the
+/// `while offset < slot.bytes.len()` loop below never advances: a livelock, not
+/// a short count. We CLAMP instead, which the surrounding partial-write loop
+/// already handles correctly (a file is a byte stream, so resuming the next SQE
+/// at `offset + n` is sound — see `positioned` below).
+pub(crate) const MAX_SQE_WRITE_LEN: usize = u32::MAX as usize;
+
+/// Bytes to describe in the next `Write` SQE given `remaining` unwritten bytes.
+/// Guaranteed `> 0` whenever `remaining > 0` — that is the property that makes
+/// `write_all` terminate.
+pub(crate) fn sqe_write_len(remaining: usize, cap: usize) -> usize {
+    remaining.min(cap)
+}
+
 pub(crate) fn write_all(
     port: &mut dyn RingPort,
     reg: &mut InflightRegistry,
     data: Vec<u8>,
     positioned: bool,
     label: &str,
+) -> WriteResult {
+    write_all_capped(port, reg, data, positioned, label, MAX_SQE_WRITE_LEN)
+}
+
+/// `write_all` with the per-SQE length cap injected. Production always passes
+/// `MAX_SQE_WRITE_LEN`; a test passes a small cap so the split path is
+/// exercised without allocating 4 GiB (#7751 row 12).
+pub(crate) fn write_all_capped(
+    port: &mut dyn RingPort,
+    reg: &mut InflightRegistry,
+    data: Vec<u8>,
+    positioned: bool,
+    label: &str,
+    max_sqe_len: usize,
 ) -> WriteResult {
     // Reclaim any previously-deferred buffers whose terminal CQE has surfaced.
     reg.reap_ready(port);
@@ -669,7 +707,10 @@ pub(crate) fn write_all(
 
         // A push failure means the SQE was never submitted — nothing is on the
         // fd, so a synchronous retry from offset 0 is safe (#2477).
-        if let Err(e) = port.push_write(id, &slot.bytes[offset..], file_offset) {
+        // Clamp to what one SQE can describe; the loop resumes at offset + n.
+        let chunk_len = sqe_write_len(slot.bytes.len() - offset, max_sqe_len);
+        let chunk = &slot.bytes[offset..offset + chunk_len];
+        if let Err(e) = port.push_write(id, chunk, file_offset) {
             return WriteResult::NothingWritten(slot.bytes, e);
         }
 

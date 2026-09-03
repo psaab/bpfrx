@@ -18,6 +18,12 @@ struct FakeRing {
     ready: VecDeque<Completion>,
     /// Number of `push_write` calls — i.e. write SQEs submitted.
     push_calls: usize,
+    /// Byte length handed to each `push_write`, in order. #7751 row 12: lets a
+    /// test assert the per-SQE clamp actually SPLIT the buffer. `push_calls`
+    /// alone cannot discriminate — the UNCLAMPED path also pushes twice,
+    /// because its first completion is short and the loop pushes the remainder
+    /// anyway. Only the recorded lengths differ.
+    push_lens: Vec<usize>,
     /// Number of `push_cancel` calls.
     cancel_calls: usize,
     /// Recorded (cancel_id, target) pairs for every `push_cancel` — lets a test
@@ -66,6 +72,7 @@ impl FakeRing {
             in_flight: VecDeque::new(),
             ready: VecDeque::new(),
             push_calls: 0,
+            push_lens: Vec::new(),
             cancel_calls: 0,
             cancels: Vec::new(),
             cancel_completes_target: true,
@@ -149,10 +156,11 @@ impl RingPort for FakeRing {
     fn push_write(
         &mut self,
         user_data: u64,
-        _buf: &[u8],
+        buf: &[u8],
         _offset: Option<u64>,
     ) -> Result<(), String> {
         self.push_calls += 1;
+        self.push_lens.push(buf.len());
         self.in_flight.push_back(user_data);
         Ok(())
     }
@@ -940,5 +948,47 @@ fn ring_writer_drops_the_ring_before_the_registry_7106() {
          starting the kernel's teardown — before the registry drops and \
          releases buffers. Swapping them compiles and passes every behavioural \
          test while silently widening the #6168 window (#7106)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #7751 row 12 — SQE length narrowing
+// ---------------------------------------------------------------------------
+
+/// Arithmetic half: the cast the fix replaced narrows a 4 GiB remainder to
+/// **zero** — a valid-looking "nothing writable" that stalls `write_all`
+/// forever. The clamp must never return 0 for a non-zero remainder.
+#[test]
+fn sqe_write_len_never_narrows_a_nonzero_remainder_to_zero() {
+    let pathological = 1usize << 32;
+    // Control: this is what makes the cell meaningful rather than decorative —
+    // it asserts the hazard is real on this target. On a 32-bit `usize` it
+    // fails loudly instead of the cell passing vacuously.
+    assert_eq!(
+        pathological as u32, 0,
+        "control: the raw `as u32` cast DOES narrow 2^32 to zero"
+    );
+    let n = super::sqe_write_len(pathological, super::MAX_SQE_WRITE_LEN);
+    assert!(
+        n > 0,
+        "a non-zero remainder must always yield a non-zero SQE length"
+    );
+    assert_eq!(n, u32::MAX as usize);
+}
+
+/// Wiring half: with the cap injected small, an 8-byte buffer must be SPLIT
+/// into two 4-byte SQEs. Reverting the clamp inside `write_all_capped` makes
+/// the first push carry all 8 bytes, so the recorded LENGTHS go red while
+/// `push_calls` stays 2 either way (verified: the mutant yields [8, 4]).
+#[test]
+fn write_all_clamps_every_sqe_to_the_len_cap() {
+    let mut ring = FakeRing::new(vec![Ok(()), Ok(())], vec![4, 4]);
+    let mut reg = InflightRegistry::new();
+    let out = super::write_all_capped(&mut ring, &mut reg, vec![0u8; 8], true, "cap", 4);
+    assert!(matches!(out, WriteResult::Done(_)), "got {out:?}");
+    assert_eq!(
+        ring.push_lens,
+        vec![4, 4],
+        "each SQE must be clamped to the 4-byte cap"
     );
 }
