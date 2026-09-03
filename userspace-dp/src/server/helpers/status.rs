@@ -76,6 +76,15 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     state.status.pending_neigh_decap_drops_total = state.afxdp.pending_neigh_decap_drops_total();
     // #7106: process-global, not per-binding — a registry that retains buffers
     // is being dropped, so the count has to outlive it.
+    // #8447: process-global, like the io_uring counters below — the match path
+    // has no per-pool object to hang them on.
+    {
+        let m = crate::nat::process_source_nat_match_counters().snapshot();
+        state.status.source_nat_match_consulted_total = m.consulted;
+        state.status.source_nat_match_matched_total = m.matched;
+        state.status.source_nat_match_unavailable_total = m.unavailable;
+        state.status.source_nat_match_no_match_total = m.no_match;
+    }
     state.status.io_uring_retained_buffers_total =
         crate::io_uring_write::process_retained().buffers();
     state.status.io_uring_retained_bytes_total =

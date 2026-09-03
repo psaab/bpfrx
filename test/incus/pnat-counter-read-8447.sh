@@ -94,7 +94,25 @@ counters() {   # -> "admitted declined"
 		2>/dev/null || echo "ERR ERR"
 }
 
-run_arm() {   # persistent(0|1) -> "sessions pooltranslated admitted declined"
+# #8447 follow-up: the rule-match quartet, process-global and unlabelled.
+# `consulted` is the one that settles what the admission pair could not: it
+# counts every packet that REACHED source-NAT, so a zero in the others can be
+# told from "nothing arrived". Read as a DELTA around the traffic, because the
+# counters are cumulative for the life of the helper and an absolute would
+# include every packet since boot.
+match_counters() {   # -> "consulted matched unavailable no_match"
+	incus exec "$PRIMARY" -- bash -lc \
+		"curl -s --max-time 5 http://127.0.0.1:8080/metrics" 2>/dev/null \
+		| awk '
+			/^xpf_userspace_source_nat_match_consulted_total/ { c=$NF }
+			/^xpf_userspace_source_nat_match_matched_total/ { m=$NF }
+			/^xpf_userspace_source_nat_match_unavailable_total/ { u=$NF }
+			/^xpf_userspace_source_nat_match_no_match_total/ { n=$NF }
+			END { if (c=="" ) print "ABSENT ABSENT ABSENT ABSENT"; else printf "%d %d %d %d\n", c+0, m+0, u+0, n+0 }' \
+		2>/dev/null || echo "ERR ERR ERR ERR"
+}
+
+run_arm() {   # persistent(0|1) -> "sessions pooltranslated admitted declined dConsulted dMatched dUnavail dNoMatch"
 	local persistent="$1" pnat="" n pn adm dec
 	if [ "$persistent" = 1 ]; then
 		pnat="set security nat source pool ${POOL_NAME} persistent-nat permit any-remote-host
@@ -140,21 +158,30 @@ EOF
 		echo "FIXTURE-CONTAMINATED 0 0 0"; return
 	fi
 	fw_cli "$PRIMARY" "clear security flow session" >/dev/null 2>&1 || true
+	local mc0 mc1 c0 m0 u0 n0 c1 m1 u1 n1
+	mc0="$(match_counters)"; read -r c0 m0 u0 n0 <<<"$mc0"
 	incus exec "$LAN_CLIENT" -- bash -c \
 		"nohup iperf3 --forceflush --connect-timeout 5000 -B ${POOL_SRC} -t 20 -c ${TARGET} -p ${POOL_PORT} -P 2 >/tmp/cnt-iperf.log 2>&1 &" || true
 	sleep 10
 	n="$(fw_cli "$PRIMARY" "show security flow session source-prefix ${POOL_SRC}" | grep -c "Session State: Valid" || true)"
 	pn="$(fw_cli "$PRIMARY" "show security flow session source-prefix ${POOL_SRC}" | grep -c "${POOL_ADDR}" || true)"
 	read -r adm dec <<<"$(counters)"
+	mc1="$(match_counters)"; read -r c1 m1 u1 n1 <<<"$mc1"
 	incus exec "$LAN_CLIENT" -- pkill -9 -f "iperf3.*-B ${POOL_SRC}" 2>/dev/null || true
-	echo "${n:-0} ${pn:-0} ${adm:-ERR} ${dec:-ERR}"
+	if [ "$c0" = ABSENT ] || [ "$c1" = ABSENT ]; then
+		echo "${n:-0} ${pn:-0} ${adm:-ERR} ${dec:-ERR} ABSENT ABSENT ABSENT ABSENT"
+	else
+		echo "${n:-0} ${pn:-0} ${adm:-ERR} ${dec:-ERR} $((c1-c0)) $((m1-m0)) $((u1-u0)) $((n1-n0))"
+	fi
 }
 
-printf '  %-24s %-10s %-16s %-10s %s\n' "arm" "sessions" "pool-translated" "admitted" "declined"
-read -r c_n c_pn c_adm c_dec <<<"$(run_arm 0)"
-printf '  %-24s %-10s %-16s %-10s %s\n' "PLAIN pool (control)" "$c_n" "$c_pn" "$c_adm" "$c_dec"
-read -r p_n p_pn p_adm p_dec <<<"$(run_arm 1)"
-printf '  %-24s %-10s %-16s %-10s %s\n' "PERSISTENT-NAT pool" "$p_n" "$p_pn" "$p_adm" "$p_dec"
+fmt='  %-22s %-9s %-10s %-9s %-9s %-11s %-9s %-13s %s\n'
+# shellcheck disable=SC2059
+printf "$fmt" "arm" "sessions" "pool-xlat" "admitted" "declined" "d.consulted" "d.matched" "d.unavailable" "d.no_match"
+read -r c_n c_pn c_adm c_dec c_dc c_dm c_du c_dn <<<"$(run_arm 0)"
+printf "$fmt" "PLAIN (control)" "$c_n" "$c_pn" "$c_adm" "$c_dec" "$c_dc" "$c_dm" "$c_du" "$c_dn"
+read -r p_n p_pn p_adm p_dec p_dc p_dm p_du p_dn <<<"$(run_arm 1)"
+printf "$fmt" "PERSISTENT-NAT" "$p_n" "$p_pn" "$p_adm" "$p_dec" "$p_dc" "$p_dm" "$p_du" "$p_dn"
 
 echo
 echo "======================================"
@@ -176,9 +203,20 @@ elif [ "${p_adm:-0}" -gt 0 ] 2>/dev/null; then
 	echo "  The allocator installed the translation and something downstream removed"
 	echo "  it. The defect is NOT in the admission path."
 else
-	echo "ANSWER: NEITHER — both counters are zero while the control installed"
-	echo "  ${c_pn} pool-translated session(s). allocate_translation is never reached"
-	echo "  with persistent_nat set, so the refusal is UPSTREAM of the allocator."
-	echo "  This relocates the investigation off the mint path entirely."
+	echo "ANSWER: NEITHER — both admission counters are zero while the control"
+	echo "  installed ${c_pn} pool-translated session(s). allocate_translation is never"
+	echo "  reached with persistent_nat set."
+	echo
+	if [ "${p_dc}" = ABSENT ]; then
+		echo "  Rule-match quartet: ABSENT (helper predates it) — cannot say WHERE."
+	elif [ "${p_dc:-0}" -eq 0 ] 2>/dev/null; then
+		echo "  AND consulted=0: no packet REACHED source-NAT during the persistent arm"
+		echo "  (control arm saw ${c_dc}). The defect is upstream of source-NAT entirely,"
+		echo "  and this issue is not a NAT bug."
+	else
+		echo "  BUT consulted=${p_dc}: packets DID reach source-NAT and it answered"
+		echo "  matched=${p_dm} unavailable=${p_du} no_match=${p_dn}. The decision is IN"
+		echo "  the match path, between rule match and the allocator call."
+	fi
 fi
 echo "======================================"

@@ -981,6 +981,10 @@
       "rate_limited_packets": 0,
       "write_errors": 0
     },
+    "source_nat_match_consulted_total": 0,
+    "source_nat_match_matched_total": 0,
+    "source_nat_match_no_match_total": 0,
+    "source_nat_match_unavailable_total": 0,
     "source_nat_pools": [],
     "started_at": "1970-01-01T00:00:00Z",
     "state_file": "",

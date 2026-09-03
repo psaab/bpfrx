@@ -445,20 +445,25 @@ type xpfCollector struct {
 	workerSessionInstallPartial          *prometheus.Desc
 	// #4800: per-worker transit new-flow installs, plus the six
 	// process-global publish/replication contention counters.
-	workerNewFlowInstalls                       *prometheus.Desc
-	userspaceSharedSessionPublishes             *prometheus.Desc
-	userspaceSharedSessionPublishLockAcquired   *prometheus.Desc
-	userspaceSharedSessionPublishLockBlocked    *prometheus.Desc
-	userspaceSessionReplicationUpserts          *prometheus.Desc
-	userspaceSessionReplicationEnqueued         *prometheus.Desc
-	userspaceSessionReplicationLockBlocked      *prometheus.Desc
-	userspaceSessionReplicationQueueDepthSum    *prometheus.Desc
-	userspaceSessionReplicationQueueDepthMax    *prometheus.Desc
-	userspaceSessionCreateDrops                 *prometheus.Desc
-	userspaceSessionInstallAdmissionRefused     *prometheus.Desc
-	userspaceSessionInstallPartial              *prometheus.Desc
-	userspaceSessionTableEntries                *prometheus.Desc
-	userspaceSessionTableCapacity               *prometheus.Desc
+	workerNewFlowInstalls                     *prometheus.Desc
+	userspaceSharedSessionPublishes           *prometheus.Desc
+	userspaceSharedSessionPublishLockAcquired *prometheus.Desc
+	userspaceSharedSessionPublishLockBlocked  *prometheus.Desc
+	userspaceSessionReplicationUpserts        *prometheus.Desc
+	userspaceSessionReplicationEnqueued       *prometheus.Desc
+	userspaceSessionReplicationLockBlocked    *prometheus.Desc
+	userspaceSessionReplicationQueueDepthSum  *prometheus.Desc
+	userspaceSessionReplicationQueueDepthMax  *prometheus.Desc
+	userspaceSessionCreateDrops               *prometheus.Desc
+	userspaceSessionInstallAdmissionRefused   *prometheus.Desc
+	userspaceSessionInstallPartial            *prometheus.Desc
+	userspaceSessionTableEntries              *prometheus.Desc
+	userspaceSessionTableCapacity             *prometheus.Desc
+	// #8447: source-NAT rule-match outcome quartet.
+	userspaceSourceNATMatchConsulted            *prometheus.Desc
+	userspaceSourceNATMatchMatched              *prometheus.Desc
+	userspaceSourceNATMatchUnavailable          *prometheus.Desc
+	userspaceSourceNATMatchNoMatch              *prometheus.Desc
 	userspaceNatReverseKeyCollisions            *prometheus.Desc
 	userspaceNatReverseKeyCollisionsDistinctSrc *prometheus.Desc
 	// #1789: total failed USERSPACE_SESSIONS BPF-map publishes — the
@@ -959,6 +964,10 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.userspaceSessionInstallPartial
 	ch <- c.userspaceSessionTableEntries
 	ch <- c.userspaceSessionTableCapacity
+	ch <- c.userspaceSourceNATMatchConsulted
+	ch <- c.userspaceSourceNATMatchMatched
+	ch <- c.userspaceSourceNATMatchUnavailable
+	ch <- c.userspaceSourceNATMatchNoMatch
 	ch <- c.userspaceNatReverseKeyCollisions
 	ch <- c.userspaceNatReverseKeyCollisionsDistinctSrc
 	ch <- c.userspaceSessionPublishErrors
