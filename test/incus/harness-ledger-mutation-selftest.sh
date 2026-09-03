@@ -193,6 +193,34 @@ MUTATIONS = {
         "the separation of the ROW's verdict from the GATE's exit status: an "
         "unattributable row now reds `make test-failover`",
     ),
+    "comparator-reads-a-single-path": (
+        PY_FILE, "py",
+        "    p = pathlib.Path(path)\n    if p.is_dir():",
+        "    p = pathlib.Path(path)\n    if False:",
+        "the shard-directory read: the comparator falls back to single-file "
+        "behaviour and the glob is decorative (#8346 acceptance)",
+    ),
+    "merge-guard-blind-to-a-legacy-parent": (
+        PY_FILE, "py",
+        '    legacy = run(["git", "show", f"{rev}:test/results/{LEGACY_LEDGER_NAME}"])',
+        '    legacy = run(["git", "show", f"{rev}:test/results/NOTHING"])',
+        "the legacy source in run_ids_at_rev: a parent from before the migration "
+        "reads as the EMPTY SET and the completeness guard passes vacuously",
+    ),
+    "ordering-tie-break-is-storage-dependent": (
+        PY_FILE, "py",
+        '    return sorted(rows, key=lambda r: (r["ts"], r.get("run_id", "")))',
+        '    return sorted(rows, key=lambda r: r["ts"])',
+        "the storage-independent tie-break: which row is 'newest' becomes a "
+        "function of the filenames rather than of the data",
+    ),
+    "shard-filename-identity-unchecked": (
+        PY_FILE, "py",
+        '        if row.get("run_id") != name:',
+        "        if False:",
+        "the filename==run_id check, which is what makes reading the run-id set "
+        "off a git tree trustworthy",
+    ),
     "dirty-flag-permanently-on": (
         SH_FILE, "sh",
         '\tdirt=$(git -C "$root" status --porcelain -uall 2>/dev/null |',

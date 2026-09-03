@@ -823,7 +823,7 @@ else
 CLUSTER_ENV := $(BPFRX_CLUSTER_ENV)
 endif
 
-# Ledger `env` label for a gate run (test/results/ledger.jsonl). A band is only
+# Ledger `env` label for a gate run (test/results/ledger.d/). A band is only
 # comparable WITHIN one env, so this label is what keeps runs on the loss
 # userspace cluster from being compared against runs on the legacy local
 # cluster. It is the env file's basename, or `local-cluster` when CLUSTER_ENV

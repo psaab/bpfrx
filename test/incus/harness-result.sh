@@ -7,7 +7,7 @@
 #       --env loss-userspace-cluster --cluster --node loss:xpf-userspace-fw0 \
 #       -- ./test/incus/test-failover.sh
 #
-# and it appends exactly one JSON row to test/results/ledger.jsonl.
+# and it writes exactly one JSON row to test/results/ledger.d/<run_id>.json.
 #
 # ── Why the verdict is a STRING and never an exit code ────────────────
 #
@@ -78,11 +78,17 @@ harness_result_root() {
 		printf '%s\n' "$(cd "$HARNESS_RESULT_DIR/../.." && pwd)"
 }
 
+# The ledger is a DIRECTORY of one <run_id>.json per run (#8346), not an
+# appended file. Two writers never touch the same path, so concurrent lanes
+# cannot conflict and no merge driver is involved -- which matters because this
+# repo's .git/config shadowed git's built-in `union` with a no-op for months
+# (#8348) and silently dropped three real rows. XPF_LEDGER still overrides, and
+# now names the DIRECTORY.
 harness_ledger_path() {
 	if [[ -n "${XPF_LEDGER:-}" ]]; then
 		printf '%s\n' "$XPF_LEDGER"
 	else
-		printf '%s/test/results/ledger.jsonl\n' "$(harness_result_root)"
+		printf '%s/test/results/ledger.d\n' "$(harness_result_root)"
 	fi
 }
 
@@ -393,8 +399,10 @@ harness_adapt_iperf_throughput() {
 # because a dirty tree's sha does not identify a binary and saying so is the
 # point.
 #
-# The ledger itself is EXCLUDED from that dirtiness test. It is this emitter's
-# own output, so counting it would pin every row to "-dirty" forever --
+# The ledger itself is EXCLUDED from that dirtiness test -- both the shard
+# directory (#8346) and the legacy single file, because a checkout mid-
+# transition can carry either. It is this emitter's own output, so counting it
+# would pin every row to "-dirty" forever --
 # including rows produced from an otherwise pristine checkout, since the row
 # being written is what makes the file differ. A flag that is always on carries
 # no information, and the one thing this flag has to do is distinguish the two
@@ -408,7 +416,7 @@ harness_build_git_sha() {
 	# nothing on exactly the case it exists for -- a fresh checkout writing its
 	# first row.
 	dirt=$(git -C "$root" status --porcelain -uall 2>/dev/null |
-		grep -v 'test/results/ledger\.jsonl$' || true)
+		grep -vE 'test/results/ledger\.(d/.*\.json|jsonl)$' || true)
 	if [[ -n "$dirt" ]]; then
 		printf '%s-dirty\n' "$sha"
 	else
@@ -527,18 +535,27 @@ harness_result_emit() {
 	fi
 
 	[[ -z "$ledger" ]] && ledger="$(harness_ledger_path)"
-	[[ -z "$ts" ]] && ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+	# Milliseconds, not seconds (#8346). Under one file per run the ledger's
+	# file order no longer encodes write order, so `ts` is the only thing that
+	# does -- and at second granularity two runs finishing in the same second
+	# tie, leaving "which is newest" to a tie-break rather than to the data.
+	# The comparator's tie-break is deterministic either way; this is what keeps
+	# it from being needed. String sort still orders these correctly, and older
+	# second-granularity rows remain comparable.
+	[[ -z "$ts" ]] && ts="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
 
-	local row
-	row=$(
+	# The helper writes the shard and echoes its path; capturing the path (not
+	# the row) is what makes a write failure a non-zero rc here.
+	local shard
+	shard=$(
 		HR_SCHEMA="$HARNESS_RESULT_SCHEMA" HR_TS="$ts" HR_GATE="$gate" HR_ENV="$env" \
 			HR_VERDICT="$verdict" HR_VOID_REASON="$void_reason" HR_HEADLINE="$headline" \
 			HR_DIRECTION="$direction" HR_METRICS="$metrics" HR_GITSHA="$build_git_sha" \
 			HR_BUILD_EXE="$build_exe" HR_RUN_EXE="$running_exe" HR_EXE_CHECK="$exe_check" \
 			HR_DURATION="$duration_s" HR_ARTIFACTS="$artifacts" HR_ADAPTER="$adapter" \
-			HR_NODE="$node" \
+			HR_NODE="$node" HR_LEDGER="$ledger" \
 			python3 - <<'PY'
-import json, os, sys
+import json, os, pathlib, sys
 
 def num(s):
     try:
@@ -613,21 +630,29 @@ row = {
 # a void_reason contains one.
 line = json.dumps(row, separators=(",", ":"), ensure_ascii=False)
 assert "\n" not in line
-print(line)
+
+# Write the shard HERE rather than handing the line back to the shell: this is
+# where the run_id exists, and the filename must BE that id. A shard whose name
+# and payload disagree breaks both properties the layout exists for --
+# conflict-freedom, and reading the run-id set off a git tree without parsing.
+#
+# Written under a temp name in the SAME directory and renamed, so a reader
+# globbing the directory while a gate finishes never sees a half-written shard.
+# rename(2) within one directory is atomic; an append never was, which is why
+# the old single-file path needed flock and why this one needs no lock at all.
+ledger_dir = pathlib.Path(os.environ["HR_LEDGER"])
+ledger_dir.mkdir(parents=True, exist_ok=True)
+target = ledger_dir / f"{row['run_id']}.json"
+tmp = ledger_dir / f".{row['run_id']}.tmp"
+tmp.write_text(line + "\n", encoding="utf-8")
+os.replace(tmp, target)
+print(target)
 PY
 	) || return 2
-
-	mkdir -p "$(dirname "$ledger")" || return 2
-	# flock so parallel worktrees appending to the same ledger cannot interleave
-	# a partial line. Falls back to a plain append where flock is absent.
-	if command -v flock >/dev/null 2>&1; then
-		(
-			flock -x 9 || exit 1
-			printf '%s\n' "$row" >&9
-		) 9>>"$ledger" || return 2
-	else
-		printf '%s\n' "$row" >>"$ledger" || return 2
-	fi
+	# Echo the shard path so a caller (and the self-test) can point at the file
+	# this run produced rather than re-deriving it from the run_id, which only
+	# the helper knows.
+	printf '%s\n' "$shard"
 	return 0
 }
 

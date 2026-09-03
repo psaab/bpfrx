@@ -435,26 +435,24 @@ fi
 
 # ── 5. ledger lint (#8302 §4.1) ──
 #
-# test/results/ledger.jsonl is git-tracked and appended to by every gate run,
-# from many worktrees in parallel. It carries merge=union in .gitattributes --
-# a driver docs/log/README.md measured SILENTLY FUSING two _Log.md entries
-# whose `- **Timestamp**` lines aligned, and says should not be added for that
-# file. The ledger differs: one self-contained row per line, no shared closer,
-# no meaningful order, and every row carries a random run_id so two rows are
-# never byte-identical and union has nothing to align.
+# test/results/ledger.d/ is git-tracked: one <run_id>.json shard per gate run
+# (#8346). Concurrent lanes never touch the same path, so the layout is
+# conflict-free by construction rather than by a merge driver -- which is the
+# point, because this repo's .git/config shadowed git's built-in `union` with a
+# no-op for months (#8348) and silently dropped three real rows.
 #
-# This leg is what catches that reasoning being wrong rather than trusting it:
-# every line must parse as JSON and satisfy the same contract the emitter
-# enforces at write time, and a repeated run_id whose payload DIFFERS is
-# reported -- so a committed conflict marker, a hand-edited row, or a damaged
-# union resolve is a RED GATE rather than silent corruption.
-#
-# It FAILS on a zero-row ledger. Linting an empty file and reporting success is
-# the swept-nothing pass this runner already guards against in three other
-# places.
+# WHAT THIS LEG CAN AND CANNOT SEE, stated plainly because an overstated
+# docstring is how the gap above stayed invisible: ledger-lint reads every
+# shard and applies the emitter's own contract, so a hand-edited row, a
+# committed conflict marker, a shard whose filename disagrees with its run_id,
+# and an EMPTY ledger are all red here. It CANNOT see a row that is simply
+# GONE -- a deleted shard leaves a well-formed, internally consistent,
+# perfectly lint-clean directory. That is what the separate
+# ledger-merge-completeness leg below is for, and neither leg substitutes for
+# the other.
 hdr "harness ledger"
 if command -v python3 >/dev/null 2>&1; then
-	out=$(python3 test/incus/ledger_compare.py --lint --ledger test/results/ledger.jsonl 2>&1)
+	out=$(python3 test/incus/ledger_compare.py --lint --ledger test/results/ledger.d 2>&1)
 	rc=$?
 	if [ "$rc" -eq 0 ]; then
 		passl "ledger-lint ($out)"

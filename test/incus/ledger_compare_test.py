@@ -18,6 +18,11 @@ the empty set is never allowed to reach an assertion-free path.
 """
 
 import json
+import os
+import pathlib
+import shutil
+import subprocess
+import tempfile
 import unittest
 import uuid
 
@@ -26,20 +31,29 @@ from ledger_compare import (
     BAND_Z,
     IMPROVED,
     LEDGER_CORRUPT,
+    LEDGER_DIR_NAME,
+    LEGACY_LEDGER_NAME,
     LedgerError,
     MIN_BASELINE_RUNS,
     NO_BASELINE,
     REGRESSION,
     VOID,
     WITHIN_BAND,
+    _sorted_rows,
     band,
     classify,
     compare,
     exit_status,
     lint_ledger,
     lint_merge_completeness,
+    lint_merge_completeness_ids,
     lint_row,
+    lint_shard_names,
+    load_ledger_text,
     parse_ledger,
+    run_ids,
+    run_ids_at_rev,
+    shard_paths,
 )
 
 GATE = "test-failover"
@@ -463,6 +477,232 @@ class LedgerParsingAndLint(unittest.TestCase):
         res = compare([newest] + rows, GATE, ENV)
         self.assertEqual(res["ts"], "2026-09-01T00:09:00Z")
         self.assertEqual(res["outcome"], REGRESSION)
+
+
+class OneFilePerRunStorage(unittest.TestCase):
+    """#8346: the ledger is a directory of <run_id>.json, not one appended file."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="xpf-ledger-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+
+    def _shard(self, r, into=None):
+        d = pathlib.Path(into or self.dir)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{r['run_id']}.json").write_text(
+            json.dumps(r, separators=(",", ":"), ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+
+    def test_the_band_is_identical_to_the_band_over_one_file(self):
+        # MUTATION: make load_ledger_text read only a single path.
+        #
+        # The acceptance criterion of #8346, and the regression that would
+        # actually matter: a STORAGE change must not move a VERDICT. Asserted
+        # as an equivalence over the same rows in both layouts rather than by
+        # pinning a number, because a pinned number is satisfied by both sides
+        # being wrong the same way.
+        rows = greens([23.1, 23.0, 23.2]) + [row("2026-09-01T00:04:00Z", value=12.0)]
+        as_file = "\n".join(json.dumps(r) for r in rows) + "\n"
+        for r in rows:
+            self._shard(r)
+        from_file = compare(parse_ledger(as_file), GATE, ENV)
+        from_dir = compare(parse_ledger(load_ledger_text(self.dir)), GATE, ENV)
+        self.assertEqual(from_file, from_dir)
+        # ...and the fixture must actually reach the interesting branch: an
+        # equivalence between two NO-BASELINEs would hold for a broken loader.
+        self.assertEqual(from_dir["outcome"], REGRESSION)
+        self.assertEqual(len(shard_paths(self.dir)), 4)
+
+    def test_a_directory_and_a_file_of_the_same_rows_load_identically(self):
+        rows = greens([1.0, 2.0, 3.0])
+        for r in rows:
+            self._shard(r)
+        self.assertEqual(
+            {r["run_id"] for r in parse_ledger(load_ledger_text(self.dir))},
+            {r["run_id"] for r in rows},
+        )
+
+    def test_an_empty_shard_directory_reds_exactly_as_an_empty_ledger_did(self):
+        # MUTATION: drop the zero-rows problem from lint_ledger.
+        #
+        # The assertion #8346 flagged as most likely to be lost in the move.
+        # An empty DIRECTORY is the new empty ledger, and linting it clean
+        # would be the swept-nothing pass one layout down.
+        os.makedirs(self.dir, exist_ok=True)
+        self.assertEqual(load_ledger_text(self.dir), "")
+        self.assertIn("zero rows", " ".join(lint_ledger(load_ledger_text(self.dir))))
+
+    def test_a_missing_path_is_not_the_same_as_an_empty_one(self):
+        # "We could not look" and "we looked and there is nothing" are
+        # different answers; collapsing them makes a fresh checkout with no
+        # ledger indistinguishable from one whose shards were all deleted.
+        missing = os.path.join(self.dir, "nope")
+        self.assertEqual(load_ledger_text(missing), "")
+        self.assertFalse(os.path.exists(missing))
+
+    def test_a_pretty_printed_shard_is_re_compacted_to_one_line(self):
+        # A hand-edited shard must not become a stream of unparseable
+        # fragments, which would report N problems for one file.
+        r = row("2026-09-01T00:01:00Z")
+        pathlib.Path(self.dir, f"{r['run_id']}.json").write_text(
+            json.dumps(r, indent=2), encoding="utf-8"
+        )
+        text = load_ledger_text(self.dir)
+        self.assertEqual(len(text.splitlines()), 1)
+        self.assertEqual(lint_ledger(text), [])
+
+    def test_shard_filename_must_equal_the_run_id(self):
+        r = row("2026-09-01T00:01:00Z")
+        self._shard(r)
+        self.assertEqual(lint_shard_names(self.dir), [])          # positive control
+        pathlib.Path(self.dir, f"{r['run_id']}.json").rename(
+            pathlib.Path(self.dir, "someone-renamed-me.json")
+        )
+        probs = lint_shard_names(self.dir)
+        self.assertTrue(probs)
+        self.assertIn("filename IS the identity", probs[0])
+
+    def test_lint_shard_names_is_empty_for_a_legacy_single_file(self):
+        # There are no filenames to check in the legacy layout; reporting a
+        # problem there would make it permanently red.
+        f = os.path.join(self.dir, "ledger.jsonl")
+        pathlib.Path(f).write_text(json.dumps(row("2026-09-01T00:01:00Z")), encoding="utf-8")
+        self.assertEqual(lint_shard_names(f), [])
+
+    def test_ordering_does_not_depend_on_the_storage_order(self):
+        # MUTATION: tie-break _sorted_rows on load order instead of run_id.
+        #
+        # Under one appended file, load order WAS write order. Under one file
+        # per run it is sorted-random-hex order, so a load-order tie-break
+        # makes "which row is newest" a function of the filenames rather than
+        # of the data. Two rows at the SAME ts is the state that exposes it.
+        a = row("2026-09-01T00:01:00Z", value=1.0, run_id="aaaa")
+        b = row("2026-09-01T00:01:00Z", value=2.0, run_id="bbbb")
+        self.assertEqual([r["run_id"] for r in _sorted_rows([a, b])],
+                         [r["run_id"] for r in _sorted_rows([b, a])])
+        self.assertEqual(_sorted_rows([b, a])[-1]["run_id"], "bbbb")
+
+
+class MergeGuardSeesAcrossTheMigration(unittest.TestCase):
+    """run_ids_at_rev must read BOTH layouts at every revision."""
+
+    def _fake_git(self, legacy_text=None, tree_names=()):
+        class R:
+            def __init__(self, rc, out):
+                self.returncode, self.stdout = rc, out
+
+        def run(cmd):
+            # The fake HONOURS THE REQUESTED PATH. An earlier version returned
+            # the legacy text for any `git show`, which made it blind to WHICH
+            # path was asked for -- so the mutation that points the legacy
+            # source at the wrong path ESCAPED. A fixture that cannot
+            # distinguish the mutant from the original is not testing the
+            # thing it names.
+            if cmd[1] == "show":
+                if cmd[2].endswith(f":test/results/{LEGACY_LEDGER_NAME}") and legacy_text is not None:
+                    return R(0, legacy_text)
+                return R(128, "")
+            if cmd[1] == "ls-tree":
+                wanted = f"test/results/{LEDGER_DIR_NAME}/"
+                if cmd[-1] != wanted:
+                    return R(0, "")
+                return R(0, "\n".join(tree_names)) if tree_names else R(0, "")
+            raise AssertionError(f"unexpected git call {cmd}")
+
+        return run
+
+    def test_a_parent_from_before_the_migration_is_not_the_empty_set(self):
+        # MUTATION: drop the legacy `git show` source from run_ids_at_rev.
+        #
+        # THE cell of this change. After #8346 a parent commit that predates it
+        # has no ledger.d/ at all. A source reading only the new layout returns
+        # the EMPTY SET for that parent, `missing` is empty, and the merge
+        # guard passes VACUOUSLY -- loudest on the one merge most likely to
+        # drop rows: the migration's own, whose other parent is legacy-only.
+        legacy = "\n".join(json.dumps(r) for r in greens([1.0, 2.0])) + "\n"
+        ids = run_ids_at_rev("PARENT", run=self._fake_git(legacy_text=legacy))
+        self.assertEqual(len(ids), 2)
+        self.assertEqual(ids, run_ids(legacy))
+
+    def test_a_rev_with_only_shards_reads_ids_off_the_filenames(self):
+        ids = run_ids_at_rev("HEAD", run=self._fake_git(
+            tree_names=[f"test/results/{LEDGER_DIR_NAME}/aaaa.json",
+                        f"test/results/{LEDGER_DIR_NAME}/bbbb.json"]))
+        self.assertEqual(ids, {"aaaa", "bbbb"})
+
+    def test_a_rev_carrying_both_layouts_unions_them(self):
+        legacy = json.dumps(row("2026-09-01T00:01:00Z", run_id="legacy1")) + "\n"
+        ids = run_ids_at_rev("MID", run=self._fake_git(
+            legacy_text=legacy,
+            tree_names=[f"test/results/{LEDGER_DIR_NAME}/shard1.json"]))
+        self.assertEqual(ids, {"legacy1", "shard1"})
+
+    def test_a_migration_that_dropped_a_row_is_caught(self):
+        # The guard validating this very change: 3 rows in the legacy parent,
+        # 2 shards in the merge result.
+        legacy = "\n".join(json.dumps(r) for r in greens([1.0, 2.0, 3.0])) + "\n"
+        parent = run_ids_at_rev("P", run=self._fake_git(legacy_text=legacy))
+        kept = sorted(parent)[:2]
+        merged = run_ids_at_rev("M", run=self._fake_git(
+            tree_names=[f"test/results/{LEDGER_DIR_NAME}/{i}.json" for i in kept]))
+        probs = lint_merge_completeness_ids(merged, [parent])
+        self.assertTrue(probs)
+        self.assertIn("dropped 1 run_id", probs[0])
+        # ...and the control: a faithful migration is clean.
+        faithful = run_ids_at_rev("M2", run=self._fake_git(
+            tree_names=[f"test/results/{LEDGER_DIR_NAME}/{i}.json" for i in sorted(parent)]))
+        self.assertEqual(lint_merge_completeness_ids(faithful, [parent]), [])
+
+
+@unittest.skipIf(shutil.which("git") is None, "git not installed")
+class ConcurrentWritersDoNotConflict(unittest.TestCase):
+    """#8346 acceptance: assert it by WRITING both, not by reasoning about it."""
+
+    def test_two_branches_each_adding_a_shard_merge_without_conflict(self):
+        d = tempfile.mkdtemp(prefix="xpf-ledger-git-")
+        self.addCleanup(shutil.rmtree, d, True)
+
+        def git(*args, check=True):
+            r = subprocess.run(["git", "-C", d, *args], capture_output=True, text=True)
+            if check and r.returncode != 0:
+                raise AssertionError(f"git {args} failed: {r.stderr}")
+            return r
+
+        def shard(run_id, value):
+            led = pathlib.Path(d, "test", "results", LEDGER_DIR_NAME)
+            led.mkdir(parents=True, exist_ok=True)
+            r = row("2026-09-01T00:01:00Z", value=value, run_id=run_id)
+            (led / f"{run_id}.json").write_text(json.dumps(r), encoding="utf-8")
+
+        git("init", "-q", ".")
+        git("config", "user.email", "t@t")
+        git("config", "user.name", "t")
+        shard("base0000", 1.0)
+        git("add", "-A")
+        git("commit", "-qm", "base")
+        base = git("rev-parse", "HEAD").stdout.strip()
+
+        git("checkout", "-q", "-b", "laneA")
+        shard("laneaaaa", 2.0)
+        git("add", "-A")
+        git("commit", "-qm", "lane A run")
+
+        git("checkout", "-q", base)
+        git("checkout", "-q", "-b", "laneB")
+        shard("lanebbbb", 3.0)
+        git("add", "-A")
+        git("commit", "-qm", "lane B run")
+
+        merge = git("merge", "--no-edit", "laneA", check=False)
+        self.assertEqual(
+            merge.returncode, 0,
+            f"two concurrent gate runs CONFLICTED, which is the whole thing #8346 "
+            f"removes:\n{merge.stdout}{merge.stderr}",
+        )
+        # A clean exit is not enough on its own -- the #8348 no-op driver also
+        # exited 0. Assert the SET.
+        names = {p.name for p in pathlib.Path(d, "test", "results", LEDGER_DIR_NAME).glob("*.json")}
+        self.assertEqual(names, {"base0000.json", "laneaaaa.json", "lanebbbb.json"})
 
 
 class ConstantsAreWhatTheCommentsClaim(unittest.TestCase):

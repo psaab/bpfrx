@@ -120,7 +120,7 @@ the mechanics, so this section is sequencing only.
 
    **Every gate in this table now leaves a ledger row (#8302).** The nine
    cluster gates run through `test/incus/harness-result.sh`, which appends one
-   JSON row per run to the tracked `test/results/ledger.jsonl`: verdict as a
+   JSON row per run to the tracked `test/results/ledger.d/`: verdict as a
    STRING (`PASS` / `FAIL` / **`VOID`**), the headline metric, and the sha256 of
    the binary that was actually RUNNING on the node. Two things follow for you
    as an author:
