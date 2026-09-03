@@ -8482,3 +8482,63 @@ fn absent_tcp_session_timeout_fields_keep_the_dataplane_defaults_7342() {
     // sessions reap exactly where they did before the state was split.
     assert_eq!(t.tcp_closing_ns, t.tcp_time_wait_ns);
 }
+
+// ---------------------------------------------------------------------------
+// #7888: the inert set has to survive the trip from the wire into the
+// forwarding state. This is the Rust half of the wiring guard — the Go half
+// (`TestScreenInertProfilesReachTheWire_7888`) proves the field is EMITTED;
+// this proves it is CONSUMED.
+//
+// RED on revert: delete `state.screen_inert_profiles = build_screen_inert_profiles(snapshot)`
+// and the map is empty, which is the pre-#7888 behaviour — the field arrives on
+// the wire and is dropped on the floor, so every inert zone still gets a bare
+// Pass. A cell that called `build_screen_inert_profiles` directly would stay
+// green through that revert, which is precisely the mistake this issue is about:
+// the builder was never the broken part.
+// ---------------------------------------------------------------------------
+#[test]
+fn inert_screen_profiles_reach_the_forwarding_state_7888() {
+    let snapshot = ConfigSnapshot {
+        screen_inert_profile_zones: vec![crate::ScreenMissingProfileRef {
+            zone: "trust".into(),
+            profile: "p".into(),
+        }],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    assert_eq!(
+        state.screen_inert_profiles.get("trust").map(String::as_str),
+        Some("p"),
+        "the inert set must reach the forwarding state with its profile name intact — the \
+         runtime WARN names the profile, and a WARN that cannot name it sends the operator \
+         nowhere"
+    );
+    assert!(
+        state.screen_missing_profiles.is_empty(),
+        "an inert zone must NOT land in the undefined map — they select different WARN \
+         texts, and merging them reintroduces the defect one layer down"
+    );
+}
+
+// The mirror direction: an UNDEFINED ref must not leak into the inert map. Two
+// cells, because a single implementation that wrote both wire fields into one
+// map would satisfy either one alone.
+#[test]
+fn undefined_screen_profiles_do_not_leak_into_the_inert_map_7888() {
+    let snapshot = ConfigSnapshot {
+        screen_missing_profile_zones: vec![crate::ScreenMissingProfileRef {
+            zone: "trust".into(),
+            profile: "ghost".into(),
+        }],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    assert_eq!(
+        state.screen_missing_profiles.get("trust").map(String::as_str),
+        Some("ghost")
+    );
+    assert!(
+        state.screen_inert_profiles.is_empty(),
+        "an undefined ref must not appear in the inert map"
+    );
+}

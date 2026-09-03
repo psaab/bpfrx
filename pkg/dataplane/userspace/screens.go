@@ -209,41 +209,34 @@ func ScreenMissingProfileRefs(cfg *config.Config) []ScreenMissingProfileRef {
 // posture is an OPEN design decision owned by #5806; when it is settled, a grep
 // for 5806 must land on every place that asserts today's behaviour, including
 // this one.
-// #7168 SPLIT this from screenNoEnforcementTail, which it used to share.
+// #7888 RE-SHARED the consequence half, which #7168 had split.
 //
-// The tail exists because both no-enforcement states had an IDENTICAL
-// consequence and only differed in WHY. That is no longer true. An unresolved
-// reference is now enforced against the substituted conservative default, so
-// "no screen checks are applied to this zone" — the tail's central claim — is
-// FALSE for this state and remains true for the inert one. Continuing to share
-// the tail would make this surface assert a consequence the code contradicts,
-// which is the exact failure the single-sourcing was built to prevent, arriving
-// from the other direction: the risk was never two copies as such, it was two
-// statements of one fact drifting apart. Here the FACT diverged, so the
-// sentences must.
+// The history is worth carrying because it is a single fact moving, not a
+// preference oscillating. A shared tail existed originally (#7059) because both
+// no-enforcement states had an IDENTICAL consequence and differed only in WHY.
+// #7168 gave the UNRESOLVED state a substituted conservative default, so "no
+// screen checks are applied" became false for it and true only for the inert
+// one — the fact diverged, so the sentences had to. #7888 then settled the same
+// posture for the INERT state, on the ground that two configurations with the
+// identical consequence must not get different protection, and that the one
+// which looks MORE correct to an operator must not get LESS. The fact converged
+// again, so the sentences do too.
 //
-// TestScreenUnresolvedDispositionHasOneSource still counts the tail literal and
-// still requires exactly one occurrence; its self-check now anchors on
-// ScreenInertDisposition, the constant that still owns the tail.
-const ScreenUnresolvedDisposition = "the profile reference does not resolve, so " +
+// What must never happen is the two surfaces stating this one fact from two
+// literals: the nine substituted check names would then drift the first time
+// that set changes. Hence one tail, two prefixes.
+const screenSubstitutedDefaultTail = "so " +
 	"the dataplane enforces a substituted conservative default for this zone — the " +
 	"threshold-free malformed-packet checks only (land, teardrop, winnuke, syn-fin, " +
 	"no-flag, fin-no-ack, syn-frag, ping-death, source-route-option), with NO " +
 	"flood, scan or session-limit thresholds synthesised; policy evaluation is " +
 	"unaffected. The zone is protected but its configured profile is NOT in " +
-	"effect, so the reference still needs fixing (#5806 posture, resolved in #7168)"
+	"effect, so the reference still needs fixing"
 
-// screenNoEnforcementTail is the half of the disposition sentence that must
-// exist exactly once (#7059). It is now used by ScreenInertDisposition alone —
-// see the #7168 note above for why the unresolved state no longer shares it.
-// TestScreenUnresolvedDispositionHasOneSource enforces exactly this: it counts
-// the sentence as a source literal across pkg/ and cmd/ and requires exactly
-// one. Writing the second disposition as its own full sentence reddened that
-// guard, which is the guard working — the fix is to share the tail, not to
-// weaken the count.
-const screenNoEnforcementTail = "so no screen " +
-	"checks are applied to this zone; policy evaluation is unaffected (current " +
-	"behaviour, pending the #5806 enforcement-posture decision)"
+// ScreenUnresolvedDisposition's VALUE is unchanged by the #7888 refactor — it is
+// a shipped, documented string and this change re-sources it without editing it.
+const ScreenUnresolvedDisposition = "the profile reference does not resolve, " +
+	screenSubstitutedDefaultTail + " (#5806 posture, resolved in #7168)"
 
 // ScreenUnresolvedProfileLines renders the operator-facing status block for
 // every zone whose configured screen profile does not resolve (#5806). Returns
@@ -552,8 +545,17 @@ func userspaceSupportsScreenProfiles(cfg *config.Config) bool {
 // from ScreenUnresolvedDisposition on purpose: the reference resolves, so
 // telling an operator it "does not resolve" would send them looking for a
 // missing definition that is in fact present.
+//
+// #7888 changed the CONSEQUENCE half. This used to end "so no screen checks are
+// applied to this zone ... pending the #5806 enforcement-posture decision", and
+// both halves of that are now false: the dataplane enforces the substituted
+// conservative default for this zone, and the posture is no longer pending. A
+// surface left asserting the old sentence would be telling an operator that a
+// zone is unprotected while the dataplane drops LAND and teardrop on it — the
+// same class of false statement about enforcement that #7059 and #7888 exist to
+// remove, just pointing the other way.
 const ScreenInertDisposition = "the profile is defined but enables no checks, " +
-	screenNoEnforcementTail
+	screenSubstitutedDefaultTail + " (#7059 posture, resolved in #7888)"
 
 // ScreenInertProfileRefs is the EXPORTED single source of truth for "which zones
 // resolve to a screen profile that enforces NOTHING" (#7059).

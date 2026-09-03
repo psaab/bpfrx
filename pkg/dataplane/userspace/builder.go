@@ -119,6 +119,7 @@ func buildSnapshotWithSchedulerStateAndNATCounters(cfg *config.Config, ucfg conf
 		Nptv6:                 buildNptv6Snapshots(cfg),
 		Screens:               buildScreenSnapshots(cfg),
 		ScreenMissingProfiles: buildScreenMissingProfileRefs(cfg),
+		ScreenInertProfiles:   buildScreenInertProfileRefs(cfg),
 		SYNCookieMasterKey:    buildSYNCookieMasterKey(cfg),
 		Filters:               buildFirewallFilterSnapshots(cfg),
 		Policers:              buildPolicerSnapshots(cfg),

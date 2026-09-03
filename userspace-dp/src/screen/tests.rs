@@ -4,6 +4,9 @@
 // `#[path = "screen_tests.rs"]` from screen.rs.
 
 use super::*;
+// #7888: the two WARN texts live in the `unresolved` child module after the
+// split; `use super::*` does not reach into a sibling module's namespace.
+use super::unresolved::{inert_profile_warn_message, missing_profile_warn_message};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// #3607: nanoseconds per second. The `_opts` / `validate_*` screen entry
@@ -6116,4 +6119,205 @@ fn substituted_default_excludes_icmp_fragment_7168() {
     assert_eq!(p.session_limit_src, 0);
     assert_eq!(p.session_limit_dst, 0);
     assert!(!p.alarm_without_drop, "the substitute must DROP, not merely alarm");
+}
+
+// ---------------------------------------------------------------------------
+// #7888 — the screen reference has THREE states, and the helper must tell all
+// three apart.
+//
+// Before this change the helper held ONE map, `missing_profile_refs`, and it
+// was doing the work of separating three states while carrying only one of
+// them. An inert zone — profile defined, no check enabled — was in neither
+// `zones` nor that map, so it fell out of `missing_profile_verdict` as a bare
+// `Pass`: no substitution, no WARN, indistinguishable from a zone with no
+// screen configured at all. The state that looks MORE correct to an operator
+// had LESS protection than the one that looks broken.
+//
+// Each cell below asserts the verdict AND which warn counter moved. The counter
+// is what makes "the right branch ran" falsifiable: a single shared counter
+// would be satisfied by either branch, which is the merge this issue exists to
+// prevent.
+// ---------------------------------------------------------------------------
+
+fn inert_ref_state(zone: &str, profile: &str) -> ScreenState {
+    let mut state = ScreenState::new();
+    let mut inert = FxHashMap::default();
+    inert.insert(zone.to_string(), profile.to_string());
+    state.update_inert_profiles(inert);
+    state
+}
+
+// THE MIDDLE ROW. A LAND packet to an inert zone must be DROPPED by the same
+// #7168 substituted conservative default an undefined reference gets.
+//
+// RED on revert: drop the `UnresolvedScreen::Inert` arm (or let
+// `unresolved_screen_kind` consult only `missing_profile_refs`) and this
+// returns `Pass`, which is exactly the pre-#7888 behaviour.
+#[test]
+fn inert_profile_gets_the_substituted_default_7888() {
+    let mut state = inert_ref_state("trust", "p");
+    let same = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let land = tcp_pkt(same, same, 5000, 5000, TCP_SYN);
+    assert!(
+        matches!(
+            state.check_packet("trust", &land, 1),
+            ScreenVerdict::Drop(_)
+        ),
+        "a LAND packet to a zone whose screen profile is DEFINED but enables no check must \
+         be dropped by the substituted conservative default — the consequence is identical \
+         to an undefined reference, so the protection must be too"
+    );
+    assert_eq!(
+        state.substituted_default_drops(),
+        1,
+        "an inert-zone drop is still the substitute doing the work, and must be counted as \
+         such — the operator has a real configuration to fix either way"
+    );
+    assert_eq!(
+        state.inert_profile_warn_count(),
+        1,
+        "the INERT warn must fire"
+    );
+    assert_eq!(
+        state.missing_profile_warn_count(),
+        0,
+        "the undefined-profile warn must NOT fire for a defined profile — emitting it here \
+         is the exact defect #7888 was filed for: its text is word-for-word the strict \
+         commit-time error for a genuinely missing profile"
+    );
+}
+
+// The flowless None branch is a SEPARATE call site. Fixing only the flow-present
+// one leaves half the packets unprotected.
+#[test]
+fn inert_profile_substitutes_on_the_flowless_path_7888() {
+    let mut state = inert_ref_state("trust", "p");
+    let same = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let land = flowless_icmp_pkt(same, same);
+    assert!(
+        matches!(
+            state.check_flowless_screens("trust", &land, true, 1),
+            ScreenVerdict::Drop(_)
+        ),
+        "the flowless branch must substitute for an inert zone too"
+    );
+}
+
+// The third state, and the one that must NOT change: a zone with no `screen`
+// statement is a legitimate configuration and passes silently. Without this cell
+// the two maps could be replaced by "anything not in `zones`" and every other
+// cell here would still pass — while every unscreened zone started dropping.
+#[test]
+fn zone_with_no_screen_still_passes_silently_7888() {
+    let mut state = ScreenState::new();
+    let same = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let land = tcp_pkt(same, same, 5000, 5000, TCP_SYN);
+    assert_eq!(
+        state.check_packet("trust", &land, 1),
+        ScreenVerdict::Pass,
+        "a zone with NO screen configured must still pass — 'nothing enforced because \
+         nothing was asked for' is a legitimate configuration, not a fault, and it is the \
+         only arm that may pass without a signal"
+    );
+    assert_eq!(state.substituted_default_drops(), 0);
+    assert_eq!(
+        state.missing_profile_warn_count(),
+        0,
+        "no signal for a legit zone"
+    );
+    assert_eq!(
+        state.inert_profile_warn_count(),
+        0,
+        "no signal for a legit zone"
+    );
+}
+
+// The undefined state keeps its own warn and must not be re-routed through the
+// inert branch. Together with the cell above this pins all three arms, so a
+// change that COLLAPSES two of them cannot pass by satisfying only the ends.
+#[test]
+fn undefined_profile_keeps_its_own_warn_7888() {
+    let mut state = missing_ref_state("trust", "ghost");
+    let same = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let land = tcp_pkt(same, same, 5000, 5000, TCP_SYN);
+    assert!(matches!(
+        state.check_packet("trust", &land, 1),
+        ScreenVerdict::Drop(_)
+    ));
+    assert_eq!(state.missing_profile_warn_count(), 1);
+    assert_eq!(
+        state.inert_profile_warn_count(),
+        0,
+        "an undefined profile must not report itself as defined-but-inert"
+    );
+}
+
+// The two WARN texts must be tellable apart by an OPERATOR, which is a property
+// of the wording and not of the branch. The undefined text is word-for-word the
+// strict commit-time validation error in
+// `pkg/config/compiler_validate_strict_screen.go`; if the inert text also said
+// "undefined" (or if the two were merely reworded versions of each other) the
+// operator would still be sent to look for an `ids-option` stanza that is
+// present, with no commit-time evidence to reconcile against — the same
+// confusion in a new form.
+#[test]
+fn the_two_warn_texts_are_distinguishable_7888() {
+    let undefined = missing_profile_warn_message("trust", "ghost");
+    let inert = inert_profile_warn_message("trust", "p");
+
+    assert_ne!(
+        undefined, inert,
+        "the two states must not render identically"
+    );
+    assert!(
+        undefined.contains("references undefined"),
+        "the undefined text is shipped and documented; this fix must not reword it: {undefined}"
+    );
+    assert!(
+        !inert.contains("undefined"),
+        "the inert text must NOT call a DEFINED profile undefined — that is the factual \
+         error #7888 was filed about: {inert}"
+    );
+    assert!(
+        inert.contains("IS DEFINED"),
+        "the inert text must lead with the fact that contradicts the operator's likely \
+         first guess: {inert}"
+    );
+    // Naming the cause is what makes the message actionable: the canonical way
+    // into this state is configuring a MODIFIER and believing it enabled a check.
+    assert!(
+        inert.contains("modifier"),
+        "the inert text must name the actual cause, not just the symptom: {inert}"
+    );
+    // Different remedy, not just different prose. "Upgrade the HA peer" is wrong
+    // advice for a profile that is present and committed.
+    assert!(
+        !inert.contains("upgrade the HA peer"),
+        "the inert remedy is to add a check or remove the screen statement, not to upgrade \
+         a peer — the config is already what the operator intended to write: {inert}"
+    );
+    // Both must still name the zone and the profile, or the operator has nowhere
+    // to go.
+    for (label, msg) in [("undefined", &undefined), ("inert", &inert)] {
+        assert!(
+            msg.contains("trust"),
+            "{label} text must name the zone: {msg}"
+        );
+    }
+}
+
+// #6860 closed an all-or-nothing hole: with NO resolved profiles the screen
+// stage was skipped entirely, so the missing-profile WARN never fired. An
+// inert-only config has the same shape — no `zones` entry and no missing ref —
+// so `has_screen_state` has to see the inert map too, or the substituted default
+// never runs for the very config this issue is about.
+#[test]
+fn has_screen_state_sees_an_inert_only_config_7888() {
+    let state = inert_ref_state("trust", "p");
+    assert!(
+        state.has_screen_state(),
+        "a config whose ONLY screen reference is inert must still activate the screen \
+         stage — otherwise the stage is skipped and the substitution is unreachable, the \
+         same all-or-nothing hole #6860 closed for undefined references"
+    );
 }

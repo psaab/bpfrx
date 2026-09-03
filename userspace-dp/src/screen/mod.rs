@@ -181,6 +181,7 @@ mod scan;
 mod stateless;
 mod syn_rate;
 mod syncookie;
+mod unresolved;
 mod zone;
 
 pub(crate) use extract::extract_screen_info;
@@ -307,13 +308,39 @@ pub(crate) struct ScreenState {
     /// profile, so they never appear in `zones` and folding them in would muddy
     /// the "one value per configured zone" invariant.
     missing_profile_refs: FxHashMap<String, String>,
+    /// #7888: zone -> profile name for zones whose screen profile IS DEFINED
+    /// but enables no check (the #7059 third state). A zone in this map is
+    /// enforced against the SAME #7168 substituted conservative default as an
+    /// undefined reference, and emits its OWN runtime WARN text.
+    ///
+    /// Deliberately a SECOND map rather than a flag inside
+    /// `missing_profile_refs`. The verdict is identical for both, but the WARN
+    /// text is not, and one map holding both states would make that text
+    /// undecidable at the point it is emitted -- which is the defect #7888
+    /// exists to fix, reintroduced one layer down. With two maps the three
+    /// states are read off membership directly, and the legitimate silent
+    /// `Pass` is "in NEITHER map".
+    ///
+    /// The two are disjoint by construction: the Go builders each skip the
+    /// other's case. Should a malformed or future sender ever put a zone in
+    /// both, `unresolved_screen_kind` resolves Undefined first -- the verdict
+    /// is the same either way, so only the WARN wording is affected.
+    inert_profile_refs: FxHashMap<String, String>,
     /// #3082: per-zone rate counter that bounds the missing-profile WARN to
     /// `MISSING_PROFILE_WARN_RATE_LIMIT_PER_SEC` per zone so a flood of packets
     /// to a misconfigured zone cannot spam the log (CLAUDE.md log-flood rule).
     missing_profile_warn_counters: FxHashMap<String, RateCounter>,
+    /// #7888: the inert-profile WARN's own per-zone rate counters. Separate
+    /// from `missing_profile_warn_counters` so each set's `retain` on config
+    /// update cannot evict the other's counters.
+    inert_profile_warn_counters: FxHashMap<String, RateCounter>,
     /// #3082: count of WARNs actually emitted (post rate-limit). Test seam so a
     /// unit test can assert the WARN path was taken without scraping stderr.
     missing_profile_warn_count: u64,
+    /// #7888: count of inert-profile WARNs actually emitted (post rate-limit).
+    /// Test seam, and separately assertable from the missing-profile count so
+    /// a test can prove the RIGHT warning fired, not merely that one did.
+    inert_profile_warn_count: u64,
     /// #7168: packets DROPPED by the conservative default substituted for an
     /// unresolved screen reference. Distinct from the ordinary screen drop
     /// counters on purpose: a drop here means a zone whose real profile never
@@ -373,107 +400,17 @@ impl ScreenState {
             ip_sweep: IpSweepTracker::default(),
             last_cleanup_secs: 0,
             missing_profile_refs: FxHashMap::default(),
+            inert_profile_refs: FxHashMap::default(),
             missing_profile_warn_counters: FxHashMap::default(),
+            inert_profile_warn_counters: FxHashMap::default(),
             missing_profile_warn_count: 0,
+            inert_profile_warn_count: 0,
             substituted_default_drops: 0,
             syn_alarm_pending: false,
             syn_flood_dst_drops: 0,
             syn_flood_src_drops: 0,
             syn_flood_alarm_events: 0,
             alarm_without_drop_events: 0,
-        }
-    }
-
-    /// #3082: replace the set of zones that reference an undefined screen
-    /// profile (called on config update alongside `update_profiles`). Retains
-    /// only the WARN rate counters for zones still in the set so a removed /
-    /// fixed reference stops warning and frees its counter.
-    pub fn update_missing_profiles(&mut self, missing: FxHashMap<String, String>) {
-        self.missing_profile_warn_counters
-            .retain(|k, _| missing.contains_key(k));
-        self.missing_profile_refs = missing;
-    }
-
-    /// #7168: the verdict for a zone whose configured screen reference does NOT
-    /// resolve.
-    ///
-    /// Both `None` branches (flow-present and flowless) route here instead of
-    /// returning `ScreenVerdict::Pass` unconditionally. A zone with NO screen
-    /// configured still passes silently — that is a legitimate configuration,
-    /// not a fault. A zone that REFERENCES a profile which did not resolve is
-    /// evaluated against `ScreenProfile::conservative_default()`: the
-    /// threshold-free malformed-packet subset, and none of the rate checks.
-    ///
-    /// Only STATELESS checks are run, and that is structural rather than a
-    /// choice made here — the rate checks need per-zone tracker/sketch state
-    /// that lives in `ZoneScreenState`, which by definition does not exist for
-    /// an unresolved zone. So "the substitution cannot synthesise a rate check"
-    /// is enforced by construction, not by remembering not to.
-    ///
-    /// Recovery is automatic: the substitution is a property of the resolved
-    /// map, so the next snapshot in which the profile appears displaces it with
-    /// no restart.
-    ///
-    /// `addrs_known` mirrors the flowless path's constraint — LAND compares
-    /// source and destination, so it is only meaningful when the caller
-    /// supplied real L3 addresses.
-    fn missing_profile_verdict(
-        &mut self,
-        zone: &str,
-        pkt: &ScreenPacketInfo,
-        now_secs: u64,
-        addrs_known: bool,
-    ) -> ScreenVerdict {
-        // The WARN is unchanged and still rate-limited; it now reports a
-        // substituted default rather than a bare fail-open.
-        self.maybe_warn_missing_profile(zone, now_secs);
-        if !self.missing_profile_refs.contains_key(zone) {
-            // No screen configured for this zone at all — nothing to substitute.
-            return ScreenVerdict::Pass;
-        }
-        let profile = ScreenProfile::conservative_default();
-        if addrs_known && let Some(reason) = stateless::check_land(&profile, pkt) {
-            self.substituted_default_drops = self.substituted_default_drops.wrapping_add(1);
-            return ScreenVerdict::Drop(reason);
-        }
-        if let Some(reason) = stateless::check_tcp_flag_screens(&profile, pkt) {
-            self.substituted_default_drops = self.substituted_default_drops.wrapping_add(1);
-            return ScreenVerdict::Drop(reason);
-        }
-        if let Some(reason) = stateless::check_fragment_and_route(&profile, pkt) {
-            self.substituted_default_drops = self.substituted_default_drops.wrapping_add(1);
-            return ScreenVerdict::Drop(reason);
-        }
-        ScreenVerdict::Pass
-    }
-
-    /// #3082: emit a rate-limited runtime WARN if `zone` references a screen
-    /// profile that was undefined at snapshot-build time. This emits the SIGNAL
-    /// only; the verdict is decided by the caller, `missing_profile_verdict`,
-    /// which since #7168 evaluates the substituted conservative default rather
-    /// than returning Pass. O(1) lookup; the WARN is bounded to one per zone
-    /// per second.
-    fn maybe_warn_missing_profile(&mut self, zone: &str, now_secs: u64) {
-        let Some(profile) = self.missing_profile_refs.get(zone) else {
-            // Zone has no screen configured at all — legit Pass, no signal.
-            return;
-        };
-        let limited = self
-            .missing_profile_warn_counters
-            .entry(zone.to_string())
-            .or_default()
-            .increment(now_secs, MISSING_PROFILE_WARN_RATE_LIMIT_PER_SEC);
-        if !limited {
-            self.missing_profile_warn_count = self.missing_profile_warn_count.wrapping_add(1);
-            eprintln!(
-                "xpf-userspace-dp: screen WARN: zone {zone:?} references undefined \
-                 screen profile {profile:?}; enforcing the SUBSTITUTED conservative \
-                 default (malformed-packet checks only — no flood/scan/session-limit \
-                 thresholds) for this zone (#7168 lenient/HA-sync path) — fix the \
-                 config or upgrade the HA peer to restore the configured profile",
-                zone = zone,
-                profile = profile,
-            );
         }
     }
 
@@ -487,6 +424,13 @@ impl ScreenState {
 
     pub(crate) fn missing_profile_warn_count(&self) -> u64 {
         self.missing_profile_warn_count
+    }
+
+    /// #7888: number of inert-profile WARNs actually emitted (post rate-limit).
+    /// Test seam, separate from `missing_profile_warn_count` so a test can
+    /// assert WHICH warning fired rather than that some warning did.
+    pub(crate) fn inert_profile_warn_count(&self) -> u64 {
+        self.inert_profile_warn_count
     }
 
     /// Replace all screen profiles (called on config update).
@@ -721,8 +665,15 @@ impl ScreenState {
     /// Partial resolution was never affected: with one profile resolved,
     /// `has_profiles()` is already true and the WARN fires normally. This
     /// closes the all-or-nothing case only.
+    /// #7888: the inert set counts too. A config whose ONLY screen reference is
+    /// an inert one publishes no `zones` entry and no missing-profile ref, so
+    /// without this arm the whole screen stage would be skipped for it and the
+    /// substituted default would never run -- the same all-or-nothing hole
+    /// #6860 closed for the undefined case.
     pub fn has_screen_state(&self) -> bool {
-        !self.zones.is_empty() || !self.missing_profile_refs.is_empty()
+        !self.zones.is_empty()
+            || !self.missing_profile_refs.is_empty()
+            || !self.inert_profile_refs.is_empty()
     }
 
     /// Run all screen checks for a packet arriving on the given zone.

@@ -305,6 +305,7 @@
     "policers": [],
     "policies": [],
     "routes": [],
+    "screen_inert_profile_zones": [],
     "screen_missing_profile_zones": [],
     "screens": [],
     "source_nat_rules": [],

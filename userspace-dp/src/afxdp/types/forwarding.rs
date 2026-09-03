@@ -362,6 +362,10 @@ pub(in crate::afxdp) struct ForwardingState {
     /// emits a rate-limited runtime WARN for it (verdict still Pass). A zone
     /// in neither map simply has no screen configured (legit Pass).
     pub(in crate::afxdp) screen_missing_profiles: FastMap<String, String>,
+    /// #7888: zone -> screen profile name for zones whose profile IS DEFINED
+    /// but enables no check. Kept separate from `screen_missing_profiles`
+    /// because the two select different runtime WARN texts.
+    pub(in crate::afxdp) screen_inert_profiles: FastMap<String, String>,
     pub(in crate::afxdp) syn_cookie_master_key: SynCookieMasterKey,
     pub(in crate::afxdp) tunnel_interfaces: FastSet<i32>,
     pub(in crate::afxdp) filter_state: crate::filter::FilterState,

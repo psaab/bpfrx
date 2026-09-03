@@ -91,6 +91,66 @@ fn screen_missing_profile_zones_wire_roundtrip_and_skew() {
     assert_eq!(snap.screen_missing_profile_zones[0].zone, "trust");
     assert_eq!(snap.screen_missing_profile_zones[0].profile, "ghost");
 
+    // #7888: the INERT sibling is a separate additive field and needs the same
+    // two-direction skew proof. Extending this test in the same change is the
+    // point — an additive wire field whose skew test is not extended is the
+    // thing that LOOKS bound and is not.
+    //
+    // Old-helper skew: absent field must decode to empty, which is exactly
+    // today's behaviour (inert zones Pass silently).
+    let mut v = serde_json::to_value(ConfigSnapshot::default())
+        .expect("serialize default ConfigSnapshot");
+    v.as_object_mut()
+        .expect("snapshot is a JSON object")
+        .remove("screen_inert_profile_zones");
+    let snap: ConfigSnapshot =
+        serde_json::from_value(v).expect("snapshot without the inert field must decode");
+    assert!(
+        snap.screen_inert_profile_zones.is_empty(),
+        "absent inert field must default to empty — an old Go binary that does not emit it \
+         must leave the set empty, not fail the decode"
+    );
+
+    // Present: round-trips with both zone and profile preserved.
+    let mut v = serde_json::to_value(ConfigSnapshot::default())
+        .expect("serialize default ConfigSnapshot");
+    v.as_object_mut().expect("snapshot is a JSON object").insert(
+        "screen_inert_profile_zones".into(),
+        serde_json::json!([{"zone":"trust","profile":"p"}]),
+    );
+    let snap: ConfigSnapshot =
+        serde_json::from_value(v).expect("snapshot with the inert field must decode");
+    assert_eq!(snap.screen_inert_profile_zones.len(), 1);
+    assert_eq!(snap.screen_inert_profile_zones[0].zone, "trust");
+    assert_eq!(snap.screen_inert_profile_zones[0].profile, "p");
+
+    // The two fields are INDEPENDENT on the wire. A snapshot carrying only the
+    // inert set must leave the missing set empty and vice versa — if one
+    // decoder key were reused for both, this is the assertion that catches it.
+    let mut v = serde_json::to_value(ConfigSnapshot::default())
+        .expect("serialize default ConfigSnapshot");
+    {
+        let obj = v.as_object_mut().expect("snapshot is a JSON object");
+        obj.insert(
+            "screen_inert_profile_zones".into(),
+            serde_json::json!([{"zone":"trust","profile":"p"}]),
+        );
+        obj.insert(
+            "screen_missing_profile_zones".into(),
+            serde_json::json!([{"zone":"wan","profile":"ghost"}]),
+        );
+    }
+    let snap: ConfigSnapshot =
+        serde_json::from_value(v).expect("snapshot with both fields must decode");
+    assert_eq!(snap.screen_inert_profile_zones.len(), 1);
+    assert_eq!(snap.screen_inert_profile_zones[0].zone, "trust");
+    assert_eq!(snap.screen_missing_profile_zones.len(), 1);
+    assert_eq!(
+        snap.screen_missing_profile_zones[0].zone, "wan",
+        "the two sets must decode independently; one key serving both would make the \
+         helper's WARN text undecidable"
+    );
+
     // A ref with only a zone (profile omitted) decodes with an empty profile.
     let r: ScreenMissingProfileRef =
         serde_json::from_str(r#"{"zone":"dmz"}"#).expect("ref with omitted profile decodes");
