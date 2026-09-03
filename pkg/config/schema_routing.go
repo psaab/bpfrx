@@ -473,7 +473,13 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 			valueExamples: ISISLevelSpellings(), validator: ValidateISISLevel, children: nil},
 		"export": {desc: "Export policy", args: 1, multi: true, placeholder: "<policy-name>", children: nil},
 		"interface": {desc: "Interface", args: 1, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: map[string]*schemaNode{
-			"level":               {desc: "Level", args: 1, placeholder: "<level>", children: nil},
+			// #8450: the PER-INTERFACE circuit type. Typed so a value the FRR
+			// renderer cannot express is rejected at commit instead of leaving
+			// the interface silently at the router-wide is-type. Wider spelling
+			// domain than the router-wide leaf: Junos writes a bare digit here.
+			"level": {desc: "IS-IS circuit type for this interface", args: 1, placeholder: "<level>",
+				valueType: ValueEnumOf, valueDesc: "IS-IS interface level",
+				valueExamples: ISISCircuitTypeSpellings(), validator: ValidateISISCircuitType, children: nil},
 			"passive":             {desc: "Passive interface", children: nil},
 			"metric":              {desc: "Metric", args: 1, placeholder: "<value>", children: nil},
 			"authentication-key":  {desc: "Authentication key", args: 1, placeholder: "<key>", children: nil},
@@ -849,7 +855,10 @@ var schemaRoutingInstances = &schemaNode{desc: "Routing instance configuration",
 				valueExamples: ISISLevelSpellings(), validator: ValidateISISLevel, children: nil},
 			"export": {desc: "Export policy", args: 1, multi: true, placeholder: "<policy-name>", children: nil},
 			"interface": {desc: "Interface", args: 1, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: map[string]*schemaNode{
-				"level":               {desc: "Level", args: 1, placeholder: "<level>", children: nil},
+				// #8450: same typing as the other copy; see there.
+				"level": {desc: "IS-IS circuit type for this interface", args: 1, placeholder: "<level>",
+					valueType: ValueEnumOf, valueDesc: "IS-IS interface level",
+					valueExamples: ISISCircuitTypeSpellings(), validator: ValidateISISCircuitType, children: nil},
 				"passive":             {desc: "Passive interface", children: nil},
 				"metric":              {desc: "Metric", args: 1, placeholder: "<value>", children: nil},
 				"authentication-key":  {desc: "Authentication key", args: 1, placeholder: "<key>", children: nil},
