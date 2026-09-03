@@ -1036,6 +1036,48 @@ func typedLeafErrorf(path []string, format string, args ...interface{}) error {
 
 // typedLeafInvalidErrorf builds the "invalid value" variant which quotes
 // the offending token and the validator's own message.
+//
+// #8434: EXCEPT when the leaf carries a credential. This path echoed the value
+// of `encrypted-password` (both `system login user ... authentication` and
+// `system root-authentication`) straight back into a commit error an operator
+// sees, logs, and pastes into a bug report.
+//
+// The project had already decided this leaf is a secret — it is in
+// `secretLeafKeywords` (secret.go) — and the redaction machinery is live: the
+// same value under `security ike policy pre-shared-key` renders `<redacted>`.
+// This was one path not consulting a registry the project maintains and other
+// paths honour, which is why keying on the REGISTRY rather than on a list of
+// leaves is the fix: the next typed secret leaf is covered by construction.
+//
+// `isSecretLeaf` rather than `IsSecretLeafKeyword` because dual-use keywords
+// are resolved by their root — `community` is a credential under `snmp` and a
+// BGP route-target name under `policy-options`, and #4097 exists to show the
+// operator WHICH community member was bad. Blanket keyword-keying broke that
+// diagnostic once already.
+//
+// The validator's own message is redacted too when it contains the token:
+// schema_validators.go's "invalid value %q (expected one of: ...)" echoes it a
+// SECOND time, so redacting only the wrapper leaves the leak intact. The
+// containment test can over-redact for a very short token; that is the safe
+// direction and it is preferred to reasoning about which validators echo.
 func typedLeafInvalidErrorf(path []string, tok string, err error) error {
-	return fmt.Errorf("%s: invalid value %q: %v", strings.Join(path, " "), tok, err)
+	joined := strings.Join(path, " ")
+	if len(path) > 0 && isSecretLeaf(joined, path[len(path)-1:]) {
+		// Redact the value INSIDE the reason rather than discarding the
+		// reason. The validators echo it themselves — ValidateCryptHash says
+		// "not an encrypted password hash (got %q) — plaintext is not ..." —
+		// so they are a second leak site, but the sentence after the value is
+		// the whole diagnostic. Dropping it told the operator only that
+		// something was invalid, and TestLoginUserEncryptedPasswordSchemaGate
+		// caught that: it asserts the reason still says "plaintext".
+		reason := "<redacted>"
+		if err != nil {
+			reason = err.Error()
+			if tok != "" {
+				reason = strings.ReplaceAll(reason, tok, "<redacted>")
+			}
+		}
+		return fmt.Errorf("%s: invalid value <redacted>: %s", joined, reason)
+	}
+	return fmt.Errorf("%s: invalid value %q: %v", joined, tok, err)
 }
