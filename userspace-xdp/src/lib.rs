@@ -67,7 +67,9 @@ const USERSPACE_CTRL_FLAG_STRICT: u32 = 8;
 const USERSPACE_CTRL_FLAG_WG_RX: u32 = 16;
 mod binding_index;
 mod ipv6_ext_walk;
-use binding_index::{BINDING_QUEUES_PER_IFACE, RawRxQueue, binding_slot};
+use binding_index::{
+    BINDING_QUEUES_PER_IFACE, BINDING_SLOT_MAP_MAX_ENTRIES, RawRxQueue, binding_slot,
+};
 use ipv6_ext_walk::{
     EH_CLASS_TERMINAL, FragHdr, MAX_EXT_HDRS, PROTO_FRAGMENT_NO_L4, eh_class, eh_class_table,
     read_bytes,
@@ -375,10 +377,10 @@ static USERSPACE_BINDINGS: Array<UserspaceBindingValue> =
 static USERSPACE_INGRESS_IFACES: HashMap<u32, u8> = HashMap::with_max_entries(MAX_INTERFACES, 0);
 
 #[map(name = "userspace_heartbeat")]
-static USERSPACE_HEARTBEAT: Array<u64> = Array::with_max_entries(4096, 0);
+static USERSPACE_HEARTBEAT: Array<u64> = Array::with_max_entries(BINDING_SLOT_MAP_MAX_ENTRIES, 0);
 
 #[map(name = "userspace_xsk_map")]
-static USERSPACE_XSK_MAP: XskMap = XskMap::with_max_entries(4096, 0);
+static USERSPACE_XSK_MAP: XskMap = XskMap::with_max_entries(BINDING_SLOT_MAP_MAX_ENTRIES, 0);
 
 #[map(name = "userspace_local_v4")]
 static USERSPACE_LOCAL_V4: HashMap<u32, u8> = HashMap::with_max_entries(8192, 0);

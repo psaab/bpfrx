@@ -32,4 +32,21 @@ const (
 	// userspace-xdp/src/lib.rs. This is the max_entries of the aya
 	// Array<UserspaceBindingValue> named "userspace_bindings".
 	BindingArrayMaxEntries uint32 = MaxInterfaces * BindingQueuesPerIface
+
+	// BindingSlotMapMaxEntries mirrors BINDING_SLOT_MAP_MAX_ENTRIES in
+	// userspace-xdp/src/binding_index.rs: the max_entries of the two shim
+	// maps keyed by the binding VALUE's slot field — "userspace_heartbeat"
+	// and "userspace_xsk_map".
+	//
+	// Deliberately NOT derived from MaxInterfaces, and NOT interchangeable
+	// with BindingArrayMaxEntries even though both are "the binding bound"
+	// in casual speech (#7497). BindingArrayMaxEntries bounds the COMPOSED
+	// index `ifindex*BindingQueuesPerIface + queue` into userspace_bindings,
+	// so it scales with the ifindex axis. This one bounds `slot`, which the
+	// helper's planner assigns DENSELY over the bindings it planned, so it
+	// is a ceiling on the TOTAL NUMBER OF BINDINGS. It is 256x smaller, and
+	// a check against the larger value admits slots these maps cannot
+	// address — which is why the write-side composed-index guards do not
+	// stand in for it.
+	BindingSlotMapMaxEntries uint32 = 4096
 )

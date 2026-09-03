@@ -101,6 +101,48 @@ The shim checks several conditions before redirecting a packet to userspace:
    coordinated stride bump; the helper planner
    (`replan_bindings_from_candidates`) does not cap the queue count, so the
    Go boundary is the enforcement point for what gets published.
+
+   **The slot axis is a SEPARATE bound, and is not covered by any of the
+   above (#7497).** The composed index `ifindex * 16 + queue` addresses
+   `userspace_bindings`, whose capacity is `MAX_INTERFACES *
+   BINDING_QUEUES_PER_IFACE` = 1,048,576. But the redirect and the liveness
+   check are not keyed by that index — they are keyed by `binding.slot`, a
+   field of the binding VALUE:
+
+   ```
+   lib.rs  USERSPACE_BINDINGS.get(ifindex * 16 + queue)   1,048,576 entries
+   lib.rs  USERSPACE_HEARTBEAT.get(binding.slot)              4,096 entries
+   lib.rs  USERSPACE_XSK_MAP.redirect(binding.slot, 0)        4,096 entries
+   ```
+
+   `slot` is assigned **densely** by the helper planner — a plain counter over
+   the bindings it planned (`replan_bindings_from_candidates`) — so it is not
+   derived from ifindex or queue id, and `BINDING_SLOT_MAP_MAX_ENTRIES` (4,096,
+   in `binding_index.rs`) is a ceiling on the **total number of bindings**. It
+   is 256x smaller than the binding array, so the write-side `#814` guard,
+   which checks the composed index against the larger value, does **not** stand
+   in for it: a slot that guard admits can still be unaddressable in the two
+   slot-keyed maps.
+
+   The planner therefore **refuses the whole plan** when
+   `queue_count * interfaces` would exceed `MAX_BINDING_SLOTS`, naming the
+   interface count, the queue count and the limit. Two properties of that are
+   deliberate. It is checked at **plan time**, not at `register_xsk_slot`,
+   because registration runs during bringup after the previous bindings have
+   been torn down — failing there takes forwarding down instead of declining to
+   change it. And it **refuses** rather than truncating to the first 4,096:
+   the surplus RX queues would be left unbound, and an unbound queue does not
+   reduce throughput, it takes `drop_degraded_transit` on every transit packet
+   while the interface still reads up and most traffic still flows. A refusal
+   is loud; a partial plan is an availability failure indistinguishable from a
+   healthy one.
+
+   Go pins `BindingSlotMapMaxEntries` against the **compiled** shim in
+   `validateUserspaceShimSpecWith`, and the helper's mirror is asserted against
+   the shim's own source by a host test that `#[path]`-includes
+   `binding_index.rs`. The two checks cover different boundaries: the shim `.o`
+   is git-tracked and rebuilt only by `make generate`, so source and object can
+   drift independently of each other.
 4. The binding's heartbeat (written every 250ms by the worker) must not be
    stale (default 5s timeout).
 5. ICMP/ICMPv6 is handled by the userspace dataplane or passed to the kernel
