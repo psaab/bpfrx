@@ -498,3 +498,61 @@ func TestEmptiedChainDenyIsQuarantineCounted7625(t *testing.T) {
 		}
 	}
 }
+
+// AGREEMENT. bgpNeighborAuthoredExport/Import re-state the most-specific-wins
+// resolution that bgpNeighborExportChain/ImportChain apply (a neighbor with ANY
+// own entry suppresses the global default; otherwise it inherits). Two copies of
+// one rule drift, and the drift would be silent and dangerous in BOTH
+// directions: an authored list read from the wrong source could deny a neighbor
+// that inherits a perfectly good global chain, or miss an emptied one.
+//
+// So this pins the AGREEMENT rather than either copy: filtering the authored
+// chain must reproduce the resolver's chain exactly, for every shape. A change
+// to either function alone fails here.
+func TestAuthoredChainAgreesWithResolvedChain7625(t *testing.T) {
+	po := policyOptions7625("REAL", "ALSO")
+	cases := []struct {
+		name string
+		bgp  *config.BGPConfig
+		n    *config.BGPNeighbor
+	}{
+		{"neighbor own list overrides global",
+			&config.BGPConfig{Import: []string{"REAL"}, Export: []string{"REAL"}},
+			&config.BGPNeighbor{Import: []string{"ALSO"}, Export: []string{"ALSO"}}},
+		{"neighbor empty inherits global",
+			&config.BGPConfig{Import: []string{"REAL", "ALSO"}, Export: []string{"REAL"}},
+			&config.BGPNeighbor{}},
+		{"both empty",
+			&config.BGPConfig{},
+			&config.BGPNeighbor{}},
+		{"neighbor ghost-only still overrides global",
+			&config.BGPConfig{Import: []string{"REAL"}, Export: []string{"REAL"}},
+			&config.BGPNeighbor{Import: []string{"GHOST"}, Export: []string{"GHOST"}}},
+		{"global ghost-only, neighbor inherits it",
+			&config.BGPConfig{Import: []string{"GHOST"}, Export: []string{"GHOST"}},
+			&config.BGPNeighbor{}},
+		{"neighbor mixed, one survives",
+			&config.BGPConfig{},
+			&config.BGPNeighbor{Import: []string{"REAL", "GHOST"}, Export: []string{"GHOST", "ALSO"}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gi := bgpGlobalImportChain(tc.bgp, po)
+			ge := bgpGlobalExportChain(tc.bgp, po)
+
+			wantIn := bgpNeighborImportChain(tc.n, gi, po)
+			gotIn := filterDefinedPolicies(bgpNeighborAuthoredImport(tc.n, tc.bgp), po)
+			if !equalStringSlice(gotIn, wantIn) {
+				t.Errorf("import: authored%v filters to %v, resolver says %v",
+					bgpNeighborAuthoredImport(tc.n, tc.bgp), gotIn, wantIn)
+			}
+
+			wantOut := bgpNeighborExportChain(tc.n, ge, po)
+			gotOut := filterDefinedPolicies(bgpNeighborAuthoredExport(tc.n, tc.bgp), po)
+			if !equalStringSlice(gotOut, wantOut) {
+				t.Errorf("export: authored%v filters to %v, resolver says %v",
+					bgpNeighborAuthoredExport(tc.n, tc.bgp), gotOut, wantOut)
+			}
+		})
+	}
+}
