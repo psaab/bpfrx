@@ -1167,6 +1167,13 @@ struct PortAllocatorShared {
     allocations_total: AtomicU64,
     reuses_total: AtomicU64,
     exhaustion_total: AtomicU64,
+    // #8447: the persistent-NAT ADMISSION pair. Both arms are counted, never
+    // just the failure: a lone "declined" counter reading zero is equally
+    // consistent with "nothing was declined" and with "this path never ran",
+    // and those are the two answers the question is between. A zero on
+    // `declined` is only informative next to a non-zero on `admitted`.
+    persistent_admitted_total: AtomicU64,
+    persistent_declined_total: AtomicU64,
     /// #4800: production acquisitions of the `live` mutex (allocate /
     /// reserve / release / rollback / GC), and the subset of those that
     /// found the mutex already held. Together they give the contention
@@ -1223,6 +1230,8 @@ impl Default for PortAllocator {
                 allocations_total: AtomicU64::new(0),
                 reuses_total: AtomicU64::new(0),
                 exhaustion_total: AtomicU64::new(0),
+                persistent_admitted_total: AtomicU64::new(0),
+                persistent_declined_total: AtomicU64::new(0),
                 live_lock_acquisitions: AtomicU64::new(0),
                 live_lock_contended: AtomicU64::new(0),
                 max_tracked_flows: 0,
@@ -1293,6 +1302,8 @@ impl PortAllocator {
                 allocations_total: AtomicU64::new(0),
                 reuses_total: AtomicU64::new(0),
                 exhaustion_total: AtomicU64::new(0),
+                persistent_admitted_total: AtomicU64::new(0),
+                persistent_declined_total: AtomicU64::new(0),
                 live_lock_acquisitions: AtomicU64::new(0),
                 live_lock_contended: AtomicU64::new(0),
                 max_tracked_flows,
@@ -1634,9 +1645,6 @@ impl PortAllocator {
         Ok(self.port_low + (val % range) as u16)
     }
 
-    /// Free a translated port's occupancy bit. `recycle` pushes the port onto
-    /// the FIFO reuse ring (#3011); the deterministic path passes `false`.
-    /// Returns true iff the bit was set.
     /// #8121: CLAIM one specific `(addr_index, port)` for the idle-lease
     /// import — the mirror of `free_translated_port`. `None` when the index is
     /// out of range; `Some(false)` when the bit is already held. An idle lease still holds its
@@ -1650,6 +1658,9 @@ impl PortAllocator {
         Some(self.shared.occupancy.get(addr_index)?.reserve(port))
     }
 
+    /// Free a translated port's occupancy bit. `recycle` pushes the port onto
+    /// the FIFO reuse ring (#3011); the deterministic path passes `false`.
+    /// Returns true iff the bit was set.
     fn free_translated_port(&self, addr_index: usize, port: u16, recycle: bool) -> bool {
         let Some(occ) = self.shared.occupancy.get(addr_index) else {
             return false;
@@ -1662,7 +1673,49 @@ impl PortAllocator {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// #8447: the persistent-NAT admission counter pair lives here, on a thin
+    /// wrapper, so it observes EVERY return of the real body — including the
+    /// early config-shape refusals (`InvalidPortRange`, `WrongAddressFamily`)
+    /// that sit above the locked path. Counting inside the body instead would
+    /// have missed exactly those, and "declined = 0" would then have been
+    /// reported for a pool that refused every flow before it reached the
+    /// allocator.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn allocate_translation(
+        &self,
+        flow: SourceNatFlowKey,
+        family_addresses: PoolAddressFamily<'_>,
+        family_offset: usize,
+        address_persistent: bool,
+        persistent_nat: bool,
+        persistent_nat_permit: super::source::PersistentNatPermit,
+        persistent_nat_timeout_ns: u64,
+        now_ns: u64,
+        holder: NatHolder,
+    ) -> Result<TranslatedTuple, super::source::SourceNatFailureReason> {
+        let out = self.allocate_translation_inner(
+            flow,
+            family_addresses,
+            family_offset,
+            address_persistent,
+            persistent_nat,
+            persistent_nat_permit,
+            persistent_nat_timeout_ns,
+            now_ns,
+            holder,
+        );
+        if persistent_nat {
+            let counter = if out.is_ok() {
+                &self.shared.persistent_admitted_total
+            } else {
+                &self.shared.persistent_declined_total
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        out
+    }
+
+    fn allocate_translation_inner(
         &self,
         flow: SourceNatFlowKey,
         family_addresses: PoolAddressFamily<'_>,
@@ -3708,6 +3761,14 @@ impl PortAllocator {
             allocations_total: self.shared.allocations_total.load(Ordering::Relaxed),
             reuses_total: self.shared.reuses_total.load(Ordering::Relaxed),
             exhaustion_total: self.shared.exhaustion_total.load(Ordering::Relaxed),
+            persistent_admitted_total: self
+                .shared
+                .persistent_admitted_total
+                .load(Ordering::Relaxed),
+            persistent_declined_total: self
+                .shared
+                .persistent_declined_total
+                .load(Ordering::Relaxed),
             live_lock_acquisitions_total: self
                 .shared
                 .live_lock_acquisitions
@@ -3933,6 +3994,10 @@ pub(crate) struct PortAllocatorSnapshot {
     pub(crate) allocations_total: u64,
     pub(crate) reuses_total: u64,
     pub(crate) exhaustion_total: u64,
+    /// #8447: persistent-NAT admissions that produced a translation.
+    pub(crate) persistent_admitted_total: u64,
+    /// #8447: persistent-NAT admissions that returned a failure instead.
+    pub(crate) persistent_declined_total: u64,
     /// #4800: `live` map-mutex acquisitions on the production
     /// allocate/reserve/release/rollback/GC paths, and the subset that
     /// blocked. Read as a ratio: `contended / acquisitions` is the NAT

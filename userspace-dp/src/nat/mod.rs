@@ -107,6 +107,9 @@ mod tests_destination;
 #[path = "tests_idle_lease_sync_8121.rs"]
 mod tests_idle_lease_sync_8121;
 #[cfg(test)]
+#[path = "tests_persistent_admission_8447.rs"]
+mod tests_persistent_admission_8447;
+#[cfg(test)]
 #[path = "tests_pool.rs"]
 mod tests_pool;
 // #7560 residual: the derived report gate (nat64 omitted a field from its own).
