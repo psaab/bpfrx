@@ -367,6 +367,30 @@ A measurement run **PASSES** iff ALL of:
    The reducer rejects gate comparisons whose idle and loaded cells were
    captured with different probe modes or minimum-interval pacing.
 
+   **The gate emits `VOID-NOT-ATTRIBUTABLE` when the mice and the elephants
+   terminate on the SAME host (#8259), instead of PASS or FAIL.** The two
+   cells being ratioed then differ by the elephants' entire offered load on
+   the very machine whose service time is inside every mouse sample — ~8.6
+   Gbit/s on the standing loss cluster — and the ratio attributes all of it to
+   firewall queueing. `PASS` is the dangerous half rather than `FAIL`: a FAIL
+   invites investigation, while a PASS gets cited as a control, and one was —
+   #7159's cross-class PASS was the comparison point for #8259's FAIL and
+   carries the same defect. The verdict is deliberately not a warning field
+   beside a PASS/FAIL, because a warning is discarded by every consumer that
+   reads `verdict`, which is how the confound survived to be cited. It exits
+   2 (undetermined), never 0.
+
+   `MOUSE_TARGET_V4` and `ELEPHANT_TARGET_V4` are separate knobs that default
+   to the same address, so the check passes the moment a second host exists:
+   point `ELEPHANT_TARGET_V4` at it and the gate resumes producing
+   attributable numbers with no further change. There is no second host on
+   VLAN 80 today, and the current target is external lab hardware with no
+   management path — `test/incus/target-services.sh` records that it "is not
+   an incus instance in any project, and it does not accept ssh", which is
+   also why the target cannot simply be sampled instead. Artifacts predating
+   the split declare no targets and are never voided on their absence: the
+   void fires on positive evidence that the two are equal.
+
 A run that satisfies any single gate while failing another **does
 not pass**. There is no "OR flagged" escape clause; if a gate
 cannot be met, the contract requires either a code change or a

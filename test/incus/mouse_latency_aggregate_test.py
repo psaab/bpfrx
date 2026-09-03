@@ -348,3 +348,112 @@ class LoadCellRepsInvalidMarkerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VoidNotAttributableTests(unittest.TestCase):
+    """#8259 — the gate must refuse a verdict it cannot attribute.
+
+    When the mice and the elephants terminate on the SAME host, the loaded
+    cell adds the elephants' offered load to the very machine whose service
+    time is inside every mouse sample, and the idle cell does not. The ratio
+    then attributes that whole difference to firewall queueing.
+
+    PASS is the dangerous half. A FAIL invites investigation; a PASS gets
+    cited as a control, and one already was — #7159's cross-class PASS was
+    used as the comparison point for #8259's FAIL and carries the same defect.
+    """
+
+    @staticmethod
+    def _cell(mouse_target, elephant_target, p999):
+        cell = {"status": "OK", "median_rep": {"p999_us": p999}}
+        if mouse_target is not None:
+            cell["mouse_target"] = mouse_target
+        if elephant_target is not None:
+            cell["elephant_target"] = elephant_target
+        return cell
+
+    def _decide(self, loaded, idle):
+        return decide(
+            {(100, 100): loaded, (0, 100): idle},
+            gate_elephants=100,
+            gate_mice=100,
+            gate_percentile="p999_us",
+        )
+
+    def test_shared_target_voids_instead_of_failing(self):
+        """The real #8259 numbers: a 7.69 ratio that must NOT be reported."""
+        v = self._decide(
+            self._cell("172.16.80.200", "172.16.80.200", 52039),
+            self._cell("172.16.80.200", "172.16.80.200", 6765),
+        )
+        self.assertEqual(v["verdict"], "VOID-NOT-ATTRIBUTABLE")
+        self.assertNotIn("ratio", v)
+        self.assertEqual(v["mouse_target"], "172.16.80.200")
+        self.assertIn("172.16.80.200", v["reason"])
+        self.assertIn("VLAN 80", v["unblocked_by"])
+
+    def test_shared_target_voids_a_PASS_too(self):
+        """The half that matters most.
+
+        A ratio comfortably under threshold is the case a reader trusts, and
+        it is exactly as unattributable. Without this the gate would keep
+        emitting citable PASSes on a shared target.
+        """
+        v = self._decide(
+            self._cell("172.16.80.200", "172.16.80.200", 7000),
+            self._cell("172.16.80.200", "172.16.80.200", 6765),
+        )
+        self.assertEqual(v["verdict"], "VOID-NOT-ATTRIBUTABLE")
+
+    def test_separate_targets_still_produce_a_verdict(self):
+        """The accept side, and the reason the check is not permanently true.
+
+        Stand up a second host on VLAN 80, point ELEPHANT_TARGET_V4 at it, and
+        the gate produces attributable numbers with no further change. A gate
+        that voided unconditionally would pass every other cell here.
+        """
+        v = self._decide(
+            self._cell("172.16.80.201", "172.16.80.200", 52039),
+            self._cell("172.16.80.201", "172.16.80.200", 6765),
+        )
+        self.assertEqual(v["verdict"], "FAIL")
+        self.assertAlmostEqual(v["ratio"], 52039 / 6765, places=3)
+
+    def test_separate_targets_pass_is_still_a_pass(self):
+        v = self._decide(
+            self._cell("172.16.80.201", "172.16.80.200", 7000),
+            self._cell("172.16.80.201", "172.16.80.200", 6765),
+        )
+        self.assertEqual(v["verdict"], "PASS")
+
+    def test_legacy_artifacts_without_targets_are_not_voided(self):
+        """Artifacts predating the split declare no targets.
+
+        They must not be voided on a guess — that would retroactively void
+        every historical run on a field they never carried. The void fires on
+        POSITIVE evidence that the two are equal, never on its absence.
+        """
+        v = self._decide(
+            self._cell(None, None, 52039),
+            self._cell(None, None, 6765),
+        )
+        self.assertEqual(v["verdict"], "FAIL")
+
+    def test_void_does_not_exit_zero(self):
+        """A void painted green in CI would be the whole defect restored."""
+        self.assertEqual(exit_status_for_verdict("VOID-NOT-ATTRIBUTABLE"), 2)
+        self.assertEqual(exit_status_for_verdict("PASS"), 0)
+        self.assertEqual(exit_status_for_verdict("FAIL"), 1)
+
+    def test_idle_cell_shared_target_also_voids(self):
+        """Either cell being unattributable voids the pair.
+
+        The gate is a ratio; a contaminated denominator is as fatal as a
+        contaminated numerator.
+        """
+        v = self._decide(
+            self._cell("172.16.80.201", "172.16.80.200", 52039),
+            self._cell("172.16.80.200", "172.16.80.200", 6765),
+        )
+        self.assertEqual(v["verdict"], "VOID-NOT-ATTRIBUTABLE")
+        self.assertIn("idle cell", v["reason"])
