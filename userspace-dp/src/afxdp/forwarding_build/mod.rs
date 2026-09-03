@@ -715,6 +715,14 @@ fn build_fallible_forwarding_state(
     // Err and keeps the previous live forwarding state rather than installing a
     // silently-narrower NPTv6 config (the helper-boundary backstop to the Go
     // commit-time gate).
+    // #8115 R3: NAT64 prefixes are their own occupancy domains, and the
+    // source-NAT peer index was built above — inside
+    // `parse_source_nat_rules_with_previous`, where `state.nat64` did not exist
+    // yet. This is the second pass that makes NAT64 a MEMBER of that index and
+    // hands the combined view to both features. It must run AFTER both are
+    // assigned, and it fast-outs before any work when no prefix contributes a
+    // domain.
+    crate::nat::wire_nat64_overlap_peers(&mut state.source_nat_rules, &mut state.nat64.prefixes);
     state.nptv6 = Nptv6State::try_from_snapshots(&snapshot.nptv6_rules)?;
     state.screen_profiles = build_screen_profiles(snapshot);
     state.screen_missing_profiles = build_screen_missing_profiles(snapshot);

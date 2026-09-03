@@ -948,7 +948,19 @@ the NAT module applies it:
   conflict needed no new disposition. PASS 2, reached when the zone pair cannot
   be resolved, stays byte-identical: that is an HA node's entire first sync
   before any snapshot is applied, where the active's rule choice cannot be
-  reproduced, and refusing there would reject every import on such a node. Two source-NAT pools whose
+  reproduced, and refusing there would reject every import on such a node.
+  **NAT64 prefixes are members of the same index (#8115 R3).** A `Nat64Prefix`
+  owns its own `port_allocator`, keyed by `(prefix_bytes, pool_v4)`, so a
+  source-NAT pool sharing one of those addresses — or a second prefix over the
+  same pool — is a second occupancy domain over one address; #5144 names both as
+  distinct collision owners at commit. This was a registry gap, not a missing
+  caller: the query worked, the domain was never added. The source-NAT index is
+  built inside `parse_source_nat_rules_with_previous`, before `state.nat64`
+  exists, so `wire_nat64_overlap_peers` runs as a second pass from
+  `forwarding_build` once both are assigned, replacing the source-only index
+  with a combined one (a strict superset) and handing it to both features. Both
+  directions are closed: the NAT64 mint refuses an identity a source pool holds,
+  and the source-NAT mint refuses one a prefix holds. Two source-NAT pools whose
   addresses overlap are two independent occupancy bitmaps — the allocator key
   carries the pool NAME — so each is blind to the other's live translations and
   both would publish one `(pool address, port)` for two live flows. One
