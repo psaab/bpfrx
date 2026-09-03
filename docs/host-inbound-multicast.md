@@ -134,6 +134,39 @@ session miss the shim steers on address alone — `should_fallback_early`, then
 | `255.255.255.255` (DHCP DISCOVER) | kernel, via the shim's early fallback | inert — this advisory's subject |
 | ordinary local unicast | kernel, via `is_local_destination` | inert on the userspace plane |
 | unicast to an **interface-mode-SNAT** address | **redirected to the AF_XDP dataplane** | **load-bearing, fail-closed** |
+| **subnet-directed broadcast** (`192.168.1.255`) | redirected to the AF_XDP dataplane, then **dropped** — never locally delivered | inert: the packet never reaches the gate |
+
+**The fourth row is the #8061 asymmetry, and it is deliberate.** A
+subnet-directed broadcast is none of `should_fallback_early`'s three classes
+(`0xffff_ffff`, multicast, link-local), so unlike the limited broadcast it is
+NOT handed to the kernel — it enters the AF_XDP dataplane. It does not,
+however, reach local delivery: every `LocalDelivery` return site is gated on
+membership the address cannot have. `fib.rs`'s arm requires `local_tables_v4` /
+`local_nat_any_table_v4`, populated from each interface's HOST address
+(`forwarding_build/interfaces.rs`, `local_v4.insert(v4.addr())`);
+`forwarding/local_delivery.rs` requires `iface.primary_v4 == Some(ip)`;
+`poll_stages.rs`'s site is the IPsec passthrough decision and is not
+address-derived. The only residual path is an operator configuring the
+directed broadcast as a **DNAT external**, which is a deliberate act.
+
+So the consequence chain one would expect — L2-less delivery on `xpf-usp0`,
+invisible to an `AF_PACKET` consumer on the physical NIC, and subject to the
+fail-closed host-inbound gate — **does not occur**: the packet is dropped
+before local delivery, so the gate is never consulted.
+
+Nor is there a consumer to harm. The product's three `AF_PACKET` consumers each
+take a different class: the DHCP client (`pkg/dhcp`, nclient4/nclient6) uses the
+limited broadcast, which early-falls-back; VRRP (`pkg/vrrp`) uses multicast
+224.0.0.18 / ff02::12, likewise; and the HA ARP probe is EtherType 0x0806, which
+never reaches the AF_INET arm at all.
+
+This is not an oversight but the **advertised** state of a knob. `family inet
+targeted-broadcast` — Junos's directed-broadcast forwarding — is a real config
+leaf that is ACCEPTED-ONLY and not enforced by the runtime (#4308), and a
+commit-time advisory tells the operator so: *"configured but accepted-only —
+typed and stored but not enforced by the runtime yet (parity, #4308)"*, guarded
+by `TestInterfaceParityKnobsAdvisory_4308`. An operator who wants directed
+broadcasts forwarded is told at commit that they are not.
 
 The third row is not this advisory's subject, but the sentence above was being
 read as covering it. A DHCP **client** on such an interface receives its
