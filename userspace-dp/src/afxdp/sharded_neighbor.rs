@@ -30,7 +30,7 @@ use rustc_hash::FxHasher;
 use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{LazyLock, Mutex, MutexGuard};
 
 pub(super) const NUM_SHARDS: usize = 64;
 
@@ -176,12 +176,69 @@ pub(crate) struct ShardedNeighborMap {
 /// like `/24` LANs (constant ifindex + sequential last octet).
 const SHARD_BITS: u32 = NUM_SHARDS.trailing_zeros();
 
-fn shard_idx(key: &(i32, IpAddr)) -> usize {
+/// #7752: per-process random seed mixed into shard selection.
+///
+/// The Knuth post-multiply above closes the ACCIDENTAL clustering case — a
+/// `/24` of neighbours whose low bits are correlated still spreads across
+/// shards. It cannot close the CHOSEN-input case, because `FxHash` is a fixed
+/// public function with no per-process secret: an attacker who can pick
+/// neighbour addresses can compute, offline, a set that lands in one shard.
+///
+/// That matters here specifically because of the #5673 per-shard learn cap.
+/// With `NUM_SHARDS = 64` and `MAX_DYNAMIC_NEIGHBORS_PER_SHARD = 2048`, filling
+/// ONE shard costs 2048 entries against an aggregate capacity of 131,072 — so
+/// an unkeyed hash hands the attacker a 64x discount AND lets them choose WHICH
+/// addresses are denied, since a new learn into a full shard is refused
+/// (`prior_mac.is_none() && shard.len() >= MAX`) while updates to already-known
+/// neighbours are not. Source learning runs on RX before screen/policy
+/// admission, so an L2-adjacent host spoofing sources reaches it.
+///
+/// The seed does not make `FxHash` a keyed MAC and this is NOT claimed as
+/// cryptographic keying. What it removes is OFFLINE precomputation: without the
+/// seed an attacker must probe the live mapping, which is slow and observable,
+/// instead of arriving with a prepared address set.
+///
+/// Seeded once per process. A `getrandom` failure does not refuse to start — a
+/// firewall that will not boot because the RNG hiccuped is a worse outcome than
+/// a weaker shard seed — but the fallback is still process-varying rather than
+/// a compile-time constant, and it says so on stderr.
+static SHARD_SEED: LazyLock<u64> = LazyLock::new(|| {
+    let mut b = [0u8; 8];
+    if getrandom::getrandom(&mut b).is_ok() {
+        return u64::from_ne_bytes(b);
+    }
+    eprintln!(
+        "xpf-dp: getrandom failed seeding the neighbor shard index; falling \
+         back to a process-varying seed (#7752)"
+    );
+    let mut h = FxHasher::default();
+    std::process::id().hash(&mut h);
+    (&b as *const u8 as usize).hash(&mut h);
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+        .hash(&mut h);
+    h.finish()
+});
+
+/// The seeded shard computation, split out from [`shard_idx`] so the seed's
+/// contribution is testable. Reading the process seed inside the only caller
+/// would make "does the seed change the mapping?" unaskable — the property
+/// would be true by construction and unfalsifiable, which is how a guard ends
+/// up unable to notice its own subject being deleted.
+#[inline]
+fn shard_idx_with(seed: u64, key: &(i32, IpAddr)) -> usize {
     let mut hasher = FxHasher::default();
+    hasher.write_u64(seed);
     key.hash(&mut hasher);
     let h = hasher.finish();
     let mixed = h.wrapping_mul(0x9E3779B97F4A7C15);
     (mixed >> (64 - SHARD_BITS)) as usize
+}
+
+fn shard_idx(key: &(i32, IpAddr)) -> usize {
+    shard_idx_with(*SHARD_SEED, key)
 }
 
 impl ShardedNeighborMap {

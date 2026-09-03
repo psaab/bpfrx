@@ -72,6 +72,18 @@ the userspace dataplane admission boundary is in
   short-circuits the bulk lock once its pre-check sees every candidate key
   new-and-at-cap, so a steady flood no longer serializes the shards. Refusals
   are surfaced as `xpf_userspace_dynamic_neighbor_learn_cap_drops_total`.
+  **The shard index is seeded per process (#7752)** so that cap cannot be
+  aimed. `FxHash` is a fixed public function, so with an unseeded index an
+  attacker who chooses neighbour addresses could compute offline a set landing
+  in ONE shard — filling it for 2048 entries against an aggregate capacity of
+  131,072, a 64x discount, and choosing WHICH later addresses are refused,
+  since a new learn into a full shard is denied. A random per-process seed
+  (`SHARD_SEED`, `getrandom`, with a process-varying fallback that never
+  degrades to a compile-time constant) removes the OFFLINE precomputation: the
+  attacker must probe the live mapping, which is slow and observable. It is not
+  cryptographic keying and is not claimed as such — the Knuth post-multiply
+  already handled the ACCIDENTAL case (a `/24` whose low bits correlate); the
+  seed handles the CHOSEN-input one.
 - **Firewall filters**: policer (token bucket + three-color), lo0 filter,
   flexible match, port ranges, hit counters, logging, forwarding-class
   DSCP rewrite.
