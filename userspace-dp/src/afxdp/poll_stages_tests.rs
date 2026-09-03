@@ -1882,10 +1882,25 @@ fn forwarding_zone_pair_uses_logical_ingress_ifindex_3021() {
     // zone-pair, not lan's.
     let (from_physical, _) =
         zone_pair_ids_for_flow_with_override(&forwarding, 11, None, egress_ifindex);
+    // #7509 RETARGET of the counter-factual, re-expressed rather than deleted --
+    // and the new claim is STRICTLY STRONGER than the one it replaces.
+    //
+    // This reconstructed the pre-#3021 behaviour to prove the fix matters: feed
+    // the raw parent 11 to the zone-pair helper and show it yields `wan`, i.e.
+    // a DIFFERENT zone from the unit's own `lan`. The contrast was "lan vs some
+    // other zone".
+    //
+    // A contested parent now carries no zone, so the reconstruction yields 0.
+    // The counter-factual still does its job -- a physical-keyed implementation
+    // still gets the wrong answer for the VID-50 unit -- and the contrast is
+    // now "lan vs NO zone", which additionally distinguishes "resolved
+    // correctly" from "resolved to some other zone". The old form could not:
+    // any two differing values satisfied it.
     assert_eq!(
-        from_physical, TEST_WAN_ZONE_ID,
-        "the raw physical parent ifindex 11 wrongly resolves to wan \
-         (the #3021 bug the logical-ifindex resolution fixes)"
+        from_physical, 0,
+        "the raw physical parent ifindex 11 resolves to NO zone, because its \
+         units disagree (#7509); a physical-keyed lookup therefore still gets \
+         the wrong answer for the VID-50 unit, which is what #3021 fixes"
     );
     assert_ne!(
         from_correct, from_physical,

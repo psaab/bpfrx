@@ -92,10 +92,25 @@ mod prerouting_scope_tests {
             forwarding.ifindex_to_zone_id.get(&13).copied(),
             Some(TEST_LAN_ZONE_ID)
         );
+        // #7509 RETARGET, re-expressed and STRICTLY STRONGER. This asserted the
+        // parent inherited unit-A's first-unit `wan` zone -- the arbitrary
+        // walk-order pick that makes a VID-50 frame wrongly match unit-A's
+        // `from zone wan` DNAT, which is the hazard this cell guards.
+        //
+        // A contested parent now carries no zone, so the hazard is expressed as
+        // "the parent names no zone" instead of "the parent names the WRONG
+        // zone". Both make a physical-keyed scope decision wrong for the VID-50
+        // unit; the new form also distinguishes it from "scoped to some other
+        // real zone", which the old form could not.
+        //
+        // The two assertions above are the control: units 12 and 13 must still
+        // resolve to `wan` and `lan`, so this 0 is specific to the contested
+        // parent rather than a state with no zones at all.
         assert_eq!(
-            forwarding.ifindex_to_zone_id.get(&11).copied(),
-            Some(TEST_WAN_ZONE_ID),
-            "the physical parent inherits unit-A's (first-unit) wan zone"
+            forwarding.ifindex_to_zone_id.get(&11).copied().unwrap_or(0),
+            0,
+            "the physical parent carries units in DIFFERENT zones (wan on \
+             unit-A, lan on unit-B), so it resolves to NO zone (#7509)"
         );
 
         let src: IpAddr = "203.0.113.9".parse().unwrap();
