@@ -396,6 +396,27 @@ var namedDupRules = []namedDupRule{
 	// compiles N with peerAS=0 and export=[]. The export policy the operator
 	// authored never reaches the neighbour, and only the peer-as half warns.
 	{stanza: "protocols", inner: "bgp", keyword: "group", kind: "bgp group", effect: dupEffectSplitInstances},
+
+	// #8433. `security ike proposal <n>` and `security ipsec proposal <n>` are
+	// stored as IKEProposals[name] / Proposals[name] (compiler_ipsec.go), so a
+	// second block replaces the first. Measured at master before adding the
+	// rows, which is what the predicate above asks for:
+	//
+	//   ike proposal P1 { authentication-method pre-shared-keys; dh-group group14; }
+	//   ike proposal P1 { authentication-algorithm sha-256; encryption-algorithm aes-256-cbc; }
+	//     -> method="" dh=0 — the whole first block is gone
+	//
+	//   ipsec proposal Q1 { protocol esp; }
+	//   ipsec proposal Q1 { authentication-algorithm hmac-sha-256-128; encryption-algorithm aes-256-cbc; }
+	//     -> protocol="" — the ESP selection is gone
+	//
+	// This is worse than the average last-wins row. A proposal with no
+	// authentication-method, no DH group or no protocol is not a weaker tunnel;
+	// it is an INCOMPLETE crypto proposal, and the operator authored every part
+	// of it. The flat spelling merges the two blocks correctly, so this is a
+	// hierarchical-file / `load merge` hazard rather than a `set` one.
+	{stanza: "security", inner: "ike", keyword: "proposal", kind: "ike proposal", effect: dupEffectLastWins},
+	{stanza: "security", inner: "ipsec", keyword: "proposal", kind: "ipsec proposal", effect: dupEffectLastWins},
 }
 
 var singletonDupRules = []singletonDupRule{

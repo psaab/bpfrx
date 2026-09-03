@@ -55,6 +55,46 @@ type dup6768Case struct {
 
 func dup6768Cases() []dup6768Case {
 	return []dup6768Case{
+		// #8433. An IKE/IPsec proposal is stored as IKEProposals[name] /
+		// Proposals[name], so the second block REPLACES the first. Worse than
+		// the average last-wins row on this table: what is lost is not a weaker
+		// tunnel but an INCOMPLETE crypto proposal — the dup below loses the
+		// authentication-method AND the DH group, both of which the operator
+		// authored. Measured at master before the row was added.
+		{
+			name:     "ike_proposal",
+			kind:     "ike proposal",
+			instance: "P1",
+			effect:   "last-writer-wins",
+			dupSrc: `security {
+    ike {
+        proposal P1 { authentication-method pre-shared-keys; dh-group group14; }
+        proposal P1 { authentication-algorithm sha-256; encryption-algorithm aes-256-cbc; }
+    }
+}`,
+			oneSrc: `security {
+    ike {
+        proposal P1 { authentication-method pre-shared-keys; dh-group group14; authentication-algorithm sha-256; encryption-algorithm aes-256-cbc; }
+    }
+}`,
+		},
+		{
+			name:     "ipsec_proposal",
+			kind:     "ipsec proposal",
+			instance: "Q1",
+			effect:   "last-writer-wins",
+			dupSrc: `security {
+    ipsec {
+        proposal Q1 { protocol esp; }
+        proposal Q1 { authentication-algorithm hmac-sha-256-128; encryption-algorithm aes-256-cbc; }
+    }
+}`,
+			oneSrc: `security {
+    ipsec {
+        proposal Q1 { protocol esp; authentication-algorithm hmac-sha-256-128; encryption-algorithm aes-256-cbc; }
+    }
+}`,
+		},
 		{
 			name:     "security_log_stream",
 			kind:     "security log stream",
