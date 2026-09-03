@@ -151,7 +151,23 @@ Differences that matter (#1881):
   string is produced in exactly one place — the enum's `Display` — and is
   rendered ONLY at the `reconcile_debug` / wire `debug_reconcile_stage`
   boundary (`status.rs`) and inside `ReconcileError`'s `Display`; the strings
-  are preserved byte-for-byte. `ReconcileError::{MapSetup,WorkerSpawn,
+  are preserved byte-for-byte **except `WorkerBindIncomplete`**, which has been
+  deliberately extended twice — #6245 appended the explicit per-slot causes, and
+  #7497 added the NIC coordinate (`:<interface>:q<queue>`) to each cause. That
+  exception is stated because "byte-for-byte" was the blanket claim and #6245
+  had already made it false. Nothing parses these strings; they are operator
+  diagnostics reaching the control-response error on a failed commit, so
+  extending one is a legibility decision rather than a wire change.
+
+  The #7497 extension exists because this is the LOUD failure: a bind shortfall
+  is a fail-closed refusal that already surfaces, so the question was never
+  whether it gets noticed but whether the operator learns enough to act. A slot
+  number is a position in the minted sequence, and since per-interface queue
+  planning the slot -> (interface, queue) mapping moves whenever any interface's
+  queue count changes, so it could not be resolved to a NIC queue after the
+  fact. The coordinate is captured through `BindingCoordinate::of` at both
+  failure sites; the copy is under test, though the capture CALL still is not —
+  reaching it needs a real AF_XDP bind failure. `ReconcileError::{MapSetup,WorkerSpawn,
   WorkerBindIncomplete}` carry the typed `ReconcileStage` rather than a cloned
   string, so a failure identity cannot be silently reinterpreted as informal
   success text (the #4952 overwrite class). #6244 also moved the `"stopped"`

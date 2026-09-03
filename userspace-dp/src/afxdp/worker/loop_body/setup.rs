@@ -171,6 +171,9 @@ pub(super) fn worker_loop_setup(
         // #6245: capture the slot BEFORE `plan` is moved into the bind call so
         // a failure can be reported explicitly (was lost with the moved plan).
         let slot = plan.status.slot;
+        // #7497: the NIC coordinate, captured at the same moment and for the
+        // same reason — `plan` is moved into the bind call below.
+        let coord = BindingCoordinate::of(&plan.status);
         match create_private_binding_from_plan(plan) {
             Ok(binding) => bindings.push(binding),
             Err(err) => {
@@ -187,11 +190,11 @@ pub(super) fn worker_loop_setup(
                 let reason = err.to_string();
                 eprintln!("xpf-userspace-dp: private binding creation failed: {reason}");
                 live.set_error(reason.clone());
-                binding_failures.push(BindingSetupFailure {
-                    slot,
-                    phase: BindingSetupPhase::Private,
+                binding_failures.push(BindingSetupFailure::at(
+                    &coord,
+                    BindingSetupPhase::Private,
                     reason,
-                });
+                ));
             }
         }
     }

@@ -1162,6 +1162,8 @@ fn fallback_shared_group_to_private(
     for mut plan in plans {
         let live = plan.live.clone();
         let slot = plan.status.slot;
+        // #7497: captured before `plan` is moved into the bind call, like slot.
+        let coord = BindingCoordinate::of(&plan.status);
         let mode = plan.shared_umem.mode;
         plan.shared_umem = SharedUmemBindingPlan::disabled(mode, fallback_reason.clone());
         publish_shared_umem_plan_to_binding_status(&mut plan.status, &plan.shared_umem);
@@ -1171,11 +1173,11 @@ fn fallback_shared_group_to_private(
                 let msg = format!("private fallback after shared UMEM failure failed: {err}");
                 eprintln!("xpf-userspace-dp: {msg}");
                 live.set_error(msg.clone());
-                binding_failures.push(BindingSetupFailure {
-                    slot,
-                    phase: BindingSetupPhase::SharedFallback,
-                    reason: msg,
-                });
+                binding_failures.push(BindingSetupFailure::at(
+                    &coord,
+                    BindingSetupPhase::SharedFallback,
+                    msg,
+                ));
                 all_slots_recovered = false;
             }
         }
