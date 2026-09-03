@@ -81,3 +81,71 @@ func ValidateISISLevel(raw string, _ *Config) error {
 	}
 	return nil
 }
+
+// ---------------------------------------------------------------------------
+// Per-INTERFACE circuit type — #8450, a different leaf and a different defect.
+//
+// `protocols isis interface <if> level <n>` restricts one interface's adjacency
+// to a level. It compiled into ISISInterface.Level and was then NEVER RENDERED:
+// pkg/frr emitted no `isis circuit-type` line anywhere, so the interface formed
+// adjacencies at the ROUTER-WIDE is-type regardless of what the operator wrote.
+// Dead config that fails OPEN — the interface is wider than authored, which is
+// the same direction as the router-wide #8446 defect one level down.
+//
+// The spelling domain is WIDER here than for the router-wide leaf. Junos writes
+// the per-interface level as a bare digit (`level 1`), while FRR's circuit-type
+// takes the `level-N` forms, so both must be accepted. That is why this is a
+// separate canonicalizer rather than a reuse of CanonicalISISLevel: sharing it
+// would have to widen the router-wide leaf's domain too, and `is-type 2` is a
+// value #8446 deliberately rejects.
+// ---------------------------------------------------------------------------
+
+// isisCircuitTypeSpellings maps every accepted per-interface `level` spelling to
+// the FRR `isis circuit-type` argument it renders as.
+var isisCircuitTypeSpellings = map[string]string{
+	"1":            "level-1",
+	"2":            "level-2-only",
+	"1-2":          "level-1-2",
+	"level-1":      "level-1",
+	"level-2":      "level-2-only",
+	"level-1-2":    "level-1-2",
+	"level-2-only": "level-2-only",
+}
+
+// CanonicalISISCircuitType maps an authored per-interface `level` value to the
+// FRR circuit-type argument. An EMPTY value returns ("", true): no
+// `isis circuit-type` line is rendered and the interface inherits the
+// router-wide is-type, which is both FRR's behaviour and Junos's.
+func CanonicalISISCircuitType(raw string) (circuitType string, ok bool) {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return "", true
+	}
+	c, ok := isisCircuitTypeSpellings[v]
+	return c, ok
+}
+
+// ISISCircuitTypeSpellings returns the accepted per-interface spellings in
+// sorted order, for error text, schema value examples, and completion.
+func ISISCircuitTypeSpellings() []string {
+	out := make([]string, 0, len(isisCircuitTypeSpellings))
+	for k := range isisCircuitTypeSpellings {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ValidateISISCircuitType is the setSchema typed-leaf validator for
+// `protocols isis interface <if> level`. Shared by both schema copies.
+func ValidateISISCircuitType(raw string, _ *Config) error {
+	if strings.TrimSpace(raw) == "" {
+		return fmt.Errorf("missing value (expected one of %s)",
+			strings.Join(ISISCircuitTypeSpellings(), ", "))
+	}
+	if _, ok := CanonicalISISCircuitType(raw); !ok {
+		return fmt.Errorf("not a valid IS-IS interface level: %q (expected one of %s)",
+			raw, strings.Join(ISISCircuitTypeSpellings(), ", "))
+	}
+	return nil
+}
