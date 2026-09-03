@@ -4,6 +4,9 @@
 // `#[path = "screen_tests.rs"]` from screen.rs.
 
 use super::*;
+// #7888: the two WARN texts live in the `unresolved` child module after the
+// split; `use super::*` does not reach into a sibling module's namespace.
+use super::unresolved::{inert_profile_warn_message, missing_profile_warn_message};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// #3607: nanoseconds per second. The `_opts` / `validate_*` screen entry
@@ -6156,7 +6159,10 @@ fn inert_profile_gets_the_substituted_default_7888() {
     let same = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
     let land = tcp_pkt(same, same, 5000, 5000, TCP_SYN);
     assert!(
-        matches!(state.check_packet("trust", &land, 1), ScreenVerdict::Drop(_)),
+        matches!(
+            state.check_packet("trust", &land, 1),
+            ScreenVerdict::Drop(_)
+        ),
         "a LAND packet to a zone whose screen profile is DEFINED but enables no check must \
          be dropped by the substituted conservative default — the consequence is identical \
          to an undefined reference, so the protection must be too"
@@ -6214,8 +6220,16 @@ fn zone_with_no_screen_still_passes_silently_7888() {
          only arm that may pass without a signal"
     );
     assert_eq!(state.substituted_default_drops(), 0);
-    assert_eq!(state.missing_profile_warn_count(), 0, "no signal for a legit zone");
-    assert_eq!(state.inert_profile_warn_count(), 0, "no signal for a legit zone");
+    assert_eq!(
+        state.missing_profile_warn_count(),
+        0,
+        "no signal for a legit zone"
+    );
+    assert_eq!(
+        state.inert_profile_warn_count(),
+        0,
+        "no signal for a legit zone"
+    );
 }
 
 // The undefined state keeps its own warn and must not be re-routed through the
@@ -6251,7 +6265,10 @@ fn the_two_warn_texts_are_distinguishable_7888() {
     let undefined = missing_profile_warn_message("trust", "ghost");
     let inert = inert_profile_warn_message("trust", "p");
 
-    assert_ne!(undefined, inert, "the two states must not render identically");
+    assert_ne!(
+        undefined, inert,
+        "the two states must not render identically"
+    );
     assert!(
         undefined.contains("references undefined"),
         "the undefined text is shipped and documented; this fix must not reword it: {undefined}"
