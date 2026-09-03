@@ -149,6 +149,7 @@ pub(super) fn worker_loop_setup(
     // #3082: thread the references-missing-profile set so the screen None
     // branch can WARN (still Pass) for the lenient/HA-sync fail-open.
     screen_state.update_missing_profiles(forwarding.screen_missing_profiles.clone());
+    screen_state.update_inert_profiles(forwarding.screen_inert_profiles.clone());
     screen_state.update_syn_cookie_master_key(forwarding.syn_cookie_master_key.0);
     sessions.set_timeouts(forwarding.session_timeouts);
     // #3527: push the per-screened-zone half-open (`syn-flood timeout`)

@@ -2012,8 +2012,9 @@ is randomized per run, so ranging `cfg.Security.Zones` (a
 build for an UNCHANGED config — the hash differs, the reconcile never skips,
 and the dataplane re-applies the config on every reconcile (needless
 control-socket + dataplane work; a screen re-apply can also re-arm SYN-cookie
-state). `buildScreenSnapshots` and its sibling `buildScreenMissingProfileRefs`
-(`screens.go`, feeding `Screens` / `ScreenMissingProfiles`) now collect the
+state). `buildScreenSnapshots` and its siblings `buildScreenMissingProfileRefs` and
+`buildScreenInertProfileRefs` (`screens.go`, feeding `Screens` /
+`ScreenMissingProfiles` / `ScreenInertProfiles`) now collect the
 zone names, `sort.Strings` them, and range in sorted order — matching the
 long-standing pattern in `buildZoneSnapshots` (`zones.go`) and
 `buildSYNCookieMasterKey`. The syn-cookie master-key hash and all

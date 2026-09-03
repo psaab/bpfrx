@@ -268,6 +268,77 @@ use syncookie::SYN_COOKIE_STANDBY_ACK_VALIDATION_RATE_LIMIT_PER_SEC;
 use syncookie::SynCookieValidatedCache;
 use zone::{SynFloodGate, ZoneScreenState};
 
+/// #7888: which way a zone's screen reference failed to resolve.
+///
+/// A zone's screen reference has THREE outcomes, and only two of them are a
+/// fault. This enum names the two faults; the third -- no `screen` statement on
+/// the zone at all -- is a legitimate configuration and is represented by
+/// `None` from `unresolved_screen_kind`, never by a variant here.
+///
+/// Both variants take the SAME verdict, the #7168 substituted conservative
+/// default. They exist to select the WARN text, because "the profile does not
+/// exist" and "the profile exists and enforces nothing" send an operator to
+/// two different places.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum UnresolvedScreen {
+    /// The referenced profile is not defined at all (#3082). Strict commit
+    /// rejects this, so it arrives only through tolerant paths (HA config-sync
+    /// from a schema-skewed peer, tolerant load of an older active.json).
+    Undefined,
+    /// The referenced profile IS defined but enables no check (#7059). This
+    /// passes strict commit with zero warnings, which makes it strictly more
+    /// reachable than `Undefined` -- and it is the state that looks correct to
+    /// an operator, which is why it went unnoticed.
+    Inert,
+}
+
+/// #3082/#7168: the WARN text for a zone referencing an UNDEFINED screen
+/// profile. Extracted from the `eprintln!` so the wording is a testable value
+/// rather than a side effect -- #7888 turns on these two texts being tellable
+/// apart, and a property asserted only inside a formatting macro cannot be
+/// asserted at all.
+///
+/// Allocates, but only on the emit path, which is rate-limited to one per zone
+/// per second and is already past a `zone.to_string()` in the rate-counter
+/// lookup. Not a per-packet path.
+fn missing_profile_warn_message(zone: &str, profile: &str) -> String {
+    format!(
+        "xpf-userspace-dp: screen WARN: zone {zone:?} references undefined \
+         screen profile {profile:?}; enforcing the SUBSTITUTED conservative \
+         default (malformed-packet checks only — no flood/scan/session-limit \
+         thresholds) for this zone (#7168 lenient/HA-sync path) — fix the \
+         config or upgrade the HA peer to restore the configured profile",
+        zone = zone,
+        profile = profile,
+    )
+}
+
+/// #7888: the WARN text for a zone whose screen profile IS DEFINED but enables
+/// no check.
+///
+/// This must be tellable apart from `missing_profile_warn_message` by an
+/// OPERATOR, not just by a parser. That message is word-for-word the strict
+/// commit-time validation error in
+/// `pkg/config/compiler_validate_strict_screen.go`, so emitting it here would
+/// send someone hunting for an `ids-option` stanza that is present -- and this
+/// state passes strict commit with zero warnings, so there is no commit-time
+/// evidence to reconcile it against. Hence: lead with IS DEFINED, name the
+/// actual cause (a modifier is not a check), and give a different remedy.
+fn inert_profile_warn_message(zone: &str, profile: &str) -> String {
+    format!(
+        "xpf-userspace-dp: screen WARN: zone {zone:?} resolves to screen \
+         profile {profile:?}, which IS DEFINED but enables no check — every \
+         statement under it is a modifier (alarm-without-drop, a threshold) \
+         rather than a check, so the profile enforces nothing; enforcing the \
+         SUBSTITUTED conservative default (malformed-packet checks only — no \
+         flood/scan/session-limit thresholds) for this zone (#7888) — add at \
+         least one check to the profile, or remove the zone's screen \
+         statement if no enforcement is intended",
+        zone = zone,
+        profile = profile,
+    )
+}
+
 /// Global screen state: one consolidated per-zone map plus the cross-zone
 /// SYN-cookie machinery, per-IP scan/sweep trackers, missing-profile
 /// bookkeeping, and per-worker diagnostic counters.
@@ -307,13 +378,39 @@ pub(crate) struct ScreenState {
     /// profile, so they never appear in `zones` and folding them in would muddy
     /// the "one value per configured zone" invariant.
     missing_profile_refs: FxHashMap<String, String>,
+    /// #7888: zone -> profile name for zones whose screen profile IS DEFINED
+    /// but enables no check (the #7059 third state). A zone in this map is
+    /// enforced against the SAME #7168 substituted conservative default as an
+    /// undefined reference, and emits its OWN runtime WARN text.
+    ///
+    /// Deliberately a SECOND map rather than a flag inside
+    /// `missing_profile_refs`. The verdict is identical for both, but the WARN
+    /// text is not, and one map holding both states would make that text
+    /// undecidable at the point it is emitted -- which is the defect #7888
+    /// exists to fix, reintroduced one layer down. With two maps the three
+    /// states are read off membership directly, and the legitimate silent
+    /// `Pass` is "in NEITHER map".
+    ///
+    /// The two are disjoint by construction: the Go builders each skip the
+    /// other's case. Should a malformed or future sender ever put a zone in
+    /// both, `unresolved_screen_kind` resolves Undefined first -- the verdict
+    /// is the same either way, so only the WARN wording is affected.
+    inert_profile_refs: FxHashMap<String, String>,
     /// #3082: per-zone rate counter that bounds the missing-profile WARN to
     /// `MISSING_PROFILE_WARN_RATE_LIMIT_PER_SEC` per zone so a flood of packets
     /// to a misconfigured zone cannot spam the log (CLAUDE.md log-flood rule).
     missing_profile_warn_counters: FxHashMap<String, RateCounter>,
+    /// #7888: the inert-profile WARN's own per-zone rate counters. Separate
+    /// from `missing_profile_warn_counters` so each set's `retain` on config
+    /// update cannot evict the other's counters.
+    inert_profile_warn_counters: FxHashMap<String, RateCounter>,
     /// #3082: count of WARNs actually emitted (post rate-limit). Test seam so a
     /// unit test can assert the WARN path was taken without scraping stderr.
     missing_profile_warn_count: u64,
+    /// #7888: count of inert-profile WARNs actually emitted (post rate-limit).
+    /// Test seam, and separately assertable from the missing-profile count so
+    /// a test can prove the RIGHT warning fired, not merely that one did.
+    inert_profile_warn_count: u64,
     /// #7168: packets DROPPED by the conservative default substituted for an
     /// unresolved screen reference. Distinct from the ordinary screen drop
     /// counters on purpose: a drop here means a zone whose real profile never
@@ -373,8 +470,11 @@ impl ScreenState {
             ip_sweep: IpSweepTracker::default(),
             last_cleanup_secs: 0,
             missing_profile_refs: FxHashMap::default(),
+            inert_profile_refs: FxHashMap::default(),
             missing_profile_warn_counters: FxHashMap::default(),
+            inert_profile_warn_counters: FxHashMap::default(),
             missing_profile_warn_count: 0,
+            inert_profile_warn_count: 0,
             substituted_default_drops: 0,
             syn_alarm_pending: false,
             syn_flood_dst_drops: 0,
@@ -392,6 +492,17 @@ impl ScreenState {
         self.missing_profile_warn_counters
             .retain(|k, _| missing.contains_key(k));
         self.missing_profile_refs = missing;
+    }
+
+    /// #7888: replace the set of zones that resolve to a DEFINED screen profile
+    /// which enables no check (called on config update alongside
+    /// `update_missing_profiles`). Retains only the WARN rate counters for
+    /// zones still in the set, so a profile that gains a check stops warning
+    /// and frees its counter.
+    pub fn update_inert_profiles(&mut self, inert: FxHashMap<String, String>) {
+        self.inert_profile_warn_counters
+            .retain(|k, _| inert.contains_key(k));
+        self.inert_profile_refs = inert;
     }
 
     /// #7168: the verdict for a zone whose configured screen reference does NOT
@@ -424,13 +535,20 @@ impl ScreenState {
         now_secs: u64,
         addrs_known: bool,
     ) -> ScreenVerdict {
-        // The WARN is unchanged and still rate-limited; it now reports a
-        // substituted default rather than a bare fail-open.
-        self.maybe_warn_missing_profile(zone, now_secs);
-        if !self.missing_profile_refs.contains_key(zone) {
-            // No screen configured for this zone at all — nothing to substitute.
+        // #7888: THREE states reach here, not two, and they are read off
+        // membership in two disjoint maps. "In neither map" is the legitimate
+        // silent Pass -- a zone with no `screen` statement at all -- and it
+        // must stay the only arm that passes without a signal.
+        let Some(kind) = self.unresolved_screen_kind(zone) else {
+            // No screen configured for this zone at all — nothing to
+            // substitute, and nothing to warn about. Legitimate configuration.
             return ScreenVerdict::Pass;
-        }
+        };
+        // The WARN is rate-limited and now selects its text from `kind`: an
+        // undefined profile and a defined-but-inert one are DIFFERENT operator
+        // problems with different fixes, and #7888 exists because they were
+        // rendered identically.
+        self.maybe_warn_unresolved_profile(zone, kind, now_secs);
         let profile = ScreenProfile::conservative_default();
         if addrs_known && let Some(reason) = stateless::check_land(&profile, pkt) {
             self.substituted_default_drops = self.substituted_default_drops.wrapping_add(1);
@@ -445,6 +563,66 @@ impl ScreenState {
             return ScreenVerdict::Drop(reason);
         }
         ScreenVerdict::Pass
+    }
+
+    /// #7888: which of the two UNRESOLVED states `zone` is in, or `None` when
+    /// the zone has no screen configured at all.
+    ///
+    /// This is the single place the three states are separated, and it reads
+    /// membership rather than a flag so that adding a fourth state means adding
+    /// a map and an arm, not widening the meaning of an existing value.
+    fn unresolved_screen_kind(&self, zone: &str) -> Option<UnresolvedScreen> {
+        if self.missing_profile_refs.contains_key(zone) {
+            Some(UnresolvedScreen::Undefined)
+        } else if self.inert_profile_refs.contains_key(zone) {
+            Some(UnresolvedScreen::Inert)
+        } else {
+            None
+        }
+    }
+
+    /// #7888: emit the rate-limited runtime WARN for an unresolved screen
+    /// reference, choosing the text from `kind`. The verdict is the caller's
+    /// (`missing_profile_verdict`) and is the SAME substituted conservative
+    /// default for both kinds; only the diagnosis differs.
+    fn maybe_warn_unresolved_profile(
+        &mut self,
+        zone: &str,
+        kind: UnresolvedScreen,
+        now_secs: u64,
+    ) {
+        match kind {
+            UnresolvedScreen::Undefined => self.maybe_warn_missing_profile(zone, now_secs),
+            UnresolvedScreen::Inert => self.maybe_warn_inert_profile(zone, now_secs),
+        }
+    }
+
+    /// #7888: the WARN for a zone whose screen profile IS DEFINED but enables
+    /// no check.
+    ///
+    /// The text must be distinguishable from the undefined-profile WARN by more
+    /// than tone. That message is word-for-word the strict commit-time
+    /// validation error in `pkg/config/compiler_validate_strict_screen.go`, so
+    /// an operator who saw it here for an inert profile would go looking for an
+    /// `ids-option` stanza that is present, and then have to reconcile "the
+    /// config defines it" with "the daemon says undefined" -- with no
+    /// commit-time evidence to check against, because this state passes strict
+    /// commit with zero warnings. So this text leads with IS DEFINED, names the
+    /// actual cause (every statement under the profile is a modifier rather
+    /// than a check), and gives a different remedy.
+    fn maybe_warn_inert_profile(&mut self, zone: &str, now_secs: u64) {
+        let Some(profile) = self.inert_profile_refs.get(zone) else {
+            return;
+        };
+        let limited = self
+            .inert_profile_warn_counters
+            .entry(zone.to_string())
+            .or_default()
+            .increment(now_secs, MISSING_PROFILE_WARN_RATE_LIMIT_PER_SEC);
+        if !limited {
+            self.inert_profile_warn_count = self.inert_profile_warn_count.wrapping_add(1);
+            eprintln!("{}", inert_profile_warn_message(zone, profile));
+        }
     }
 
     /// #3082: emit a rate-limited runtime WARN if `zone` references a screen
@@ -465,15 +643,7 @@ impl ScreenState {
             .increment(now_secs, MISSING_PROFILE_WARN_RATE_LIMIT_PER_SEC);
         if !limited {
             self.missing_profile_warn_count = self.missing_profile_warn_count.wrapping_add(1);
-            eprintln!(
-                "xpf-userspace-dp: screen WARN: zone {zone:?} references undefined \
-                 screen profile {profile:?}; enforcing the SUBSTITUTED conservative \
-                 default (malformed-packet checks only — no flood/scan/session-limit \
-                 thresholds) for this zone (#7168 lenient/HA-sync path) — fix the \
-                 config or upgrade the HA peer to restore the configured profile",
-                zone = zone,
-                profile = profile,
-            );
+            eprintln!("{}", missing_profile_warn_message(zone, profile));
         }
     }
 
@@ -487,6 +657,13 @@ impl ScreenState {
 
     pub(crate) fn missing_profile_warn_count(&self) -> u64 {
         self.missing_profile_warn_count
+    }
+
+    /// #7888: number of inert-profile WARNs actually emitted (post rate-limit).
+    /// Test seam, separate from `missing_profile_warn_count` so a test can
+    /// assert WHICH warning fired rather than that some warning did.
+    pub(crate) fn inert_profile_warn_count(&self) -> u64 {
+        self.inert_profile_warn_count
     }
 
     /// Replace all screen profiles (called on config update).
@@ -721,8 +898,15 @@ impl ScreenState {
     /// Partial resolution was never affected: with one profile resolved,
     /// `has_profiles()` is already true and the WARN fires normally. This
     /// closes the all-or-nothing case only.
+    /// #7888: the inert set counts too. A config whose ONLY screen reference is
+    /// an inert one publishes no `zones` entry and no missing-profile ref, so
+    /// without this arm the whole screen stage would be skipped for it and the
+    /// substituted default would never run -- the same all-or-nothing hole
+    /// #6860 closed for the undefined case.
     pub fn has_screen_state(&self) -> bool {
-        !self.zones.is_empty() || !self.missing_profile_refs.is_empty()
+        !self.zones.is_empty()
+            || !self.missing_profile_refs.is_empty()
+            || !self.inert_profile_refs.is_empty()
     }
 
     /// Run all screen checks for a packet arriving on the given zone.

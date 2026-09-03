@@ -57,30 +57,60 @@ func TestScreenUnresolvedDispositionHasOneSource(t *testing.T) {
 	// chunk boundary matches nothing in the source and the guard would pass
 	// vacuously — the self-check below is what catches that.
 	//
-	// #7168 MOVED this guard's subject, and that is the change to understand
-	// before editing it. The tail used to be shared by BOTH no-enforcement
-	// dispositions, because both states had the identical consequence and
-	// differed only in why. An unresolved reference is now enforced against a
-	// substituted conservative default, so "no screen checks are applied" is
-	// false for that state and still true for the inert one. The tail therefore
-	// belongs to ScreenInertDisposition alone, and the self-check anchors there.
+	// This guard's SUBJECT has moved twice, and the moves are the change to
+	// understand before editing it. #7059 shared one tail between both
+	// no-enforcement dispositions, because both states had the identical
+	// consequence and differed only in why. #7168 gave the UNRESOLVED state a
+	// substituted conservative default, making "no screen checks are applied"
+	// false for it, so the tail was split and belonged to the inert disposition
+	// alone. #7888 then settled the same posture for the INERT state, so the two
+	// consequences are identical again and the tail is shared again — now
+	// describing the substituted default rather than the absence of enforcement.
 	//
-	// The COUNT property is unchanged and is the point of the guard: the tail
-	// literal must appear exactly once across pkg/ and cmd/, however split
-	// across `+` seams. What changed is which constant is allowed to contain it,
-	// not how many may.
-	const fragment = "checks are applied to this zone; policy evaluation is unaffected"
-	if !strings.Contains(ScreenInertDisposition, fragment) {
-		t.Fatalf("guard fragment is stale: %q is not inside the constant %q",
-			fragment, ScreenInertDisposition)
+	// The COUNT property never changed and is the point of the guard: the shared
+	// sentence must appear exactly once across pkg/ and cmd/, however split
+	// across `+` seams. What moves is which constants may contain it, and how
+	// many — never how many literals may exist.
+	const fragment = "the dataplane enforces a substituted conservative default for this zone"
+	// Self-check FIRST, and now against BOTH constants: a fragment that has gone
+	// stale matches nothing and the count below would pass vacuously at zero.
+	// After #7888 both dispositions must reach the sentence through the shared
+	// tail, so a fragment missing from either one is the tell that a constant was
+	// re-inlined rather than composed.
+	for _, c := range []struct {
+		name  string
+		value string
+	}{
+		{"ScreenUnresolvedDisposition", ScreenUnresolvedDisposition},
+		{"ScreenInertDisposition", ScreenInertDisposition},
+	} {
+		if !strings.Contains(c.value, fragment) {
+			t.Fatalf("guard fragment is stale: %q is not inside %s (%q)",
+				fragment, c.name, c.value)
+		}
 	}
-	// And it must NOT have crept back into the unresolved disposition: sharing
-	// the tail again would make that surface assert a consequence the dataplane
-	// contradicts, which is the drift this guard exists to prevent.
-	if strings.Contains(ScreenUnresolvedDisposition, fragment) {
-		t.Errorf("ScreenUnresolvedDisposition contains the no-enforcement tail %q, but "+
-			"#7168 made that claim FALSE for an unresolved reference — the dataplane "+
-			"enforces the substituted conservative default for that zone", fragment)
+	// Sharing the consequence must NOT collapse the two states into one message.
+	// The whole of #7059/#7888 is that an operator can tell WHICH configuration
+	// they have — "the profile does not exist" and "the profile exists and
+	// enforces nothing" have different remedies, and identical rendering is the
+	// defect, not the fix.
+	if ScreenUnresolvedDisposition == ScreenInertDisposition {
+		t.Error("the two dispositions render identically; sharing the CONSEQUENCE must not " +
+			"erase the diagnosis — an operator has to know whether to define the profile " +
+			"or to add a check to it")
+	}
+	if !strings.Contains(ScreenUnresolvedDisposition, "does not resolve") {
+		t.Errorf("ScreenUnresolvedDisposition lost its distinguishing cause: %q",
+			ScreenUnresolvedDisposition)
+	}
+	if !strings.Contains(ScreenInertDisposition, "defined but enables no checks") {
+		t.Errorf("ScreenInertDisposition lost its distinguishing cause: %q",
+			ScreenInertDisposition)
+	}
+	if strings.Contains(ScreenInertDisposition, "does not resolve") {
+		t.Errorf("ScreenInertDisposition must not tell an operator the reference does not "+
+			"resolve — it DOES resolve, and saying otherwise sends them looking for a "+
+			"definition that is present: %q", ScreenInertDisposition)
 	}
 
 	// Count OCCURRENCES, not files: a second copy in the SAME file is exactly as

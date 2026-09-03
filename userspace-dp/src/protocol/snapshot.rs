@@ -494,6 +494,21 @@ pub(crate) struct ConfigSnapshot {
     /// these zones; the verdict still stays Pass.
     #[serde(rename = "screen_missing_profile_zones", default)]
     pub screen_missing_profile_zones: Vec<ScreenMissingProfileRef>,
+    /// #7888: zones that resolve to a screen profile which IS DEFINED but
+    /// enables no check -- the #7059 third state. Like an undefined
+    /// reference, such a zone gets no `screens` entry, so without this the
+    /// helper cannot tell it from an undefined profile NOR from a zone with
+    /// no screen configured at all (a legitimate silent Pass).
+    ///
+    /// A SIBLING of `screen_missing_profile_zones`, deliberately not merged
+    /// into it: the two drive DIFFERENT runtime WARN texts, and one map
+    /// holding both would make the text undecidable where it is emitted.
+    ///
+    /// Additive + `#[serde(default)]`: an old Go binary that does not emit
+    /// this leaves the set empty, which is exactly today's behaviour (inert
+    /// zones Pass silently).
+    #[serde(rename = "screen_inert_profile_zones", default)]
+    pub screen_inert_profile_zones: Vec<ScreenMissingProfileRef>,
     /// SYN-cookie master key, hex-encoded (32 chars for 16 bytes). This
     /// is the secret that makes XDP-generated SYN-ACK cookies unforgeable
     /// — the source-validation check hashes the incoming ACK against it.

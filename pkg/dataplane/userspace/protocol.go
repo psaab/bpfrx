@@ -265,14 +265,40 @@ type ConfigSnapshot struct {
 	// Additive/skew-tolerant: an old helper without the field decodes it as
 	// empty (all-Pass, no warn); an old Go binary that does not emit it
 	// leaves the Rust set empty.
-	ScreenMissingProfiles []ScreenMissingProfileRef   `json:"screen_missing_profile_zones,omitempty"`
-	SYNCookieMasterKey    string                      `json:"syn_cookie_master_key,omitempty"`
-	Filters               []FirewallFilterSnapshot    `json:"filters,omitempty"`
-	Policers              []PolicerSnapshot           `json:"policers,omitempty"`
-	ThreeColorPolicers    []ThreeColorPolicerSnapshot `json:"three_color_policers,omitempty"`
-	ClassOfService        *ClassOfServiceSnapshot     `json:"class_of_service,omitempty"`
-	FlowExport            *FlowExportSnapshot         `json:"flow_export,omitempty"`
-	MirrorConfigs         []MirrorConfigSnapshot      `json:"mirror_configs,omitempty"`
+	ScreenMissingProfiles []ScreenMissingProfileRef `json:"screen_missing_profile_zones,omitempty"`
+	// ScreenInertProfiles records zones that resolve to a screen profile
+	// which IS DEFINED but enables no check (#7888, the #7059 third state).
+	// buildScreenSnapshots emits no `screens` entry for such a zone, exactly
+	// as it emits none for an undefined reference, so without this field the
+	// helper cannot tell the two apart -- and it cannot tell either of them
+	// from a zone with no screen configured at all, which is a LEGITIMATE
+	// silent Pass.
+	//
+	// Carried as a SIBLING of ScreenMissingProfiles rather than folded into
+	// it. The two sets are disjoint by construction (each builder skips the
+	// other's case) and must stay separately addressable on the wire: the
+	// helper branches its runtime WARN text on which set a zone is in, and
+	// merging them would make that text undecidable at the point it is
+	// emitted -- reintroducing the very defect #7888 exists to fix, one
+	// layer down.
+	//
+	// Additive/skew-tolerant in BOTH directions, which is what makes this
+	// safe to land without a flag day: an old helper without the field
+	// ignores it (inert zones Pass, exactly as today); an old Go binary that
+	// does not emit it leaves the Rust set empty (inert zones Pass, exactly
+	// as today). Neither direction is worse than the status quo, and no
+	// existing field changes meaning -- the rolling-upgrade rule is ADD a
+	// field, never redefine one, because the two HA nodes run different
+	// binaries against one wire and `serde(default)` cannot help when the
+	// OLDER binary is the sender.
+	ScreenInertProfiles []ScreenMissingProfileRef   `json:"screen_inert_profile_zones,omitempty"`
+	SYNCookieMasterKey  string                      `json:"syn_cookie_master_key,omitempty"`
+	Filters             []FirewallFilterSnapshot    `json:"filters,omitempty"`
+	Policers            []PolicerSnapshot           `json:"policers,omitempty"`
+	ThreeColorPolicers  []ThreeColorPolicerSnapshot `json:"three_color_policers,omitempty"`
+	ClassOfService      *ClassOfServiceSnapshot     `json:"class_of_service,omitempty"`
+	FlowExport          *FlowExportSnapshot         `json:"flow_export,omitempty"`
+	MirrorConfigs       []MirrorConfigSnapshot      `json:"mirror_configs,omitempty"`
 	// MirrorExclusions records the port-mirroring entries this snapshot's
 	// build REFUSED to install for a runtime reason (#7357 §2). Carried on
 	// the snapshot so a show surface renders the verdict that was actually

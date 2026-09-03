@@ -135,6 +135,24 @@ pub(super) fn build_screen_missing_profiles(
     out
 }
 
+/// #7888: build the zone -> screen-profile-name map for zones whose profile IS
+/// DEFINED but enables no check (the #7059 third state). Mirrors
+/// `build_screen_missing_profiles` exactly; the two maps stay separate so the
+/// runtime WARN can name the right cause, and so the `Pass` arm can be "in
+/// neither map" rather than a flag inside one.
+pub(super) fn build_screen_inert_profiles(
+    snapshot: &ConfigSnapshot,
+) -> FxHashMap<String, String> {
+    let mut out = FxHashMap::default();
+    for r in &snapshot.screen_inert_profile_zones {
+        if r.zone.is_empty() {
+            continue;
+        }
+        out.insert(r.zone.clone(), r.profile.clone());
+    }
+    out
+}
+
 fn parse_syn_cookie_master_key(key: &str) -> Option<[u8; 16]> {
     if key.len() != 32 {
         return None;
@@ -700,6 +718,7 @@ fn build_fallible_forwarding_state(
     state.nptv6 = Nptv6State::try_from_snapshots(&snapshot.nptv6_rules)?;
     state.screen_profiles = build_screen_profiles(snapshot);
     state.screen_missing_profiles = build_screen_missing_profiles(snapshot);
+    state.screen_inert_profiles = build_screen_inert_profiles(snapshot);
     state.syn_cookie_master_key =
         SynCookieMasterKey(parse_syn_cookie_master_key(&snapshot.syn_cookie_master_key));
     state.tcp_mss_all_tcp = snapshot.flow.tcp_mss_all_tcp;
