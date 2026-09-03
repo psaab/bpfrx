@@ -754,6 +754,45 @@ higher priority → local forced SECONDARY). The heartbeat is UDP on the
 shared control VLAN, so any host that can reach the peer's control IP
 could inject one.
 
+### Prerequisite: a cluster needs a time source (#8357)
+
+`set chassis cluster authentication-key` is not the only cluster-wide
+prerequisite. Cross-node **fabric gRPC** authenticates with
+`HMAC(PSK, unix_time / 30)` and the verifier accepts the current window
+±1, so once the two nodes' wall clocks drift more than about a minute
+apart **every inbound fabric RPC rejects — permanently**, because skew
+does not self-correct without NTP.
+
+#6708 measured this in the field: 141 s of skew, `NTPSynchronized=no` on
+**both** nodes, every cross-node RPC dead. The symptom the operator saw
+named SESSIONS ("fw0 has only 1 established sessions"); the cause was the
+clock.
+
+The appliance ships chrony installed and enabled with every default
+source deliberately commented out (`scripts/image/bake.py`), and xpfd
+renders `/etc/chrony/sources.d/xpf.sources` from `set system ntp server`.
+So a cluster with no `system ntp server` has **no time source by
+construction**.
+
+- **Configure it:** `set system ntp server <address>`, the SAME reachable
+  source on both nodes.
+- **Commit-time advisory (#8357):** committing a `chassis cluster` with
+  no `system ntp server` now emits a warning that names fabric RPC as
+  what will fail. It is a WARNING, never an error — configuring a cluster
+  before NTP is reachable is legitimate — and it is emitted on the STRICT
+  path only, so it does not repeat on every persisted-config boot
+  (`Store.Load`) or peer sync (`Store.SyncApply`).
+- **Runtime diagnosis (#6708):** once skew is already causing failures,
+  `fabric_auth_skew_6708.go` scans a bounded band and names the clock
+  rather than leaving the operator with the sessions symptom.
+
+The accept band is deliberately NOT widened to tolerate skew: the band
+**is** the replay horizon, and the allowlisted fabric RPCs include
+`ClearSessions` and cross-node redundancy-group failover. #7487 explored
+making the auth skew-INDEPENDENT and closed as operationally closed —
+see that issue for the design that survived review, if it is ever
+reopened.
+
 **Fix (first authed channel).** When a shared PSK is configured
 (`set chassis cluster authentication-key <key>` → `config.Secret`
 `ClusterConfig.ControlLinkAuthKey`, plumbed into the `Manager` by
