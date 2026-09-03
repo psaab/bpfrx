@@ -6,6 +6,7 @@
 //! decode_frame_summary, etc.) plus session-key / fabric-tag readers
 //! that operate on a frame slice without mutating it.
 
+use crate::afxdp::types::ForwardPacketMeta;
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1704,8 +1705,15 @@ pub(in crate::afxdp) fn l3_session_flow_from_meta(meta: UserspaceDpMeta) -> Opti
     };
     if src_ip.is_unspecified() || dst_ip.is_unspecified() {
         // #7055: the REACHABLE leg — an IP header carrying 0.0.0.0/:: from a
-        // fully parsed packet. On the fragment-association arms this is an
-        // operator-configured filter term not being evaluated.
+        // fully parsed packet.
+        //
+        // #7890: refusing here is CORRECT for session identity — a session keyed
+        // on `0.0.0.0` aliases every other unspecified-source flow — and it is
+        // why this function keeps the refusal. It is NOT correct for the
+        // enforcement sites, which need the packet's ADDRESSES rather than a
+        // session; they use `l3_enforcement_flow_from_meta` below. One resolver
+        // was answering both questions, and six call sites read a refusal of the
+        // first as "nothing to enforce" for the second.
         L3_CTX_NONE_UNSPECIFIED_ADDR.fetch_add(1, Ordering::Relaxed);
         return None;
     }
@@ -1722,6 +1730,61 @@ pub(in crate::afxdp) fn l3_session_flow_from_meta(meta: UserspaceDpMeta) -> Opti
             dst_port: 0,
                     discriminator: Default::default(),
                     routing_domain: 0,
+        },
+    })
+}
+
+/// The L3 context for ENFORCEMENT — interface filters, PBR and policy (#7890).
+///
+/// Identical to [`l3_session_flow_from_meta`] except that it does **not** refuse
+/// an unspecified address.
+///
+/// **Why the two are different functions rather than one.** A session keyed on
+/// `0.0.0.0` aliases every other unspecified-source flow, so refusing is right
+/// for identity. But a per-packet interface filter, a PBR
+/// `then { routing-instance X; discard; }` term and a zone policy do not need a
+/// session — they need the packet's **addresses**, and those parsed fine. The
+/// header carried `0.0.0.0`, which is a perfectly well-defined value to evaluate
+/// a `from`-clause against.
+///
+/// So the enforcement sites get their own accessor and the operator's configured
+/// verdict decides the packet's fate — rather than a session-identity refusal
+/// silently substituting "forward" for whatever was configured.
+///
+/// **Still refuses an unparseable family**, which is the genuinely unusable case
+/// (and unreachable in production: the shim only ever writes `AF_INET`/
+/// `AF_INET6`).
+///
+/// It bumps the same `L3_CTX_NONE_UNSPECIFIED_ADDR` counter, which therefore now
+/// means "an unspecified address was SEEN here", not "a lookup was refused".
+/// That keeps it usable as the witness a test asserts to prove the arm was
+/// entered before asserting what enforcement did.
+pub(in crate::afxdp) fn l3_enforcement_flow_from_meta(
+    meta: UserspaceDpMeta,
+) -> Option<SessionFlow> {
+    if let Some(flow) = l3_session_flow_from_meta(meta) {
+        return Some(flow);
+    }
+    // Refused. Distinguish the two legs: an unparseable family has no addresses
+    // to enforce against, an unspecified one does.
+    let (src_ip, dst_ip) = ForwardPacketMeta::from(meta).l3_addrs_unfiltered()?;
+    if !src_ip.is_unspecified() && !dst_ip.is_unspecified() {
+        // Refused for some other reason; do not invent a context.
+        return None;
+    }
+    Some(SessionFlow {
+        src_ip,
+        dst_ip,
+        forward_key: SessionKey {
+            addr_family: meta.addr_family,
+            protocol: meta.protocol,
+            src_ip,
+            dst_ip,
+            // #3291: NO L4 ports — a flowless packet's L4 header is absent.
+            src_port: 0,
+            dst_port: 0,
+            discriminator: Default::default(),
+            routing_domain: 0,
         },
     })
 }

@@ -3419,7 +3419,7 @@ pub(super) fn poll_binding_process_descriptor(
                     // miss cannot diverge on what the filter sees. Screen /
                     // IPsec are NOT repeated here: `stage_screen_check` already
                     // runs earlier in this loop for every packet, hit or miss.
-                    let hit_l3_ctx = crate::afxdp::frame::l3_session_flow_from_meta(meta);
+                    let hit_l3_ctx = crate::afxdp::frame::l3_enforcement_flow_from_meta(meta);
                     if let Some(l3_flow) = hit_l3_ctx.as_ref() {
                         let input_eval = evaluate_non_pbr_input_filter(
                             worker_ctx.forwarding,
@@ -3590,7 +3590,7 @@ pub(super) fn poll_binding_process_descriptor(
                     // reason in each: the flowless path has no L4 header to
                     // synthesize a reject from, and an ICMP error must never be
                     // answered with an ICMP error.
-                    let l3_ctx = crate::afxdp::frame::l3_session_flow_from_meta(meta);
+                    let l3_ctx = crate::afxdp::frame::l3_enforcement_flow_from_meta(meta);
 
                     // (1) Interface input filter (pre-routing), mirroring the
                     //     session-miss site above. The frame-derived `extra`
@@ -4681,7 +4681,7 @@ pub(super) fn poll_binding_process_descriptor(
                                 Some(f) => Some((f, true)),
                                 None => {
                                     synthetic_l3 =
-                                        crate::afxdp::frame::l3_session_flow_from_meta(meta);
+                                        crate::afxdp::frame::l3_enforcement_flow_from_meta(meta);
                                     synthetic_l3.as_ref().map(|f| (f, false))
                                 }
                             };
@@ -5049,7 +5049,7 @@ pub(super) fn poll_binding_process_descriptor(
                                     // observability, then PolicyDenied so the trailing
                                     // #1913 reinject chokepoint drops it fail-closed.
                                     if let Some(l3_flow) =
-                                        crate::afxdp::frame::l3_session_flow_from_meta(meta)
+                                        crate::afxdp::frame::l3_enforcement_flow_from_meta(meta)
                                     {
                                         let policy_icmp = policy_packet_icmp(packet_frame, meta);
                                         let policy_result =

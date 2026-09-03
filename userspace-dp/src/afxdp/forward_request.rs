@@ -427,7 +427,7 @@ pub(super) fn l3_wire_session_flow_from_meta(
     meta: UserspaceDpMeta,
     nat: NatDecision,
 ) -> Option<SessionFlow> {
-    let pre = crate::afxdp::frame::l3_session_flow_from_meta(meta)?;
+    let pre = crate::afxdp::frame::l3_enforcement_flow_from_meta(meta)?;
     let key = forward_wire_key(&pre.forward_key, nat);
     Some(SessionFlow {
         src_ip: key.src_ip,
@@ -507,7 +507,7 @@ pub(super) fn apply_cos_drop_side_effects(
         // the non-NAT case, where the two are identical anyway).
         ctx.flowless_wire_flow
             .clone()
-            .or_else(|| crate::afxdp::frame::l3_session_flow_from_meta(ctx.meta))
+            .or_else(|| crate::afxdp::frame::l3_enforcement_flow_from_meta(ctx.meta))
     } else {
         None
     };
