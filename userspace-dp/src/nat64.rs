@@ -239,6 +239,26 @@ pub(crate) struct Nat64Prefix {
     /// Asserted at the CONSUMPTION boundary by
     /// `nat64_6982_over_budget_is_distinguishable_from_empty_pool`.
     pub(crate) over_budget: bool,
+    /// #8115 R3: which OTHER allocators cover this prefix's `pool_v4`
+    /// addresses.
+    ///
+    /// A NAT64 prefix is its own occupancy domain — `port_allocator` is keyed by
+    /// `(prefix_bytes, pool_v4)` — so a source-NAT pool sharing one of these
+    /// addresses, or a second NAT64 prefix over the same pool, mints the same
+    /// `X:P` for a different live flow. #6979 F6 built the peer index from
+    /// source-NAT rules only, so NAT64 was never a MEMBER of it: the query
+    /// worked, the domain was simply absent.
+    ///
+    /// `None` on every config with no cross-domain overlap, which is every
+    /// config a strict commit accepts (#5144 names a source pool that also backs
+    /// a NAT64 rule-set, and two rule-sets sharing a pool under different
+    /// prefixes, as distinct collision owners).
+    ///
+    /// Populated by `wire_nat64_overlap_peers` AFTER both `source_nat_rules` and
+    /// `nat64` are built — `wire_overlap_peers` runs inside
+    /// `parse_source_nat_rules_with_previous`, before this state exists, which
+    /// is why R3 needed a second pass rather than one more line in the first.
+    pub(crate) overlap_owners: Option<std::sync::Arc<crate::nat::PoolAddressOwners>>,
 }
 
 impl Nat64Prefix {
@@ -259,6 +279,7 @@ impl Nat64Prefix {
             port_allocator,
             deterministic_v6: None,
             over_budget: false,
+            overlap_owners: None,
         }
     }
 }
@@ -273,6 +294,7 @@ impl Clone for Nat64Prefix {
             port_allocator: self.port_allocator.clone(),
             deterministic_v6: self.deterministic_v6,
             over_budget: self.over_budget,
+            overlap_owners: self.overlap_owners.clone(),
         }
     }
 }
@@ -909,6 +931,9 @@ impl Nat64State {
                 port_allocator,
                 deterministic_v6,
                 over_budget,
+                // Filled in by `wire_nat64_overlap_peers` once source-NAT rules
+                // and NAT64 prefixes both exist (#8115 R3).
+                overlap_owners: None,
             });
         }
         Self {
@@ -1267,17 +1292,32 @@ impl Nat64State {
         // of the round-robin PAT below. An out-of-range subscriber fails CLOSED
         // (DeterministicSubscriberOutOfRange) rather than silently round-robining
         // — the compliance mapping must never quietly degrade.
-        if let Some(det) = prefix.deterministic_v6 {
-            return allocate_nat64_pool_port_deterministic_v6(
+        let translated = if let Some(det) = prefix.deterministic_v6 {
+            allocate_nat64_pool_port_deterministic_v6(
                 &prefix.port_allocator,
                 flow,
                 &prefix.pool_v4,
                 det,
                 src_v6,
                 holder,
-            );
-        }
-        allocate_nat64_pool_port(&prefix.port_allocator, flow, &prefix.pool_v4, now_ns, holder)
+            )?
+        } else {
+            allocate_nat64_pool_port(&prefix.port_allocator, flow, &prefix.pool_v4, now_ns, holder)?
+        };
+        // #8115 R3: a NAT64 prefix is its own occupancy domain, so a source-NAT
+        // pool sharing one of these addresses — or a second prefix over the same
+        // pool — can already hold this identity for a live flow. ONE check after
+        // both arms rather than one inside each: the two arms differ in how they
+        // CHOOSE the tuple, not in what makes it a duplicate.
+        crate::nat::nat64_refuse_if_peer_owns(
+            &prefix.port_allocator,
+            prefix.overlap_owners.as_deref(),
+            flow,
+            translated,
+            now_ns,
+            holder,
+        )?;
+        Ok(translated)
     }
 
     /// Create a NAT64 forward decision: IPv6 packet → IPv4 translated.

@@ -56,14 +56,28 @@
 //! and `xpf_userspace_synced_import_reserve_refused_total`, whose help text
 //! already says those flows will not survive a failover (#8101).
 //!
-//! NOT COVERED, a separate route to the same duplicate rather than a rounding
-//! error (Codex round 1 on PR #8111; tracked in #8115):
-//!   - R3, NAT64 prefixes are their own allocators (`nat64.rs`) and are not
-//!     indexed here at all. It is a REGISTRY gap rather than a missing caller:
-//!     the query would work, the member was never added — and the index is
-//!     built inside `parse_source_nat_rules_with_previous`, before
-//!     `state.nat64` exists, so closing it needs a second wiring pass.
-//! It is reachable only from the same tolerated / peer-synced / handcrafted
+//! ALSO COVERED: NAT64 prefixes, as INDEX MEMBERS (#8115 R3). A `Nat64Prefix`
+//! owns its own `port_allocator`, keyed by `(prefix_bytes, pool_v4)`, so a
+//! source-NAT pool sharing one of those addresses — or a second prefix over the
+//! same pool — is a second occupancy domain over one address.
+//!
+//! This was a REGISTRY gap rather than a missing caller: the query worked, the
+//! domain was simply absent from the population it searches. `wire_overlap_peers`
+//! runs inside `parse_source_nat_rules_with_previous`, before `state.nat64`
+//! exists, so a prefix could never have been added there. `wire_nat64_overlap_peers`
+//! is the second pass, called from `forwarding_build` once both are built; it
+//! REPLACES the source-only index with a combined one (a strict superset, so no
+//! rule loses coverage) and hands it to both features. Both directions are
+//! closed: the NAT64 mint asks before publishing, and the source-NAT rules carry
+//! the combined view so their mint sees NAT64's allocations.
+//!
+//! The NAT64 mint asks ONCE, after both of its arms — round-robin PAT and
+//! deterministic NAPT64 (#4559) — because the arms differ in how they CHOOSE
+//! the tuple, not in what makes it a duplicate. The deterministic arm still
+//! earns its own cell, for the ROLLBACK: #6528 frees a block port with
+//! `free_no_recycle`, and a skipped rollback strands it.
+//!
+//! Everything is reachable only from the same tolerated / peer-synced / handcrafted
 //! population as the covered case (the Go #5144 strict gate rejects overlapping
 //! pools at commit on address overlap alone). That population is real and
 //! verified, not hypothetical: `lenientCompileOpts` is wired at
@@ -236,25 +250,99 @@ impl SourceNatRule {
 ///   excluded — a state that refuses new local mints while still accepting
 ///   synced reservations remains viable, and Codex round 1 is right to say so;
 ///   it is simply a larger change than this one.
-pub(super) fn wire_overlap_peers(out: &mut [SourceNatRule]) {
-    // Fast out: fewer than two pool-mode rules cannot overlap, and nothing is
-    // built at all.
-    if out.iter().filter(|rule| rule.pool_mode).take(2).count() < 2 {
-        return;
+/// One occupancy domain, as the index sees it: an allocator plus the addresses
+/// it covers.
+///
+/// #8115 R3: this exists so the source-NAT-only pass and the cross-feature pass
+/// share ONE index implementation. Two copies of the counting/owner-list logic
+/// would be free to drift, and a drifted copy is invisible — the query still
+/// answers, just about a different population.
+struct OwnerView<'a> {
+    allocator: &'a PortAllocator,
+    v4: &'a [Ipv4Addr],
+    v6: &'a [Ipv6Addr],
+}
+
+/// PASS 1 + PASS 2 over an already-DEDUPED list of occupancy domains.
+///
+/// `None` when fewer than two domains exist or no address is shared, which is
+/// every config a strict commit accepts.
+fn build_owner_index(views: &[OwnerView<'_>]) -> Option<PoolAddressOwners> {
+    if views.len() < 2 {
+        return None;
     }
 
-    // One entry per DISTINCT allocator that can actually HOLD a port.
+    // PASS 1 — count how many DISTINCT ALLOCATORS cover each address.
     //
-    // The `address_slots() == 0` skip is load-bearing, not tidiness:
-    // `PortAllocator::default()` builds a FRESH `Arc` per rule, and every rule
-    // that never received a real allocator carries one — a pool rule that
-    // failed with no previous generation to drain, in particular. Counting
-    // those as distinct makes this linear `same_allocator` scan quadratic in
-    // the RULE count, which no budget bounds (Codex round 2 on PR #8111,
-    // finding 1: R(R-1)/2 comparisons). An empty allocator can never answer
-    // `holds_port` true, so it is not an occupancy domain and indexing it buys
-    // nothing. A #7717 draining pool keeps its RETAINED allocator, which has
-    // slots, so it is still indexed — the case that matters.
+    // Each entry carries the last domain that incremented it, so a pool whose
+    // own configured members repeat an address counts ONCE. Counting per
+    // OCCURRENCE instead reported `[X, X]` as shared with itself: the rule then
+    // received the index and paid the `SeqCst` fence and a map probe on every
+    // mint, for a pool with no peer at all (Codex round 2 on PR #8111,
+    // finding 2). Every occurrence is still INDEXED in pass 2 — that half is
+    // required, and is what round-1 finding 3 was about.
+    let mut count_v4 = FxHashMap::<Ipv4Addr, (u32, usize)>::default();
+    let mut count_v6 = FxHashMap::<Ipv6Addr, (u32, usize)>::default();
+    for (i, view) in views.iter().enumerate() {
+        for addr in view.v4 {
+            let slot = count_v4.entry(*addr).or_insert((0, usize::MAX));
+            if slot.1 != i {
+                slot.0 += 1;
+                slot.1 = i;
+            }
+        }
+        for addr in view.v6 {
+            let slot = count_v6.entry(*addr).or_insert((0, usize::MAX));
+            if slot.1 != i {
+                slot.0 += 1;
+                slot.1 = i;
+            }
+        }
+    }
+    if !count_v4.values().any(|&(n, _)| n > 1) && !count_v6.values().any(|&(n, _)| n > 1) {
+        return None;
+    }
+
+    // PASS 2 — owner lists, for the SHARED addresses only.
+    let mut owners = PoolAddressOwners::default();
+    for view in views {
+        let v4_len = view.v4.len();
+        for (pos, addr) in view.v4.iter().enumerate() {
+            if count_v4.get(addr).map_or(0, |&(n, _)| n) < 2 {
+                continue;
+            }
+            owners.v4.entry(*addr).or_default().push(PoolAddressOwner {
+                allocator: view.allocator.clone(),
+                index: pos,
+            });
+        }
+        for (pos, addr) in view.v6.iter().enumerate() {
+            if count_v6.get(addr).map_or(0, |&(n, _)| n) < 2 {
+                continue;
+            }
+            // The occupancy vector is v4 addresses first, then v6 — the same
+            // layout `retained_pool_index_map` builds.
+            owners.v6.entry(*addr).or_default().push(PoolAddressOwner {
+                allocator: view.allocator.clone(),
+                index: v4_len + pos,
+            });
+        }
+    }
+    Some(owners)
+}
+
+/// The DISTINCT source-NAT occupancy domains, as indices into `out`.
+///
+/// The `address_slots() == 0` skip is load-bearing, not tidiness:
+/// `PortAllocator::default()` builds a FRESH `Arc` per rule, and every rule that
+/// never received a real allocator carries one — a pool rule that failed with no
+/// previous generation to drain, in particular. Counting those as distinct makes
+/// this linear `same_allocator` scan quadratic in the RULE count, which no budget
+/// bounds (Codex round 2 on PR #8111, finding 1: R(R-1)/2 comparisons). An empty
+/// allocator can never answer `holds_port` true, so it is not an occupancy domain
+/// and indexing it buys nothing. A #7717 draining pool keeps its RETAINED
+/// allocator, which has slots, so it is still indexed — the case that matters.
+fn distinct_source_owners(out: &[SourceNatRule]) -> Vec<usize> {
     let mut distinct: Vec<usize> = Vec::new();
     for (idx, rule) in out.iter().enumerate() {
         if !rule.pool_mode
@@ -271,80 +359,27 @@ pub(super) fn wire_overlap_peers(out: &mut [SourceNatRule]) {
         }
         distinct.push(idx);
     }
-    if distinct.len() < 2 {
-        return;
-    }
+    distinct
+}
 
-    // PASS 1 — count how many DISTINCT ALLOCATORS cover each address.
-    //
-    // Each entry carries the last allocator that incremented it, so a pool
-    // whose own configured members repeat an address counts ONCE. Counting per
-    // OCCURRENCE instead reported `[X, X]` as shared with itself: the rule then
-    // received the index and paid the `SeqCst` fence and a map probe on every
-    // mint, for a pool with no peer at all (Codex round 2 on PR #8111,
-    // finding 2). Every occurrence is still INDEXED in pass 2 — that half is
-    // required, and is what round-1 finding 3 was about.
-    let mut count_v4 = FxHashMap::<Ipv4Addr, (u32, usize)>::default();
-    let mut count_v6 = FxHashMap::<Ipv6Addr, (u32, usize)>::default();
-    for &idx in &distinct {
-        for addr in &out[idx].pool_addresses_v4 {
-            let slot = count_v4.entry(*addr).or_insert((0, usize::MAX));
-            if slot.1 != idx {
-                slot.0 += 1;
-                slot.1 = idx;
-            }
-        }
-        for addr in &out[idx].pool_addresses_v6 {
-            let slot = count_v6.entry(*addr).or_insert((0, usize::MAX));
-            if slot.1 != idx {
-                slot.0 += 1;
-                slot.1 = idx;
-            }
-        }
-    }
-    let shared_v4 = count_v4.values().any(|&(n, _)| n > 1);
-    let shared_v6 = count_v6.values().any(|&(n, _)| n > 1);
-    if !shared_v4 && !shared_v6 {
-        return;
-    }
+/// Hand the index to every pool-mode rule whose allocator touches a SHARED
+/// address, so every other rule keeps the `Option::is_none` fast path.
+///
+/// The address scan runs once per DISTINCT ALLOCATOR, not once per rule: rules
+/// are not bounded by #6812 and addresses are. Doing it per rule would
+/// reintroduce the round-1 cost defect one loop later — 1024 rules over two
+/// overlapping `/16` pools is 67,108,864 hash lookups when it is 131,072. The
+/// per-rule step that remains is a pointer compare against the (at most
+/// `max_pools`) allocators that touch a shared address.
+fn assign_source_owners(out: &mut [SourceNatRule], distinct: &[usize], owners: PoolAddressOwners) {
+    assign_source_owners_shared(out, distinct, Arc::new(owners));
+}
 
-    // PASS 2 — owner lists, for the SHARED addresses only.
-    let mut owners = PoolAddressOwners::default();
-    for &idx in &distinct {
-        let allocator = &out[idx].pool_allocator;
-        let v4_len = out[idx].pool_addresses_v4.len();
-        for (pos, addr) in out[idx].pool_addresses_v4.iter().enumerate() {
-            if count_v4.get(addr).map_or(0, |&(n, _)| n) < 2 {
-                continue;
-            }
-            owners.v4.entry(*addr).or_default().push(PoolAddressOwner {
-                allocator: allocator.clone(),
-                index: pos,
-            });
-        }
-        for (pos, addr) in out[idx].pool_addresses_v6.iter().enumerate() {
-            if count_v6.get(addr).map_or(0, |&(n, _)| n) < 2 {
-                continue;
-            }
-            // The occupancy vector is v4 addresses first, then v6 — the same
-            // layout `retained_pool_index_map` builds.
-            owners.v6.entry(*addr).or_default().push(PoolAddressOwner {
-                allocator: allocator.clone(),
-                index: v4_len + pos,
-            });
-        }
-    }
-
-    // Hand the index only to the rules whose pool actually touches a shared
-    // address, so every other rule keeps the `Option::is_none` fast path.
-    //
-    // The address scan runs once per DISTINCT ALLOCATOR, not once per rule, for
-    // the same reason the counting pass does: rules are not bounded by #6812
-    // and addresses are. Doing it per rule would reintroduce the round-1 cost
-    // defect one loop later — 1024 rules over two overlapping `/16` pools is
-    // 67,108,864 hash lookups when it is 131,072. The per-rule step that
-    // remains is a pointer compare against the (at most `max_pools`) allocators
-    // that touch a shared address.
+fn assign_source_owners_shared(
+    out: &mut [SourceNatRule],
+    distinct: &[usize],
+    owners: Arc<PoolAddressOwners>,
+) {
     let touching: Vec<usize> = distinct
         .iter()
         .copied()
@@ -362,7 +397,6 @@ pub(super) fn wire_overlap_peers(out: &mut [SourceNatRule]) {
     if touching.is_empty() {
         return;
     }
-    let owners = Arc::new(owners);
     let touching_allocators: Vec<PortAllocator> = touching
         .iter()
         .map(|&idx| out[idx].pool_allocator.clone())
@@ -378,6 +412,30 @@ pub(super) fn wire_overlap_peers(out: &mut [SourceNatRule]) {
             rule.overlap_owners = Some(Arc::clone(&owners));
         }
     }
+}
+
+pub(super) fn wire_overlap_peers(out: &mut [SourceNatRule]) {
+    // Fast out: fewer than two pool-mode rules cannot overlap, and nothing is
+    // built at all.
+    if out.iter().filter(|rule| rule.pool_mode).take(2).count() < 2 {
+        return;
+    }
+    let distinct = distinct_source_owners(out);
+    let owners = {
+        let views: Vec<OwnerView<'_>> = distinct
+            .iter()
+            .map(|&i| OwnerView {
+                allocator: &out[i].pool_allocator,
+                v4: &out[i].pool_addresses_v4,
+                v6: &out[i].pool_addresses_v6,
+            })
+            .collect();
+        build_owner_index(&views)
+    };
+    let Some(owners) = owners else {
+        return;
+    };
+    assign_source_owners(out, &distinct, owners);
 }
 
 /// #8115 R1/R2: does a PEER pool's allocator already own this WIRE identity, in
@@ -423,14 +481,117 @@ pub(super) fn peer_owns_wire_identity(
     flow: SourceNatFlowKey,
     translated: TranslatedTuple,
 ) -> bool {
-    if rule.overlap_owners.is_none() {
+    peer_owns_identity_in(
+        rule.overlap_owners.as_deref(),
+        &rule.pool_allocator,
+        flow,
+        translated,
+    )
+}
+
+/// The implementation behind [`peer_owns_wire_identity`], for a caller that
+/// holds an index and an allocator rather than a `SourceNatRule`.
+///
+/// #8115 R3: NAT64 has no `SourceNatRule` — a `Nat64Prefix` owns its allocator
+/// directly — so it needs this entry point. It is the SAME body rather than a
+/// second one on purpose: a NAT64 mint that asked a differently-composed
+/// question than a source-NAT mint would reproduce the split both are here to
+/// close, one feature over.
+pub(crate) fn peer_owns_identity_in(
+    owners: Option<&PoolAddressOwners>,
+    own: &PortAllocator,
+    flow: SourceNatFlowKey,
+    translated: TranslatedTuple,
+) -> bool {
+    let Some(owners) = owners else {
         return false;
-    }
+    };
     std::sync::atomic::fence(Ordering::SeqCst);
-    rule.peer_holds_identity(translated.ip, translated.port)
-        || rule.peer_holds_address_only_identity(&AddressOnlyReverseKey::for_flow(
-            &flow,
-            translated.ip,
-            translated.port,
-        ))
+    owners.peer_holds(own, translated.ip, translated.port)
+        || owners.peer_holds_address_only(
+            own,
+            &AddressOnlyReverseKey::for_flow(&flow, translated.ip, translated.port),
+        )
+}
+
+/// #8115 R3: rebuild the peer index with NAT64 prefixes as MEMBERS, and hand it
+/// to both features.
+///
+/// `wire_overlap_peers` runs inside `parse_source_nat_rules_with_previous`,
+/// where `state.nat64` does not exist yet, so a NAT64 prefix could never have
+/// been added there. This is the second pass, called once both are built. It is
+/// not a different query — it is the same index over a larger population, which
+/// is exactly what "a missing registry member" means.
+///
+/// The source-only index built by the first pass is REPLACED, not merged: the
+/// combined index is a strict superset (every source-NAT domain is still a
+/// member), so a rule that held the narrow one gets the wider one and no rule
+/// loses coverage.
+///
+/// Fast out before any work when no prefix contributes an occupancy domain,
+/// which is every config without NAT64 and every NAT64 config whose prefixes
+/// were refused by the #6982 budget (an over-budget prefix keeps a DEFAULT
+/// allocator with no slots — it can never answer `holds_port` true, so it is
+/// not a domain, the same reason the source-NAT pass skips those).
+pub(crate) fn wire_nat64_overlap_peers(
+    rules: &mut [SourceNatRule],
+    prefixes: &mut [crate::nat64::Nat64Prefix],
+) {
+    let mut distinct_n64: Vec<usize> = Vec::new();
+    for (idx, prefix) in prefixes.iter().enumerate() {
+        if prefix.pool_v4.is_empty() || prefix.port_allocator.address_slots() == 0 {
+            continue;
+        }
+        if distinct_n64.iter().any(|&seen| {
+            prefixes[seen]
+                .port_allocator
+                .same_allocator(&prefix.port_allocator)
+        }) {
+            continue;
+        }
+        distinct_n64.push(idx);
+    }
+    if distinct_n64.is_empty() {
+        return;
+    }
+    let distinct_src = distinct_source_owners(rules);
+    let owners = {
+        let mut views: Vec<OwnerView<'_>> = distinct_src
+            .iter()
+            .map(|&i| OwnerView {
+                allocator: &rules[i].pool_allocator,
+                v4: &rules[i].pool_addresses_v4,
+                v6: &rules[i].pool_addresses_v6,
+            })
+            .collect();
+        views.extend(distinct_n64.iter().map(|&i| OwnerView {
+            allocator: &prefixes[i].port_allocator,
+            v4: &prefixes[i].pool_v4,
+            // A NAT64 pool is always v4 (`allocate_nat64_pool_port` fails closed
+            // on a v6 translated tuple), so there is no v6 half to index.
+            v6: &[],
+        }));
+        build_owner_index(&views)
+    };
+    let Some(owners) = owners else {
+        return;
+    };
+    let owners = Arc::new(owners);
+    for &i in &distinct_n64 {
+        if prefixes[i]
+            .pool_v4
+            .iter()
+            .any(|addr| owners.v4.contains_key(addr))
+        {
+            let allocator = prefixes[i].port_allocator.clone();
+            // Every prefix SHARING that allocator gets it, not just the
+            // representative the dedup kept.
+            for prefix in prefixes.iter_mut() {
+                if prefix.port_allocator.same_allocator(&allocator) {
+                    prefix.overlap_owners = Some(Arc::clone(&owners));
+                }
+            }
+        }
+    }
+    assign_source_owners_shared(rules, &distinct_src, owners);
 }

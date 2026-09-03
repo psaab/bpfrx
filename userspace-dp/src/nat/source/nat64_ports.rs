@@ -153,3 +153,39 @@ pub(crate) fn reserve_nat64_pool_port(
     // NAT64 translated-port domain — so this stays the non-persistent entry point.
     allocator.reserve_flow(flow, translated, addr_index, deterministic, now_ns, holder)
 }
+
+/// #8115 R3: refuse a NAT64 mint whose translated identity a PEER allocator
+/// already owns, and undo the reservation before failing.
+///
+/// One function rather than a copy in each mint arm. NAT64 has two —
+/// round-robin PAT and deterministic NAPT64 (#4559) — and a check duplicated
+/// into both is free to drift; a drifted copy still answers, just about a
+/// different question. The caller applies this to whichever arm produced the
+/// tuple.
+///
+/// Keeps the module-private `TranslatedTuple` out of `nat64.rs`, the same reason
+/// [`allocate_nat64_pool_port`] exists.
+///
+/// `rollback_flow` rather than `release_flow`: this activation is being
+/// WITHDRAWN, not completing, and the two take different persistent-lease arms
+/// (#6528). It also matters for the DETERMINISTIC arm, whose block port must go
+/// back through `free_no_recycle` rather than onto the recycle ring the
+/// deterministic mapping never draws from.
+pub(crate) fn nat64_refuse_if_peer_owns(
+    allocator: &PortAllocator,
+    owners: Option<&PoolAddressOwners>,
+    flow: SourceNatFlowKey,
+    translated: (Ipv4Addr, u16),
+    now_ns: u64,
+    holder: NatHolder,
+) -> Result<(), SourceNatFailureReason> {
+    let tuple = TranslatedTuple {
+        ip: IpAddr::V4(translated.0),
+        port: translated.1,
+    };
+    if !peer_owns_identity_in(owners, allocator, flow, tuple) {
+        return Ok(());
+    }
+    allocator.rollback_flow(flow, tuple, now_ns, holder);
+    Err(SourceNatFailureReason::PoolPeerAddressOverlap)
+}

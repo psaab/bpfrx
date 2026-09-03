@@ -570,6 +570,9 @@ mod tests_txn_flow_cache;
 #[path = "tests_nat64_tunnel.rs"]
 mod tests_nat64_tunnel;
 #[cfg(test)]
+#[path = "tests_nat64_overlap_8115.rs"]
+mod tests_nat64_overlap_8115;
+#[cfg(test)]
 #[path = "tests_gre_local_delivery.rs"]
 mod tests_gre_local_delivery;
 #[cfg(test)]
