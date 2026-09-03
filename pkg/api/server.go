@@ -230,6 +230,10 @@ type Config struct {
 	// the xpf_ipmon_actuation_failures_total counter (#4423 L). Optional;
 	// if nil the metric is omitted.
 	IPMonActuationFailuresFn func() uint64
+	// RouteListenerMarksFn / RouteListenerRepublishesFn surface the #7437
+	// kernel-route-listener pair. Optional; nil leaves both metrics unemitted.
+	RouteListenerMarksFn       func() uint64
+	RouteListenerRepublishesFn func() uint64
 	// EventActionStatsFn surfaces event-options remediation action
 	// counters for the xpf_event_actions_* / xpf_event_action_queue_depth
 	// metrics (#2157). Optional; if nil, the family is omitted.
@@ -483,6 +487,8 @@ type Server struct {
 	schedulerRepublishFailClosedFn       func() bool
 	ipmonStatusFn                        func() []ipmon.PolicyStatus
 	ipmonActuationFailuresFn             func() uint64
+	routeListenerMarksFn                 func() uint64
+	routeListenerRepublishesFn           func() uint64
 	eventActionStatsFn                   func() eventengine.Stats
 	rpmPinFailedFn                       func() float64
 	feedsFn                              func() map[string]feeds.FeedInfo
@@ -594,6 +600,8 @@ func NewServer(cfg Config) *Server {
 		schedulerRepublishFailClosedFn:       cfg.SchedulerRepublishFailClosedFn,
 		ipmonStatusFn:                        cfg.IPMonStatusFn,
 		ipmonActuationFailuresFn:             cfg.IPMonActuationFailuresFn,
+		routeListenerMarksFn:                 cfg.RouteListenerMarksFn,
+		routeListenerRepublishesFn:           cfg.RouteListenerRepublishesFn,
 		eventActionStatsFn:                   cfg.EventActionStatsFn,
 		rpmPinFailedFn:                       cfg.RPMPinFailedFn,
 		feedsFn:                              cfg.FeedsFn,

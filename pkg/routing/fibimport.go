@@ -43,18 +43,29 @@ import (
 // NARROW; every restriction below exists so that adding routes can never
 // turn a working forwarding path into a drop or a hijack.
 //
-// WHAT THIS DOES NOT DO. It does not close the hole, it BOUNDS it. The
-// snapshot is pushed on operator commit and on ip-monitoring actuation
-// only; there is no kernel route-event subscription anywhere in this repo
-// (no netlink RouteSubscribe), so a route the kernel learns between two
-// pushes is still absent from the helper FIB and still takes the NoRoute
-// reinject until the next push. Closing that window needs an rtnetlink
-// route listener on the pkg/daemon side (the RTM_NEWNEIGH listener in
-// daemon_neighbor_listener.go is the shape to copy) and is deliberately
-// deferred. Because the window survives, the NoRoute disposition MUST stay
+// WHAT THIS DOES NOT DO. It does not close the hole, it BOUNDS it — and
+// #7437 has since narrowed that bound rather than removing it.
+//
+// Before #7437 the snapshot was pushed on operator commit and on
+// ip-monitoring actuation only, with no kernel route-event subscription
+// anywhere in the repo, so the window was "time to the next commit" —
+// unbounded in practice on a quiet box with a flapping peer. #7437 adds
+// the rtnetlink route listener (pkg/daemon/daemon_route_listener.go,
+// modelled on the RTM_NEWNEIGH listener as this comment used to
+// recommend), so a kernel route change now drives a republish on its own.
+//
+// THE WINDOW IS NARROWER, NOT GONE, and the distinction is load-bearing.
+// The listener MARKS; the republish is coalesced (pkg/coalesce, debounce
+// 1 s / throttle 3 s) because a per-event full snapshot replace under BGP
+// churn would starve session installs on the shared control socket. So a
+// route learned at t still reaches the helper FIB some seconds later, and
+// on a fresh boot the first push still bounds it.
+//
+// Because a window survives, the NoRoute disposition MUST STILL stay
 // slow-path eligible: dropping it instead — which #6664 proposes — would
 // black-hole every learned destination for the width of that window, and
-// on a fresh boot for the width of the first push.
+// on a fresh boot for the width of the first push. #7437 shrinks the
+// exposure; it does not make #6664 safe by itself.
 
 // LearnedRouteImportPreference is the Junos route preference stamped on
 // every imported route.

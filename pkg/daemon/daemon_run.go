@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/cli"
+	"github.com/psaab/xpf/pkg/coalesce"
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/dhcprelay"
@@ -536,6 +537,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 			go func() {
 				defer wg.Done()
 				d.neighborListener(ctx)
+			}()
+			// #7437: kernel route listener. Closes the learned-route
+			// staleness window #7409 left — the helper FIB was only
+			// republished on a commit or an ipmon actuation, so a route
+			// the kernel learned in between still resolved NoRoute and
+			// took the unadjudicated reinject. Marks only; the bounded
+			// republish is pkg/coalesce's, because a per-event full
+			// snapshot replace under BGP churn would starve session
+			// installs on the shared control socket.
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				d.routeListener(ctx, coalesce.New(d.actuateLearnedRouteRefresh))
 			}()
 		}
 		// #2197 item 2: always-on proxy-ARP/NDP re-assert. Started

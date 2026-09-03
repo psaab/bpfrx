@@ -473,6 +473,10 @@ func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventB
 		// #4423 L: ip-monitoring actuation-failure counter
 		// (xpf_ipmon_actuation_failures_total) — surfaces the silent
 		// #3757 self-heal retry loop so a degraded failover is visible.
+		// #7437: the kernel route-listener pair. See the field doc on
+		// Daemon for why both halves are needed to read either.
+		RouteListenerMarksFn:       d.RouteListenerMarks,
+		RouteListenerRepublishesFn: d.RouteListenerRepublishes,
 		IPMonActuationFailuresFn: func() uint64 {
 			if d.ipmon != nil {
 				return d.ipmon.ActuationFailures()

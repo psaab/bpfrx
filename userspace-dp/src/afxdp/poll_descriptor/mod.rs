@@ -4607,13 +4607,28 @@ pub(super) fn poll_binding_process_descriptor(
                             // steerable half of #6664.
                             //
                             // NOT a drop of NoRoute. #7409's importer BOUNDS the
-                            // divergence but does not close it — the snapshot is
-                            // pushed on commit and ip-monitoring actuation only, with
-                            // no netlink route subscription — so a route learned
-                            // between pushes must still reach the kernel. Dropping
-                            // NoRoute outright would black-hole every learned
-                            // destination for the width of that window, and on a fresh
-                            // boot until the first push. Adjudicating instead keeps the
+                            // divergence but does not close it, and #7437 has
+                            // narrowed that bound WITHOUT closing it either.
+                            //
+                            // This note used to say the snapshot is pushed "on
+                            // commit and ip-monitoring actuation only, with no
+                            // netlink route subscription". That premise is no
+                            // longer true: #7437 added the rtnetlink route
+                            // listener (pkg/daemon/daemon_route_listener.go), so
+                            // a kernel route change now drives a republish on its
+                            // own. The CONCLUSION is unchanged, and the premise is
+                            // corrected here rather than left to be read as still
+                            // describing the tree.
+                            //
+                            // The window survives because the listener MARKS and
+                            // the republish is coalesced (debounce 1s / throttle
+                            // 3s) — a per-event full snapshot replace would starve
+                            // session installs on the shared control socket. So a
+                            // route learned between pushes must still reach the
+                            // kernel. Dropping NoRoute outright would black-hole
+                            // every learned destination for the width of that
+                            // (now smaller) window, and on a fresh boot until the
+                            // first push. Adjudicating instead keeps the
                             // delegation for PERMITTED flows and removes it only for
                             // flows the operator's policy already denies.
                             //

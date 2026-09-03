@@ -18,6 +18,7 @@ import (
 	"golang.org/x/sync/semaphore"
 
 	"github.com/psaab/xpf/pkg/cluster"
+	"github.com/psaab/xpf/pkg/coalesce"
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/conntrack"
@@ -124,6 +125,16 @@ type Daemon struct {
 	// torn-down backend published on purpose (#6741), so a non-nil cell is
 	// not proof of an armed forwarding path.
 	dataplaneArmed atomic.Bool
+
+	// #7437 route-listener observability. The PAIR is the point: marks counts
+	// kernel route events that warranted a refresh, republishes counts the
+	// coalesced actuations, and marks >> republishes is the evidence that
+	// coalescing is working. Neither alone answers "is the listener alive and
+	// is it bounded?" — which is the question an operator has today with no
+	// way to ask it, and the reason #7409's staleness window went unnoticed
+	// long enough to need #7437.
+	routeListenerMarks atomic.Uint64
+	routeListenerLoop  atomic.Pointer[coalesce.Loop]
 
 	// #7194: last session-delta schema fingerprint advertised by the RUNNING
 	// helper, recorded from the ProcessStatus that DrainSessionDeltas returns.
