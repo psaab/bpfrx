@@ -198,6 +198,23 @@ type compileOpts struct {
 	// still boot through that already-committed config rather than fail to
 	// load. Commit stays strict (see the validator call site).
 	lenientEventAttributesMatch bool
+	// suppressClusterNTPAdvisory (#8357) suppresses the commit-time advisory
+	// that a chassis cluster carries no `system ntp server`.
+	//
+	// Unlike its neighbours this does NOT downgrade a hard error — the check is
+	// a WARNING on every path, because an operator legitimately configures a
+	// cluster before NTP is reachable and a hard reject would be worse than the
+	// fault it prevents. What the flag suppresses is the advisory ITSELF on the
+	// tolerant paths.
+	//
+	// That distinction is the point. `CompileConfigLenient` /
+	// `CompileConfigForNodeLenient` back `Store.Load` (persisted-config boot)
+	// and `Store.SyncApply` (HA peer sync), so without this the advisory would
+	// fire on every boot and every peer sync of a config that was committed
+	// long ago — which trains operators to ignore warnings, the opposite of
+	// what it is for. It belongs where an operator TYPES, once, and nowhere
+	// else.
+	suppressClusterNTPAdvisory bool
 	// lenientIPsecPolicyProposalRef (#2073) downgrades the IPsec policy
 	// proposal cross-reference check from a hard error to a warning on the
 	// tolerant load / peer-sync paths. A dangling `proposals` reference (or
@@ -2473,6 +2490,7 @@ func lenientCompileOpts() compileOpts {
 		lenientFlowTraceSizeFiles:              true,
 		lenientLogEventModeFormat:              true,
 		lenientEventAttributesMatch:            true,
+		suppressClusterNTPAdvisory:             true,
 		lenientIPsecPolicyProposalRef:          true,
 		lenientSchedulerMapRef:                 true,
 		lenientCoSInterfaceRefs:                true,
