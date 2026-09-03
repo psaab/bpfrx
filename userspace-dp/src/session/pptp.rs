@@ -118,6 +118,36 @@ impl PptpCall {
     }
 }
 
+/// A TCP/1723 segment copied off the hot path, waiting to be parsed (#7699).
+///
+/// The data path copies and moves on; it never parses. See
+/// [`PptpAssociations::take_pending`] for why the drain is periodic.
+#[derive(Clone, Debug)]
+pub(crate) struct PendingControlSegment {
+    pub(crate) src: IpAddr,
+    pub(crate) dst: IpAddr,
+    pub(crate) payload: Vec<u8>,
+}
+
+/// How many un-parsed control segments a worker will hold.
+///
+/// Small on purpose. PPTP control traffic is a handful of small messages per
+/// call, so a backlog past this means something is wrong rather than busy, and
+/// the cost of dropping is bounded and already designed: an unlearned
+/// association routes its call's data packets to the unassociated path —
+/// forwarded and counted — which is the same degradation a control segment
+/// arriving after its data takes.
+pub(crate) const PENDING_CONTROL_CAPACITY: usize = 64;
+
+/// How often a worker drains its pending control segments.
+///
+/// Matches `SESSION_GC_INTERVAL_NS`. The drain rides the periodic work the
+/// worker already does rather than adding a thread or a channel, which is the
+/// whole reason this shape was chosen — so an association can land up to one
+/// interval after its control exchange, and the first ~1s of that call's GRE
+/// data forwards unassociated.
+pub(crate) const CONTROL_DRAIN_INTERVAL_NS: u64 = 1_000_000_000;
+
 /// Reserved: the call-id pair was not carried on the HA sync wire.
 ///
 /// Not the encoding of the pair `(0, 0)` — PPTP call id 0 is not obviously
@@ -202,6 +232,17 @@ pub(crate) struct PptpAssociations {
     by_allocator: FxHashMap<(IpAddr, u16), u32>,
     /// `handle -> record`, for teardown, expiry and collision detection.
     by_handle: FxHashMap<u32, AssociationRecord>,
+    /// Control segments copied off the hot path, not yet parsed.
+    pending: Vec<PendingControlSegment>,
+    /// When [`Self::take_pending`] last handed the buffer out.
+    last_drain_ns: u64,
+    /// Control segments dropped because the buffer was full.
+    ///
+    /// Their calls learn no association and take the unassociated path. Counted
+    /// separately from `unassociated` because the causes are different: this one
+    /// means the worker could not keep up, the other means the data simply
+    /// arrived first.
+    control_dropped: u64,
     /// Version-1 packets that resolved to no association.
     ///
     /// **Expected non-zero during startup and after a restart**, and after any
@@ -350,6 +391,50 @@ impl PptpAssociations {
 
     pub(crate) fn len(&self) -> usize {
         self.by_handle.len()
+    }
+
+    /// Copy a control segment in from the data path. Never blocks, never parses.
+    ///
+    /// Returns whether it was accepted. A `false` is a DROP, counted, and its
+    /// consequence is the unassociated path — not a stall and not a retry,
+    /// because the data path must not wait on control-channel work.
+    pub(crate) fn push_control_segment(&mut self, seg: PendingControlSegment) -> bool {
+        if self.pending.len() >= PENDING_CONTROL_CAPACITY {
+            self.control_dropped = self.control_dropped.saturating_add(1);
+            return false;
+        }
+        self.pending.push(seg);
+        true
+    }
+
+    /// Hand the buffered segments out for parsing, at most once per
+    /// [`CONTROL_DRAIN_INTERVAL_NS`].
+    ///
+    /// **The interval gate is inside this function, deliberately.** The caller
+    /// is the worker poll loop, which runs at packet rate — a drain that gated
+    /// at the call site would be one edit away from running per-poll, which is
+    /// exactly the defect that shipped in #8399 when a hook landed on the wrong
+    /// side of `expire_stale_entries_ha`'s gate. Keeping the gate here means
+    /// "how often" is a property of the function rather than of every caller.
+    ///
+    /// Returns an empty vec when gated, so a caller cannot distinguish "nothing
+    /// to do" from "not yet" — which is correct: both mean do nothing.
+    pub(crate) fn take_pending(&mut self, now_ns: u64) -> Vec<PendingControlSegment> {
+        if self.last_drain_ns != 0
+            && now_ns.saturating_sub(self.last_drain_ns) < CONTROL_DRAIN_INTERVAL_NS
+        {
+            return Vec::new();
+        }
+        self.last_drain_ns = now_ns;
+        std::mem::take(&mut self.pending)
+    }
+
+    pub(crate) fn control_dropped_count(&self) -> u64 {
+        self.control_dropped
+    }
+
+    pub(crate) fn pending_len(&self) -> usize {
+        self.pending.len()
     }
 
     /// Force an association in at a CHOSEN handle, so the collision arm is
@@ -879,5 +964,97 @@ mod sweep_wiring_tests_7699 {
             Some(handle),
             "the sweep expired a live association before its idle bound"
         );
+    }
+}
+
+#[cfg(test)]
+mod dispatch_tests_7699 {
+    use super::*;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    fn seg(n: u8) -> PendingControlSegment {
+        PendingControlSegment {
+            src: ip("198.51.100.7"),
+            dst: ip("203.0.113.9"),
+            payload: vec![n; 32],
+        }
+    }
+
+    const T0: u64 = 1_000_000_000_000;
+
+    /// THE FREQUENCY PROPERTY: the drain runs once per interval, not once per
+    /// call.
+    ///
+    /// Its caller is the worker poll loop, which runs at packet rate. "The
+    /// dispatch runs" and "the dispatch runs once per drain rather than once
+    /// per packet" are different properties, and only the first is visible in
+    /// what the association table ends up containing — which is exactly how the
+    /// #8399 placement defect survived a sound wiring mutation and a sound
+    /// function mutation.
+    ///
+    /// Three steps, because the third is what makes the second mean anything:
+    /// an implementation that never drains at all also returns empty in step 2.
+    #[test]
+    fn the_control_drain_runs_once_per_interval_not_once_per_call_7699() {
+        let mut t = PptpAssociations::default();
+        assert!(t.push_control_segment(seg(1)));
+
+        // 1. First drain hands it over and starts the clock.
+        assert_eq!(t.take_pending(T0).len(), 1);
+
+        // 2. Another segment arrives, but a drain inside the interval must do
+        //    nothing — this is the per-packet-work assertion.
+        assert!(t.push_control_segment(seg(2)));
+        assert_eq!(
+            t.take_pending(T0 + CONTROL_DRAIN_INTERVAL_NS - 1).len(),
+            0,
+            "the drain ran inside its interval; called from the poll loop that \
+             is per-packet work, and the segment is still buffered so nothing \
+             about the end state would show it"
+        );
+        assert_eq!(t.pending_len(), 1, "the segment must still be buffered");
+
+        // 3. Past the interval it drains, proving step 2 was the gate and not a
+        //    drain that never fires.
+        assert_eq!(t.take_pending(T0 + CONTROL_DRAIN_INTERVAL_NS).len(), 1);
+        assert_eq!(t.pending_len(), 0);
+    }
+
+    /// A full buffer DROPS and counts; it does not stall the data path.
+    ///
+    /// The consequence is the unassociated path — the call learns no
+    /// association, so its data forwards and is counted. That is the same
+    /// designed degradation as a data packet arriving before its control
+    /// exchange, and it is asserted rather than inferred.
+    #[test]
+    fn a_full_control_buffer_drops_and_counts_7699() {
+        let mut t = PptpAssociations::default();
+        for i in 0..PENDING_CONTROL_CAPACITY {
+            assert!(
+                t.push_control_segment(seg(i as u8)),
+                "segment {i} must fit below capacity"
+            );
+        }
+        assert_eq!(t.control_dropped_count(), 0, "nothing dropped while it fit");
+
+        assert!(
+            !t.push_control_segment(seg(0xFF)),
+            "the segment past capacity must be REFUSED, not queued — the data \
+             path cannot grow this buffer on a busy box"
+        );
+        assert_eq!(t.control_dropped_count(), 1, "and the drop must be counted");
+        assert_eq!(
+            t.pending_len(),
+            PENDING_CONTROL_CAPACITY,
+            "the buffer must not have grown past its cap"
+        );
+
+        // CONTROL: after a drain there is room again, so the refusal above is
+        // about capacity and not a buffer that rejects everything.
+        assert_eq!(t.take_pending(T0).len(), PENDING_CONTROL_CAPACITY);
+        assert!(t.push_control_segment(seg(1)));
     }
 }
