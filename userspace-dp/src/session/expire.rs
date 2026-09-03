@@ -123,18 +123,6 @@ impl SessionTable {
         now_ns: u64,
         ha: Option<&ExpireHaContext<'_>>,
     ) -> Vec<ExpiredSession> {
-        // #7699: age out PPTP call associations in the same sweep the sessions
-        // use, because the hazard they carry is on the same clock.
-        //
-        // The association must expire whether or not a Call-Disconnect-Notify
-        // ever arrives: a lost notify, a restarted peer or a control channel
-        // torn down mid-call otherwise leaves an association that re-pairs a
-        // REUSED 16-bit call id onto a dead handle. That is a MIS-ATTRIBUTION —
-        // call B's traffic resolving to call A's session — not a memory leak,
-        // which is why it is bounded here rather than left to a capacity cap.
-        self.pptp
-            .expire_idle(now_ns, crate::session::pptp::ASSOCIATION_IDLE_TIMEOUT_NS);
-
         // Reset per-call stats BEFORE the gc-interval gate so that a
         // gated no-op call returns zeroed stats rather than leftovers
         // from a prior call (Codex impl-review round-2 non-blocking note).
@@ -143,6 +131,26 @@ impl SessionTable {
             return Vec::new();
         }
         self.last_gc_ns = now_ns;
+
+        // #7699: age out PPTP call associations in the same sweep the sessions
+        // use, because the hazard they carry is on the same clock.
+        //
+        // The association must expire whether or not a Call-Disconnect-Notify
+        // ever arrives: a lost notify, a restarted peer or a control channel
+        // torn down mid-call otherwise leaves an association that re-pairs a
+        // REUSED 16-bit call id onto a dead handle. That is a MIS-ATTRIBUTION —
+        // call B's traffic resolving to call A's session — not a memory leak.
+        //
+        // PLACEMENT IS LOAD-BEARING and it was wrong when this landed: this sat
+        // ABOVE the gc-interval gate, so it ran on EVERY call rather than once
+        // per interval. `expire_stale_entries_ha` is called from the worker poll
+        // loop and the gate is what makes it periodic — above it, this scanned
+        // the whole association map at poll frequency, which is precisely the
+        // per-poll work this tree exists to avoid. Below the gate it runs once
+        // per `SESSION_GC_INTERVAL_NS` like the session expiry it rides on.
+        self.pptp
+            .expire_idle(now_ns, crate::session::pptp::ASSOCIATION_IDLE_TIMEOUT_NS);
+
         self.wheel_observe(now_ns);
         let now_tick = now_ns / WHEEL_TICK_NS;
         let mut expired_entries: Vec<ExpiredSession> = Vec::new();
