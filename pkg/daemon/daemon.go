@@ -1358,6 +1358,21 @@ type Daemon struct {
 	// responder from a stale config snapshot.
 	proxyARPEnabledMu sync.Mutex
 	proxyARPEnabled   map[string]map[int]struct{}
+	// proxyARPUnresolved is the set of CONFIGURED proxy-arp interfaces whose
+	// Linux netdev did not resolve on the most recent reconcile (#7685). The
+	// reconcile already treats these as debt — it carries their prior responder
+	// state forward rather than tearing it down (#6536,
+	// retainUnresolvedProxyResponders) — but nothing published it, so a node
+	// whose proxy-arp responder is silently not answering looked identical to a
+	// healthy one on a commit that reported success.
+	//
+	// This is the SAME value the reconcile acts on, stored rather than
+	// recomputed, so the gauge and the reconcile cannot disagree about whether
+	// anything is owed. Rebuilt on every reconcile pass and cleared when the
+	// config no longer asks for proxy-arp, so a resolved interface stops being
+	// reported — a signal that keeps firing after the fix gets muted. Guarded
+	// by proxyARPEnabledMu.
+	proxyARPUnresolved []string
 
 	// archiveTransfer performs the transfer-on-commit upload of one
 	// serialized active-config file to an archive site. nil ⇒ the default

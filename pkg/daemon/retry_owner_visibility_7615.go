@@ -16,11 +16,19 @@ package daemon
 // whether anything is owed. A metric derived from a second, parallel predicate
 // would be a new way to be wrong.
 //
-// Proxy-ARP is absent on purpose. `reassertProxyARPOnce` keeps no debt and asks
-// no question — it re-runs its reconcile unconditionally every tick — so there
-// is no outstanding state to publish and a gauge wired to it could only report
-// a constant. Giving it a real signal needs a predicate invented first, which
-// is design rather than wiring; tracked as #7685.
+// Proxy-ARP joined them in #7685, but NOT by the predicate that was expected.
+// `reassertProxyARPOnce` still keeps no debt and asks no question — it re-runs
+// its reconcile unconditionally every tick — so "did the loop run" and "did the
+// kernel drift" remain unpublishable: drift is EXPECTED after a legitimate link
+// flap and is corrected on the next tick, so a gauge for it reads false almost
+// always and a counter for it reports a routine event.
+//
+// The reconcile did already hold a debt, though, and the code already called it
+// that: a CONFIGURED proxy-arp interface whose Linux netdev does not resolve is
+// retained rather than torn down (#6536), with its own log line naming it debt.
+// That condition does NOT self-heal on the next tick — it persists until the
+// interface appears — and while it holds, the responder is not answering on a
+// node whose commit reported success. See ProxyARPUnresolved below.
 
 // RADeadSenderPending reports whether an RA sender's asynchronous conn open
 // failed and has not yet been rebuilt (#6793).
@@ -58,3 +66,23 @@ func (d *Daemon) FabricOverlayMissing() bool {
 // able to observe by other means, because the channel they would use to look is
 // the channel that is down.
 func (d *Daemon) ManagementListenerDown() bool { return d.mgmtListenerDown() }
+
+// ProxyARPUnresolved reports whether a CONFIGURED proxy-arp interface failed to
+// resolve to a Linux netdev on the most recent reconcile (#7685).
+//
+// While true, proxy-arp is configured on that interface and the responder is
+// NOT answering: the reconcile could not enable it, and it retains the prior
+// state as debt rather than tearing it down (#6536). The operator's commit
+// reported success, so this is invisible by every other means.
+//
+// Unlike a drifted sysctl — which the always-on loop re-asserts on its next
+// tick and which is expected after a link flap — this does not clear until the
+// interface exists. That difference is why this is the predicate published and
+// "the kernel had drifted" is not: this one persists, and a signal that
+// persists is one an operator can act on.
+//
+// Reads the value the reconcile itself computed rather than recomputing it, so
+// the gauge and the reconcile cannot disagree, and costs nothing on the common
+// path — `proxyARPIfaceMap` is not called at all when no proxy-arp is
+// configured, preserving the loop's no-op-when-unconfigured property.
+func (d *Daemon) ProxyARPUnresolved() bool { return len(d.proxyARPUnresolvedNames()) > 0 }

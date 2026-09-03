@@ -134,9 +134,9 @@ func (c *xpfCollector) initControlPlaneDescriptors() {
 		[]string{"service"}, nil,
 	)
 	// #7615: the remaining debt-driven retry owners. Two siblings already
-	// publish (#6800, #6802); these complete the family. Proxy-ARP is
-	// deliberately absent — it keeps no debt, so a gauge could only report a
-	// constant (#7685).
+	// publish (#6800, #6802); these complete the family. Proxy-ARP joined in
+	// #7685 — not by a drift predicate, which reports a routine self-corrected
+	// event, but by the debt its reconcile already held.
 	c.raDeadSenderPending = prometheus.NewDesc(
 		"xpf_ra_dead_sender_pending",
 		"1 while a router-advertisement sender's asynchronous conn open has "+
@@ -145,6 +145,18 @@ func (c *xpfCollector) initControlPlaneDescriptors() {
 			"default route from this firewall — on a node whose commit reported "+
 			"success. The daemon rebuilds it autonomously every 30s; 0 once it "+
 			"succeeds.",
+		nil, nil,
+	)
+	c.proxyARPUnresolved = prometheus.NewDesc(
+		"xpf_proxy_arp_unresolved_pending",
+		"1 while a CONFIGURED proxy-arp interface failed to resolve to a Linux "+
+			"netdev on the most recent reconcile (#7685). While set, proxy-arp "+
+			"is configured on that interface and the responder is NOT answering "+
+			"— the reconcile could not enable it and retains its prior state as "+
+			"debt rather than tearing it down (#6536) — on a node whose commit "+
+			"reported success. Unlike a drifted sysctl, which the always-on loop "+
+			"re-asserts on its next tick, this does not clear until the "+
+			"interface exists. 0 once it resolves or proxy-arp is unconfigured.",
 		nil, nil,
 	)
 	c.fabricOverlayMissing = prometheus.NewDesc(
