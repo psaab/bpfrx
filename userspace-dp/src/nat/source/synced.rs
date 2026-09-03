@@ -548,11 +548,54 @@ fn reserve_synced_on_first_pool_owner<'a>(
                 }
                 continue;
             }
-            if rule
-                .pool_allocator
-                .reserve_address_only(flow, rewrite_src, holder)
-                .is_ok()
+            if let Ok(translated) =
+                rule.pool_allocator
+                    .reserve_address_only(flow, rewrite_src, holder)
             {
+                // #8115 R2: the identity the ACTIVE node chose may be one a
+                // LOCAL flow already owns in a PEER pool. `reserve_address_only`
+                // checks only THIS allocator's `address_only_owners`, so the
+                // import succeeded against a map that cannot see the peer, and
+                // the coordinator would then publish it and let the reverse-map
+                // insert displace the local owner.
+                //
+                // Refusing is not a new policy invented here — it is the policy
+                // this function ALREADY applies to the same conflict inside one
+                // allocator (a taken bit / an owned token returns `Refused` two
+                // lines below). It is also observable by construction: `Refused`
+                // is `may_publish() == false`, which the caller turns into
+                // `SyncedImportOutcome::RejectedReserve` and counts on
+                // `xpf_userspace_synced_import_reserve_refused_total`, whose
+                // help text already says those flows will not survive a
+                // failover. That counter is what makes fail-loud the better half
+                // of the trade (#8101), and it is why "surface the conflict
+                // rather than silently reserve" needs no new disposition.
+                //
+                // PASS 1 ONLY, and that gate is the whole design constraint.
+                // `stop_at_first_owner` is what distinguishes the two passes,
+                // and PASS 2 — reached when the zone pair CANNOT be resolved —
+                // must stay byte-identical. That is an HA node's entire first
+                // sync, before any snapshot is applied: there is no way to
+                // reproduce the active's rule choice, so the only available
+                // question is which rule's pool contains the address. Refusing
+                // there rejects EVERY import on such a node.
+                //
+                // Measured, not reasoned: without this gate the change reds
+                // `pass2_still_falls_through_a_refusing_owner_6979_f1`,
+                // `coordinator_pre_publish_reserve_uses_the_workers_zone_pair_6600`
+                // and two #6211 "frees both allocators" cells. #6979 F1 already
+                // knew PASS 2 accepts into the wrong allocator — its own comment
+                // measures the three-step latent loss — and left it deliberately
+                // for exactly this reason.
+                //
+                // Within PASS 1 the address is fixed by the WIRE, so no sibling
+                // rule can reach a different one and there is nothing to fall
+                // through to.
+                if stop_at_first_owner && peer_owns_wire_identity(rule, flow, translated) {
+                    rule.pool_allocator
+                        .rollback_flow(flow, translated, now_ns, holder);
+                    return SyncedReserveOutcome::Refused;
+                }
                 return SyncedReserveOutcome::Reserved;
             }
             // #6979 F1: the active's rule declined. Under `stop_at_first_owner`
@@ -619,18 +662,28 @@ fn reserve_synced_on_first_pool_owner<'a>(
         let persistent = rule
             .persistent_nat
             .then(|| (flow.persistent_source_key(rule.persistent_nat_permit), rule.persistent_nat_timeout_ns));
+        let translated = TranslatedTuple {
+            ip: rewrite_src,
+            port: rewrite_src_port,
+        };
         if rule.pool_allocator.reserve_flow_maybe_persistent(
             flow,
-            TranslatedTuple {
-                ip: rewrite_src,
-                port: rewrite_src_port,
-            },
+            translated,
             addr_index,
             rule.deterministic_v4.is_some(),
             now_ns,
             holder,
             persistent,
         ) {
+            // #8115 R2: see the address-only arm above. `reserve_flow` checks
+            // and sets only THIS allocator's bitmap, so an imported flow
+            // narrowed to pool B succeeds while a LOCAL flow already owns the
+            // same tuple in pool A.
+            if stop_at_first_owner && peer_owns_wire_identity(rule, flow, translated) {
+                rule.pool_allocator
+                    .rollback_flow(flow, translated, now_ns, holder);
+                return SyncedReserveOutcome::Refused;
+            }
             return SyncedReserveOutcome::Reserved;
         }
         // #6979 F1: see the address-only arm. The first pool-owning candidate

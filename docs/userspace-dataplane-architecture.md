@@ -940,7 +940,15 @@ the NAT module applies it:
   port rotation; the address-only key carries `dst_ip`/`dst_port`, so a match
   there is an exact duplicate of the wire 5-tuple and over-rejects nothing. All
   three address-only mint arms — v4 round-robin/persistent, v6, and
-  deterministic-v4 — carry the check, each bound by its own cell. Two source-NAT pools whose
+  deterministic-v4 — carry the check, each bound by its own cell.
+  **The HA synced reserve asks the same question, on PASS 1 only (#8115 R2).**
+  Both of its arms roll back and return `Refused` — already an observable
+  outcome (`SyncedImportOutcome::RejectedReserve`,
+  `xpf_userspace_synced_import_reserve_refused_total`), so surfacing the
+  conflict needed no new disposition. PASS 2, reached when the zone pair cannot
+  be resolved, stays byte-identical: that is an HA node's entire first sync
+  before any snapshot is applied, where the active's rule choice cannot be
+  reproduced, and refusing there would reject every import on such a node. Two source-NAT pools whose
   addresses overlap are two independent occupancy bitmaps — the allocator key
   carries the pool NAME — so each is blind to the other's live translations and
   both would publish one `(pool address, port)` for two live flows. One
