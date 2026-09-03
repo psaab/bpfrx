@@ -215,6 +215,13 @@ type compileOpts struct {
 	// what it is for. It belongs where an operator TYPES, once, and nowhere
 	// else.
 	suppressClusterNTPAdvisory bool
+	// suppressContestedTrunkZoneAdvisory (#7509) suppresses the commit-time
+	// advisory for a parent interface whose units span different zones. Set on
+	// the TOLERANT paths (Store.Load, Store.SyncApply) for the same reason as
+	// its sibling above: the condition is a property of a config already
+	// committed, so firing on every boot and peer sync trains the operator to
+	// skip it.
+	suppressContestedTrunkZoneAdvisory bool
 	// lenientIPsecPolicyProposalRef (#2073) downgrades the IPsec policy
 	// proposal cross-reference check from a hard error to a warning on the
 	// tolerant load / peer-sync paths. A dangling `proposals` reference (or
@@ -2491,6 +2498,7 @@ func lenientCompileOpts() compileOpts {
 		lenientLogEventModeFormat:              true,
 		lenientEventAttributesMatch:            true,
 		suppressClusterNTPAdvisory:             true,
+		suppressContestedTrunkZoneAdvisory:     true,
 		lenientIPsecPolicyProposalRef:          true,
 		lenientSchedulerMapRef:                 true,
 		lenientCoSInterfaceRefs:                true,
