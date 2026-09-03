@@ -252,8 +252,18 @@ func TestBGPNeighborImportDefinedPolicyAccepted(t *testing.T) {
 func TestBGPImportTypoLenientDowngrade(t *testing.T) {
 	// On the lenient (load / HA peer-sync, #1960) path an undefined import ref
 	// must downgrade to a warning, NOT hard-fail — an already-persisted or
-	// peer-pushed config must still load. The render path then drops the
-	// dangling route-map in (no permit-all leak).
+	// peer-pushed config must still load.
+	//
+	// #6807/#7625 CORRECTION: this comment used to add "the render path then
+	// drops the dangling route-map in (no permit-all leak)". Both halves were
+	// wrong. FRR DENIES a named-but-undefined route-map and permits only an
+	// ABSENT attachment, so dropping the reference IS the permit-all leak, not
+	// the protection from it. The renderer no longer drops it: an import chain
+	// whose every member is undefined now attaches a bounded explicit deny
+	// (pkg/frr, emptiedChainDenyName). This path — a config that committed on an
+	// older binary, or arrived from a peer — is exactly the population that fix
+	// serves, because strict commit still rejects the same config outright
+	// (TestBGPNeighborImportTypoRejected above).
 	cmds := []string{
 		"set protocols bgp local-as 65001",
 		"set protocols bgp group ebgp peer-as 65002",

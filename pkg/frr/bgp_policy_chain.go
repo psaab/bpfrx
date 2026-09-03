@@ -66,13 +66,20 @@ func hasNonEmptyPolicy(names []string) bool {
 // fails (bgp_input_modifier, bgp_output_modifier); only an ABSENT attachment
 // permits. So the direction of this drop is the opposite of what those comments
 // claim: dropping the reference is what yields permit-all, and emitting it
-// would deny. The drop is LEFT AS IS here — changing it is a behaviour choice
-// for an undefined (never-authored) policy, tracked separately — but do not
-// re-derive intent from the old sentence. Tracked as #7625. #6807 fixes the
-// sibling case where
-// the policy IS authored and the RENDERER omitted it (an over-ceiling
-// expansion): there the name is now defined by a bounded explicit deny rather
-// than left to dangle.
+// would deny.
+//
+// #7625 RESOLVED THE EMPTIED HALF. This function still returns only the
+// surviving subset, but the renderer no longer treats an EMPTY result as "no
+// attachment": when every authored member is a ghost, the attachment sites
+// reference a bounded explicit deny instead (bgpNeighborImportRef /
+// bgpNeighborExportRef, policy_chain_emptied_deny_7625.go). A NARROWED chain --
+// some members survive -- is still rendered as the surviving subset here,
+// pending a measurement of FRR chain evaluation that #7625 tracks separately.
+// Do not read the drop below as "the reference is safely discarded".
+//
+// #6807 fixes the sibling case where the policy IS authored and the RENDERER
+// omitted it (an over-ceiling expansion): there the name is defined by a
+// bounded explicit deny rather than left to dangle.
 func filterDefinedPolicies(names []string, po *config.PolicyOptionsConfig) []string {
 	out := make([]string, 0, len(names))
 	for _, n := range names {
@@ -143,6 +150,11 @@ func composedChainName(chain []string) string {
 // composed route-map (composedChainName) that renderComposedRouteMap emits. An
 // empty chain yields "" (no `route-map` line). The chain is pre-filtered to
 // DEFINED policy-statements, so the returned name never dangles.
+//
+// CALLERS: the neighbor attachment sites do NOT call this directly -- they go
+// through bgpNeighborImportRef / bgpNeighborExportRef, which map the "" case for
+// a chain that EMPTIED (every authored member undefined) onto the #7625 bounded
+// deny. Calling this directly reintroduces the permit-all hole for that case.
 func bgpRouteMapRef(chain []string) string {
 	switch len(chain) {
 	case 0:

@@ -2,6 +2,7 @@ package frr
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -242,4 +243,208 @@ func TestDanglingHelperIsBlindToNarrowing7625(t *testing.T) {
 		t.Errorf("the finding does not name the discarded policy: %v", drops[0])
 	}
 	t.Logf("#6807 helper: clean. #7625 detector: %v", drops[0])
+}
+
+// ---------------------------------------------------------------------------
+// #7625 EMPTIED-CHAIN FIX. The decision on #7625 splits the two shapes: the
+// EMPTIED chain gets a bounded explicit deny (this section), the NARROWED chain
+// keeps today's behaviour pending a measurement of FRR chain evaluation.
+//
+// Why the emptied case is a HOLE and not a degradation: the operator wrote a
+// filter on that direction, every member of it failed to resolve, and the
+// renderer's response was to emit NO attachment at all. Per the FRR semantics
+// established in #6807, an ABSENT attachment is the one and only shape that
+// PERMITS. So the config that asked for the most filtering got the least.
+
+// neighborRouteMapRefs7625 returns the route-map names attached to addr in the
+// given direction ("in"/"out"), in render order.
+func neighborRouteMapRefs7625(section, addr, dir string) []string {
+	var out []string
+	re := regexp.MustCompile(`(?m)^\s*neighbor ` + regexp.QuoteMeta(addr) +
+		` route-map (\S+) ` + dir + `\s*$`)
+	for _, m := range re.FindAllStringSubmatch(section, -1) {
+		out = append(out, m[1])
+	}
+	return out
+}
+
+// routeMapIsDeny7625 reports whether name is defined in the section and every
+// sequence it defines is a deny. A single permit sequence anywhere under the
+// name is enough to let routes through, so this asks for ALL, not ANY.
+func routeMapIsDeny7625(section, name string) (defined bool, allDeny bool) {
+	re := regexp.MustCompile(`(?m)^route-map ` + regexp.QuoteMeta(name) + ` (permit|deny) \d+\s*$`)
+	ms := re.FindAllStringSubmatch(section, -1)
+	if len(ms) == 0 {
+		return false, false
+	}
+	for _, m := range ms {
+		if m[1] != "deny" {
+			return true, false
+		}
+	}
+	return true, true
+}
+
+// THE FIX. An import chain whose every member is undefined must deny, not
+// permit. Before the fix this fails at the FIRST assertion: no attachment is
+// emitted at all.
+func TestEmptiedImportChainDeniesRatherThanPermits7625(t *testing.T) {
+	po := policyOptions7625("REAL")
+	fc := &FullConfig{
+		PolicyOptions: po,
+		BGP: &config.BGPConfig{
+			LocalAS: 65001, RouterID: "1.1.1.1",
+			Neighbors: []*config.BGPNeighbor{
+				{Address: "10.0.2.1", PeerAS: 65002, FamilyInet: true, Import: []string{"GHOST"}},
+			},
+		},
+	}
+	section := New().buildManagedSection(fc)
+
+	refs := neighborRouteMapRefs7625(section, "10.0.2.1", "in")
+	if len(refs) != 1 {
+		t.Fatalf("an emptied import chain emitted %d inbound route-map attachments, want 1 "+
+			"(no attachment is the PERMIT-ALL shape #7625 is about):\n%s", len(refs), section)
+	}
+	defined, allDeny := routeMapIsDeny7625(section, refs[0])
+	if !defined {
+		t.Fatalf("attachment references %q but the managed section never defines it", refs[0])
+	}
+	if !allDeny {
+		t.Errorf("route-map %q must be an unconditional deny; it carries a permit sequence:\n%s",
+			refs[0], section)
+	}
+	// The #6807 property must hold BY CONSTRUCTION, not because the reference
+	// was dropped.
+	if d := danglingRouteMapRefs6807(section); len(d) != 0 {
+		t.Errorf("emptied-chain fix left dangling route-map refs %v", d)
+	}
+}
+
+// THE TRAP, as a negative control. A BGP `export` list may name bare PROTOCOL
+// tokens (`static`, `direct`), which are not policy-statements and are excluded
+// from the policy chain on purpose: they render as `redistribute <proto>` on a
+// separate path. Such a list also filters to EMPTY, but it is not an emptied
+// FILTER — the operator asked to advertise those routes, not to drop
+// everything. Attaching a deny here would withdraw every route to the peer.
+//
+// This cell fails if the fix keys on "the filtered chain is empty" instead of
+// "every authored member is a genuine ghost".
+func TestEmptiedExportChainOfBareProtocolTokensGetsNoDeny7625(t *testing.T) {
+	po := policyOptions7625("REAL")
+	fc := &FullConfig{
+		PolicyOptions: po,
+		BGP: &config.BGPConfig{
+			LocalAS: 65001, RouterID: "1.1.1.1",
+			Neighbors: []*config.BGPNeighbor{
+				{Address: "10.0.2.3", PeerAS: 65004, FamilyInet: true, Export: []string{"static"}},
+			},
+		},
+	}
+	section := New().buildManagedSection(fc)
+
+	// Anti-vacuity: "static" really is a bare protocol token, so this fixture
+	// really does exercise the empty-after-filter path.
+	if !knownRedistProtocol("static") {
+		t.Fatalf("fixture premise broken: \"static\" is not a known redistribute protocol")
+	}
+	if kept := bgpNeighborExportChain(fc.BGP.Neighbors[0], nil, po); len(kept) != 0 {
+		t.Fatalf("fixture premise broken: the export chain did not filter to empty, got %v", kept)
+	}
+	if refs := neighborRouteMapRefs7625(section, "10.0.2.3", "out"); len(refs) != 0 {
+		t.Errorf("a bare-protocol export list must not attach a deny (it would withdraw "+
+			"every route to the peer); got %v:\n%s", refs, section)
+	}
+}
+
+// NEGATIVE CONTROL. An intact chain must be untouched by the fix — same
+// attachment, referencing the operator's own policy, no deny anywhere.
+func TestIntactChainIsUnaffectedByTheEmptiedFix7625(t *testing.T) {
+	po := policyOptions7625("REAL")
+	fc := &FullConfig{
+		PolicyOptions: po,
+		BGP: &config.BGPConfig{
+			LocalAS: 65001, RouterID: "1.1.1.1",
+			Neighbors: []*config.BGPNeighbor{
+				{Address: "10.0.2.4", PeerAS: 65005, FamilyInet: true, Import: []string{"REAL"}},
+			},
+		},
+	}
+	section := New().buildManagedSection(fc)
+	refs := neighborRouteMapRefs7625(section, "10.0.2.4", "in")
+	if len(refs) != 1 || refs[0] != "REAL" {
+		t.Fatalf("intact chain must reference the operator policy, got %v", refs)
+	}
+}
+
+// THE DIRECTION ASYMMETRY. A bare protocol token means REDISTRIBUTE on export,
+// but nothing at all on import — inbound has no redistribute construct, so the
+// token renders as a route-map name and resolves to nothing. The strict commit
+// path rejects it for exactly that reason
+// (config.TestBGPNeighborImportProtocolTokenRejected), so it reaches the
+// renderer only on the lenient load / peer-sync path — and there it is a ghost
+// like any other and must DENY.
+//
+// This cell fails if the protocol-token exclusion is applied to both directions
+// instead of just export. It is the counterpart of the export cell above: the
+// two together pin the asymmetry, which neither can do alone.
+func TestEmptiedImportChainOfBareProtocolTokensStillDenies7625(t *testing.T) {
+	po := policyOptions7625("REAL")
+	fc := &FullConfig{
+		PolicyOptions: po,
+		BGP: &config.BGPConfig{
+			LocalAS: 65001, RouterID: "1.1.1.1",
+			Neighbors: []*config.BGPNeighbor{
+				{Address: "10.0.2.5", PeerAS: 65006, FamilyInet: true, Import: []string{"static"}},
+			},
+		},
+	}
+	section := New().buildManagedSection(fc)
+	refs := neighborRouteMapRefs7625(section, "10.0.2.5", "in")
+	if len(refs) != 1 || refs[0] != emptiedChainDenyName {
+		t.Fatalf("an inbound bare protocol token resolves to nothing and must deny; "+
+			"got refs %v:\n%s", refs, section)
+	}
+	if _, allDeny := routeMapIsDeny7625(section, refs[0]); !allDeny {
+		t.Errorf("route-map %q must be an unconditional deny", refs[0])
+	}
+}
+
+// The reserved name must not be forgeable. FRR merges same-named route-maps, so
+// an operator policy-statement of this exact name would fuse its sequences into
+// the deny. The strict path forbids the reserved namespace; this is the
+// render-side belt for the lenient path, and it fails the apply CLOSED.
+func TestEmptiedChainDenyCollisionFailsClosed7625(t *testing.T) {
+	po := policyOptions7625("REAL", emptiedChainDenyName)
+	fc := &FullConfig{
+		PolicyOptions: po,
+		BGP: &config.BGPConfig{
+			LocalAS: 65001, RouterID: "1.1.1.1",
+			Neighbors: []*config.BGPNeighbor{
+				{Address: "10.0.2.6", PeerAS: 65007, FamilyInet: true, Import: []string{"GHOST"}},
+			},
+		},
+	}
+	err := emptiedChainDenyCollision(fc)
+	if err == nil {
+		t.Fatal("a colliding operator policy-statement of the reserved deny name must fail the apply closed")
+	}
+	if !strings.Contains(err.Error(), emptiedChainDenyName) {
+		t.Errorf("collision error does not name the route-map: %v", err)
+	}
+	// NEGATIVE CONTROL: the same colliding name is harmless when no attachment
+	// resolves to the deny, so the guard must not fire on every config that
+	// happens to define that name.
+	clean := &FullConfig{
+		PolicyOptions: po,
+		BGP: &config.BGPConfig{
+			LocalAS: 65001, RouterID: "1.1.1.1",
+			Neighbors: []*config.BGPNeighbor{
+				{Address: "10.0.2.7", PeerAS: 65008, FamilyInet: true, Import: []string{"REAL"}},
+			},
+		},
+	}
+	if err := emptiedChainDenyCollision(clean); err != nil {
+		t.Errorf("guard fired on a config that never references the deny: %v", err)
+	}
 }

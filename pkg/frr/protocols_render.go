@@ -530,7 +530,7 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				// references the composed route-map that preserves the ordered
 				// Junos policy chain (#5277) instead of dropping all but the
 				// last.
-				if rm := bgpRouteMapRef(bgpNeighborExportChain(n, globalExportChain, policyOptions)); rm != "" {
+				if rm := bgpNeighborExportRef(n, bgp, globalExportChain, policyOptions); rm != "" {
 					fmt.Fprintf(&b, "  neighbor %s route-map %s out\n", n.Address, rm)
 				}
 				// Junos `then next-hop self` is lowered per-term INSIDE the
@@ -549,7 +549,7 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				// (no dangling in-line), single-policy references the standalone
 				// route-map, and a chain of >= 2 references the composed
 				// route-map preserving the ordered inbound policy chain.
-				if rm := bgpRouteMapRef(bgpNeighborImportChain(n, globalImportChain, policyOptions)); rm != "" {
+				if rm := bgpNeighborImportRef(n, bgp, globalImportChain, policyOptions); rm != "" {
 					fmt.Fprintf(&b, "  neighbor %s route-map %s in\n", n.Address, rm)
 				}
 			}
@@ -573,7 +573,7 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 					fmt.Fprintf(&b, "  neighbor %s maximum-prefix %d\n", n.Address, n.PrefixLimitInet6)
 				}
 				// Outbound filter (#2539/#5277) — see the ipv4 block above.
-				if rm := bgpRouteMapRef(bgpNeighborExportChain(n, globalExportChain, policyOptions)); rm != "" {
+				if rm := bgpNeighborExportRef(n, bgp, globalExportChain, policyOptions); rm != "" {
 					fmt.Fprintf(&b, "  neighbor %s route-map %s out\n", n.Address, rm)
 				}
 				// `then next-hop self` is lowered per-term in the export
@@ -581,7 +581,7 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				// neighbor-wide `next-hop-self` knob (#5115) — see the ipv4
 				// block above.
 				// Inbound filter (#2490/#5277) — see the ipv4 block above.
-				if rm := bgpRouteMapRef(bgpNeighborImportChain(n, globalImportChain, policyOptions)); rm != "" {
+				if rm := bgpNeighborImportRef(n, bgp, globalImportChain, policyOptions); rm != "" {
 					fmt.Fprintf(&b, "  neighbor %s route-map %s in\n", n.Address, rm)
 				}
 			}
