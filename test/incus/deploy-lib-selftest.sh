@@ -924,14 +924,20 @@ test_reassert_issues_reset_transfer_reset_per_rg() {
 	for rg in 0 1; do
 		local xfer_ln clear_ln status_between
 		xfer_ln=$(grep -nx "request chassis cluster failover redundancy-group $rg node 0" "$CLI_LOG" | tail -1 | cut -d: -f1)
-		clear_ln=$(grep -nx "request chassis cluster failover reset redundancy-group $rg" "$CLI_LOG" | tail -1 | cut -d: -f1)
-		if (( clear_ln <= xfer_ln )); then
-			bad "reassert rg$rg: the pin-clearing reset (line $clear_ln) does not come after the transfer (line $xfer_ln)"
+		# The FIRST reset issued after the transfer is the one that matters. An
+		# earlier draft of this cell took the LAST one (`tail -1`) and was
+		# INSENSITIVE to the defect: restoring the race adds a reset right after
+		# the transfer, but a later phase-3 reset still satisfies "the last reset
+		# comes after a status read". Measured -- that mutation passed this cell
+		# and was caught only by the #7688 reset-COUNT cell next door.
+		clear_ln=$(awk -v n="$xfer_ln" 'NR>n && $0=="request chassis cluster failover reset redundancy-group '"$rg"'" {print NR; exit}' "$CLI_LOG")
+		if [[ -z "$clear_ln" ]]; then
+			bad "reassert rg$rg: no pin-clearing reset issued after the transfer at line $xfer_ln -- the pin is left set, which blocks the next election (#7688)"
 			return
 		fi
 		status_between=$(sed -n "$((xfer_ln+1)),$((clear_ln-1))p" "$CLI_LOG" | grep -cx 'show chassis cluster status')
 		if (( status_between < 1 )); then
-			bad "reassert rg$rg: pin cleared at line $clear_ln with NO status read between it and the transfer at line $xfer_ln (of $n_lines). That is the #7771 race: the reset wins and the RG falls back to the natural election."
+			bad "reassert rg$rg: the FIRST reset after the transfer (line $clear_ln) has NO status read between it and the transfer (line $xfer_ln, of $n_lines). That is the #7771 race: the reset wins and the RG falls back to the natural election."
 			return
 		fi
 	done
