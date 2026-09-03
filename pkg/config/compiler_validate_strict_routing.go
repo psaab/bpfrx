@@ -1446,6 +1446,56 @@ func validatePolicyReservedChainNameStrict(cfg *Config) error {
 // commit-check stay strict. Runs on the fully-compiled *Config so the
 // as-path map is populated regardless of authoring order. Mirrors
 // validatePolicyCommunityReferencesStrict.
+// validatePolicyCommunityRegexStrict hard-rejects a `policy-options community`
+// member that xpf cannot render into a loadable frr.conf line — the sibling of
+// validatePolicyASPathRegexStrict that #6686 never got (#8449).
+//
+// A member carrying a regex metacharacter renders into an FRR `expanded`
+// community-list, where FRR runs it through regcomp. One that does not compile
+// is a CMD_WARNING_CONFIG_FAILED, and a single such failure exits the whole
+// vtysh add-batch non-zero — failing the ENTIRE frr-reload, not just this list,
+// and leaving every dynamic routing change stale.
+//
+// Note which malformed members reached this gate before it existed and which
+// did not: `65000:(`, `65000:a{3,1}` and `65000:\` are rejected by the LEXER as
+// `unexpected character`, an accident of tokenization rather than a gate, while
+// `65000:[` and `*65000` committed clean and were rendered verbatim. That
+// partial coverage is why the hole was easy to miss — a spot check of malformed
+// members mostly returns "rejected".
+//
+// Pairs with the render-side belt in pkg/frr (generatePolicyOptions), which
+// shares ValidCommunityMember so the two cannot drift.
+func validatePolicyCommunityRegexStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	// Sort for a deterministic first-error message (map order is random).
+	names := make([]string, 0, len(cfg.PolicyOptions.Communities))
+	for name := range cfg.PolicyOptions.Communities {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		cd := cfg.PolicyOptions.Communities[name]
+		if cd == nil {
+			continue
+		}
+		for _, member := range cd.Members {
+			if err := ValidCommunityMember(member); err != nil {
+				return fmt.Errorf("policy-options community %s members %q: %v — xpf "+
+					"renders `bgp community-list expanded %s permit %s`, which "+
+					"frr-reload rejects, failing the entire FRR config load; "+
+					"write the member as a QUOTED value if it is meant as a "+
+					"literal, e.g. `set policy-options community %s members "+
+					"\"65000:100\"`",
+					name, member, err, name, member, name)
+			}
+		}
+	}
+	return nil
+}
+
 func validatePolicyASPathRegexStrict(cfg *Config) error {
 	if cfg == nil {
 		return nil
