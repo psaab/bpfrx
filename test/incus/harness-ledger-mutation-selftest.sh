@@ -193,6 +193,34 @@ MUTATIONS = {
         "the separation of the ROW's verdict from the GATE's exit status: an "
         "unattributable row now reds `make test-failover`",
     ),
+    "comparator-reads-a-single-path": (
+        PY_FILE, "py",
+        "    p = pathlib.Path(path)\n    if p.is_dir():",
+        "    p = pathlib.Path(path)\n    if False:",
+        "the shard-directory read: the comparator falls back to single-file "
+        "behaviour and the glob is decorative (#8346 acceptance)",
+    ),
+    "merge-guard-blind-to-a-legacy-parent": (
+        PY_FILE, "py",
+        '    legacy = run(["git", "show", f"{rev}:test/results/{LEGACY_LEDGER_NAME}"])',
+        '    legacy = run(["git", "show", f"{rev}:test/results/NOTHING"])',
+        "the legacy source in run_ids_at_rev: a parent from before the migration "
+        "reads as the EMPTY SET and the completeness guard passes vacuously",
+    ),
+    "ordering-tie-break-is-storage-dependent": (
+        PY_FILE, "py",
+        '    return sorted(rows, key=lambda r: (r["ts"], r.get("run_id", "")))',
+        '    return sorted(rows, key=lambda r: r["ts"])',
+        "the storage-independent tie-break: which row is 'newest' becomes a "
+        "function of the filenames rather than of the data",
+    ),
+    "shard-filename-identity-unchecked": (
+        PY_FILE, "py",
+        '        if row.get("run_id") != name:',
+        "        if False:",
+        "the filename==run_id check, which is what makes reading the run-id set "
+        "off a git tree trustworthy",
+    ),
     "dirty-flag-permanently-on": (
         SH_FILE, "sh",
         '\tdirt=$(git -C "$root" status --porcelain -uall 2>/dev/null |',
@@ -245,6 +273,28 @@ if mutated == text:
     print(f"VOID: the replacement changed nothing in {fname}", file=sys.stderr)
     raise SystemExit(3)
 open(src, "w", encoding="utf-8").write(mutated)
+
+# LANDING CHECK: re-READ the file from disk and confirm the edit is actually
+# there. An escaped mutation and a killed one are equally meaningless if the
+# edit never reached the tree, and the two failure directions look nothing
+# alike from the outside: a write that silently did not land reads as an
+# ESCAPE ("this guard has no power"), which argues for deleting a guard that
+# works. Checking the in-memory string is not the same as checking the file --
+# a failed/partial write, a read-only path, or a stale copy are exactly what
+# this is for.
+landed = open(src, encoding="utf-8").read()
+if new not in landed:
+    print(f"VOID: the mutation did not land in {src} (new text absent after write)", file=sys.stderr)
+    raise SystemExit(3)
+# Only meaningful for a REPLACEMENT. An INSERTION mutation deliberately keeps
+# the original text -- `new` contains `old` -- and asserting its absence there
+# would VOID a perfectly landed edit. (It did, on first run: the run_id-dedup
+# cell inserts a line above the text it anchors on.) Refine the check rather
+# than reshape the mutation to satisfy it; a guard that forces a workaround is
+# mis-specified.
+if old not in new and old in landed:
+    print(f"VOID: the original text is STILL in {src} after the write", file=sys.stderr)
+    raise SystemExit(3)
 raise SystemExit(0)
 PY
 }
@@ -280,6 +330,29 @@ run_gate() {
 # A runner whose gate always reds scores every mutation as KILLED and reports a
 # perfect sweep of an inverted world. This is the only cell that can tell the
 # two apart, and it runs first.
+# ── Staging check: the gates must read the STAGED copies ─────────────
+#
+# Both gates are pointed at $WORK -- the py gate by cwd + `discover -s`, the sh
+# gate by HARNESS_RESULT_LIB. If either override were ignored the gate would
+# run against the pristine tree, every mutation would score as an ESCAPE, and
+# the report would read "these guards have no power" when nothing had been
+# mutated at all. Prove the plumbing before trusting any verdict: mutate a
+# staged copy so that it CANNOT pass, and require each gate to notice.
+staging_fail=""
+restore
+printf '\nraise SystemExit("staged-copy canary")\n' >>"$WORK/ledger_compare.py"
+gate_py && staging_fail="$staging_fail py"
+restore
+printf '\nharness_adapt() { return 99; }\n' >>"$WORK/harness-result.sh"
+gate_sh && staging_fail="$staging_fail sh"
+restore
+if [ -n "$staging_fail" ]; then
+	echo "FAIL: staging check — these gates did NOT read the staged copy:$staging_fail" >&2
+	echo "  Every mutation below would have scored as an ESCAPE against an unmutated tree." >&2
+	exit 1
+fi
+echo "PASS: staging check — both gates read the staged copies, not the tree"
+
 restore
 control_fail=0
 for g in py sh; do

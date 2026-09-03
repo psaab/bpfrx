@@ -1,9 +1,29 @@
 #!/usr/bin/env python3
 """Compare the newest gate run against a band over the last K green runs.
 
-Reads ``test/results/ledger.jsonl`` (written by ``test/incus/harness-result.sh``)
+Reads ``test/results/ledger.d/`` (written by ``test/incus/harness-result.sh``)
 and answers ONE question about one gate at one env: is the newest headline
 metric inside the distribution of the runs we already trust?
+
+Storage: one file per run (#8346)
+---------------------------------
+The ledger is a DIRECTORY of ``<run_id>.json`` shards, not one appended file.
+Dozens of lanes run gates concurrently here, and every one of them appending to
+a single tracked file made a merge conflict on ordinary operation. Every row is
+a real record, so those conflicts were always union-resolvable -- which is
+precisely the problem: a hand resolve on a data file, on every rebase, is where
+a row gets dropped by accident, and one did.
+
+One file per run removes the decision instead of adding a rule to remember
+under merge pressure: two writers never touch the same path, because ``run_id``
+is already unique per run and already in the row. No merge driver is involved
+at all, which matters because this repo's ``.git/config`` shadowed git's
+built-in ``union`` driver with a no-op for months (#8348) and silently dropped
+three real rows.
+
+A legacy single-file ``ledger.jsonl`` is still READ wherever one is named --
+:func:`load_ledger_text` accepts either -- because history is full of them and
+:func:`run_ids_at_rev` has to see across the migration. Nothing WRITES one.
 
 Why a band and not "compare against the previous run"
 -----------------------------------------------------
@@ -130,6 +150,127 @@ LEDGER_CORRUPT = "LEDGER-CORRUPT"
 
 class LedgerError(Exception):
     """The ledger could not be read as a ledger. Never a comparison result."""
+
+
+# ---------------------------------------------------------------------------
+# Storage: a directory of <run_id>.json shards, or a legacy single .jsonl
+# ---------------------------------------------------------------------------
+
+#: Directory name under test/results/ holding one JSON object per run.
+LEDGER_DIR_NAME = "ledger.d"
+
+#: The pre-#8346 single-file ledger. Never written any more; still read, because
+#: every merge parent from before the migration has one and the merge-
+#: completeness guard must see across that boundary.
+LEGACY_LEDGER_NAME = "ledger.jsonl"
+
+
+def default_ledger_path() -> str:
+    """The repo's ledger: the shard directory, or the legacy file if that is
+    all this checkout has."""
+    import pathlib
+
+    results = pathlib.Path(__file__).resolve().parents[2] / "test" / "results"
+    shards = results / LEDGER_DIR_NAME
+    if shards.is_dir():
+        return str(shards)
+    legacy = results / LEGACY_LEDGER_NAME
+    if legacy.exists():
+        return str(legacy)
+    return str(shards)
+
+
+def shard_paths(directory: str) -> List[str]:
+    """Every shard in a ledger directory, in a deterministic order.
+
+    Sorted so two runs of the comparator over one directory read the rows in
+    the same order. Order does not change a verdict -- :func:`compare` sorts by
+    the ``ts`` FIELD -- but a non-deterministic read order would make a
+    difference between two runs impossible to attribute.
+    """
+    import pathlib
+
+    d = pathlib.Path(directory)
+    if not d.is_dir():
+        return []
+    return [str(p) for p in sorted(d.glob("*.json"))]
+
+
+def load_ledger_text(path: str) -> str:
+    """Read a ledger -- a shard DIRECTORY or a legacy single file -- as JSONL.
+
+    Returning text rather than rows is deliberate. Every check below
+    (:func:`lint_ledger`, :func:`parse_ledger`, :func:`run_ids`) was written
+    against JSONL text and is exercised by cells against JSONL text; making the
+    storage change produce the SAME text keeps the storage change from touching
+    the band arithmetic at all. ``ledger_compare_test.py`` pins that as an
+    equivalence rather than asserting it here: the band over the sharded rows
+    must equal the band over the same rows as one file.
+
+    Each shard is emitted as ONE line, so a hand-edited pretty-printed shard is
+    re-compacted rather than producing a stream of unparseable fragments. A
+    shard that does not parse is passed through verbatim so the linter reports
+    it by name instead of this function swallowing it.
+
+    A missing path returns "" -- the caller decides whether "no ledger" is a
+    read error or the empty-ledger FAIL, and those are different answers.
+    """
+    import pathlib
+
+    p = pathlib.Path(path)
+    if p.is_dir():
+        out = []
+        for shard in shard_paths(path):
+            raw = pathlib.Path(shard).read_text(encoding="utf-8").strip()
+            if not raw:
+                continue
+            try:
+                out.append(json.dumps(json.loads(raw), separators=(",", ":"), ensure_ascii=False))
+            except ValueError:
+                # Not parseable: hand it to the linter as-is, flattened so it
+                # stays one "line" and is reported once rather than N times.
+                out.append(raw.replace("\n", " "))
+        return "\n".join(out)
+    if p.exists():
+        return p.read_text(encoding="utf-8")
+    return ""
+
+
+def lint_shard_names(directory: str) -> List[str]:
+    """Each shard's FILENAME must equal the ``run_id`` it contains.
+
+    Under one-file-per-run the filename IS the identity: it is what makes two
+    concurrent writers conflict-free, and it is what
+    :func:`run_ids_at_rev` reads out of a git tree WITHOUT parsing the file. A
+    shard whose name and payload disagree breaks both properties silently --
+    the tree-level run-id set would name a run the file does not describe.
+
+    Empty on a legacy single-file ledger: there are no filenames to check, and
+    reporting a problem for a layout that has none would make the legacy path
+    permanently red.
+    """
+    import pathlib
+
+    problems: List[str] = []
+    if not pathlib.Path(directory).is_dir():
+        return problems
+    for shard in shard_paths(directory):
+        name = pathlib.Path(shard).stem
+        try:
+            row = json.loads(pathlib.Path(shard).read_text(encoding="utf-8"))
+        except ValueError as exc:
+            problems.append(f"{shard}: not parseable as JSON ({exc})")
+            continue
+        if not isinstance(row, dict):
+            problems.append(f"{shard}: not a JSON object")
+            continue
+        if row.get("run_id") != name:
+            problems.append(
+                f"{shard}: filename says run_id {name!r} but the row says "
+                f"{row.get('run_id')!r} — the filename IS the identity under "
+                "one-file-per-run"
+            )
+    return problems
 
 
 # ---------------------------------------------------------------------------
@@ -291,10 +432,27 @@ def lint_merge_completeness(merged: str, parents: Sequence[str]) -> List[str]:
     survives the config being fixed, the storage moving to one-file-per-run, or
     a future driver regressing again.
     """
+    # #8346 note: the SET LOGIC moved to lint_merge_completeness_ids so a caller
+    # that already has the ids -- read off shard FILENAMES in a git tree,
+    # without parsing anything -- can use it directly. This text-taking
+    # signature is kept as the public door rather than replaced, because
+    # #8349's cells drive the guard through it; retiring it would leave the
+    # logic tested only through the newer path and quietly decommission the
+    # tests that were written against the real incident.
+    return lint_merge_completeness_ids(run_ids(merged), [run_ids(p_) for p_ in parents])
+
+
+def lint_merge_completeness_ids(merged: set, parents: Sequence[set]) -> List[str]:
+    """The set check itself, over run-id SETS rather than ledger text.
+
+    Same rule, same message, one layer down: a merge result must retain every
+    ``run_id`` present in either parent. A SET check and not a count -- a count
+    is satisfied by a merge that dropped one row and added another, which is
+    exactly the coincidence a count cannot see.
+    """
     problems: List[str] = []
-    have = run_ids(merged)
     for idx, parent in enumerate(parents):
-        missing = run_ids(parent) - have
+        missing = set(parent) - set(merged)
         if missing:
             problems.append(
                 f"merge dropped {len(missing)} run_id(s) present in parent {idx}: "
@@ -303,6 +461,60 @@ def lint_merge_completeness(merged: str, parents: Sequence[str]) -> List[str]:
                 "shrink is never legitimate"
             )
     return problems
+
+
+def run_ids_at_rev(rev: str, *, run=None) -> set:
+    """Every ``run_id`` recorded at a git revision, across BOTH layouts.
+
+    This is the transition-safety of the #8349 guard, and it is the one place
+    the storage change could have silently disarmed it.
+
+    ``lint_merge_completeness`` compares the merge result's run-id set against
+    each PARENT's. After #8346 a parent that predates the migration has no
+    ``ledger.d/`` at all -- so a source that read only the new layout would
+    return the EMPTY SET for it, ``missing`` would be empty, and the guard would
+    pass vacuously. It would pass loudest on exactly the merge most likely to
+    drop rows: the migration's own, whose other parent is legacy-only. A
+    detector that reports "none dropped" because it looked in the wrong place
+    is worse than no detector, which is the lesson #8348 already cost us.
+
+    So both sources are read at every rev and unioned:
+
+    * ``git show <rev>:test/results/ledger.jsonl`` -- ids parsed out of the
+      legacy file, if it exists at that rev;
+    * ``git ls-tree <rev> test/results/ledger.d/`` -- ids read straight off the
+      FILENAMES, with no parsing at all, because under one-file-per-run the
+      filename is the identity.
+
+    The second source is strictly more robust than the first: a shard whose
+    CONTENT was damaged still contributes its id, so a merge that damaged a row
+    is reported by the linter rather than being invisible to the guard because
+    the guard could not parse it. ``lint_shard_names`` is what keeps that
+    trustworthy by pinning filename == payload id.
+
+    Returns the empty set for a rev that has neither -- correct, and the reason
+    the guard is only meaningful when at least one parent is non-empty.
+    """
+    import subprocess
+
+    if run is None:
+        run = lambda cmd: subprocess.run(cmd, capture_output=True, text=True)  # noqa: E731
+
+    out = set()
+
+    legacy = run(["git", "show", f"{rev}:test/results/{LEGACY_LEDGER_NAME}"])
+    if legacy.returncode == 0:
+        out |= run_ids(legacy.stdout)
+
+    tree = run(
+        ["git", "ls-tree", "--name-only", rev, f"test/results/{LEDGER_DIR_NAME}/"]
+    )
+    if tree.returncode == 0:
+        for line in tree.stdout.splitlines():
+            name = line.strip().rsplit("/", 1)[-1]
+            if name.endswith(".json"):
+                out.add(name[: -len(".json")])
+    return out
 
 
 def parse_ledger(text: str) -> List[Dict]:
@@ -382,9 +594,23 @@ def classify(value: float, lo: float, hi: float, direction: str) -> str:
 
 
 def _sorted_rows(rows: Iterable[Dict]) -> List[Dict]:
-    # Sort by ts, keeping file order for equal timestamps. A ledger written by
-    # parallel worktrees is not guaranteed to be in ts order on disk.
-    return [r for _, _, r in sorted(((r["ts"], i, r) for i, r in enumerate(rows)), key=lambda t: (t[0], t[1]))]
+    """Chronological order, with a tie-break that does not depend on storage.
+
+    The tie-break is ``run_id``, NOT the order the rows were loaded in, and the
+    #8346 storage change is why. Under the old single appended file, load order
+    WAS write order, so ties resolved chronologically by accident. Under one
+    file per run the load order is the sorted filename order -- random hex --
+    so a load-order tie-break makes "which row is newest" depend on which
+    random id sorted first. Two runs finishing in the same second would then
+    get a verdict that is not a function of the data, and a nondeterministic
+    comparator makes every disagreement unattributable.
+
+    ``run_id`` does not recover the true order within a second -- ``ts`` carries
+    milliseconds since #8346 so that real runs do not tie at all -- but it makes
+    the answer DETERMINISTIC, which is the property a comparator owes: identical
+    input, identical verdict, whatever the storage.
+    """
+    return sorted(rows, key=lambda r: (r["ts"], r.get("run_id", "")))
 
 
 def compare(
@@ -589,7 +815,11 @@ def exit_status(result: Dict) -> int:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     p = argparse.ArgumentParser(description="Compare the newest gate run against its band.")
-    p.add_argument("--ledger", default=None, help="path to ledger.jsonl")
+    p.add_argument(
+        "--ledger",
+        default=None,
+        help="path to the ledger: a ledger.d/ shard directory, or a legacy .jsonl file",
+    )
     p.add_argument("--gate", help="gate name to compare")
     p.add_argument("--env", default=None, help="restrict to this env")
     p.add_argument("--k", type=int, default=MIN_BASELINE_RUNS, help="green runs required")
@@ -605,28 +835,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     args = p.parse_args(argv)
 
-    ledger = args.ledger
-    if ledger is None:
-        import pathlib
+    import pathlib
 
-        ledger = str(pathlib.Path(__file__).resolve().parents[2] / "test" / "results" / "ledger.jsonl")
-
-    try:
-        with open(ledger, encoding="utf-8") as fh:
-            text = fh.read()
-    except OSError as exc:
-        print(f"LEDGER-CORRUPT: cannot read {ledger}: {exc}", file=sys.stderr)
-        return 2
+    ledger = args.ledger if args.ledger is not None else default_ledger_path()
 
     if args.lint_merge:
         import subprocess
-
-        def _show(rev: str) -> str:
-            r = subprocess.run(
-                ["git", "show", f"{rev}:test/results/ledger.jsonl"],
-                capture_output=True, text=True,
-            )
-            return r.stdout if r.returncode == 0 else ""
 
         parents = subprocess.run(
             ["git", "rev-parse", "HEAD^@"], capture_output=True, text=True
@@ -636,20 +850,37 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # this file guards against elsewhere, so say what was checked.
             print("lint-merge: HEAD is not a merge commit — nothing to check")
             return 0
-        merged = _show("HEAD")
-        probs = lint_merge_completeness(merged, [_show(p_) for p_ in parents])
+        # run_ids_at_rev, not a read of one path: it unions the legacy file and
+        # the shard directory at every rev, so a parent from before #8346 is
+        # not silently the empty set. See its docstring.
+        merged = run_ids_at_rev("HEAD")
+        probs = lint_merge_completeness_ids(merged, [run_ids_at_rev(p_) for p_ in parents])
         if probs:
             for pr in probs:
                 print(pr)
             return 1
         print(
-            f"lint-merge: OK — {len(run_ids(merged))} run_id(s), none dropped "
+            f"lint-merge: OK — {len(merged)} run_id(s), none dropped "
             f"across {len(parents)} parents"
         )
         return 0
 
+    # A MISSING ledger and an EMPTY one are different answers and must not
+    # collapse. Missing is a read error (exit 2, "we could not look"); empty is
+    # the zero-row FAIL that lint_ledger reports (exit 1, "we looked and there
+    # is nothing"). Collapsing them would make a fresh checkout with no ledger
+    # indistinguishable from a directory whose shards were all deleted.
+    if not pathlib.Path(ledger).exists():
+        print(f"LEDGER-CORRUPT: cannot read {ledger}: no such path", file=sys.stderr)
+        return 2
+    try:
+        text = load_ledger_text(ledger)
+    except OSError as exc:
+        print(f"LEDGER-CORRUPT: cannot read {ledger}: {exc}", file=sys.stderr)
+        return 2
+
     if args.lint:
-        problems = lint_ledger(text)
+        problems = lint_ledger(text) + lint_shard_names(ledger)
         if problems:
             print(f"ledger-lint: {len(problems)} problem(s) in {ledger}", file=sys.stderr)
             for prob in problems:

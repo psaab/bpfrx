@@ -17,7 +17,7 @@ string, and how to read the comparison.
 | Path | What it is |
 |---|---|
 | `test/incus/harness-result.sh` | the adapter table, the emitter, and the run wrapper |
-| `test/results/ledger.jsonl` | the tracked ledger — one JSON row per gate run |
+| `test/results/ledger.d/` | the tracked ledger — one `<run_id>.json` shard per gate run |
 | `test/incus/ledger_compare.py` | the band comparator and `ledger-lint` |
 | `test/incus/harness-result-selftest.sh` | hermetic cells for the adapters, the emitter and the wrapper |
 | `test/incus/ledger_compare_test.py` | hermetic cells for the comparator |
@@ -219,37 +219,60 @@ The third is deliberately not folded into the first: "every invariant held" and
 "there were no invariants to check" are the same sentence only if you do not
 look.
 
-## The ledger file
+## The ledger: one file per run
 
-`test/results/ledger.jsonl` is git-tracked and append-only; bulk artifacts stay
-untracked behind the `/artifacts/` gitignore line (#8323).
+`test/results/ledger.d/<run_id>.json` is git-tracked, one shard per gate run;
+bulk artifacts stay untracked behind the `/artifacts/` gitignore line (#8323).
 
-Dozens of worktrees run gates in parallel here, so it carries `merge=union` in
-`.gitattributes`. That driver is **not** safe in general, and this project has
-measured it failing: [`docs/log/README.md`](log/README.md) records union
-silently fusing two `_Log.md` entries whose `- **Timestamp**` lines aligned,
-and says it should not be added for that file.
+It was a single appended `ledger.jsonl` until #8346. Dozens of lanes run gates
+in parallel here, so every one of them appending to one tracked file conflicted
+on ordinary operation. Every row is a real record, so those conflicts were
+always union-resolvable — which is exactly the problem: a hand resolve on a
+data file, on every rebase, is where a row gets dropped by accident.
 
-Three things make the ledger different, and the third is a change rather than
-an argument:
+**One file per run removes the decision rather than adding a rule to remember
+under merge pressure.** Two writers never touch the same path, because `run_id`
+is unique per run and already in the row. No merge driver is involved at all —
+the repo no longer has a `.gitattributes` at all, because that one rule was the
+only thing in it.
 
-* each row is a complete independent record on one line, with no shared
-  closing token and no shared prefix line for union to align;
-* row order carries no meaning — the comparator sorts by the `ts` field, not
-  by file position;
-* **every row carries a random `run_id`**, so two rows are never byte-identical
-  and the fusion mode has nothing to align. `ledger_compare.py` dedupes an
-  identical repeat — the artifact of both branches carrying one row, which
-  would otherwise count one run twice and inflate a baseline — and **refuses**
-  a repeated `run_id` whose payload differs, because that is two runs claiming
-  one identity rather than a merge artifact.
+That last point is not incidental. The `merge=union` rule that used to sit
+there was **disarmed for months without anyone noticing**: this repo's
+`.git/config` defined a custom driver *named* `union` whose command was the
+shell no-op `true` (#8348, residue of the rejected PR #1582). A custom driver
+shadows git's built-in, so every `merge=union` path silently resolved to
+"ours" — exit 0, no conflict, nothing in the merge summary, and `git check-attr`
+reporting `merge: union` throughout. Three real gate records were lost that way.
+A rule whose driver can be disarmed from a file nobody reads does not belong in
+the path of a data file.
 
-The reasoning is **backed by an instrument rather than trusted**: the
-`ledger-lint` leg of `make selftest` parses every line, applies the emitter's
-own contract, and flags a conflicting `run_id`, so a union resolve that
-produced a damaged row — or a committed conflict marker — is a red gate rather
-than silent corruption. It **fails on a zero-row ledger**: linting an empty
-file and reporting success is the swept-nothing pass.
+### The filename is the identity
+
+A shard is named for the `run_id` it contains, and `lint_shard_names` enforces
+that. It is what makes concurrent writes conflict-free, and it is what lets the
+merge guard read the run-id set straight off a **git tree** — `git ls-tree
+--name-only <rev> test/results/ledger.d/` — with no parsing at all, so a shard
+whose *content* was damaged still contributes its id.
+
+### What each check can and cannot see
+
+Stated plainly, because an overstated claim about a detector is how the #8348
+gap stayed invisible for months — it stops the next person looking.
+
+| Check | Sees | Does NOT see |
+|---|---|---|
+| `ledger-lint` (`--lint`) | a malformed row, a committed conflict marker, a hand-edited row that violates the emitter's contract, a shard whose filename disagrees with its `run_id`, an **empty** ledger | **a row that is simply GONE.** A deleted shard leaves a well-formed, internally consistent, perfectly lint-clean directory |
+| `ledger-merge-completeness` (`--lint-merge`, #8349) | a merge result missing any `run_id` present in **either parent** — a set check, so a drop-one-add-one is caught where a count would not be | anything about a non-merge commit; it is a no-op on a linear HEAD and says so |
+
+Neither substitutes for the other, and `--lint-merge` is the one that can see a
+loss. It reads **both layouts at every revision** — the legacy `ledger.jsonl`
+*and* the shard directory — because a parent commit from before #8346 has no
+`ledger.d/` at all: a source reading only the new layout would return the empty
+set for that parent and pass vacuously, loudest on the migration's own merge.
+
+Both legs run under `make selftest`. `--lint` **fails on a zero-row ledger**:
+an empty directory is the new empty ledger, and linting nothing and reporting
+success is the swept-nothing pass.
 
 ## Mutation cells, and why they are not optional
 
@@ -322,5 +345,6 @@ recipes invoke it — so the two layers do not need separate registration.
 | adapters | `FAIL` with the metric that moved | `VOID` plus a reason | no summary line → `VOID`, never a pass |
 | `harness_result_emit` | n/a — an emitter, not a gate | refuses (exit 2) and writes **no row** | refuses an empty metrics map on a PASS/FAIL |
 | `ledger_compare` | `REGRESSION` with the value, the band, K, and the build sha | `VOID` or `NO-BASELINE` — never `WITHIN-BAND` | zero matching rows → `NO-BASELINE` |
-| `ledger-lint` | names the first bad line (catches a conflict marker) | n/a | **FAIL** on a zero-row ledger |
+| `ledger-lint` | names the first bad line or the mis-named shard | n/a | **FAIL** on a zero-row ledger (an empty `ledger.d/`) |
+| `ledger-merge-completeness` | names every `run_id` the merge dropped, and which parent had it | n/a — a pure git read | a non-merge HEAD reports "nothing to check", never "clean" |
 | mutation gate | reports the ESCAPED mutation by name | a cell whose mutation did not apply is a VOID and a failure | zero cells is a FAIL |

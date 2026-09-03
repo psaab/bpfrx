@@ -48,7 +48,7 @@ bad() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
 WORK=$(mktemp -d "${TMPDIR:-/var/tmp}/xpf-harness-result-selftest.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 LOG="$WORK/gate.log"
-LEDGER="$WORK/ledger.jsonl"
+LEDGER="$WORK/ledger.d"
 
 # adapt_field <adapter> <rc> <n> -- nth TAB field of the adapter's line
 adapt_field() {
@@ -315,7 +315,8 @@ if command -v git >/dev/null 2>&1; then
 			ok "build_git_sha: a pristine tree gets NO -dirty suffix" ||
 			bad "build_git_sha: a pristine tree was marked dirty ($clean_sha)"
 
-		printf '{"row":1}\n' >"$REPO/test/results/ledger.jsonl"
+		mkdir -p "$REPO/test/results/ledger.d"
+		printf '{"row":1}\n' >"$REPO/test/results/ledger.d/deadbeef.json"
 		with_ledger=$(harness_build_git_sha "$REPO")
 		if [[ "$with_ledger" != *-dirty ]]; then
 			ok "build_git_sha: the ledger's own new row does NOT make the tree dirty"
@@ -399,7 +400,9 @@ refuses "an unknown exe_check value" --gate g --env e --verdict PASS \
 	--headline-metric m --headline-direction higher-better --metrics "m=1" --exe-check PROBABLY
 
 # Exactly the two accepted rows landed: a refused row must write NOTHING.
-n=$(wc -l <"$LEDGER" 2>/dev/null || echo 0)
+# Counting SHARDS, not lines: under one file per run (#8346) a row is a file.
+ledger_rows() { find "$LEDGER" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l; }
+n=$(ledger_rows)
 if [[ "$n" == "2" ]]; then
 	ok "a refused row writes NOTHING (ledger has exactly the 2 accepted rows)"
 else
@@ -407,15 +410,57 @@ else
 fi
 
 # A row is always ONE physical line, even when the reason contains a newline.
-: >"$LEDGER"
-harness_result_emit "${emit_base[@]}" --gate g --env e --verdict VOID \
-	--void-reason "$(printf 'line one\nline two')" >/dev/null 2>&1
-n=$(wc -l <"$LEDGER")
-if [[ "$n" == "1" ]] && python3 -c "import json,sys; json.loads(open(sys.argv[1]).read())" "$LEDGER" 2>/dev/null; then
+rm -rf "$LEDGER"
+shard=$(harness_result_emit "${emit_base[@]}" --gate g --env e --verdict VOID \
+	--void-reason "$(printf 'line one\nline two')" 2>/dev/null)
+n=$(ledger_rows)
+if [[ "$n" == "1" ]] && [[ "$(wc -l <"$shard")" == "1" ]] &&
+	python3 -c "import json,sys; json.loads(open(sys.argv[1]).read())" "$shard" 2>/dev/null; then
 	ok "a multi-line void reason still serialises to ONE parseable JSON line"
 else
-	bad "a multi-line void reason broke the one-row-per-line invariant ($n lines)"
+	bad "a multi-line void reason broke the one-row-per-line invariant ($n shards)"
 fi
+
+# ── 9b. One file per run: two writes never touch one path (#8346) ────
+rm -rf "$LEDGER"
+s1=$(harness_result_emit "${emit_base[@]}" --gate g --env e --verdict PASS \
+	--headline-metric m --headline-direction higher-better --metrics "m=1" 2>/dev/null)
+s2=$(harness_result_emit "${emit_base[@]}" --gate g --env e --verdict PASS \
+	--headline-metric m --headline-direction higher-better --metrics "m=2" 2>/dev/null)
+if [[ -n "$s1" && -n "$s2" && "$s1" != "$s2" && "$(ledger_rows)" == "2" ]]; then
+	ok "two runs write two DIFFERENT paths — the layout is conflict-free by construction"
+else
+	bad "two runs did not produce two distinct shards (s1=$s1 s2=$s2 count=$(ledger_rows))"
+fi
+# The filename IS the identity: it is what makes the paths distinct, and it is
+# what run_ids_at_rev reads off a git tree WITHOUT parsing the file.
+# Checked through the comparator's own lint_shard_names, so the self-test and
+# the linter cannot disagree about what "the filename is the identity" means.
+if python3 -c "
+import sys
+sys.path.insert(0, sys.argv[1])
+import ledger_compare as lc
+probs = lc.lint_shard_names(sys.argv[2])
+sys.exit(1 if probs else 0)
+" "$SCRIPT_DIR" "$LEDGER"; then
+	ok "every shard's filename equals the run_id it contains"
+else
+	bad "shard filename != run_id — the tree-level run-id set would name a run the file does not describe"
+fi
+# ...and the control: a shard whose name and payload disagree must be REPORTED.
+# Without it, a lint_shard_names that returns [] unconditionally passes above.
+cp "$s1" "$LEDGER/nottheid.json"
+if python3 -c "
+import sys
+sys.path.insert(0, sys.argv[1])
+import ledger_compare as lc
+sys.exit(1 if lc.lint_shard_names(sys.argv[2]) else 0)
+" "$SCRIPT_DIR" "$LEDGER"; then
+	bad "a shard renamed away from its run_id was NOT reported"
+else
+	ok "a shard renamed away from its run_id IS reported"
+fi
+rm -f "$LEDGER/nottheid.json"
 
 # ── 10. The run wrapper ──────────────────────────────────────────────
 mkfake() {
@@ -427,13 +472,17 @@ run_wrapper() {
 	# the wrapper's own rc is observable.
 	(harness_result_run --ledger "$LEDGER" --hermetic --env testenv "$@" >/dev/null 2>&1)
 }
+# Reads the SHARD DIRECTORY through the comparator's own loader, so the
+# self-test cannot pass on a layout the comparator would reject.
 last_row_field() { python3 -c "
 import json,sys
-rows=[json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+sys.path.insert(0, sys.argv[3])
+import ledger_compare as lc
+rows=lc._sorted_rows([json.loads(l) for l in lc.load_ledger_text(sys.argv[1]).splitlines() if l.strip()])
 print(rows[-1][sys.argv[2]] if rows else '<no rows>')
-" "$LEDGER" "$1"; }
+" "$LEDGER" "$1" "$SCRIPT_DIR"; }
 
-: >"$LEDGER"
+rm -rf "$LEDGER"
 mkfake <<'FAKE'
 #!/usr/bin/env bash
 echo "  PASS  iperf3 throughput: 23.1 Gbps (>= 23 Gbps)"
@@ -551,8 +600,10 @@ unset -f incus
 # "there is no deployed binary" and "we could not read the deployed binary" are
 # different facts.
 [[ "$(python3 -c "
-import json
-rows=[json.loads(l) for l in open('$LEDGER') if l.strip()]
+import json,sys
+sys.path.insert(0, '$SCRIPT_DIR')
+import ledger_compare as lc
+rows=[json.loads(l) for l in lc.load_ledger_text('$LEDGER').splitlines() if l.strip()]
 print([r['exe_check'] for r in rows if r['gate']=='fake-green'][0])
 ")" == "NOT-APPLICABLE" ]] &&
 	ok "run wrapper: a hermetic run records NOT-APPLICABLE, not UNAVAILABLE" ||
