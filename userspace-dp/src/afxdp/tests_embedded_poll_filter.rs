@@ -1934,10 +1934,22 @@ fn poll_descriptor_policy_deny_keys_logical_ingress_zone_3021() {
         Some(TEST_LAN_ZONE_ID),
         "logical ifindex 13 (reth0.50) is zone lan"
     );
+    // #7509 RETARGET, and the re-expressed form is STRICTLY STRONGER. This
+    // asserted the parent inherited reth0.80's `wan`, so that a physical-keyed
+    // lookup would report a zone DIFFERENT from the unit's `lan` and the cell
+    // could tell the fix from the bug.
+    //
+    // A contested parent now carries no zone. The contrast the cell needs is
+    // preserved and sharpened: a reverted, physical-keyed implementation would
+    // report 0 rather than `wan`, which is distinguishable from `lan` and from
+    // every other real zone -- the old form only distinguished it from `lan`.
+    // The subject assertion below (`event.ingress_zone_id == TEST_LAN_ZONE_ID`)
+    // is unchanged and still carries the cell.
     assert_eq!(
-        forwarding.ifindex_to_zone_id.get(&11).copied(),
-        Some(TEST_WAN_ZONE_ID),
-        "physical parent ifindex 11 inherits reth0.80's wan zone"
+        forwarding.ifindex_to_zone_id.get(&11).copied().unwrap_or(0),
+        0,
+        "physical parent ifindex 11 carries units in DIFFERENT zones (wan on \
+         reth0.80, lan on reth0.50), so it resolves to NO zone (#7509)"
     );
 
     // The physical port the VLAN sub-interface rides on is ifindex 11.

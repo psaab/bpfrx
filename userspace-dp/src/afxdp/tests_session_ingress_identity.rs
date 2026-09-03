@@ -169,14 +169,31 @@ fn run_ingress_identity_flow_on(
         Some(TEST_LAN_ZONE_ID),
         "reth0.50 is in zone lan"
     );
+    // #7509 RETARGET, and it makes this precondition STRONGER rather than
+    // weaker. It used to assert the shared parent resolved to `wan` — the first
+    // sub-interface's zone, inherited by an arbitrary walk-order pick — so that
+    // stamping the parent instead of the packet's binding would be observable.
+    //
+    // A contested parent now carries NO zone at all, so the observability this
+    // precondition exists to guarantee is stronger than before: stamping the
+    // parent would yield 0, which is distinguishable from `lan` AND from every
+    // other real zone, where previously it only had to differ from `lan`.
+    //
+    // The control keeps it non-vacuous. "Parent is unzoned" is satisfied by a
+    // state with no zones at all, so the logical unit must still resolve — that
+    // is asserted just above (ifindex 13 -> lan) and is what makes the 0 here
+    // specific to the contested parent.
     assert_eq!(
         forwarding
             .ifindex_to_zone_id
             .get(&INGRESS_PARENT_IFINDEX)
-            .copied(),
-        Some(TEST_WAN_ZONE_ID),
-        "the SHARED physical parent resolves to wan on its own, so stamping \
-         the parent's zone instead of the packet's binding is observable"
+            .copied()
+            .unwrap_or(0),
+        0,
+        "the SHARED physical parent carries units in DIFFERENT zones, so it \
+         resolves to no zone at all (#7509) -- stamping the parent's zone \
+         instead of the packet's binding stays observable, and is now \
+         distinguishable from every real zone rather than only from lan"
     );
 
     let frame = build_txn_tcp_syn_frame_v4(
