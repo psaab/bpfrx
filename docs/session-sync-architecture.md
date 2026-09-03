@@ -1235,21 +1235,26 @@ keys and different discriminators both ride the window.
 - A keyed-GRE synced session is retracted by its idle timeout, not by an
   explicit delete, because the delete wire has no value slot to carry the
   discriminator (see above).
-- The REVERSE COMPANION of a keyed-GRE session is still shared. All five
-  `SessionKey` transforms (`forward_wire_key`, `translated_session_key`,
-  `reverse_wire_key`, `reverse_canonical_key`, `reverse_session_key`,
-  `session/key.rs`) build their output with `discriminator:
-  Default::default()` — they preserve the sibling `routing_domain` and drop
-  this field. Measured after this change: two synced keyed tunnels produce
-  THREE rows in `sessions.synced`, not four — two forward keys carrying
-  `Keyed(100)` / `Keyed(200)` and ONE reverse companion carrying `None`. This
-  is a defect in what the ACTIVE node's identity model produces (it reproduces
-  on a standalone box with no cluster configured), not in the sync path: the
-  sync path's job is to make the standby's identity match the active's, which
-  it now does exactly. Fixing it is a packet-path change — it alters which
-  session a live reply resolves to — so it wants its own PR, cells built from
-  two tunnels, and a smoke that generates real keyed GRE in both directions.
-  Tracked as **#8103**.
+- ~~The REVERSE COMPANION of a keyed-GRE session is still shared.~~ **RESOLVED
+  in #8103.** All five `SessionKey` transforms (`forward_wire_key`,
+  `translated_session_key`, `reverse_wire_key`, `reverse_canonical_key`,
+  `reverse_session_key`, `session/key.rs`) used to build their output with
+  `discriminator: Default::default()` — preserving the sibling `routing_domain`
+  and dropping this field — so two synced keyed tunnels produced THREE rows in
+  `sessions.synced`, not four: two forward keys carrying `Keyed(100)` /
+  `Keyed(200)` and ONE reverse companion carrying `None`. It was a defect in
+  what the ACTIVE node's identity model produced (it reproduced on a standalone
+  box with no cluster configured), not in the sync path.
+
+  All five now carry it. The three REVERSE-direction transforms derive it
+  through `reverse_direction_discriminator`, an **exhaustive match with no `_`
+  arm**: every class today is direction-symmetric, but RFC 2637's PPTP call ID
+  is not (#8382 carries the peer's call ID, so the two directions differ), and
+  copying it unchanged would build a reverse key holding the wrong value —
+  turning a shared reverse companion into NO reverse companion. The missing `_`
+  makes that a compile error when the class lands rather than a note someone
+  reads afterwards. The row count is now asserted, not described, in
+  `tests_gre_session_sync_7188.rs`: four rows, two of them reverse.
 - `dataplane.SessionKey` — the Go BPF-mirror key — still aliases two
   same-endpoint tunnels onto one row, so the mirror-backed `show`/clear surfaces
   and the #5085 `bulkRecvV4` reconcile see one entry for both. This is

@@ -93,23 +93,34 @@ fn two_keyed_gre_tunnels_sharing_a_5_tuple_sync_as_two_sessions_7188() {
     assert!(forward.contains(&TunnelDiscriminator::Keyed(100)));
     assert!(forward.contains(&TunnelDiscriminator::Keyed(200)));
 
-    // WHAT THIS CELL DOES NOT CLAIM, stated because the filter above is easy to
-    // read past. It counts FORWARD entries. The REVERSE companions of these two
-    // tunnels are still one entry, because all five `SessionKey` transforms in
-    // `session/key.rs` build their output with `discriminator:
-    // Default::default()` — they preserve the sibling `routing_domain` and drop
-    // this field. MEASURED here: the map holds three rows, not four —
+    // #8103 FIXED, and this is where it is measured. The REVERSE companions
+    // used to be ONE shared entry: all five `SessionKey` transforms in
+    // `session/key.rs` built their output with `discriminator:
+    // Default::default()`, preserving the sibling `routing_domain` and dropping
+    // this field, so two tunnels' reverse keys differed in nothing (protocol 47
+    // has no L4 ports) and the second publish evicted the first. The map held
+    // THREE rows, not four.
     //
-    //     198.51.100.7->203.0.113.9 disc=Keyed(100) reverse=false
-    //     198.51.100.7->203.0.113.9 disc=Keyed(200) reverse=false
-    //     203.0.113.9->198.51.100.7 disc=None       reverse=true
-    //
-    // That is a defect in what the ACTIVE node's own identity model produces
-    // (it reproduces on a standalone box with no cluster configured), not in
-    // the sync path this change fixes — the sync path's job is to make the
-    // standby's identity match the active's, which it now does exactly.
-    // Tracked as #8103; see also `docs/session-sync-architecture.md`, "Known
-    // residuals".
+    // It now holds four. Asserted rather than described, because the previous
+    // version of this block stated the row count in prose and prose does not
+    // fail when the behaviour changes — in either direction.
+    let reverse: Vec<_> = synced
+        .iter()
+        .filter(|(key, _)| key.protocol == PROTO_GRE && synced[key].metadata.is_reverse)
+        .map(|(key, _)| key.discriminator)
+        .collect();
+    assert_eq!(
+        reverse.len(),
+        2,
+        "each keyed tunnel must have its OWN reverse companion (#8103). One \
+         means they still share it, so a reply resolves whichever tunnel \
+         published last — and with `gre-performance-acceleration` on, a reply \
+         may match no session at all, because it is parsed as `Keyed(k)` while \
+         the stored companion is keyed `None`. Discriminators present: \
+         {reverse:?}"
+    );
+    assert!(reverse.contains(&TunnelDiscriminator::Keyed(100)));
+    assert!(reverse.contains(&TunnelDiscriminator::Keyed(200)));
 }
 
 /// #7188 decision 2, the fail-closed half: a peer that does NOT carry the
