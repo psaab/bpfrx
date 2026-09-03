@@ -698,7 +698,7 @@ pub(in crate::afxdp) struct BatchCounters {
     // this is the observable-drop half of #2562.
     nat64_frag_dropped: u64,
     // #7054: first-fragment installs that evicted a still-LIVE association
-    // because their shard was at `NAT64_FRAG_CAP_PER_SHARD` with nothing
+    // because their shard was at `FRAG_CAP_PER_SHARD` with nothing
     // expired to reclaim. The eviction itself is correct — a fixed ceiling has
     // to sacrifice something — but it was SILENT: the victim's non-first
     // fragments then miss and are dropped fail-closed, and the only trace was a

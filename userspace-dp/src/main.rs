@@ -12,6 +12,7 @@ mod hot_hash_seed;
 mod io_uring_write;
 mod ip_proto;
 mod nat;
+mod fragment_assoc;
 mod nat64;
 mod nptv6;
 mod policy;

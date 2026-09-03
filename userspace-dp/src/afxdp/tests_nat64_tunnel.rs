@@ -1359,7 +1359,7 @@ fn nat64_rolled_back_first_fragment_publishes_no_frag_assoc_5146() {
 // the first fragment's permit + egress + NAT64 translation.
 //
 // This is the production-wiring counterpart to the key-level guards in
-// nat64_tests.rs. Those prove `Nat64FragKey` DISCRIMINATES by authority; this
+// nat64_tests.rs. Those prove `FragKey` DISCRIMINATES by authority; this
 // proves the authority is actually THREADED at the real install and consult
 // sites — a fix that widened the key but passed a constant authority from
 // poll_descriptor would pass the key-level tests and still be bypassable.
@@ -1568,7 +1568,7 @@ fn nat64_association_hit_still_runs_interface_input_filter_5798() {
                 nat64_v6_frag_meta(first.len(), src, dst),
                 None,
             );
-            let seed_key = crate::nat64::nat64_first_fragment_key(
+            let seed_key = crate::fragment_assoc::first_fragment_key(
                 &first[14..],
                 libc::AF_INET6,
                 seed_authority,
@@ -1588,7 +1588,7 @@ fn nat64_association_hit_still_runs_interface_input_filter_5798() {
             None,
         );
         let key =
-            crate::nat64::nat64_first_fragment_key(&first[14..], libc::AF_INET6, authority)
+            crate::fragment_assoc::first_fragment_key(&first[14..], libc::AF_INET6, authority)
                 .expect("seeded first-fragment key");
         // Install on the SAME clock the poll path reads (CLOCK_MONOTONIC), or the
         // entry is already past its 2s TTL by the time the consult runs and the
@@ -2721,7 +2721,7 @@ fn t_run_6836(
 /// #6857 WIRING: the install SITE must derive the owner RG, not stamp a
 /// constant.
 ///
-/// The cells in nat64_tests.rs call `Nat64FragAssoc::install` directly with an
+/// The cells in nat64_tests.rs call `FragAssoc::install` directly with an
 /// explicit owner RG, so they pin the fence and say nothing about where the
 /// stamp comes from. The mutation matrix proved it: replacing the
 /// `owner_rg_for_resolution(...)` call at both install sites with a literal `0`
@@ -2784,7 +2784,7 @@ fn nat64_frag_assoc_install_site_derives_the_owner_rg_6857() {
     // predicate is asked about. A hardcoded 0 never reaches the predicate at
     // all, because owner_rg 0 is deliberately not fenced.
     let non_first = nat64_v6_frag_frame(0x0008, 0x1234_5678, src, dst, 0, 0);
-    let key = crate::nat64::nat64_nonfirst_fragment_key(
+    let key = crate::fragment_assoc::nonfirst_fragment_key(
         &non_first[14..],
         libc::AF_INET6,
         crate::afxdp::poll_descriptor::frag_assoc::frag_ingress_authority(

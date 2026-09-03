@@ -4,6 +4,18 @@
 // `#[path = "nat64_tests.rs"]` from nat64.rs.
 
 use super::*;
+// #7899: the fragment-association cache moved to `crate::fragment_assoc`. The
+// 55 frag tests in this file were NOT moved with it -- they are interleaved with
+// 119 non-frag NAT64 tests across 7000 lines, and extracting them is a separate
+// change with its own risk (a mis-placed insertion between a doc comment and its
+// `fn` silently steals the `#[test]` attribute). Imported here instead so the
+// move stays motion-only and no guard changes.
+use crate::fragment_assoc::{
+    FragAuthority, FRAG_CAP_PER_SHARD, NAT64_FRAG_CROSS_DOMAIN_MISSES,
+    NAT64_FRAG_PROTOCOL_ALIAS_MISSES, FRAG_SHARDS, FRAG_TTL_NS, FragAssoc,
+    FragKey, frag_shard_index, first_fragment_key,
+    nonfirst_fragment_key,
+};
 
 /// #5798: a fixed ingress authority for fragment-key tests that are not ABOUT
 /// the authority. `frag_other_authority` mints a DIFFERENT domain so a test can
@@ -4798,22 +4810,22 @@ fn nat64_frag_assoc_v6_to_v4_nonfirst_inherits_and_translates() {
 
     // Port-free key co-location: first and non-first share ONE key so the
     // non-first fragment finds the first fragment's association.
-    let kf = nat64_first_fragment_key(&first, libc::AF_INET6, frag_test_authority()).expect("first-fragment key");
+    let kf = first_fragment_key(&first, libc::AF_INET6, frag_test_authority()).expect("first-fragment key");
     let kn =
-        nat64_nonfirst_fragment_key(&nonfirst, libc::AF_INET6, frag_test_authority()).expect("non-first-fragment key");
+        nonfirst_fragment_key(&nonfirst, libc::AF_INET6, frag_test_authority()).expect("non-first-fragment key");
     assert_eq!(
         kf, kn,
         "first and non-first fragments must share the port-free key"
     );
     // DoS property: a non-first fragment can NEVER produce a first-fragment key
     // (so it can never INSTALL into the cache).
-    assert!(nat64_first_fragment_key(&nonfirst, libc::AF_INET6, frag_test_authority()).is_none());
+    assert!(first_fragment_key(&nonfirst, libc::AF_INET6, frag_test_authority()).is_none());
     // An atomic fragment (MF=0, offset 0) is not a first fragment either.
     let atomic = make_ipv6_frag_udp(src_v6, dst_v6, 1, 2, &[0u8; 8], 0, false, ident);
-    assert!(nat64_first_fragment_key(&atomic, libc::AF_INET6, frag_test_authority()).is_none());
+    assert!(first_fragment_key(&atomic, libc::AF_INET6, frag_test_authority()).is_none());
 
     // Install the first fragment's decision; the non-first fragment inherits it.
-    let cache = Nat64FragAssoc::new();
+    let cache = FragAssoc::new();
     let decision = frag_test_decision(Nat64State::forward_decision(snat_v4, dst_v4, 5000));
     cache.install(kf, decision, None, 1_000, 1, 0);
     let (hit, reverse) = cache
@@ -4877,8 +4889,8 @@ fn nat64_frag_assoc_v4_to_v6_nonfirst_inherits_and_translates() {
     let first = make_ipv4_frag_udp(server_v4, snat_v4, 53, 1000, &[0xCCu8; 16], 0, true, ident);
     let nonfirst = make_ipv4_frag_udp(server_v4, snat_v4, 0, 0, &[0xDDu8; 24], 120, false, ident);
 
-    let kf = nat64_first_fragment_key(&first, libc::AF_INET, frag_test_authority()).expect("first key");
-    let kn = nat64_nonfirst_fragment_key(&nonfirst, libc::AF_INET, frag_test_authority()).expect("non-first key");
+    let kf = first_fragment_key(&first, libc::AF_INET, frag_test_authority()).expect("first key");
+    let kn = nonfirst_fragment_key(&nonfirst, libc::AF_INET, frag_test_authority()).expect("non-first key");
     assert_eq!(kf, kn, "reverse fragments share the port-free key");
     assert_eq!(
         kf.ident,
@@ -4888,7 +4900,7 @@ fn nat64_frag_assoc_v4_to_v6_nonfirst_inherits_and_translates() {
 
     // Reverse association carries the original v6 addresses (the frame builder's
     // v4->v6 branch reads these; `decision.nat` value is not consulted here).
-    let cache = Nat64FragAssoc::new();
+    let cache = FragAssoc::new();
     let reverse = Nat64ReverseInfo {
         orig_src_v6: orig_client_v6,
         orig_dst_v6,
@@ -4943,11 +4955,11 @@ fn nat64_frag_assoc_nonfirst_without_first_misses_and_drops() {
     // A non-first fragment with NO installed first fragment MISSES -> the caller
     // drops it fail-closed (#4617). The existing first-path translator also
     // still drops a non-first fragment (no association => never L3-translated).
-    let cache = Nat64FragAssoc::new();
+    let cache = FragAssoc::new();
     let src_v6: Ipv6Addr = "2001:db8::5".parse().unwrap();
     let dst_v6: Ipv6Addr = "64:ff9b::c000:0205".parse().unwrap();
     let nonfirst = make_ipv6_frag_udp(src_v6, dst_v6, 0, 0, &[0u8; 16], 100, false, 0x9999);
-    let kn = nat64_nonfirst_fragment_key(&nonfirst, libc::AF_INET6, frag_test_authority()).expect("key");
+    let kn = nonfirst_fragment_key(&nonfirst, libc::AF_INET6, frag_test_authority()).expect("key");
     assert!(
         cache.lookup(&kn, 10, 1, |_| true).is_none(),
         "orphan non-first fragment misses"
@@ -4966,7 +4978,7 @@ fn nat64_frag_assoc_cache_is_bounded() {
     // ceiling must NOT exceed it (LRU eviction). RED-on-revert: dropping the
     // `if shard.len() >= CAP { remove(0) }` eviction lets the cache grow without
     // bound.
-    let cache = Nat64FragAssoc::new();
+    let cache = FragAssoc::new();
     let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
     let dst_v6: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
     let decision = frag_test_decision(Nat64State::forward_decision(
@@ -4974,9 +4986,9 @@ fn nat64_frag_assoc_cache_is_bounded() {
         Ipv4Addr::new(8, 8, 8, 8),
         5000,
     ));
-    let ceiling = NAT64_FRAG_SHARDS * NAT64_FRAG_CAP_PER_SHARD;
+    let ceiling = FRAG_SHARDS * FRAG_CAP_PER_SHARD;
     for i in 0..(ceiling * 4) as u32 {
-        let key = Nat64FragKey {
+        let key = FragKey {
             addr_family: libc::AF_INET6 as u8,
             src: IpAddr::V6(src_v6),
             dst: IpAddr::V6(dst_v6),
@@ -4999,8 +5011,8 @@ fn nat64_frag_assoc_ttl_evicts() {
     // The association expires after the short TTL and is pruned on the next
     // consult. RED-on-revert: dropping the `retain(deadline > now)` prune (or the
     // deadline field) makes the expired entry still hit.
-    let cache = Nat64FragAssoc::new();
-    let key = Nat64FragKey {
+    let cache = FragAssoc::new();
+    let key = FragKey {
         addr_family: libc::AF_INET6 as u8,
         src: IpAddr::V6("2001:db8::1".parse().unwrap()),
         dst: IpAddr::V6("64:ff9b::0808:0808".parse().unwrap()),
@@ -5018,14 +5030,14 @@ fn nat64_frag_assoc_ttl_evicts() {
     // Still within the TTL window: hit.
     assert!(
         cache
-            .lookup(&key, 1_000 + NAT64_FRAG_TTL_NS - 1, 1, |_| true)
+            .lookup(&key, 1_000 + FRAG_TTL_NS - 1, 1, |_| true)
             .is_some()
     );
     // Past the (refreshed) TTL with no intervening hit: pruned + miss.
     cache.install(key, decision, None, 1_000, 1, 0);
     assert!(
         cache
-            .lookup(&key, 1_000 + NAT64_FRAG_TTL_NS + 1, 1, |_| true)
+            .lookup(&key, 1_000 + FRAG_TTL_NS + 1, 1, |_| true)
             .is_none(),
         "expired association must miss",
     );
@@ -5044,7 +5056,7 @@ fn frag_idents_in_one_shard(
     count: usize,
 ) -> Vec<u32> {
     let mut out = Vec::with_capacity(count);
-    let target = nat64_frag_shard_index(&Nat64FragKey {
+    let target = frag_shard_index(&FragKey {
         addr_family: family,
         src,
         dst,
@@ -5054,7 +5066,7 @@ fn frag_idents_in_one_shard(
     });
     let mut ident: u32 = 0;
     while out.len() < count && ident < 1_000_000 {
-        let key = Nat64FragKey {
+        let key = FragKey {
             addr_family: family,
             src,
             dst,
@@ -5062,7 +5074,7 @@ fn frag_idents_in_one_shard(
             protocol: PROTO_UDP,
             authority: frag_test_authority(),
         };
-        if nat64_frag_shard_index(&key) == target {
+        if frag_shard_index(&key) == target {
             out.push(ident);
         }
         ident += 1;
@@ -5096,8 +5108,8 @@ fn nat64_frag_assoc_install_prunes_expired_before_evicting_live() {
     ));
 
     // Need CAP idents to fill one shard, plus one more for the flood install.
-    let idents = frag_idents_in_one_shard(src, dst, family, NAT64_FRAG_CAP_PER_SHARD + 1);
-    let mk = |ident: u32| Nat64FragKey {
+    let idents = frag_idents_in_one_shard(src, dst, family, FRAG_CAP_PER_SHARD + 1);
+    let mk = |ident: u32| FragKey {
         addr_family: family,
         src,
         dst,
@@ -5106,29 +5118,29 @@ fn nat64_frag_assoc_install_prunes_expired_before_evicting_live() {
         authority: frag_test_authority(),
     };
 
-    let cache = Nat64FragAssoc::new();
+    let cache = FragAssoc::new();
 
     // The LIVE association: installed FIRST so it sits at the front (oldest by
     // insertion order). Its deadline is FAR in the future.
     let live_key = mk(idents[0]);
-    let live_now = 2 * NAT64_FRAG_TTL_NS; // deadline = 4*TTL
+    let live_now = 2 * FRAG_TTL_NS; // deadline = 4*TTL
     cache.install(live_key, decision, None, live_now, 1, 0);
 
     // Fill the rest of the shard to cap with EXPIRED entries: installed at
     // now=0 so their deadline is TTL, which the flood/lookup times below exceed.
-    for &ident in &idents[1..NAT64_FRAG_CAP_PER_SHARD] {
+    for &ident in &idents[1..FRAG_CAP_PER_SHARD] {
         cache.install(mk(ident), decision, None, 0, 1, 0);
     }
     assert_eq!(
         cache.len(),
-        NAT64_FRAG_CAP_PER_SHARD,
+        FRAG_CAP_PER_SHARD,
         "shard filled to cap (1 live front + CAP-1 expired)",
     );
 
     // The flood: a NEW first fragment installs at a time past the expired
     // deadlines but well within the LIVE entry's window.
-    let flood_now = NAT64_FRAG_TTL_NS + 1; // > TTL (expired) but < 4*TTL (live alive)
-    let new_key = mk(idents[NAT64_FRAG_CAP_PER_SHARD]);
+    let flood_now = FRAG_TTL_NS + 1; // > TTL (expired) but < 4*TTL (live alive)
+    let new_key = mk(idents[FRAG_CAP_PER_SHARD]);
     cache.install(new_key, decision, None, flood_now, 1, 0);
 
     // The LIVE association survived (expired slots were reclaimed first)...
@@ -5172,8 +5184,8 @@ fn nat64_frag_assoc_install_reports_only_live_evictions_7054() {
         Ipv4Addr::new(7, 7, 7, 7),
         5007,
     ));
-    let idents = frag_idents_in_one_shard(src, dst, family, NAT64_FRAG_CAP_PER_SHARD + 2);
-    let mk = |ident: u32| Nat64FragKey {
+    let idents = frag_idents_in_one_shard(src, dst, family, FRAG_CAP_PER_SHARD + 2);
+    let mk = |ident: u32| FragKey {
         addr_family: family,
         src,
         dst,
@@ -5182,7 +5194,7 @@ fn nat64_frag_assoc_install_reports_only_live_evictions_7054() {
         authority: frag_test_authority(),
     };
 
-    let cache = Nat64FragAssoc::new();
+    let cache = FragAssoc::new();
 
     // FALSE 1 — a plain install with room in the shard.
     assert!(
@@ -5196,7 +5208,7 @@ fn nat64_frag_assoc_install_reports_only_live_evictions_7054() {
         "a same-key refresh evicts nothing and must report false"
     );
 
-    for &ident in &idents[1..NAT64_FRAG_CAP_PER_SHARD] {
+    for &ident in &idents[1..FRAG_CAP_PER_SHARD] {
         assert!(
             !cache.install(mk(ident), decision, None, 1_000, 1, 0),
             "filling the shard must not report an eviction until it is full"
@@ -5204,14 +5216,14 @@ fn nat64_frag_assoc_install_reports_only_live_evictions_7054() {
     }
     assert_eq!(
         cache.len(),
-        NAT64_FRAG_CAP_PER_SHARD,
+        FRAG_CAP_PER_SHARD,
         "fixture: the shard must be exactly at cap, or the cell below is not \
          exercising the eviction branch at all"
     );
 
     // TRUE — every entry live, shard at cap: the oldest live entry is sacrificed.
     assert!(
-        cache.install(mk(idents[NAT64_FRAG_CAP_PER_SHARD]), decision, None, 1_000, 1, 0),
+        cache.install(mk(idents[FRAG_CAP_PER_SHARD]), decision, None, 1_000, 1, 0),
         "an install that evicted a still-LIVE association must report it — this \
          is the condition #7054 exists to make observable"
     );
@@ -5225,10 +5237,10 @@ fn nat64_frag_assoc_install_reports_only_live_evictions_7054() {
     // FALSE 3 — the #5447 prune path. Advance past the TTL so every entry is
     // expired; the install then reclaims a dead slot and must NOT be reported as
     // a live eviction.
-    let past_ttl = 1_000 + NAT64_FRAG_TTL_NS + 1;
+    let past_ttl = 1_000 + FRAG_TTL_NS + 1;
     assert!(
         !cache.install(
-            mk(idents[NAT64_FRAG_CAP_PER_SHARD + 1]),
+            mk(idents[FRAG_CAP_PER_SHARD + 1]),
             decision,
             None,
             past_ttl,
@@ -5256,8 +5268,8 @@ fn nat64_frag_assoc_install_all_live_still_evicts_oldest() {
         5001,
     ));
 
-    let idents = frag_idents_in_one_shard(src, dst, family, NAT64_FRAG_CAP_PER_SHARD + 1);
-    let mk = |ident: u32| Nat64FragKey {
+    let idents = frag_idents_in_one_shard(src, dst, family, FRAG_CAP_PER_SHARD + 1);
+    let mk = |ident: u32| FragKey {
         addr_family: family,
         src,
         dst,
@@ -5266,15 +5278,15 @@ fn nat64_frag_assoc_install_all_live_still_evicts_oldest() {
         authority: frag_test_authority(),
     };
 
-    let cache = Nat64FragAssoc::new();
+    let cache = FragAssoc::new();
     // Fill the shard to cap with entries that are ALL live at the times below.
-    for &ident in &idents[..NAT64_FRAG_CAP_PER_SHARD] {
+    for &ident in &idents[..FRAG_CAP_PER_SHARD] {
         cache.install(mk(ident), decision, None, 1_000, 1, 0);
     }
-    assert_eq!(cache.len(), NAT64_FRAG_CAP_PER_SHARD, "shard filled to cap");
+    assert_eq!(cache.len(), FRAG_CAP_PER_SHARD, "shard filled to cap");
 
     let oldest_key = mk(idents[0]);
-    let new_key = mk(idents[NAT64_FRAG_CAP_PER_SHARD]);
+    let new_key = mk(idents[FRAG_CAP_PER_SHARD]);
     // Install a NEW key while every existing entry is still live.
     cache.install(new_key, decision, None, 1_000, 1, 0);
 
@@ -5288,7 +5300,7 @@ fn nat64_frag_assoc_install_all_live_still_evicts_oldest() {
         "new entry installed",
     );
     assert!(
-        cache.len() <= NAT64_FRAG_CAP_PER_SHARD,
+        cache.len() <= FRAG_CAP_PER_SHARD,
         "shard never exceeds cap",
     );
 }
@@ -5304,11 +5316,11 @@ fn nat64_frag_assoc_generation_change_invalidates_stale_association() {
     // (treats as a miss + EVICTS) an entry whose stamped generation != the
     // current generation, while a same-generation replay still hits.
     //
-    // RED-on-revert: neutralize the generation guard in `Nat64FragAssoc::lookup`
+    // RED-on-revert: neutralize the generation guard in `FragAssoc::lookup`
     // (e.g. change `if shard[pos].generation != generation` to `if false`) and
     // the post-commit lookup HITS -> the `is_none()` assertion below fails.
-    let cache = Nat64FragAssoc::new();
-    let key = Nat64FragKey {
+    let cache = FragAssoc::new();
+    let key = FragKey {
         addr_family: libc::AF_INET6 as u8,
         src: IpAddr::V6("2001:db8::1".parse().unwrap()),
         dst: IpAddr::V6("64:ff9b::0808:0808".parse().unwrap()),
@@ -5840,7 +5852,7 @@ fn nat64_6876_release_frees_every_prefix_holding_the_flow() {
 // fragment from ANY security domain that reproduced that tuple inherited the
 // first domain's authority — bypassing its own input filter, PBR, zone
 // derivation and zone security policy. These are FAIL-ON-REVERT guards: drop a
-// field from Nat64FragKey (or stop threading it through nat64_fragment_fields)
+// field from FragKey (or stop threading it through fragment_fields)
 // and the corresponding "must NOT inherit" assertion fires.
 // ---------------------------------------------------------------------------
 
@@ -5866,24 +5878,24 @@ fn frag_v6_decision() -> SessionDecision {
 /// fragment arriving from domain B. This is the #5798 root: the cross-domain
 /// permit-inheritance bypass.
 ///
-/// RED on revert: remove `authority` from `Nat64FragKey` (or stop stamping it in
-/// `nat64_fragment_fields`) and the domain-B lookup HITS — the cross-domain
+/// RED on revert: remove `authority` from `FragKey` (or stop stamping it in
+/// `fragment_fields`) and the domain-B lookup HITS — the cross-domain
 /// assertion below fails.
 #[test]
 fn frag_assoc_cross_domain_nonfirst_fragment_does_not_inherit_permit() {
     let (first, nonfirst) = frag_pair_v6();
-    let cache = Nat64FragAssoc::new();
+    let cache = FragAssoc::new();
     let decision = frag_v6_decision();
 
     // Domain A: the permitted first fragment installs its decision.
-    let ka = nat64_first_fragment_key(&first, libc::AF_INET6, frag_test_authority())
+    let ka = first_fragment_key(&first, libc::AF_INET6, frag_test_authority())
         .expect("domain-A first-fragment key");
     cache.install(ka, decision, None, 1_000, 1, 0);
 
     // Domain B: a non-first fragment with the SAME (family, src, dst, ident) —
     // an attacker only has to reproduce a 32-bit fragment ID, which is not an
     // authorization mechanism.
-    let kb = nat64_nonfirst_fragment_key(&nonfirst, libc::AF_INET6, frag_other_authority())
+    let kb = nonfirst_fragment_key(&nonfirst, libc::AF_INET6, frag_other_authority())
         .expect("domain-B non-first-fragment key");
     assert_ne!(
         ka, kb,
@@ -5897,7 +5909,7 @@ fn frag_assoc_cross_domain_nonfirst_fragment_does_not_inherit_permit() {
     // Control: the SAME domain still inherits — the fix must not blackhole
     // legitimate fragmented traffic. The cache is Arc-shared across workers, so
     // this also covers "same domain, different worker".
-    let ka_nonfirst = nat64_nonfirst_fragment_key(&nonfirst, libc::AF_INET6, frag_test_authority())
+    let ka_nonfirst = nonfirst_fragment_key(&nonfirst, libc::AF_INET6, frag_test_authority())
         .expect("domain-A non-first-fragment key");
     assert_eq!(ka, ka_nonfirst, "same-domain first/non-first share one key");
     assert!(
@@ -5962,15 +5974,15 @@ fn frag_assoc_every_authority_dimension_is_load_bearing() {
             "{dimension}: the perturbation must vary exactly one dimension"
         );
 
-        let cache = Nat64FragAssoc::new();
-        let kf = nat64_first_fragment_key(&first, libc::AF_INET6, base).expect("first key");
+        let cache = FragAssoc::new();
+        let kf = first_fragment_key(&first, libc::AF_INET6, base).expect("first key");
         cache.install(kf, decision, None, 1_000, 1, 0);
 
         // POSITIVE CONTROL FIRST: the baseline non-first fragment HITS. Ordered
         // before the negative assertion so a lookup that never returns anything
         // fails here rather than passing the "must not inherit" check for free.
         let kn_base =
-            nat64_nonfirst_fragment_key(&nonfirst, libc::AF_INET6, base).expect("baseline key");
+            nonfirst_fragment_key(&nonfirst, libc::AF_INET6, base).expect("baseline key");
         assert!(
             cache.lookup(&kn_base, 1_100, 1, |_| true).is_some(),
             "{dimension} control: the SAME-authority non-first fragment must inherit — without \
@@ -5978,7 +5990,7 @@ fn frag_assoc_every_authority_dimension_is_load_bearing() {
         );
 
         let kn =
-            nat64_nonfirst_fragment_key(&nonfirst, libc::AF_INET6, other).expect("non-first key");
+            nonfirst_fragment_key(&nonfirst, libc::AF_INET6, other).expect("non-first key");
         assert!(
             cache.lookup(&kn, 1_100, 1, |_| true).is_none(),
             "{dimension} must be part of the association authority; a fragment differing only \
@@ -5999,16 +6011,16 @@ fn frag_assoc_every_authority_dimension_is_load_bearing() {
 /// the IPv4 Protocol byte), both of which every fragment carries, so a non-first
 /// fragment never has to have its payload interpreted as L4.
 ///
-/// RED on revert: drop `protocol` from `Nat64FragKey` and the TCP-labelled
+/// RED on revert: drop `protocol` from `FragKey` and the TCP-labelled
 /// non-first fragment inherits the UDP datagram's decision.
 #[test]
 fn frag_assoc_protocol_collision_does_not_alias() {
     let (first, nonfirst) = frag_pair_v6();
-    let cache = Nat64FragAssoc::new();
+    let cache = FragAssoc::new();
     let decision = frag_v6_decision();
 
     let kf =
-        nat64_first_fragment_key(&first, libc::AF_INET6, frag_test_authority()).expect("first key");
+        first_fragment_key(&first, libc::AF_INET6, frag_test_authority()).expect("first key");
     // The builder emits UDP, so the key's protocol must come from the packet —
     // not be defaulted or zeroed.
     assert_eq!(
@@ -6017,9 +6029,9 @@ fn frag_assoc_protocol_collision_does_not_alias() {
     );
     cache.install(kf, decision, None, 1_000, 1, 0);
 
-    let kn = nat64_nonfirst_fragment_key(&nonfirst, libc::AF_INET6, frag_test_authority())
+    let kn = nonfirst_fragment_key(&nonfirst, libc::AF_INET6, frag_test_authority())
         .expect("non-first key");
-    let collided = Nat64FragKey { protocol: PROTO_TCP, ..kn };
+    let collided = FragKey { protocol: PROTO_TCP, ..kn };
     assert!(
         cache.lookup(&collided, 1_100, 1, |_| true).is_none(),
         "a TCP fragment must not inherit a UDP datagram's decision on an ident collision"
@@ -6035,7 +6047,7 @@ fn frag_assoc_protocol_collision_does_not_alias() {
 /// carries). Guards the v4 arm of the same SSOT builder.
 ///
 /// The key comparisons alone would all hold against a cache that never serves a
-/// hit, so the second half drives the SAME keys through a real `Nat64FragAssoc`
+/// hit, so the second half drives the SAME keys through a real `FragAssoc`
 /// — same-domain HIT (the positive control) then cross-domain MISS.
 #[test]
 fn frag_assoc_v4_key_carries_protocol_and_authority() {
@@ -6046,8 +6058,8 @@ fn frag_assoc_v4_key_carries_protocol_and_authority() {
     let nonfirst = make_ipv4_frag_udp(server_v4, snat_v4, 0, 0, &[0xDDu8; 24], 120, false, ident);
 
     let kf =
-        nat64_first_fragment_key(&first, libc::AF_INET, frag_test_authority()).expect("v4 first key");
-    let kn = nat64_nonfirst_fragment_key(&nonfirst, libc::AF_INET, frag_test_authority())
+        first_fragment_key(&first, libc::AF_INET, frag_test_authority()).expect("v4 first key");
+    let kn = nonfirst_fragment_key(&nonfirst, libc::AF_INET, frag_test_authority())
         .expect("v4 non-first key");
     assert_eq!(
         kf.protocol, PROTO_UDP,
@@ -6061,7 +6073,7 @@ fn frag_assoc_v4_key_carries_protocol_and_authority() {
     assert_eq!(kf, kn, "same domain + protocol still co-locates the datagram");
 
     // Cross-domain on the v4 arm too.
-    let kn_other = nat64_nonfirst_fragment_key(&nonfirst, libc::AF_INET, frag_other_authority())
+    let kn_other = nonfirst_fragment_key(&nonfirst, libc::AF_INET, frag_other_authority())
         .expect("v4 non-first key, other domain");
     assert_ne!(
         kf, kn_other,
@@ -6069,11 +6081,11 @@ fn frag_assoc_v4_key_carries_protocol_and_authority() {
     );
 
     // Drive the same keys through a real cache. Everything above compares keys
-    // and would hold verbatim against a `Nat64FragAssoc` that never returns a
+    // and would hold verbatim against a `FragAssoc` that never returns a
     // hit, so the discrimination below needs a positive control to mean
     // anything: same-domain HITS, other-domain MISSES, and the entry the
     // other-domain fragment failed to match is still live afterwards.
-    let cache = Nat64FragAssoc::new();
+    let cache = FragAssoc::new();
     cache.install(kf, frag_v6_decision(), None, 1_000, 1, 0);
     assert!(
         cache.lookup(&kn, 1_100, 1, |_| true).is_some(),
@@ -6101,7 +6113,7 @@ fn frag_assoc_v4_key_carries_protocol_and_authority() {
 // gate prevents on the enforcement path.
 // ---------------------------------------------------------------------------
 
-fn frag_rg_fixture() -> (Nat64FragAssoc, Nat64FragKey, Nat64FragKey, SessionDecision) {
+fn frag_rg_fixture() -> (FragAssoc, FragKey, FragKey, SessionDecision) {
     let src_v6: Ipv6Addr = "2001:db8::1".parse().expect("src");
     let dst_v6: Ipv6Addr = "64:ff9b::808:808".parse().expect("dst");
     let snat_v4 = Ipv4Addr::new(172, 16, 80, 8);
@@ -6109,16 +6121,16 @@ fn frag_rg_fixture() -> (Nat64FragAssoc, Nat64FragKey, Nat64FragKey, SessionDeci
     let ident: u32 = 0x0000_BEEF;
     let first = make_ipv6_frag_udp(src_v6, dst_v6, 1000, 53, &[0xAAu8; 16], 0, true, ident);
     let nonfirst = make_ipv6_frag_udp(src_v6, dst_v6, 0, 0, &[0xBBu8; 24], 185, false, ident);
-    let kf = nat64_first_fragment_key(&first, libc::AF_INET6, frag_test_authority())
+    let kf = first_fragment_key(&first, libc::AF_INET6, frag_test_authority())
         .expect("first-fragment key");
-    let kn = nat64_nonfirst_fragment_key(&nonfirst, libc::AF_INET6, frag_test_authority())
+    let kn = nonfirst_fragment_key(&nonfirst, libc::AF_INET6, frag_test_authority())
         .expect("non-first-fragment key");
     assert_eq!(
         kf, kn,
         "#6857 premise: the two fragments must share one key"
     );
     let decision = frag_test_decision(Nat64State::forward_decision(snat_v4, dst_v4, 5000));
-    (Nat64FragAssoc::new(), kf, kn, decision)
+    (FragAssoc::new(), kf, kn, decision)
 }
 
 /// The property: an association minted under owner RG 3 must MISS once RG 3 is
@@ -6907,8 +6919,8 @@ fn frag_alias_counts_7056() -> (u64, u64) {
     )
 }
 
-fn frag_key_7056(protocol: u8, authority: FragAuthority) -> Nat64FragKey {
-    Nat64FragKey {
+fn frag_key_7056(protocol: u8, authority: FragAuthority) -> FragKey {
+    FragKey {
         addr_family: libc::AF_INET6 as u8,
         src: IpAddr::V6("2001:db8::1".parse().unwrap()),
         dst: IpAddr::V6("64:ff9b::0808:0808".parse().unwrap()),
@@ -6933,7 +6945,7 @@ fn refused_alias_misses_are_counted_distinctly_7056() {
     ));
 
     // (1) CROSS-DOMAIN: installed under one authority, consulted under another.
-    let cache = Nat64FragAssoc::new();
+    let cache = FragAssoc::new();
     cache.install(
         frag_key_7056(PROTO_UDP, frag_test_authority()),
         decision,
@@ -6964,7 +6976,7 @@ fn refused_alias_misses_are_counted_distinctly_7056() {
     );
 
     // (2) PROTOCOL ALIAS: same authority, TCP vs UDP on one (src, dst, ident).
-    let cache = Nat64FragAssoc::new();
+    let cache = FragAssoc::new();
     cache.install(
         frag_key_7056(PROTO_UDP, frag_test_authority()),
         decision,
@@ -6993,7 +7005,7 @@ fn refused_alias_misses_are_counted_distinctly_7056() {
     );
 
     // (3) THE MIDDLE ROW — an ordinary miss, no entry at all. Neither counter.
-    let cache = Nat64FragAssoc::new();
+    let cache = FragAssoc::new();
     let (x0, p0) = frag_alias_counts_7056();
     let hit = cache.lookup(
         &frag_key_7056(PROTO_UDP, frag_test_authority()),
@@ -7013,7 +7025,7 @@ fn refused_alias_misses_are_counted_distinctly_7056() {
     );
 
     // (4) A HIT must not count either, or the counters measure consult volume.
-    let cache = Nat64FragAssoc::new();
+    let cache = FragAssoc::new();
     let key = frag_key_7056(PROTO_UDP, frag_test_authority());
     cache.install(key, decision, None, 1_000, 1, 0);
     let (x0, p0) = frag_alias_counts_7056();
@@ -7045,7 +7057,7 @@ fn a_generation_fenced_miss_is_not_reported_as_an_alias_7056() {
         Ipv4Addr::new(8, 8, 8, 8),
         5000,
     ));
-    let cache = Nat64FragAssoc::new();
+    let cache = FragAssoc::new();
     cache.install(
         frag_key_7056(PROTO_UDP, frag_test_authority()),
         decision,
