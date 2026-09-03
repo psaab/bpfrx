@@ -37,6 +37,7 @@ from ledger_compare import (
     compare,
     exit_status,
     lint_ledger,
+    lint_merge_completeness,
     lint_row,
     parse_ledger,
 )
@@ -472,6 +473,58 @@ class ConstantsAreWhatTheCommentsClaim(unittest.TestCase):
         self.assertEqual(MIN_BASELINE_RUNS, 3)
         self.assertEqual(BAND_Z, 3.0)
         self.assertEqual(BAND_REL_FLOOR, 0.05)
+
+
+class MergeCompletenessSeesADroppedRow8346(unittest.TestCase):
+    """#8346: the check `lint_ledger` structurally cannot make.
+
+    A dropped row leaves a well-formed, internally consistent, lint-clean
+    file — nothing in the surviving rows says anything is missing. These
+    cells pin that the completeness check sees what lint cannot, and that it
+    does not fire on a legitimate merge.
+    """
+
+    @staticmethod
+    def _led(*ids):
+        # Built through the module's own `row()` helper so every fixture row
+        # SURVIVES lint_row(). An earlier hand-rolled fixture omitted required
+        # keys, which made the "lint is blind to a drop" control below fail for
+        # a schema reason and look like it had detected the drop — a control
+        # that passes for the wrong reason is worse than no control.
+        return "\n".join(
+            json.dumps(row(f"2026-09-01T00:0{n}:00Z", run_id=i))
+            for n, i in enumerate(ids)
+        ) + "\n"
+
+    def test_a_dropped_row_is_reported(self):
+        merged = self._led("a", "b")          # 'c' lost
+        problems = lint_merge_completeness(merged, [self._led("a", "b"),
+                                                    self._led("a", "c")])
+        self.assertTrue(problems)
+        self.assertIn("c", problems[0])
+
+    def test_a_correct_union_is_clean(self):
+        merged = self._led("a", "b", "c")
+        self.assertEqual(
+            lint_merge_completeness(merged, [self._led("a", "b"),
+                                             self._led("a", "c")]),
+            [],
+        )
+
+    def test_a_count_preserving_swap_is_still_caught(self):
+        # The reason this is a SET check and not a row count: one row dropped
+        # and one added leaves the count identical, so a count-based guard
+        # passes on exactly the corruption it exists to catch.
+        merged = self._led("a", "z")          # 'b' lost, 'z' gained
+        problems = lint_merge_completeness(merged, [self._led("a", "b"), self._led("a")])
+        self.assertTrue(problems)
+        self.assertIn("b", problems[0])
+
+    def test_lint_ledger_is_blind_to_the_same_drop(self):
+        # The discriminating control, and the argument for this check
+        # existing at all: run the ROW linter over the damaged merge result
+        # and watch it report clean.
+        self.assertEqual(lint_ledger(self._led("a", "b")), [])
 
 
 if __name__ == "__main__":

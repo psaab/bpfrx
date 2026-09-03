@@ -462,8 +462,30 @@ if command -v python3 >/dev/null 2>&1; then
 		faill "ledger-lint"
 		echo "$out" | sed 's/^/      /'
 	fi
+	# #8346: the completeness half. `ledger-lint` above is over the rows that
+	# are PRESENT, so a row that is simply MISSING leaves a well-formed,
+	# internally consistent, lint-clean file -- it cannot see a drop. Three real
+	# gate records were lost to a `merge.union.driver = true` in .git/config
+	# that shadowed git's BUILT-IN union with a no-op (no conflict, no warning,
+	# and `git check-attr` reporting `merge: union` the whole time), and this
+	# leg was green throughout. The check below compares against the merge
+	# PARENTS instead of against the file alone, and is a run_id SET check --
+	# a count would pass a merge that dropped one row and added another.
+	#
+	# A no-op on a non-merge HEAD, and it SAYS so rather than printing a bare
+	# pass, because "checked nothing" and "checked and clean" must not look the
+	# same here.
+	out=$(python3 test/incus/ledger_compare.py --lint-merge 2>&1)
+	rc=$?
+	if [ "$rc" -eq 0 ]; then
+		passl "ledger-merge-completeness ($out)"
+	else
+		faill "ledger-merge-completeness"
+		echo "$out" | sed 's/^/      /'
+	fi
 else
 	skipl "ledger-lint (python3 not installed)"
+	skipl "ledger-merge-completeness (python3 not installed)"
 fi
 
 # ── summary ──

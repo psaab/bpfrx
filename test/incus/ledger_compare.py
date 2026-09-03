@@ -208,6 +208,14 @@ def lint_ledger(text: str) -> List[str]:
     and :func:`parse_ledger` dedupes it. A repeat whose payload DIFFERS is
     corruption: two different runs claiming one identity, which would put a
     foreign measurement into a band.
+
+    WHAT THIS CANNOT SEE (#8346): a row that is simply MISSING. Every check
+    here is over the rows that are present, so a dropped row leaves a
+    well-formed, internally consistent, lint-clean file. Three real gate
+    records were lost to a no-op ``merge.union.driver`` and this leg stayed
+    green throughout. :func:`lint_merge_completeness` is the check that can
+    see it, because it compares against the merge parents rather than against
+    the file alone.
     """
     problems: List[str] = []
     seen = 0
@@ -235,6 +243,65 @@ def lint_ledger(text: str) -> List[str]:
         by_run_id.setdefault(run_id, canon)
     if seen == 0:
         problems.append("the ledger has zero rows — linting an empty ledger is not a pass")
+    return problems
+
+
+def run_ids(text: str) -> set:
+    """The set of ``run_id`` values in a ledger, ignoring damaged lines.
+
+    Deliberately tolerant where :func:`parse_ledger` refuses: this is used by
+    :func:`lint_merge_completeness`, whose job is to answer "did a row go
+    MISSING", and a parent that also has a damaged line should not mask that.
+    """
+    out = set()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict) and isinstance(row.get("run_id"), str):
+            out.add(row["run_id"])
+    return out
+
+
+def lint_merge_completeness(merged: str, parents: Sequence[str]) -> List[str]:
+    """A merge result must retain every ``run_id`` present in EITHER parent.
+
+    #8346: this is the check :func:`lint_ledger` structurally cannot make, and
+    the distinction is the whole point. ``lint_ledger`` keys on a repeated
+    ``run_id`` whose payload DIFFERS -- corruption. A row that is simply GONE
+    leaves a well-formed, internally consistent, perfectly lint-clean file. It
+    is the "fails to a value indistinguishable from healthy" shape: nothing in
+    the surviving rows says anything is missing.
+
+    That is not hypothetical. `merge.union.driver = true` in this repo's
+    ``.git/config`` shadowed git's BUILT-IN union driver with a no-op, so every
+    ``merge=union`` file silently resolved to "ours" -- no conflict, no warning,
+    not even a line in the merge summary, while ``git check-attr`` reported
+    ``merge: union`` throughout. Three real gate records were lost that way
+    before anyone noticed, and they were noticed by hand.
+
+    A SET check, not a count. Counting rows would pass a merge that dropped one
+    row and added another, which is exactly the coincidence a count cannot see.
+
+    Mechanism-independent by design: it does not care WHY a row vanished, so it
+    survives the config being fixed, the storage moving to one-file-per-run, or
+    a future driver regressing again.
+    """
+    problems: List[str] = []
+    have = run_ids(merged)
+    for idx, parent in enumerate(parents):
+        missing = run_ids(parent) - have
+        if missing:
+            problems.append(
+                f"merge dropped {len(missing)} run_id(s) present in parent {idx}: "
+                + ", ".join(sorted(missing))
+                + " — the ledger is append-only and nothing prunes it, so a "
+                "shrink is never legitimate"
+            )
     return problems
 
 
@@ -528,6 +595,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--k", type=int, default=MIN_BASELINE_RUNS, help="green runs required")
     p.add_argument("--json", action="store_true", help="emit JSON instead of text")
     p.add_argument("--lint", action="store_true", help="lint the ledger and exit")
+    p.add_argument(
+        "--lint-merge",
+        action="store_true",
+        help=(
+            "if HEAD is a merge commit, verify the ledger retained every run_id "
+            "from both parents (#8346); a no-op on a non-merge HEAD"
+        ),
+    )
     args = p.parse_args(argv)
 
     ledger = args.ledger
@@ -542,6 +617,36 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except OSError as exc:
         print(f"LEDGER-CORRUPT: cannot read {ledger}: {exc}", file=sys.stderr)
         return 2
+
+    if args.lint_merge:
+        import subprocess
+
+        def _show(rev: str) -> str:
+            r = subprocess.run(
+                ["git", "show", f"{rev}:test/results/ledger.jsonl"],
+                capture_output=True, text=True,
+            )
+            return r.stdout if r.returncode == 0 else ""
+
+        parents = subprocess.run(
+            ["git", "rev-parse", "HEAD^@"], capture_output=True, text=True
+        ).stdout.split()
+        if len(parents) < 2:
+            # Not a merge. Reporting "clean" here would be the empty-set pass
+            # this file guards against elsewhere, so say what was checked.
+            print("lint-merge: HEAD is not a merge commit — nothing to check")
+            return 0
+        merged = _show("HEAD")
+        probs = lint_merge_completeness(merged, [_show(p_) for p_ in parents])
+        if probs:
+            for pr in probs:
+                print(pr)
+            return 1
+        print(
+            f"lint-merge: OK — {len(run_ids(merged))} run_id(s), none dropped "
+            f"across {len(parents)} parents"
+        )
+        return 0
 
     if args.lint:
         problems = lint_ledger(text)
