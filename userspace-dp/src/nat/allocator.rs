@@ -1322,7 +1322,7 @@ impl PortAllocator {
     /// goes through here. `snapshot()` deliberately does NOT — it is the
     /// ~1s status poll that reads these very counters, and counting it
     /// would inject the observer into the observation.
-    fn lock_live(&self) -> MutexGuard<'_, PortAllocatorLiveState> {
+    pub(super) fn lock_live(&self) -> MutexGuard<'_, PortAllocatorLiveState> {
         self.shared
             .live_lock_acquisitions
             .fetch_add(1, Ordering::Relaxed);
@@ -1615,6 +1615,19 @@ impl PortAllocator {
     /// Free a translated port's occupancy bit. `recycle` pushes the port onto
     /// the FIFO reuse ring (#3011); the deterministic path passes `false`.
     /// Returns true iff the bit was set.
+    /// #8121: CLAIM one specific `(addr_index, port)` for the idle-lease
+    /// import — the mirror of `free_translated_port`. `None` when the index is
+    /// out of range; `Some(false)` when the bit is already held. An idle lease still holds its
+    /// bit on the active node (it is freed on the expiry path, not when the
+    /// last flow closes), so importing without the bit would let a local flow
+    /// mint the same translated identity.
+    // #8121 part 1: reached only from `idle_lease_sync_8121` and its tests
+    // until the transport lands (see that module's header).
+    #[allow(dead_code)]
+    pub(super) fn try_claim_translated_port(&self, addr_index: usize, port: u16) -> Option<bool> {
+        Some(self.shared.occupancy.get(addr_index)?.reserve(port))
+    }
+
     fn free_translated_port(&self, addr_index: usize, port: u16, recycle: bool) -> bool {
         let Some(occ) = self.shared.occupancy.get(addr_index) else {
             return false;
@@ -1993,7 +2006,10 @@ impl PortAllocator {
         None
     }
 
-    fn insert_lease_expiration_locked(
+    /// #8121: the idle-lease import needs the same expiry registration a mint
+    /// does, or an imported lease is invisible to GC and outlives what the
+    /// active node held.
+    pub(super) fn insert_lease_expiration_locked(
         live: &mut PortAllocatorLiveState,
         addr_index: usize,
         expires_at_ns: u64,
