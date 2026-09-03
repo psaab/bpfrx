@@ -897,11 +897,11 @@ pub(super) fn apply_worker_commands(
                 // Trivial variant — kept inline (#1346 plan v2 §4.1).
                 shaped_tx_requests.push(req);
             }
-            WorkerCommand::InstallPptpCall(call) => {
+            WorkerCommand::InstallPptpCall { call, control, learned_ns } => {
                 // #7699: learn the association on THIS worker. A collision is
                 // refused rather than merged (two calls sharing one handle
                 // share one session), and counted so a refusal is not silent.
-                if let Err(e) = sessions.pptp_mut().install(call) {
+                if let Err(e) = sessions.pptp_mut().install(call, control, learned_ns) {
                     debug_log!("PPTP association refused: {:?}", e);
                 }
             }

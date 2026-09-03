@@ -192,7 +192,13 @@ mod tests_7699 {
         let call = learn_from_control_segment(s, d, &msg).expect("a connected reply must learn");
 
         let mut table = crate::session::pptp::PptpAssociations::default();
-        let handle = table.install(call).expect("install");
+        let handle = table
+            .install(
+                call,
+                crate::session::pptp::ControlChannelId::new(s, 49152, d, 1723),
+                0,
+            )
+            .expect("install");
         assert_eq!(
             table.resolve(s, 0xAAAA),
             Some(handle),

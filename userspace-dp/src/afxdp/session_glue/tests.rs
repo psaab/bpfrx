@@ -8217,7 +8217,11 @@ fn worker_commands_install_and_forget_pptp_associations_7699() {
     commands
         .lock()
         .expect("commands")
-        .push_back(WorkerCommand::InstallPptpCall(call));
+        .push_back(WorkerCommand::InstallPptpCall {
+            call,
+            control: crate::session::pptp::ControlChannelId::new(a, 49152, b, 1723),
+            learned_ns: 0,
+        });
     apply_worker_commands(
         &commands,
         &mut sessions,
@@ -8322,7 +8326,12 @@ fn a_control_segment_becomes_a_resolvable_association_7699() {
         .map(|_| Arc::new(Mutex::new(VecDeque::new())))
         .collect();
     assert_eq!(
-        crate::afxdp::worker_queue::broadcast_pptp_install(&queues, call),
+        crate::afxdp::worker_queue::broadcast_pptp_install(
+            &queues,
+            call,
+            crate::session::pptp::ControlChannelId::new(pac, 49152, pns, 1723),
+            0,
+        ),
         2,
         "the association must reach every worker; the control channel and the \
          GRE data channel are not co-located"
