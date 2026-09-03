@@ -1657,26 +1657,55 @@ pub(in crate::afxdp) fn parse_session_flow_from_meta(meta: UserspaceDpMeta) -> O
 /// Cumulative and process-global, like `INTERFACE_SNAT_PAT_COLLISIONS`, so tests
 /// read them as a delta.
 ///
-/// These COUNT; they do not change disposition. The callers still forward, and
-/// deliberately so: the same `if let Some(l3_flow)` gate exists on the
-/// association-HIT arm, the session-MISS arm, the MissingNeighbor policy arm
-/// and — since #7480 — the NoRoute policy arm, and the hit/miss pair carries an
-/// explicit invariant that they must not diverge on what the filter sees. Making
-/// one arm discard would break that invariant while leaving the bypass reachable
-/// through the others. The disposition question is tracked separately in #7890
-/// (which covers the hit arm, the miss arm, and the MissingNeighbor policy arm —
-/// since changing one alone would break the stated hit/miss parity invariant
-/// while leaving the bypass reachable through the others).
+/// **`L3_CTX_NONE_UNKNOWN_FAMILY` counts without changing disposition.** An
+/// unparseable family has no addresses to enforce against, so every site still
+/// refuses and falls through. It is unreachable in production anyway.
 ///
-/// #7480 added the FOURTH such site and deliberately kept the same
-/// fall-through, so this enumeration stays accurate: a NoRoute frame with no
-/// derivable L3 identity is NOT adjudicated and is still delegated to the kernel
-/// — which for the reachable leg means a dst-unspecified packet, the one this
-/// doc notes "dies at NoRoute". Bringing that arm under #7890 rather than
-/// diverging from the other three is the deliberate choice; #7480 narrowed the
-/// bypass for every frame that HAS an L3 identity, which is all of them in
-/// production unless `L3_CTX_NONE_UNSPECIFIED_ADDR` is moving. This counter exists so the
-/// seam cannot be silently widened by a future metadata change.
+/// **`L3_CTX_NONE_UNSPECIFIED_ADDR` no longer describes a bypass (#7890).**
+/// This paragraph used to say the callers "still forward, and deliberately so",
+/// because the same `if let Some(l3_flow)` gate sat on the association-HIT arm,
+/// the session-MISS arm, the MissingNeighbor policy arm and — since #7480 — the
+/// NoRoute policy arm, and diverging on one would have broken the hit/miss
+/// parity invariant. #7890 changed all of them together, which is what that
+/// invariant actually required: the four arms and the two flowless filter-log
+/// sites now resolve through `l3_enforcement_flow_from_meta`, which answers the
+/// ADDRESS question rather than the identity one and does not refuse an
+/// unspecified address. The operator's configured verdict decides the packet.
+///
+/// The counter is kept, with its meaning restated on that function: "an
+/// unspecified address was SEEN here", not "a lookup was refused". A test
+/// asserts it MOVED before asserting what enforcement did, so a fixture that
+/// misses a conjunct cannot pass proving nothing.
+///
+/// Each site is bound by a named cell, and the binding was measured by
+/// site-local mutation against the full suite rather than assumed:
+///
+///   - `poll_descriptor` association-HIT arm —
+///     `unspecified_source_association_hit_still_runs_the_input_filter_7890`
+///   - `poll_descriptor` session-MISS arm —
+///     `unspecified_source_still_runs_the_is_fragment_input_filter_7890`
+///     (paired with `..._honours_a_non_discard_filter_verdict_7890`, which is
+///     what distinguishes evaluating the filter from dropping on `None`)
+///   - `poll_descriptor` NoRoute arm —
+///     `unspecified_source_noroute_fragment_still_policy_denied_7890`
+///   - `poll_descriptor` MissingNeighbor arm —
+///     `unspecified_source_missing_neighbor_fragment_still_policy_denied_7890`
+///   - the two `forward_request` flowless filter-log sites —
+///     `unspecified_source_flowless_egress_filter_log_is_still_emitted_7890`,
+///     which binds them as a PAIR: they form a fallback chain, so reverting
+///     either alone leaves the suite green while reverting both reds that cell.
+///
+/// Two of those bindings are not the obvious ones, and both were found by
+/// mutation rather than by reading:
+///
+///   - On the NoRoute arm, `forward == 0` does NOT bind anything — a NoRoute
+///     packet does not forward either way. `policy_deny == 1` does.
+///   - On the filter-log sites the failure is a MISSING LOG on a packet that
+///     forwards correctly, so no packet-side observable can see it; the cell
+///     has to read the event stream and assert the record's addresses.
+///
+/// The counters stay so the seam cannot be silently reopened by a future
+/// metadata or resolver change.
 pub(in crate::afxdp) static L3_CTX_NONE_UNKNOWN_FAMILY: AtomicU64 = AtomicU64::new(0);
 
 /// See `L3_CTX_NONE_UNKNOWN_FAMILY`. This is the leg that is reachable in
