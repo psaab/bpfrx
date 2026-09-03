@@ -413,6 +413,19 @@ func validateApplicationSyntaxStrict(cfg *Config) error {
 		// supported — calling it an "unknown statement" would send the operator
 		// looking for a typo that is not there. The consequence is the same
 		// fail-open: the constraint is dropped and the term widens.
+		// #8339: the DIRECT-body twin of the check below. The term path has
+		// refused this since #6564; the direct body accepted it and matched
+		// every port. Ordered before the term check only so the two read as a
+		// pair; an application cannot populate both.
+		if len(app.IncompleteDirectLeaves) > 0 {
+			return fmt.Errorf(
+				"application %q: statement %q is missing its value; the "+
+					"statement is dropped along with the constraint it was meant to "+
+					"impose, WIDENING the application to match more than intended "+
+					"(e.g. `protocol tcp destination-port` with no port matches "+
+					"EVERY TCP port)",
+				name, app.IncompleteDirectLeaves[0])
+		}
 		if len(app.IncompleteTermLeaves) > 0 {
 			return fmt.Errorf(
 				"application %q: `term` statement %q is missing its value; the "+
