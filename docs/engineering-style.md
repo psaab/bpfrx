@@ -571,6 +571,65 @@ all three remain open. The rule is documented here rather than left in the
 tracker because a policy that lives only in an issue is not read before the
 next test is written, which is how this reached four packages.
 
+## Verification discipline (#8348)
+
+Two rules earned by a defect that stayed invisible for four months while every
+health signal stayed green.
+
+### A check you had to manufacture to pass is measuring your setup, not the system
+
+`.git/config` carried `merge.union.driver = true` — a custom driver **named** after
+git's built-in `union` whose command is the shell no-op `true`. A custom driver
+**shadows** the built-in, so every `merge=union` path resolved to *ours* and silently
+discarded the other side. Exit 0, no conflict, nothing in the merge summary. Rows were
+lost from `test/results/ledger.jsonl`.
+
+The provenance is the lesson. `docs/issues/pr-history.md:26283` is the verification
+checklist of PR **#1582** — a `merge=union` attempt **closed/rejected** in May 2026:
+
+```
+- [x] `git config --get-all merge.union.driver` returns `cat %A %B > %A` (built-in)
+```
+
+Git's built-in union has **no** `.driver` config key, so a healthy repo returns
+nothing. **The check could only pass if someone set the key — passing the verification
+required manufacturing the defect.** That is not a weak check; it is an inverted one.
+The PR was rejected; the config residue outlived it by four months.
+
+**The test:** *would this step pass on a fresh clone with nothing done to it?* If the
+honest answer is no, the check is describing your workspace. A verification step that
+fails on a clean machine and passes only after you have configured something has
+verified your own edit and nothing else.
+
+Corollaries:
+
+- **Never name a custom merge driver after a built-in.** It silently redefines an
+  attribute the rest of the repo documents and relies on. Use a distinct name.
+- **A detector's docstring is a claim about what it can see.** `ledger_compare.py`'s
+  lint claimed to be "what catches that reasoning being wrong rather than trusting
+  it". It keys on a repeated `run_id` with a *differing payload* — corruption — and a
+  silently **dropped** row is well-formed and lint-clean by construction. An
+  overstated docstring is worse than none: it stops the next person looking.
+
+### Tell a peer what baseline to expect, so their green becomes falsifiable
+
+A `make test-failover` run reported `20 passed, 0 failed`. The branch predated
+`ff6551d88`, so it ran the **older cell set** — which coincidentally also totals 20.
+Same number, different tests. Nothing in the output distinguished them.
+
+It was caught only because a peer had said in advance: *expect two `KNOWN` gap lines.*
+None appeared, and that got checked rather than shrugged at.
+
+**A summary line is not a result — it is a count of whatever ran.** "N passed" is
+silent about *which* N. So a brief that names the expected signal converts an
+unfalsifiable summary into a checkable one, and that is a property of the **dispatch**,
+not of the recipient's diligence:
+
+- name the specific lines, markers or counts a correct run produces;
+- say what their **absence** means (usually: the wrong thing ran — not that it passed);
+- prefer a signal that is **structurally** different between right and wrong, not a
+  total. A count is exactly what collided here.
+
 ## Review discipline
 
 ### Reviewing (adversarial by design)
