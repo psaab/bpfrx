@@ -388,7 +388,7 @@ impl SourceNatRule {
 /// interface-mode mint path (new flows), and the `is_draining_pool` test is a
 /// cheap `Option::is_some` that is false for every rule in a healthy config, so
 /// the common case never reaches the address comparison.
-fn address_has_draining_pool_occupancy(rules: &[SourceNatRule], addr: IpAddr) -> bool {
+pub(crate) fn address_has_draining_pool_occupancy(rules: &[SourceNatRule], addr: IpAddr) -> bool {
     rules.iter().any(|candidate| {
         candidate.is_draining_pool()
             && candidate.pool_contains_address(addr)

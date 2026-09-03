@@ -189,6 +189,9 @@ pub(crate) use source::{reserve_synced_source_nat_allocation, rollback_source_na
 pub(crate) use source::retire_worker_from_pool_rules;
 // #7560 residual: nat64.rs is the third reseed call site and needs the same note.
 pub(crate) use source::report_dropped_leases;
+// #7799: the NAT64 mint path (`crate::nat64`) needs the same drain-occupancy
+// test the interface-mode mint path uses.
+pub(crate) use source::address_has_draining_pool_occupancy;
 // #6979: reachable from the afxdp coordinator test that binds the retirement
 // wiring; the primitive itself stays covered by nat::tests_pool.
 pub(crate) use allocator::TranslatedTuple;

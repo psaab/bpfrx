@@ -288,3 +288,123 @@ fn only_the_overlap_quarantine_retains_its_allocator_7717() {
          satisfied by retention being broken outright"
     );
 }
+
+/// #7799: NAT64 is a THIRD occupancy domain. It mints from `Nat64Prefix`'s own
+/// `PortAllocator`, which can see neither the interface registry nor a
+/// source-NAT pool's occupancy bitmap — so a NAT64 mint on an address a
+/// quarantined pool is still DRAINING can hand out an identity that pool still
+/// owns, and the reverse index cannot disambiguate the reply.
+///
+/// The CONTROL half carries as much weight as the refusal: with the same rules
+/// before they are quarantined, the same mint must SUCCEED. Without it a
+/// permanently-broken NAT64 mint would pass this cell, and a permanent
+/// quarantine is a working drain's exact failure mode.
+#[test]
+fn nat64_mint_fails_closed_while_a_pool_drains_the_same_address_7799() {
+    // A live pool-mode flow on E, exactly as the interface-arm cell sets up.
+    let gen1 = parse_source_nat_rules(&[pool_snapshot(false)]);
+    let reg = InterfaceNatAllocators::default();
+    match admit(&reg, &gen1, "10.0.0.1", 5555) {
+        SourceNatLookup::Matched(_) => {}
+        other => panic!("setup: the healthy pool must admit: {other:?}"),
+    }
+    assert_eq!(gen1[0].pool_allocator.live_flow_count(), 1, "setup");
+
+    // A NAT64 rule-set whose pool is the SAME address the pool SNAT holds.
+    let nat64 = crate::nat64::Nat64State::from_snapshots(&[crate::NAT64RuleSnapshot {
+        name: "n64".to_string(),
+        prefix: "64:ff9b::/96".to_string(),
+        pool_addresses: vec![E.to_string()],
+        ..Default::default()
+    }]);
+    let client: std::net::Ipv6Addr = "2001:db8::1".parse().expect("client v6");
+    let dst_v4: std::net::Ipv4Addr = SRV.parse().expect("server v4");
+
+    // CONTROL: nothing is draining, so the NAT64 mint succeeds. This is what
+    // makes the refusal below attributable to the DRAIN rather than to the
+    // rule set, the pool, or the allocator being unusable in the first place.
+    nat64
+        .allocate_source_for_worker(0, TCP, client, dst_v4, 6000, 443, 0, 0, &gen1)
+        .expect("control: with no draining pool a NAT64 mint on E must succeed");
+
+    // Quarantine the pool. Its allocator is RETAINED, so it is still holding
+    // the live flow from gen1 — the draining state, not the drained one.
+    let draining = parse_source_nat_rules_with_previous(
+        &[pool_snapshot(true)],
+        Some(&gen1),
+        &NatCounterStore::default(),
+        0,
+    );
+    let pool_idx = draining
+        .iter()
+        .position(|r| r.pool_mode)
+        .expect("the quarantined pool rule must be present — it is what the gate scans for");
+    assert_eq!(
+        draining[pool_idx].pool_allocator.live_flow_count(),
+        1,
+        "setup: still draining, not drained"
+    );
+
+    match nat64.allocate_source_for_worker(0, TCP, client, dst_v4, 6001, 443, 0, 0, &draining) {
+        Err(SourceNatFailureReason::Nat64OverlapDraining) => {}
+        other => panic!(
+            "#7799: a NAT64 mint on an address a quarantined pool is still draining must fail \
+             CLOSED, and must name the DRAIN so the counter does not blame interface SNAT. \
+             Got {other:?}"
+        ),
+    }
+}
+
+/// #7799, second mint path. `Nat64State` has TWO ways to mint on `pool_v4`:
+/// round-robin `allocate_nat64_pool_port` and the mode-2 deterministic NAPT64
+/// `allocate_nat64_pool_port_deterministic_v6`. #7799 named only the first.
+/// Both allocate from the same pool and carry the same collision, so the gate
+/// is placed before the deterministic branch — and this cell is what makes that
+/// placement a tested property rather than a claim about a set from one member.
+#[test]
+fn nat64_deterministic_mint_also_fails_closed_while_draining_7799() {
+    let gen1 = parse_source_nat_rules(&[pool_snapshot(false)]);
+    let reg = InterfaceNatAllocators::default();
+    match admit(&reg, &gen1, "10.0.0.1", 5555) {
+        SourceNatLookup::Matched(_) => {}
+        other => panic!("setup: the healthy pool must admit: {other:?}"),
+    }
+
+    // A DETERMINISTIC (mode 2) NAT64 prefix whose pool is the drained address.
+    let nat64 = crate::nat64::Nat64State::from_snapshots(&[crate::NAT64RuleSnapshot {
+        name: "n64-det".to_string(),
+        prefix: "64:ff9b::/96".to_string(),
+        pool_addresses: vec![E.to_string()],
+        deterministic_block_size: 512,
+        deterministic_blocks_per_ip: 126,
+        deterministic_host_prefix_len: 32,
+        deterministic_host_base_v6: "2001:db8::".to_string(),
+        ..Default::default()
+    }]);
+    assert!(
+        nat64.prefixes[0].deterministic_v6.is_some(),
+        "setup: this cell is only meaningful if the DETERMINISTIC branch is the one taken"
+    );
+
+    let client: std::net::Ipv6Addr = "2001:db8:0:5::".parse().expect("client v6");
+    let dst_v4: std::net::Ipv4Addr = SRV.parse().expect("server v4");
+
+    // CONTROL: the deterministic path mints fine while nothing is draining.
+    nat64
+        .allocate_source_for_worker(0, TCP, client, dst_v4, 6000, 443, 0, 0, &gen1)
+        .expect("control: a deterministic NAPT64 mint must succeed with no draining pool");
+
+    let draining = parse_source_nat_rules_with_previous(
+        &[pool_snapshot(true)],
+        Some(&gen1),
+        &NatCounterStore::default(),
+        0,
+    );
+    match nat64.allocate_source_for_worker(0, TCP, client, dst_v4, 6001, 443, 0, 0, &draining) {
+        Err(SourceNatFailureReason::Nat64OverlapDraining) => {}
+        other => panic!(
+            "#7799: the DETERMINISTIC NAPT64 mint path allocates from the same pool and must \
+             fail closed on a draining address too. Got {other:?}"
+        ),
+    }
+}

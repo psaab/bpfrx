@@ -6847,6 +6847,7 @@ fn nat64_7094_rollback_for_worker_frees_only_that_holder() {
             443,
             3,
             0,
+            &[],
         )
         .expect("a fresh flow still allocates");
     assert_ne!(
@@ -6879,7 +6880,17 @@ fn nat64_7094_rollback_is_a_noop_on_the_reverse_entry() {
     let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
     let c: Ipv6Addr = "2001:db8::2".parse().unwrap();
     let (snat, pa) = state
-        .allocate_source_for_worker(0, crate::ip_proto::PROTO_TCP, c, dst_v4, 6000, 443, 1, 0)
+        .allocate_source_for_worker(
+            0,
+            crate::ip_proto::PROTO_TCP,
+            c,
+            dst_v4,
+            6000,
+            443,
+            1,
+            0,
+            &[],
+        )
         .unwrap();
     let key = crate::session::SessionKey {
         addr_family: libc::AF_INET6 as u8,
@@ -6900,7 +6911,17 @@ fn nat64_7094_rollback_is_a_noop_on_the_reverse_entry() {
         0,
     );
     let again = state
-        .allocate_source_for_worker(0, crate::ip_proto::PROTO_TCP, c, dst_v4, 6000, 443, 3, 0)
+        .allocate_source_for_worker(
+            0,
+            crate::ip_proto::PROTO_TCP,
+            c,
+            dst_v4,
+            6000,
+            443,
+            3,
+            0,
+            &[],
+        )
         .unwrap();
     assert_eq!(
         again,
