@@ -637,6 +637,50 @@ class MergeGuardSeesAcrossTheMigration(unittest.TestCase):
             tree_names=[f"test/results/{LEDGER_DIR_NAME}/shard1.json"]))
         self.assertEqual(ids, {"legacy1", "shard1"})
 
+    def test_the_migration_merge_shape_catches_a_dropped_id(self):
+        """A jsonl-only parent merged with a shard-only parent — the real shape.
+
+        This is the cell that proves the union is LIVE rather than a claim in
+        inert code. Every other test here passes with the leg simplified back
+        to a single path, because every other fixture has the id reachable
+        from the layout that leg reads. Only a merge whose two parents use
+        DIFFERENT layouts can tell a two-source reader from a one-source one,
+        and that is exactly the shape of the migration's own merge commit:
+        master carrying `ledger.jsonl`, this branch carrying `ledger.d/`.
+
+        Asserted in both directions. The faithful merge is clean, and a merge
+        that drops one id NAMES it — a cell that only checked the clean case
+        would pass against a guard that can never fail.
+        """
+        legacy_rows = greens([1.0, 2.0, 3.0])
+        legacy = "\n".join(json.dumps(r) for r in legacy_rows) + "\n"
+        all_ids = sorted(r["run_id"] for r in legacy_rows)
+
+        # parent 0: pre-migration master — the legacy file only, no ledger.d/
+        p_legacy = run_ids_at_rev("MASTER", run=self._fake_git(legacy_text=legacy))
+        # parent 1: the migration branch — shards only, no ledger.jsonl
+        p_shards = run_ids_at_rev("BRANCH", run=self._fake_git(
+            tree_names=[f"test/results/{LEDGER_DIR_NAME}/{i}.json" for i in all_ids]))
+        self.assertEqual(p_legacy, p_shards, "the fixture's two parents must hold the SAME ids")
+        self.assertEqual(len(p_legacy), 3)
+
+        faithful = run_ids_at_rev("MERGE", run=self._fake_git(
+            tree_names=[f"test/results/{LEDGER_DIR_NAME}/{i}.json" for i in all_ids]))
+        self.assertEqual(
+            lint_merge_completeness_ids(faithful, [p_legacy, p_shards]), [],
+            "a faithful migration merge must be clean",
+        )
+
+        lossy = run_ids_at_rev("MERGE-BAD", run=self._fake_git(
+            tree_names=[f"test/results/{LEDGER_DIR_NAME}/{i}.json" for i in all_ids[1:]]))
+        probs = lint_merge_completeness_ids(lossy, [p_legacy, p_shards])
+        self.assertTrue(probs, "a merge that dropped a row must be caught")
+        self.assertIn(all_ids[0], " ".join(probs))
+        # The LEGACY parent is the one that can only be seen through the
+        # `git show` source. If that source were dropped it would read as the
+        # empty set and contribute no complaint at all.
+        self.assertIn("parent 0", probs[0])
+
     def test_a_migration_that_dropped_a_row_is_caught(self):
         # The guard validating this very change: 3 rows in the legacy parent,
         # 2 shards in the merge result.

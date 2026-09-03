@@ -232,8 +232,9 @@ data file, on every rebase, is where a row gets dropped by accident.
 
 **One file per run removes the decision rather than adding a rule to remember
 under merge pressure.** Two writers never touch the same path, because `run_id`
-is unique per run and already in the row. No merge driver is involved at all,
-and `.gitattributes` no longer carries one.
+is unique per run and already in the row. No merge driver is involved at all —
+the repo no longer has a `.gitattributes` at all, because that one rule was the
+only thing in it.
 
 That last point is not incidental. The `merge=union` rule that used to sit
 there was **disarmed for months without anyone noticing**: this repo's
