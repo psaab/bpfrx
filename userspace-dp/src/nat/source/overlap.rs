@@ -35,17 +35,35 @@
 //! `peer_holds_address_only` is REMOTE-SPECIFIC (the key carries
 //! `dst_ip`/`dst_port`), so it over-rejects nothing.
 //!
-//! NOT COVERED, each a separate route to the same duplicate rather than a
-//! rounding error (Codex round 1 on PR #8111; tracked in #8115):
-//!   - R2, the HA synced reserve (`synced.rs`) calls `reserve_flow` /
-//!     `reserve_address_only` on one allocator directly and never reaches this
-//!     check, so an imported flow can take a tuple a LOCAL flow already owns in
-//!     a peer pool. It needs a DECISION rather than a patch: the synced path
-//!     exists to reproduce what the active node decided (#6211 pass 1), so it
-//!     must surface the conflict rather than simply refuse;
+//! ALSO COVERED: the HA synced reserve, on PASS 1 ONLY (#8115 R2). `synced.rs`
+//! called `reserve_flow_maybe_persistent` / `reserve_address_only` on ONE
+//! allocator, so an imported flow narrowed to pool B took a tuple a LOCAL flow
+//! already owned in pool A; both arms now ask `peer_owns_wire_identity` and roll
+//! back into the existing `Refused` outcome.
+//!
+//! The PASS-1 gate is the design constraint, not an optimisation. PASS 2 is
+//! reached when the zone pair cannot be resolved — an HA node's entire first
+//! sync, before any snapshot is applied — where the active's rule choice cannot
+//! be reproduced and "which rule's pool contains the address" is the only
+//! available question. Refusing there rejects EVERY import on such a node.
+//! #6979 F1 already measured that PASS 2 accepts into the wrong allocator and
+//! left it deliberately; ungating this reds its cell plus the #6211/#6600
+//! contract cells.
+//!
+//! Refusing on PASS 1 is not a new disposition: `Refused` is what this function
+//! already returns for the same conflict inside ONE allocator, and it is
+//! observable — `may_publish()` false, `SyncedImportOutcome::RejectedReserve`,
+//! and `xpf_userspace_synced_import_reserve_refused_total`, whose help text
+//! already says those flows will not survive a failover (#8101).
+//!
+//! NOT COVERED, a separate route to the same duplicate rather than a rounding
+//! error (Codex round 1 on PR #8111; tracked in #8115):
 //!   - R3, NAT64 prefixes are their own allocators (`nat64.rs`) and are not
-//!     indexed here at all.
-//! Both are reachable only from the same tolerated / peer-synced / handcrafted
+//!     indexed here at all. It is a REGISTRY gap rather than a missing caller:
+//!     the query would work, the member was never added — and the index is
+//!     built inside `parse_source_nat_rules_with_previous`, before
+//!     `state.nat64` exists, so closing it needs a second wiring pass.
+//! It is reachable only from the same tolerated / peer-synced / handcrafted
 //! population as the covered case (the Go #5144 strict gate rejects overlapping
 //! pools at commit on address overlap alone). That population is real and
 //! verified, not hypothetical: `lenientCompileOpts` is wired at
@@ -360,4 +378,59 @@ pub(super) fn wire_overlap_peers(out: &mut [SourceNatRule]) {
             rule.overlap_owners = Some(Arc::clone(&owners));
         }
     }
+}
+
+/// #8115 R1/R2: does a PEER pool's allocator already own this WIRE identity, in
+/// EITHER ownership space?
+///
+/// #6979 F6 asked only the bitmap question, which is the right one for a PAT
+/// mint against a PAT peer and blind in both directions to the OTHER space: a
+/// `port no-translation` / port-less flow claims no occupancy bit at all. So a
+/// peer preserving `X:P` did not stop a PAT mint of `X:P`, and two address-only
+/// flows in different pools collided whenever protocol and remote matched.
+///
+/// The two sub-questions are not equally precise, and the difference is worth
+/// stating because it decides where an over-rejection can occur:
+///
+///   - `peer_holds_identity` is REMOTE-AGNOSTIC. The occupancy bit means "this
+///     allocator may publish `X:P`", not "toward this remote". Refusing on it
+///     can therefore decline a flow whose remote differs from the peer flow's,
+///     which is not a wire collision. That is #6979 F6's shipped posture and is
+///     kept: for a PAT mint the cost is one rotation to another port, and the
+///     conservative direction is the safe one for a token that is the sole
+///     ownership word.
+///   - `peer_holds_address_only_identity` is REMOTE-SPECIFIC — the key carries
+///     `dst_ip`/`dst_port` — so a match is an exact duplicate of the wire
+///     5-tuple and carries no over-rejection at all.
+///
+/// The key is built by `AddressOnlyReverseKey::for_flow`, the SAME constructor
+/// the reserve paths insert with. Building it from three literals here would
+/// reproduce the #6751 defect that constructor exists to prevent: a check keyed
+/// differently from its insert finds nothing, every mint "succeeds", and no
+/// behavioural test can see it.
+///
+/// #8115 R2: the HA synced reserve asks this too. It lives here rather than in
+/// `match_rules` because it is the composed PEER QUERY, and its two consumers —
+/// the local mint and the synced import — must not drift on what "a peer owns
+/// this" means. A synced import that reserved on a different answer than the
+/// local mint uses would be the two-domains-one-identity split all over again,
+/// one layer up.
+///
+/// `false` on every config with no overlapping pools — `overlap_owners` is
+/// `None` there and this is one `Option::is_none`.
+pub(super) fn peer_owns_wire_identity(
+    rule: &SourceNatRule,
+    flow: SourceNatFlowKey,
+    translated: TranslatedTuple,
+) -> bool {
+    if rule.overlap_owners.is_none() {
+        return false;
+    }
+    std::sync::atomic::fence(Ordering::SeqCst);
+    rule.peer_holds_identity(translated.ip, translated.port)
+        || rule.peer_holds_address_only_identity(&AddressOnlyReverseKey::for_flow(
+            &flow,
+            translated.ip,
+            translated.port,
+        ))
 }

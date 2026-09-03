@@ -390,3 +390,258 @@ fn two_deterministic_address_only_pools_do_not_both_mint_one_identity_8115() {
          the identical wire identity (#8115 R1)"
     );
 }
+
+// ===========================================================================
+// #8115 R2 — the HA synced reserve never reached the peer check.
+//
+// `reserve_synced_on_first_pool_owner` calls `reserve_flow_maybe_persistent` /
+// `reserve_address_only` on ONE allocator. Those check and set only that
+// allocator's own state, so an imported flow narrowed to pool B succeeded while
+// a LOCAL flow already owned the same tuple in pool A — and the coordinator
+// then published the import, letting the reverse-map insert displace A's owner.
+// Sequential; no concurrency needed.
+//
+// # Why refusing is not a new policy
+//
+// The issue calls this "a decision, not a patch", because the synced path
+// exists to reproduce what the ACTIVE node decided (#6211 pass 1) and so must
+// not simply refuse. Two facts settle it without inventing a disposition:
+//
+//   1. This function ALREADY refuses this exact conflict when it happens inside
+//      ONE allocator — a taken bit or an owned token returns `Refused`. Wiring
+//      the peer query in makes the two-allocator case behave like the
+//      one-allocator case; it does not introduce a new answer.
+//   2. `Refused` is OBSERVABLE by construction: `may_publish()` is false, the
+//      caller turns it into `SyncedImportOutcome::RejectedReserve`, and
+//      `xpf_userspace_synced_import_reserve_refused_total` counts it — a metric
+//      whose help text already says those flows will not survive a failover
+//      (#8101). "Surface the conflict rather than silently reserve" is exactly
+//      what `Refused` already means here.
+//
+// The alternative — import anyway — is the LATENT loss the #6979 F1 comment
+// measured three steps of: the import is accepted into the wrong allocator, the
+// squatter retires, and the first allocator re-issues an identity the imported
+// flow is still live on.
+
+fn synced_key(src: &str, src_port: u16, dst: &str) -> crate::session::SessionKey {
+    crate::session::SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        src_ip: src.parse().expect("src"),
+        dst_ip: dst.parse().expect("dst"),
+        src_port,
+        dst_port: 443,
+        discriminator: Default::default(),
+        routing_domain: 0,
+    }
+}
+
+/// Import the active node's decision, with the zone pair present so the #6979
+/// F1 pass-1 narrowing applies (that is the path R2 is about).
+fn import(rules: &[SourceNatRule], key: &crate::session::SessionKey, port: Option<u16>) -> bool {
+    reserve_synced_source_nat_allocation_untracked(
+        &InterfaceNatAllocators::default(),
+        rules,
+        key,
+        NatDecision {
+            rewrite_src: Some(shared_ip()),
+            rewrite_src_port: port,
+            ..NatDecision::default()
+        },
+        false,
+        Some(("lan", "wan")),
+        0,
+    )
+}
+
+fn pat_rule_two_ports(name: &str, pool: &str, source: &str) -> SourceNATRuleSnapshot {
+    SourceNATRuleSnapshot {
+        port_high: 20001,
+        ..pat_rule(name, pool, source)
+    }
+}
+
+/// R2, PORT-BEARING arm: an import must not take a tuple a LOCAL flow already
+/// owns in a peer pool.
+///
+/// Fires on: deleting the `peer_owns_wire_identity` call from the port-bearing
+/// arm of `reserve_synced_on_first_pool_owner`. Pool `b`'s own bitmap is empty,
+/// so the reserve succeeds and the import is published.
+#[test]
+fn a_synced_import_is_refused_when_a_peer_pool_owns_the_identity_8115() {
+    let rules = parse_source_nat_rules(&[
+        pat_rule_two_ports("r1", "a", "10.0.0.0/24"),
+        pat_rule_two_ports("r2", "b", "10.1.0.0/24"),
+    ]);
+
+    // A LOCAL flow takes 203.0.113.1:20000 in pool `a`.
+    let local = mint_to(&rules, "10.0.0.7", 1111, REMOTE);
+    assert_eq!(
+        identity(&local),
+        Some((shared_ip(), Some(20000))),
+        "fixture: the local flow must own the identity the import will claim"
+    );
+
+    // The active node's decision names that same identity, and the importing
+    // flow's source only matches rule r2 — so pass 1 narrows to pool `b`, whose
+    // bitmap knows nothing about pool `a`.
+    let accepted = import(&rules, &synced_key("10.1.0.7", 40000, REMOTE), Some(20000));
+    assert!(
+        !accepted,
+        "the import must be REFUSED: a local flow in peer pool `a` already owns \
+         203.0.113.1:20000. Accepting books the reservation in an allocator the \
+         active never used, and once the local flow retires pool `a` re-issues \
+         an identity the imported session is still live on (#8115 R2)"
+    );
+}
+
+/// CONTROL for the port-bearing arm.
+///
+/// The same two pools, an import for an identity NO peer owns. It must still be
+/// reserved — #6211's contract is that a standby reproduces what the active
+/// decided, and a check that refuses here would drop synced sessions that never
+/// collided.
+#[test]
+fn a_synced_import_of_an_unowned_identity_is_still_reserved_8115() {
+    let rules = parse_source_nat_rules(&[
+        pat_rule_two_ports("r1", "a", "10.0.0.0/24"),
+        pat_rule_two_ports("r2", "b", "10.1.0.0/24"),
+    ]);
+
+    let local = mint_to(&rules, "10.0.0.7", 1111, REMOTE);
+    assert_eq!(identity(&local), Some((shared_ip(), Some(20000))), "fixture");
+
+    let accepted = import(&rules, &synced_key("10.1.0.7", 40000, REMOTE), Some(20001));
+    assert!(
+        accepted,
+        "port 20001 is owned by no peer, so the import must be reserved. A \
+         refusal here would be the check over-reaching into every synced \
+         session over an overlapping pool"
+    );
+}
+
+/// R2, ADDRESS-ONLY arm: the same property on the other synced reserve call.
+///
+/// A separate arm with its own `reserve_address_only`, so a fix wired only into
+/// the port-bearing arm passes both cells above.
+///
+/// Fires on: deleting the `peer_owns_wire_identity` call from the address-only
+/// arm alone.
+#[test]
+fn a_synced_address_only_import_is_refused_when_a_peer_pool_owns_it_8115() {
+    let rules = parse_source_nat_rules(&[
+        notrans_rule("r1", "a", "10.0.0.0/24"),
+        notrans_rule("r2", "b", "10.1.0.0/24"),
+    ]);
+
+    // A LOCAL address-only flow preserves 203.0.113.1:20000 toward 8.8.8.8.
+    let local = mint_to(&rules, "10.0.0.7", 20000, REMOTE);
+    assert_eq!(
+        identity(&local),
+        Some((shared_ip(), None)),
+        "fixture: the local flow must own the ADDRESS-ONLY identity (no port \
+         minted), or this cell is measuring the port-bearing arm"
+    );
+
+    // `rewrite_src_port: None` is what routes the import to the address-only arm.
+    let accepted = import(&rules, &synced_key("10.1.0.7", 20000, REMOTE), None);
+    assert!(
+        !accepted,
+        "the address-only import must be REFUSED: pool `a` already owns the \
+         reverse identity (TCP, 203.0.113.1, 20000, 8.8.8.8, 443). \
+         `reserve_address_only` consults only pool `b`'s own \
+         `address_only_owners`, which is empty of it (#8115 R2)"
+    );
+}
+
+/// CONTROL for the address-only arm, and the reason its key keeps the remote.
+///
+/// The same preserved port toward a DIFFERENT remote is a different wire
+/// identity. It must still be reserved.
+#[test]
+fn a_synced_address_only_import_toward_another_remote_is_reserved_8115() {
+    let rules = parse_source_nat_rules(&[
+        notrans_rule("r1", "a", "10.0.0.0/24"),
+        notrans_rule("r2", "b", "10.1.0.0/24"),
+    ]);
+
+    let local = mint_to(&rules, "10.0.0.7", 20000, REMOTE);
+    assert_eq!(identity(&local), Some((shared_ip(), None)), "fixture");
+
+    let accepted = import(
+        &rules,
+        &synced_key("10.1.0.7", 20000, OTHER_REMOTE),
+        None,
+    );
+    assert!(
+        accepted,
+        "a different remote is a different reverse identity — the import must \
+         still be reserved"
+    );
+}
+
+/// R2, the DETERMINISTIC route through the port-bearing arm.
+///
+/// Not a fourth call site — deterministic pools take the SAME
+/// `reserve_flow_maybe_persistent` — but they take a different ROLLBACK: #6528
+/// frees a deterministic block port with `free_no_recycle`, so a refusal that
+/// mishandles it either strands the port or feeds it back to the recycle ring
+/// the deterministic mapping must never draw from. The two cells above cannot
+/// see that; both pools there are ordinary PAT.
+///
+/// The collision is natural rather than contrived: two deterministic pools over
+/// one external address, each mapping its OWN subscriber #5 to block 5, so both
+/// derive port 3584.
+#[test]
+fn a_synced_deterministic_import_is_refused_and_leaves_no_reservation_8115() {
+    let det = |name: &str, pool: &str, source: &str, host_base: u32| SourceNATRuleSnapshot {
+        name: name.to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec![source.to_string()],
+        pool_name: pool.to_string(),
+        pool_addresses: vec![format!("{SHARED}/32")],
+        port_low: 1024,
+        port_high: 65535,
+        deterministic_mode: 1,
+        deterministic_block_size: 512,
+        deterministic_blocks_per_ip: 126,
+        deterministic_host_base: host_base,
+        deterministic_host_count: 256,
+        ..SourceNATRuleSnapshot::default()
+    };
+    const BASE_A: u32 = (100 << 24) | (64 << 16);
+    const BASE_B: u32 = BASE_A + 256;
+    let rules = parse_source_nat_rules(&[
+        det("r1", "a", "100.64.0.0/24", BASE_A),
+        det("r2", "b", "100.64.1.0/24", BASE_B),
+    ]);
+    assert!(
+        rules[0].deterministic_v4.is_some() && rules[1].deterministic_v4.is_some(),
+        "precondition: both rules must be deterministic, or this cell silently \
+         measures the round-robin path it is not about"
+    );
+
+    // Pool `a`'s subscriber #5 -> block 5 -> port 1024 + 5*512 = 3584.
+    let local = mint_to(&rules, "100.64.0.5", 1111, REMOTE);
+    assert_eq!(
+        identity(&local),
+        Some((shared_ip(), Some(3584))),
+        "fixture: the deterministic mapping must put the local flow on 3584 — if \
+         this moves, the import below is no longer naming a contended identity"
+    );
+
+    // Pool `b`'s subscriber #5 derives the SAME 3584 on the SAME address.
+    let accepted = import(&rules, &synced_key("100.64.1.5", 40000, REMOTE), Some(3584));
+    assert!(
+        !accepted,
+        "a deterministic import must be refused when a peer deterministic pool \
+         already owns the identity (#8115 R2)"
+    );
+    assert!(
+        !rules[1].pool_allocator.debug_is_port_occupied(0, 3584),
+        "and the refusal must leave pool `b` CLEAN. A rollback that skips the \
+         deterministic release strands 3584 in an allocator no session will ever \
+         free — the import was never published, so no teardown names it"
+    );
+}

@@ -17,7 +17,6 @@
 //! round-robin). Everything else remains the moved code.
 
 use super::*;
-use crate::nat::allocator::AddressOnlyReverseKey;
 
 /// #6979 F6: refuse a PAT identity a PEER pool already owns, and roll ours back.
 ///
@@ -57,54 +56,6 @@ use crate::nat::allocator::AddressOnlyReverseKey;
 ///
 /// `None` on every config with no overlapping pools — `overlap_owners` is
 /// `None` there and the whole call is one `Option::is_none`.
-/// #8115 R1: does a PEER pool's allocator already own this WIRE identity, in
-/// EITHER ownership space?
-///
-/// #6979 F6 asked only the bitmap question, which is the right one for a PAT
-/// mint against a PAT peer and blind in both directions to the OTHER space: a
-/// `port no-translation` / port-less flow claims no occupancy bit at all. So a
-/// peer preserving `X:P` did not stop a PAT mint of `X:P`, and two address-only
-/// flows in different pools collided whenever protocol and remote matched.
-///
-/// The two sub-questions are not equally precise, and the difference is worth
-/// stating because it decides where an over-rejection can occur:
-///
-///   - `peer_holds_identity` is REMOTE-AGNOSTIC. The occupancy bit means "this
-///     allocator may publish `X:P`", not "toward this remote". Refusing on it
-///     can therefore decline a flow whose remote differs from the peer flow's,
-///     which is not a wire collision. That is #6979 F6's shipped posture and is
-///     kept: for a PAT mint the cost is one rotation to another port, and the
-///     conservative direction is the safe one for a token that is the sole
-///     ownership word.
-///   - `peer_holds_address_only_identity` is REMOTE-SPECIFIC — the key carries
-///     `dst_ip`/`dst_port` — so a match is an exact duplicate of the wire
-///     5-tuple and carries no over-rejection at all.
-///
-/// The key is built by `AddressOnlyReverseKey::for_flow`, the SAME constructor
-/// the reserve paths insert with. Building it from three literals here would
-/// reproduce the #6751 defect that constructor exists to prevent: a check keyed
-/// differently from its insert finds nothing, every mint "succeeds", and no
-/// behavioural test can see it.
-///
-/// `false` on every config with no overlapping pools — `overlap_owners` is
-/// `None` there and this is one `Option::is_none`.
-fn peer_owns_wire_identity(
-    rule: &SourceNatRule,
-    flow: SourceNatFlowKey,
-    translated: TranslatedTuple,
-) -> bool {
-    if rule.overlap_owners.is_none() {
-        return false;
-    }
-    std::sync::atomic::fence(Ordering::SeqCst);
-    rule.peer_holds_identity(translated.ip, translated.port)
-        || rule.peer_holds_address_only_identity(&AddressOnlyReverseKey::for_flow(
-            &flow,
-            translated.ip,
-            translated.port,
-        ))
-}
-
 /// #8115 R1: the ADDRESS-ONLY sibling of [`reject_peer_owned_identity`].
 ///
 /// Same shape as the PAT arm deliberately — post-mint check, rollback, and the
