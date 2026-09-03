@@ -32,6 +32,27 @@ pub(crate) enum TunnelDiscriminator {
     Unkeyed,
     /// RFC 2890 Key, including the legal value 0.
     Keyed(u32),
+    /// #7699: an RFC 2637 PPTP call, named by a LOCALLY-DERIVED call HANDLE
+    /// — deliberately not the call ID off the packet.
+    ///
+    /// **Why a handle and not the wire value.** The PPTP GRE Call ID field
+    /// carries the call ID *of the peer the packet is being sent to* (RFC 2637
+    /// §4.1), and each side allocates its own, so the two directions of ONE
+    /// call carry DIFFERENT values. A discriminator built from the packet's own
+    /// value would therefore differ per direction — and since a reply is looked
+    /// up by its own parsed forward key
+    /// (`lookup_session_across_scopes(.., &flow.forward_key, ..)`), the stored
+    /// reverse companion would never equal it and the reply would match NO
+    /// session at all. That is strictly worse than the aliasing it would
+    /// replace, which is why #8382 was closed rather than landed.
+    ///
+    /// The handle is derived from the LEARNED `(call-id A, call-id B)` pair, so
+    /// both directions of one call resolve to the same value. That is what
+    /// makes this class direction-SYMMETRIC like every other, and why
+    /// `reverse_direction_discriminator` can keep returning its input: the
+    /// asymmetry is resolved at PARSE time, where the association is available,
+    /// rather than at reverse-key time, where it is not.
+    Pptp(u32),
     /// The header could not be read.
     ///
     /// Fail-closed ACROSS classes, NOT splitting WITHIN this one (#8380). The
@@ -107,6 +128,12 @@ const WIRE_UNPARSEABLE: u64 = 3;
 /// scalar tags above. Key 0 encodes as `0x1_0000_0000`, never as `0`, which is
 /// what keeps decision 6's `Keyed(0) != Unkeyed != Absent` true on the wire.
 const WIRE_KEYED_TAG: u64 = 1 << 32;
+/// `Pptp(handle)` rides as `PPTP_TAG | handle`, in its own 32-bit window above
+/// the keyed one so no handle can be read as an RFC 2890 key (#7699). The two
+/// classes are different identity axes — a keyed GRE tunnel and a PPTP call are
+/// not comparable — so merging their tag spaces would be the #7188 decision-6
+/// collapse in a new place.
+const WIRE_PPTP_TAG: u64 = 2 << 32;
 
 impl TunnelDiscriminator {
     /// Encode for the HA session-sync wire. Never returns [`WIRE_ABSENT`]: a
@@ -117,6 +144,7 @@ impl TunnelDiscriminator {
             TunnelDiscriminator::None => WIRE_NONE,
             TunnelDiscriminator::Unkeyed => WIRE_UNKEYED,
             TunnelDiscriminator::Keyed(key) => WIRE_KEYED_TAG | u64::from(key),
+            TunnelDiscriminator::Pptp(handle) => WIRE_PPTP_TAG | u64::from(handle),
             TunnelDiscriminator::Unparseable => WIRE_UNPARSEABLE,
         }
     }
@@ -132,6 +160,21 @@ impl TunnelDiscriminator {
             _ if wire & WIRE_KEYED_TAG != 0 && wire >> 33 == 0 => WireDiscriminator::Present(
                 TunnelDiscriminator::Keyed((wire & 0xFFFF_FFFF) as u32),
             ),
+            // #7699: the PPTP window sits at bit 33 and the keyed window at bit
+            // 32, so the two are disjoint by construction. `wire >> 34 == 0`
+            // rejects anything above this window as Unrecognized rather than
+            // truncating a future class into a PPTP handle.
+            // Handle 0 is RESERVED and decodes as Unrecognized, not as
+            // `Pptp(0)`. `PptpCall::handle` never produces 0, so a bare
+            // `WIRE_PPTP_TAG` is a value no honest peer emits — the same
+            // reasoning that makes `WIRE_ABSENT` its own state rather than
+            // `None`'s tag. It also keeps the bare tag available should the
+            // class ever need a payload-free form.
+            _ if wire & WIRE_PPTP_TAG != 0 && wire >> 34 == 0 && wire & 0xFFFF_FFFF != 0 => {
+                WireDiscriminator::Present(TunnelDiscriminator::Pptp(
+                    (wire & 0xFFFF_FFFF) as u32,
+                ))
+            }
             _ => WireDiscriminator::Unrecognized,
         }
     }
@@ -156,6 +199,13 @@ mod tests {
             TunnelDiscriminator::Keyed(100),
             TunnelDiscriminator::Keyed(200),
             TunnelDiscriminator::Keyed(u32::MAX),
+            // #7699: the PPTP call-handle class. Added to THIS set rather than
+            // asserted in a cell of its own, because the property that matters
+            // is disjointness across every class — a parallel cell would pass
+            // while the new tag collided with an old one.
+            TunnelDiscriminator::Pptp(1),
+            TunnelDiscriminator::Pptp(100),
+            TunnelDiscriminator::Pptp(u32::MAX),
         ];
         let mut seen = std::collections::HashSet::new();
         for class in classes {
@@ -235,6 +285,53 @@ mod tests {
         );
     }
 
+    /// #7699: a PPTP handle must never decode as an RFC 2890 key, and vice
+    /// versa. They are different identity axes — a keyed GRE tunnel and a PPTP
+    /// call are not comparable — so a shared tag space would be #7188 decision
+    /// 6's collapse in a new place.
+    ///
+    /// Asserted at the SAME numeric value in both classes, which is the case a
+    /// set-disjointness walk over distinct values would not exercise: the tags
+    /// have to separate them, not the payloads.
+    #[test]
+    fn a_pptp_handle_never_decodes_as_an_rfc2890_key_7699() {
+        for v in [1u32, 100, u32::MAX] {
+            let pptp = TunnelDiscriminator::Pptp(v);
+            let keyed = TunnelDiscriminator::Keyed(v);
+            assert_ne!(
+                pptp.to_wire(),
+                keyed.to_wire(),
+                "Pptp({v}) and Keyed({v}) share a wire tag; a PPTP call would \
+                 import as a GRE tunnel with that key"
+            );
+            assert_eq!(
+                TunnelDiscriminator::from_wire(pptp.to_wire()),
+                WireDiscriminator::Present(pptp)
+            );
+            assert_eq!(
+                TunnelDiscriminator::from_wire(keyed.to_wire()),
+                WireDiscriminator::Present(keyed)
+            );
+        }
+
+        // The asymmetry at zero, asserted because it is a real difference
+        // between the two classes and not an oversight. `Keyed(0)` is a LEGAL
+        // RFC 2890 key and must round-trip (#7188 decision 6). Handle 0 is
+        // RESERVED — `PptpCall::handle` never produces it — so the bare PPTP
+        // tag decodes as Unrecognized rather than as a call nobody can have.
+        assert_eq!(
+            TunnelDiscriminator::from_wire(TunnelDiscriminator::Keyed(0).to_wire()),
+            WireDiscriminator::Present(TunnelDiscriminator::Keyed(0)),
+            "Keyed(0) is a legal key and must survive the wire"
+        );
+        assert_eq!(
+            TunnelDiscriminator::from_wire(TunnelDiscriminator::Pptp(0).to_wire()),
+            WireDiscriminator::Unrecognized,
+            "handle 0 is reserved; decoding the bare PPTP tag into a call would \
+             import an identity no peer can legitimately have emitted"
+        );
+    }
+
     /// The pair decision 6 singles out: an unkeyed tunnel and a tunnel whose
     /// RFC 2890 Key is literally zero are DIFFERENT tunnels. A naive
     /// "key or zero" encoding merges them, which is why this is asserted
@@ -270,7 +367,11 @@ mod tests {
     /// reproduce, so it fails closed rather than defaulting into a class.
     #[test]
     fn an_unknown_tag_is_unrecognized_not_coerced_7188() {
-        for wire in [4u64, 5, 0xFFFF, 2 << 32, u64::MAX] {
+        // #7699 claimed the `2 << 32` window, so the bare tag stays here for a
+        // different reason — handle 0 is reserved and must not decode — and
+        // `3 << 32` is added so the "a window this build does not define at
+        // all" case keeps being covered as classes are added.
+        for wire in [4u64, 5, 0xFFFF, 2 << 32, 3 << 32, u64::MAX] {
             assert_eq!(
                 TunnelDiscriminator::from_wire(wire),
                 WireDiscriminator::Unrecognized,
