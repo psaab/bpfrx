@@ -6,6 +6,41 @@
 
 use super::*;
 
+/// #8103: the discriminator a REVERSE-direction key carries.
+///
+/// **Exhaustive with no `_` arm, on purpose.** A new [`TunnelDiscriminator`]
+/// class cannot be added without deciding what happens to it under direction
+/// reversal — the same way `count_decap_err`'s exhaustive match forces a
+/// decision about counting (`wg/counters.rs`). A `_` arm would carry a new
+/// class through unchanged, which is right for every class that exists and
+/// wrong for the one that is coming.
+///
+/// Every class today is direction-SYMMETRIC, so every arm returns its input:
+///
+///   * `None` and `Unkeyed` trivially — there is no per-direction value.
+///   * `Keyed(k)` because RFC 2890's Key identifies the **tunnel**, and both
+///     directions of one tunnel carry the same value. That is what makes a
+///     reverse companion findable at all.
+///   * `Unparseable` because an unreadable header is unreadable in either
+///     direction. (It does not SEPARATE two unreadable tunnels — see #8380 —
+///     but it does not lose anything under reversal either.)
+///
+/// **The class that will break this is already designed.** RFC 2637 PPTP GRE
+/// carries the Call ID *of the peer the packet is sent to*, so the two
+/// directions of one call carry DIFFERENT values (#8382). Copying it unchanged
+/// would build a reverse key holding the wrong call ID, and the reply would
+/// never match — turning a shared reverse companion into no reverse companion,
+/// which is worse than the bug this function fixes. When that class lands, this
+/// match stops compiling and the decision has to be made here.
+fn reverse_direction_discriminator(d: TunnelDiscriminator) -> TunnelDiscriminator {
+    match d {
+        TunnelDiscriminator::None => TunnelDiscriminator::None,
+        TunnelDiscriminator::Unkeyed => TunnelDiscriminator::Unkeyed,
+        TunnelDiscriminator::Keyed(key) => TunnelDiscriminator::Keyed(key),
+        TunnelDiscriminator::Unparseable => TunnelDiscriminator::Unparseable,
+    }
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(crate) struct SessionKey {
     pub addr_family: u8,
@@ -147,7 +182,10 @@ pub(crate) fn forward_wire_key(forward_key: &SessionKey, nat: NatDecision) -> Se
         dst_ip: wire_dst,
         src_port,
         dst_port,
-        discriminator: Default::default(),
+        // #8103: SAME-direction key — carry the tunnel discriminator through.
+        // Provably a no-op for every non-GRE session, whose discriminator is
+        // already `None`; it changes behaviour only for keyed GRE.
+        discriminator: forward_key.discriminator,
         routing_domain: forward_key.routing_domain,
     }
 }
@@ -170,7 +208,10 @@ pub(crate) fn translated_session_key(key: &SessionKey, nat: NatDecision) -> Sess
         dst_ip: nat.rewrite_dst.unwrap_or(key.dst_ip),
         src_port,
         dst_port,
-        discriminator: Default::default(),
+        // #8103: SAME-direction key — carry the tunnel discriminator through.
+        // Provably a no-op for every non-GRE session, whose discriminator is
+        // already `None`; it changes behaviour only for keyed GRE.
+        discriminator: key.discriminator,
         routing_domain: key.routing_domain,
     }
 }
@@ -221,7 +262,9 @@ pub(super) fn reverse_wire_key(forward_key: &SessionKey, nat: NatDecision) -> Se
         dst_ip: wire_dst,
         src_port,
         dst_port,
-        discriminator: Default::default(),
+        // #8103: REVERSE-direction key — derive the discriminator through the
+        // exhaustive helper, so a new class must decide rather than defaulting.
+        discriminator: reverse_direction_discriminator(forward_key.discriminator),
         // #7160 (#2387): REVERSE-MATCH key — deliberately domain-agnostic.
         // See the `routing_domain` doc on SessionKey: a reply may legitimately
         // arrive in a different routing domain than the forward direction
@@ -245,7 +288,9 @@ pub(crate) fn reverse_canonical_key(forward_key: &SessionKey, _nat: NatDecision)
         dst_ip: forward_key.src_ip,
         src_port,
         dst_port,
-        discriminator: Default::default(),
+        // #8103: REVERSE-direction key — derive the discriminator through the
+        // exhaustive helper, so a new class must decide rather than defaulting.
+        discriminator: reverse_direction_discriminator(forward_key.discriminator),
         // #7160 (#2387): REVERSE-MATCH key — deliberately domain-agnostic, for
         // the same reason as `reverse_wire_key` above.
         routing_domain: 0,
@@ -345,7 +390,154 @@ pub(crate) fn reverse_session_key(key: &SessionKey, nat: NatDecision) -> Session
         dst_ip: wire_dst,
         src_port,
         dst_port,
-        discriminator: Default::default(),
+        // #8103: REVERSE-direction key — derive the discriminator through the
+        // exhaustive helper, so a new class must decide rather than defaulting.
+        discriminator: reverse_direction_discriminator(key.discriminator),
         routing_domain: key.routing_domain,
+    }
+}
+
+#[cfg(test)]
+mod discriminator_carry_tests_8103 {
+    use super::*;
+    use crate::session::TunnelDiscriminator;
+
+    fn gre_key(disc: TunnelDiscriminator) -> SessionKey {
+        SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: 47, // GRE
+            src_ip: "198.51.100.7".parse().unwrap(),
+            dst_ip: "203.0.113.9".parse().unwrap(),
+            src_port: 0,
+            dst_port: 0,
+            discriminator: disc,
+            routing_domain: 0,
+        }
+    }
+
+    /// All FIVE transforms must carry the tunnel discriminator (#8103).
+    ///
+    /// Asserted as a set over every transform AND every class rather than one
+    /// call each: the defect was that all five defaulted the field, so a cell
+    /// covering one transform would have passed while four stayed broken. A
+    /// future sixth transform is not covered here — that is what the exhaustive
+    /// `reverse_direction_discriminator` match is for on the reverse side.
+    #[test]
+    fn every_transform_carries_the_tunnel_discriminator_8103() {
+        let nat = NatDecision::default();
+        for disc in [
+            TunnelDiscriminator::Unkeyed,
+            TunnelDiscriminator::Keyed(0),
+            TunnelDiscriminator::Keyed(100),
+            TunnelDiscriminator::Keyed(u32::MAX),
+            TunnelDiscriminator::Unparseable,
+        ] {
+            let k = gre_key(disc);
+            for (name, got) in [
+                ("forward_wire_key", forward_wire_key(&k, nat).discriminator),
+                (
+                    "translated_session_key",
+                    translated_session_key(&k, nat).discriminator,
+                ),
+                ("reverse_wire_key", reverse_wire_key(&k, nat).discriminator),
+                (
+                    "reverse_canonical_key",
+                    reverse_canonical_key(&k, nat).discriminator,
+                ),
+                (
+                    "reverse_session_key",
+                    reverse_session_key(&k, nat).discriminator,
+                ),
+            ] {
+                assert_eq!(
+                    got, disc,
+                    "{name} dropped the tunnel discriminator {disc:?}. Two keyed \
+                     tunnels between one pair of outer endpoints then share a key \
+                     — protocol 47 has no L4 ports, so the discriminator is the \
+                     ONLY thing separating them (#8103)"
+                );
+            }
+        }
+    }
+
+    /// The no-op half, and it is what makes this change safe to land.
+    ///
+    /// For every session that is not keyed GRE the source discriminator is
+    /// already `None`, which is exactly what `Default::default()` produced — so
+    /// preserving the field cannot change any non-GRE key. Asserted rather than
+    /// argued, because "provably a no-op" is the kind of claim that stops people
+    /// checking.
+    #[test]
+    fn carrying_the_discriminator_is_a_no_op_for_non_tunnel_sessions_8103() {
+        let nat = NatDecision::default();
+        let mut tcp = gre_key(TunnelDiscriminator::None);
+        tcp.protocol = 6;
+        tcp.src_port = 51000;
+        tcp.dst_port = 443;
+        for (name, got) in [
+            ("forward_wire_key", forward_wire_key(&tcp, nat).discriminator),
+            (
+                "translated_session_key",
+                translated_session_key(&tcp, nat).discriminator,
+            ),
+            ("reverse_wire_key", reverse_wire_key(&tcp, nat).discriminator),
+            (
+                "reverse_canonical_key",
+                reverse_canonical_key(&tcp, nat).discriminator,
+            ),
+            (
+                "reverse_session_key",
+                reverse_session_key(&tcp, nat).discriminator,
+            ),
+        ] {
+            assert_eq!(
+                got,
+                TunnelDiscriminator::None,
+                "{name} must leave a non-tunnel session in the None class"
+            );
+        }
+    }
+
+    /// Two keyed tunnels between one pair of outer endpoints must produce
+    /// DISTINCT reverse-match keys.
+    ///
+    /// This is the property the issue is actually about, stated at the key
+    /// level: with both reverse keys in the `None` class they were equal, so
+    /// the second publish evicted the first. Equality is asserted on the whole
+    /// key, not just the discriminator, because it is the whole key a session
+    /// map keys on.
+    #[test]
+    fn two_keyed_tunnels_get_distinct_reverse_keys_8103() {
+        let nat = NatDecision::default();
+        let a = gre_key(TunnelDiscriminator::Keyed(100));
+        let b = gre_key(TunnelDiscriminator::Keyed(200));
+        assert_ne!(
+            reverse_canonical_key(&a, nat),
+            reverse_canonical_key(&b, nat),
+            "two tunnels shared one reverse companion; the second publish evicts \
+             the first and a reply resolves whichever tunnel published last"
+        );
+        assert_ne!(reverse_wire_key(&a, nat), reverse_wire_key(&b, nat));
+        assert_ne!(reverse_session_key(&a, nat), reverse_session_key(&b, nat));
+    }
+
+    /// The reverse-direction helper is IDENTITY for every class that exists —
+    /// pinned so the day it stops being identity is a deliberate edit.
+    ///
+    /// Its value is not this assertion, it is the missing `_` arm: a new class
+    /// cannot be added without deciding, and #8382's PPTP call-ID class is
+    /// asymmetric by RFC 2637 §4.1, so copying it unchanged would build a
+    /// reverse key holding the wrong call ID.
+    #[test]
+    fn reverse_direction_discriminator_is_identity_for_todays_classes_8103() {
+        for disc in [
+            TunnelDiscriminator::None,
+            TunnelDiscriminator::Unkeyed,
+            TunnelDiscriminator::Keyed(0),
+            TunnelDiscriminator::Keyed(7),
+            TunnelDiscriminator::Unparseable,
+        ] {
+            assert_eq!(reverse_direction_discriminator(disc), disc);
+        }
     }
 }
