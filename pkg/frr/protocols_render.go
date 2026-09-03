@@ -10,6 +10,7 @@ package frr
 
 import (
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -129,14 +130,23 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				if iface.NetworkType != "" {
 					fmt.Fprintf(&b, " ip ospf network %s\n", iface.NetworkType)
 				}
-				if iface.AuthType == "md5" {
+				// #8443: an EMPTY key must render nothing. Without this guard
+				// `authentication { md5 1; }` — a clean commit — emitted
+				// `ip ospf message-digest-key 1 md5` with no argument, and
+				// `authentication { simple-password; }` emitted
+				// `ip ospf authentication-key` with none. vtysh rejects a
+				// keyword missing its argument, and ONE rejected line fails the
+				// entire managed-section reload (#1880/#2223) — taking down all
+				// dynamic routing, not just OSPF. RIP and IS-IS already guard
+				// this; OSPF was the only path that did not.
+				if iface.AuthKey != "" && iface.AuthType == "md5" {
 					b.WriteString(" ip ospf authentication message-digest\n")
 					keyID := iface.AuthKeyID
 					if keyID == 0 {
 						keyID = 1
 					}
 					fmt.Fprintf(&b, " ip ospf message-digest-key %d md5 %s\n", keyID, sanitizeFRRValue(iface.AuthKey.Reveal()))
-				} else if iface.AuthType == "simple" {
+				} else if iface.AuthKey != "" && iface.AuthType == "simple" {
 					b.WriteString(" ip ospf authentication\n")
 					fmt.Fprintf(&b, " ip ospf authentication-key %s\n", sanitizeFRRValue(iface.AuthKey.Reveal()))
 				}
@@ -607,7 +617,17 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 		if rip.AuthKey != "" {
 			for _, iface := range rip.Interfaces {
 				fmt.Fprintf(&b, "interface %s\n", iface)
-				if rip.AuthType == "md5" {
+				// #8443: a value the strict gate would now reject can still arrive
+				// on the TOLERANT load path (#1960 — a persisted config must still
+				// boot). Render what we always rendered, but say so: silently
+				// downgrading md5 to plaintext is the defect, and the operator has
+				// no other signal because `show configuration` echoes their value.
+				if config.AuthTypeUnrecognized(rip.AuthType) {
+					slog.Warn("frr: unrecognized rip authentication-type; rendering PLAINTEXT authentication",
+						"interface", iface, "authentication_type", rip.AuthType,
+						"accepted", config.AuthTypeSpellings())
+				}
+				if config.AuthTypeIsMD5(rip.AuthType) {
 					b.WriteString(" ip rip authentication mode md5\n")
 				} else {
 					b.WriteString(" ip rip authentication mode text\n")
@@ -661,7 +681,12 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 			b.WriteString(" set-overload-bit\n")
 		}
 		if isis.AuthKey != "" {
-			if isis.AuthType == "md5" {
+			if config.AuthTypeUnrecognized(isis.AuthType) {
+				slog.Warn("frr: unrecognized isis authentication-type; rendering PLAINTEXT area/domain password",
+					"authentication_type", isis.AuthType,
+					"accepted", config.AuthTypeSpellings())
+			}
+			if config.AuthTypeIsMD5(isis.AuthType) {
 				fmt.Fprintf(&b, " area-password md5 %s\n", sanitizeFRRValue(isis.AuthKey.Reveal()))
 				fmt.Fprintf(&b, " domain-password md5 %s\n", sanitizeFRRValue(isis.AuthKey.Reveal()))
 			} else {
@@ -704,7 +729,12 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				fmt.Fprintf(&b, " isis metric %d\n", iface.Metric)
 			}
 			if iface.AuthKey != "" {
-				if iface.AuthType == "md5" {
+				if config.AuthTypeUnrecognized(iface.AuthType) {
+					slog.Warn("frr: unrecognized isis interface authentication-type; rendering PLAINTEXT password",
+						"interface", iface.Name, "authentication_type", iface.AuthType,
+						"accepted", config.AuthTypeSpellings())
+				}
+				if config.AuthTypeIsMD5(iface.AuthType) {
 					fmt.Fprintf(&b, " isis password md5 %s\n", sanitizeFRRValue(iface.AuthKey.Reveal()))
 				} else {
 					fmt.Fprintf(&b, " isis password clear %s\n", sanitizeFRRValue(iface.AuthKey.Reveal()))
