@@ -264,14 +264,6 @@ func counterReadsOutsideVerdictGuard(fset *token.FileSet, fd *ast.FuncDecl, verd
 // It fails in BOTH directions (TestPartialAnnotationExemptionsAreLive_8185), so
 // an entry whose renderer is fixed reds and must be deleted — the list cannot
 // rot into permanent permission.
-//
-// Both current entries are REAL instances, adjudicated rather than waved
-// through: each discards a fail-closed verdict and then emits live port usage
-// for a pool the builder refused. Neither is fixed here because the fix is a
-// STRUCTURED-SURFACE field (protobuf + JSON), which is the open #7473 work —
-// fixing them here would collide with it. They are listed so this gate can
-// merge in either order relative to that PR, and the liveness test deletes them
-// the moment it lands.
 var partiallyAnnotatedExemptions = map[string]string{
 	// EMPTY, and it got here the right way. This list carried two entries
 	// while #7473 was open — GetNATPoolStats and natPoolStatsHandler, both real
