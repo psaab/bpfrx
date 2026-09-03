@@ -1,6 +1,9 @@
+import json
+import os
 import pathlib
 import re
 import subprocess
+import tempfile
 import unittest
 
 
@@ -255,3 +258,109 @@ class TargetSplitWiringTests(unittest.TestCase):
             SCRIPT.count('MOUSE_TARGET_V4="$MOUSE_TARGET_V4" ELEPHANT_TARGET_V4="$ELEPHANT_TARGET_V4"'),
             2,
         )
+
+
+MATRIX = (pathlib.Path(__file__).resolve().parent / "test-mouse-latency-matrix.sh").read_text()
+
+
+class AbortIsDistinguishableTests(unittest.TestCase):
+    """#8244 defect 2 — an abort must not look like a gate failure.
+
+    Every abort path used to `exit 1` and write no summary.json, so the only
+    signal was an ABSENCE, and rc=1 is also what a measured gate FAIL returns.
+    On #7100 the same rc=1 meant "never ran" (0 JSON files) once and "ran and
+    failed" (62 files) the other time, and the run was read as an unprovisioned
+    lab when eleven of twelve echo listeners were up.
+
+    Same defect as #8259's void verdict, one layer out: a state the harness
+    could not measure, reported as though it had measured it.
+    """
+
+    def test_every_abort_path_goes_through_the_helper(self):
+        # The usage error is the one legitimate `exit 1`: it fires before $1
+        # exists, so there is no out_root to write an artifact into.
+        code_lines = [
+            ln for ln in MATRIX.splitlines()
+            if "exit 1" in ln and not ln.lstrip().startswith("#")
+        ]
+        self.assertEqual(
+            len(code_lines), 1,
+            f"every abort but the usage error must call abort_matrix, found: {code_lines}",
+        )
+
+    def test_abort_exits_two_not_one(self):
+        # 0 = PASS, 1 = measured FAIL, 2 = did not produce a verdict. An abort
+        # that exits 1 is the defect; an abort that exits 0 would be worse.
+        self.assertIn("    exit 2\n}", MATRIX)
+
+    def test_each_abort_reason_is_distinctly_named(self):
+        for code in (
+            "ABORTED-LOCK-CONTENTION",
+            "ABORTED-TARGET-SERVICES-DOWN",
+            "ABORTED-PREFLIGHT-INVALID",
+            "ABORTED-PREFLIGHT-NO-PROBE",
+            "ABORTED-PREFLIGHT-FAILED",
+        ):
+            with self.subTest(code=code):
+                self.assertIn(code, MATRIX)
+
+    def test_out_root_is_resolved_before_the_mutex(self):
+        """A lock-contention abort must be able to write its artifact too.
+
+        That is the purest 'never ran' case, and it used to be the one with
+        the least evidence.
+        """
+        self.assertLess(
+            MATRIX.index('OUT_ROOT="$1"'),
+            MATRIX.index('LOCK_FILE="/tmp/test-mouse-latency-matrix.lock"'),
+        )
+
+    def test_the_matrix_sources_the_shared_port_defaults(self):
+        """#8244 defect 1: the default lived in two files and drifted.
+
+        Without the source line the substitution below expands to EMPTY, which
+        is worse than the wrong port — measured before this test existed.
+        """
+        self.assertIn('. "${SCRIPT_DIR}/mouse-elephant-lib.sh"', MATRIX)
+        self.assertIn('MOUSE_PORT="${MOUSE_PORT:-$MOUSE_DEFAULT_ECHO_PORT}"', MATRIX)
+        self.assertIn('MOUSE_PORT="${MOUSE_PORT:-$MOUSE_DEFAULT_ECHO_PORT}"', SCRIPT)
+        self.assertNotIn('MOUSE_PORT:-6200', MATRIX)
+        self.assertNotIn('MOUSE_PORT:-6200', SCRIPT)
+
+    def test_abort_helper_writes_a_readable_artifact(self):
+        """FUNCTIONAL, not a string pin: run the helper and parse what it wrote.
+
+        The artifact must match what mouse_latency_aggregate.py emits, so a
+        consumer already reading summary.json["verdict"]["verdict"] needs no
+        change to see an abort.
+        """
+        import re as _re
+        m = _re.search(r"^abort_matrix\(\) \{.*?^\}$", MATRIX, _re.M | _re.S)
+        self.assertIsNotNone(m, "abort_matrix must be a shell function")
+        with tempfile.TemporaryDirectory() as tmp:
+            script_dir = os.path.join(tmp, "bin")
+            os.makedirs(script_dir)
+            # Stub the scan so the test is hermetic and its output identifiable.
+            stub = os.path.join(script_dir, "target-services.sh")
+            with open(stub, "w") as f:
+                f.write("#!/bin/sh\necho '6200:closed 6201:OPEN 6202:OPEN'\n")
+            os.chmod(stub, 0o755)
+            out_root = os.path.join(tmp, "run")
+            harness = os.path.join(tmp, "h.sh")
+            with open(harness, "w") as f:
+                f.write(
+                    "set -uo pipefail\n"
+                    f'OUT_ROOT="{out_root}"\nSCRIPT_DIR="{script_dir}"\n'
+                    + m.group(0)
+                    + '\nabort_matrix ABORTED-TARGET-SERVICES-DOWN "echo 6200 down"\n'
+                )
+            proc = subprocess.run(["bash", harness], capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 2, proc.stderr)
+            with open(os.path.join(out_root, "summary.json")) as f:
+                doc = json.load(f)
+            self.assertEqual(doc["verdict"]["verdict"], "ABORTED-TARGET-SERVICES-DOWN")
+            self.assertIn("6200 down", doc["verdict"]["reason"])
+            # The scan is the half that turns "the lab is down" into "one port
+            # is down" — it must reach the artifact, not just stderr.
+            self.assertIn("6201:OPEN", doc["verdict"]["target_services_scan"])
+            self.assertEqual(doc["summaries"], {})

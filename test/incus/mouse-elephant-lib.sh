@@ -105,3 +105,33 @@ mouse_elephant_kill_cmd() { mouse_remote_job_kill_cmd iperf3 "$1" iperf3; }
 mouse_elephant_stale_check_cmd() {
     printf 'if pgrep -f "iperf3 [-]c " >/dev/null 2>&1; then exit 1; fi; exit 0'
 }
+
+# ---------------------------------------------------------------------------
+# #8244: the canonical default ports, in ONE place.
+#
+# These were declared independently in test-mouse-latency.sh and
+# test-mouse-latency-matrix.sh, and a default that lives in two files drifts.
+# `cos_port_grid_test.py` pinned one of the two spellings, so a change to the
+# other would have gone unnoticed.
+#
+# 6200 is queue 0 / best-effort in the canonical grid (cos-iperf-config.set,
+# PORT_GRID in cos_port_grid_test.py), which is the right SEMANTIC default for
+# a cross-class mouse: it matches no `bandwidth-output` term and so shares no
+# class with the elephants.
+#
+# It is also, on the standing loss cluster, the one echo listener that is
+# down — 6201-6211 are all up. That is a PROVISIONING gap, and the fix for it
+# is NOT to move the default to 6201.
+#
+# Auto-selecting an open port would be worse than the bug. The echo port
+# DETERMINES THE FORWARDING CLASS (620x -> queue x), so silently substituting
+# 6201 would move the mice from best-effort into iperf-100m and change what
+# the run measures — two invocations of the same command would produce
+# different experiments, with nothing in the output saying so. A wrong number
+# that looks right is the failure this harness has already paid for twice.
+#
+# So the default stays semantic, and the ABORT is what improves: it reports
+# the whole grid, so a one-port gap reads as a one-port gap instead of a dead
+# lab (#8244).
+MOUSE_DEFAULT_ECHO_PORT=6200
+MOUSE_DEFAULT_IPERF_PORT=5202
