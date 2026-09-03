@@ -17,6 +17,7 @@
 //! round-robin). Everything else remains the moved code.
 
 use super::*;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// #6979 F6: refuse a PAT identity a PEER pool already owns, and roll ours back.
 ///
@@ -205,7 +206,60 @@ pub(crate) fn match_source_nat_result(
 /// least-invasive shape. The cold-path commit site clones the captured
 /// `Arc` and increments it once per committed translated flow.
 #[allow(clippy::too_many_arguments)]
+/// #8447: the rule-match outcome counters live on this thin wrapper, so they
+/// observe EVERY return of the real body. The body has many early returns and
+/// per-return instrumentation would silently under-count the moment another is
+/// added — the same reason the persistent-NAT admission pair is wrapped rather
+/// than sprinkled.
+///
+/// `consulted` is bumped for every call including `NoMatch`, because the
+/// question it answers is "did a packet reach source-NAT at all", not "did NAT
+/// act on one". Without it a zero in the other three is unreadable.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn match_source_nat_result_for_tuple(
+    iface_allocs: &InterfaceNatAllocators,
+    rules: &[SourceNatRule],
+    scope: &NatScopeCtx,
+    from_zone: &str,
+    to_zone: &str,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: Option<u8>,
+    src_port: u16,
+    dst_port: u16,
+    egress_v4: Option<Ipv4Addr>,
+    egress_v6: Option<Ipv6Addr>,
+    now_ns: u64,
+    non_first_fragment: bool,
+    icmp_identifier_present: bool,
+    holder: NatHolder,
+    matched_counter: &mut Option<Arc<NatRuleCounter>>,
+) -> SourceNatLookup {
+    let out = match_source_nat_result_for_tuple_inner(
+        iface_allocs,
+        rules,
+        scope,
+        from_zone,
+        to_zone,
+        src_ip,
+        dst_ip,
+        protocol,
+        src_port,
+        dst_port,
+        egress_v4,
+        egress_v6,
+        now_ns,
+        non_first_fragment,
+        icmp_identifier_present,
+        holder,
+        matched_counter,
+    );
+    process_source_nat_match_counters().record(&out);
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn match_source_nat_result_for_tuple_inner(
     // #6751: the node-lifetime interface-mode identity registry. Interface
     // SNAT has no pool to allocate from, so this is where its translated
     // identity is minted — preserve the source port when its reverse
@@ -922,4 +976,88 @@ pub(crate) fn match_source_nat_result_for_tuple(
         }
     }
     SourceNatLookup::NoMatch
+}
+
+// ---------------------------------------------------------------------------
+// #8447: source-NAT rule-match outcome counters.
+//
+// The admission pair (`persistent_admitted_total` / `persistent_declined_total`)
+// answered that `allocate_translation` is never reached with `persistent_nat`
+// set. It could not say WHY, and the reading it leaves open is the one that
+// matters: "never reached the allocator" is true whether the packet was
+// refused before allocation or never arrived at all. Both arms of the cluster
+// comparison lose ICMP under a pool, so arrival is not something that run
+// could establish.
+//
+// FOUR QUANTITIES, and the first is the one that settles it:
+//
+//   * `consulted` — the match path RAN for a packet. Zero means nothing
+//     reached source-NAT at all, and then the defect is not in NAT and this
+//     issue's title is wrong. Non-zero is what makes every count below
+//     readable.
+//   * `matched` / `unavailable` / `no_match` — the three arms of
+//     `SourceNatLookup`. A rule matched and produced a decision; a rule
+//     matched and could not translate; no rule matched.
+//
+// Counting only `matched` would repeat the mistake the admission pair was
+// built to avoid: a lone match counter reading zero cannot separate "no
+// packets arrived" from "packets arrived and matched nothing", which are
+// exactly the two answers this question is between.
+//
+// `consulted` is also an internal consistency check on the other three —
+// it must equal their sum, and a divergence means a return path escaped the
+// wrapper rather than that the dataplane did something surprising.
+
+#[derive(Debug, Default)]
+pub(crate) struct SourceNatMatchCounters {
+    consulted: AtomicU64,
+    matched: AtomicU64,
+    unavailable: AtomicU64,
+    no_match: AtomicU64,
+}
+
+/// A point-in-time read. Tests assert DELTAS across a call rather than
+/// absolute values, because the production counters are process-global and a
+/// test that pinned an absolute would fail the moment another test in the same
+/// binary touched the match path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SourceNatMatchSnapshot {
+    pub(crate) consulted: u64,
+    pub(crate) matched: u64,
+    pub(crate) unavailable: u64,
+    pub(crate) no_match: u64,
+}
+
+impl SourceNatMatchCounters {
+    pub(crate) fn snapshot(&self) -> SourceNatMatchSnapshot {
+        SourceNatMatchSnapshot {
+            consulted: self.consulted.load(Ordering::Relaxed),
+            matched: self.matched.load(Ordering::Relaxed),
+            unavailable: self.unavailable.load(Ordering::Relaxed),
+            no_match: self.no_match.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Record one outcome. `consulted` is bumped for EVERY call, including the
+    /// ones that fall to `NoMatch`, so it is a count of packets that reached
+    /// the match path rather than of packets NAT did something to.
+    pub(crate) fn record(&self, out: &SourceNatLookup) {
+        self.consulted.fetch_add(1, Ordering::Relaxed);
+        let arm = match out {
+            SourceNatLookup::Matched(_) => &self.matched,
+            SourceNatLookup::Unavailable(_) => &self.unavailable,
+            SourceNatLookup::NoMatch => &self.no_match,
+        };
+        arm.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The process sink every production match consults. One per process, like
+/// `io_uring_write::process_retained`, because the match path has no per-pool
+/// object to hang a counter on and threading one through 17 parameters would
+/// change every call site to instrument none of them better.
+pub(crate) fn process_source_nat_match_counters() -> &'static Arc<SourceNatMatchCounters> {
+    static COUNTERS: std::sync::LazyLock<Arc<SourceNatMatchCounters>> =
+        std::sync::LazyLock::new(|| Arc::new(SourceNatMatchCounters::default()));
+    &COUNTERS
 }

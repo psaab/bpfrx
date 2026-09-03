@@ -219,6 +219,18 @@ pub(crate) struct ProcessStatus {
     /// were deliberately not returned to the allocator. Without this the
     /// condition is silent by construction: the whole point is that nothing
     /// further is ever heard about those writes.
+    /// #8447: source-NAT rule-match outcomes. `consulted` counts every packet
+    /// that REACHED the match path, including the ones that matched nothing —
+    /// which is what makes a zero in the other three readable. Without it,
+    /// "nothing matched" and "nothing arrived" are the same number.
+    #[serde(rename = "source_nat_match_consulted_total", default)]
+    pub source_nat_match_consulted_total: u64,
+    #[serde(rename = "source_nat_match_matched_total", default)]
+    pub source_nat_match_matched_total: u64,
+    #[serde(rename = "source_nat_match_unavailable_total", default)]
+    pub source_nat_match_unavailable_total: u64,
+    #[serde(rename = "source_nat_match_no_match_total", default)]
+    pub source_nat_match_no_match_total: u64,
     #[serde(rename = "io_uring_retained_buffers_total", default)]
     pub io_uring_retained_buffers_total: u64,
     /// Bytes held by `io_uring_retained_buffers_total`.

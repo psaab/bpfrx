@@ -554,16 +554,9 @@ fn promote_cos_queue_flow_fair(
 ) {
     queue.config.shared_exact = queue_fast.shared_exact;
     // #917: pull V_min coordination Arc from the fast-path
-    // struct.
-    //
-    // #8428: this used to say "only allocated on shared_exact queues", which
-    // reads as shared_exact => allocated. The implication runs the OTHER way.
-    // `build_shared_cos_queue_vtime_floors_reusing_existing` admits on
-    // `exact && rate >= COS_SHARED_EXACT_MIN_RATE_BYTES`, a STRICT SUBSET of
-    // what `queue_uses_shared_exact_service` routes (rate alone, since #1598).
-    // So a non-exact high-rate queue is promoted shared_exact with `None`
-    // here, and every consumer must treat that as an ordinary state rather
-    // than corruption. The runtime caches it so hot-path
+    // struct. Only allocated on shared_exact queues (per
+    // `build_shared_cos_queue_vtime_floors_reusing_existing`
+    // in coordinator.rs). The runtime caches it so hot-path
     // pop/push_front helpers can publish without an
     // iface_fast lookup. `worker_id` is the local thread's
     // 0-based id — used to index `vtime_floor.slots` for
@@ -595,16 +588,9 @@ fn promote_cos_queue_flow_fair(
     // gate (`flow_fair_state.is_some()`).
     queue.config.flow_fair_eligible = true;
     // Exact queues promote EAGERLY at build (today's behavior — they
-    // always carry expected flows).
-    //
-    // #8428: the rest of this sentence used to claim "the V_min / v8-lease
-    // coordination on shared_exact assumes a stable `flow_fair_state` for the
-    // interface's lifetime". That assumption was already false when written:
-    // since #1598 a NON-exact queue can be shared_exact, and the very next
-    // branch leaves its `flow_fair_state` as `None` until lazy promotion. The
-    // V_min path `.expect()`ed on that assumption and panicked the worker
-    // (v_min.rs:212). It now treats the absence as not-applicable, so the
-    // eager/lazy split below is free to stay as it is. Non-exact eligible queues stay
+    // always carry expected flows, and the V_min / v8-lease
+    // coordination on shared_exact assumes a stable `flow_fair_state`
+    // for the interface's lifetime). Non-exact eligible queues stay
     // `None` here and promote lazily via the hash-free front-key
     // contention probe in `cos_queue_push_back` only once a SECOND
     // distinct flow arrives — so single-flow / uncontended best-effort

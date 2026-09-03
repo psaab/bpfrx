@@ -1295,52 +1295,6 @@ Deliberately NOT applied to `system login class`: #6838 already made the class
 cohort reader-independent by folding permissions across the whole same-named
 set, and a merge here would fight that design.
 
-### The duplicate-block CONSERVATION census (#8436)
-
-#8436's argument, which this implements: every duplicate-block instance so far
-(#3884, #4287, #5180, #5631/#5878, #5649, #8426, #8427, #8433) was closed by
-adding a `namedDupRules` row or a bespoke gate. **That is an opt-in pattern whose
-opt-ins were being discovered one review at a time.** A registry-row test proves
-the row exists; it cannot see the next uncovered container, and the uncovered set
-was written down nowhere.
-
-The census binds the **conservation** property instead:
-
-```
-<kw> NAME { A; }   <kw> NAME { B; }        (two hierarchical blocks)
-                  ==
-<kw> NAME { A; B; }                        (what flat-set `set` produces)
-```
-
-Flat-set merges correctly in every measured case, so the merged form is the
-reference. Where the duplicate form does not equal it, configuration the operator
-authored is silently lost.
-
-**Measured: 29 named containers checked, 25 do not conserve, of which 16 are
-SILENT** — no commit gate at all. The other 9 are rejected at commit
-(conservation by *refusal*); the census compiles **leniently** so it still sees
-the reduction, which is why a rejected container stays listed. A second, strict
-compile is what separates the two, and that column is what makes the inventory a
-candidate list rather than a wall of names.
-
-**Reachability narrows the class usefully**: none of it is reachable through
-`set` commands — only a hierarchical config file, `load merge` or
-`load override`.
-
-Two design points that decide whether the census measures anything:
-
-- **Two different leaves, not two values of one leaf.** A `multi` leaf
-  legitimately accumulates, so a single-leaf probe would measure the leaf's list
-  semantics rather than the block's reduction.
-- **A vacuity guard** drops any site where the second leaf is not observable in
-  the typed config — otherwise the two spellings agree for a reason that has
-  nothing to do with conservation.
-
-`checked = 29` is a FLOOR, not a census of the whole schema: the walk is
-depth-limited and needs a container with two simple single-value leaves. Sites it
-cannot reach are unruled, not clean — the same honesty the #2419 census applies
-to its own skip buckets.
-
 ### Duplicate containers beyond the original four (#6768)
 
 #### IKE and IPsec proposals (#8433)

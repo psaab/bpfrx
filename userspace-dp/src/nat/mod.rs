@@ -107,6 +107,9 @@ mod tests_destination;
 #[path = "tests_idle_lease_sync_8121.rs"]
 mod tests_idle_lease_sync_8121;
 #[cfg(test)]
+#[path = "tests_match_counters_8447.rs"]
+mod tests_match_counters_8447;
+#[cfg(test)]
 #[path = "tests_persistent_admission_8447.rs"]
 mod tests_persistent_admission_8447;
 #[cfg(test)]
@@ -209,6 +212,8 @@ pub(crate) use source::report_dropped_leases;
 // #7799: the NAT64 mint path (`crate::nat64`) needs the same drain-occupancy
 // test the interface-mode mint path uses.
 pub(crate) use source::address_has_draining_pool_occupancy;
+// #8447: rule-match outcome counters (process-global).
+pub(crate) use source::{SourceNatMatchSnapshot, process_source_nat_match_counters};
 // #6979: reachable from the afxdp coordinator test that binds the retirement
 // wiring; the primitive itself stays covered by nat::tests_pool.
 pub(crate) use allocator::TranslatedTuple;

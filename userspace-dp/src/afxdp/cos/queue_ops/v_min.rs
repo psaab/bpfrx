@@ -202,47 +202,21 @@ pub(in crate::afxdp) fn cos_queue_v_min_continue(
         queue.v_min.v_min_suspension_window = V_MIN_SUSPENSION_BATCHES;
         return true;
     }
-    // #8428: BOTH of these were `.expect()`, on the invariant that a
-    // shared_exact queue is necessarily exact and therefore carries both a
-    // `flow_fair_state` and a `vtime_floor`. That invariant has been false
-    // since #1598 widened `queue_uses_shared_exact_service` to route on RATE
-    // ALONE, and both panics are reachable from ordinary traffic on a
-    // configuration the commit path accepts:
-    //
-    //   * `promote_cos_queue_flow_fair` allocates `flow_fair_state` only `if
-    //     queue.config.exact`; a non-exact queue promotes LAZILY on its second
-    //     distinct flow, so between routing and that second flow it is
-    //     shared_exact with NO flow-fair state;
-    //   * the floor allocator skips `!queue.exact` DELIBERATELY — see its own
-    //     "#1598: this filter is intentionally STRICTER than the routing-side
-    //     gate ... V_min-floor is exact-only" — so a non-exact queue never gets
-    //     a floor at all.
-    //
-    // The divergence is the producer's stated design, so the consumer is what
-    // has to tolerate it. Allocating a floor for every routed queue would
-    // contradict a decision the allocator states outright and calls "useless
-    // work".
-    //
-    // Disposition: NOT APPLICABLE, not "throttle". A queue with no floor has no
-    // peer slots to compare against and a queue with no flow-fair state has no
-    // virtual time to compare — there is nothing the V_min lag check can
-    // measure, exactly as on the `!shared_exact()` and #2981 unshaped arms
-    // above, which both continue. This matches the `if let` form the file's
-    // siblings (`publish_committed_queue_vtime` and neighbours) already use.
-    //
-    // The counters are reset on the way out for the same reason those arms do
-    // it: a not-throttled outcome must not leave a stale skip count or a
-    // half-decayed suspension window behind.
-    let Some(ff) = queue.flow_fair_state.as_ref() else {
-        queue.v_min.consecutive_v_min_skips = 0;
-        queue.v_min.v_min_suspension_window = V_MIN_SUSPENSION_BATCHES;
-        return true;
-    };
-    let Some(floor) = queue.v_min.vtime_floor.as_ref() else {
-        queue.v_min.consecutive_v_min_skips = 0;
-        queue.v_min.v_min_suspension_window = V_MIN_SUSPENSION_BATCHES;
-        return true;
-    };
+    // Invariant: shared_exact queues are also flow_fair (set together
+    // in promote_cos_queue_flow_fair) and therefore have flow_fair_state
+    // allocated. Silent fall-through here would skip the V_min lag
+    // check entirely and let one worker run away vs peers.
+    let ff = queue
+        .flow_fair_state
+        .as_ref()
+        .expect("cos_queue_v_min_continue: shared_exact queue without flow_fair_state");
+    // vtime_floor is allocated for shared_exact queues at promotion time.
+    // None here is structural; same panic discipline.
+    let floor = queue
+        .v_min
+        .vtime_floor
+        .as_ref()
+        .expect("cos_queue_v_min_continue: shared_exact queue without vtime_floor");
     // Single-pass snapshot of participating peers' V_min. See the
     // memory-ordering doc on `participating_v_min_snapshot` for the
     // non-atomic-across-slots contract. The replaced inline loop did

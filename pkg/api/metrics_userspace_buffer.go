@@ -30,6 +30,29 @@ func (c *xpfCollector) emitUserspaceDynamicBufferMetrics(ch chan<- prometheus.Me
 	// unconditionally (cumulative CounterValue, not gated on a session-
 	// table denominator) so a 0 is a real published "no collisions" signal
 	// rather than an absent series.
+	// #8447: emitted unconditionally, same doctrine — a published 0 for
+	// `consulted` is the finding (nothing reached source-NAT), and an absent
+	// series would be indistinguishable from a helper that predates it.
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceSourceNATMatchConsulted,
+		prometheus.CounterValue,
+		float64(status.SourceNATMatchConsultedTotal),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceSourceNATMatchMatched,
+		prometheus.CounterValue,
+		float64(status.SourceNATMatchMatchedTotal),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceSourceNATMatchUnavailable,
+		prometheus.CounterValue,
+		float64(status.SourceNATMatchUnavailableTotal),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceSourceNATMatchNoMatch,
+		prometheus.CounterValue,
+		float64(status.SourceNATMatchNoMatchTotal),
+	)
 	ch <- prometheus.MustNewConstMetric(
 		c.userspaceNatReverseKeyCollisions,
 		prometheus.CounterValue,

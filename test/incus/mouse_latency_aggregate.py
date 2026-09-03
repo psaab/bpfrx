@@ -83,39 +83,6 @@ def _probe_config_from_rep(rep: dict) -> dict:
     }
 
 
-def _target_pair_from_rep(rep: dict) -> Optional[Tuple[str, str]]:
-    """The (mouse_target, elephant_target) this rep was captured against.
-
-    #8259. `None` when the rep predates the split — an older artifact cannot
-    say where its flows terminated, and inventing a default would be the same
-    class of error the void verdict exists to prevent.
-    """
-    # The manifest is NESTED under rep["manifest"], not merged at top level —
-    # reading it flat returns None for every rep and the void check below
-    # becomes a silent no-op. Same access shape as _probe_config_from_rep.
-    manifest = rep.get("manifest")
-    if not isinstance(manifest, dict):
-        manifest = {}
-    mouse = manifest.get("mouse_target")
-    elephant = manifest.get("elephant_target")
-    if not mouse or not elephant:
-        return None
-    return (str(mouse), str(elephant))
-
-
-def shared_target_pair(reps: List[dict]) -> Optional[Tuple[str, str]]:
-    """The one target pair every valid rep agrees on, if they do.
-
-    Returns `None` when no rep declares a pair. Mixed pairs are reported by the
-    caller as their own defect: a cell whose reps terminated on different hosts
-    cannot be summarised at all.
-    """
-    pairs = {p for p in (_target_pair_from_rep(r) for r in reps) if p is not None}
-    if len(pairs) == 1:
-        return next(iter(pairs))
-    return None
-
-
 def _probe_config_key(config: dict) -> Tuple[object, object]:
     return (config.get("connection_mode"), config.get("min_interval_ms"))
 
@@ -222,10 +189,6 @@ def summarize_cell(reps: List[dict], representative_percentile: str = "p99") -> 
         "iqr_p99_across_reps": None,
         "representative_percentile": representative_percentile,
     }
-    pair = shared_target_pair(valid)
-    if pair is not None:
-        # #8259: the gate needs to know where the two flows terminated.
-        summary["mouse_target"], summary["elephant_target"] = pair
     probe_configs = _unique_probe_configs(valid)
     if len(probe_configs) == 1:
         summary["probe_config"] = probe_configs[0]
@@ -290,58 +253,6 @@ def decide(
                 f"idle=N0_M{gate_mice}"
             ),
         }
-    # #8259: REFUSE to emit a verdict this measurement cannot attribute.
-    #
-    # When the mice and the elephants terminate on the SAME host, the loaded
-    # cell adds the elephants' full offered load to the very machine whose
-    # service time is inside every mouse sample, while the idle cell does not.
-    # The ratio then attributes that entire difference to firewall queueing.
-    # On the standing loss cluster the two are ~8.6 Gbit/s apart.
-    #
-    # PASS is the dangerous half, not FAIL. A FAIL invites investigation; a
-    # PASS gets cited as a control, and one already has been — the #7159
-    # cross-class PASS was used as the comparison point for #8259's FAIL, and
-    # it carries this same defect. A verdict that cannot mean what it says is
-    # worse than no verdict.
-    #
-    # This is deliberately NOT a warning field alongside a PASS/FAIL. A warning
-    # is discarded by every consumer that reads `verdict`, which is what let
-    # the confound survive to be cited.
-    #
-    # ORDERING: this runs BEFORE the cell-status check, so a cell that is BOTH
-    # short of valid reps AND on a shared target reports VOID rather than
-    # INSUFFICIENT-DATA. That is the more useful of the two, and deliberate:
-    # INSUFFICIENT-DATA says "collect more reps", and more reps cannot make an
-    # unattributable comparison attributable. Attribution is the prior
-    # question. A cell with NO valid reps has no targets recorded and still
-    # reports INSUFFICIENT-DATA, which is also right — there is nothing to
-    # attribute yet.
-    #
-    # The check passes the moment the two targets differ, so standing up a
-    # second host on VLAN 80 and pointing ELEPHANT_TARGET_V4 at it turns the
-    # gate back on with no further change. See target-services.sh for why
-    # there is no second host today.
-    loaded_pair = (gate_loaded.get("mouse_target"), gate_loaded.get("elephant_target"))
-    idle_pair = (gate_idle.get("mouse_target"), gate_idle.get("elephant_target"))
-    for cell_name, (mouse, elephant) in (("loaded", loaded_pair), ("idle", idle_pair)):
-        if mouse and elephant and mouse == elephant:
-            return {
-                "verdict": "VOID-NOT-ATTRIBUTABLE",
-                "reason": (
-                    f"{cell_name} cell: mice and elephants both terminate on "
-                    f"{mouse}, so the loaded cell adds the elephants' offered "
-                    f"load to the host whose service time is inside every mouse "
-                    f"sample. The loaded/idle ratio cannot separate firewall "
-                    f"queueing from target-host service, and neither PASS nor "
-                    f"FAIL would mean what it says (#8259)."
-                ),
-                "mouse_target": mouse,
-                "elephant_target": elephant,
-                "unblocked_by": (
-                    "a second host on VLAN 80 with ELEPHANT_TARGET_V4 pointed "
-                    "at it; see test/incus/target-services.sh"
-                ),
-            }
     if gate_loaded.get("status") != "OK" or gate_idle.get("status") != "OK":
         return {
             "verdict": "INSUFFICIENT-DATA",

@@ -367,30 +367,6 @@ A measurement run **PASSES** iff ALL of:
    The reducer rejects gate comparisons whose idle and loaded cells were
    captured with different probe modes or minimum-interval pacing.
 
-   **The gate emits `VOID-NOT-ATTRIBUTABLE` when the mice and the elephants
-   terminate on the SAME host (#8259), instead of PASS or FAIL.** The two
-   cells being ratioed then differ by the elephants' entire offered load on
-   the very machine whose service time is inside every mouse sample — ~8.6
-   Gbit/s on the standing loss cluster — and the ratio attributes all of it to
-   firewall queueing. `PASS` is the dangerous half rather than `FAIL`: a FAIL
-   invites investigation, while a PASS gets cited as a control, and one was —
-   #7159's cross-class PASS was the comparison point for #8259's FAIL and
-   carries the same defect. The verdict is deliberately not a warning field
-   beside a PASS/FAIL, because a warning is discarded by every consumer that
-   reads `verdict`, which is how the confound survived to be cited. It exits
-   2 (undetermined), never 0.
-
-   `MOUSE_TARGET_V4` and `ELEPHANT_TARGET_V4` are separate knobs that default
-   to the same address, so the check passes the moment a second host exists:
-   point `ELEPHANT_TARGET_V4` at it and the gate resumes producing
-   attributable numbers with no further change. There is no second host on
-   VLAN 80 today, and the current target is external lab hardware with no
-   management path — `test/incus/target-services.sh` records that it "is not
-   an incus instance in any project, and it does not accept ssh", which is
-   also why the target cannot simply be sampled instead. Artifacts predating
-   the split declare no targets and are never voided on their absence: the
-   void fires on positive evidence that the two are equal.
-
 A run that satisfies any single gate while failing another **does
 not pass**. There is no "OR flagged" escape clause; if a gate
 cannot be met, the contract requires either a code change or a
@@ -1314,31 +1290,6 @@ the sweep exit `2`; they do not produce a false-green fairness verdict.
   NOT a fix for an observed runaway throttle. SHAPED queues
   (`transmit_rate_bytes > 0`) are byte-identical — threshold and gating
   decision unchanged.
-  #8428 adds two more NOT-APPLICABLE arms to the same brake, and unlike
-  the #2981 one these were reachable and fatal. `cos_queue_v_min_continue`
-  is gated on `shared_exact()`, and since #1598
-  `queue_uses_shared_exact_service` admits on RATE ALONE — a NON-exact
-  queue at or above `COS_SHARED_EXACT_MIN_RATE_BYTES` is routed into the
-  shared-exact flow-fair drain. But neither of the things the brake reads
-  is allocated for such a queue: `promote_cos_queue_flow_fair` builds
-  `flow_fair_state` only `if queue.config.exact` (non-exact queues
-  promote LAZILY on their second distinct flow), and
-  `build_shared_cos_queue_vtime_floors_reusing_existing` skips
-  `!queue.exact` DELIBERATELY — its own comment states the divergence:
-  "V_min coordination is an exact-only concept ... both gates keep their
-  own predicate: shared_exact-routing is broader, V_min-floor is
-  exact-only." The brake `.expect()`ed both, so an ordinary
-  high-rate uncapped class PANICKED the worker thread — the worker dies,
-  its bindings stall, and there is no auto-recovery. Both are now
-  `if let` with the same continue-unthrottled disposition as the
-  `!shared_exact()` and unshaped arms: a queue with no peer slots has
-  nothing to compare against, and one with no virtual time has nothing to
-  compare. The fix is deliberately on the CONSUMER side — allocating
-  floors for every routed queue would contradict the allocator's stated
-  design and, in its words, be "useless work". The containment
-  (floor-eligible ⇒ shared_exact-routed, never the reverse) is pinned by
-  `a_non_exact_high_rate_queue_gets_no_vtime_floor_8428` so the
-  divergence cannot be closed from the producer side unnoticed.
 - **`xpf_userspace_binding_v_min_throttle_hard_cap_overrides_total{binding_slot=..., queue_id=..., worker_id=..., iface=...}`**
   counter (#1831): V_MIN_CONSECUTIVE_SKIP_HARD_CAP escape-hatch
   activations — after that many back-to-back throttle decisions the

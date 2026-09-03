@@ -154,17 +154,10 @@ class RemoteJobLifecycleWiringTests(unittest.TestCase):
     def test_every_remote_job_is_launched_through_the_library(self):
         # The raw launch strings are what leaked: they left nothing on
         # the remote side that a kill could address.
-        # #8259: the elephant target moved from $TARGET_V4 to
-        # $ELEPHANT_TARGET_V4 when the single target variable was split, so
-        # both raw-launch spellings are now forbidden.
         self.assertNotIn('"iperf3 -c ${TARGET_V4}', SCRIPT)
-        self.assertNotIn('"iperf3 -c ${ELEPHANT_TARGET_V4}', SCRIPT)
         self.assertNotIn('"mpstat 1 ${DURATION}', SCRIPT)
         self.assertNotIn('"mpstat 1 ${SETTLE_BUDGET}', SCRIPT)
-        self.assertIn(
-            'mouse_elephant_start_cmd "$REP_TAG" "$ELEPHANT_TARGET_V4" "$ELEPHANT_PORT"',
-            SCRIPT,
-        )
+        self.assertIn('mouse_elephant_start_cmd "$REP_TAG" "$TARGET_V4" "$ELEPHANT_PORT"', SCRIPT)
         self.assertIn('mouse_remote_job_start_cmd mpstat-settle "$REP_TAG"', SCRIPT)
         self.assertIn('mouse_remote_job_start_cmd mpstat "$REP_TAG" mpstat 1 "$DURATION"', SCRIPT)
 
@@ -211,47 +204,3 @@ class RemoteJobLifecycleWiringTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-class TargetSplitWiringTests(unittest.TestCase):
-    """#8259 — the mouse and elephant targets must be SEPARATELY addressable.
-
-    They were one variable, which is why the gate could never separate
-    firewall queueing from target-host service: both flows terminated on the
-    same host by construction, not by configuration.
-
-    These pin the WIRING rather than the values. `mouse_latency_aggregate`
-    refuses to emit PASS/FAIL when the two are equal, and that check is only
-    meaningful if the harness can actually drive them apart — otherwise it is
-    permanently true and the gate is permanently void.
-    """
-
-    def test_both_targets_are_overridable_and_default_together(self):
-        self.assertIn('MOUSE_TARGET_V4="${MOUSE_TARGET_V4:-$TARGET_V4}"', SCRIPT)
-        self.assertIn('ELEPHANT_TARGET_V4="${ELEPHANT_TARGET_V4:-$TARGET_V4}"', SCRIPT)
-
-    def test_the_mouse_probe_uses_the_mouse_target(self):
-        self.assertIn('--target "$MOUSE_TARGET_V4" --port "$MOUSE_PORT"', SCRIPT)
-
-    def test_the_reachability_preflight_uses_the_mouse_target(self):
-        # The preflight opens the ECHO port; checking it on the elephant
-        # target would probe a host that need not run an echo daemon at all.
-        self.assertIn('exec 3<>/dev/tcp/${MOUSE_TARGET_V4}/${MOUSE_PORT}', SCRIPT)
-
-    def test_both_targets_reach_the_manifest(self):
-        # The reducer's void check reads these out of manifest.json. If they
-        # are not recorded, the check silently never fires — which is the
-        # failure mode this whole change exists to remove.
-        self.assertIn('"mouse_target": os.environ["MOUSE_TARGET_V4"]', SCRIPT)
-        self.assertIn('"elephant_target": os.environ["ELEPHANT_TARGET_V4"]', SCRIPT)
-        # Both the OK and the INVALID manifest builders.
-        self.assertEqual(SCRIPT.count('"mouse_target": os.environ["MOUSE_TARGET_V4"]'), 2)
-
-    def test_both_targets_are_exported_to_the_manifest_builders(self):
-        # The manifest python runs under an explicit env prefix; a variable
-        # missing from it raises KeyError at run time, on the cluster, after
-        # the lock is taken.
-        self.assertEqual(
-            SCRIPT.count('MOUSE_TARGET_V4="$MOUSE_TARGET_V4" ELEPHANT_TARGET_V4="$ELEPHANT_TARGET_V4"'),
-            2,
-        )

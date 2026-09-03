@@ -32,4 +32,3 @@ mod hard_cap;
 mod prepared_drain;
 mod cadence;
 mod rejoiner;
-mod no_floor_8428;

@@ -13,6 +13,32 @@ func (c *xpfCollector) initUserspaceSessionDescriptors() {
 		"Aggregate userspace session-table capacity across workers.",
 		nil, nil,
 	)
+	// #8447: source-NAT rule-match outcomes. Consulted is the denominator that
+	// makes the other three readable — it counts every packet that REACHED the
+	// match path, including ones that matched nothing, so a zero elsewhere can
+	// be told from "nothing arrived". Emitted unconditionally for the same
+	// reason the collision counters below are: a published 0 is a real signal,
+	// an absent series is not.
+	c.userspaceSourceNATMatchConsulted = prometheus.NewDesc(
+		"xpf_userspace_source_nat_match_consulted_total",
+		"Packets that reached the source-NAT rule-match path, whatever the outcome.",
+		nil, nil,
+	)
+	c.userspaceSourceNATMatchMatched = prometheus.NewDesc(
+		"xpf_userspace_source_nat_match_matched_total",
+		"Source-NAT rule matches that produced a translation decision.",
+		nil, nil,
+	)
+	c.userspaceSourceNATMatchUnavailable = prometheus.NewDesc(
+		"xpf_userspace_source_nat_match_unavailable_total",
+		"Source-NAT rule matches that could not produce a translation.",
+		nil, nil,
+	)
+	c.userspaceSourceNATMatchNoMatch = prometheus.NewDesc(
+		"xpf_userspace_source_nat_match_no_match_total",
+		"Packets that reached source-NAT and matched no rule.",
+		nil, nil,
+	)
 	c.userspaceNatReverseKeyCollisions = prometheus.NewDesc(
 		"xpf_userspace_session_nat_reverse_key_collisions_total",
 		"Aggregate NAT reverse-key (nat_reverse_index) 1:N collision "+
