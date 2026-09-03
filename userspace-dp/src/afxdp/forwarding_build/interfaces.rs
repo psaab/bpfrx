@@ -103,6 +103,17 @@ pub(super) fn populate_interfaces(
     let mut egress_zone_claim: BTreeMap<i32, EgressZoneClaim> = BTreeMap::new();
     let mut zones_carried: BTreeMap<i32, std::collections::BTreeSet<String>> = BTreeMap::new();
 
+    // #7509: parent ifindexes whose zoned child units DISAGREE. Tracked for the
+    // whole walk so a later row carrying the first zone cannot resurrect a guess
+    // a second row already contested, and reported after the walk so an operator
+    // can get from "my traffic stopped" to the contested ifindex in one place.
+    let mut contested_parent_ifindexes: std::collections::BTreeSet<i32> =
+        std::collections::BTreeSet::new();
+    let mut contested_parent_zones: std::collections::BTreeMap<
+        i32,
+        std::collections::BTreeSet<u16>,
+    > = std::collections::BTreeMap::new();
+
     for iface in &snapshot.interfaces {
         if iface.ifindex <= 0 {
             continue;
@@ -162,10 +173,12 @@ pub(super) fn populate_interfaces(
             match state.zone_name_to_id.get(&iface.zone).copied() {
                 Some(id) => id,
                 None => {
-                    return Err(crate::policy::SnapshotIntegrityError::InterfaceUnknownZone {
-                        interface: iface.name.clone(),
-                        zone: iface.zone.clone(),
-                    });
+                    return Err(
+                        crate::policy::SnapshotIntegrityError::InterfaceUnknownZone {
+                            interface: iface.name.clone(),
+                            zone: iface.zone.clone(),
+                        },
+                    );
                 }
             }
         };
@@ -241,12 +254,80 @@ pub(super) fn populate_interfaces(
             // `ifindex_unambiguous_zone_id` instead, which this arm never
             // touches.
             if iface.parent_ifindex > 0 {
-                match state.ifindex_to_zone_id.get(&iface.parent_ifindex) {
-                    Some(existing) if *existing != row_zone_id => {}
-                    _ => {
-                        state
-                            .ifindex_to_zone_id
-                            .insert(iface.parent_ifindex, row_zone_id);
+                // #7509: a CONTESTED parent ifindex is UNZONED, not guessed.
+                //
+                // This arm used to keep the first zoned child's answer and
+                // silently ignore a sibling that disagreed
+                // (`Some(existing) if *existing != row_zone_id => {}`). On a
+                // shared base ifindex — an interface-level tunnel maps every
+                // unit onto one netdev via `TunnelNameMap` — that adjudicates a
+                // packet on `st0.0` against `st0.1`'s policies: a policy set the
+                // operator never wrote for that unit, chosen by row order.
+                //
+                // The dataplane sees an IFINDEX, not a unit, so it cannot tell
+                // the two apart with anything on the wire today. When it cannot
+                // know which zone a packet belongs to, the firewall must decline
+                // to pick one rather than guess. Declining = no entry, so
+                // adjudication falls to the default policy.
+                //
+                // This also collapses an asymmetry rather than adding a second
+                // mechanism: the egress half already resolves a contested
+                // ifindex to nothing (`EgressZoneClaim::Conflicting` ->
+                // `resolve` -> `None`, `ifindex_unambiguous_zone_id` gets no
+                // entry). Ingress now matches it, which is the #6727 symmetry.
+                //
+                // A contested parent stays unzoned for the REST of the walk:
+                // `contested_parent_ifindexes` is checked before every insert,
+                // so a third row carrying the first zone cannot resurrect the
+                // guess after a second row contested it. Without that the
+                // outcome would depend on row order again, just less obviously.
+                //
+                // WHAT WOULD INVALIDATE THIS (#4308). The rationale above rests
+                // on untagged traffic having no principled unit attribution
+                // today: `native-vlan-id` is accepted-only and NOT enforced
+                // (`schema_interfaces.go`, and `compiler_validate_warn_routing.go`
+                // emits a commit advisory saying so). If #4308 is ever
+                // implemented, untagged frames on a trunk acquire a DEFINED unit
+                // — the native VLAN — and declining to zone them becomes wrong
+                // for that unit specifically, though it stays right for every
+                // other contested case. A future implementer of #4308 will not
+                // think to look here, so this is written down rather than left
+                // to be re-derived.
+                //
+                // SCOPE, wider than the issue's framing. #7509 describes
+                // interface-level TUNNEL units sharing a netdev. The condition
+                // is any parent whose units span different zones, which includes
+                // an ordinary VLAN trunk — `poll_stages_tests.rs`'s #3021
+                // fixture is exactly that shape. The affected traffic stays
+                // narrow: a tagged frame resolves to its own logical unit
+                // ifindex first (#3021), so only traffic that resolves to the
+                // RAW PARENT changes behaviour.
+                //
+                // Accepted cost, stated because it is a real regression for a
+                // configured case: where two units with different zones share a
+                // base ifindex, the one that happened to win the old race worked
+                // and is now denied. It worked by accident of ordering, its
+                // sibling was being misadjudicated the whole time, and both are
+                // now reported (see the warn! below).
+                if !contested_parent_ifindexes.contains(&iface.parent_ifindex) {
+                    match state.ifindex_to_zone_id.get(&iface.parent_ifindex) {
+                        Some(existing) if *existing != row_zone_id => {
+                            contested_parent_ifindexes.insert(iface.parent_ifindex);
+                            contested_parent_zones
+                                .entry(iface.parent_ifindex)
+                                .or_insert_with(std::collections::BTreeSet::new)
+                                .insert(*existing);
+                            contested_parent_zones
+                                .entry(iface.parent_ifindex)
+                                .or_insert_with(std::collections::BTreeSet::new)
+                                .insert(row_zone_id);
+                            state.ifindex_to_zone_id.remove(&iface.parent_ifindex);
+                        }
+                        _ => {
+                            state
+                                .ifindex_to_zone_id
+                                .insert(iface.parent_ifindex, row_zone_id);
+                        }
                     }
                 }
             }
@@ -409,10 +490,7 @@ pub(super) fn populate_interfaces(
             && !iface.host_inbound_configured
             && !is_host_inbound_lifeline(&iface.name)
         {
-            state
-                .ifindex_host_inbound
-                .entry(iface.ifindex)
-                .or_default();
+            state.ifindex_host_inbound.entry(iface.ifindex).or_default();
         }
     }
 
@@ -436,6 +514,30 @@ pub(super) fn populate_interfaces(
     //     makes this unreachable in practice — a row carrying an unresolvable
     //     zone already returned `InterfaceUnknownZone` above — but a failed
     //     lookup must not default to a real zone id.
+    // #7509 Condition 1: the deny must be OBSERVABLE. A contested ifindex that
+    // silently unzones is a blackhole with no error anywhere on the box — the
+    // #8296 failure mode, where a config committed clean, rendered back
+    // verbatim, and reached no consumer while traffic died with no log line.
+    //
+    // One line per contested ifindex per build, naming the ifindex and every
+    // zone id that claimed it, so an operator whose traffic stopped can reach
+    // "these units share a base ifindex and disagree about their zone" without
+    // reading source. Emitted once per build rather than per row: the condition
+    // is a property of the snapshot, and a per-row line would scale with
+    // interface count for one fact.
+    for (ifindex, zones) in &contested_parent_zones {
+        let ids: Vec<String> = zones.iter().map(|z| z.to_string()).collect();
+        eprintln!(
+            "xpf-userspace-dp: WARNING zone contest on shared base ifindex {}: units \
+             claim zone ids [{}] — the ingress zone is UNSET for it and its traffic \
+             falls to the default policy in BOTH directions (#7509). The dataplane \
+             sees an ifindex, not a unit, so it cannot tell which unit a packet \
+             arrived on; give the units distinct netdevs or put them in one zone.",
+            ifindex,
+            ids.join(", ")
+        );
+    }
+
     for (ifindex, claim) in egress_zone_claim {
         let Some(zone) = claim.resolve(zones_carried.get(&ifindex)) else {
             continue;
@@ -512,7 +614,8 @@ pub(super) fn populate_egress(
         // and the EgressInterface.vlan_id site. An out-of-range value
         // (> 65535) fails the snapshot closed rather than wrapping to a
         // different VLAN (a different L2 domain).
-        let vlan_id = super::validated::VlanId::try_from_snapshot(iface.vlan_id, &iface.name)?.get();
+        let vlan_id =
+            super::validated::VlanId::try_from_snapshot(iface.vlan_id, &iface.name)?.get();
         // #2706: validate the MTU ONCE here instead of narrowing it with an
         // unchecked `iface.mtu.max(0) as usize`. A NEGATIVE value fails the
         // snapshot closed rather than collapsing to 0 — which the egress MTU
@@ -545,10 +648,12 @@ pub(super) fn populate_egress(
         // integrity check even though the value below comes from the ledger:
         // an unresolvable zone NAME must still reject the snapshot here.
         if !iface.zone.is_empty() && !state.zone_name_to_id.contains_key(&iface.zone) {
-            return Err(crate::policy::SnapshotIntegrityError::InterfaceUnknownZone {
-                interface: iface.name.clone(),
-                zone: iface.zone.clone(),
-            });
+            return Err(
+                crate::policy::SnapshotIntegrityError::InterfaceUnknownZone {
+                    interface: iface.name.clone(),
+                    zone: iface.zone.clone(),
+                },
+            );
         }
         // #6722: take the row's zone from the LEDGER, not from the row itself.
         // `state.egress` is keyed by ifindex and written last-write-wins, so
