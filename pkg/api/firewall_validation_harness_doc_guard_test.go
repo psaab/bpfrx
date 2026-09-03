@@ -140,13 +140,34 @@ func TestFirewallValidationHarnessDocGuard(t *testing.T) {
 		}
 	}
 
-	// 8. Bind claim: Ledger result infrastructure paths
-	const ledgerPath = "test/results/ledger.jsonl"
-	const runnerPath = "test/incus/harness-result.sh"
-	if !strings.Contains(doc, ledgerPath) {
-		t.Errorf("doc does not cite ledger path %q", ledgerPath)
-	}
-	if !strings.Contains(doc, runnerPath) {
-		t.Errorf("doc does not cite harness runner %q", runnerPath)
+	// 8. Bind claim: Ledger result infrastructure paths.
+	//
+	// #8385: these anchor the doc to paths that must EXIST, not merely to
+	// strings. The previous version pinned "test/results/ledger.jsonl", which
+	// #8346/#8359 replaced with the per-run ledger.d/ shard directory -- and it
+	// stayed GREEN, because the doc was stale in the same direction. A pin
+	// between two spellings only fires when they disagree, so migrating the
+	// underlying artifact and updating neither leaves the pair self-consistent
+	// and both wrong. Worse, it then RESISTS the correction: the first person to
+	// fix the doc gets a red test and reasonably concludes their change is the
+	// defect.
+	//
+	// The repair is that at least one side must be anchored to something that
+	// cannot drift silently. Each path below is checked against the filesystem
+	// first, so a future migration reds this test AT THE MIGRATION rather than
+	// later at the doc fix.
+	for _, p := range []string{
+		"test/results/ledger.d",
+		"test/incus/harness-result.sh",
+	} {
+		if _, err := os.Stat(filepath.Join(root, p)); err != nil {
+			t.Errorf("path %q named by this guard does not exist (%v); the guard is "+
+				"asserting a path the tree no longer has -- update the guard AND the "+
+				"doc together (#8385)", p, err)
+			continue
+		}
+		if !strings.Contains(doc, p) {
+			t.Errorf("doc does not cite %q", p)
+		}
 	}
 }
