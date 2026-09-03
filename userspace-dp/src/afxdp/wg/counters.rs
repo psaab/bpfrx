@@ -237,7 +237,7 @@ impl WgCounters {
                 &self.decap_drops_replay
             }
             DecapError::AllowedIpsViolation => &self.decap_drops_allowed_ips,
-            DecapError::MalformedInner => &self.decap_drops_malformed_inner,
+            DecapError::MalformedInner(_) => &self.decap_drops_malformed_inner,
             DecapError::BufferTooSmall => &self.decap_drops_buffer,
             DecapError::Expired => &self.decap_drops_expired,
             // #7230: a keepalive is not a DROP — it is an authenticated
@@ -342,7 +342,12 @@ mod counters_tests {
             DecapError::ReplayDuplicate,
             DecapError::ReplayOutOfWindow,
             DecapError::AllowedIpsViolation,
-            DecapError::MalformedInner,
+            // #7686/#7230: the two identity-carrying variants. The key is a
+            // fixture value — this cell is about the MAPPING, not attribution
+            // (that is bound in wg/tests.rs) — but they must be present or the
+            // test does not meet its own name.
+            DecapError::MalformedInner([7u8; 32]),
+            DecapError::Keepalive([9u8; 32]),
             DecapError::BufferTooSmall,
             DecapError::Expired,
         ] {
@@ -356,10 +361,21 @@ mod counters_tests {
         assert_eq!(c.decap_drops_crypto.load(Ordering::Relaxed), 1);
         assert_eq!(c.decap_drops_allowed_ips.load(Ordering::Relaxed), 1);
         assert_eq!(c.decap_drops_malformed_inner.load(Ordering::Relaxed), 1);
+        // #7230: a keepalive is NOT a drop, so it must land on its own
+        // counter. Absent this the test's name ("covers every variant") was a
+        // claim it did not meet: Keepalive was missing from the list above
+        // from the moment #7230 added it.
+        assert_eq!(c.decap_keepalives.load(Ordering::Relaxed), 1);
         assert_eq!(c.decap_drops_buffer.load(Ordering::Relaxed), 1);
         assert_eq!(c.decap_drops_expired.load(Ordering::Relaxed), 1);
-        // The keepalive class never routes through the mapper.
-        assert_eq!(c.decap_keepalives.load(Ordering::Relaxed), 0);
+        // #7686: the assertion that stood here was `decap_keepalives == 0`,
+        // justified by "the keepalive class never routes through the mapper".
+        // That is FALSE — `try_decap` returns
+        // `Err(count_decap_err(DecapError::Keepalive(..)))` (engine.rs:1614) —
+        // and it passed only because `Keepalive` was missing from the variant
+        // list above, so the zero was vacuous rather than verified. A counter
+        // asserted to be 0 by a test that never feeds it is indistinguishable
+        // from a working one. The live assertion is above.
     }
 
     #[test]

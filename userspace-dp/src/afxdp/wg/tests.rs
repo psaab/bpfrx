@@ -191,7 +191,7 @@ fn decap_rejects_inner_src_outside_allowed_ips() {
     // The responder's peer (the initiator) is allowed 10.0.0.0/24.
     // The initiator sends a packet with src 10.0.99.99 — must be
     // dropped by the AllowedIPs gate, NOT silently accepted.
-    let (init_engine, resp_engine, _init_pub, resp_pub) = established_pair(
+    let (init_engine, resp_engine, init_pub, resp_pub) = established_pair(
         vec!["10.0.1.0/24".parse().unwrap()],
         vec!["10.0.0.0/24".parse().unwrap()],
     );
@@ -207,7 +207,7 @@ fn decap_rejects_inner_src_outside_allowed_ips() {
 
 #[test]
 fn replay_window_rejects_duplicate_ciphertext() {
-    let (init_engine, resp_engine, _init_pub, resp_pub) = established_pair(
+    let (init_engine, resp_engine, init_pub, resp_pub) = established_pair(
         vec!["10.0.1.0/24".parse().unwrap()],
         vec!["10.0.0.0/24".parse().unwrap()],
     );
@@ -469,7 +469,7 @@ fn transport_plaintext_is_padded_to_16_byte_multiple() {
     // be zero-padded to a multiple of 16 before encryption. Test
     // several inner-packet lengths to cover both the "exact
     // multiple" and "needs padding" arms.
-    let (init_engine, resp_engine, _init_pub, resp_pub) = established_pair(
+    let (init_engine, resp_engine, init_pub, resp_pub) = established_pair(
         vec!["10.0.1.0/24".parse().unwrap()],
         vec!["10.0.0.0/24".parse().unwrap()],
     );
@@ -642,7 +642,7 @@ fn decap_zeros_plaintext_on_allowed_ips_violation() {
     // initiator covers `10.0.0.0/24` only. The initiator then
     // sends with inner src `10.0.99.99` — authenticates, fails
     // AllowedIPs gate, must return AllowedIpsViolation AND wipe.
-    let (init_engine, resp_engine, _init_pub, resp_pub) = established_pair(
+    let (init_engine, resp_engine, init_pub, resp_pub) = established_pair(
         vec!["10.0.1.0/24".parse().unwrap()],
         vec!["10.0.0.0/24".parse().unwrap()],
     );
@@ -679,7 +679,7 @@ fn decap_zeros_plaintext_on_malformed_inner() {
     // byte has IP version != 4/6 so `inner_src_ip` returns None.
     // The packet authenticates (it's just bytes to the AEAD) but
     // the post-decrypt parse fails, and the engine must wipe.
-    let (init_engine, resp_engine, _init_pub, resp_pub) = established_pair(
+    let (init_engine, resp_engine, init_pub, resp_pub) = established_pair(
         vec!["10.0.1.0/24".parse().unwrap()],
         vec!["10.0.0.0/24".parse().unwrap()],
     );
@@ -693,7 +693,11 @@ fn decap_zeros_plaintext_on_malformed_inner() {
     let err = resp_engine
         .try_decap(&wire[..enc.len], &mut plain)
         .unwrap_err();
-    assert_eq!(err, DecapError::MalformedInner);
+    // #7686: the error now names the peer that sent it. Asserting the KEY,
+    // not just the variant, is what makes this cell guard the attribution:
+    // `MalformedInner(_)` would stay green under a version that carried the
+    // wrong peer's key out of try_decap.
+    assert_eq!(err, DecapError::MalformedInner(init_pub));
     let padded_inner_len = (inner.len() + 15) & !15;
     assert!(
         plain[..padded_inner_len].iter().all(|&b| b == 0),
@@ -1250,7 +1254,7 @@ fn old_snapshot_observes_old_config_after_concurrent_reconcile() {
 /// mis-parse the bytes as a real IPv4 header.
 #[test]
 fn decap_rejects_inner_ipv4_with_invalid_ihl_or_total_length() {
-    let (init_engine, resp_engine, _init_pub, resp_pub) = established_pair(
+    let (init_engine, resp_engine, init_pub, resp_pub) = established_pair(
         vec!["10.0.1.0/24".parse().unwrap()],
         vec!["10.0.0.0/24".parse().unwrap()],
     );
@@ -1276,7 +1280,7 @@ fn decap_rejects_inner_ipv4_with_invalid_ihl_or_total_length() {
             .unwrap_err();
         assert_eq!(
             err,
-            DecapError::MalformedInner,
+            DecapError::MalformedInner(init_pub),
             "IHL < 5 must be rejected as MalformedInner"
         );
     }
@@ -1297,7 +1301,7 @@ fn decap_rejects_inner_ipv4_with_invalid_ihl_or_total_length() {
             .unwrap_err();
         assert_eq!(
             err,
-            DecapError::MalformedInner,
+            DecapError::MalformedInner(init_pub),
             "total_length < ihl*4 must be rejected as MalformedInner"
         );
     }
@@ -1495,7 +1499,7 @@ fn allowed_ips_unit_check() {
 fn try_decap_rejects_sub_poly1305_tag_records_without_panicking() {
     use super::framing::encode_data_header;
 
-    let (init_engine, resp_engine, _init_pub, resp_pub) = established_pair(
+    let (init_engine, resp_engine, init_pub, resp_pub) = established_pair(
         vec!["10.0.1.0/24".parse().unwrap()],
         vec!["10.0.0.0/24".parse().unwrap()],
     );
@@ -3095,7 +3099,7 @@ mod telemetry_counters {
     /// AllowedIPs-violating inner → decap_drops_allowed_ips.
     #[test]
     fn allowed_ips_violation_counts() {
-        let (init_engine, resp_engine, _init_pub, resp_pub) = established_pair(
+        let (init_engine, resp_engine, init_pub, resp_pub) = established_pair(
             vec!["0.0.0.0/0".parse().unwrap()],
             // Responder only accepts 10.7.0.0/16 from the initiator.
             vec!["10.7.0.0/16".parse().unwrap()],
@@ -3121,7 +3125,7 @@ mod telemetry_counters {
     /// (ShortRecord folds into the malformed-header class).
     #[test]
     fn short_record_counts_malformed_header() {
-        let (init_engine, resp_engine, _init_pub, resp_pub) = established_pair(
+        let (init_engine, resp_engine, init_pub, resp_pub) = established_pair(
             vec!["0.0.0.0/0".parse().unwrap()],
             vec!["0.0.0.0/0".parse().unwrap()],
         );
@@ -4191,15 +4195,21 @@ fn multi_peer_keepalive_carries_its_peer_7230() {
         },
     ]);
 
-    // ANTI-VACUITY FLOOR: the pre-#7230 recovery path must be incapable
-    // of attributing this datagram. If this ever returns Some, the
-    // fixture has collapsed to one peer and the assertion below would
-    // pass against the very defect it exists to catch.
+    // ANTI-VACUITY FLOOR: the fixture must really be MULTI-peer. If it
+    // collapses to one, the pre-#7230 recovery path would have attributed
+    // this datagram correctly by luck and the assertion below would pass
+    // against the very defect it exists to catch.
+    //
+    // #7686 asserts the peer COUNT directly. This read
+    // `single_peer_pubkey().is_none()` until that function was deleted —
+    // once the malformed-inner arm stopped needing it, nothing in
+    // production called it, and a floor whose only support is a function
+    // kept alive for the floor is circular. The property is unchanged.
     assert!(
-        resp_engine.single_peer_pubkey().is_none(),
-        "precondition: the responder must have MORE than one peer, or the old \
-         single_peer_pubkey() path could attribute the keepalive and this cell \
-         proves nothing (#7230)"
+        resp_engine.peer_pubkeys().len() > 1,
+        "precondition: the responder must have MORE than one peer, or a \
+         single-peer identity guess could attribute the keepalive and this \
+         cell proves nothing (#7230)"
     );
 
     // A zero-length authenticated transport record: header + tag only.
@@ -4241,4 +4251,102 @@ fn multi_peer_keepalive_carries_its_peer_7230() {
     let relaxed = std::sync::atomic::Ordering::Relaxed;
     assert_eq!(rc.decap_keepalives.load(relaxed), 1);
     assert_eq!(rc.decap_drops_malformed_inner.load(relaxed), 0);
+}
+
+/// #7686 — a MALFORMED-but-authenticated inner packet must name the peer
+/// that sent it, on a MULTI-PEER interface.
+///
+/// The same discard #7230 fixed for keepalives, one variant over. The record
+/// is POST-AEAD, so the sender provably holds the session keys — the #1865
+/// basis on which these datagrams count for endpoint learning at all — but
+/// `MalformedInner` carried no identity, so the caller fell back to a
+/// single-peer guess that could attribute nothing on a multi-peer interface.
+///
+/// WHY THIS MUST BE A TWO-PEER TEST, and it is the same trap as #7230's: on a
+/// ONE-peer interface the old guess is right, so a single-peer version of this
+/// cell passes against the defect and proves nothing. The second peer is what
+/// makes the guess impossible. The anti-vacuity floor below asserts the
+/// fixture really is multi-peer, so the cell cannot silently degrade into the
+/// vacuous shape if the fixture changes.
+///
+/// FAIL-ON-REVERT: narrow `MalformedInner` back to a unit variant and the
+/// match below cannot compile; carry the wrong peer's key and the `assert_eq!`
+/// reds. A `MalformedInner(_)` pattern here would pass under both, which is
+/// why the KEY is asserted rather than the variant.
+#[test]
+fn multi_peer_malformed_inner_carries_its_peer_7686() {
+    let (init_engine, resp_engine, init_pub, resp_pub) = established_pair(
+        vec!["10.0.1.0/24".parse().unwrap()],
+        vec!["10.0.0.0/24".parse().unwrap()],
+    );
+
+    // Add a SECOND peer to the responder so no single-peer identity guess can
+    // attribute the datagram.
+    let (_decoy_priv, decoy_pub) = keypair();
+    resp_engine.reconcile_peers(&[
+        WgPeerConfig {
+            pubkey: init_pub,
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+            preshared_key: [0u8; 32].into(),
+        },
+        WgPeerConfig {
+            pubkey: decoy_pub,
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec!["203.0.113.0/24".parse().unwrap()],
+            preshared_key: [0u8; 32].into(),
+        },
+    ]);
+
+    // ANTI-VACUITY FLOOR: see #7230's cell. A one-peer fixture would let a
+    // single-peer guess attribute this correctly by luck.
+    assert!(
+        resp_engine.peer_pubkeys().len() > 1,
+        "precondition: the responder must have MORE than one peer, or a \
+         single-peer identity guess could attribute this datagram and the cell \
+         proves nothing (#7686)"
+    );
+
+    // A payload whose first nibble is neither 4 nor 6: it authenticates (the
+    // AEAD sees only bytes) and then fails the post-decrypt inner-IP parse,
+    // which is the MalformedInner arm under test.
+    let mut inner = vec![0u8; 32];
+    inner[0] = 0x05;
+    let mut wire = [0u8; 2048];
+    let enc = init_engine.try_encap(&resp_pub, &inner, &mut wire).unwrap();
+
+    let mut plain = [0u8; 2048];
+    let err = resp_engine
+        .try_decap(&wire[..enc.len], &mut plain)
+        .unwrap_err();
+
+    match err {
+        DecapError::MalformedInner(pk) => {
+            assert_eq!(
+                pk, init_pub,
+                "the malformed inner must name the peer that actually sent it, \
+                 not the decoy — attribution is by receiver index, resolved \
+                 before AEAD"
+            );
+            assert_ne!(
+                pk, decoy_pub,
+                "attributed the datagram to the WRONG peer; a wrong-peer endpoint \
+                 roam is worse than none at all"
+            );
+        }
+        other => panic!(
+            "a malformed-but-authenticated inner packet on a multi-peer interface \
+             must carry its peer (#7686); got {other:?}, which is the pre-fix \
+             behaviour that reports the datagram Unauthenticated and roams nothing"
+        ),
+    }
+
+    // Still a malformed-inner DROP: carrying the identity does not make it
+    // deliverable, and the "no TUN write" contract is unchanged.
+    let rc = resp_engine.counters();
+    let relaxed = std::sync::atomic::Ordering::Relaxed;
+    assert_eq!(rc.decap_drops_malformed_inner.load(relaxed), 1);
+    assert_eq!(rc.decap_keepalives.load(relaxed), 0);
 }
