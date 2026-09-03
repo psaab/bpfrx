@@ -7,6 +7,15 @@
 use std::io;
 use std::os::raw::c_void;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+/// Running total of UMEM bytes that FAILED to get explicit 2 MB hugepages and
+/// fell back to standard pages. Reported on every fallback so the magnitude of
+/// a partial shortfall is visible, not just its existence.
+static FALLBACK_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Gates the one-time remedy line. The per-allocation line below always fires;
+/// this keeps the (long) operator instruction from repeating once per binding.
+static FALLBACK_REPORTED: AtomicBool = AtomicBool::new(false);
 
 pub(in crate::afxdp) struct MmapArea {
     ptr: NonNull<u8>,
@@ -94,11 +103,44 @@ impl MmapArea {
         }
         let ptr =
             NonNull::new(ptr.cast::<u8>()).ok_or_else(|| io::Error::other("null mmap pointer"))?;
+        // #7497 criterion 1: this fallback is a THROUGHPUT CLIFF, not a
+        // neutral allocation strategy, and until now it announced itself in
+        // the same register as the success path ("standard pages + THP hint").
+        //
+        // MADV_HUGEPAGE is advisory: the kernel may promote none of it. At
+        // ring-entries 16384 one binding is 40960 4 KB pages, so an unpromoted
+        // UMEM costs ~40960 TLB entries instead of ~80, and measured
+        // throughput drops from 22.1 to 20.4 Gbps
+        // (docs/userspace-dataplane-architecture.md). Nothing else reports it:
+        // `is_hugepage_backed` has no consumer, there is no counter, and the
+        // per-allocation line is one of hundreds in a boot.
+        //
+        // The deficit is a PROVISIONING error with a one-line remedy, so name
+        // the remedy. `vm.nr_hugepages` must cover EVERY binding the planner
+        // mints — `Σ min(rx_queues, 16)` over all binding candidates since
+        // #7497, not one NIC's worth — and the pool is reservable only at boot
+        // or via sysctl, never by this process.
+        let total = FALLBACK_BYTES.fetch_add(aligned_len as u64, Ordering::Relaxed)
+            + aligned_len as u64;
         eprintln!(
-            "xpf-ha: umem alloc {} bytes ({} MB, standard pages + THP hint)",
+            "xpf-ha: umem alloc {} bytes ({} MB, standard pages + THP hint) \
+             — NO explicit hugepages ({} MB of UMEM now unbacked)",
             aligned_len,
-            aligned_len / (1024 * 1024)
+            aligned_len / (1024 * 1024),
+            total / (1024 * 1024)
         );
+        if !FALLBACK_REPORTED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "xpf-ha: WARNING: the 2 MB hugepage pool could not back this UMEM. \
+                 THP promotion is advisory, so throughput may stall in TLB-miss \
+                 latency. Raise vm.nr_hugepages (etc/sysctl.d/99-xpf-hugepages.conf) \
+                 to cover {} x 2 MB pages per binding across ALL binding candidates \
+                 (the planner mints the SUM of each interface's min(rx_queues, 16) \
+                 since #7497), then `sysctl --system` and restart xpfd. Verify with \
+                 `grep HugePages_ /proc/meminfo`.",
+                aligned_len.div_ceil(HUGE_PAGE_SIZE)
+            );
+        }
         Ok(Self {
             ptr,
             len,

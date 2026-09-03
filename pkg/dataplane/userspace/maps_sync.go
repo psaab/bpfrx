@@ -1682,8 +1682,9 @@ const heartbeatSlotsPerWorker = 2 * 16
 // the BINDING SLOT — the XDP shim reads `USERSPACE_HEARTBEAT.get(binding.slot)`
 // (userspace-xdp/src/lib.rs) and the helper writes `update_heartbeat_slot(fd,
 // slot, ..)` (userspace-dp/src/afxdp/bpf_map/ha.rs) — and the binding count is
-// `min(rx_queues) * interfaces`, which has never been a function of
-// `cfg.Workers`. With the default `Workers: 1` (capabilities.go) the loop
+// `Σ min(rx_queues, 16)` over the binding candidates since #7497 (it was
+// `min(rx_queues) * interfaces` before), which has never been a function of
+// `cfg.Workers` under either rule. With the default `Workers: 1` (capabilities.go) the loop
 // zeroed 32 slots, so ANY box whose binding count exceeds that — six dataplane
 // interfaces at 6 queues, or three at 16 — left its tail slots holding the
 // PREVIOUS load's timestamps.
