@@ -40,6 +40,8 @@ xpf_enter_destructive_cluster_cell "pnat-mint-observability-8341 $*" "$0" "$@"
 source "${SCRIPT_DIR}/cluster-env.sh"
 # shellcheck source=test/incus/deploy-lib.sh
 source "${SCRIPT_DIR}/deploy-lib.sh"
+# shellcheck source=test/incus/cos-apply-lib.sh
+source "${SCRIPT_DIR}/cos-apply-lib.sh"
 
 LAN_CLIENT="${LAN_CLIENT:-$CLUSTER_LAN_HOST}"
 TARGET="${TARGET:-$IPERF_TARGET4}"
@@ -104,7 +106,11 @@ commit
 exit
 quit
 EOF
-if ! grep -q "commit complete" /tmp/pnat8341-apply.out; then
+# #6440: gate on the CLI's success MARKER, never on the session's exit status.
+# The piped-stdin CLI is a REPL: it prints "error: ..." for a failed command and
+# still exits 0, so an exit-status gate cannot fire. cos_require_markers is the
+# single source of the marker set.
+if ! cos_require_markers "pool apply on $PRIMARY" /tmp/pnat8341-apply.out "$COS_MARKER_COMMIT"; then
 	echo "FATAL: pool config did not commit; not probing a fixture that was never applied" >&2
 	sed -n '1,40p' /tmp/pnat8341-apply.out >&2
 	exit 2

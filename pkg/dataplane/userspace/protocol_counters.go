@@ -21,6 +21,14 @@ type SourceNATPoolStatus struct {
 	AllocationsTotal               uint64 `json:"allocations_total,omitempty"`
 	ReusesTotal                    uint64 `json:"reuses_total,omitempty"`
 	ExhaustionTotal                uint64 `json:"exhaustion_total,omitempty"`
+	// #8447: persistent-NAT admissions that produced a translation, and those
+	// that returned a failure instead. Read as a PAIR for the same reason the
+	// lock counters below are: a decline count of zero cannot tell "nothing
+	// was declined" from "this path never ran", and only a non-zero admitted
+	// count separates them. Zero from an older helper that predates the
+	// counters. JSON tags MUST match the Rust serde names.
+	PersistentAdmittedTotal uint64 `json:"persistent_admitted_total,omitempty"`
+	PersistentDeclinedTotal uint64 `json:"persistent_declined_total,omitempty"`
 	// #4800: acquisitions of this pool's residual live-state mutex on the
 	// helper's production allocate/reserve/release/rollback/GC paths, and
 	// the subset that found it already held by another worker. The

@@ -1023,3 +1023,38 @@ code: the lookup returns `Some(ReverseFlow)`), and that the SYN-ACK
 installs the policy-path forward + reverse companion pair with
 source-NAT instead. The #4439/#4453/#4414 guard tests were removed with
 the function they guarded.
+
+## The fabric link can be lost at COMMIT, not just at runtime (#8444)
+
+Everything above assumes `cc.FabricInterface` is set. It is not configured
+directly — it is DERIVED, and until #8444 a typo could leave it empty with no
+commit-time signal at all.
+
+`deriveFabricInterface` (`pkg/config/compiler_derivations.go`) walks the `fabN`
+interfaces and selects the first whose `member-interfaces` list contains a name
+that both parses to an FPC slot (`InterfaceSlot`) and maps to THIS node
+(`SlotToNodeID`). Everything in this document is gated downstream of that:
+`pkg/daemon/daemon_run_bringup.go` skips every fabric bring-up when the derived
+interface is empty. So a member name that does not parse produces no fabric
+link, no cross-chassis redirect, no session sync and no config sync — while the
+config commits clean and `show configuration` reads back exactly what was typed.
+
+Two spellings reached that state, both measured through `configstore.CheckText`:
+
+- `fabster` — an outright typo (no `-<fpc>/` to parse);
+- `ge-0-0-0` — the KERNEL name form. This one matters more than it looks: it is
+  what networkd renames the NIC to and what several other surfaces in this tree
+  accept, so it is a plausible thing to type in a fabric stanza. It derives
+  nothing on EITHER node.
+
+`validateFabricMemberDefinedStrict` now rejects both at commit / commit-check,
+naming the fab interface and the offending member. It checks slot-parseability,
+NOT existence under `interfaces` — a fabric member is a bare NIC and correctly
+has no `interfaces` stanza of its own (neither `ge-0/0/0` nor `ge-7/0/0` has one
+in `docs/ha-cluster-userspace.conf`), so an existence check would have rejected
+the canonical production config on both nodes. The tolerant `Store.Load` /
+`Store.SyncApply` ingress downgrades the rejection to a warning (#1960
+no-brick). Full rationale, the measured derivation table, and the deliberate
+scope boundary (`ge-0/0/99` — parses, derives, then fails visibly at netlink) are
+in `docs/config-schema.md` § "chassis-cluster fabric `member-interfaces` name
+validation (#8444)".

@@ -1297,6 +1297,35 @@ set, and a merge here would fight that design.
 
 ### Duplicate containers beyond the original four (#6768)
 
+#### IKE and IPsec proposals (#8433)
+
+Two more rows on the same table, added by the same predicate rather than by a
+new gate. `security ike proposal <n>` and `security ipsec proposal <n>` are
+stored as `IKEProposals[name]` / `Proposals[name]`, so a second hierarchical
+block **replaces** the first. Measured at master before the rows were added:
+
+```
+ike proposal P1 { authentication-method pre-shared-keys; dh-group group14; }
+ike proposal P1 { authentication-algorithm sha-256; encryption-algorithm aes-256-cbc; }
+   ->  method=""  dh=0
+
+ipsec proposal Q1 { protocol esp; }
+ipsec proposal Q1 { authentication-algorithm hmac-sha-256-128; encryption-algorithm aes-256-cbc; }
+   ->  protocol=""
+```
+
+**These are worse than the average last-wins row on this table.** What survives is
+not a weaker tunnel — it is an **incomplete crypto proposal**: no
+authentication-method, no DH group, or no ESP selection, every part of which the
+operator authored. The flat `set` spelling merges the two blocks correctly, so
+the reachable route is a hierarchical config file or `load merge`.
+
+Adding them cost two rows and nothing else: no new diagnostic path, and the
+strict/lenient #1960 split comes from the table. `TestEveryDuplicateContainerRuleHasAFixture_6768`
+then **refused the change** until each row had a fixture — the registry guarding
+itself, which is why adding a row is cheap but not free.
+
+
 The #5180 gate started as four hand-written copies of one walk. #6768 turned
 the walk into a registry — `namedDupRules` / `singletonDupRules` in
 `pkg/config/dup_named_blocks.go` — so adding a container is one row and the
@@ -1610,6 +1639,73 @@ false-reject. Plus the top-level no-false-positive accepts (apply-groups
 deep-merge carrying both rules, cross-group coalescing, #3096 bracket-list
 expansion).
 
+### Empty forwarding-class identity (#8442) — and why it is NOT in the #6455 family gate
+
+`class-of-service forwarding-classes queue 5 ""` committed GREEN and then made
+the helper refuse the whole snapshot. Measured at master by dumping the emitted
+snapshot:
+
+```json
+{"forwarding_classes":[{"name":"","queue":5},{"name":"realfc","queue":6}],
+ "scheduler_maps":[{"name":"sm1","entries":[{"forwarding_class":""},{"forwarding_class":"realfc"}]}]}
+```
+
+**The fault is a Go/Rust SET DISAGREEMENT, and each side is reasonable alone.**
+The Go emitter KEEPS an empty class — in `forwarding_classes` *and* in the
+scheduler-map entries, because `CoSForwardingClassUndefined(cos, "")` is false
+(the entry exists), so the #6534/#2409 exclusion filter retains it. The Rust
+`build_cos_classifier_tables` SKIPS an empty name when building
+`class_to_queue`. So the scheduler-map entry's lookup misses and
+`build_cos_iface_config` fails the snapshot closed with
+`SchedulerMapUnknownClass { forwarding_class: "" }`.
+
+**The blast radius is the point.** The apply preflight keeps the previous live
+forwarding state, so *every* forwarding change in that commit silently does not
+apply — not just the CoS stanza, and not just the offending class — while the
+CLI reports a successful commit. The empty class even DENIES a real one: the
+FC↔queue bijection gate reports `forwarding-class "realfc" conflicts with ""`.
+
+**Why not the #6455 quoted-empty-name family gate.** That family
+(`rule ""`, `group ""`, `interface ""`, `ids-option ""`) is enforced by the
+pre-expansion duplicate-name scanners, which walk
+`namedInstances(FindChildren(keyword))` — NAMED BLOCKS. A forwarding-class name
+is not one. It is a positional VALUE token: arg 1 of
+`forwarding-classes queue <id> <name>`, or the identity arg of a
+`forwarding-class <name>` reference. The `namedDupRules` registry cannot see
+it, so extending it would have meant reshaping that scanner around a different
+grammar. Typed-leaf validators are where value slots are gated, so that is where
+this lives.
+
+`ValidateForwardingClassName` (`schema_validators_cos.go`) is attached to every
+slot that names a forwarding class:
+
+- the DEFINITION slot, via `keyValidatorPos: ValidateForwardingClassQueueArg` on
+  `forwarding-classes queue` (positional because arg 0 is the queue id and arg 1
+  the name — only the name slot carries this identity);
+- all eight `forwarding-class <class-name>` REFERENCE slots (classifiers dscp /
+  ieee-802.1 / inet-precedence, rewrite-rules, scheduler-maps).
+
+The two firewall-filter `then forwarding-class` slots already carry a stricter
+`treeValidator: validateForwardingClassRef`, which requires the reference to
+resolve — and after this gate no empty class can be defined, so an empty
+reference cannot resolve.
+
+**It cannot false-reject a shorter authoring.** The schema walker clamps the
+declared-arg span to `len(node.Keys)`, so arg 1 is only visited when the
+operator actually wrote a second token; a bare `queue 5` never reaches the name
+validator. Only a present-but-empty token is rejected.
+
+Strict on commit / commit-check; the tolerant load / peer-sync path is unchanged
+(#1960 no-brick) — which is also where the harm remains observable, and where
+`TestEmptyForwardingClassWouldReachTheWire_8442` pins that the emitter still
+produces the empty name so the gate has something to prevent.
+
+This also repaired two in-tree claims that had gone stale. The Rust skip
+described an empty class as *"the legitimate placeholder case"*, and the
+`SchedulerMapUnknownClass` test called that error a backstop that *"never fires
+on a fresh operator config"* — both false while this hole was open, both true
+again only because the Go gate now exists.
+
 ### Duplicate hierarchical `unit N` blocks (#8427)
 
 `compileInterfaces` writes `ifc.Units[unitNum] = unit` unconditionally, so two
@@ -1792,6 +1888,82 @@ too, the FC simply did not bind). A VALID queue still binds unchanged. Covered b
 `pkg/config/cos_fc_queue_5973_test.go` (strict reject of non-numeric/overflow
 naming the token, valid `queue 0`/`7`/`255` binds, lenient warn-and-drop leaving
 the FC inert), RED on revert of the parse-site gate.
+
+### chassis-cluster fabric `member-interfaces` name validation (#8444)
+
+A one-character typo in `interfaces fabN fabric-options member-interfaces`
+committed clean and left the node with **no fabric link at all**.
+
+`deriveFabricInterface` (`compiler_derivations.go`) auto-populates
+`cc.FabricInterface` only from a member for which `InterfaceSlot(member) >= 0`
+**and** `SlotToNodeID(slot) == cc.NodeID`. A name that does not parse to an FPC
+slot matches nothing, so `cc.FabricInterface` stays EMPTY — and every fabric
+bring-up in `pkg/daemon/daemon_run_bringup.go` is gated on it, so cross-chassis
+forwarding, session sync and config sync are all silently skipped. The operator
+sees a connectivity failure, never a config one.
+
+Measured through `configstore.CheckText` on the canonical two-fab shape from
+`docs/ha-cluster-userspace.conf`:
+
+| `fab0` member | `fab1` member | node | derived `cc.FabricInterface` |
+|---|---|---|---|
+| `ge-0/0/0` | `ge-7/0/0` | 0 | `fab0` |
+| `ge-0/0/0` | `ge-7/0/0` | 1 | `fab1` |
+| `fabster`  | `ge-7/0/0` | 0 | **`""` — outage** |
+| `ge-0-0-0` | `ge-7-0-0` | 0 | **`""` — outage** |
+| `ge-0-0-0` | `ge-7-0-0` | 1 | **`""` — outage** |
+| `ge-0/0/99` | `ge-7/0/99` | 0 | `fab0` (derives; see scope below) |
+
+Note the member LIST is populated in every row, including the outage rows — an
+assertion that `FabricMembers` is non-empty stays green straight through the
+failure. The gate and its tests bind the DERIVED interface instead.
+
+**Why this is not an existence check.** The obvious gate — require the member to
+be defined under `interfaces`, reusing `zoneReferenceableInterfaceBases` the way
+`validateZoneInterfaceDefinedStrict` does one stanza over — is **unsound here**,
+and reading the canonical config is what shows it: neither `ge-0/0/0` nor
+`ge-7/0/0` has an `interfaces` stanza in `docs/ha-cluster-userspace.conf`. Each
+appears exactly once, as the member entry itself. A fabric member is a bare
+physical NIC — unlike a zone member it carries no unit, address or family, so it
+has no reason to be declared separately. An existence gate would hard-reject the
+working production config on BOTH nodes (the #4191 over-rejection class, with a
+cluster outage attached).
+
+The property that actually separates the good name from the typo is the one the
+derivation itself consumes: **does the name parse to an FPC slot**
+(`validateFabricMemberDefinedStrict`, `compiler_validate_strict_fabric_member_8444.go`,
+dispatched from `runUniformGates` after the zone-interface-defined gate so the
+more specific zone diagnostic still wins the first-error slot).
+
+**This is also why the gate is node-agnostic.** One config text describes both
+nodes and is synced verbatim between them, so a check whose answer depended on
+which node evaluated it would accept on one node and reject on its peer,
+wedging the sync. `ge-0/0/0` and `ge-7/0/0` parse on both nodes; `fabster` and
+`ge-0-0-0` parse on neither. The gate therefore rejects the typo on either node,
+which is what an operator wants at the terminal they typed it on.
+
+Not to be confused with the `.unit`-reference validation (#5933) above: that
+gate validates the `.unit` SUFFIX of a `<if>.<unit>` reference via
+`ValidateLogicalUnit`, not whether an interface name is resolvable. Fabric
+members carry no unit suffix, so #5933 never looked at them.
+
+**Deliberately out of scope:** a member that parses but names a port that does
+not exist (`ge-0/0/99`). Measured, that one DOES derive — bring-up runs and
+fails at netlink with a visible error. It is a different, non-silent defect, and
+catching it would need exactly the existence check shown unsound above.
+
+`lenientFabricMemberDefined` downgrades the rejection to a `cfg.Warnings` entry
+on the tolerant load / peer-sync paths (#1960 no-brick — the fabric is already
+down in such a config, so refusing to boot would add an outage to an outage).
+That flag is set in `lenientCompileOpts()`, which is what `Store.Load` and
+`Store.SyncApply` reach through `compileTreeLenient`, so the no-brick behaviour
+is bound at the STORE INGRESS, not only at the validator. Covered by
+`pkg/configstore/fabric_member_8444_test.go` (strict reject of the typo and of
+the dash form on both nodes; positive control asserting a correct config still
+commits AND still derives `fab0`/`ge-0/0/0` and `fab1`/`ge-7/0/0`;
+anti-over-rejection rows for `xe-` and the absent port; lenient store-ingress
+warn). RED on revert of either the dispatch or the lenient opt.
+
 
 ### security address-book same-name `address` + `address-set` collision (#5676)
 
