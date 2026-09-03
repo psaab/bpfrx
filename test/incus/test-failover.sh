@@ -774,11 +774,24 @@ esac
 
 echo
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+# #8344: the known-gap tally is a SEPARATE line, and deliberately does not use
+# the words the ledger's HA-smoke adapter parses.
+#
+# harness-result-selftest.sh requires EXACTLY ONE echo matching
+# `passed, ...failed` per gate — two summaries and the adapter cannot know which
+# run a recorded row describes — and harness-result.sh greps
+# `[0-9]+ passed, [0-9]+ failed` out of the log. So the canonical summary below
+# is left byte-identical to what it was, and this line is worded so it cannot
+# match either.
+#
+# The counts are NOT folded in. A known-gap cell is neither a pass nor a
+# failure, and rolling it into "passed" would report 22 passed on a run where
+# two assertions are known-broken — a number indistinguishable from a healthy
+# one, which is the exact failure mode this harness exists to catch.
 if [[ $KNOWN -gt 0 ]]; then
-	echo "  Failover test: $PASS passed, $FAIL failed, $KNOWN known-gap (${KNOWN_ISSUES[*]})"
-else
-	echo "  Failover test: $PASS passed, $FAIL failed"
+	echo "  Known gaps (tracked, NOT counted as assertions): $KNOWN — ${KNOWN_ISSUES[*]}"
 fi
+echo "  Failover test: $PASS passed, $FAIL failed"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 if [[ $FAIL -gt 0 ]]; then
