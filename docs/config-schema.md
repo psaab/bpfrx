@@ -745,6 +745,65 @@ compiled to an EMPTY member list. The correct spelling is
 it the cell would have passed against a gate that never ran, on a config that
 never carried the value.
 
+### NAT rule `match` — closed-world plus an UNCONSTRAINED-set gate (#8430)
+
+An empty NAT match set is read by the dataplane as **unconstrained**:
+
+```rust
+nets_match_v4:  if !constrained { return true }
+source_constrained = !snap.source_addresses.is_empty()
+```
+
+So an empty match does not match nothing — it matches **everything**, and a
+one-letter typo widened a source-NAT rule from an authored prefix to every
+source. Two routes reach that empty set and they need different mechanisms.
+
+**Unknown leaves → `closedWorld: true` on the three `match` subtrees.** The match
+switches in `compiler_nat_{source,static,destination}.go` have no `default:`
+arm. Rather than a fourth hand-rolled allowlist, the schema closes the subtree —
+the #4313 mechanism already used for the DNAT `then`, `nat64`, `natv6v4` and the
+IKE/IPsec proposals. The schema's declared match children were checked against
+each compiler's switch arms **first** and agree exactly, so closing cannot
+false-reject a leaf a compiler reads.
+
+**Valueless and empty → `validateNATRuleMatchConstrainedStrict`.** A recognised
+leaf with no value (`source-address;`) and an empty `match { }` land in the same
+empty set and no allowlist can see either, because the leaf IS recognised. The
+gate reads the **compiled** match rather than the AST, which is what binds the
+harm: a cell asserting the typo is rejected proves the allowlist and stays green
+for a fix that leaves the valueless route open.
+
+**`matchAuthored`, and why the first version of that gate was wrong.** It
+rejected any rule with an empty match, and false-rejected the **scope-only**
+rule — `from zone trust; to zone untrust;` with no `match` at all — which is
+legitimate and common, because the rule-set's own from/to is the constraint.
+Nine existing cells across `compiler_nat_scope_3079`,
+`compiler_nat_mixed_scope_4881` and `dup_names_6455` caught it. The compiled
+`NATMatch` cannot tell "no match authored" from "match authored and empty", so
+`NATRule` carries an **unexported** `matchAuthored`, following `thenAuthored`'s
+precedent: compile-time diagnostic state, read only by the strict gate, kept off
+the dataplane contract and out of config-sync payloads. It is registered in the
+#6812 axis census as an admitted **blind spot**, not production-constant — it
+genuinely varies (false for every scope-only rule) and nothing sorts on it.
+
+Static NAT is not gated: its rule shape is a different struct with no comparable
+authored flag, and the closed-world flip on its `match` subtree already closes
+the typo route.
+
+### Closed-world does NOT descend into a multi-value leaf (#8430)
+
+`walkSchemaNode` stops the `childClosed` fold at a `multi: true` leaf with no
+schema children. **Its children are VALUES, not keywords.** The hierarchical
+mixed shape `source-address <v1> { <v2>; }` — the spelling #6693 fixed the
+compiler to accumulate — presents `<v2>` as an AST child, and inheriting
+closed-world there read it as an unknown keyword and rejected a valid config.
+
+Worth recording how that was found: **by a control, not by review.** Flipping the
+three `match` subtrees left the entire `pkg/config` and `pkg/configstore` suites
+GREEN through the false reject, because no existing cell authors the mixed shape
+under a closed subtree. Any future `closedWorld` flip over a subtree containing
+`multi` leaves should carry a mixed-shape control for the same reason.
+
 ### `security zones` interface-defined reference (ps-review-002 F6, #4515)
 
 `validateZoneInterfaceDefinedStrict` (`compiler_validate_strict_zones.go`, gated

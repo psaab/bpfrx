@@ -591,6 +591,20 @@ func walkSchemaNode(node *Node, parent *schemaNode, path []string, vc *walkConte
 	// a subtree that opts in (childSchema.closedWorld) closes every level
 	// below it, and an already-closed ancestor keeps it closed.
 	childClosed := closed || childSchema.closedWorld
+	// #8430: closed-world must NOT descend into a multi-value LEAF. A
+	// `multi: true` leaf with no schema children carries VALUES, and the
+	// hierarchical mixed shape `source-address <v1> { <v2>; }` (#6693, a
+	// spelling the compiler reads and accumulates) presents <v2> as an AST
+	// CHILD. Inheriting closed-world there reads that value as an unknown
+	// KEYWORD and rejects a valid configuration.
+	//
+	// Found by a control, not by review: flipping the three NAT `match`
+	// subtrees closed-world left the entire pkg/config and pkg/configstore
+	// suites GREEN while false-rejecting the mixed shape, because no existing
+	// cell authors it under a closed subtree.
+	if childSchema.multi && childSchema.children == nil {
+		childClosed = false
+	}
 
 	missingArgs := declaredKeyTokens - consumed
 	if missingArgs > 0 && !childSchema.compoundKey {

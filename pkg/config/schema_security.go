@@ -493,7 +493,7 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 					"routing-instance": {desc: "Egress routing instance name", args: 1, multi: true, placeholder: "<routing-instance>", children: nil},
 				}},
 				"rule": {desc: "Source NAT rule name", args: 1, placeholder: "<rule-name>", children: map[string]*schemaNode{
-					"match": {desc: "Match criteria", children: map[string]*schemaNode{
+					"match": {desc: "Match criteria", closedWorld: true, children: map[string]*schemaNode{
 						"source-address":           {desc: "Source address prefix to match", args: 1, multi: true, placeholder: "<prefix>", children: nil},
 						"source-address-name":      {desc: "Source address book entry to match", args: 1, multi: true, placeholder: "<address-name>", children: nil},
 						"destination-address":      {desc: "Destination address prefix to match", args: 1, multi: true, placeholder: "<prefix>", children: nil},
@@ -537,7 +537,7 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 					"routing-instance": {desc: "Ingress routing instance name", args: 1, multi: true, placeholder: "<routing-instance>", children: nil},
 				}},
 				"rule": {desc: "Destination NAT rule name", args: 1, placeholder: "<rule-name>", children: map[string]*schemaNode{
-					"match": {desc: "Match criteria", children: map[string]*schemaNode{
+					"match": {desc: "Match criteria", closedWorld: true, children: map[string]*schemaNode{
 						"source-address":           {desc: "Source address prefix to match", args: 1, multi: true, placeholder: "<prefix>", children: nil},
 						"source-address-name":      {desc: "Source address book entry to match", args: 1, multi: true, placeholder: "<address-name>", children: nil},
 						"destination-address":      {desc: "Destination address prefix to match", args: 1, multi: true, placeholder: "<prefix>", children: nil},
@@ -610,7 +610,7 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 					// values are address prefixes OR address-book names
 					// (consumed verbatim by nodeVal), so they stay untyped
 					// like the source/destination-NAT match leaves above.
-					"match": {desc: "Match criteria", children: map[string]*schemaNode{
+					"match": {desc: "Match criteria", closedWorld: true, children: map[string]*schemaNode{
 						"destination-address": {desc: "Destination address prefix to match", args: 1, multi: true, placeholder: "<prefix>", children: nil},
 						"source-address":      {desc: "Source address prefix to match", args: 1, multi: true, placeholder: "<prefix>", children: nil},
 						// #2491: external (pre-translation) destination port the
