@@ -804,6 +804,60 @@ GREEN through the false reject, because no existing cell authors the mixed shape
 under a closed subtree. Any future `closedWorld` flip over a subtree containing
 `multi` leaves should carry a mixed-shape control for the same reason.
 
+### A FUSED statement — the missing-semicolon gate (#8437)
+
+A missing semicolon fuses two hierarchical statements. The lexer has no
+terminator to stop at, so the next statement's keyword and its value are
+absorbed onto this node's `Keys`, and the compiler — reading only the tokens its
+own grammar declares — **silently drops the second statement**.
+
+```
+route-filter 10.0.0.0/8 orlonger protocol static;     # `;` after orlonger omitted
+```
+
+parses with zero errors, commits strict-clean, and compiles to
+`FromProtocols = []`. With the semicolon present it is `[static]`. **One
+character apart, both green.**
+
+It is worse than an ordinary parse bug because `FormatSet` renders the fused
+line back: `show configuration` **displays** a constraint the compiled policy
+does not carry, so the operator's verification step confirms the config they
+intended while the dataplane enforces a wider one. The reverse direction (an
+extra semicolon) errors, so the asymmetry is entirely in the dangerous
+direction.
+
+**The discriminator is that an absorbed token NAMES A SIBLING** of this leaf in
+the enclosing container — the same test #3673 uses for
+`security policies … match` (`emitSwallowed`), generalised to every container.
+Only tokens past the declared identity span are considered.
+
+Two sharper-looking checks were tried first and both were wrong, which is the
+part worth keeping:
+
+- **A plain arity check** ("a bare flag takes no trailing tokens") condemned
+  `then static-nat prefix 10.0.0.5/32`. Several leaves are **under-declared** in
+  `setSchema` — no `args`, no `children` — and keep their grammar in the
+  compiler. The walker's own comment states the contract that check violates:
+  *"tokens past it are keywords/ignored per the compiler-faithful contract"*.
+  `TestSchema2008_StaticNATMatch_AcceptsValid` caught it.
+- **The sibling test alone** then fired on
+  `system login user bob class super-user`, where `class` names both a sibling
+  of `user` under `login` **and** a child of `user`. That input was already
+  rejected — by #6706's packed-spelling gate, with a targeted message. So the
+  check **defers when the token also names a child of this node**. A second gate
+  firing first on the same input replaces a specific diagnostic with a generic
+  one, which is a regression even though the verdict is unchanged.
+
+**Scope, narrower than #8437 states.** `system { host-name p domain-name x; }`
+is already rejected by the existing typed-leaf trailing-token gate. The gap this
+closes is specifically **untyped** and **`multi`** leaves.
+
+**Testing it binds the WIDENING, not the parse.** A cell asserting the
+route-filter prefix and match-type survived stays GREEN on the defective input —
+both *are* intact. What is lost is the `protocol` dimension. The cell asserts
+the control's own `FromProtocols` is `[static]` first, so a failure
+distinguishes "fusion happened" from "this fixture never reached the compiler".
+
 ### `security zones` interface-defined reference (ps-review-002 F6, #4515)
 
 `validateZoneInterfaceDefinedStrict` (`compiler_validate_strict_zones.go`, gated
