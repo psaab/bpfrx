@@ -1005,3 +1005,113 @@ fn l3_ctx_none_on_unspecified_source_is_the_reachable_leg_7055() {
          exist to report"
     );
 }
+
+// ---- #7890: the split — identity refuses, enforcement does not ----
+
+/// The two questions, answered differently for the SAME packet.
+///
+/// This is the whole defect in one assertion: a header carrying `0.0.0.0` has no
+/// usable session identity (a session keyed on it aliases every other
+/// unspecified-source flow) but perfectly usable ADDRESSES. Six call sites read
+/// the first refusal as "nothing to enforce" for the second question.
+///
+/// **This cell cannot be satisfied by "drop on `None`".** That repair leaves the
+/// resolver refusing and changes the call sites to drop — so the enforcement
+/// accessor would still return `None` here and this reds. The two repairs are
+/// distinguishable at exactly this point, which is why the assertion is on the
+/// returned addresses rather than on a packet's fate.
+#[test]
+fn an_unspecified_source_refuses_identity_but_yields_enforcement_addresses_7890() {
+    let mut src = [0u8; 16];
+    let mut dst = [0u8; 16];
+    dst[..4].copy_from_slice(&[203, 0, 113, 9]); // valid destination
+    let meta = UserspaceDpMeta {
+        addr_family: libc::AF_INET as u8,
+        flow_src_addr: src,
+        flow_dst_addr: dst,
+        ..UserspaceDpMeta::default()
+    };
+
+    assert!(
+        l3_session_flow_from_meta(meta).is_none(),
+        "identity must still refuse — a session keyed on 0.0.0.0 aliases every \
+         other unspecified-source flow, and #7890 does not change that"
+    );
+
+    let flow = l3_enforcement_flow_from_meta(meta)
+        .expect("enforcement must get the addresses: a filter needs the packet's \
+                 addresses, not a session, and 0.0.0.0 is a well-defined value \
+                 to evaluate a `from`-clause against");
+    assert_eq!(
+        flow.src_ip,
+        "0.0.0.0".parse::<std::net::IpAddr>().unwrap(),
+        "the source must be carried through AS the header had it, not \
+         substituted — the operator's term decides, not this resolver"
+    );
+    assert_eq!(
+        flow.dst_ip,
+        "203.0.113.9".parse::<std::net::IpAddr>().unwrap()
+    );
+    assert_eq!(flow.forward_key.src_port, 0, "flowless: no L4 ports");
+    assert_eq!(flow.forward_key.dst_port, 0);
+
+    // Anti-vacuity: the same source, unchanged, must be the reason. A valid
+    // source yields a flow from BOTH, so the assertions above are about the
+    // unspecified value and not about a resolver that always succeeds.
+    src[..4].copy_from_slice(&[198, 51, 100, 7]);
+    let ok = UserspaceDpMeta {
+        flow_src_addr: src,
+        ..meta
+    };
+    assert!(l3_session_flow_from_meta(ok).is_some());
+    assert!(l3_enforcement_flow_from_meta(ok).is_some());
+}
+
+/// The witness still moves, and it now means "SEEN", not "refused".
+///
+/// Tests for the enforcement sites assert this counter advanced to prove the arm
+/// was ENTERED before asserting what enforcement did — without it, a fixture
+/// that misses a conjunct passes proving nothing, which is the failure the whole
+/// #7890 enumeration existed to prevent.
+#[test]
+fn the_unspecified_witness_advances_on_the_enforcement_path_too_7890() {
+    let mut dst = [0u8; 16];
+    dst[..4].copy_from_slice(&[203, 0, 113, 9]);
+    let meta = UserspaceDpMeta {
+        addr_family: libc::AF_INET as u8,
+        flow_src_addr: [0u8; 16],
+        flow_dst_addr: dst,
+        ..UserspaceDpMeta::default()
+    };
+    let (_, uns0) = l3_none_counts_7055();
+    assert!(l3_enforcement_flow_from_meta(meta).is_some());
+    let (_, uns1) = l3_none_counts_7055();
+    assert_eq!(
+        uns1 - uns0,
+        1,
+        "the witness must advance even though the lookup now SUCCEEDS — it \
+         records that an unspecified address was seen here, which is what a \
+         per-arm fixture asserts to prove it entered the arm"
+    );
+}
+
+/// The unparseable-family leg still refuses on BOTH paths.
+///
+/// An unknown family has no addresses to enforce against, so unlike the
+/// unspecified case there is nothing to hand a filter. Widening that too would
+/// have been the over-correction.
+#[test]
+fn an_unparseable_family_still_refuses_on_the_enforcement_path_7890() {
+    let meta = UserspaceDpMeta {
+        addr_family: libc::AF_UNIX as u8,
+        flow_src_addr: [1u8; 16],
+        flow_dst_addr: [2u8; 16],
+        ..UserspaceDpMeta::default()
+    };
+    assert!(l3_session_flow_from_meta(meta).is_none());
+    assert!(
+        l3_enforcement_flow_from_meta(meta).is_none(),
+        "an unparseable family has no addresses to evaluate a filter against; \
+         #7890 widens the UNSPECIFIED leg only"
+    );
+}
