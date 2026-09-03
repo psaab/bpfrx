@@ -115,6 +115,53 @@ fn resolve_synced_discriminator(
 /// #7188: `intent` is the OTHER identity axis, and it is NOT derived — it says
 /// what the key is FOR, because install and delete want opposite answers when
 /// the peer could not state the discriminator. See `SyncedKeyIntent`.
+/// #7699: verify a synced PPTP record carries the association its handle was
+/// derived from, and that the two nodes agree on the derivation.
+///
+/// Returns `Ok(Some(call))` for a verified PPTP record, `Ok(None)` for any
+/// non-PPTP session, and an `Err` carrying [`SYNCED_IMPORT_REFUSED_PREFIX`] —
+/// a WITHHOLD, not a transport failure — in two cases:
+///
+///   * **the pair was not carried.** An older peer sends the handle (or, more
+///     precisely, cannot send it either) without the call ids. Importing the
+///     session would leave this node holding a record whose handle it cannot
+///     reproduce from a packet, so every PPTP packet for that call resolves
+///     unassociated while a session for it sits in the table. Absent is better
+///     than present-and-unusable.
+///   * **the handle does not match the pair.** Both nodes derive the handle
+///     with the same pure function, so a mismatch means they disagree about the
+///     derivation — a version skew or a corrupted record. Importing it would
+///     install a session under an identity this node will never compute.
+///
+/// Deliberately NOT a repair: recomputing the handle locally and importing
+/// under it would make the two nodes' tables disagree silently, which is the
+/// failure this check exists to catch.
+pub(crate) fn verify_synced_pptp_association(
+    req: &SessionSyncRequest,
+    discriminator: TunnelDiscriminator,
+    src_ip: std::net::IpAddr,
+    dst_ip: std::net::IpAddr,
+) -> Result<Option<crate::session::pptp::PptpCall>, String> {
+    let TunnelDiscriminator::Pptp(handle) = discriminator else {
+        return Ok(None);
+    };
+    let Some(call) = crate::session::pptp::PptpCall::from_wire_call_ids(
+        req.pptp_call_ids,
+        src_ip,
+        dst_ip,
+    ) else {
+        return Err(format!(
+            "{SYNCED_IMPORT_REFUSED_PREFIX}pptp-call-ids-not-carried"
+        ));
+    };
+    if call.handle() != handle {
+        return Err(format!(
+            "{SYNCED_IMPORT_REFUSED_PREFIX}pptp-handle-mismatch"
+        ));
+    }
+    Ok(Some(call))
+}
+
 pub(crate) fn build_synced_session_key(
     req: &SessionSyncRequest,
     routing_domain: u32,
@@ -122,17 +169,24 @@ pub(crate) fn build_synced_session_key(
 ) -> Result<crate::session::SessionKey, String> {
     reject_unresolved_ipv6_ext_protocol(req)?;
     let discriminator = resolve_synced_discriminator(req, intent)?;
+    let src_ip = req
+        .src_ip
+        .parse()
+        .map_err(|e| format!("parse src_ip {}: {e}", req.src_ip))?;
+    let dst_ip = req
+        .dst_ip
+        .parse()
+        .map_err(|e| format!("parse dst_ip {}: {e}", req.dst_ip))?;
+    // #7699: a PPTP handle is DERIVED from the learned call-id pair, so a
+    // record carrying the handle without the pair is one the receiver can never
+    // match a packet against — it cannot build the association its workers
+    // resolve through. Withhold rather than downgrade, the #7188 discipline.
+    verify_synced_pptp_association(req, discriminator, src_ip, dst_ip)?;
     Ok(crate::session::SessionKey {
         addr_family: req.addr_family,
         protocol: req.protocol,
-        src_ip: req
-            .src_ip
-            .parse()
-            .map_err(|e| format!("parse src_ip {}: {e}", req.src_ip))?,
-        dst_ip: req
-            .dst_ip
-            .parse()
-            .map_err(|e| format!("parse dst_ip {}: {e}", req.dst_ip))?,
+        src_ip,
+        dst_ip,
         src_port: req.src_port,
         dst_port: req.dst_port,
         // #7188: NOT `Default::default()`. Default is `None` — the "no
