@@ -40,6 +40,9 @@ use std::sync::{Arc, Mutex};
 
 mod allocator;
 mod destination;
+// #8121: idle persistent-NAT lease export/import — the population session
+// sync provably cannot reach (a lease with zero flows has no session).
+mod idle_lease_sync_8121;
 // #6751 PR 2/3: the node-lifetime interface-mode translated-identity registry.
 mod iface_registry;
 mod source;
@@ -99,6 +102,9 @@ mod tests_static;
 #[cfg(test)]
 #[path = "tests_destination.rs"]
 mod tests_destination;
+#[cfg(test)]
+#[path = "tests_idle_lease_sync_8121.rs"]
+mod tests_idle_lease_sync_8121;
 #[cfg(test)]
 #[path = "tests_pool.rs"]
 mod tests_pool;
