@@ -216,9 +216,32 @@ impl NeighborManager {
 ///
 /// TEN tests across TWO modules spawn one. That population was enumerated by
 /// running every test in the binary alone and watching for the monitor's own
-/// `listening` line, not by reading call sites — which is also how it was
-/// established that none of them LEAKS one (every spawner stops it), so the
-/// contamination is concurrent overlap and nothing else.
+/// `listening` line, not by reading call sites.
+///
+/// #7810: that enumeration ALSO carried the claim "none of them LEAKS one
+/// (every spawner stops it), so the contamination is concurrent overlap and
+/// nothing else." **That is true only on the normal path.** A spawner whose
+/// teardown is a trailing `coordinator.stop()` skips it when the cell PANICS
+/// and leaks its monitor into these process-wide gates, which then red
+/// alongside it — measured on the first #7010 mutation matrix, where one cell's
+/// red carried two collateral #6637 failures that had nothing to do with the
+/// mutation.
+///
+/// So the contamination has TWO sources, not one, and they need different
+/// remedies: concurrent overlap is what this lock fixes; panic leakage is what
+/// `StoppedCoordinator` (whose `Drop` calls `stop()`) fixes. A census at
+/// `3961adbee` found 12 guard-taking cells, 11 panic-safe via
+/// `StoppedCoordinator::{new,wrap}` and one residual —
+/// `coordinator_bringup_does_not_leak_a_neigh_monitor_thread_6637` itself,
+/// which handles its own explicit panic branch but not a panic in setup or in
+/// `reconcile`. It is left as-is deliberately: it asserts process-wide thread
+/// COUNTS at specific points, so wrapping it would add a second `stop()` after
+/// the measurement it exists to take.
+///
+/// NOTHING here is a production leak. `stop_inner` signals AND JOINS the
+/// monitor (#5165), and bringup installs `monitor_stop` + `monitor_join`
+/// together only when the thread actually spawned. This is a test-hygiene
+/// property only.
 ///
 /// It lives in the production module beside the thing it guards, mirroring
 /// `icmp_ratelimit::global_bucket_test_lock`, and is `pub(crate)` rather than
