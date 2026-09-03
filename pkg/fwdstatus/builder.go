@@ -240,6 +240,7 @@ func Build(
 				fs.HelperPID = rec.PID
 				fs.HelperLastExit = rec.At
 				fs.HelperRestarts = rec.Restarts
+				fs.HelperLastRestartAttempt = rec.LastRestartAttempt
 				fs.HelperNextRestart = rec.NextRestart
 			}
 		}

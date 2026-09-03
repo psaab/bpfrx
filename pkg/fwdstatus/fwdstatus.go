@@ -120,6 +120,12 @@ type ForwardingStatus struct {
 	// helper that reached readiness.
 	HelperRestarts int
 
+	// HelperLastRestartAttempt is when a restart was last attempted in this
+	// crash episode; zero when none has been. Unlike HelperNextRestart this
+	// needs no RestartPending guard — it is a fact about what already
+	// happened, not a promise about what will (#7967).
+	HelperLastRestartAttempt time.Time
+
 	// HelperNextRestart is when the armed retry is due. Only meaningful when
 	// RestartPending — after an intentional stop the underlying record
 	// carries a time in the PAST with no timer behind it.
@@ -267,6 +273,14 @@ func writeHelperCrash(b *strings.Builder, fs *ForwardingStatus) {
 		writeRow(b, "Helper last PID", strconv.Itoa(fs.HelperPID))
 	}
 	writeRow(b, "Helper restart attempts", strconv.Itoa(fs.HelperRestarts))
+
+	// No RestartPending guard: a past attempt is a fact, not a promise. The
+	// deadline below needs the guard because after an intentional stop the
+	// record carries one with no timer behind it.
+	if !fs.HelperLastRestartAttempt.IsZero() {
+		writeRow(b, "Helper last restart attempt",
+			fs.HelperLastRestartAttempt.Format(time.RFC3339))
+	}
 
 	// Only meaningful when a retry is armed. After an intentional stop the
 	// record carries a deadline in the PAST with no timer behind it, so

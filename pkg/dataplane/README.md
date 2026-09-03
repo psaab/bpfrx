@@ -723,14 +723,28 @@ would blackhole every flow handed to it.
     computed from visible inputs cannot drift from the predicate it
     explains, which a string captured at decision time can.
 
-**#5838's acceptance bullet is NOT fully closed, and the surface says so.**
-The crash-loop *reason* is satisfied by derivation (above). The **last-restart
-timestamp is not, and cannot be** with this data model: `restartHelperAfterCrash`
-zeroes the whole record on a successful restart, so such a field would be wiped
-by the very event it records. That makes it a question about where crash history
-lives rather than a field addition — tracked in **#7967**, not folded silently
-into the rendering change. Do not mark the bullet done: every other named field
-renders a row, so the missing one is invisible from the output.
+**#5838's acceptance bullet is now closed (#7967).** The crash-loop *reason* is
+satisfied by derivation (above), and the **last-restart timestamp** is backed by
+`HelperCrashRecord.LastRestartAttempt`, set where the attempt is made in
+`restartHelperAfterCrash` and rendered as `Helper last restart attempt`.
+
+This paragraph previously said such a field "cannot be" added, because
+`restartHelperAfterCrash` zeroes the whole record on a successful restart and it
+would be "wiped by the very event it records". **That argument does not survive
+being applied consistently**: the wipe is total, so it clears `Restarts`,
+`NextRestart`, `ExitCode`, `Detail` and `LastExitWasCrash` too — five fields
+that were already shipped and rendered on the same surface. A rejection that
+would equally reject what you have already built is not a reason to withhold
+the sixth. The record is episode-scoped and the new field is episode-scoped
+with it, which is the contract, not a defect.
+
+What the bullet asked for and what an operator often wants are still different
+things. **History across episodes** — "has this helper crashed before?" — is
+not answerable by any field on a record that is wiped on recovery, and nothing
+retains it today: there is no crash or restart metric either, so journald is
+the only trace. That is a separate requirement, tracked as #8397, and it must
+not be conflated with the bullet — shipping it instead would leave the bullet
+unmet while looking done.
 
 ## Armed-state admission contract (#2114 A3)
 

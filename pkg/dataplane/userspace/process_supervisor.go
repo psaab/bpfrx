@@ -150,6 +150,27 @@ type HelperCrashRecord struct {
 	// RestartPending is true — after an intentional stop this is a time in the
 	// PAST with no timer behind it (#7250).
 	NextRestart time.Time
+
+	// LastRestartAttempt is when a restart was last ATTEMPTED — the moment
+	// `restartHelperAfterCrash` called into `ensureProcessLocked`, whatever the
+	// outcome. Zero when none has been attempted in this episode.
+	//
+	// #7967 / #5838: episode-scoped like every other field here, and cleared by
+	// the same successful-restart wipe. That was raised as an objection to the
+	// field existing at all — that it would be "wiped by the very event it
+	// records" — but the objection applies equally to `Restarts`, `NextRestart`,
+	// `ExitCode`, `Detail` and `LastExitWasCrash`, all of which are shipped and
+	// rendered. A rejection that would also reject five existing fields is not a
+	// reason to omit the sixth.
+	//
+	// What it buys is ergonomic rather than informational: the scheduling time
+	// was always DERIVABLE, since `helperRestartDelay` is a pure function of
+	// `Restarts` and both it and `NextRestart` are on the surface, so
+	// `NextRestart - helperRestartDelay(Restarts)` recovers it. A status surface
+	// that requires the reader to reimplement the backoff function in their head
+	// is one that gets misread. Stating the fact is not the same as making it
+	// recoverable.
+	LastRestartAttempt time.Time
 	// RestartPending reports whether a retry is actually armed and will fire.
 	//
 	// #7250: DERIVED in HelperCrashState() from the live generation rather than
@@ -343,6 +364,10 @@ func (m *Manager) restartHelperAfterCrash(gen uint64) {
 	if m.procGen != gen || m.proc != nil || !m.helperCrash.LastExitWasCrash {
 		return
 	}
+	// #7967: record the ATTEMPT, before its outcome is known. On failure the
+	// record survives and carries it; on success the whole record is cleared,
+	// which is the episode-scoped contract every field here shares.
+	m.helperCrash.LastRestartAttempt = time.Now()
 	if err := m.ensureProcessLocked(m.cfg); err != nil {
 		slog.Error("userspace dataplane helper restart failed; will retry",
 			"attempt", m.helperCrash.Restarts, "err", err)

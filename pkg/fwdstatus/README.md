@@ -41,8 +41,19 @@ Three things about it are easy to break:
   discipline as `BufferKnown` beside `BufferPercent`.
 - `Format` renders **nothing** when there is no episode. The record is wiped on
   a successful restart, so the block reports the current crash episode, never a
-  history. #5838's "last restart timestamp" is unbacked for that reason and is
-  tracked in #7967; every other field it names renders a row.
+  history.
+- #5838's "last restart timestamp" **is now backed** (#7967):
+  `HelperLastRestartAttempt`, rendered as `Helper last restart attempt`. It is
+  episode-scoped like every other field here and is cleared by the same wipe.
+  That was once given as the reason it could not exist — "wiped by the very
+  event it records" — but the same is true of `Restarts`, `NextRestart`,
+  `ExitCode`, `Detail` and `LastExitWasCrash`, every one of which is rendered.
+  A property that disqualifies six fields equally is not a reason to omit one.
+  It renders WITHOUT a `RestartPending` guard, unlike the next-restart
+  deadline: a past attempt is a fact, a future deadline is a promise.
+- What is still missing is **history across episodes** — "has this helper
+  crashed before?" — which no field on an episode-scoped record can answer and
+  which is a different requirement from the bullet. Tracked as #8397.
 - The headline is four named states over (`RestartPending` x `CrashLooping`),
   and `RestartPending` picks it — a stopped helper reads "stopped", never
   "CRASH LOOPING", because the loop predicate stays true after an intentional
