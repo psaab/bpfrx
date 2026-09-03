@@ -8266,3 +8266,80 @@ fn worker_commands_install_and_forget_pptp_associations_7699() {
     );
     assert_eq!(sessions.pptp().resolve(a, 0x1111), None);
 }
+
+/// #7699 stage 2 END-TO-END: control-channel BYTES through to an association a
+/// data packet resolves against.
+///
+/// Every other PPTP cell tests one hop. The parser cells build a segment and
+/// assert a parse; the table cells install a `PptpCall` and assert a resolve;
+/// the drain cell pushes a `WorkerCommand` and asserts it lands. **All of them
+/// stay green against a build where nothing calls the parser**, because each
+/// end works and nothing joins them — the same two-correct-halves-and-no-join
+/// shape that hid the missing `ProxyARPUnresolvedFn` behind a green suite
+/// (#7685) and the missing install arm behind green table cells (#8392).
+///
+/// So this one starts at the wire bytes and ends at `resolve`, with nothing
+/// hand-constructed in between: delete the `learn_from_control_segment` call
+/// from the publish path and this reds while every single-hop cell passes.
+#[test]
+fn a_control_segment_becomes_a_resolvable_association_7699() {
+    use crate::session::pptp_control::{
+        fixtures_7699::outgoing_call_reply, learn_from_control_segment,
+    };
+
+    // The PAC answers the PNS's Outgoing-Call-Request. Its own Call ID is
+    // 0xAAAA; it echoes the PNS's 0xBBBB.
+    let (pac, pns): (std::net::IpAddr, std::net::IpAddr) = (
+        "198.51.100.7".parse().unwrap(),
+        "203.0.113.9".parse().unwrap(),
+    );
+    let segment = outgoing_call_reply(0xAAAA, 0xBBBB, 1);
+
+    // 1. the control channel, off the data path
+    let call = learn_from_control_segment(pac, pns, &segment)
+        .expect("a connected Outgoing-Call-Reply must yield the pair");
+    let handle = call.handle();
+
+    // 2. published to every worker
+    let queues: Vec<_> = (0..2)
+        .map(|_| Arc::new(Mutex::new(VecDeque::new())))
+        .collect();
+    assert_eq!(
+        crate::afxdp::worker_queue::broadcast_pptp_install(&queues, call),
+        2,
+        "the association must reach every worker; the control channel and the \
+         GRE data channel are not co-located"
+    );
+
+    // 3. drained by a worker
+    let mut sessions = SessionTable::new();
+    let forwarding = test_forwarding_state();
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+    apply_worker_commands(
+        &queues[1],
+        &mut sessions,
+        -1,
+        -1,
+        -1,
+        &forwarding,
+        &BTreeMap::new(),
+        &dynamic_neighbors,
+        0,
+        &mut VecDeque::new(),
+    );
+
+    // 4. and a data packet in EITHER direction resolves to one handle.
+    //    A packet to the PAC carries the PAC's call id; to the PNS, the PNS's.
+    assert_eq!(
+        sessions.pptp().resolve(pac, 0xAAAA),
+        Some(handle),
+        "a data packet toward the PAC must resolve the call learned from the \
+         control channel"
+    );
+    assert_eq!(
+        sessions.pptp().resolve(pns, 0xBBBB),
+        Some(handle),
+        "and the reverse direction must resolve to the SAME handle — that is \
+         what makes the reverse companion match and the reply find its session"
+    );
+}
