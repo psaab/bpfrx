@@ -169,7 +169,16 @@ func runPreWalkGates(tree *ConfigTree, opts compileOpts) ([]string, error) {
 	// inherited ranges expanded; `inactive:` ranges already stripped) and
 	// MUTATES the clone in place. A config with no interface-range stanza is
 	// left byte-identical. See compiler_interface_range.go.
-	ifaceRangeWarnings := expandInterfaceRanges(tree)
+	// #8438: a config whose interface-range expansion exceeds the total budget
+	// is REJECTED at commit / commit-check and only WARNED about on the tolerant
+	// load / peer-sync path (#1960 no-brick). Either way expandInterfaceRanges
+	// has already declined to expand, so the tolerant path boots instead of
+	// stalling for minutes to hours on the replay — the harm here is the
+	// expansion itself, so skipping it IS the protection.
+	ifaceRangeWarnings, ifaceRangeErr := expandInterfaceRanges(tree)
+	if ifaceRangeErr != nil && !opts.lenientInterfaceRangeBudget {
+		return nil, ifaceRangeErr
+	}
 
 	// #2008 H9/H10 interface silent-drop gate. Runs on the group-expanded,
 	// inactive-pruned tree (apply-groups-inherited stanzas covered;

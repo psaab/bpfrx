@@ -2444,6 +2444,15 @@ type compileOpts struct {
 	// (#5829); this closes the residual #5829 deferred to #5933.
 	lenientInterfaceUnitRef bool
 
+	// lenientInterfaceRangeBudget (#8438) downgrades the total interface-range
+	// expansion budget from a hard compile error to a cfg.Warnings entry. The
+	// expansion is SKIPPED either way — the harm is the replay cost itself, so a
+	// tolerant path that expanded anyway would stall the peer and every boot for
+	// minutes to hours. Set ONLY on the tolerant load / peer-sync paths so a
+	// config an older binary already persisted still BOOTS (#1960 no-brick),
+	// with its interface-range members simply not materialized.
+	lenientInterfaceRangeBudget bool
+
 	// lenientFabricMemberDefined (#8444) downgrades the chassis-cluster fabric
 	// member-interface existence gate (a typo'd `interfaces fabN fabric-options
 	// member-interfaces` entry for THIS node's slot) from a hard compile error to
@@ -2669,6 +2678,7 @@ func lenientCompileOpts() compileOpts {
 		lenientNonNumericUnit:                  true,
 		lenientInterfaceUnitRef:                true,
 		lenientLoginClassDeny:                  true,
+		lenientInterfaceRangeBudget:            true,
 		lenientFabricMemberDefined:             true,
 	}
 }

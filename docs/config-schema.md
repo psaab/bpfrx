@@ -2010,6 +2010,73 @@ commits AND still derives `fab0`/`ge-0/0/0` and `fab1`/`ge-7/0/0`;
 anti-over-rejection rows for `xe-` and the absent port; lenient store-ingress
 warn). RED on revert of either the dispatch or the lenient opt.
 
+### `interface-range` total expansion budget (#8438)
+
+`interfaces interface-range` expansion was uncapped and superlinear: 32,000
+members took **142 s** at commit with zero diagnostic, on the strict path AND
+the tolerant peer-sync / boot path — a config that reached the store this way
+stalled the peer and every subsequent boot too.
+
+Each shared statement is replayed through `ConfigTree.SetPath` under each
+member, and `SetPath` locates the member by a linear scan of the `interfaces`
+root, which by then holds every member. A CPU profile of the expansion is 100%
+`SetPathQuotedGrouped`, 55% of it in `keysEqual`/`memeqbody`. So the cost is
+driven by the **product** of members and shared statements:
+
+| members | shared stmts | compile |
+|---|---|---|
+| 2,000 | 1 | 0.4 s |
+| 4,096 | 1 | 1.4 s |
+| 4,096 | 3 | 23.2 s |
+| 4,096 | 6 | **77.9 s** |
+| 2,000 | 20 | **268 s** |
+
+**Why this is not a member-count cap.** The obvious guard — limit the number of
+members, reusing the 4096 the sibling `member-range` cap already ships — admits
+every row in that table. 4,096 members with six shared statements (an mtu, a
+description, a unit with an address) is a 78-second commit that a member-count
+guard waves straight through, and 2,000 members with twenty is worse than the
+32,000-member headline. The budget therefore debits `members x shared-statements`
+(`interfaceRangeExpansionCost`, `compiler_interface_range.go`), which is the
+number of `SetPath` replays the expansion will drive.
+
+**The shipped per-range cap was never a budget.** `interfaceRangeMaxMembers`
+(4096) bounds ONE `member-range` statement. Eight 2,000-wide `member-range`
+statements in a single range expand to 16,000 interfaces in 18.9 s with **zero
+warnings** — so the `member` list was not the only spelling that escaped, and a
+fix applied to the member-list side alone would leave that shape live. One
+budget is debited by both spellings, checked once, before any replay.
+
+**Why 4096.** It is the number the per-range cap already ships, so the two
+guards state one limit rather than two, and it bounds the worst admitted case at
+~1.4 s. It is a safety valve, not a policy: the largest interface-range anywhere
+in this tree — fixtures included — is **23 members**, and no shipped `.conf`
+uses the construct at all. A 23-member range would need 178 shared statements to
+reach the limit.
+
+**What an operator sees.** At commit / commit-check, a hard rejection naming the
+total, the range count and the limit. On the tolerant load / peer-sync path
+(`lenientInterfaceRangeBudget`, set in `lenientCompileOpts()` and so reached by
+`Store.Load` and `Store.SyncApply` via `compileTreeLenient`), the same text as a
+warning and **no expansion** — the members do not materialize. Warn-and-expand
+was rejected as the tolerant disposition because the harm here IS the expansion:
+expanding anyway would leave the peer and every boot stalled for minutes to
+hours, which is the availability failure the guard exists to stop. Skipping is
+also what the shipped `member-range` cap already does with an over-limit range.
+
+**Not node-divergent.** A count-based gate could in principle reject on one
+cluster node and accept on its peer, wedging config sync. It cannot here:
+expansion cost is a property of the statement list, and the per-node mechanisms
+(apply-groups, `${node}` substitution) rewrite member NAMES without changing how
+many statements exist. Measured on both nodes — identical counts.
+
+The budget lives inside `expandInterfaceRanges`, which has four call sites (the
+prewalk, plus the unit-alias, QinQ and vlan-map clone passes that discard its
+warnings), so all four are protected by the skip; only the prewalk surfaces the
+rejection. Covered by `pkg/configstore/interface_range_budget_8438_test.go`,
+RED on revert of the budget check, of the shared-statement multiplier (which
+degrades it to the member-count cap), or of the lenient opt.
+
 
 ### security address-book same-name `address` + `address-set` collision (#5676)
 
@@ -9148,7 +9215,8 @@ reserved for whole-dataplane selection where a rewrite shim
   Each member gets the range's shared statements — flattened to
   `set`-command suffixes and replayed through `ConfigTree.SetPath`, so
   they re-nest with the exact schema-driven shape a normal per-interface
-  config would have — merged with the member's own per-interface config:
+  config would have (that replay is quadratic in the member count and is
+  bounded by the #8438 total expansion budget above) — merged with the member's own per-interface config:
   the member's own statements are re-applied LAST so they WIN on a scalar
   conflict (e.g. a member-local `mtu` overrides the range `mtu`) while
   additive statements (addresses) accumulate. `member-range <a> to <b>`

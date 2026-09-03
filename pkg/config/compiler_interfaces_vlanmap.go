@@ -129,7 +129,9 @@ func collectVLANMapFindingsForNode(tree *ConfigTree, nodeID int, out map[string]
 	}
 	// expandInterfaceRanges mutates the clone in place; its warnings are
 	// emitted on the real path (runPreWalkGates) and discarded here.
-	_ = expandInterfaceRanges(clone)
+	// #8438: the clone paths only need the budget SKIP (the expansion is capped
+	// inside); the rejection is surfaced once, by the prewalk caller.
+	_, _ = expandInterfaceRanges(clone)
 	for _, ifaces := range clone.FindChildren("interfaces") {
 		collectVLANMapFromInterfacesNode(ifaces, out)
 	}
