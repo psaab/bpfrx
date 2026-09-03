@@ -809,6 +809,43 @@ func (mon *Monitor) updateIPTargetDampenedState(rg *config.RedundancyGroup, targ
 // and from interface-monitor names so it never collides with them.
 const ipAggregateMonitorName = "ip-monitoring"
 
+// reservedMonitorNames are the exact monitor-key names that do NOT belong to
+// the interface-monitor reconciler.
+//
+// #8338: ONE list, consumed by both `isReservedMonitorName` and the guard test
+// that proves each survives a config commit. A third reserved debt added
+// without appearing here is what the guard is for — the predicate and the test
+// cannot disagree about the category, because they read the same slice.
+var reservedMonitorNames = []string{
+	ipAggregateMonitorName,
+	DataplaneArmMonitorIface,
+}
+
+// isReservedMonitorName reports whether a monitor key belongs to some owner
+// OTHER than the interface-monitor reconciler.
+//
+// #8338: the category, named once. Before this there was a single exemption for
+// the IP class and the surrounding comment described the interface reconciler as
+// owning "the rest" — a fail-OPEN default. `__dataplane-arm__` fell into "the
+// rest" and every config commit deleted it, so a node whose dataplane failed to
+// arm lost its election penalty on the next unrelated commit and could take the
+// RG while unable to forward.
+//
+// The default is now inverted: this reconciler owns only keys it can recognise
+// as interface monitors, so a future reserved class is safe unless someone
+// deliberately makes it interface-shaped.
+func isReservedMonitorName(iface string) bool {
+	if isIPMonitorName(iface) {
+		return true
+	}
+	for _, reserved := range reservedMonitorNames {
+		if iface == reserved {
+			return true
+		}
+	}
+	return false
+}
+
 // isIPMonitorName reports whether a monitor name in monitorWeights /
 // MonitorFails belongs to the IP-MONITORING path rather than an
 // interface-monitor. IP-monitor debts are installed by reconcileRGIPDebts under
