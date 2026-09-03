@@ -65,6 +65,23 @@
 // generator, and the raw-LOC measurement so the gate cannot silently
 // start counting test warehouses as production again.
 //
+// # The package is also the home for unrelated mechanical canaries
+//
+// The framing above — "its primary purpose is to give `go test ./...` a
+// home for the modularity gate" — describes how the package started, not
+// what it now holds. Guards that have nothing to do with the heatmap have
+// accumulated here because this is where a repo-WIDE structural check can
+// run inside the required aggregate without inventing a package for one
+// test: the `_Log.md` closure (#6874), conflict-marker residue, the
+// commit-check dataplane ban (#7297), the applied-marker registry (#7343),
+// the iperf3 port (#6897) and the duplicate `#[test]` scanner (#8393).
+//
+// What they share is shape, not subject: each answers a question about the
+// TREE that no single package's own tests can see, and each fails to a
+// value an author would otherwise mistake for healthy. A canary belongs
+// here when it is mechanical, repo-wide and cheap; it does not belong here
+// merely because it is a test with nowhere obvious to live.
+//
 // See audit_touched_test.go, audit_jobs_test.go, audit_canary_test.go,
 // docs/refactoring-audit.md, scripts/refactoring-audit.sh,
 // scripts/refactoring-audit-touched.sh,

@@ -8185,3 +8185,84 @@ fn synced_refresh_with_identical_nat_keeps_its_reservation_6979_f3() {
          its idempotent holder-OR early return and the F3 release must not run"
     );
 }
+
+/// #7699: the `WorkerCommand` arms actually reach the worker's association
+/// table.
+///
+/// The table's own cells (`session::pptp`) and the broadcast's cells
+/// (`afxdp::worker_queue`) both pass against a build where the drain arms are
+/// missing entirely — the table works, the queue delivers, and nothing connects
+/// them. That is the #6852 no-production-caller shape one layer in, so the
+/// wiring gets its own cell driving the real drain.
+///
+/// FAIL-ON-REVERT: delete either arm from `apply_worker_commands` and this reds
+/// while every other PPTP cell stays green.
+#[test]
+fn worker_commands_install_and_forget_pptp_associations_7699() {
+    use crate::session::pptp::PptpCall;
+
+    let (a, b): (std::net::IpAddr, std::net::IpAddr) = (
+        "198.51.100.7".parse().unwrap(),
+        "203.0.113.9".parse().unwrap(),
+    );
+    let call = PptpCall::new(a, 0x1111, b, 0x2222);
+    let handle = call.handle();
+
+    let mut sessions = SessionTable::new();
+    let commands = Arc::new(Mutex::new(VecDeque::new()));
+    let ha_state = BTreeMap::new();
+    let forwarding = test_forwarding_state();
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+
+    commands
+        .lock()
+        .expect("commands")
+        .push_back(WorkerCommand::InstallPptpCall(call));
+    apply_worker_commands(
+        &commands,
+        &mut sessions,
+        -1,
+        -1,
+        -1,
+        &forwarding,
+        &ha_state,
+        &dynamic_neighbors,
+        0,
+        &mut VecDeque::new(),
+    );
+    assert_eq!(
+        sessions.pptp().resolve(b, 0x2222),
+        Some(handle),
+        "the install command did not reach this worker's association table, so \
+         its PPTP data packets resolve as unassociated"
+    );
+    assert_eq!(
+        sessions.pptp().resolve(a, 0x1111),
+        Some(handle),
+        "the reverse direction must resolve to the same handle after the drain"
+    );
+
+    commands
+        .lock()
+        .expect("commands")
+        .push_back(WorkerCommand::ForgetPptpCall(handle));
+    apply_worker_commands(
+        &commands,
+        &mut sessions,
+        -1,
+        -1,
+        -1,
+        &forwarding,
+        &ha_state,
+        &dynamic_neighbors,
+        0,
+        &mut VecDeque::new(),
+    );
+    assert_eq!(
+        sessions.pptp().resolve(b, 0x2222),
+        None,
+        "the forget command did not reach the table; a stale association \
+         re-pairs a REUSED 16-bit call id onto a dead handle"
+    );
+    assert_eq!(sessions.pptp().resolve(a, 0x1111), None);
+}

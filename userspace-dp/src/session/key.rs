@@ -32,11 +32,32 @@ use super::*;
 /// never match — turning a shared reverse companion into no reverse companion,
 /// which is worse than the bug this function fixes. When that class lands, this
 /// match stops compiling and the decision has to be made here.
+#[cfg(test)]
+pub(crate) fn reverse_direction_discriminator_for_test(
+    d: TunnelDiscriminator,
+) -> TunnelDiscriminator {
+    reverse_direction_discriminator(d)
+}
+
 fn reverse_direction_discriminator(d: TunnelDiscriminator) -> TunnelDiscriminator {
     match d {
         TunnelDiscriminator::None => TunnelDiscriminator::None,
         TunnelDiscriminator::Unkeyed => TunnelDiscriminator::Unkeyed,
         TunnelDiscriminator::Keyed(key) => TunnelDiscriminator::Keyed(key),
+        // #7699: identity, and this arm is the one this match was built for.
+        //
+        // The doc above warns that copying the forward value is wrong for PPTP.
+        // It is — for the CALL ID off the packet, which differs per direction.
+        // `Pptp` does not carry that. It carries a handle derived from the
+        // LEARNED `(call-id A, call-id B)` pair, so both directions of one call
+        // already resolve to the same value before they reach here. The
+        // asymmetry is dissolved at parse time, where the association exists,
+        // rather than papered over here, where it does not.
+        //
+        // So the guard did its job precisely: it refused the obvious answer
+        // until the representation was changed to one for which the obvious
+        // answer is correct.
+        TunnelDiscriminator::Pptp(handle) => TunnelDiscriminator::Pptp(handle),
         TunnelDiscriminator::Unparseable => TunnelDiscriminator::Unparseable,
     }
 }

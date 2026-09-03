@@ -48,6 +48,7 @@ type SeededReverseTranslatedIndex = HashMap<SessionKey, NatIndexBucket, FxSeeded
 // translated_session_key, reverse_canonical_key, reverse_wire_key,
 // reply_matches_forward_session) live in session/key.rs. Re-exporting
 // at pub(crate) keeps the existing crate::session::* surface intact.
+pub(crate) mod pptp;
 mod discriminator;
 mod key;
 // #7188: `WireDiscriminator` is exported alongside the class enum because the
@@ -836,6 +837,21 @@ pub(crate) const SESSION_ID_NODE_BIT_SHIFT: u32 = 15;
 pub(crate) const SESSION_ID_MAX_WORKER: u64 = (1u64 << SESSION_ID_NODE_BIT_SHIFT) - 1;
 
 pub(crate) struct SessionTable {
+    /// #7699: the PPTP call associations THIS worker can resolve.
+    ///
+    /// Per-worker, and deliberately not shared behind a lock: `resolve` runs on
+    /// the data path for every PPTP GRE packet, and this tree keeps the packet
+    /// path lock-free (shared maps exist only for HA import). Workers are fed
+    /// by `WorkerCommand::InstallPptpCall` / `ForgetPptpCall`, so every worker
+    /// holds the same set and a call resolves on whichever worker RSS lands its
+    /// data packets on — which is generally NOT the one that saw its control
+    /// channel.
+    ///
+    /// It lives inside `SessionTable` because it is per-worker session-identity
+    /// state with exactly this lifetime, and because `SessionTable` is already
+    /// threaded `&mut` through the drain — a separate parameter would be the
+    /// same data with more plumbing.
+    pptp: crate::session::pptp::PptpAssociations,
     /// #964 Step 1: slab-allocated session storage. Indexed by u32
     /// handle. Replaces the prior `sessions: FxHashMap<Key, Entry>`.
     entries: slab::Slab<SessionRecord>,
@@ -1106,6 +1122,17 @@ pub(crate) struct SessionTable {
 }
 
 impl SessionTable {
+    /// #7699: the PPTP call associations this worker can resolve.
+    pub(crate) fn pptp(&self) -> &crate::session::pptp::PptpAssociations {
+        &self.pptp
+    }
+
+    /// Mutable access, for the `WorkerCommand` drain that installs and forgets
+    /// associations and for the unassociated counter.
+    pub(crate) fn pptp_mut(&mut self) -> &mut crate::session::pptp::PptpAssociations {
+        &mut self.pptp
+    }
+
     pub fn new() -> Self {
         // #2364: the per-boot, per-process secret seed for the
         // attacker-keyed session indices. Drawn once (process-global
@@ -1116,6 +1143,7 @@ impl SessionTable {
         let seed = crate::hot_hash_seed::hot_path_hash_seed() as usize;
         let state = FxSeededState::with_seed(seed);
         Self {
+            pptp: crate::session::pptp::PptpAssociations::default(),
             // Start with an empty slab and let it grow on demand.
             // `Slab::with_capacity(DEFAULT_MAX_SESSIONS)` would eagerly
             // allocate a 131072-slot backing Vec per worker (Copilot

@@ -437,6 +437,18 @@ pub(in crate::afxdp) fn gre_keyed_session_flow(
     match discriminator {
         TunnelDiscriminator::Unparseable | TunnelDiscriminator::None => return None,
         TunnelDiscriminator::Unkeyed | TunnelDiscriminator::Keyed(_) => {}
+        // #7699: cannot arrive from `gre_transit_discriminator`, which returns
+        // `Unparseable` for any GRE version != 0 (`GRE_VERSION_MASK`, before
+        // the Key read) and PPTP is version 1. A version-1 packet therefore
+        // takes the `Unparseable` arm above and produces no session — which is
+        // the "forward unassociated" behaviour stage 1 defines, not a drop.
+        //
+        // Deliberately `return None` rather than `unreachable!()`: this is the
+        // AF_XDP hot path and a panic here kills the worker, so an impossible
+        // input must degrade, not abort. When the PPTP data path lands it will
+        // construct its flow from the association table, not from this
+        // version-0 extractor.
+        TunnelDiscriminator::Pptp(_) => return None,
     }
     let mut flow = super::frame::parse_session_flow_from_meta(meta)?;
     // GRE has no ports and never gains fake ones (#7188 decision 5): identity

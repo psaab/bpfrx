@@ -95,6 +95,13 @@ func (m *Manager) hasBusyBindingsWedgeLocked(repaired bool) bool {
 // rebind is repeating an action that has already failed twice for a fault it
 // evidently cannot repair, and continuing buys nothing while tearing down every
 // healthy binding on each attempt.
+//
+// THAT DERIVATION IS NOT ENFORCED BY ANY TEST. The cells read this constant on
+// both sides of their assertions — deliberately, so a legitimate retune does
+// not red them — which means changing 3 to 30 keeps the suite green and leaves
+// the reasoning above describing a value the code no longer uses. Anyone
+// changing it is overriding an argument, not adjusting a knob: re-derive it
+// from what a rebind can repair, and rewrite this comment to match.
 const maxConsecutiveAutoRebinds = 3
 
 func (m *Manager) shouldAutoRebindBusyBindingsLocked(now time.Time, repaired bool) bool {
