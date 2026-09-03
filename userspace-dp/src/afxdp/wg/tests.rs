@@ -40,7 +40,7 @@ pub(super) fn keypair() -> ([u8; 32], [u8; 32]) {
 /// The handshake is driven entirely on the slow path of both
 /// sides — exactly the pattern a real worker would use to install
 /// sessions for the hot path.
-pub(super) fn established_pair(
+pub(crate) fn established_pair(
     init_allowed_for_resp: Vec<ipnet::IpNet>,
     resp_allowed_for_init: Vec<ipnet::IpNet>,
 ) -> (WgEngine, WgEngine, [u8; 32], [u8; 32]) {

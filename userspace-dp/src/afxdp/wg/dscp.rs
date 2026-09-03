@@ -8,12 +8,20 @@
 //! Conversion is `dscp << 2`. This helper CLEARS the ECN bits and is
 //! used only where the source is a 6-bit DSCP value (no ECN context).
 //!
-//! NOTE (#2303): the production WG/GRE encap path does NOT use this
-//! helper for outer-header DSCP/ECN. It copies the FULL inner TOS byte
-//! (DSCP + ECN) via `crate::afxdp::gre::inner_tos_byte`, so the inner
-//! ECN is COPIED to the outer per RFC 6040 normal-mode ingress. This
-//! helper remains for the DSCP-only case (a config-set DSCP value with
-//! no inner-packet ECN to carry).
+//! NOTE (#2303, #7758): the production WG/GRE encap paths do NOT use
+//! this helper for outer-header DSCP/ECN. They copy the FULL inner TOS
+//! byte (DSCP + ECN) via `crate::afxdp::gre::inner_tos_byte`, so the
+//! inner ECN is COPIED to the outer per RFC 6040 normal-mode ingress.
+//! This helper remains for the DSCP-only case (a config-set DSCP value
+//! with no inner-packet ECN to carry).
+//!
+//! "Paths" is plural and load-bearing. WireGuard has TWO encap sites and
+//! #2303 wired only one: the TRANSIT path (`frame/wg.rs`). The
+//! HOST-ORIGINATED path (`wg_control::encap_and_send`, inner read from
+//! the wgN TUN) sent an unmarked outer until #7758, so one inner marking
+//! produced two different outer DSCPs depending on the path taken. Both
+//! now read the same `inner_tos_byte`, which is what keeps them from
+//! drifting on what "the inner DS byte" means.
 //!
 //! NOTE (#2315/#2317): the complementary DECAP-side RFC 6040 §4.2 ECN
 //! *combine* (outer ECN → inner ECN — the half that reflects a CE mark

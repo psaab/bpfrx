@@ -122,7 +122,7 @@ pub(crate) mod timers;
 
 #[cfg(test)]
 #[path = "tests.rs"]
-mod tests;
+pub(crate) mod tests;
 
 // #6422: lock poison-recovery regressions. A sibling of `tests` (not a
 // child of any one production file) because the sites it pins are spread

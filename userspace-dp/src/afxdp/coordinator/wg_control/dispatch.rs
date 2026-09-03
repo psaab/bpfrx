@@ -87,7 +87,9 @@ pub(super) fn dispatch_inbound(
                     // Challenge the real source; DROP the initiation. Not
                     // authenticated for endpoint-learning (a cookie reply is
                     // not proof the source holds the keys).
-                    if let Err(e) = wg_send_to(socket, socket_is_v6, &response_buf[..len], from) {
+                    if let Err(e) =
+                        wg_send_to(socket, socket_is_v6, &response_buf[..len], from, None)
+                    {
                         WgCounters::bump(&engine.counters().hs_send_errors);
                         record_local_tunnel_exception(
                             recent_exceptions,
@@ -110,7 +112,7 @@ pub(super) fn dispatch_inbound(
                     // #1865: the response send error was silently
                     // discarded (`let _ =`) — the responder mirror of
                     // the #1736 initiator-EINVAL class. Count + record.
-                    match wg_send_to(socket, socket_is_v6, &response_buf[..len], from) {
+                    match wg_send_to(socket, socket_is_v6, &response_buf[..len], from, None) {
                         Ok(_) => {
                             // #1888 S5: msg2 on the wire is an
                             // authenticated SEND.
@@ -317,9 +319,41 @@ pub(super) fn encap_and_send(
         );
         return;
     }
+    // #7758: RFC 6040 §4.1 ingress + uniform DSCP (RFC 2983 §3) -- copy the
+    // inner DS byte onto the outer header, exactly as the TRANSIT encap path
+    // does (`frame/wg.rs`, #2303) and GRE does (`gre.rs`, #2303).
+    //
+    // This path is the HOST-ORIGINATED one (inner read from the wgN TUN); the
+    // transit path has copied since #2303. Until now the two disagreed, so the
+    // same inner marking produced a different outer DSCP depending on whether
+    // the packet was transit or host-originated -- an internal routing detail
+    // no operator can see, visible to every downstream classifier.
+    //
+    // Reuses `gre::inner_tos_byte`, the same helper both other paths call, so
+    // the three cannot drift in what "the inner DS byte" means. The family is
+    // read from the IP version nibble, matching the decap arm above; an
+    // unrecognisable inner yields None and sends unmarked rather than guessing
+    // a family for a malformed packet.
+    let outer_tos = match inner_ip.first().map(|b| b >> 4) {
+        Some(4) => Some(crate::afxdp::gre::inner_tos_byte(
+            inner_ip,
+            libc::AF_INET as u8,
+        )),
+        Some(6) => Some(crate::afxdp::gre::inner_tos_byte(
+            inner_ip,
+            libc::AF_INET6 as u8,
+        )),
+        _ => None,
+    };
     match engine.try_encap(peer_pubkey, inner_ip, out) {
         Ok(outcome) => {
-            if let Err(e) = wg_send_to(socket, socket_is_v6, &out[..outcome.len], endpoint) {
+            if let Err(e) = wg_send_to(
+                socket,
+                socket_is_v6,
+                &out[..outcome.len],
+                endpoint,
+                outer_tos,
+            ) {
                 WgCounters::bump(&engine.counters().transport_send_errors);
                 record_local_tunnel_exception(
                     recent_exceptions,

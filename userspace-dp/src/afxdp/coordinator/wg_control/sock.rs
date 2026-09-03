@@ -186,6 +186,7 @@ pub(super) fn wg_send_to(
     socket_is_v6: bool,
     buf: &[u8],
     target: SocketAddr,
+    outer_tos: Option<u8>,
 ) -> io::Result<usize> {
     let wire_target = match target {
         SocketAddr::V4(v4) if socket_is_v6 => SocketAddr::new(
@@ -194,7 +195,140 @@ pub(super) fn wg_send_to(
         ),
         other => other,
     };
-    socket.send_to(buf, wire_target)
+    // #7758: `None` is the pre-existing path, byte-for-byte. Every send that
+    // carries no inner IP packet -- handshake initiation, handshake response,
+    // cookie reply, keepalive -- passes it, because there is no inner DS byte
+    // to propagate and RFC 6040 §4.1 has nothing to say about them. The
+    // parameter is explicit rather than defaulted so a NEW send site has to
+    // decide which it is instead of silently inheriting either answer.
+    let Some(tos) = outer_tos else {
+        return socket.send_to(buf, wire_target);
+    };
+    send_to_with_tos(socket, buf, wire_target, tos)
+}
+
+/// #7758: `sendmsg` one datagram with the outer DS byte set per-datagram via
+/// `IP_TOS` / `IPV6_TCLASS` ancillary data.
+///
+/// Per-datagram ancillary data rather than `setsockopt`: the value is the
+/// INNER packet's DS byte and therefore varies packet to packet, so a socket
+/// option would both be wrong and race between the control thread's sends.
+///
+/// The cmsg level follows the WIRE family of the destination, not the socket
+/// family. A v4-mapped destination on the dual-stack AF_INET6 socket emits an
+/// IPv4 datagram and takes `IPPROTO_IP` / `IP_TOS` -- the same split the
+/// RECEIVE side already documents, where `IP_RECVTOS` "governs both native v4
+/// and the v4-mapped datagrams the dual-stack v6 socket delivers". The
+/// loopback round-trip tests assert this rather than trusting it.
+///
+/// An error is returned rather than retried without the cmsg. The caller
+/// already counts `transport_send_errors` and records a tunnel exception
+/// carrying the errno, so a rejecting kernel is diagnosable as
+/// `wg_socket_send:EINVAL`; a silent fall back to an unmarked send would be a
+/// safety net that no test can reach, which is worse than a loud failure on a
+/// path whose sockopts have been stable for two decades and whose kernel floor
+/// is 6.18.
+fn send_to_with_tos(
+    socket: &UdpSocket,
+    buf: &[u8],
+    wire_target: SocketAddr,
+    tos: u8,
+) -> io::Result<usize> {
+    let (storage, addr_len) = socketaddr_to_storage(wire_target);
+    // Choose the option family from the datagram that will actually go out.
+    let (level, ctype) = match wire_target {
+        SocketAddr::V4(_) => (libc::IPPROTO_IP, libc::IP_TOS),
+        SocketAddr::V6(v6) if v6.ip().to_ipv4_mapped().is_some() => {
+            (libc::IPPROTO_IP, libc::IP_TOS)
+        }
+        SocketAddr::V6(_) => (libc::IPPROTO_IPV6, libc::IPV6_TCLASS),
+    };
+    // Linux's `ip_cmsg_send` / `ip6_datagram_send_ctl` both read this payload
+    // as a C `int`; the DS byte is the low-order octet.
+    let tos_val = tos as libc::c_int;
+    let mut cbuf = CmsgBuf([0u8; 256]);
+    let mut iov = libc::iovec {
+        iov_base: buf.as_ptr() as *mut libc::c_void,
+        iov_len: buf.len(),
+    };
+    // SAFETY: `msg` is zeroed then fully populated below. `msg_name` points at
+    // `storage`, which outlives the call and is described by `addr_len`.
+    // `msg_control` points at `cbuf`, which is `cmsghdr`-aligned (#2334) and
+    // large enough for one `int` cmsg -- CMSG_SPACE(4) is 24 bytes against a
+    // 256-byte buffer. The single CMSG_DATA write below is bounded by that
+    // space, and `msg_controllen` is then trimmed to exactly what was written.
+    let n = unsafe {
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_name = &storage as *const _ as *mut libc::c_void;
+        msg.msg_namelen = addr_len;
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cbuf.0.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32) as _;
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        if cmsg.is_null() {
+            return Err(io::Error::other("wg send: no room for TOS cmsg"));
+        }
+        (*cmsg).cmsg_level = level;
+        (*cmsg).cmsg_type = ctype;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) as _;
+        std::ptr::copy_nonoverlapping(
+            &tos_val as *const libc::c_int as *const u8,
+            libc::CMSG_DATA(cmsg),
+            std::mem::size_of::<libc::c_int>(),
+        );
+        libc::sendmsg(socket.as_raw_fd(), &msg, 0)
+    };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(n as usize)
+}
+
+/// #7758: render a `SocketAddr` into the `sockaddr_storage` + length pair
+/// `sendmsg` needs for `msg_name`. The v4/v6 mapping decision was already made
+/// by the caller; this only serialises it.
+fn socketaddr_to_storage(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    // SAFETY: `sockaddr_storage` is a plain byte aggregate with no invalid bit
+    // patterns; zeroing it is the documented way to build one, and only the
+    // family-appropriate prefix is written below.
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    match addr {
+        SocketAddr::V4(v4) => {
+            // SAFETY: `storage` is at least as large and as aligned as
+            // `sockaddr_in` (that is the type's purpose).
+            unsafe {
+                let sin = &raw mut storage as *mut libc::sockaddr_in;
+                (*sin).sin_family = libc::AF_INET as libc::sa_family_t;
+                (*sin).sin_port = v4.port().to_be();
+                // `octets()` is already network order and `s_addr` is a
+                // network-order u32, so this is a NATIVE-endian reinterpret of
+                // bytes that are already correct -- not a byte swap. Same rule
+                // as the BPF `__be32` fields (see CLAUDE.md).
+                (*sin).sin_addr.s_addr = u32::from_ne_bytes(v4.ip().octets());
+            }
+            (
+                storage,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        }
+        SocketAddr::V6(v6) => {
+            // SAFETY: as above, for `sockaddr_in6`.
+            unsafe {
+                let sin6 = &raw mut storage as *mut libc::sockaddr_in6;
+                (*sin6).sin6_family = libc::AF_INET6 as libc::sa_family_t;
+                (*sin6).sin6_port = v6.port().to_be();
+                (*sin6).sin6_addr.s6_addr = v6.ip().octets();
+                (*sin6).sin6_flowinfo = v6.flowinfo();
+                // Scope id is load-bearing for link-local peers.
+                (*sin6).sin6_scope_id = v6.scope_id();
+            }
+            (
+                storage,
+                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+            )
+        }
+    }
 }
 
 /// #2317: enable receiving the outer IP TOS / Traffic Class as ancillary

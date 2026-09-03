@@ -242,7 +242,13 @@ pub(super) fn send_keepalive(
     use crate::afxdp::wg::timers::KeepaliveKind;
     match engine.create_keepalive(peer_pubkey, encap_buf) {
         Ok(outcome) => {
-            match wg_send_to(socket, socket_is_v6, &encap_buf[..outcome.len], endpoint) {
+            match wg_send_to(
+                socket,
+                socket_is_v6,
+                &encap_buf[..outcome.len],
+                endpoint,
+                None,
+            ) {
                 Ok(_) => {
                     let counters = engine.counters();
                     match kind {
@@ -310,7 +316,7 @@ pub(super) fn drive_initiation(
     // completions flat is the #1736 EINVAL fingerprint.
     if let Ok(_local_index) = engine.create_initiation(peer_pubkey, out) {
         let len = crate::afxdp::wg::WG_MSG_INIT_LEN;
-        match wg_send_to(socket, socket_is_v6, &out[..len], endpoint) {
+        match wg_send_to(socket, socket_is_v6, &out[..len], endpoint, None) {
             Ok(_) => {
                 // #1888 S5: a handshake initiation on the wire is an
                 // authenticated SEND — clears the T6 arm, paces T8.

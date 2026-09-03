@@ -48,7 +48,7 @@ fn wg_send_to_maps_v4_target_on_v6_socket() {
     let (tx, tx_is_v6) = bind_wg_socket(0).expect("bind tx");
     // The plain V4 loopback target — the failing live shape.
     let target: SocketAddr = format!("127.0.0.1:{rx_port}").parse().unwrap();
-    wg_send_to(&tx, tx_is_v6, b"wg-test", target).expect("mapped v4 send must succeed");
+    wg_send_to(&tx, tx_is_v6, b"wg-test", target, None).expect("mapped v4 send must succeed");
     rx.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     let mut buf = [0u8; 16];
     let (n, _) = rx.recv_from(&mut buf).expect("datagram must arrive");
@@ -67,7 +67,7 @@ fn wg_send_to_native_v4_socket_roundtrip() {
     let rx_port = rx.local_addr().unwrap().port();
     let tx = UdpSocket::bind("127.0.0.1:0").expect("bind v4 tx");
     let target: SocketAddr = format!("127.0.0.1:{rx_port}").parse().unwrap();
-    wg_send_to(&tx, false, b"wg-v4", target).expect("native v4 send");
+    wg_send_to(&tx, false, b"wg-v4", target, None).expect("native v4 send");
     rx.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     let mut buf = [0u8; 16];
     let (n, _) = rx.recv_from(&mut buf).expect("datagram must arrive");
@@ -826,5 +826,191 @@ fn wg_apply_combine_drops_illegal_combo_and_counts() {
     assert!(
         WG_DECAP_ECN_ILLEGAL_DROPS.load(Ordering::Relaxed) >= wg_before + 1,
         "the WG global illegal-drop counter must advance on the WG path"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #7758: RFC 6040 §4.1 ingress on the HOST-ORIGINATED encap path.
+//
+// WireGuard has TWO encap paths. The transit one (`frame/wg.rs`) has copied the
+// inner DS byte onto the outer header since #2303, exactly as GRE does. The
+// host-originated one (`encap_and_send`, inner read from the wgN TUN) did not,
+// so the SAME inner marking produced a DIFFERENT outer DSCP depending on which
+// path a packet took — an internal routing detail no operator can see, visible
+// to every downstream classifier.
+//
+// These cells assert on the DS byte AS RECEIVED ON THE WIRE rather than on the
+// helper's return value. The helper was never the missing part; the wiring was,
+// and a cell that called `inner_tos_byte` directly would have stayed green
+// through the entire defect.
+//
+// Reading the outer DS back also verifies something this code cannot assume:
+// which cmsg family a v4-mapped destination on the dual-stack AF_INET6 socket
+// takes. The send path picks `IP_TOS` by the destination's WIRE family; if that
+// choice is wrong the kernel silently sends unmarked and these cells red.
+// ---------------------------------------------------------------------------
+
+/// Read the full DS byte the kernel reports for the next datagram. Deliberately
+/// a SECOND cmsg parser rather than production's `parse_outer_ecn_from_cmsg`:
+/// that one masks to the 2 ECN bits, and DSCP is six of the eight bits under
+/// test here. An independent reader also cannot inherit a bug from the parser
+/// it is checking.
+fn recv_outer_ds_byte(sock: &UdpSocket, payload: &mut [u8]) -> Option<u8> {
+    let mut cbuf = CmsgBuf([0u8; 256]);
+    let mut iov = libc::iovec {
+        iov_base: payload.as_mut_ptr() as *mut libc::c_void,
+        iov_len: payload.len(),
+    };
+    // SAFETY: msghdr fully populated; iov/control buffers outlive the call.
+    unsafe {
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cbuf.0.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = cbuf.0.len() as _;
+        let n = libc::recvmsg(sock.as_raw_fd(), &mut msg, 0);
+        if n < 0 {
+            return None;
+        }
+        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+        while !cmsg.is_null() {
+            let level = (*cmsg).cmsg_level;
+            let ctype = (*cmsg).cmsg_type;
+            if (level == libc::IPPROTO_IP && ctype == libc::IP_TOS)
+                || (level == libc::IPPROTO_IPV6 && ctype == libc::IPV6_TCLASS)
+            {
+                return Some(*libc::CMSG_DATA(cmsg));
+            }
+            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+        }
+    }
+    None
+}
+
+/// An IPv4 packet carrying an explicit DS byte, addressed so the peer's
+/// AllowedIPs cover it.
+fn inner_v4_with_ds(ds: u8) -> Vec<u8> {
+    let mut p = vec![0u8; 40];
+    p[0] = 0x45; // v4, IHL 5
+    p[1] = ds;
+    p[2..4].copy_from_slice(&40u16.to_be_bytes());
+    p[8] = 64; // TTL
+    p[9] = 17; // UDP
+    p[12..16].copy_from_slice(&Ipv4Addr::new(10, 0, 0, 5).octets());
+    p[16..20].copy_from_slice(&Ipv4Addr::new(10, 0, 1, 5).octets());
+    p
+}
+
+fn rx_socket_with_tos() -> Option<(UdpSocket, u16)> {
+    let (rx, rx_is_v6) = bind_wg_socket(0).ok()?;
+    set_recv_tos_options(rx.as_raw_fd(), rx_is_v6);
+    rx.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    let port = rx.local_addr().ok()?.port();
+    Some((rx, port))
+}
+
+/// The copy, end to end through `encap_and_send`, asserted on the wire.
+///
+/// RED on revert: pass `None` for `outer_tos` at the `wg_send_to` call in
+/// `encap_and_send` — which is the pre-#7758 tree — and the received DS byte
+/// falls to 0.
+///
+/// The second assertion is the one the issue is actually about: the byte on the
+/// wire must equal what the TRANSIT path's own helper derives from the same
+/// inner packet. Pinning a literal would let the two paths drift apart while
+/// this stayed green; asserting the agreement cannot.
+#[test]
+fn host_encap_copies_inner_ds_onto_the_outer_7758() {
+    let Some((rx, rx_port)) = rx_socket_with_tos() else {
+        return; // no usable UDP socket in this sandbox
+    };
+    let (tx, tx_is_v6) = bind_wg_socket(0).expect("bind tx");
+    let (init_engine, _resp_engine, _init_pub, resp_pub) =
+        crate::afxdp::wg::tests::established_pair(
+            vec!["10.0.0.0/24".parse().unwrap()],
+            vec!["10.0.1.0/24".parse().unwrap()],
+        );
+
+    // DSCP EF (46) with Not-ECT: 46 << 2 = 0xB8. A value with bits in BOTH
+    // halves of the byte, so a mask error in either direction is visible.
+    const DS: u8 = 0xB8;
+    let inner = inner_v4_with_ds(DS);
+    let target: SocketAddr = format!("127.0.0.1:{rx_port}").parse().unwrap();
+    let exceptions = std::sync::Arc::new(Mutex::new(ExceptionEventRing::new()));
+    let mut out = vec![0u8; 2048];
+
+    encap_and_send(
+        &init_engine,
+        &tx,
+        tx_is_v6,
+        &resp_pub,
+        target,
+        &inner,
+        &mut out,
+        1500,
+        "wg0",
+        &exceptions,
+    );
+
+    let mut payload = [0u8; 2048];
+    let got = recv_outer_ds_byte(&rx, &mut payload)
+        .expect("the encapped datagram must arrive with a TOS cmsg");
+    assert_eq!(
+        got, DS,
+        "the outer DS byte must carry the inner marking (RFC 6040 §4.1 ingress + \
+         uniform DSCP); 0 here is the pre-#7758 behaviour where the host-originated \
+         path sent unmarked while the transit path copied"
+    );
+    assert_eq!(
+        got,
+        crate::afxdp::gre::inner_tos_byte(&inner, libc::AF_INET as u8),
+        "the two WG encap paths must agree on the outer DS for one inner packet — \
+         this asserts the AGREEMENT rather than a literal, so it still fails if \
+         either path later changes what it means by the inner DS byte"
+    );
+}
+
+/// The exemption. A keepalive carries NO inner IP packet, so there is nothing
+/// for RFC 6040 §4.1 to propagate and it must go out unmarked.
+///
+/// This drives the real `send_keepalive` rather than `wg_send_to` directly,
+/// because the claim is about the CALL SITE's choice. A cell that only checked
+/// data packets could not see a change that started stamping keepalives — and a
+/// keepalive inheriting some previous packet's DSCP is precisely the bug a
+/// per-datagram cmsg exists to avoid.
+#[test]
+fn keepalives_are_not_marked_7758() {
+    let Some((rx, rx_port)) = rx_socket_with_tos() else {
+        return;
+    };
+    let (tx, tx_is_v6) = bind_wg_socket(0).expect("bind tx");
+    let (init_engine, _resp_engine, _init_pub, resp_pub) =
+        crate::afxdp::wg::tests::established_pair(
+            vec!["10.0.0.0/24".parse().unwrap()],
+            vec!["10.0.1.0/24".parse().unwrap()],
+        );
+    let target: SocketAddr = format!("127.0.0.1:{rx_port}").parse().unwrap();
+    let exceptions = std::sync::Arc::new(Mutex::new(ExceptionEventRing::new()));
+    let mut encap_buf = vec![0u8; 2048];
+
+    send_keepalive(
+        &init_engine,
+        &tx,
+        tx_is_v6,
+        &resp_pub,
+        target,
+        crate::afxdp::wg::timers::KeepaliveKind::Passive,
+        1,
+        &mut encap_buf,
+        "wg0",
+        &exceptions,
+    );
+
+    let mut payload = [0u8; 2048];
+    let got = recv_outer_ds_byte(&rx, &mut payload).unwrap_or(0);
+    assert_eq!(
+        got, 0,
+        "a keepalive has no inner packet, so its outer DS must stay 0; a non-zero \
+         value means a send site grew a TOS copy it has no source for"
     );
 }
