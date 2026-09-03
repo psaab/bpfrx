@@ -52,7 +52,7 @@ for host in xpf-fw trust-host untrust-host; do
 	if ! instance_running "$host"; then
 		skip "$host is not running (preflight prerequisite missing)"
 		echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-		echo "  Results: 0 passed, 0 failed, 1 skipped (VOID)"
+		echo "  Preflight abort: $host is offline (VOID)"
 		echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 		exit 77
 	fi
