@@ -151,41 +151,48 @@ fn padded_shard_align_at_least_64() {
 /// (12) to filter only obviously-correlated hashes.
 #[test]
 fn shard_distribution_ipv4_24_constant_ifindex() {
+    for &seed in SHARD_SEEDS_7752 {
     let mut counts = [0usize; NUM_SHARDS];
     for last in 0..=255u8 {
-        counts[shard_idx(&key_v4(7, last))] += 1;
+        counts[shard_idx_with(seed, &key_v4(7, last))] += 1;
     }
     let max = *counts.iter().max().unwrap();
     assert!(
         max <= 12,
-        "shard distribution too skewed: {:?} (max {})",
+        "shard distribution too skewed under seed {:#x}: {:?} (max {})",
+        seed,
         counts,
         max
     );
+    }
 }
 
 /// Distribution test: /16 LAN, varying second-to-last octet.
 #[test]
 fn shard_distribution_ipv4_16() {
+    for &seed in SHARD_SEEDS_7752 {
     let mut counts = [0usize; NUM_SHARDS];
     for second_last in 0..=255u16 {
         for last in 0..=15u16 {
             let ip = IpAddr::V4(Ipv4Addr::new(10, 0, second_last as u8, last as u8));
-            counts[shard_idx(&(7, ip))] += 1;
+            counts[shard_idx_with(seed, &(7, ip))] += 1;
         }
     }
     // 4096 keys, 64 shards → ideal 64/shard. Acceptance: max ≤ 2× ideal.
     let max = *counts.iter().max().unwrap();
     assert!(
         max <= 128,
-        "shard distribution too skewed: max {} (ideal 64)",
+        "shard distribution too skewed under seed {:#x}: max {} (ideal 64)",
+        seed,
         max
     );
+    }
 }
 
 /// Distribution test: IPv6 SLAAC-like pattern (varying last 8 bytes).
 #[test]
 fn shard_distribution_ipv6_slaac() {
+    for &seed in SHARD_SEEDS_7752 {
     let mut counts = [0usize; NUM_SHARDS];
     for i in 0..256u32 {
         for j in 0..16u32 {
@@ -199,16 +206,18 @@ fn shard_distribution_ipv6_slaac() {
                 (i & 0xFFFF) as u16,
                 (j & 0xFFFF) as u16,
             ));
-            counts[shard_idx(&(7, ip))] += 1;
+            counts[shard_idx_with(seed, &(7, ip))] += 1;
         }
     }
     // 4096 keys, 64 shards → ideal 64/shard. Acceptance: max ≤ 2× ideal.
     let max = *counts.iter().max().unwrap();
     assert!(
         max <= 128,
-        "ipv6 shard distribution too skewed: max {} (ideal 64)",
+        "ipv6 shard distribution too skewed under seed {:#x}: max {} (ideal 64)",
+        seed,
         max
     );
+    }
 }
 
 /// Poison policy: a thread that panics while holding the shard
@@ -779,4 +788,87 @@ fn get_with_capacity_reports_at_cap_on_full_shard() {
     let (existing_entry, existing_at_cap) = map.get_with_capacity(&keys[0]);
     assert_eq!(existing_entry, Some(entry(0x44)), "existing key still readable at cap");
     assert!(existing_at_cap, "shard is full regardless of the probed key's presence");
+}
+
+/// #7752: fixed seeds for the distribution tests.
+///
+/// The shard hash is seeded per process, so running the distribution tests
+/// against the LIVE seed would make them non-deterministic — and their bounds
+/// are statistical (the /24 case accepts max <= 12 where a perfect uniform hash
+/// gives 9-11 "with high probability"), so a random seed would eventually flake
+/// on a legitimate outlier and be debugged as a hash regression.
+///
+/// Fixed seeds keep them deterministic AND strengthen them: uniformity is now
+/// asserted across several seeds rather than the single mapping that happened
+/// to be compiled in. A failure names the seed, so a red is reproducible from
+/// the message alone.
+const SHARD_SEEDS_7752: &[u64] = &[
+    0,
+    1,
+    0x9E37_79B9_7F4A_7C15,
+    0xDEAD_BEEF_CAFE_F00D,
+    0xFFFF_FFFF_FFFF_FFFF,
+    0x0123_4567_89AB_CDEF,
+];
+
+/// #7752: the seed must actually change the shard mapping.
+///
+/// This is the cell that fails if someone deletes the `write_u64(seed)` from
+/// `shard_idx_with` — without it every seed produces an identical assignment
+/// and the per-process seeding becomes decorative while every other test here
+/// stays green. The distribution tests above cannot see that: a mapping can be
+/// perfectly uniform and completely predictable, which is exactly the state
+/// this issue was filed about.
+///
+/// Asserted over a key SET rather than one key, because two seeds can of course
+/// agree on any single key (1 in 64). Two seeds agreeing on all 256 keys of a
+/// /24 does not happen by chance.
+#[test]
+fn the_seed_changes_the_shard_mapping_7752() {
+    let assignment = |seed: u64| -> Vec<usize> {
+        (0..=255u8)
+            .map(|last| shard_idx_with(seed, &key_v4(7, last)))
+            .collect()
+    };
+
+    let base = assignment(SHARD_SEEDS_7752[0]);
+    for &seed in &SHARD_SEEDS_7752[1..] {
+        assert_ne!(
+            base,
+            assignment(seed),
+            "seed {seed:#x} produced the SAME shard assignment as seed {:#x} \
+             across all 256 keys of a /24 — the seed is not reaching the hash, \
+             so an attacker can still precompute a shard-targeting address set \
+             (#7752)",
+            SHARD_SEEDS_7752[0]
+        );
+    }
+}
+
+/// #7752: the live per-process seed is wired into `shard_idx`, and the mapping
+/// is stable within a process.
+///
+/// Stability is not incidental — `shard_idx` selects which mutex guards a key
+/// and which `shard_mac_epochs` slot it reads. A key that moved shards mid-run
+/// would take the wrong lock.
+///
+/// This cannot assert WHICH shard a key lands in (the seed is random by
+/// design), so it asserts the two properties that survive that: same key ->
+/// same shard, always; and the live path agrees with `shard_idx_with` fed the
+/// live seed, which is what proves `shard_idx` did not quietly grow a second
+/// implementation.
+#[test]
+fn the_process_seed_is_wired_and_stable_7752() {
+    let k = key_v4(7, 42);
+    let first = shard_idx(&k);
+    for _ in 0..1000 {
+        assert_eq!(shard_idx(&k), first, "shard_idx is not stable for one key");
+    }
+    assert_eq!(
+        first,
+        shard_idx_with(*SHARD_SEED, &k),
+        "shard_idx disagrees with shard_idx_with(*SHARD_SEED, ..) — the live \
+         path is no longer the seeded path (#7752)"
+    );
+    assert!(first < NUM_SHARDS, "shard index {first} out of range");
 }
