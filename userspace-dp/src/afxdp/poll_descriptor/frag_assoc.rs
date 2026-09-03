@@ -32,7 +32,7 @@ pub(in crate::afxdp) fn frag_ingress_authority(
     forwarding: &ForwardingState,
     meta: UserspaceDpMeta,
     ingress_zone_override: Option<u16>,
-) -> crate::nat64::FragAuthority {
+) -> crate::fragment_assoc::FragAuthority {
     let physical = meta.ingress_ifindex as i32;
     let logical =
         resolve_ingress_logical_ifindex(forwarding, physical, meta.ingress_vlan_id)
@@ -62,7 +62,7 @@ pub(in crate::afxdp) fn frag_ingress_authority(
         .filter(|id| forwarding.zone_id_to_name.contains_key(id))
         .or_else(|| forwarding.ifindex_to_zone_id.get(&logical).copied())
         .unwrap_or(0);
-    crate::nat64::FragAuthority {
+    crate::fragment_assoc::FragAuthority {
         ingress_ifindex: logical as u32,
         ingress_vlan_id: meta.ingress_vlan_id,
         ingress_zone: zone,
@@ -96,7 +96,7 @@ pub(super) fn nat64_install_forward_fragment_assoc(
     forwarding: &ForwardingState,
     l3_packet: &[u8],
     addr_family: i32,
-    authority: crate::nat64::FragAuthority,
+    authority: crate::fragment_assoc::FragAuthority,
     decision: &SessionDecision,
     now_ns: u64,
 ) -> bool {
@@ -112,7 +112,7 @@ pub(super) fn nat64_install_forward_fragment_assoc(
     {
         return false;
     }
-    if let Some(key) = crate::nat64::nat64_first_fragment_key(l3_packet, addr_family, authority) {
+    if let Some(key) = crate::fragment_assoc::nat64_first_fragment_key(l3_packet, addr_family, authority) {
         // #5624: stamp the association with the generation of the forwarding
         // state that admitted this first fragment. `build_generation` advances
         // on every config reload, so an association installed here is rejected
@@ -145,7 +145,7 @@ pub(super) fn nat64_consult_forward_fragment_assoc(
     forwarding: &ForwardingState,
     l3_packet: &[u8],
     addr_family: i32,
-    authority: crate::nat64::FragAuthority,
+    authority: crate::fragment_assoc::FragAuthority,
     now_ns: u64,
     // #6857: the runtime-ownership fence needs to ask whether the association's
     // stamped owner RG is STILL forwarding-active locally.
@@ -155,7 +155,7 @@ pub(super) fn nat64_consult_forward_fragment_assoc(
     if addr_family != libc::AF_INET6 {
         return None;
     }
-    let key = crate::nat64::nat64_nonfirst_fragment_key(l3_packet, addr_family, authority)?;
+    let key = crate::fragment_assoc::nat64_nonfirst_fragment_key(l3_packet, addr_family, authority)?;
     // #5624: consult under the CURRENT forwarding state's generation. An
     // association installed under a prior generation (before a config commit
     // changed deny/NAT64 rules) is treated as a miss + evicted here, so the
@@ -203,7 +203,7 @@ pub(super) fn nat_install_forward_fragment_assoc(
     forwarding: &ForwardingState,
     l3_packet: &[u8],
     addr_family: i32,
-    authority: crate::nat64::FragAuthority,
+    authority: crate::fragment_assoc::FragAuthority,
     decision: &SessionDecision,
     now_ns: u64,
 ) -> bool {
@@ -219,7 +219,7 @@ pub(super) fn nat_install_forward_fragment_assoc(
     {
         return false;
     }
-    if let Some(key) = crate::nat64::nat64_first_fragment_key(l3_packet, addr_family, authority) {
+    if let Some(key) = crate::fragment_assoc::nat64_first_fragment_key(l3_packet, addr_family, authority) {
         return forwarding.nat64.frag_assoc.install(
             key,
             *decision,
@@ -272,14 +272,14 @@ pub(super) fn nat_consult_forward_fragment_assoc(
     forwarding: &ForwardingState,
     l3_packet: &[u8],
     addr_family: i32,
-    authority: crate::nat64::FragAuthority,
+    authority: crate::fragment_assoc::FragAuthority,
     now_ns: u64,
     // #6857: the runtime-ownership fence needs to ask whether the association's
     // stamped owner RG is STILL forwarding-active locally.
     ha_state: &std::collections::BTreeMap<i32, crate::afxdp::types::HAGroupRuntime>,
     now_secs: u64,
 ) -> Option<SessionDecision> {
-    let key = crate::nat64::nat64_nonfirst_fragment_key(l3_packet, addr_family, authority)?;
+    let key = crate::fragment_assoc::nat64_nonfirst_fragment_key(l3_packet, addr_family, authority)?;
     let (decision, _reverse) = forwarding.nat64.frag_assoc.lookup(
         &key,
         now_ns,

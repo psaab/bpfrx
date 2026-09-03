@@ -365,7 +365,7 @@ impl super::Coordinator {
     /// than cache pressure. Surfaced as
     /// `xpf_userspace_nat64_frag_cross_domain_misses_total`.
     pub fn nat64_frag_cross_domain_misses_total(&self) -> u64 {
-        crate::nat64::NAT64_FRAG_CROSS_DOMAIN_MISSES.load(Ordering::Relaxed)
+        crate::fragment_assoc::NAT64_FRAG_CROSS_DOMAIN_MISSES.load(Ordering::Relaxed)
     }
 
     /// #7056: the sibling leg — same ingress domain, different upper-layer
@@ -375,7 +375,7 @@ impl super::Coordinator {
     /// different operator stories. Surfaced as
     /// `xpf_userspace_nat64_frag_protocol_alias_misses_total`.
     pub fn nat64_frag_protocol_alias_misses_total(&self) -> u64 {
-        crate::nat64::NAT64_FRAG_PROTOCOL_ALIAS_MISSES.load(Ordering::Relaxed)
+        crate::fragment_assoc::NAT64_FRAG_PROTOCOL_ALIAS_MISSES.load(Ordering::Relaxed)
     }
 
     /// #6751 PR 2/3: interface-mode SNAT admissions that failed CLOSED with no

@@ -4,6 +4,18 @@
 // `#[path = "nat64_tests.rs"]` from nat64.rs.
 
 use super::*;
+// #7899: the fragment-association cache moved to `crate::fragment_assoc`. The
+// 55 frag tests in this file were NOT moved with it -- they are interleaved with
+// 119 non-frag NAT64 tests across 7000 lines, and extracting them is a separate
+// change with its own risk (a mis-placed insertion between a doc comment and its
+// `fn` silently steals the `#[test]` attribute). Imported here instead so the
+// move stays motion-only and no guard changes.
+use crate::fragment_assoc::{
+    FragAuthority, NAT64_FRAG_CAP_PER_SHARD, NAT64_FRAG_CROSS_DOMAIN_MISSES,
+    NAT64_FRAG_PROTOCOL_ALIAS_MISSES, NAT64_FRAG_SHARDS, NAT64_FRAG_TTL_NS, Nat64FragAssoc,
+    Nat64FragKey, nat64_frag_shard_index, nat64_first_fragment_key,
+    nat64_nonfirst_fragment_key,
+};
 
 /// #5798: a fixed ingress authority for fragment-key tests that are not ABOUT
 /// the authority. `frag_other_authority` mints a DIFFERENT domain so a test can
