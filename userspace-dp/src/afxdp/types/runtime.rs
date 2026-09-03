@@ -445,6 +445,19 @@ pub(in crate::afxdp) enum WorkerCommand {
     /// vacate runs on the worker thread (single-writer invariant) —
     /// this command sets a flag in `WorkerCommandResults`; the outer
     /// poll loop dispatches via `vacate_all_shared_exact_slots`.
+    /// #7699: learn a PPTP call association on this worker.
+    ///
+    /// Broadcast to EVERY worker, not sent to one. The control channel
+    /// (TCP/1723) and the GRE data channel are not reliably co-located — RSS
+    /// hashes the flow tuple, so they share a worker only by chance — and the
+    /// data packets must resolve on whichever worker they land on.
+    InstallPptpCall(crate::session::pptp::PptpCall),
+    /// #7699: forget a PPTP call association, by handle. Also broadcast.
+    ///
+    /// Teardown must reach every worker for the same reason the install does; a
+    /// worker that keeps a stale association re-pairs a REUSED 16-bit call id
+    /// onto a dead handle, which is a mis-attribution rather than a leak.
+    ForgetPptpCall(u32),
     VacateAllSharedExactSlots,
 }
 
