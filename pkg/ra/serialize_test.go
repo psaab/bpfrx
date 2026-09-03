@@ -2,8 +2,10 @@ package ra
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -312,6 +314,42 @@ func (fl *fakeListen) liveCount() int32 {
 // goodbyeCount on the owner's conn. "Exactly one goodbye event" therefore means
 // exactly one conn carries goodbye writes (we assert both the per-conn count
 // and that only a single conn emitted any).
+// goodbyeAttribution renders, per conn generation for `name`, how many goodbye
+// writes (lifetime == 0) it carries and whether it is `want` -- so a failure can
+// say WHICH sender emitted rather than only that one did.
+//
+// #8031: goodbyeStats aggregates over fl.allConns[name], every generation. That
+// is the right property for the assertions (the invariant is "nobody emitted"),
+// but it makes a failure unattributable: `1 conns / 3 writes` is byte-identical
+// whether the wedged owner emitted, a replacement did, or the reclaimer's
+// LEGITIMATE post-close goodbye (#5094 -- "exactly one goodbye is emitted") was
+// somehow observed early. Those need different fixes and the message could not
+// tell them apart, which is why #8031 sat unreproduced with its evidence lost.
+func (fl *fakeListen) goodbyeAttribution(name string, want *fakeConn) string {
+	fl.mu.Lock()
+	conns := append([]*fakeConn(nil), fl.allConns[name]...)
+	fl.mu.Unlock()
+	var b strings.Builder
+	for i, c := range conns {
+		n, total := 0, 0
+		for _, w := range c.snapshot() {
+			total++
+			if w.lifetime == 0 {
+				n++
+			}
+		}
+		mark := ""
+		if want != nil && c == want {
+			mark = " <-- the WEDGED owner"
+		}
+		fmt.Fprintf(&b, "\n    conn[%d]: %d writes, %d goodbye%s", i, total, n, mark)
+	}
+	if b.Len() == 0 {
+		return "\n    (no conns recorded for " + name + ")"
+	}
+	return b.String()
+}
+
 func (fl *fakeListen) goodbyeStats(name string) (totalGoodbyeWrites, connsWithGoodbye int) {
 	fl.mu.Lock()
 	conns := append([]*fakeConn(nil), fl.allConns[name]...)
@@ -1797,9 +1835,13 @@ func TestRestartTimeoutNoGoodbyeNoReplacement(t *testing.T) {
 	// No standalone goodbye on the timeout path (owner could be live).
 	total, conns := fl.goodbyeStats("lo")
 	if conns != 0 || total != 0 {
+		// #8031: name WHICH conn emitted. The aggregate alone cannot separate
+		// "the timeout path emitted" from "the reclaimer's legitimate #5094
+		// goodbye was observed early", and those want different fixes.
 		t.Fatalf("restart timeout emitted a goodbye (%d conns / %d writes); "+
-			"the timeout path must NOT read goodbyeEmitted/emit — #2033 round-4 MAJOR 1",
-			conns, total)
+			"the timeout path must NOT read goodbyeEmitted/emit — #2033 round-4 MAJOR 1"+
+			"\n  per-conn attribution (#8031):%s",
+			conns, total, fl.goodbyeAttribution("lo", old))
 	}
 	// No replacement started while the old conn may be live; ≤1 live conn.
 	m.mu.Lock()
