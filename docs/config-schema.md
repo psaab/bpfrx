@@ -1610,6 +1610,51 @@ false-reject. Plus the top-level no-false-positive accepts (apply-groups
 deep-merge carrying both rules, cross-group coalescing, #3096 bracket-list
 expansion).
 
+### Duplicate hierarchical `unit N` blocks (#8427)
+
+`compileInterfaces` writes `ifc.Units[unitNum] = unit` unconditionally, so two
+hierarchical `unit 0 { … }` blocks under one interface are **last-writer-wins**
+for the unit's filter, addresses and flags, while the interface-level
+tunnel-address collection **appends** from every block. The unit's security
+filter is decided by config order and its addresses are not.
+
+The #5631/#5878 alias gate cannot see it, and says so in its own doc: detection
+is scoped to **distinct spellings** that canonicalize to one unit. Two
+hierarchical `unit 0` blocks are the *same* spelling, and being hierarchical they
+do not take the flat-set merge path that makes same-spelling `set` lines safe.
+
+The detection therefore counts **instances** rather than recording presence —
+one diagnostic path for one consequence, rather than a second gate. An alias
+still gets #5631's message; a same-spelling duplicate gets one naming the count
+and saying why the alias gate did not fire.
+
+**The fold is the whole safety argument, and it has two traps.** The alias gate
+unions three deliberately overlapping views (pre-expansion, plus the tree
+expanded for node0 and node1), because a peer-only alias must be caught at either
+node's commit. A presence *set* collapses that overlap for free; a count does
+not.
+
+1. **Fold views with MAX, never sum.** Summing makes one authored `unit 0` count
+   three times and rejects essentially every config.
+2. **Do not accumulate across `groups` bodies either.** `groups node0` and
+   `groups node1` each declaring `em0 unit 0` with that node's own address is the
+   *normal* HA pattern — only one applies per node. Measured: accumulating there
+   rejected **all four** shipped cluster configs (`docs/ha-cluster.conf`,
+   `docs/ha-cluster-loss.conf`, `docs/ha-cluster-userspace.conf`,
+   `examples/deploy/ha-pair.conf`). Each `interfaces` root and each group body is
+   its own collection pass.
+
+Two `unit 0` blocks in two **sibling** `interfaces { }` roots are a different
+shape, already rejected by the duplicate-container gate, so scoping the count per
+pass loses nothing.
+
+**The per-node-groups control is load-bearing**, not decoration: it is the shape
+that caught trap 2, and it lives in the test file so a later tightening cannot
+silently re-break every shipped cluster config. A separate cell pins that the
+#5631 alias case still gets **its** message — a shared loop that reclassified an
+alias as a duplicate would lose the diagnostic telling the operator the two
+spellings are one unit.
+
 ### Non-numeric logical-unit identity fail-closed (#5829)
 
 `interfaces <if> unit <identity>` had NO positional key validation: the `unit`
