@@ -513,6 +513,55 @@ func walkSchemaNode(node *Node, parent *schemaNode, path []string, vc *walkConte
 	// keyValidatorPos (#5576, route-filter) takes precedence and receives
 	// each token's 0-based arg index so a multi-arg slot can enforce a
 	// distinct grammar per position (prefix slot vs match-type slot).
+	// #8437: a missing semicolon FUSES two hierarchical statements. The lexer
+	// has no statement terminator to stop at, so the next statement's keyword
+	// and its value are absorbed onto THIS node's Keys — and the compiler,
+	// which reads only the tokens its own grammar declares, silently drops the
+	// second statement. `show configuration` still renders the fused line, so
+	// the operator's verification step confirms a constraint the dataplane
+	// does not enforce.
+	//
+	// The signature is precise: an absorbed token NAMES A SIBLING of this leaf
+	// in the enclosing container. That is what distinguishes a fused statement
+	// from the trailing tokens a leaf legitimately carries — several leaves are
+	// under-declared in setSchema and keep their grammar in the compiler
+	// (`then static-nat prefix <cidr>` is the worked example), and a plain
+	// arity check condemns those. Same discriminator #3673 already uses for
+	// `security policies ... match` (emitSwallowed); this generalises it to
+	// every container.
+	//
+	// Only tokens PAST the declared identity span are considered, so a leaf
+	// whose own args legitimately consume a token that happens to share a
+	// sibling's name is untouched.
+	if parent != nil && parent.children != nil && len(node.Keys) > declaredKeyTokens {
+		for _, tok := range node.Keys[declaredKeyTokens:] {
+			if _, isSibling := parent.children[tok]; !isSibling {
+				continue
+			}
+			if tok == keyword {
+				continue // a repeat of this leaf, not a foreign statement
+			}
+			// A token that also names a CHILD of this node is ambiguous: it may
+			// be a PACKED spelling (`system login user bob class super-user`)
+			// rather than a fused statement, and packing has its own dedicated
+			// gate with a more specific message (#6706). Defer to it — a second
+			// gate firing first on the same input replaces a targeted diagnostic
+			// with a generic one.
+			if childSchema.children != nil {
+				if _, isOwnChild := childSchema.children[tok]; isOwnChild {
+					continue
+				}
+			}
+			return fmt.Errorf("%s: the token %q follows `%s` but names a SIBLING "+
+				"statement — a missing semicolon after `%s` fuses the two, and the "+
+				"`%s` statement is then silently dropped from the compiled config "+
+				"while `show configuration` still displays it. Add the missing `;` "+
+				"(#8437)",
+				strings.Join(append(append([]string(nil), path...), keyword), " "),
+				tok, keyword, keyword, tok)
+		}
+	}
+
 	if childSchema.keyValidatorPos != nil || childSchema.keyValidator != nil {
 		keyPath := append(append([]string(nil), path...), keyword)
 		// #6834: a WILDCARD's identity IS the keyword — Keys[0] — not an arg
