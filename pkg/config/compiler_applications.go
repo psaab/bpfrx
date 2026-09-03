@@ -355,6 +355,7 @@ func compileApplications(node *Node, apps *ApplicationsConfig) error {
 		// alias restate (icmp / junos-icmp-all) is not a false conflict.
 		var dupDirectLeaves []string
 		var (
+			incompleteDirectLeaves                       []string
 			protoSet, dstSet, srcSet, algSet, timeoutSet bool
 			itypeSet, icodeSet                           bool
 			protoVal, dstVal, srcVal, algVal             string
@@ -368,6 +369,21 @@ func compileApplications(node *Node, apps *ApplicationsConfig) error {
 		directLeaves, unknownDirect := applicationDirectLeaves(inst.node)
 		app.UnknownDirectLeaves = unknownDirect
 		for _, prop := range directLeaves {
+			// #8339: a RECOGNIZED value-taking leaf with no value. Checked once
+			// here rather than as an `else` on each arm, mirroring the term
+			// path -- a per-arm guard has to be repeated for every future
+			// value-taking leaf and is the duplication that drifts.
+			//
+			// The consequence is a permit-WIDENING, not a dropped statement:
+			// nodeVal returns "" for a 1-key childless node, resolveAppPort
+			// passes it through, and portInSpec("") returns true for every
+			// port (pkg/appid/runtime.go). A dangling `destination-port` on
+			// `protocol tcp` therefore matched EVERY TCP port, on the STRICT
+			// commit path, with the config rendering exactly as typed.
+			if valueTakingApplicationLeaves[prop.Name()] && nodeVal(prop) == "" {
+				incompleteDirectLeaves = append(incompleteDirectLeaves, prop.Name())
+				continue
+			}
 			switch prop.Name() {
 			case "protocol":
 				hasDirectBody = true
@@ -488,6 +504,7 @@ func compileApplications(node *Node, apps *ApplicationsConfig) error {
 		// below (`else`); a term-bearing app discards this struct, and a mixed
 		// direct+term app is already rejected by MixedDirectTermApps.
 		app.DuplicateDirectLeaves = dupDirectLeaves
+		app.IncompleteDirectLeaves = incompleteDirectLeaves
 
 		if len(terms) > 0 {
 			// #3366: an application that mixes a direct match body with `term`
@@ -511,6 +528,11 @@ func compileApplications(node *Node, apps *ApplicationsConfig) error {
 				// Description is carried, mirroring how parseApplicationTerms
 				// already lands UnknownTermLeaves on each term (#3352).
 				t.UnknownDirectLeaves = app.UnknownDirectLeaves
+				// #8339: carried for the SAME reason and it is not optional —
+				// this branch discards `app`, so a dangling direct leaf on a
+				// term-bearing application would escape the strict gate
+				// entirely. That is the shape #6524 documents one line above.
+				t.IncompleteDirectLeaves = app.IncompleteDirectLeaves
 				apps.Applications[t.Name] = t
 				implicitSet.Applications = append(implicitSet.Applications, t.Name)
 			}
@@ -670,7 +692,7 @@ func parseApplicationTerms(parentName string, keys []string) []*Application {
 		// Checked ONCE here rather than as eight `else` branches: a per-arm
 		// else would have to be repeated for every future value-taking leaf and
 		// is exactly the kind of duplication that drifts.
-		if i+1 >= len(keys) && valueTakingTermLeaves[keys[i]] {
+		if i+1 >= len(keys) && valueTakingApplicationLeaves[keys[i]] {
 			incompleteTermLeaves = append(incompleteTermLeaves, keys[i])
 			continue
 		}
@@ -833,16 +855,35 @@ func parseApplicationTerms(parentName string, keys []string) []*Application {
 	return result
 }
 
-// valueTakingTermLeaves is the set of inline-`term` leaves that REQUIRE a
-// following value token (#6564 member 9). It is the arity contract for
-// parseApplicationTerms' switch: every arm below that consumes `keys[i+1]`
-// must appear here, so a keyword left dangling in the last position is
-// recorded rather than silently dropping its constraint.
+// valueTakingApplicationLeaves is the set of application leaves that REQUIRE a
+// value (#6564 member 9, extended to the direct body by #8339). It is the
+// arity contract for BOTH switches that compile an application body, and it is
+// deliberately ONE set rather than two:
 //
-// Adding a value-taking leaf to the switch without adding it here re-opens the
-// fail-open, so the two are pinned together by
-// TestValueTakingTermLeavesCoversEveryConsumingArm6564.
-var valueTakingTermLeaves = map[string]bool{
+//   - parseApplicationTerms consumes `keys[i+1]` from a flat key run, so a
+//     dangling leaf is `i+1 >= len(keys)`;
+//   - the direct body reads the leaf node's own value via nodeVal(prop), so a
+//     dangling leaf is `nodeVal(prop) == ""`.
+//
+// The DETECTION differs because the two grammars park the value in different
+// places. The CONTRACT -- which keywords require one at all -- is a property of
+// the Junos statement, not of the shape it was typed in, and #8339 is what
+// happens when only one of the two enforces it: the term path refused a
+// dangling `destination-port` while the direct body accepted it and matched
+// EVERY port. Two sets would drift apart exactly the way the two guards did.
+//
+// Membership is derived from the switches, not asserted: every arm in either
+// that consumes a value must appear here, pinned by
+// TestValueTakingTermLeavesCoversEveryConsumingArm6564 and
+// TestValueTakingLeavesCoverEveryDirectConsumingArm8339.
+//
+// NOT members, deliberately:
+//   - `description`: takes a value, but a dangling one drops a cosmetic field
+//     and widens nothing. Excluded to keep the commit-refusal surface to
+//     statements whose absence changes what traffic matches.
+//   - `term`: a container, not a leaf; its name is consumed by descending into
+//     the body rather than by a value read.
+var valueTakingApplicationLeaves = map[string]bool{
 	"protocol":           true,
 	"destination-port":   true,
 	"source-port":        true,

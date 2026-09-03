@@ -175,7 +175,13 @@ func TestDanglingTermKeywordIsWarnOnlyOnTolerantPath6564(t *testing.T) {
 }
 
 // TestValueTakingTermLeavesCoversEveryConsumingArm6564 binds the
-// valueTakingTermLeaves set to the switch it describes.
+// valueTakingApplicationLeaves set to the TERM switch it describes.
+//
+// #8339 renamed the set (it now governs the direct body too) and this test
+// moved with it rather than being left pinning a symbol that no longer exists.
+// It still asserts exactly what it did: every parseApplicationTerms arm that
+// consumes keys[i+1] is a member. Its direct-body twin is
+// TestValueTakingLeavesCoverEveryDirectConsumingArm8339.
 //
 // The set is the arity contract for parseApplicationTerms: the dangling-keyword
 // guard fires only for keywords listed in it, so a future value-taking leaf
@@ -189,7 +195,7 @@ func TestDanglingTermKeywordIsWarnOnlyOnTolerantPath6564(t *testing.T) {
 // pins its map against the dispatch table it mirrors.
 //
 // FAIL-ON-REVERT: add a `case "foo":` arm to parseApplicationTerms that reads
-// `keys[i+1]` without adding "foo" to valueTakingTermLeaves.
+// `keys[i+1]` without adding "foo" to valueTakingApplicationLeaves.
 func TestValueTakingTermLeavesCoversEveryConsumingArm6564(t *testing.T) {
 	src, err := os.ReadFile("compiler_applications.go")
 	if err != nil {
@@ -236,9 +242,9 @@ func TestValueTakingTermLeavesCoversEveryConsumingArm6564(t *testing.T) {
 		for _, m := range kwRe.FindAllStringSubmatch(labels, -1) {
 			kw := m[1]
 			checked++
-			if !valueTakingTermLeaves[kw] {
+			if !valueTakingApplicationLeaves[kw] {
 				t.Errorf("#6564: parseApplicationTerms has a value-consuming arm for %q "+
-					"(its body reads keys[i+1]) but %q is NOT in valueTakingTermLeaves — a "+
+					"(its body reads keys[i+1]) but %q is NOT in valueTakingApplicationLeaves — a "+
 					"dangling `%s` would fall through recording nothing, dropping the "+
 					"constraint and widening the term, exactly the fail-open member 9 closed",
 					kw, kw, kw)
@@ -251,8 +257,8 @@ func TestValueTakingTermLeavesCoversEveryConsumingArm6564(t *testing.T) {
 	}
 	// Every member of the set must correspond to a real arm, so the set cannot
 	// accumulate entries for leaves that no longer exist.
-	if checked != len(valueTakingTermLeaves) {
-		t.Errorf("valueTakingTermLeaves has %d entries but %d value-consuming arms were found; "+
-			"the set and the switch have drifted", len(valueTakingTermLeaves), checked)
+	if checked != len(valueTakingApplicationLeaves) {
+		t.Errorf("valueTakingApplicationLeaves has %d entries but %d value-consuming arms were found; "+
+			"the set and the switch have drifted", len(valueTakingApplicationLeaves), checked)
 	}
 }

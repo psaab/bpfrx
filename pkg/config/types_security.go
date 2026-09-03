@@ -1451,6 +1451,18 @@ type Application struct {
 	// hard-rejects the first one on the strict commit path / warns on the tolerant
 	// load / peer-sync path (#5574).
 	DuplicateDirectLeaves []string
+	// IncompleteDirectLeaves records recognized value-taking leaves on the
+	// DIRECT application body that were left with no value — the direct-body
+	// twin of IncompleteTermLeaves (#8339).
+	//
+	// Worded separately from UnknownDirectLeaves because the keyword IS
+	// supported: calling it an unknown statement sends the operator looking for
+	// a typo that is not there. The consequence is worse than a dropped
+	// statement — nodeVal returns "" for a 1-key childless node and
+	// portInSpec("") matches EVERY port, so a dangling `destination-port`
+	// WIDENS the application instead of narrowing it, and does so on the strict
+	// commit path where the config renders exactly as typed.
+	IncompleteDirectLeaves []string
 	// UnknownDirectLeaves records the raw tokens directly under an
 	// `applications application <name>` body that are NOT a recognized direct
 	// match leaf (protocol / destination-port / source-port /
