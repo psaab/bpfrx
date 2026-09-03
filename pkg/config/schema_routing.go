@@ -459,10 +459,19 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 		"authentication-type": {desc: "Authentication type", args: 1, placeholder: "<type>", children: nil},
 	}},
 	"isis": {desc: "IS-IS configuration", children: map[string]*schemaNode{
-		"net":     {desc: "NET address", args: 1, placeholder: "<net-address>", children: nil},
-		"level":   {desc: "Level", args: 1, placeholder: "<level>", children: nil},
-		"is-type": {desc: "IS type", args: 1, placeholder: "<type>", children: nil},
-		"export":  {desc: "Export policy", args: 1, multi: true, placeholder: "<policy-name>", children: nil},
+		"net": {desc: "NET address", args: 1, placeholder: "<net-address>", children: nil},
+		// #8446: BOTH spell the same concept and both compile into
+		// ISISConfig.Level. Typed so a non-canonical value (notably
+		// `level-2-only`, the spelling this product's OWN renderer
+		// emits) is rejected at commit instead of silently widening
+		// the router to level-1-2 via the renderer's missing default.
+		"level": {desc: "IS-IS level (alias of is-type)", args: 1, placeholder: "<level>",
+			valueType: ValueEnumOf, valueDesc: "IS-IS level",
+			valueExamples: ISISLevelSpellings(), validator: ValidateISISLevel, children: nil},
+		"is-type": {desc: "IS type (alias of level)", args: 1, placeholder: "<type>",
+			valueType: ValueEnumOf, valueDesc: "IS-IS level",
+			valueExamples: ISISLevelSpellings(), validator: ValidateISISLevel, children: nil},
+		"export": {desc: "Export policy", args: 1, multi: true, placeholder: "<policy-name>", children: nil},
 		"interface": {desc: "Interface", args: 1, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: map[string]*schemaNode{
 			"level":               {desc: "Level", args: 1, placeholder: "<level>", children: nil},
 			"passive":             {desc: "Passive interface", children: nil},
@@ -830,10 +839,15 @@ var schemaRoutingInstances = &schemaNode{desc: "Routing instance configuration",
 			"group": {desc: "BGP group", args: 1, placeholder: "<group-name>", children: nil},
 		}},
 		"isis": {desc: "IS-IS configuration", children: map[string]*schemaNode{
-			"net":     {desc: "NET address", args: 1, placeholder: "<net-address>", children: nil},
-			"level":   {desc: "Level", args: 1, placeholder: "<level>", children: nil},
-			"is-type": {desc: "IS type", args: 1, placeholder: "<type>", children: nil},
-			"export":  {desc: "Export policy", args: 1, multi: true, placeholder: "<policy-name>", children: nil},
+			"net": {desc: "NET address", args: 1, placeholder: "<net-address>", children: nil},
+			// #8446: same typing as the top-level copy; see there.
+			"level": {desc: "IS-IS level (alias of is-type)", args: 1, placeholder: "<level>",
+				valueType: ValueEnumOf, valueDesc: "IS-IS level",
+				valueExamples: ISISLevelSpellings(), validator: ValidateISISLevel, children: nil},
+			"is-type": {desc: "IS type (alias of level)", args: 1, placeholder: "<type>",
+				valueType: ValueEnumOf, valueDesc: "IS-IS level",
+				valueExamples: ISISLevelSpellings(), validator: ValidateISISLevel, children: nil},
+			"export": {desc: "Export policy", args: 1, multi: true, placeholder: "<policy-name>", children: nil},
 			"interface": {desc: "Interface", args: 1, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: map[string]*schemaNode{
 				"level":               {desc: "Level", args: 1, placeholder: "<level>", children: nil},
 				"passive":             {desc: "Passive interface", children: nil},
