@@ -112,6 +112,8 @@ pub(super) fn publish_v4_session(
     // the session (SESSION_CREATE/CLOSE). `0` = unknown/absent (the caller had no
     // live entry), preserving the legacy ordinal fallback on the Go render side.
     session_id: u64,
+    // #8125: see build_conntrack_value_v4.
+    timeout_secs: u32,
 ) {
     let bpf_key = bpf_session_key_v4(src.octets(), dst.octets(), key.src_port, key.dst_port, key.protocol);
 
@@ -128,6 +130,7 @@ pub(super) fn publish_v4_session(
         alg_disable_flags,
         app_id,
         session_id,
+        timeout_secs,
     ) else {
         return;
     };
@@ -164,6 +167,10 @@ pub(super) fn build_conntrack_value_v4(
     alg_disable_flags: u8,
     app_id: u16,
     session_id: u64,
+    // #8125: the session's own inactivity window in whole seconds, from
+    // SessionTable::timeout_secs_for. 0 = no live entry, which keeps the
+    // documented default below rather than stamping a zero window.
+    timeout_secs: u32,
 ) -> Option<BpfSessionValueV4> {
     let alg_type =
         alg_type_for_session(key.protocol, key.src_port, key.dst_port, alg_disable_flags);
@@ -204,7 +211,21 @@ pub(super) fn build_conntrack_value_v4(
         session_id,
         created: now_secs,
         last_seen: now_secs,
-        timeout: 1800, // default 30min; Go GC is SkipSweep'd, helper owns lifetime (#333)
+        // #8125: the session's OWN window, not a constant. This column read
+        // 1800 for every session — the Junos `established-timeout` default —
+        // whatever window was actually in force, so a half-closed session on a
+        // 30 s (or configured 3 s) closing window and an ESTABLISHED session on
+        // its 300 s default both reported the same number. The reap behaviour
+        // proved they differed by an order of magnitude; the column did not.
+        //
+        // 1800 remains the fallback for a publish with NO live table entry
+        // (`timeout_secs == 0`), which is the pre-#8125 behaviour for exactly
+        // the case that has no window to report. It is a default, not a
+        // measurement, and the refresh loop corrects it within one cycle once
+        // an entry exists. Go GC is SkipSweep'd and the helper owns lifetime
+        // (#333), so nothing downstream acts on this value — it is an operator
+        // display.
+        timeout: if timeout_secs > 0 { timeout_secs } else { 1800 },
         // #3056: the admitting policy's ID, stamped on the session at install.
         // The Go session-row surfaces (`show security flow session`, REST,
         // gRPC) read this slot as `val.PolicyID` and resolve a policy name from
@@ -276,6 +297,8 @@ pub(super) fn publish_v6_session(
     app_id: u16,
     // #5213: stable dataplane session id — see publish_v4_session.
     session_id: u64,
+    // #8125: see build_conntrack_value_v4.
+    timeout_secs: u32,
 ) {
     // #6923: THE CHOKEPOINT. Refuse to make a key the shim would probe visible
     // when its protocol is an IPv6 extension-header type rather than an L4.
@@ -333,6 +356,7 @@ pub(super) fn publish_v6_session(
         alg_disable_flags,
         app_id,
         session_id,
+        timeout_secs,
     ) else {
         return;
     };
@@ -368,6 +392,10 @@ pub(super) fn build_conntrack_value_v6(
     alg_disable_flags: u8,
     app_id: u16,
     session_id: u64,
+    // #8125: the session's own inactivity window in whole seconds, from
+    // SessionTable::timeout_secs_for. 0 = no live entry, which keeps the
+    // documented default below rather than stamping a zero window.
+    timeout_secs: u32,
 ) -> Option<BpfSessionValueV6> {
     let alg_type =
         alg_type_for_session(key.protocol, key.src_port, key.dst_port, alg_disable_flags);
@@ -405,7 +433,8 @@ pub(super) fn build_conntrack_value_v6(
         session_id,
         created: now_secs,
         last_seen: now_secs,
-        timeout: 1800,
+        // #8125: see the v4 arm.
+        timeout: if timeout_secs > 0 { timeout_secs } else { 1800 },
         // #3056: see publish_v4_session — stamp the admitting policy ID so the
         // IPv6 live-session rows attribute the policy that admitted the flow.
         policy_id: metadata.policy_id,

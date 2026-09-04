@@ -3690,7 +3690,7 @@ fn iter_with_idle_budgeted_bounds_and_resumes_full_coverage() {
     // Bounded loop guards against a non-advancing cursor hanging the test.
     for _ in 0..1024 {
         let mut this_slice = 0usize;
-        let next = table.iter_with_idle_budgeted(cursor, BUDGET, now, |k, _d, meta, _idle, _c| {
+        let next = table.iter_with_idle_budgeted(cursor, BUDGET, now, |k, _d, meta, _idle, _c, _exp| {
             this_slice += 1;
             if !meta.is_reverse {
                 seen.insert(k.clone());
@@ -3731,7 +3731,7 @@ fn count_full_budgeted_sweep(table: &SessionTable, now_ns: u64) -> usize {
     // so a non-advancing cursor panics instead of spinning forever.
     let guard = table.entries_capacity_for_test() + 8;
     for _ in 0..guard {
-        let next = table.iter_with_idle_budgeted(cursor, 1, now_ns, |_, _, _, _, _| {});
+        let next = table.iter_with_idle_budgeted(cursor, 1, now_ns, |_, _, _, _, _, _exp| {});
         examined += 1;
         if next == 0 {
             return examined;
@@ -3872,7 +3872,7 @@ fn iter_with_idle_budgeted_never_skips_a_live_session_above_the_len() {
     let mut cursor = 0usize;
     let mut refreshed = false;
     for _ in 0..(table.entries_capacity_for_test() + 8) {
-        let next = table.iter_with_idle_budgeted(cursor, 8, now, |k, _d, _m, _idle, _c| {
+        let next = table.iter_with_idle_budgeted(cursor, 8, now, |k, _d, _m, _idle, _c, _exp| {
             if k == &survivor {
                 refreshed = true;
             }

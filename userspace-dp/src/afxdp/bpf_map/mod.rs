@@ -125,6 +125,13 @@ pub(super) struct ConntrackCtx<'a> {
     /// completeness — the production conntrack mirror is the direct
     /// poll_descriptor call, which resolves the id from the session table.
     pub(super) session_id: u64,
+    /// #8125: the session's own inactivity window in whole seconds, so the
+    /// mirrored row's `Timeout:` column reports the window actually in force
+    /// rather than the 1800 constant it used to carry. Like `app_id` and
+    /// `session_id`, carried for contract completeness — the production
+    /// conntrack mirror is the direct poll_descriptor call, which resolves the
+    /// window from the session table. 0 = no live entry.
+    pub(super) timeout_secs: u32,
 }
 
 // ── BPF conntrack map structs (mirrors C struct session_key / session_value) ──
@@ -481,6 +488,9 @@ pub(super) fn publish_bpf_conntrack_entry(
     // `show security flow session` reports the SAME id RT_FLOW emits. `0` =
     // unknown (no live entry) — the Go render then keeps the legacy ordinal.
     session_id: u64,
+    // #8125: the session's own inactivity window in whole seconds
+    // (SessionTable::timeout_secs_for); 0 = no live entry.
+    timeout_secs: u32,
 ) {
     // #6965: record the call BEFORE the `fd >= 0` gate below. The gate is what
     // makes this a no-op under a unit test's `-1` fds, and the property the
@@ -531,6 +541,7 @@ pub(super) fn publish_bpf_conntrack_entry(
                 alg_disable_flags,
                 app_id,
                 session_id,
+                timeout_secs,
             );
         }
         (libc::AF_INET6, IpAddr::V6(src), IpAddr::V6(dst)) if conntrack_v6_fd >= 0 => {
@@ -548,6 +559,7 @@ pub(super) fn publish_bpf_conntrack_entry(
                 alg_disable_flags,
                 app_id,
                 session_id,
+                timeout_secs,
             );
         }
         _ => {}
@@ -703,7 +715,7 @@ pub(super) fn refresh_bpf_conntrack_last_seen(
 ) -> usize {
     let now_secs = now_ns / 1_000_000_000;
 
-    sessions.iter_with_idle_budgeted(cursor, budget, now_ns, |key, _decision, metadata, idle_ns, counters| {
+    sessions.iter_with_idle_budgeted(cursor, budget, now_ns, |key, _decision, metadata, idle_ns, counters, expires_after_ns| {
         // Only refresh forward entries — reverse entries mirror the forward.
         // #2501: the forward SessionEntry carries BOTH directions' counters
         // (the reverse entry shares them via the canonical forward key the
@@ -736,6 +748,21 @@ pub(super) fn refresh_bpf_conntrack_last_seen(
                     // so a live policy reorder no longer mis-attributes this
                     // established session's row.
                     value.policy_id = reresolved_policy_id;
+                    // #8125: re-stamp the session's OWN window. The publisher
+                    // stamps a constant 1800 at install, so without this the
+                    // column reports the Junos established-timeout default for
+                    // every session whatever window is in force — including a
+                    // half-closed session on a 30 s (or configured 3 s) closing
+                    // window, where the reap behaviour differs by an order of
+                    // magnitude and the column does not.
+                    //
+                    // Zero is not written: it would render as an immediate
+                    // expiry the session is not on. The walk only reaches
+                    // occupied slots, so a zero here means the window itself is
+                    // unset rather than the entry being absent.
+                    if expires_after_ns > 0 {
+                        value.timeout = (expires_after_ns / 1_000_000_000) as u32;
+                    }
                     // #2501: surface live per-session volume so `show security
                     // flow session` reports real byte/packet counts.
                     // #7919: an all-zero entry is a SIBLING WORKER's replica of
@@ -779,6 +806,10 @@ pub(super) fn refresh_bpf_conntrack_last_seen(
                     // #3395: re-stamp the re-resolved current positional policy_id
                     // (see v4 arm).
                     value.policy_id = reresolved_policy_id;
+                    // #8125: re-stamp the session's own window (see v4 arm).
+                    if expires_after_ns > 0 {
+                        value.timeout = (expires_after_ns / 1_000_000_000) as u32;
+                    }
                     // #2501: surface live per-session volume (see v4 arm).
                     // #7919: an all-zero entry is a SIBLING WORKER's replica of
                     // a live session and must not overwrite the owner's volume.
@@ -870,6 +901,7 @@ pub(super) fn publish_session_map_entry_for_session_with_conntrack(
                 ctx.alg_disable_flags,
                 ctx.app_id,
                 ctx.session_id,
+                ctx.timeout_secs,
             );
         }
         return Ok(());
@@ -887,6 +919,7 @@ pub(super) fn publish_session_map_entry_for_session_with_conntrack(
             ctx.alg_disable_flags,
             ctx.app_id,
             ctx.session_id,
+            ctx.timeout_secs,
         );
     }
     result

@@ -395,7 +395,7 @@ fn build_conntrack_value_stamps_stable_session_id_v4() {
     // #4915-namespaced id that is clearly not 0 or a small ordinal.
     const SID: u64 = (7u64 << 48) | 42;
     let value = publish_conntrack::build_conntrack_value_v4(
-        &key, decision, &metadata, 0, 1, 2, 100, 0, 0, SID,
+        &key, decision, &metadata, 0, 1, 2, 100, 0, 0, SID, 0,
     )
     .expect("a v4 session must map to a v4 conntrack value");
     assert_eq!(
@@ -422,7 +422,7 @@ fn build_conntrack_value_stamps_stable_session_id_v6() {
     let metadata = synced_forward_metadata();
     const SID: u64 = (3u64 << 48) | 7;
     let value = publish_conntrack::build_conntrack_value_v6(
-        &key, decision, &metadata, 0, 1, 2, 100, 0, 0, SID,
+        &key, decision, &metadata, 0, 1, 2, 100, 0, 0, SID, 0,
     )
     .expect("a v6 session must map to a v6 conntrack value");
     assert_eq!(
@@ -566,7 +566,7 @@ fn build_conntrack_value_stamps_ingress_identity_v4_4983() {
     metadata.ingress_vlan_id = 80;
 
     let value = publish_conntrack::build_conntrack_value_v4(
-        &key, decision, &metadata, 0, 1, 2, 100, 0, 0, 0,
+        &key, decision, &metadata, 0, 1, 2, 100, 0, 0, 0, 0,
     )
     .expect("a v4 session must map to a v4 conntrack value");
 
@@ -602,7 +602,7 @@ fn build_conntrack_value_stamps_ingress_identity_v6_4983() {
     metadata.ingress_vlan_id = 80;
 
     let value = publish_conntrack::build_conntrack_value_v6(
-        &key, decision, &metadata, 0, 1, 2, 100, 0, 0, 0,
+        &key, decision, &metadata, 0, 1, 2, 100, 0, 0, 0, 0,
     )
     .expect("a v6 session must map to a v6 conntrack value");
 
@@ -642,7 +642,7 @@ fn ingress_identity_does_not_occupy_the_fib_egress_slots_4983() {
     metadata.ingress_vlan_id = 80;
 
     let value = publish_conntrack::build_conntrack_value_v4(
-        &key, decision, &metadata, 0, 1, 2, 100, 0, 0, 0,
+        &key, decision, &metadata, 0, 1, 2, 100, 0, 0, 0, 0,
     )
     .expect("a v4 session must map to a v4 conntrack value");
 
@@ -835,4 +835,120 @@ fn the_mirror_gate_holds_for_a_real_sibling_replica_7919() {
     // (tests_bind_forward.rs), which is what establishes that a sibling's entry
     // really is all-zero; this cell is about what the gate then does with it.
     let _ = SessionTable::new();
+}
+
+// #8125 FAIL-ON-REVERT: the conntrack row's `Timeout:` column must report the
+// session's OWN window, not a constant.
+//
+// The column read `1800` for every session — the JUNOS default for
+// `established-timeout` — whatever window was actually in force. Measured on the
+// cluster before the fix, with the reap behaviour proving the windows differed:
+//
+//     closing-timeout UNSET (30 s window):  Timeout: 1800s   session alive at +8s
+//     closing-timeout 3     (3 s window):   Timeout: 1800s   session GONE  at +8s
+//
+// and 1800 for ESTABLISHED sessions too, whose window is 300 s
+// (DEFAULT_TCP_SESSION_TIMEOUT_NS) unless configured. A wrong number is
+// indistinguishable from a right one at the point of reading, which is what
+// makes this worse than an unimplemented column.
+//
+// TWO sessions with DIFFERENT windows, because a single-session cell cannot see
+// this defect: any constant passes it.
+#[test]
+fn conntrack_timeout_column_reports_the_session_window_8125() {
+    let key = SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: 6,
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+        src_port: 41086,
+        dst_port: 5201,
+        discriminator: Default::default(),
+        routing_domain: 0,
+    };
+    let decision = local_delivery_decision(0);
+    let metadata = synced_forward_metadata();
+
+    // The two windows an operator actually sees on one box at one time: an
+    // ESTABLISHED session on its 300 s default and a half-closed one on the
+    // 30 s closing window.
+    const ESTABLISHED_SECS: u32 = 300;
+    const CLOSING_SECS: u32 = 30;
+
+    let established = publish_conntrack::build_conntrack_value_v4(
+        &key, decision, &metadata, 0, 1, 2, 100, 0, 0, 0, ESTABLISHED_SECS,
+    )
+    .expect("a v4 session must map to a v4 conntrack value");
+    let closing = publish_conntrack::build_conntrack_value_v4(
+        &key, decision, &metadata, 0, 1, 2, 100, 0, 0, 0, CLOSING_SECS,
+    )
+    .expect("a v4 session must map to a v4 conntrack value");
+
+    assert_eq!(
+        established.timeout, ESTABLISHED_SECS,
+        "the row must report the ESTABLISHED window, not the 1800 constant"
+    );
+    assert_eq!(
+        closing.timeout, CLOSING_SECS,
+        "the row must report the CLOSING window, not the 1800 constant"
+    );
+    // The property the two rows exist for. Asserting each value alone would
+    // pass on a builder that returned its argument for one call and a constant
+    // for the other; asserting they DIFFER is what a constant cannot satisfy.
+    assert_ne!(
+        established.timeout, closing.timeout,
+        "two sessions on windows an order of magnitude apart must not render \
+         the same Timeout column (#8125)"
+    );
+
+    // The documented fallback, and the only place 1800 survives: a publish with
+    // NO live table entry has no window to report, which is the pre-#8125
+    // behaviour for exactly that case.
+    let no_entry = publish_conntrack::build_conntrack_value_v4(
+        &key, decision, &metadata, 0, 1, 2, 100, 0, 0, 0, 0,
+    )
+    .expect("a v4 session must map to a v4 conntrack value");
+    assert_eq!(
+        no_entry.timeout, 1800,
+        "with no live entry the documented default stands; the refresh loop \
+         corrects it within one cycle once an entry exists"
+    );
+}
+
+// #8125 v6 sibling. The v6 builder carried its own copy of the constant, and a
+// fix applied to one renderer with the sibling surface left behind is the #8258
+// class — every v4 cell above passes against exactly that half-fix.
+#[test]
+fn conntrack_timeout_column_reports_the_session_window_v6_8125() {
+    let key = SessionKey {
+        addr_family: libc::AF_INET6 as u8,
+        protocol: 6,
+        src_ip: IpAddr::V6("2001:559:8585:bf01::102".parse().unwrap()),
+        dst_ip: IpAddr::V6("2001:559:8585:80::200".parse().unwrap()),
+        src_port: 41086,
+        dst_port: 5201,
+        discriminator: Default::default(),
+        routing_domain: 0,
+    };
+    let decision = local_delivery_decision(0);
+    let metadata = synced_forward_metadata();
+
+    let established = publish_conntrack::build_conntrack_value_v6(
+        &key, decision, &metadata, 0, 1, 2, 100, 0, 0, 0, 300,
+    )
+    .expect("a v6 session must map to a v6 conntrack value");
+    let closing = publish_conntrack::build_conntrack_value_v6(
+        &key, decision, &metadata, 0, 1, 2, 100, 0, 0, 0, 30,
+    )
+    .expect("a v6 session must map to a v6 conntrack value");
+
+    assert_eq!(established.timeout, 300);
+    assert_eq!(closing.timeout, 30);
+    assert_ne!(established.timeout, closing.timeout);
+
+    let no_entry = publish_conntrack::build_conntrack_value_v6(
+        &key, decision, &metadata, 0, 1, 2, 100, 0, 0, 0, 0,
+    )
+    .expect("a v6 session must map to a v6 conntrack value");
+    assert_eq!(no_entry.timeout, 1800);
 }
