@@ -1990,6 +1990,36 @@ fn wire_invariant_default_specimens() {
     s.insert("config_snapshot".into(), dump(&ConfigSnapshot::default()));
     s.insert("control_request".into(), dump(&ControlRequest::default()));
     s.insert("control_response".into(), dump(&ControlResponse::default()));
+    // #8121: a POPULATED specimen, not a default one, and that is the point.
+    //
+    // `idle_leases` on ControlRequest/ControlResponse carries
+    // `skip_serializing_if = "Vec::is_empty"`, and every specimen above is a
+    // `::default()` — so an empty vec is omitted and this payload's field
+    // spellings were invisible to the wire pin entirely. Four of its own
+    // fields carry `skip_serializing_if` too, so even a non-empty vec of
+    // defaults would hide them.
+    //
+    // That gap is not specific to this type: ANY field that is
+    // `skip_serializing_if` on its default value is unpinned by a default
+    // specimen. This one is pinned because the Go side (`IdleLeaseWire`,
+    // pkg/dataplane/userspace/protocol.go) has to agree with it field for
+    // field across the control socket, and nothing else asserts that.
+    s.insert(
+        "idle_lease_wire".into(),
+        dump(&IdleLeaseWire {
+            pool_name: "p1".into(),
+            protocol: 6,
+            src_ip: "10.0.61.102".into(),
+            src_port: 40000,
+            remote_ip: "8.8.8.8".into(),
+            remote_port: 443,
+            translated_ip: "172.16.80.7".into(),
+            translated_port: 51400,
+            address_only: true,
+            remaining_ns: 123,
+            timeout_ns: 300_000_000_000,
+        }),
+    );
     s.insert("cos_active_flow_count_status".into(), dump(&CoSActiveFlowCountStatus::default()));
     s.insert("cos_dscp_classifier_entry_snapshot".into(), dump(&CoSDSCPClassifierEntrySnapshot::default()));
     s.insert("cos_dscp_classifier_snapshot".into(), dump(&CoSDSCPClassifierSnapshot::default()));
