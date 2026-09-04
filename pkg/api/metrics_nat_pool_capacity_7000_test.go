@@ -8,6 +8,7 @@ import (
 	dto "github.com/prometheus/client_model/go"
 
 	"github.com/psaab/xpf/pkg/dataplane"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
 // #7000: the `xpf_nat_pool_total_ports` gauge is the DENOMINATOR of pool
@@ -37,7 +38,7 @@ func natPoolGauges(t *testing.T, setLines []string, poolIDs map[string]uint8) (m
 	}
 	ch := make(chan prometheus.Metric)
 	go func() {
-		c.collectNATPoolMetrics(ch, dp)
+		c.collectNATPoolMetrics(ch, dp, &dpuserspace.ProcessStatus{})
 		close(ch)
 	}()
 	got := map[string]float64{}

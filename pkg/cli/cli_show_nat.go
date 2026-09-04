@@ -196,12 +196,13 @@ func (c *CLI) showNATSourceSummary(cfg *config.Config) error {
 	// Count pools: named pools + interface-mode rules
 	type ruleSetKey struct{ from, to string }
 	type poolInfo struct {
-		name    string
-		address string
-		total   int // total ports (0 = N/A for interface)
-		used    int
-		isIface bool
-		key     ruleSetKey
+		name      string
+		address   string
+		total     int // total ports (0 = N/A for interface)
+		used      int
+		usedKnown bool
+		isIface   bool
+		key       ruleSetKey
 	}
 	var pools []poolInfo
 
@@ -257,15 +258,19 @@ func (c *CLI) showNATSourceSummary(cfg *config.Config) error {
 			for name, id := range cr.ZoneIDs {
 				zoneByID[id] = name
 			}
+			// #8606: occupancy comes from the helper's live status. The
+			// legacy `nat_port_counters` map is seeded with `rand.Uint64()`
+			// and nothing has advanced it since #1476 deleted the eBPF
+			// pipeline, so reading it reported a random number as used ports.
+			// See `userspace.SourceNATPoolOccupancy`.
+			occ := c.sourceNATPoolOccupancy()
 			for i := range pools {
 				if pools[i].isIface {
 					continue
 				}
-				if id, ok := cr.PoolIDs[pools[i].name]; ok {
-					cnt, err := c.dp.ReadNATPortCounter(uint32(id))
-					if err == nil {
-						pools[i].used = int(cnt)
-					}
+				if rp, ok := occ[pools[i].name]; ok {
+					pools[i].used = int(rp.UsedPorts)
+					pools[i].usedKnown = true
 				}
 			}
 		}
@@ -331,12 +336,23 @@ func (c *CLI) showNATSourceSummary(cfg *config.Config) error {
 		// and fail-closed if it stops holding.
 		if p.total > 0 && poolDisarm == "" {
 			ports = fmt.Sprintf("%d", p.total)
-			a := p.total - p.used
-			if a < 0 {
-				a = 0
+			// #8606: Available and Utilization are both DERIVED from `used`.
+			// With no live occupancy there is nothing to derive them from, and
+			// computing them off a zeroed `used` would render "full capacity
+			// available, 0.0% utilized" for a pool nobody measured -- the same
+			// measured-looking fabrication #7473 removed from the Used column.
+			// Ports is config-derived and stays.
+			if p.usedKnown {
+				a := p.total - p.used
+				if a < 0 {
+					a = 0
+				}
+				avail = fmt.Sprintf("%d", a)
+				util = fmt.Sprintf("%.1f%%", float64(p.used)/float64(p.total)*100)
+			} else {
+				avail = "unknown"
+				util = "unknown"
 			}
-			avail = fmt.Sprintf("%d", a)
-			util = fmt.Sprintf("%.1f%%", float64(p.used)/float64(p.total)*100)
 		}
 		// #7473: the USED column was the one number in this row that ignored
 		// `poolDisarm`. Ports/Available/Utilization already render N/A for a
@@ -349,7 +365,13 @@ func (c *CLI) showNATSourceSummary(cfg *config.Config) error {
 		// `poolDisarm` the annotation below renders.
 		used := "N/A"
 		if poolDisarm == "" {
-			used = fmt.Sprintf("%d", p.used)
+			// #8606: "unknown" (helper not reporting) is a third state,
+			// distinct from N/A (pool refused) and from a measured number.
+			if p.usedKnown {
+				used = fmt.Sprintf("%d", p.used)
+			} else {
+				used = "unknown"
+			}
 		}
 		fmt.Printf("%-20s %-20s %-8s %-8s %-12s %-12s\n",
 			p.name, p.address, ports, used, avail, util)
@@ -383,10 +405,12 @@ func (c *CLI) showNATSourcePool(cfg *config.Config, poolName string) error {
 
 	// If poolName is empty or "all", show all pools
 	showAll := poolName == "" || poolName == "all"
-	var cr *dataplane.ApplyResult
-	if c.dp != nil && c.dp.IsLoaded() {
-		cr = c.applyResult()
-	}
+
+	// #8606: pool occupancy is read from the helper's live status, not from
+	// the legacy `nat_port_counters` map (a `rand.Uint64()` seed with no
+	// writer since #1476). The apply result is no longer consulted here --
+	// its only use was the PoolID needed to index that map.
+	detailOccupancy := c.sourceNATPoolOccupancy()
 
 	detailOverBudget := config.SourceNATAggregateOverBudgetPools(cfg)
 	for name, pool := range cfg.Security.NAT.SourcePools {
@@ -427,21 +451,25 @@ func (c *CLI) showNATSourcePool(cfg *config.Config, poolName string) error {
 		// The gate is `unusable`, the SAME value the line above renders --
 		// not a second call to the predicate, which would be a second chance
 		// to disagree with it.
-		if cr != nil && unusable == "" {
-			if id, ok := cr.PoolIDs[name]; ok {
-				cnt, err := c.dp.ReadNATPortCounter(uint32(id))
-				if err == nil {
-					avail := totalPorts - int(cnt)
-					if avail < 0 {
-						avail = 0
-					}
-					fmt.Printf("  Ports allocated: %d\n", cnt)
-					fmt.Printf("  Ports available: %d\n", avail)
-					if totalPorts > 0 {
-						fmt.Printf("  Utilization: %.1f%%\n",
-							float64(cnt)/float64(totalPorts)*100)
-					}
+		// #8606: the helper's live status is the only source of occupancy.
+		// When it has no entry for this pool there is NO measurement, and
+		// printing "Ports allocated: 0" would be the fabricated healthy zero
+		// #7473 refused for a disarmed pool. Say so instead.
+		if unusable == "" {
+			if rp, ok := detailOccupancy[name]; ok {
+				used := int(rp.UsedPorts)
+				avail := totalPorts - used
+				if avail < 0 {
+					avail = 0
 				}
+				fmt.Printf("  Ports allocated: %d\n", used)
+				fmt.Printf("  Ports available: %d\n", avail)
+				if totalPorts > 0 {
+					fmt.Printf("  Utilization: %.1f%%\n",
+						float64(used)/float64(totalPorts)*100)
+				}
+			} else {
+				fmt.Printf("  Ports allocated: unknown (dataplane helper not reporting)\n")
 			}
 		}
 		fmt.Println()
@@ -1081,4 +1109,19 @@ func natPoolArg(rest []string) string {
 		return rest[1]
 	}
 	return ""
+}
+
+// sourceNATPoolOccupancy indexes the helper's live source-NAT pool status by
+// pool name, deduplicated (never summed -- rules sharing a pool share one
+// allocator and report identical UsedPorts).
+//
+// #8606: this replaces reads of the legacy `nat_port_counters` map, which is
+// seeded with `rand.Uint64()` and has had no writer since #1476 deleted the
+// eBPF pipeline, so it reported a random number as pool occupancy.
+func (c *CLI) sourceNATPoolOccupancy() map[string]dpuserspace.SourceNATPoolStatus {
+	st, err := c.userspaceDataplaneStatus()
+	if err != nil {
+		return nil
+	}
+	return dpuserspace.SourceNATPoolOccupancy(st)
 }

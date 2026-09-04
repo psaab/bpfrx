@@ -11,6 +11,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"github.com/psaab/xpf/pkg/natshow"
 	"github.com/psaab/xpf/pkg/vrrp"
@@ -149,7 +150,40 @@ func (s *Server) GetNATPoolStats(ctx context.Context, _ *pb.GetNATPoolStatsReque
 
 	resp := &pb.GetNATPoolStatsResponse{}
 	cr := s.loadedApplyResult()
-	telemetry := s.telemetry()
+
+	// #8606: pool occupancy comes from the helper's live status, never from
+	// the legacy `nat_port_counters` map. That map is seeded with
+	// `rand.Uint64()` and nothing has advanced it since the eBPF pipeline was
+	// deleted (#1476), so reading it reported a RANDOM number as used ports --
+	// which then saturated to `math.MinInt32` through the unchecked
+	// `int64(cnt)` below `clampInt32`. See
+	// `userspace.SourceNATPoolOccupancy` for the full derivation.
+	//
+	// An unavailable helper leaves `used64` at 0 with `UsedPortsAvailable`
+	// false, rather than substituting the seed: a random value presented as a
+	// measurement is worse than no value, which is the same judgement #7473
+	// made about the disarmed-pool zero.
+	// A status read FAILURE fails the RPC as unavailable rather than
+	// degrading every pool to "unknown" (#5046, #3345 counter-error
+	// contract). This matches natPoolStatsHandler, which already returns 500
+	// on the same failure -- the two surfaces must not disagree about whether
+	// an unreadable helper is an error or a state.
+	// "No Status() surface" and "the Status() round trip FAILED" are different
+	// answers and must not collapse. `userspaceDataplaneStatus` returns an
+	// error for both, and treating that as a failure fails the RPC on every
+	// deployment that simply has no userspace helper -- the NORMAL case, not
+	// the exceptional one. Only a genuine round-trip failure fails closed
+	// (#5046, #3345), matching natPoolStatsHandler; an absent surface leaves
+	// occupancy unknown.
+	var poolOccupancy map[string]dpuserspace.SourceNATPoolStatus
+	if provider, ok := s.dpProbe().(userspaceStatusProvider); ok {
+		st, stErr := provider.Status()
+		if stErr != nil {
+			return nil, status.Errorf(codes.Internal,
+				"NAT pool runtime status read failed: %v", stErr)
+		}
+		poolOccupancy = dpuserspace.SourceNATPoolOccupancy(st)
+	}
 
 	// Named pools
 	grpcOverBudget := config.SourceNATAggregateOverBudgetPools(cfg)
@@ -175,27 +209,34 @@ func (s *Server) GetNATPoolStats(ctx context.Context, _ *pb.GetNATPoolStatsReque
 		// all three; the shared multiplication above is unchanged.
 		totalPorts64, poolDisarm := config.SourceNATPoolReportablePorts(pool, name, portLow, portHigh, grpcOverBudget)
 		var used64 int64
-		if cr != nil {
-			if id, ok := cr.PoolIDs[name]; ok {
-				cnt, err := telemetry.NATPortCounter(uint32(id))
-				if err != nil {
-					// A counter read FAILURE must fail the RPC as unavailable,
-					// not return a healthy zero-usage pool (#5046, #3345
-					// counter-error contract, matching GetZones/GetPolicies).
-					return nil, status.Errorf(codes.Internal,
-						"NAT pool port counter read failed for pool %q: %v", name, err)
-				}
-				used64 = int64(cnt)
-			}
+		usedKnown := false
+		if rp, ok := poolOccupancy[name]; ok {
+			// The helper's occupancy is a real count bounded by the pool's own
+			// port window, so it cannot exceed MaxInt64 and the conversion is
+			// safe. It still saturates through clampInt32 on the way to the
+			// wire, because `total_ports` legitimately can exceed int32
+			// (#2282).
+			used64 = int64(rp.UsedPorts)
+			usedKnown = true
 		}
 
 		avail64 := totalPorts64 - used64
 		if avail64 < 0 {
 			avail64 = 0
 		}
-		util := "0.0%"
-		if totalPorts64 > 0 {
+		// #8606: "unknown" is a THIRD state and must not collapse onto "0.0%".
+		// The helper is the only source of occupancy; when it is not running
+		// there is no measurement, and rendering 0.0% would be a fabricated
+		// healthy reading. Utilization is already a string on this message, so
+		// the unknown case is expressible without a wire change.
+		util := "unknown"
+		switch {
+		case !usedKnown:
+			util = "unknown"
+		case totalPorts64 > 0:
 			util = fmt.Sprintf("%.1f%%", float64(used64)/float64(totalPorts64)*100)
+		default:
+			util = "0.0%"
 		}
 
 		// #7473: the reason was computed above for the capacity and discarded
