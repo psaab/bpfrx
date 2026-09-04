@@ -58,7 +58,163 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 	if head == "authentication-key" {
 		return true
 	}
-	return containerKeyword == "match"
+	if containerKeyword == "match" {
+		return true
+	}
+	// #8690, second increment: the CREDENTIAL family. Chosen on consequence
+	// rather than on count — each of these is a token whose silent drop leaves
+	// something authenticating (or authorizing) with NOTHING, on a commit that
+	// reports success. That is the failure #8689 demonstrated on its own
+	// `authentication-key` above: the brace-elided spelling compiled to an
+	// empty AuthKey, rendered as `area-password md5`, and the IS-IS adjacency
+	// came up unauthenticated.
+	//
+	// EVERY ENTRY BELOW WAS MEASURED, not reasoned about. The rule is that a
+	// site may enter this pass only once the census shows its elided spelling
+	// compiling identically to the EMPTY stanza — a positive measurement that
+	// no reader consumes the packed tail today, so moving it cannot break one.
+	// `TestCompactNormalizeScopePreservesCompiledResult8690` re-derives that for
+	// every admitted site on each run, against the same census machinery the
+	// inventory uses, so this list cannot drift from its own justification.
+	//
+	// The measurement also EXCLUDED members of the family, and NEITHER exclusion
+	// came from empty-equivalence — see the two notes below. Membership is by
+	// measurement rather than by name, and the measurement that matters is not
+	// always the one the rule names.
+	//
+	// EXCLUDED BY DESIGN, and this is not the empty-equivalence rule — it is a
+	// second gate that behaviour measurement cannot see. `system login user
+	// <u> authentication <leaf>` measures empty-equivalent (nothing reads the
+	// tail), and normalizing it would still be wrong: the compact spelling is
+	// REJECTED at commit by the #6662 packed-login-body gate, and on the
+	// tolerant load / peer-sync path it is warned and left inert on purpose, so
+	// a peer-synced config behaves exactly as the binary that accepted it did
+	// (#1960). Compiling the value there would change RBAC across an HA sync,
+	// silently, between nodes on different binaries.
+	//
+	// `filedByDesign` in compact_block_equivalence_2419_test.go is the registry,
+	// and its tripwire is what caught this: the empty-equivalence probe said
+	// "safe" for all four leaves, because the probe measures whether a reader
+	// consumes the tail and cannot see a decision that it SHOULD NOT be read.
+	//
+	// `user` is excluded too, and the registry does NOT list it — that was
+	// found by measuring the gate rather than by reading the registry. The
+	// normalizer runs at compiler.go:210 and the #6662 gate at :349, so a
+	// rewritten tree reaches the gate already un-packed. Measured before and
+	// after admitting `user`/`class`:
+	//
+	//	before: `system login user u1 class super-user;` -> REJECTED at commit
+	//	        ("the account resolves to the fail-closed `unauthorized` class
+	//	         ... on a binary before #6701 it instead reached the legacy
+	//	         no-RBAC allow-everything mode")
+	//	after:  compiles clean
+	//
+	// Normalizing it does not merely change a spelling: it converts a loud
+	// commit-time rejection into a silent acceptance, and makes an RBAC class
+	// compile on this binary that a peer on an older one still drops. The
+	// registry lists the four `authentication` leaves; the GATE governs the
+	// whole packed login body. Only the before/after comparison shows the
+	// difference, so the exclusion is by container, not by the registry.
+	if containerKeyword == "authentication" || containerKeyword == "user" {
+		return false
+	}
+	if compactCredentialHeads[head] {
+		return true
+	}
+	// `key` is too generic to admit unqualified — it appears on containers that
+	// read their tail — so it is scoped to the containers that measured safe.
+	// (`class` was scoped here too, under `user`; that branch is gone because
+	// the container exclusion above already made it unreachable, and leaving a
+	// dead branch would misdescribe the scope to the next reader.)
+	//
+	// Stated as an `if` rather than a `switch` on containerKeyword so a
+	// non-matching head under `tunnel`/`md5` FALLS THROUGH to the pair switch
+	// below instead of returning false early. The two families are independent
+	// and neither may silently shadow the other.
+	if (containerKeyword == "tunnel" || containerKeyword == "md5") && head == "key" {
+		return true
+	}
+	// #8690 family 2: the POLICY-ENFORCEMENT surface — security zones and
+	// security policies. 20 sites left the inventory and none entered it, and
+	// every one of the 20 was recorded with drop shape "empty": the
+	// measurement that no reader consumes the tail today, and therefore that
+	// truncating it takes nothing away.
+	//
+	// 20 rather than the 17 zones+policies sites the pairs were chosen for.
+	// Three came along because they share a pair: `security address-book global
+	// address-set <s> {address,address-set}` and `security pre-id-default-policy
+	// then log`. They are the same shape and the same consequence class, so they
+	// are in scope deliberately rather than tolerated — but they are named here
+	// because "the diff is bigger than the families I listed" is exactly the
+	// sentence a reviewer should be able to check.
+	//
+	// `security policies from-zone <a> <b> <c> policy` is NOT covered: its pair
+	// is `from-zone policy`, which is not listed, so the bare policy instance
+	// remains in the inventory. Left out rather than added quietly, so the
+	// inventory diff continues to equal the declared scope.
+	//
+	// The consequential members are not the descriptions:
+	//
+	//	security-zone <z> screen <profile>      the zone's IDS screen binding
+	//	security-zone <z> host-inbound-traffic  what the box itself accepts there
+	//	security-zone <z> interfaces <if> ...   per-interface admission
+	//	policy <p> then log                     session logging for the policy
+	//
+	// A brace-elided `screen` leaves the zone with no screen profile applied,
+	// on a commit that reports success — the same shape as #8689's IS-IS
+	// authentication key, one layer up.
+	//
+	// SCOPED BY (container, head) PAIR RATHER THAN BY CONTAINER KEYWORD, and
+	// the difference is load-bearing. `then` is not specific enough: the
+	// `then log` sites here are shape "empty", but
+	// `policy-options policy-statement <p> term <t> then <action>` is shape
+	// "partial" for eight actions — something DOES consume part of that tail,
+	// so truncating it could remove a value that is currently read. A
+	// containerKeyword == "then" rule would have crossed into them silently.
+	//
+	// That is why the widening rule is per SITE rather than per family: a
+	// family label is not a safety property, and this is the case that proves
+	// it. TestNormalizerScopeNeverCoversAPartialSite8690 binds it mechanically
+	// so the next widening cannot make the same mistake by inspection.
+	switch containerKeyword + " " + head {
+	case "zones security-zone",
+		"security-zone screen",
+		"security-zone description",
+		"security-zone interfaces",
+		"security-zone address-book",
+		"security-zone host-inbound-traffic",
+		"host-inbound-traffic protocols",
+		"host-inbound-traffic system-services",
+		"address-set address",
+		"address-set address-set",
+		"address-book address-set",
+		"policies default-policy-log",
+		"policies from-zone",
+		"policies global",
+		"policy description",
+		"policy then",
+		"then log",
+		"global policy":
+		return true
+	}
+	return false
+}
+
+// compactCredentialHeads are the #8690 credential leaves whose heads are
+// distinctive enough to admit without qualifying the container. Each was
+// measured empty-equivalent; see compactNormalizeInScope.
+var compactCredentialHeads = map[string]bool{
+	"encrypted-password":       true,
+	"ssh-dsa":                  true,
+	"ssh-rsa":                  true,
+	"ssh-ed25519":              true,
+	"pre-shared-key":           true,
+	"preshared-key":            true,
+	"private-key":              true,
+	"authentication-type":      true,
+	"authentication-algorithm": true,
+	"authentication-method":    true,
+	"pseudorandom-function":    true,
 }
 
 func normalizeCompactNodes(nodes []*Node, schema *schemaNode) int {

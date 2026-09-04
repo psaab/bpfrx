@@ -5,6 +5,23 @@ package config
 // load/peer-sync path can share the identical compile + group-expansion
 // pipeline while differing on a single, narrow validator's severity.
 type compileOpts struct {
+	// #8690 TEST SEAM, and the only one in this struct. When true, the
+	// brace-elided normalizer (compact_normalize_8662.go) is not run.
+	//
+	// It exists because the normalizer ERASES the evidence for its own safety
+	// rule. A site may only be normalized once its elided spelling compiles to
+	// the EMPTY stanza — a positive measurement that no reader consumes the
+	// packed tail. Once the pass is in scope for that site, elided and braced
+	// compile identically by construction, so the measurement can no longer be
+	// taken through the compile path, and the safety claim degrades into "it
+	// was true when someone checked".
+	//
+	// With this flag the claim is re-derived on every run by
+	// TestCompactNormalizeScopePreservesCompiledResult8690, so a future widening that
+	// admits a tail somebody reads is caught rather than reasoned about.
+	// Production never sets it.
+	skipCompactNormalize bool
+
 	// #1830 (e): the former lenientEqualFlowWorkerCap flag (#1733) is
 	// retired along with validateEqualFlowWorkerCapStrict — the
 	// dataplane no longer caps equal-flow-enforcement at 32 workers, so
