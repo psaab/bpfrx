@@ -6317,3 +6317,45 @@ fn cached_cos_tx_selection_carries_the_reject_message_type_6854() {
         "#6854: a cached reject with no message-type must keep administratively-prohibited"
     );
 }
+
+/// #8597 K41: the precondition for the fallback arm's None branch — a prepared
+/// descriptor pointing outside the UMEM makes the clone refuse rather than
+/// return garbage.
+///
+/// WHAT THIS DOES AND DOES NOT BIND, stated so nobody reads it as more.
+/// It binds that `None` is REACHABLE, which is what makes the caller's arm
+/// worth having. It does NOT drive the caller's arm: reaching that needs a
+/// prepared item whose enqueue fails AND whose descriptor is already corrupt,
+/// and the prepare step writes the offset it later reads back, so nothing in
+/// this harness can mint that pairing without a corruption seam that does not
+/// exist. The caller's arm is therefore covered by construction (it cannot
+/// panic — there is no `expect` left) rather than by a fail-on-revert cell, and
+/// the anti-over-count control is the existing
+/// `..._admission_drop_does_not_inflate_tx_errors` cell, which still passes:
+/// this change adds a `tx_errors` bump on a FAULT and must not disturb the
+/// shaping-drop accounting.
+#[test]
+fn clone_prepared_request_for_cos_refuses_an_out_of_bounds_descriptor_8597_k41() {
+    let area = MmapArea::new(4096).expect("mmap");
+    let req = PreparedTxRequest {
+        // Past the end of a 4096-byte area: `area.slice` must refuse.
+        offset: 8192,
+        len: 64,
+        recycle: PreparedTxRecycle::FreeTxFrame,
+        expected_ports: None,
+        expected_addr_family: libc::AF_INET as u8,
+        expected_protocol: PROTO_TCP,
+        flow_key: None,
+        egress_ifindex: 80,
+        cos_queue_id: Some(0),
+        dscp_rewrite: None,
+        mirror_clone: false,
+        enqueue_ns: 0,
+    };
+    assert!(
+        clone_prepared_request_for_cos(&area, &req).is_none(),
+        "a descriptor outside the UMEM must make the clone refuse — the caller \
+         turns that refusal into a counted drop instead of the worker panic it \
+         used to be (#8597 K41)"
+    );
+}
