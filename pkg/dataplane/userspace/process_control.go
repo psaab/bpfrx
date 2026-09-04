@@ -54,8 +54,21 @@ const (
 	controlDeadlinePerMiB = 1 * time.Second
 	// controlMaxDeadline caps the scaled deadline so a genuinely-hung helper
 	// still eventually times out rather than blocking the caller (which holds
-	// m.mu across the round-trip) forever. At the 64 MiB request ceiling the
-	// scaled deadline is base + 64s = 67s, comfortably under this cap.
+	// m.mu across the round-trip) forever.
+	//
+	// IT IS NOT THE REACHABLE BOUND, AND MUST NOT BE QUOTED AS ONE. The only
+	// production caller of controlRoundtripDeadline is requestDetailedLocked
+	// below, strictly AFTER the #2744 pre-flight rejects a body over
+	// MaxControlRequestBytes — so the largest body that ever reaches the sizing
+	// function is 64 MiB, giving base + 64s = 67s. This 120s clamp only binds
+	// on a body that cannot occur, and exists so the sizing function is total.
+	//
+	// The reachable bound is what any stop-budget analysis must use: 67s
+	// against the unit's TimeoutStopSec=20 is a 3.35x overrun, not the 6x that
+	// reading this constant alone suggests. #7675 made exactly that error and
+	// promoted the inflated figure into a design constraint;
+	// control_deadline_reachable_bound_7675_test.go pins the reachable bound,
+	// the pre-flight ordering it depends on, and the ratio band.
 	controlMaxDeadline = 120 * time.Second
 )
 
