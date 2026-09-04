@@ -48,6 +48,27 @@ orderings and `#[inline]` attributes moved byte-identical, and the
   undrained RPC-fallback delta arms `delta_loss_pending`; the owning
   worker folds it into `SessionTable::set_delta_loss` so the standby
   recovers via table-truth re-export instead of silently diverging.
+- **...but the resync's OWN deltas must not arm it (#8593).** The resync
+  is a full owner-RG export, and it publishes through
+  `flush_session_deltas` into THIS buffer — which its chunked drain does
+  not empty (that drain empties the `SessionTable` ring) and which the Go
+  side polls on the ~5 s `DrainSessionDeltas` cadence. So the export
+  overflows the buffer whose overflow triggered it, and re-arms.
+  Measured on `loss:xpf-userspace-fw0`: 125,780 session creates produced
+  25.26M deltas of which 23.29M (92%) were dropped, and with the
+  generator stopped and `active_flow_count = 0` the helper kept
+  generating ~149k deltas/s for ~90 s, ending only as the owned sessions
+  aged out. The signature was 32.68M dropped session-CREATE deltas
+  against 52k dropped closes — re-exported opens, not traffic.
+  `SessionDelta::bulk_resync` marks the export's own deltas and
+  `push_session_delta_bulk_export` counts their drops without arming.
+  The marker rides on the DELTA rather than a flag at the flush call
+  site because a call site that passed the flag wrongly would SUPPRESS a
+  genuine arm, silently; a producer that sets it cannot be got wrong by a
+  new drain site. Not-arming is also the correct answer, not merely the
+  loop-safe one: the recovery is an OPEN-ONLY snapshot of the owned set,
+  so it cannot restore a dropped CLOSE however many times it runs, and
+  every OPEN it could restore is already in the snapshot being shipped.
 - **Status-snapshot `last_error` precedence (#4971 / #6145).**
   `snapshot()` (`snapshot.rs`) renders `last_error` from TWO sources with
   a fixed precedence: the `last_error` **mutex** string (written by the

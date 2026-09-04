@@ -394,6 +394,7 @@ impl SessionTable {
                                 // frame carries the SAME id this session's
                                 // SESSION_CREATE did — the correlatable key.
                                 session_id: removed.session_id,
+                                bulk_resync: false,
                             });
                         }
                         expired_entries.push(ExpiredSession {

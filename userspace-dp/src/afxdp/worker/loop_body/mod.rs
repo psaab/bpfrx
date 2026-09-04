@@ -1304,11 +1304,38 @@ pub(crate) fn worker_loop(
             // Drain the existing backlog so the ring starts empty.
             drain_and_flush_all!();
             chunked_drain_as_you_export!(sessions.all_owner_rg_ids());
-            // The export drained to empty without overflowing, so any latch set
-            // during this resync was a genuinely-new local drop, not the export
-            // re-flooding itself. Clearing it here is unnecessary (drain-as-you-
-            // export does not drop), but the chunked loop guarantees no
-            // spurious re-arm regardless.
+            // #8593: that claim was TRUE OF ONE RING AND FALSE OF THE OTHER,
+            // and #5290 widened its scope without re-checking it. An earlier
+            // revision read: "The export drained to empty without overflowing,
+            // so any latch set during this resync was a genuinely-new local
+            // drop, not the export re-flooding itself."
+            //
+            // `chunked_drain_as_you_export!` does keep the SessionTable ring
+            // (`sessions.push_delta`) under its cap — that half is right. But
+            // every chunk is then flushed through `flush_session_deltas` into
+            // the PER-BINDING RPC-fallback buffer, which the chunking does not
+            // drain and which the Go side polls on the ~5 s
+            // `DrainSessionDeltas` cadence. #5290 later made THAT buffer's
+            // overflow arm this same latch, so the export re-armed the trigger
+            // that produced it.
+            //
+            // Measured on `loss:xpf-userspace-fw0`: 125,780 session creates
+            // produced 25.26M deltas of which 23.29M (92%) were dropped, and
+            // with the generator stopped and `active_flow_count = 0` the helper
+            // kept generating ~149k deltas/s for ~90 s, ending only as the
+            // owned sessions aged out. 32.68M dropped session-CREATE deltas
+            // against 52k dropped closes, from 32,768 real creates — the
+            // signature of re-exported opens, not of traffic.
+            //
+            // The export's own deltas now carry `SessionDelta::bulk_resync`
+            // (set by their sole producer, `emit_open_delta_with_origin`), and
+            // `flush_session_deltas` routes those to
+            // `push_session_delta_bulk_export`, which counts a drop but does not
+            // arm. The marker is on the DELTA rather than passed at this call
+            // site on purpose: a future drain site that passed the flag wrongly
+            // would SUPPRESS a genuine arm, silently, and here it does not
+            // choose. So the claim above is true again, and for both rings: any
+            // latch set from here on is a genuinely-new incremental drop.
         }
         // #7919: publish this tick's per-session counter answers into the
         // worker's reply slots. Answer fields FIRST, then the sequence with
