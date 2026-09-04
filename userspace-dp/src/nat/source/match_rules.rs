@@ -635,18 +635,30 @@ fn match_source_nat_result_for_tuple_inner(
                         // `has_l4_ports`). The token is freed by the SAME teardown
                         // path (`release_source_nat_allocation` -> `release_flow`)
                         // as the round-robin branch — no new release site, no leak.
-                        match rule
-                            .pool_allocator
-                            .reserve_address_only(flow, IpAddr::V4(pool_addr), NatHolder::Untracked)
-                        {
+                        // #8597 K09: pass the CALLING WORKER's holder, not
+                        // `Untracked`. `holder`'s own contract (see the
+                        // parameter doc) reserves `Untracked` for the test entry
+                        // points and the read-only fragment probe; this is a
+                        // real-flow mint. Minting with `holders == 0` leaves the
+                        // mask naming every SIBLING worker and not the owner
+                        // (`replicate_session_upsert` excludes the allocating
+                        // worker), so the last sibling replica to idle-reap frees
+                        // a reverse identity the owner is still forwarding on —
+                        // the #6522 mechanism, on the one path that still had it.
+                        // The det-PAT arm below has always passed `holder`.
+                        match rule.pool_allocator.reserve_address_only(
+                            flow,
+                            IpAddr::V4(pool_addr),
+                            holder,
+                        ) {
                             Ok(translated) => {
                                 // #8115 R1: see the round-robin arms.
+                                // #8597 K09: same correction as the mint above.
+                                // The refusal path rolls the record back, and a
+                                // rollback keyed on the wrong holder is how a
+                                // partial free happens.
                                 if let Some(refused) = reject_peer_owned_address_only_identity(
-                                    rule,
-                                    flow,
-                                    translated,
-                                    now_ns,
-                                    NatHolder::Untracked,
+                                    rule, flow, translated, now_ns, holder,
                                 ) {
                                     return refused;
                                 }

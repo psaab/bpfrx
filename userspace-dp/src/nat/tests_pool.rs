@@ -10402,3 +10402,99 @@ fn pool_snat_occupancy_counter_agrees_with_bitmap_7174_m13() {
     );
 }
 
+
+// #8597 K09 FAIL-ON-REVERT. The DETERMINISTIC-CGNAT address-only mint must
+// record the ALLOCATING worker's holder bit, like every sibling arm.
+//
+// WHY THIS SHAPE. The `holders` mask has no test accessor, so the bit is
+// observed through the operation whose behaviour it governs: `retire_worker`
+// selects records with `holders & bit != 0`. With the owner's bit recorded,
+// retiring the sole holder frees exactly one record. With the pre-fix
+// `NatHolder::Untracked` the record's mask is EMPTY, `retire_worker` never
+// selects it, and this returns 0 — so the assertion is RED on revert and for
+// the right reason, not merely different.
+//
+// WHY IT MATTERS, in the shape the box actually fails: a mint with `holders ==
+// 0` is not inert. `replicate_session_upsert` fans the session to every SIBLING
+// worker and EXCLUDES the allocating one, so each sibling ORs its own bit in and
+// the mask ends up naming every worker except the one forwarding the traffic.
+// RSS steers the flow to the owner, so the sibling replicas always idle out
+// first, and the last one to reap empties the mask and frees a reverse identity
+// the owner is still using — after which a colliding flow is admitted onto a
+// live public identity (#6522 / #5269). The whole population is invisible to a
+// single-worker box, which is why the existing suite is green.
+//
+// GRE is the address-only trigger: `has_l4_ports(PROTO_GRE)` is false, so the
+// mint takes the `reserve_address_only` arm rather than the det-PAT arm 30 lines
+// below it (which has always passed `holder`).
+#[test]
+fn deterministic_address_only_mint_records_the_owning_worker_8597_k09() {
+    let host_base = u32::from(Ipv4Addr::new(100, 64, 0, 0));
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "cgn-pool".to_string(),
+        from_zone: "subs".to_string(),
+        to_zone: "inet".to_string(),
+        source_addresses: vec!["100.64.0.0/22".to_string()],
+        pool_name: "cgn-pool".to_string(),
+        pool_addresses: vec!["203.0.113.1/32".to_string()],
+        port_low: 1024,
+        port_high: 65535,
+        deterministic_mode: 1,
+        deterministic_block_size: 512,
+        deterministic_blocks_per_ip: 126,
+        deterministic_host_base: host_base,
+        deterministic_host_count: 1024,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    assert!(
+        rules[0].deterministic_v4.is_some(),
+        "mode-1 snapshot must build a deterministic rule (test precondition)"
+    );
+
+    let mut counter = None;
+    let decision = expect_snat_decision(match_source_nat_result_for_tuple(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &NatScopeCtx::default(),
+        "subs",
+        "inet",
+        "100.64.0.5".parse().expect("src"),
+        "8.8.8.8".parse().expect("dst"),
+        // Port-less: takes the address-only arm, not det-PAT.
+        Some(PROTO_GRE),
+        0,
+        0,
+        None,
+        None,
+        1_000,
+        false,
+        false,
+        NatHolder::Worker(0),
+        &mut counter,
+    ));
+
+    // FIXTURE ADEQUACY: this must really be the ADDRESS-ONLY arm. A port-bearing
+    // decision would mean the tuple took the det-PAT path, which already passed
+    // `holder` before this fix and would make the assertion below vacuous.
+    assert!(
+        decision.rewrite_src.is_some(),
+        "the fixture must produce a translation, or the retire below measures nothing"
+    );
+    assert!(
+        decision.rewrite_src_port.is_none(),
+        "this must be the ADDRESS-ONLY arm (no port rewrite) — a port here means \
+         the fixture took the det-PAT path, which was never the defect"
+    );
+
+    // THE BINDER. Worker 0 minted it and is its only holder, so retiring worker 0
+    // frees exactly this record. Pre-fix the mask is empty, nothing is selected,
+    // and this is 0.
+    assert_eq!(
+        rules[0].pool_allocator.retire_worker(0, 2_000),
+        1,
+        "the deterministic address-only mint must record the ALLOCATING worker's \
+         holder bit — with an empty mask the owner is not named, and the last \
+         SIBLING replica to idle-reap frees a reverse identity the owner is still \
+         forwarding on (#8597 K09, the #6522 mechanism)"
+    );
+}
