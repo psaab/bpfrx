@@ -841,3 +841,268 @@ fn unknown_zone_override_does_not_reach_the_frag_authority_7050() {
          fabric interface does not already resolve to"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #7770: the RETURN direction of a fabric redirect, which #6478's fail-on-
+// revert pair never reaches.
+//
+// Both #6478 cells above drive `lan -> wan` — `src = 10.0.61.102`,
+// `dst = 8.8.8.8`, stamp `TEST_LAN_ZONE_ID`, `ha_state = {1: active}`. That
+// zone pair carries the fixture's ONLY permit (`nat_snapshot`'s `allow-all`,
+// `lan -> wan`, any/any/any), so both packets are ADMITTED and the cells can
+// assert `sessions.len() == 2`. They pin that the removed cluster-peer return
+// fast path does not seed a `ReverseFlow` — a real property, and not this one.
+//
+// The direction #7770 is about is the mirror image: a peer-owned session's
+// reply, redirected across the fabric to the LAN-owning node, arriving as
+// `wan -> lan` with a #6458 stamp claiming `wan`. That pair has no permit BY
+// DESIGN — return traffic is admitted by a SESSION, never by policy — so the
+// packet is dropped on transit default-deny. Under a sustained RG split the
+// session has not synced yet when the reply arrives ~1-3 ms later, so this is
+// the first packet of every new flow, indefinitely.
+//
+// That disposition is currently only asserted in prose, in
+// `docs/fabric-cross-chassis-fwd.md`, where it is described as a drop
+// "confined to the race window". These cells make it executable, so that
+// whichever of the standing options eventually changes it has a red to work
+// against instead of a paragraph.
+//
+// WHAT THIS CELL UNIQUELY COVERS, measured rather than asserted. Mutating the
+// tree to implement option A — force PERMIT whenever a validated fabric-zone
+// stamp is present, i.e. "skip policy for fabric-ingress packets" — reds
+// EXACTLY ONE test in the whole 5187-cell suite: this one. Option A is the
+// tempting fix for #7770 and the issue rules it dead precisely because it
+// would upgrade #6458's accepted, bounded stamp-forgery residual into a full
+// zone-policy bypass, in the window where the stamp is known to be forgeable.
+// Until this cell there was nothing in the tree that would have caught it.
+//
+// WHY THE ASSERTIONS PIN THE EVENT'S ZONES AND NOT JUST THE COUNTERS.
+// Measured: an UNSTAMPED `wan -> lan` frame produces counters IDENTICAL to a
+// stamped one — `sessions=0 forwards=0 policy_deny=2` for both — because both
+// land on the same default-deny verdict. Only the emitted event separates
+// them: stamped gives `ingress_zone_id = wan`, unstamped gives 0 (the fabric
+// parent's own unzoned id). So a cell asserting only "no session, no forward"
+// could not tell which zone pair was evaluated.
+//
+// To be precise about what that does and does not add: dropping the stamp
+// override on the miss path reds three PRE-EXISTING cells as well as this one
+// (`fabric_ingress_syn_ack_seeds_no_reverse_session_6478`,
+// `legitimate_fabric_punted_flow_still_admitted_6458`,
+// `frag_assoc_authority_binds_the_fabric_zone_stamp_5798`), so #6458's
+// validation is not this cell's to guard and this cell is not what keeps it
+// honest. What the zone assertions add is that the RETURN direction
+// specifically is adjudicated under the stamped pair — the direction none of
+// those three exercises.
+
+/// The `nat_snapshot_with_fabric` fixture plus a reachable neighbour for the
+/// LAN host on `ge-0-0-1`.
+///
+/// NOT boilerplate. Without it the bare fixture drops the `wan -> lan` frame
+/// TWICE — once on policy and once on MissingNeighbor (measured:
+/// `policy_deny=1 missing_neigh=1`) — so a cell asserting "the packet did not
+/// get through" would be partly measuring an absent connected-subnet
+/// neighbour rather than the policy verdict under test. The
+/// `stamped_fabric_frame` comment warns about exactly this confound.
+fn fabric_snapshot_with_lan_neighbor_7770() -> ConfigSnapshot {
+    let mut snapshot = nat_snapshot_with_fabric();
+    // `..Default::default()` rather than an exhaustive literal: the #7689
+    // additive-wire ratchet counts exhaustive `NeighborSnapshot` literals
+    // across the whole crate and this one pushed it over its ceiling. Only the
+    // fields this fixture depends on are named.
+    snapshot.neighbors.push(NeighborSnapshot {
+        interface: "reth1.0".to_string(),
+        ifindex: 24,
+        family: "inet".to_string(),
+        ip: "10.0.61.102".to_string(),
+        mac: "de:ad:be:ef:00:01".to_string(),
+        state: "reachable".to_string(),
+        ..Default::default()
+    });
+    snapshot
+}
+
+/// Stamp `frame` as a fabric punt claiming `zone_id`, the #6458 shape.
+fn stamp_fabric_zone_7770(frame: &mut [u8], zone_id: u16) {
+    let [hi, lo] = zone_id.to_be_bytes();
+    frame[0..6].copy_from_slice(&[0x02, 0xbf, 0x72, 0xff, 0x00, 0x01]);
+    frame[6..12].copy_from_slice(&[0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, hi, lo]);
+}
+
+/// #7770 fail-on-revert: a session-less fabric-ingress RETURN packet
+/// (`wan -> lan`) is dropped on transit default-deny on the LAN-owning node.
+///
+/// Two legs per form, and the second is what keeps the first honest:
+///
+///   * RETURN (`wan -> lan`, stamp `wan`, LAN RG local / WAN RG remote —
+///     the split placement in which the #6458 stamp validates): DENIED.
+///   * CONTROL (`lan -> wan`, stamp `lan`, the existing #6478 cells'
+///     placement): ADMITTED, two sessions and a forward.
+///
+/// Without the control leg a fixture that had stopped forwarding anything at
+/// all — a broken snapshot, an unroutable destination — would satisfy every
+/// assertion in the first leg while exercising nothing.
+#[test]
+fn fabric_ingress_return_traffic_is_denied_on_the_lan_node_7770() {
+    let forwarding = build_forwarding_state(&fabric_snapshot_with_lan_neighbor_7770());
+    let now_secs = monotonic_nanos() / 1_000_000_000;
+    let lan_host = Ipv4Addr::new(10, 0, 61, 102);
+    let wan_peer = Ipv4Addr::new(8, 8, 8, 8);
+
+    // --- RETURN: the #7770 shape. LAN RG (2) local, WAN RG (1) remote. -----
+    for (form, mut frame, protocol, sport, dport) in [
+        (
+            "icmp echo reply",
+            {
+                let mut f = build_icmp_echo_frame_v4(wan_peer, lan_host, 64);
+                let icmp_start = 34;
+                f[icmp_start] = 0; // echo REQUEST -> echo REPLY
+                f[icmp_start + 2..icmp_start + 4].copy_from_slice(&[0, 0]);
+                let csum = checksum16(&f[icmp_start..]);
+                f[icmp_start + 2..icmp_start + 4].copy_from_slice(&csum.to_be_bytes());
+                f
+            },
+            PROTO_ICMP,
+            0x1234u16,
+            0u16,
+        ),
+        (
+            "tcp syn-ack",
+            build_txn_tcp_syn_frame_v4(wan_peer, lan_host, 443, 12345, TCP_FLAG_SYN | TCP_FLAG_ACK),
+            PROTO_TCP,
+            443,
+            12345,
+        ),
+    ] {
+        stamp_fabric_zone_7770(&mut frame, TEST_WAN_ZONE_ID);
+        let mut meta = txn_meta_v4(21, 0, frame.len() as u16);
+        meta.protocol = protocol;
+        if protocol == PROTO_ICMP {
+            meta.payload_offset = 42;
+        } else {
+            meta.tcp_flags = TCP_FLAG_SYN | TCP_FLAG_ACK;
+        }
+
+        let mut binding = fabric_binding();
+        let mut sessions = SessionTable::new();
+        let (_batch, dbg, _handle, event_rx) = txn_run_descriptor_capturing_events(
+            &mut binding,
+            &mut sessions,
+            &forwarding,
+            // LAN RG 2 is LOCAL; WAN RG 1 is the peer's. That placement is
+            // what makes the `wan` stamp pass #6458 V1b (not all of the
+            // claimed zone's RGs are locally forwarding-active) — the exact
+            // window the residual is accepted in.
+            &BTreeMap::from([(2, active_rg(now_secs))]),
+            &frame,
+            meta,
+        );
+
+        assert_eq!(
+            dbg.missing_neigh, 0,
+            "{form}: the fixture dropped on MissingNeighbor, so the deny \
+             asserted below would be measuring the absent LAN neighbour \
+             rather than the policy verdict (#7770)"
+        );
+        assert_eq!(
+            sessions.len(),
+            0,
+            "{form}: a session-less fabric-ingress RETURN packet installed a \
+             session. `wan -> lan` has no permit by design — return traffic is \
+             admitted by a SESSION, never by policy — so admitting one here is \
+             a zone-policy bypass on the forgeable-stamp window #6458 \
+             documents (#7770)"
+        );
+        assert_eq!(
+            binding.scratch.scratch_forwards.len(),
+            0,
+            "{form}: the denied RETURN packet was queued for forwarding"
+        );
+        assert!(
+            dbg.policy_deny > 0,
+            "{form}: the RETURN packet was neither forwarded nor policy-denied \
+             — it left by some third path this cell does not describe (#7770)"
+        );
+
+        let event = event_rx
+            .try_recv()
+            .expect("a transit policy deny must emit an event")
+            .decode_dataplane_event()
+            .expect("policy deny payload");
+        assert_eq!(
+            event.kind,
+            crate::event_stream::codec::DataplaneEventKind::PolicyDeny,
+            "{form}: wrong event kind"
+        );
+        assert_eq!(event.action, 0, "{form}: the disposition must be DENY");
+        assert_eq!(
+            event.reason, 5,
+            "{form}: reason 5 is the TRANSIT policy deny; 6 would mean the \
+             packet was adjudicated as host-inbound instead, which is a \
+             different arm with a different fix"
+        );
+        assert_eq!(
+            event.policy_id,
+            u32::MAX,
+            "{form}: the deny must be the no-match DEFAULT, not a named policy \
+             — a named policy denying this would mean the fixture, not the \
+             design, produced the drop"
+        );
+        // The load-bearing pair. Counters alone cannot distinguish a validated
+        // `wan` stamp from no stamp at all (measured: identical). These can.
+        assert_eq!(
+            event.ingress_zone_id, TEST_WAN_ZONE_ID,
+            "{form}: the RETURN packet was NOT adjudicated under the \
+             #6458-validated stamped zone. An unstamped frame reports \
+             ingress_zone_id 0 and produces byte-identical counters, so the \
+             counters above cannot tell which pair was evaluated and this is \
+             the assertion that can (#7770)"
+        );
+        assert_eq!(
+            event.egress_zone_id, TEST_LAN_ZONE_ID,
+            "{form}: the egress zone is not the LAN zone, so the pair being \
+             evaluated is not `wan -> lan` and this cell is describing some \
+             other flow"
+        );
+        assert_eq!(event.src_ip, IpAddr::V4(wan_peer), "{form}: src");
+        assert_eq!(event.dst_ip, IpAddr::V4(lan_host), "{form}: dst");
+        assert_eq!(event.src_port, sport, "{form}: sport");
+        assert_eq!(event.dst_port, dport, "{form}: dport");
+    }
+
+    // --- CONTROL: the permitted direction still works. --------------------
+    // Same fixture, same fabric ingress, mirrored placement and stamp. If this
+    // leg ever reds, the first leg's denials stopped being evidence about the
+    // RETURN direction and became evidence about a broken fixture.
+    let mut frame = build_txn_tcp_syn_frame_v4(
+        lan_host,
+        wan_peer,
+        12345,
+        443,
+        TCP_FLAG_SYN | TCP_FLAG_ACK,
+    );
+    stamp_fabric_zone_7770(&mut frame, TEST_LAN_ZONE_ID);
+    let meta = txn_meta_v4(21, TCP_FLAG_SYN | TCP_FLAG_ACK, frame.len() as u16);
+    let mut binding = fabric_binding();
+    let mut sessions = SessionTable::new();
+    txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &BTreeMap::from([(1, active_rg(now_secs))]),
+        &frame,
+        meta,
+    );
+    assert_eq!(
+        sessions.len(),
+        2,
+        "CONTROL: the PERMITTED `lan -> wan` fabric punt stopped installing \
+         its forward + reverse pair. The RETURN legs above assert an ABSENCE, \
+         and an absence proves nothing once the fixture forwards nothing at \
+         all (#7770)"
+    );
+    assert_eq!(
+        binding.scratch.scratch_forwards.len(),
+        1,
+        "CONTROL: the permitted direction stopped forwarding"
+    );
+}
