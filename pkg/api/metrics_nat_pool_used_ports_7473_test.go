@@ -8,16 +8,23 @@ import (
 	dto "github.com/prometheus/client_model/go"
 
 	"github.com/psaab/xpf/pkg/dataplane"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
 // natPoolUsedPortsSamples collects the pool names that emitted an
 // `xpf_nat_pool_used_ports` sample.
 //
 // It records PRESENCE, not value, because the value cannot distinguish the two
-// states: `ReadNATPortCounter` returns 0 for a pool the dataplane never
-// installed, and 0 is also the honest reading for a healthy idle pool. The
-// defect is that the SERIES EXISTS. An assertion on the number would be the
-// vacuous version of this test — it would pass before and after the fix.
+// states: a pool the dataplane never installed reads 0, and 0 is also the
+// honest reading for a healthy idle pool. The defect is that the SERIES EXISTS.
+// An assertion on the number would be the vacuous version of this test — it
+// would pass before and after the fix.
+//
+// #8606: the source is now the helper's live status rather than the legacy
+// `nat_port_counters` map. The fixture below reports BOTH pools in that status
+// on purpose: supplying only the healthy one would make the refused-pool
+// assertion pass because the pool is ABSENT from the status, not because the
+// refusal gate suppressed it — the discriminator this test exists for.
 func natPoolUsedPortsSamples(t *testing.T, setLines []string, poolIDs map[string]uint8) map[string]bool {
 	t.Helper()
 	store := newConfigStore(t, t.TempDir())
@@ -35,9 +42,15 @@ func natPoolUsedPortsSamples(t *testing.T, setLines []string, poolIDs map[string
 		Manager: dataplane.New(),
 		apply:   &dataplane.ApplyResult{PoolIDs: poolIDs},
 	}
+	st := &dpuserspace.ProcessStatus{}
+	for name := range poolIDs {
+		st.SourceNATPools = append(st.SourceNATPools, dpuserspace.SourceNATPoolStatus{
+			PoolName: name, RuleName: "r-" + name, UsedPorts: 7,
+		})
+	}
 	ch := make(chan prometheus.Metric)
 	go func() {
-		c.collectNATPoolMetrics(ch, dp)
+		c.collectNATPoolMetrics(ch, dp, st)
 		close(ch)
 	}()
 	seen := map[string]bool{}

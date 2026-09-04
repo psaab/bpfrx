@@ -1581,7 +1581,7 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	// scrape-error sample is no longer emitted from an explicit call here — the
 	// deferred emit covers this normal-completion path AND the unloaded early
 	// return above with exactly one emission per scrape.
-	c.collectNATPoolMetrics(ch, dp)
+	c.collectNATPoolMetrics(ch, dp, userspaceStatus)
 	c.collectSessionGauges(ch, dp)
 	c.collectUserspaceStatus(ch, userspaceStatus)
 	// #6845: a top-level status-derived signal, emitted only when a status was

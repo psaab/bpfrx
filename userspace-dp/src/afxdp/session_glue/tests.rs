@@ -8884,3 +8884,236 @@ fn flush_session_deltas_routes_a_bulk_export_drop_to_the_non_arming_push_8593() 
          fix that never arms deletes the recovery instead of bounding it"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #8586 — the delete-drop epoch and the `is_peer_synced()`-scoped reconcile.
+// ---------------------------------------------------------------------------
+
+fn key8586(src_port: u16) -> SessionKey {
+    let mut k = test_key();
+    k.src_port = src_port;
+    k
+}
+
+fn install8586(sessions: &mut SessionTable, key: &SessionKey, origin: SessionOrigin) {
+    assert!(
+        sessions.install_with_protocol_with_origin(
+            key.clone(),
+            test_decision(),
+            test_metadata(),
+            origin,
+            1_000_000,
+            PROTO_TCP,
+            0x10,
+        ),
+        "fixture: install must succeed for {origin:?}"
+    );
+}
+
+fn publish8586(
+    shared: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    key: &SessionKey,
+) {
+    shared.lock().expect("shared sessions").insert(
+        key.clone(),
+        SyncedSessionEntry {
+            key: key.clone(),
+            decision: test_decision(),
+            metadata: test_metadata(),
+            origin: SessionOrigin::SyncImport,
+            protocol: PROTO_TCP,
+            tcp_flags: 0x10,
+            generation: 0,
+            session_id: 0,
+        },
+    );
+}
+
+/// THE SAFETY PROPERTY (#8586). The reconcile sweeps ONLY origins that shared
+/// authority actually arbitrates, and the exclusions are what make it safe to
+/// run at all.
+///
+/// Every entry below is absent from the shared map, so a sweep that scoped by
+/// anything looser than `is_peer_synced()` would delete all of them. Only the
+/// three peer-synced origins may go.
+///
+/// `SharedPromote` is the one a reader expects to be swept and must not be: it
+/// is synced-DERIVED but no longer peer-AUTHORITATIVE — the origin an entry
+/// receives AFTER local traffic promoted it — so this node owns it and its
+/// absence from the shared map is not evidence it should die. `loop_body`'s
+/// "synced-derived" classification DOES include it; using that one here would
+/// be the bug, and this cell is what makes the choice explicit rather than an
+/// implicit consequence of which predicate got typed.
+///
+/// `FabricPuntSeed` and `MissingNeighborSeed` are transient-local by
+/// construction — never HA-exported, never Open-delta'd — so they are live
+/// local sessions that are absent from the shared map BY DESIGN. They are the
+/// population #8586 named as the reason not to build a naive sweep.
+///
+/// Fail-on-revert: scope the walk with `is_promotable_synced()`, or with
+/// `!matches!(origin, ForwardFlow | ReverseFlow | LocalMiss)`, or drop the
+/// origin test entirely — each reds a different line below.
+#[test]
+fn the_reconcile_sweeps_only_peer_synced_origins_8586() {
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let mut sessions = SessionTable::new();
+
+    // Swept: shared authority arbitrates these and no longer holds them.
+    let swept = [
+        (SessionOrigin::SyncImport, key8586(1001)),
+        (SessionOrigin::SharedMaterialize, key8586(1002)),
+        (SessionOrigin::WorkerLocalImport, key8586(1003)),
+    ];
+    // NOT swept: this node owns them, and none is in the shared map either — so
+    // "absent from shared" cannot be the discriminator on its own.
+    let kept = [
+        (SessionOrigin::SharedPromote, key8586(2001)),
+        (SessionOrigin::FabricPuntSeed, key8586(2002)),
+        (SessionOrigin::MissingNeighborSeed, key8586(2003)),
+        (SessionOrigin::ForwardFlow, key8586(2004)),
+        (SessionOrigin::ReverseFlow, key8586(2005)),
+        (SessionOrigin::LocalMiss, key8586(2006)),
+    ];
+    for (origin, key) in swept.iter().chain(kept.iter()) {
+        install8586(&mut sessions, key, *origin);
+    }
+    assert!(
+        shared_sessions.lock().expect("shared").is_empty(),
+        "fixture: NOTHING is in the shared map, so every entry is a sweep \
+         candidate as far as the map is concerned"
+    );
+
+    let mut evicted = Vec::new();
+    let n = reconcile_peer_synced_against_shared(&mut sessions, &shared_sessions, &mut evicted);
+
+    assert_eq!(n, swept.len(), "exactly the peer-synced origins are swept");
+    for (origin, key) in &swept {
+        assert!(
+            sessions.lookup(key, 2_000_000, 0).is_none(),
+            "{origin:?} is peer-authoritative and shared authority dropped it — \
+             it must be swept"
+        );
+        assert!(
+            evicted.contains(key),
+            "{origin:?}'s key must reach the flow-cache eviction list, or its \
+             cached descriptor outlives the entry (the #6457 failure mode)"
+        );
+    }
+    for (origin, key) in &kept {
+        assert!(
+            sessions.lookup(key, 2_000_000, 0).is_some(),
+            "{origin:?} is LOCALLY owned; sweeping it against a map that never \
+             held it deletes a live session"
+        );
+        assert!(!evicted.contains(key));
+    }
+}
+
+/// A peer-synced entry shared authority STILL holds must survive. Without this
+/// the cell above is satisfied by "sweep every peer-synced entry", which would
+/// delete the standby's whole synced table on the first refused delete.
+#[test]
+fn the_reconcile_keeps_a_peer_synced_entry_the_shared_map_still_holds_8586() {
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let mut sessions = SessionTable::new();
+    let live = key8586(3001);
+    let gone = key8586(3002);
+    install8586(&mut sessions, &live, SessionOrigin::SyncImport);
+    install8586(&mut sessions, &gone, SessionOrigin::SyncImport);
+    publish8586(&shared_sessions, &live);
+
+    let mut evicted = Vec::new();
+    let n = reconcile_peer_synced_against_shared(&mut sessions, &shared_sessions, &mut evicted);
+
+    assert_eq!(n, 1, "only the one shared authority dropped");
+    assert!(
+        sessions.lookup(&live, 2_000_000, 0).is_some(),
+        "a peer-synced entry the shared map STILL holds is live; sweeping it \
+         would empty the standby's synced table on any refused delete"
+    );
+    assert!(sessions.lookup(&gone, 2_000_000, 0).is_none());
+    assert_eq!(evicted, vec![gone]);
+}
+
+/// THE TRIGGER SEPARATION (#8586), and it is the measured one.
+///
+/// Ordinary session establishment pins the command queue at the 4096 cap and
+/// discards tens of thousands of commands while dropping ZERO deletes — the
+/// losses there are `UpsertSynced` replicas whose content the shared map still
+/// holds. A reconcile keyed on queue pressure would therefore run its
+/// whole-table walk continuously through normal traffic and reconcile nothing.
+///
+/// So the epoch must move for a refused DELETE and not for a refused UPSERT.
+/// Both arms below fill the SAME queue to the SAME cap and push one command
+/// through the same `push_bounded`; only the command kind differs.
+///
+/// Fail-on-revert: bump the epoch from `push_bounded`, or from
+/// `replicate_session_upsert`, and the upsert arm reds.
+#[test]
+fn only_a_refused_delete_moves_the_worker_epoch_8586() {
+    use std::sync::atomic::Ordering;
+
+    // A worker id high enough that no other cell in this binary shares it.
+    const W: u32 = 77;
+    let forwarding = drop8114_forwarding();
+    let nat = drop8114_reserve(&forwarding, W);
+    let (peers, by_id) = drop8114_queues(W, true);
+
+    let before = crate::afxdp::session_glue::session_delete_drop_epoch(W);
+
+    // (a) A refused UPSERT. Same queue, same cap, same refusal.
+    {
+        let mut pending = worker_queue::lock_recover(&peers[0]);
+        let queued = worker_queue::push_bounded(
+            &mut pending,
+            WorkerCommand::UpsertSynced(SyncedSessionEntry {
+                key: key8586(4001),
+                decision: test_decision(),
+                metadata: test_metadata(),
+                origin: SessionOrigin::SyncImport,
+                protocol: PROTO_TCP,
+                tcp_flags: 0x10,
+                generation: 0,
+                session_id: 0,
+            }),
+        );
+        assert!(
+            !queued,
+            "fixture: the upsert must also have been REFUSED, or this arm is \
+             not comparing like with like"
+        );
+    }
+    assert_eq!(
+        crate::afxdp::session_glue::session_delete_drop_epoch(W),
+        before,
+        "a refused UPSERT must NOT raise a reconcile: its content is still in \
+         the shared map, and establishment refuses these by the tens of \
+         thousands while losing no deletes"
+    );
+
+    // (b) A refused DELETE through the production fan-out.
+    let outcome = replicate_session_delete_repairing(
+        &peers,
+        &by_id,
+        &forwarding,
+        &drop8114_key(),
+        nat,
+        false,
+        2_000,
+    );
+    assert_eq!(outcome.dropped, 1, "fixture: the delete must have been refused");
+    assert_eq!(outcome.repaired, 1, "fixture: and attributed to worker {W}");
+    assert_eq!(
+        crate::afxdp::session_glue::session_delete_drop_epoch(W),
+        before + 1,
+        "a refused DELETE must raise exactly one reconcile for the worker that \
+         will never receive it"
+    );
+    assert_eq!(
+        crate::afxdp::session_glue::SESSION_DELETE_DROP_EPOCH[(W + 1) as usize]
+            .load(Ordering::Relaxed),
+        0,
+        "and only for THAT worker — a broadcast bump makes every sibling walk \
+         its table for a delete it did receive"
+    );
+}

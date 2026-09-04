@@ -406,6 +406,12 @@ pub(crate) fn worker_loop(
         }};
     }
     // Debug: periodic summary counters
+    // #8586: the delete-drop epoch this worker has already reconciled against.
+    // Seeded from the CURRENT value rather than 0 so a worker that starts after
+    // some other worker's refusals does not run one spurious sweep on its first
+    // pass.
+    let mut last_delete_drop_epoch =
+        crate::afxdp::session_glue::session_delete_drop_epoch(worker_id);
     let mut dbg_last_report_ns = monotonic_nanos();
     // #1776: the per-interval cfg(debug-log) dbg_* counters are
     // consolidated into debug_report::DbgCounters (single-line
@@ -1291,6 +1297,46 @@ pub(crate) fn worker_loop(
         for binding in &bindings {
             if binding.live.take_delta_loss() {
                 sessions.set_delta_loss();
+            }
+        }
+        // #8586: a cross-worker `DeleteSynced` for THIS worker was refused by a
+        // full queue, so this worker never learned the session is gone. Its NAT
+        // holder bit was already released on its behalf (#8576); what is left is
+        // its own local table entry and its per-binding flow-cache slots, which
+        // only this loop can reach — and the signal could not travel through the
+        // queue that refused the command, hence the out-of-band epoch.
+        //
+        // KEYED ON THE DELETE DROP, NOT ON QUEUE PRESSURE, and that distinction
+        // is measured rather than assumed: ordinary session establishment pins
+        // the queue at the 4096 cap and discards 85,668 commands over 32,768
+        // creates while dropping ZERO deletes (#8586). A trigger on queue depth
+        // would run this walk continuously through normal traffic and reconcile
+        // nothing.
+        //
+        // One relaxed load per pass. A burst raises exactly ONE reconcile per
+        // pass however many refusals it caused, because the epoch is compared,
+        // not counted down.
+        let delete_drop_epoch =
+            crate::afxdp::session_glue::session_delete_drop_epoch(worker_id);
+        if delete_drop_epoch != last_delete_drop_epoch {
+            last_delete_drop_epoch = delete_drop_epoch;
+            let mut evicted_keys: Vec<crate::session::SessionKey> = Vec::new();
+            let reconciled = crate::afxdp::session_glue::reconcile_peer_synced_against_shared(
+                &mut sessions,
+                &shared_sessions,
+                &mut evicted_keys,
+            );
+            if reconciled > 0 {
+                crate::afxdp::worker::invalidate_flow_cache_slots_for_keys(
+                    &mut bindings,
+                    &evicted_keys,
+                );
+                debug_log!(
+                    "DELETE_DROP_RECONCILE: worker={} epoch={} swept={}",
+                    worker_id,
+                    delete_drop_epoch,
+                    reconciled,
+                );
             }
         }
         if sessions.take_delta_loss() {

@@ -1122,6 +1122,45 @@ pub(crate) static SESSION_DELETE_REPLICA_DROPPED: AtomicU64 = AtomicU64::new(0);
 /// repaired", and those have opposite remediations.
 pub(crate) static SESSION_DELETE_REPLICA_DROP_REPAIRED: AtomicU64 = AtomicU64::new(0);
 
+/// #8586: per-worker epoch, bumped when a cross-worker `DeleteSynced` replica
+/// for THAT worker was refused by its full queue.
+///
+/// It is the out-of-band signal the refused worker needs, and it has to be
+/// out-of-band by construction: the thing that must reach it cannot travel
+/// through the queue that is full. One relaxed load per worker per loop pass on
+/// the read side, one relaxed increment per refusal on the write side.
+///
+/// WHY IT COUNTS DELETES AND NOT QUEUE PRESSURE. Measured on
+/// `loss:xpf-userspace-fw0` (#8586): ordinary session ESTABLISHMENT pins the
+/// queue at the 4096 cap and discards 85,668 commands over 32,768 creates —
+/// and ZERO of them are deletes. What is lost there is `UpsertSynced` replicas,
+/// whose content the shared map still holds. A trigger keyed on queue depth, or
+/// on `WORKER_COMMAND_QUEUE_DROPS`, would therefore fire continuously through
+/// normal traffic and reconcile nothing. The harmful loss is confined to a
+/// revocation burst or an RG activation: one `clear security flow session` over
+/// 32,770 entries refused 30,786 delete replicas, and the two conditions come
+/// apart cleanly enough to key on.
+///
+/// Indexed by worker id, bounded by `MAX_NAT_HOLDER_WORKERS` — the same ceiling
+/// `replan_bindings` refuses to mint past, so a worker id is always in range.
+/// A refusal whose worker id could NOT be resolved bumps nothing: there is no
+/// worker to name. Those are the `SESSION_DELETE_REPLICA_DROPPED -
+/// SESSION_DELETE_REPLICA_DROP_REPAIRED` remainder, measured at 0 across 30,786
+/// refusals.
+pub(crate) static SESSION_DELETE_DROP_EPOCH: [AtomicU64;
+    crate::nat::MAX_NAT_HOLDER_WORKERS as usize] =
+    [const { AtomicU64::new(0) }; crate::nat::MAX_NAT_HOLDER_WORKERS as usize];
+
+/// #8586: read a worker's delete-drop epoch. Out of range reads 0 (an id past
+/// the planner's own ceiling cannot have been bumped either, so the pair is
+/// consistent and a reconcile is never raised for a worker that cannot exist).
+pub(crate) fn session_delete_drop_epoch(worker_id: u32) -> u64 {
+    SESSION_DELETE_DROP_EPOCH
+        .get(worker_id as usize)
+        .map(|e| e.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
 /// #8114 item 4: what one `replicate_session_delete_repairing` fan-out did,
 /// per call.
 ///
@@ -1243,6 +1282,14 @@ pub(super) fn replicate_session_delete_repairing(
         };
         SESSION_DELETE_REPLICA_DROP_REPAIRED.fetch_add(1, Ordering::Relaxed);
         outcome.repaired += 1;
+        // #8586: tell the refused worker. Its local session entry and its
+        // flow-cache slots for this key are the half #8576 could not repair
+        // from here — they live behind that worker's own `&mut SessionTable`
+        // and per-binding caches — so it has to reconcile them itself, and the
+        // signal cannot go through the queue that just refused the command.
+        if let Some(epoch) = SESSION_DELETE_DROP_EPOCH.get(worker_id as usize) {
+            epoch.fetch_add(1, Ordering::Relaxed);
+        }
         // Byte-for-byte the two releases `handle_delete_synced` would have run,
         // with that worker's id as the holder, so the mask empties on the same
         // last-release rule and the port is returned exactly once.
@@ -1265,6 +1312,73 @@ pub(super) fn replicate_session_delete_repairing(
         );
     }
     outcome
+}
+
+/// #8586: drop this worker's LOCAL entries for peer-synced sessions that shared
+/// authority no longer holds, and hand their keys back for flow-cache eviction.
+///
+/// This is the half of a refused cross-worker `DeleteSynced` that #8576 could
+/// not repair from the DELETING worker: that worker released the refused
+/// worker's NAT holder bit on its behalf, but the refused worker's own session
+/// entry and per-binding flow-cache slots live behind its `&mut SessionTable`
+/// and are reachable only from its own loop. The signal that it must run this
+/// cannot travel through the queue that refused the command, which is why the
+/// trigger is the out-of-band `SESSION_DELETE_DROP_EPOCH`.
+///
+/// SCOPED BY `SessionOrigin::is_peer_synced()`, and the exclusions are the
+/// safety property rather than a detail:
+///
+/// - `SharedPromote` is EXCLUDED, and it is the one a reader would expect to be
+///   in. It is synced-DERIVED but no longer peer-AUTHORITATIVE: it is the origin
+///   an entry receives after local traffic has promoted it, so this node owns it
+///   and shared authority is not the arbiter of whether it should exist.
+///   Reconciling it away would delete a live local session. (`loop_body`'s
+///   "synced-derived, never create-counted" arm DOES include `SharedPromote`;
+///   it asks a different question and is correct for it. Using that
+///   classification here would be the bug.)
+/// - `FabricPuntSeed` and `MissingNeighborSeed` are transient-local by
+///   construction — never HA-exported, never Open-delta'd — so they are live
+///   local sessions that are ABSENT from the shared map by design. A naive
+///   "drop what the shared map does not have" sweep deletes them on its first
+///   pass. That is the worse-failure-mode #8586 declined to build against an
+///   unestablished premise, and `is_peer_synced()` excludes them.
+///
+/// What it deliberately does NOT do: release NAT, remove shared state, or
+/// replicate a delete. The deleting worker already removed shared authority and
+/// already ran #8576's NAT teardown for THIS worker's holder bit; repeating
+/// either here would double-process a pair, and re-replicating would recurse.
+/// Local table plus local caches is the whole remit.
+///
+/// The shared-map lock is held only across the membership FILTER, not across
+/// the table walk: the walk clones candidate keys first. Sibling workers take
+/// that same lock on their packet path, and a full-table walk under it would
+/// stall them for the length of this worker's session table.
+pub(in crate::afxdp) fn reconcile_peer_synced_against_shared(
+    sessions: &mut SessionTable,
+    shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    evicted_keys: &mut Vec<SessionKey>,
+) -> usize {
+    let mut candidates: Vec<SessionKey> = Vec::new();
+    sessions.iter_with_origin(|key, _decision, _metadata, origin| {
+        if origin.is_peer_synced() {
+            candidates.push(key.clone());
+        }
+    });
+    if candidates.is_empty() {
+        return 0;
+    }
+    let stale: Vec<SessionKey> = {
+        let shared = lock_shared_recover(shared_sessions);
+        candidates
+            .into_iter()
+            .filter(|key| !shared.contains_key(key))
+            .collect()
+    };
+    for key in &stale {
+        sessions.delete(key);
+        evicted_keys.push(key.clone());
+    }
+    stale.len()
 }
 
 pub(super) fn should_teardown_tcp_rst(_meta: UserspaceDpMeta, _flow: Option<&SessionFlow>) -> bool {
