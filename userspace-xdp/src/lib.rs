@@ -1477,10 +1477,13 @@ fn parse_ipv6(
     let dscp = ((version_priority & 0x0f) << 2) | (flow_lbl0 >> 6);
     let (payload_offset, tcp_flags, flow_src_port, flow_dst_port, icmp_type) =
         parse_l4(data, data_end, offset, protocol)?;
+    // #8249 EXPERIMENT: reuse the already-validated 40-byte header slice
+    // instead of re-reading the addresses from the packet. `ip6` covers
+    // [l3_offset, l3_offset+40) and the addresses live at +8 and +24 within it.
     let mut src_addr = [0u8; 16];
-    src_addr.copy_from_slice(unsafe { read_bytes(data, data_end, l3_offset as usize + 8, 16) }?);
+    src_addr.copy_from_slice(&ip6[8..24]);
     let mut dst_addr = [0u8; 16];
-    dst_addr.copy_from_slice(unsafe { read_bytes(data, data_end, l3_offset as usize + 24, 16) }?);
+    dst_addr.copy_from_slice(&ip6[24..40]);
     Some(ParsedPacket {
         vlan_id,
         vlan_pcp,
