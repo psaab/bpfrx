@@ -1432,7 +1432,9 @@ func (s *Store) loadRollbackHistory() {
 	var entries []*HistoryEntry
 	for i := 1; i <= s.history.MaxSize(); i++ {
 		path := s.rollbackPath(i)
-		data, err := os.ReadFile(path)
+		// #8597 (muse-004 K70): bounded, like every other authoritative read in
+		// this package.
+		data, err := ReadBoundedFile(path, MaxConfigSize)
 		if err != nil {
 			// #3441 L2: stop only at a genuinely missing slot (the
 			// contiguous-sequence terminator). A transient/permission
