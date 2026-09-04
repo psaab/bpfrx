@@ -903,7 +903,36 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 				proto.ISIS.Overload = true
 			case "interface":
 				if len(child.Keys) >= 2 {
-					iface := &ISISInterface{Name: child.Keys[1]}
+					// #8436 find-or-create. ISIS.Interfaces is a SLICE, so a
+					// second block naming the SAME interface used to APPEND a
+					// second entry with that name rather than overwrite one —
+					// it looks like a merge until the entries are counted, and
+					// whichever consumer reads first wins while the other
+					// block's settings are unreachable. Same shape as `system
+					// login class` (#8548) and the #8594 OSPF/OSPF3/RA
+					// interface batch.
+					//
+					// THE DIFFERENT-NAMES CASE IS PRESERVED BY CONSTRUCTION:
+					// the lookup is keyed on the interface NAME, so two blocks
+					// naming different interfaces do not match and still append
+					// two entries — ordinary Junos authoring. Only two blocks
+					// naming the SAME interface merge, which is the case the
+					// #8436 census builds and the only one that was ever wrong.
+					// TestDistinctISISInterfaceBlocksStillAppend8436 is the
+					// control: an over-broad merge that matched any entry would
+					// silently configure one interface where the operator wrote
+					// two, and only that cell can see it.
+					var iface *ISISInterface
+					for _, existing := range proto.ISIS.Interfaces {
+						if existing != nil && existing.Name == child.Keys[1] {
+							iface = existing
+							break
+						}
+					}
+					appendISISIface := iface == nil
+					if appendISISIface {
+						iface = &ISISInterface{Name: child.Keys[1]}
+					}
 					for _, prop := range child.Children {
 						switch prop.Name() {
 						case "level":
@@ -951,7 +980,9 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 							// next key is the level value, handled above
 						}
 					}
-					proto.ISIS.Interfaces = append(proto.ISIS.Interfaces, iface)
+					if appendISISIface {
+						proto.ISIS.Interfaces = append(proto.ISIS.Interfaces, iface)
+					}
 				}
 			}
 		}
