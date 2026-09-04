@@ -574,38 +574,24 @@ func dhGroupBits(group int) int {
 // modp<dhGroupBits(group)> (the unchanged pre-#2392 behaviour for the
 // classic MODP groups 1/2/5/14/15/16).
 func formatDHGroup(group int) string {
-	switch group {
-	case 19:
-		return "ecp256"
-	case 20:
-		return "ecp384"
-	case 21:
-		return "ecp521"
-	case 25:
-		return "ecp192"
-	case 26:
-		return "ecp224"
-	case 27:
-		return "ecp224bp"
-	case 28:
-		return "ecp256bp"
-	case 29:
-		return "ecp384bp"
-	case 30:
-		return "ecp512bp"
-	case 31:
-		return "curve25519"
-	case 32:
-		return "curve448"
-	case 22:
-		return "modp1024s160"
-	case 23:
-		return "modp2048s224"
-	case 24:
-		return "modp2048s256"
-	default:
-		return fmt.Sprintf("modp%d", dhGroupBits(group))
-	}
+	// #8597 (muse-004 K88): the keyword table is config.DHGroupKeyword, the
+	// SAME map ValidateDHGroup accepts against.
+	//
+	// This used to carry its own switch with a `default: modp<dhGroupBits(n)>`
+	// fall-through, and the validator accepted any positive integer — so the
+	// gate and the renderer had different ideas of the accepted set. Measured:
+	// 99 -> "modp99", 17 -> "modp17", 33 -> "modp33", all of which charon
+	// rejects. 17 is the worst of them: it is a REAL group (RFC 3526
+	// modp6144), so the render is not merely unspelled but wrong.
+	//
+	// The fall-through is gone rather than corrected, because a fall-through is
+	// what let an unspellable group reach swanctl in the first place. An
+	// unlisted group is now refused at commit with the accepted set named; if
+	// one ever reaches here anyway (a tolerant load, a future caller), it
+	// renders the empty string, which fails LOUDLY at proposal-build rather
+	// than becoming a plausible-looking keyword charon quietly refuses.
+	kw, _ := config.DHGroupKeyword(group)
+	return kw
 }
 
 // SAStatus represents an IPsec Security Association as reported by

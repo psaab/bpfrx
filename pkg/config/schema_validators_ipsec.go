@@ -29,5 +29,22 @@ func ValidateDHGroup(raw string, _ *Config) error {
 	if v < 1 {
 		return fmt.Errorf("DH group must be a positive integer (got %d); 0 silently drops the modp term from the negotiated proposal", v)
 	}
+	// #8597 (muse-004 K88): accept exactly the groups the renderer can SPELL.
+	//
+	// Any positive integer used to pass here, and pkg/ipsec's formatDHGroup
+	// falls through to `modp<n>` for anything outside its table — measured,
+	// `dh-group 99` committed clean and rendered `modp99`, which charon
+	// rejects. The operator gets an IPsec that never establishes and
+	// diagnostics that point at charon rather than at the value they typed.
+	//
+	// Binding to config.DHGroupKeyword rather than a second list here is the
+	// whole fix: the defect was a validator and a renderer with different
+	// ideas of the accepted set, and a hand-copied set in the validator would
+	// reproduce it.
+	if _, ok := DHGroupKeyword(v); !ok {
+		return fmt.Errorf("unsupported DH group %d; accepted groups are %v "+
+			"(an unlisted group renders as a proposal keyword strongSwan does not "+
+			"accept, so IPsec never establishes)", v, SupportedDHGroups())
+	}
 	return nil
 }
