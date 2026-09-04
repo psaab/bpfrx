@@ -1179,6 +1179,57 @@ they repeatedly bite:
   - **A `-race` failure has no `--- FAIL` line.** It emits `WARNING: DATA
     RACE` plus a package-level FAIL, so a `^--- FAIL` counter scores a genuine
     race red as a PASS. Count both.
+  - **ANCHORING a `--- FAIL` scan is unsound, and the direction is the
+    damaging one (#8213).** Parallel `go test -v` interleaves concurrent
+    tests MID-LINE, so a real `--- FAIL: TestX` can be spliced into another
+    test's failure text and no longer start at column 0. An anchored scan
+    then reports zero named failures for a run that genuinely failed, and the
+    cell scores as an ESCAPE — which reads as "the fix is not bound" and
+    points a reviewer at the TEST as the thing to weaken. It does not merely
+    lose a signal; it manufactures an argument for deleting a guard that
+    works. Observed shape, from the #8000 matrix:
+
+    ```
+    ...left the barrier armed --- FAIL: TestR--- FAIL: TestRemoteFailover... (0.60s)
+    ```
+
+    Every anchor variant fails somewhere. Measured against a fixture holding
+    one top-level failure, one subtest failure and the spliced line above
+    (three real failing tests):
+
+    | pattern | finds | misses |
+    |---|---|---|
+    | `^--- FAIL` | 1 | the indented SUBTEST and the spliced line |
+    | `^\s+--- FAIL` | 1 | the TOP-LEVEL line — it has no leading whitespace |
+    | `^\s*--- FAIL` | 2 | the spliced line |
+    | unanchored `grep -oE -- '--- FAIL: '` | **4** | nothing — it OVER-counts |
+    | `go test -json`, `.Action=="fail"` | 3 | nothing, by construction |
+
+    Note the second row against the first: the two anchors fail in OPPOSITE
+    directions, so "tighten the anchor" and "loosen the anchor" each fix one
+    and break the other. `^\s*` is not the bug — it is strictly better than
+    both `^` and `^\s+` — it is just still text.
+
+    The unanchored count is the landed mitigation (`mutation_go_failed` in
+    `scripts/mutate-lib.sh`). It returns FOUR for three real failures, because
+    the spliced line carries two markers — the truncated `TestR` fragment and
+    the real name. That over-count is the right trade and it is why the
+    counter is used only for the VERDICT: over-counting cannot turn a kill
+    into an escape, whereas the anchored under-count could and did.
+
+    It is NOT sound for ATTRIBUTION. Anything reporting WHICH test killed a
+    mutant must use `mutation_go_failed_names_json` over `go test -json`,
+    where events are emitted one per line and cannot splice, or it will report
+    a test named `TestR` that does not exist.
+
+  - **The Rust half is NOT exposed, and that asymmetry is deliberate.**
+    `mutation_rust_failed` keeps its `^test .* \.\.\. FAILED` anchor.
+    Measured on a full parallel `cargo test` run of 5217 tests: zero lines
+    carry a `test ... ` marker anywhere but column 0, and zero lines carry two
+    of them. Rust's libtest holds the stdout lock for each result line, so it
+    cannot interleave the way Go's `-v` output does. Do not "fix" the Rust
+    pattern by symmetry with the Go one, and do not read the Rust pattern's
+    safety as evidence the Go one was fine.
   - **Count collection in PACKAGES, not in result lines.** If `collected`
     includes `--- FAIL` lines it moves with the failure count, and a package
     that failed to BUILD hides behind another package's extra failures.
