@@ -156,6 +156,24 @@ func resolveInterfaceRef(ref string, cfg *config.Config) (physName string, confi
 //     not about.
 var errVLANCreateFailed = errors.New("VLAN sub-interface creation failed")
 
+// errVLANBringUpFailed marks the two failures that happen AFTER netlink.LinkAdd
+// has already succeeded: the created link could not be found again, or it could
+// not be brought up.
+//
+// It exists for the operator's record, not for control flow. Both of these fall
+// through to the caller's soft skip, which labels its UnarmedSurface "create
+// failed" for anything that is not errVLANAdoptRefused — so a link that WAS
+// created and then failed to come up was filed as a creation failure. That is
+// the same false-statement harm #6916 named one branch over: it is the sentence
+// that sends an operator looking for a creation error that never happened,
+// while the actual fault (a set-up refusal on a link that exists) goes unnamed.
+//
+// It deliberately does NOT change the disposition. Failing the apply here is
+// what errVLANCreateFailed's own comment declines to do, and for the reason
+// stated there: the link exists, the filter binding IS assigned, and the #6893
+// harm does not arise.
+var errVLANBringUpFailed = errors.New("VLAN sub-interface created but not brought up")
+
 // ensureVLANSubInterfaceFn is ensureVLANSubInterface's test seam, mirroring
 // teardownCleanupFn in loader.go: the paired proof for #6893 part 2 needs a
 // CREATION FAILURE, which is not reachable in a unit test without netlink and
@@ -183,6 +201,21 @@ var errVLANAdoptRefused = errors.New("VLAN sub-interface adoption refused")
 // reachable in a unit test without netlink and CAP_NET_ADMIN. Production
 // leaves it pointing at the real function.
 var vlanLinkByNameSeam = netlink.LinkByName
+
+// vlanLinkAddSeam / vlanLinkSetUpSeam are the create path's test seams.
+//
+// Added for a specific reason (#8122), and it is worth recording because the
+// reason is a mutation that ESCAPED. The first version of the errVLANBringUpFailed
+// test drove ensureVLANSubInterfaceFn — the CALLER's seam — and synthesized the
+// wrapped error itself, so it bound the label switch and not the two production
+// sites that must carry the sentinel. Deleting both `%w: %w` wraps from this file
+// left that test green. Without these seams the wrapping is unbindable, and an
+// unbindable claim is one that will be believed exactly as long as nobody tries
+// it.
+var (
+	vlanLinkAddSeam   = netlink.LinkAdd
+	vlanLinkSetUpSeam = netlink.LinkSetUp
+)
 
 // #8119/#8120: the netlink MUTATORS on the interface-reconcile path, behind
 // seams so a test can drive the real compileZones over a simulated host and
@@ -214,6 +247,24 @@ var (
 // the caller has to be able to say so. A flag that were merely "a VLAN was
 // configured" would be true on every apply of a VLAN config and would report
 // nothing; it is true only when this call actually added a link.
+// disableAcceptRA turns off RA acceptance on a VLAN child — the firewall uses
+// its own configured routes. Extracted (#8122) so the create and adopt paths
+// call ONE thing: the split that let the adopt path skip it was structural, and
+// a second inline copy would be the same shape waiting to drift again.
+func disableAcceptRA(subName string) {
+	raPath := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/accept_ra", subName)
+	if err := acceptRAWriteSeam(raPath, []byte("0"), 0644); err != nil {
+		slog.Warn("failed to disable accept_ra on VLAN sub-interface",
+			"name", subName, "err", err)
+	}
+}
+
+// acceptRAWriteSeam is disableAcceptRA's test seam. The real write targets
+// /proc, which a unit test cannot create, so without a seam the create/adopt
+// symmetry this change is about could only be asserted by reading the code —
+// which is what let the paths diverge in the first place.
+var acceptRAWriteSeam = os.WriteFile
+
 func ensureVLANSubInterface(parentName string, vlanID int) (int, bool, error) {
 	parent, err := vlanLinkByNameSeam(parentName)
 	if err != nil {
@@ -245,12 +296,35 @@ func ensureVLANSubInterface(parentName string, vlanID int) (int, bool, error) {
 			// legitimate child out of the dataplane. Discarding it entirely,
 			// which is what this line did before, left the operator with no
 			// way to see why a configured child never came up.
-			if err := netlink.LinkSetUp(existing); err != nil {
-				slog.Warn("could not bring existing VLAN sub-interface up",
+			if err := vlanLinkSetUpSeam(existing); err != nil {
+				// #8122: name the CONSEQUENCE, not just the call. The apply
+				// goes on to report success and the child stays in the
+				// dataplane and is armed, so the only thing that says traffic
+				// is not moving through a configured surface is this line.
+				slog.Warn("configured VLAN sub-interface is DOWN and the apply "+
+					"will still report success: an adopted child could not be "+
+					"brought up, so nothing forwards through it",
 					"name", subName, "parent", parentName, "vlan_id", vlanID,
 					"err", err)
 			}
 		}
+		// #8122: apply accept_ra on the ADOPT path too. The create path below
+		// writes it and this branch returned before reaching it, so a child
+		// that pre-existed the daemon with accept_ra=1 kept it.
+		//
+		// Two other mechanisms already cover this on every SUCCESSFUL apply —
+		// pkg/networkd emits IPv6AcceptRA=no for every managed interface
+		// (path-independent), and daemon bring-up sets default/accept_ra=0 so a
+		// child created after bring-up inherits 0. The reachable gap is exactly
+		// a pre-existing child that is adopted, and it does not self-heal on an
+		// ABORTED apply: d.networkd.Apply is guarded on applyResult != nil, so
+		// the networkd re-assertion is skipped precisely when the abort leaves
+		// the child adopted.
+		//
+		// Taken here only because this change already touches the create/adopt
+		// symmetry; on its own a third writer of the same fact would be hard to
+		// justify.
+		disableAcceptRA(subName)
 		// Not counted as a creation: the link was already present. Bringing an
 		// existing link up is a state nudge the next apply repeats idempotently,
 		// not a new object the operator would have to remove by hand.
@@ -265,7 +339,7 @@ func ensureVLANSubInterface(parentName string, vlanID int) (int, bool, error) {
 		},
 		VlanId: vlanID,
 	}
-	if err := netlink.LinkAdd(vlan); err != nil {
+	if err := vlanLinkAddSeam(vlan); err != nil {
 		return 0, false, fmt.Errorf("create VLAN sub-interface %s: %w: %w",
 			subName, errVLANCreateFailed, err)
 	}
@@ -275,19 +349,17 @@ func ensureVLANSubInterface(parentName string, vlanID int) (int, bool, error) {
 	// steps do. Reporting false on a later failure would understate exactly the
 	// state #4960 is about.
 	// Bring it up
-	link, err := netlink.LinkByName(subName)
+	link, err := vlanLinkByNameSeam(subName)
 	if err != nil {
-		return 0, true, fmt.Errorf("find created VLAN sub-interface %s: %w", subName, err)
+		return 0, true, fmt.Errorf("find created VLAN sub-interface %s: %w: %w",
+			subName, errVLANBringUpFailed, err)
 	}
-	if err := netlink.LinkSetUp(link); err != nil {
-		return 0, true, fmt.Errorf("set VLAN sub-interface %s up: %w", subName, err)
+	if err := vlanLinkSetUpSeam(link); err != nil {
+		return 0, true, fmt.Errorf("set VLAN sub-interface %s up: %w: %w",
+			subName, errVLANBringUpFailed, err)
 	}
 
-	// Disable RA acceptance — firewall uses its own configured routes.
-	raPath := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/accept_ra", subName)
-	if err := os.WriteFile(raPath, []byte("0"), 0644); err != nil {
-		slog.Warn("failed to disable accept_ra on VLAN sub-interface", "name", subName, "err", err)
-	}
+	disableAcceptRA(subName)
 
 	slog.Info("created VLAN sub-interface",
 		"name", subName, "parent", parentName, "vlan_id", vlanID,
@@ -753,9 +825,18 @@ func (st *zoneMapState) mapZoneInterface(dp DataPlane, cfg *config.Config, resul
 			// failed" would be a false statement in the operator's own
 			// record, and it is the statement that would send them looking
 			// for a creation error that never happened.
+			// #8122: a link that WAS created and then failed to come up is
+			// not a creation failure, and filing it as one is the #6916 harm
+			// exactly — a false statement in the operator's own record, and
+			// the one that sends them looking for an error that never
+			// happened. errVLANBringUpFailed exists to make that sentence
+			// true.
 			what := "create failed"
-			if errors.Is(err, errVLANAdoptRefused) {
+			switch {
+			case errors.Is(err, errVLANAdoptRefused):
 				what = "not adopted"
+			case errors.Is(err, errVLANBringUpFailed):
+				what = "created but could not be brought up"
 			}
 			result.recordUnarmedSurface(UnarmedSurface{
 				Name:   fmt.Sprintf("%s.%d", physName, vlanID),
