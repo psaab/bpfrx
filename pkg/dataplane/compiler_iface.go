@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -184,26 +183,6 @@ var errVLANAdoptRefused = errors.New("VLAN sub-interface adoption refused")
 // leaves it pointing at the real function.
 var vlanLinkByNameSeam = netlink.LinkByName
 
-// #8119/#8120: the netlink MUTATORS on the interface-reconcile path, behind
-// seams so a test can drive the real compileZones over a simulated host and
-// assert what TWO consecutive applies leave behind.
-//
-// A single apply is self-consistent, so a single-apply assertion passes on both
-// of those defects whichever way the zone map happened to iterate. The second
-// apply is the only witness that can contradict a reconcile, because it does
-// not share the assumption that one pass converges.
-//
-// Reads are NOT seamed: CompileResult's ifCache / linkCache / linkIdxMap are
-// package-visible maps a test seeds directly, which also reproduces the real
-// cache lifetime — one CompileResult per apply, populated once from the host.
-var (
-	linkSetMTUSeam     = netlink.LinkSetMTU
-	addrLinkByNameSeam = netlink.LinkByName
-	addrListSeam       = netlink.AddrList
-	addrAddSeam        = netlink.AddrAdd
-	addrDelSeam        = netlink.AddrDel
-)
-
 // ensureVLANSubInterface creates a Linux VLAN sub-interface if it doesn't exist.
 // Returns the sub-interface's ifindex and whether this call CREATED it.
 //
@@ -245,12 +224,35 @@ func ensureVLANSubInterface(parentName string, vlanID int) (int, bool, error) {
 			// legitimate child out of the dataplane. Discarding it entirely,
 			// which is what this line did before, left the operator with no
 			// way to see why a configured child never came up.
-			if err := netlink.LinkSetUp(existing); err != nil {
-				slog.Warn("could not bring existing VLAN sub-interface up",
+			if err := vlanLinkSetUpSeam(existing); err != nil {
+				// #8122: name the CONSEQUENCE, not just the call. The apply
+				// goes on to report success and the child stays in the
+				// dataplane and is armed, so the only thing that says traffic
+				// is not moving through a configured surface is this line.
+				slog.Warn("configured VLAN sub-interface is DOWN and the apply "+
+					"will still report success: an adopted child could not be "+
+					"brought up, so nothing forwards through it",
 					"name", subName, "parent", parentName, "vlan_id", vlanID,
 					"err", err)
 			}
 		}
+		// #8122: apply accept_ra on the ADOPT path too. The create path below
+		// writes it and this branch returned before reaching it, so a child
+		// that pre-existed the daemon with accept_ra=1 kept it.
+		//
+		// Two other mechanisms already cover this on every SUCCESSFUL apply —
+		// pkg/networkd emits IPv6AcceptRA=no for every managed interface
+		// (path-independent), and daemon bring-up sets default/accept_ra=0 so a
+		// child created after bring-up inherits 0. The reachable gap is exactly
+		// a pre-existing child that is adopted, and it does not self-heal on an
+		// ABORTED apply: d.networkd.Apply is guarded on applyResult != nil, so
+		// the networkd re-assertion is skipped precisely when the abort leaves
+		// the child adopted.
+		//
+		// Taken here only because this change already touches the create/adopt
+		// symmetry; on its own a third writer of the same fact would be hard to
+		// justify.
+		disableAcceptRA(subName)
 		// Not counted as a creation: the link was already present. Bringing an
 		// existing link up is a state nudge the next apply repeats idempotently,
 		// not a new object the operator would have to remove by hand.
@@ -265,7 +267,7 @@ func ensureVLANSubInterface(parentName string, vlanID int) (int, bool, error) {
 		},
 		VlanId: vlanID,
 	}
-	if err := netlink.LinkAdd(vlan); err != nil {
+	if err := vlanLinkAddSeam(vlan); err != nil {
 		return 0, false, fmt.Errorf("create VLAN sub-interface %s: %w: %w",
 			subName, errVLANCreateFailed, err)
 	}
@@ -275,19 +277,17 @@ func ensureVLANSubInterface(parentName string, vlanID int) (int, bool, error) {
 	// steps do. Reporting false on a later failure would understate exactly the
 	// state #4960 is about.
 	// Bring it up
-	link, err := netlink.LinkByName(subName)
+	link, err := vlanLinkByNameSeam(subName)
 	if err != nil {
-		return 0, true, fmt.Errorf("find created VLAN sub-interface %s: %w", subName, err)
+		return 0, true, fmt.Errorf("find created VLAN sub-interface %s: %w: %w",
+			subName, errVLANBringUpFailed, err)
 	}
-	if err := netlink.LinkSetUp(link); err != nil {
-		return 0, true, fmt.Errorf("set VLAN sub-interface %s up: %w", subName, err)
+	if err := vlanLinkSetUpSeam(link); err != nil {
+		return 0, true, fmt.Errorf("set VLAN sub-interface %s up: %w: %w",
+			subName, errVLANBringUpFailed, err)
 	}
 
-	// Disable RA acceptance — firewall uses its own configured routes.
-	raPath := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/accept_ra", subName)
-	if err := os.WriteFile(raPath, []byte("0"), 0644); err != nil {
-		slog.Warn("failed to disable accept_ra on VLAN sub-interface", "name", subName, "err", err)
-	}
+	disableAcceptRA(subName)
 
 	slog.Info("created VLAN sub-interface",
 		"name", subName, "parent", parentName, "vlan_id", vlanID,
@@ -753,9 +753,18 @@ func (st *zoneMapState) mapZoneInterface(dp DataPlane, cfg *config.Config, resul
 			// failed" would be a false statement in the operator's own
 			// record, and it is the statement that would send them looking
 			// for a creation error that never happened.
+			// #8122: a link that WAS created and then failed to come up is
+			// not a creation failure, and filing it as one is the #6916 harm
+			// exactly — a false statement in the operator's own record, and
+			// the one that sends them looking for an error that never
+			// happened. errVLANBringUpFailed exists to make that sentence
+			// true.
 			what := "create failed"
-			if errors.Is(err, errVLANAdoptRefused) {
+			switch {
+			case errors.Is(err, errVLANAdoptRefused):
 				what = "not adopted"
+			case errors.Is(err, errVLANBringUpFailed):
+				what = "created but could not be brought up"
 			}
 			result.recordUnarmedSurface(UnarmedSurface{
 				Name:   fmt.Sprintf("%s.%d", physName, vlanID),

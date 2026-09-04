@@ -1784,6 +1784,17 @@ a test in `armproof_5275_test.go`.
   read as covered — the proven-down promotion to `skipped` and the delegation to
   a covered required parent — would then let an unrelated local interface answer
   for it, and both directions are **under**-counts that hide a live forwarding
+  Note also that the create/adopt split was structural rather than intentional
+  in a second place (#8122): the `accept_ra=0` write sat below `netlink.LinkAdd`,
+  so the adopt branch returned before reaching it and a VLAN child that
+  **pre-existed the daemon** with `accept_ra=1` kept it. Both paths now call one
+  `disableAcceptRA`. The gap was narrow — `pkg/networkd` emits `IPv6AcceptRA=no`
+  for every managed interface and daemon bring-up sets `default/accept_ra=0`, so
+  a child created after bring-up inherits 0 — but it does not self-heal on an
+  ABORTED apply, because `d.networkd.Apply` is guarded on `applyResult != nil`
+  and the re-assertion is skipped precisely when the abort leaves the child
+  adopted.
+
   surface with no shim. It is reachable: `ensureVLANSubInterface` adopts *any*
   existing device named `<phys>.<vid>` without checking its kind, the ifindex is
   recorded as a delegated child, the userspace attach loop skips it, and the
@@ -1825,6 +1836,32 @@ a test in `armproof_5275_test.go`.
   records an `UnarmedSurface`. The first three also emit a compiler-side `slog`
   line; the nil zone slot emits none, so the proof's own per-surface line is the
   only place it becomes visible.
+  - **What that record SAYS was wrong for one of the four (#8122).** The skip
+    branch labels its record `"VLAN sub-interface create failed"` for anything
+    that is not `errVLANAdoptRefused` — and two of `ensureVLANSubInterface`'s
+    error returns happen AFTER `netlink.LinkAdd` has already succeeded: the
+    created link could not be found again, or `LinkSetUp` refused. Both were
+    filed as creation failures for a link that WAS created. That is the same
+    false-statement harm #6916 named one branch over: the sentence that sends an
+    operator looking for a creation error that never happened, while the actual
+    fault goes unnamed. `errVLANBringUpFailed` marks those two, and the label
+    becomes `"created but could not be brought up"`.
+    It deliberately does **not** change the disposition — `errVLANCreateFailed`
+    is still the only sentinel that fails the apply, for the reason its own
+    comment gives: the link exists, `compileFirewallFilters` resolves it, and
+    the #6893 harm does not arise. A cell pins that the gate did not widen.
+  - **The ADOPT path is not one of the four, and that is the residual #8122
+    records.** An adopted child whose `LinkSetUp` nudge fails stays in the
+    dataplane, is armed, and is DOWN. It is `CoverageDirect` and correctly so —
+    the arm-coverage proof is about attachment, and a down-but-attached child is
+    attached. Nothing forwards through it, the apply reports success, and the
+    only thing that says so is a `slog.Warn`, which now names the consequence
+    rather than the failed call. A fourth record type was considered and
+    rejected on measurement: `UnarmedSurface` is consumed by this proof
+    (`armproof.go` turns each into a `CoverageSkipped` surface), `StillForwarding`
+    documents the opposite condition, and `UnappliedFilterBinding` — the
+    precedent for adding a type — has no production consumer outside its own
+    tests. A record nothing reads is not observability.
   - `skipped` is **not** a claim that nothing forwards. It is the third unknown:
     the compiler did not look, so the proof cannot say. `WouldGate` excludes it
     because a clean `disable` is a legitimate operator action and folding every
