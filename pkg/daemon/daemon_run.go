@@ -269,6 +269,22 @@ func (d *Daemon) Run(ctx context.Context) error {
 			gc.Run(ctx)
 		}()
 
+		// #8607: keep the persistent-NAT SHOW table populated.
+		//
+		// It is started HERE, beside the GC whose SkipSweep above is the
+		// reason it is needed, and NOT from cluster-comms wiring where the
+		// #8121 lease PUSH loop lives. That loop is gated on being RG master,
+		// which is right for a peer push and wrong for an operator table: a
+		// standalone box with a persistent-NAT pool would keep the empty table
+		// this exists to fix. The refresher is a no-op on any backend that
+		// cannot export leases, so binding it to the run path costs nothing on
+		// the others.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			d.runPersistentNatShowRefreshLoop(ctx)
+		}()
+
 		evSrc, evErr := rt.Telemetry().NewEventSource()
 		if evErr != nil {
 			slog.Warn("failed to create event source", "err", evErr)
