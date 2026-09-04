@@ -255,6 +255,52 @@ func TestCompactNormalizeScopePreservesCompiledResult8690(t *testing.T) {
 			"into the clean count so the distinction stays visible.",
 			len(fixtureLimited), fixtureLimited)
 	}
+	// STEP 3 of the rule, given somewhere to live. The arm above cannot
+	// distinguish a gate refusing the packed SPELLING (harmful to disarm) from
+	// one refusing the CONSEQUENCE OF THE DROP, where the pass repairs the drop
+	// and the acceptance is the correct outcome. That distinction needs a
+	// person, and a person's verdict needs a home — otherwise a benign disarm
+	// blocks its family forever and the only way forward is to drop a real fix.
+	//
+	// An entry here is a CLASSIFICATION with its evidence, not a suppression,
+	// and it is held to the same standard as #8704's deepDupUnreportable: the
+	// cell below fails for a listed site that is NOT currently disarming, so a
+	// stale entry — one whose gate was retired, or whose site left the scope —
+	// reds instead of quietly excusing the next real disarm that lands on the
+	// same key.
+	benign := map[string]string{
+		"snmp trap-group xpfarg targets": "the gate refuses the CONSEQUENCE of the drop, not " +
+			"the spelling. Measured: with the pass disabled the elided " +
+			"`trap-group tg1 targets 10.0.0.1;` loses its targets and snmp rejects with " +
+			"\"no targets configured (a trap group with zero targets sends no " +
+			"notifications)\"; with the pass enabled the target survives and the same gate " +
+			"accepts. The gate is doing its job in both cases — it is the DROP it objects " +
+			"to, and the pass repairs the drop. Normalizing here makes the operator's " +
+			"config mean what they wrote, which is the acceptance being correct rather " +
+			"than the gate being disarmed. Same shape as the #8430 empty-match example " +
+			"in the LIMITATION note above.",
+	}
+	var unclassified []string
+	for _, site := range disarmed {
+		if _, ok := benign[site]; !ok {
+			unclassified = append(unclassified, site)
+		}
+	}
+	for site := range benign {
+		found := false
+		for _, d := range disarmed {
+			if d == site {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("site %q is classified benign in this cell but is NOT currently disarming "+
+				"any gate. The classification is stale — its gate may have been retired or the "+
+				"site may have left the scope — and a stale entry silently excuses the next "+
+				"real disarm that lands on the same key. Delete it (#8690)", site)
+		}
+	}
+	disarmed = unclassified
 	if len(disarmed) > 0 {
 		t.Errorf("%d site(s) in the normalizer's scope are REJECTED at strict "+
 			"commit with the pass disabled and ACCEPTED with it enabled: %v.\n"+
