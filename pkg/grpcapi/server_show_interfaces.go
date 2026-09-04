@@ -297,23 +297,49 @@ func (s *Server) ShowInterfacesDetail(_ context.Context, req *pb.ShowInterfacesD
 
 			fmt.Fprintf(&buf, "    Security: Zone: %s\n", li.zoneName)
 
-			// Host-inbound traffic services
-			if li.zone != nil && li.zone.HostInboundTraffic != nil {
-				hit := li.zone.HostInboundTraffic
-				if len(hit.SystemServices) > 0 {
-					fmt.Fprintf(&buf, "    Allowed host-inbound traffic : %s\n", strings.Join(hit.SystemServices, " "))
-				}
-				if len(hit.Protocols) > 0 {
-					fmt.Fprintf(&buf, "    Allowed host-inbound protocols: %s\n", strings.Join(hit.Protocols, " "))
-				}
-			}
-			// #3682: flag a management / cluster-control lifeline interface,
-			// which is EXCLUDED from host-inbound deny scoping, so the implicit
-			// exemption is visible on this surface too.
+			// Host-inbound traffic services (#8183): render the EFFECTIVE
+			// admitted set for THIS logical interface, not the zone's.
+			//
+			// Since #6515 a per-interface `host-inbound-traffic` stanza REPLACES
+			// the zone stanza on that interface, so reading
+			// `li.zone.HostInboundTraffic` verbatim — which this did — reports
+			// services the box does not admit. The inverse is the dangerous one:
+			// a zone admitting `ssh` under an interface stanza of `{ ping; }`
+			// rendered as admitting `ssh` here, which reads as an exposure that
+			// does not exist, and whose obvious remedy (removing `ssh` from the
+			// zone) changes nothing on that interface. That is the #5619
+			// doctrine: a surface that answers "what does this interface admit"
+			// must answer for the interface.
+			//
+			// This is the surface the REMOTE cli prints — cmd/cli/show_interfaces.go
+			// renders `resp.GetOutput()` verbatim — so it was the copy most
+			// operators actually read, while its local-CLI twin
+			// (pkg/cli/cli_show_interfaces.go) had been correct since #3654.
+			// Both now route through the same resolver, which is what
+			// host_inbound_surface_agreement_8183_test.go pins.
 			if li.zone != nil {
 				ref := fmt.Sprintf("%s.%d", physName, li.unitNum)
-				if config.HostInboundLifelineInterface(ref, config.HostInboundLifelineSet(cfg)) {
+				svc, proto, overridden := li.zone.InterfaceHostInboundEffective(ref)
+				// #3682: a management / cluster-control lifeline interface is
+				// EXCLUDED from host-inbound deny scoping; flag it explicitly so
+				// the exemption is visible rather than masked by a (misleading)
+				// default-deny line.
+				lifeline := config.HostInboundLifelineInterface(
+					ref, config.HostInboundLifelineSet(cfg))
+				if overridden {
+					fmt.Fprintln(&buf, "    Host-inbound: interface-specific override (effective set below)")
+				}
+				if len(svc) > 0 {
+					fmt.Fprintf(&buf, "    Allowed host-inbound traffic : %s\n", strings.Join(svc, " "))
+				}
+				if len(proto) > 0 {
+					fmt.Fprintf(&buf, "    Allowed host-inbound protocols: %s\n", strings.Join(proto, " "))
+				}
+				if lifeline {
 					fmt.Fprintln(&buf, "    Host-inbound: lifeline-exempt (management/fabric, bypasses host-inbound deny)")
+				} else if len(svc) == 0 && len(proto) == 0 {
+					fmt.Fprintf(&buf, "    Host-inbound: default deny (%s)\n",
+						config.HostInboundDenyReason(overridden, li.zone.HostInboundTraffic != nil))
 				}
 			}
 

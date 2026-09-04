@@ -2260,6 +2260,26 @@ Physical interface: reth0, Enabled, Physical link is Up
   - `Flow error statistics (Packets dropped due to):` header.
   - Each counter: 6-space indent, name padded, colon, right-aligned number.
 - **Protocol blocks:** `Protocol inet, MTU: 1500` and `Protocol inet6, MTU: 1500`.
+- **Host-inbound (#8183):** the `Allowed host-inbound traffic :` /
+  `Allowed host-inbound protocols:` lines under a logical interface are the
+  EFFECTIVE set for THAT interface, not the zone's. Since #6515 a per-interface
+  `host-inbound-traffic` stanza REPLACES the zone stanza, so an interface that
+  declares one renders its own set, prefixed by
+  `Host-inbound: interface-specific override (effective set below)`. An
+  interface admitting nothing renders an explicit
+  `Host-inbound: default deny (<reason>)` line rather than a blank section, and
+  a management / cluster-control lifeline interface renders
+  `Host-inbound: lifeline-exempt (...)` INSTEAD of the deny line (#3682) — the
+  two are mutually exclusive.
+
+  This holds on BOTH `show interfaces` surfaces. Until #8183 the gRPC handler
+  (`pkg/grpcapi/server_show_interfaces.go`), which is what the REMOTE `cli`
+  prints, rendered the ZONE set verbatim while the local CLI already rendered
+  the effective one — so the same interface reported different admission sets
+  depending on which surface an operator used, and the remote one reported a set
+  that is not enforced. `pkg/cli/host_inbound_surface_agreement_8183_test.go`
+  drives both renderers over one config and asserts they agree with each other
+  AND with `config.InterfaceHostInboundEffective`.
   - Address entries under each protocol.
 - **Bondless reth resolution (#4328):** a reth (`reth0`) has no kernel netdev
   of its own, so `show interfaces reth0`, `show interfaces reth0 detail`, and
