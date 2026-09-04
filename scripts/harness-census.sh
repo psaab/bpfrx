@@ -139,6 +139,7 @@ test/incus/host-inbound-lib.sh
 test/incus/iperf-throughput-lib.sh
 test/incus/mouse-elephant-lib.sh
 test/incus/newflow-ceiling-lib.sh
+test/incus/screen-probe-lib.sh
 test/incus/target-services.sh
 "
 fi
