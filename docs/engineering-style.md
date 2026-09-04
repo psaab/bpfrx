@@ -1268,6 +1268,32 @@ they repeatedly bite:
     that failed to BUILD hides behind another package's extra failures.
   - **Commit before mutating.** A harness that restores files by checkout or
     copy will eat uncommitted work; this has cost a full fix rewrite.
+    The sharper form, learned again the hard way: **`git checkout --` is a
+    RESTORE when your work is committed and a DELETION when it is not** — the
+    same command, opposite meaning, and the discriminator is invisible at the
+    moment you type it. A killed belt that leaves a mutant applied over
+    uncommitted work is recoverable only from a `cp` backup, and the backup's
+    CONTENTS must be checked before restoring rather than its filename trusted.
+  - **A guard that SKIPS is indistinguishable from one that passes (#8371).**
+    42 tests across 19 files call `rlimit.RemoveMemlock()` and `t.Skipf` on
+    failure. Without `CAP_SYS_RESOURCE` they skip, the package reports `ok`, and
+    the guards provide no protection — and a reviewer who greps for the test
+    name concludes the defect is guarded. Measured on the development host
+    (uid 1000, `ulimit -l` 8192): **all 42 are inert there**, which is where
+    `make test-go` runs and where changes are first validated, so this is not a
+    CI-only concern.
+    `pkg/memlockcensus` makes the SET a gated quantity: a new memlock-gated
+    guard cannot appear without a registry row, and a dead row cannot linger.
+    It deliberately does NOT red the suite when memlock is missing — a gate
+    everyone learns to ignore is worse than the silence it replaces — but it
+    reports the inert guards BY NAME, and fails under
+    `XPF_REQUIRE_MEMLOCK_GUARDS=1` so a privileged leg cannot silently stop
+    executing them.
+    **The registry is the fallback, not the remedy.** Ask first whether the test
+    needs a real BPF map: #8370 moved four of its own below the privilege
+    boundary through the `fakeCtrlMap` seam (added by #5486 for this reason) and
+    they now execute unprivileged while still asserting the row was never
+    written.
 - **Shared-cluster lock protocol (#1875).** The loss userspace cluster
   is shared by concurrent agents; ownership is serialized by the
   advisory flock on `/tmp/xpf-cluster.lock` with holder metadata in
