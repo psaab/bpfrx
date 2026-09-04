@@ -217,6 +217,30 @@ pub(super) fn poll_binding_process_descriptor(
                     &mut binding.last_learned_neighbor,
                     worker_ctx,
                 );
+                // #7699 stage 7b: THE PPTP DATA-CHANNEL RESOLVE.
+                //
+                // It cannot live inside the stage above, which takes
+                // `&WorkerContext`: the association table is per-worker state on
+                // `SessionTable`, broadcast to every worker at install so the
+                // packet path reads it without a lock. This is the one point in
+                // the loop where the frame and `&mut sessions` are both in
+                // scope, which is why the join is here rather than beside its
+                // sibling.
+                //
+                // Gated on `flow.is_none()` so it is purely ADDITIVE: a packet
+                // that already has an identity is untouched, and a version-1
+                // GRE packet is flowless today, so the only reachable change is
+                // flowless -> identified. Gated on `gre_acceleration` for the
+                // same reason the sibling is — with the knob off this expression
+                // does nothing and the path is bit-identical.
+                if flow.is_none() && worker_ctx.forwarding.gre_acceleration {
+                    flow = crate::afxdp::gre_discriminator::pptp_data_session_flow(
+                        packet_frame,
+                        meta,
+                        sessions,
+                        now_ns,
+                    );
+                }
                 // #4743: fail-closed drop for an OVER-LIMIT IPv6 extension-header
                 // chain. `stage_parse_flow_and_learn` returns `None` (flowless)
                 // when the #2292 helper walkers give up past
