@@ -301,14 +301,17 @@ func (e *Engine) withinMatches(pol *config.EventPolicy, rt *policyRuntime, event
 	// that legitimately means "no temporal filter"; this guard is only for
 	// a within clause that exists but gates nothing.
 	for _, wc := range pol.WithinClauses {
-		if wc.Seconds <= 0 || (wc.TriggerOn <= 0 && wc.TriggerUntil <= 0) {
+		if _, ok := withinWindow(wc.Seconds); !ok {
+			return false
+		}
+		if wc.TriggerOn <= 0 && wc.TriggerUntil <= 0 {
 			return false
 		}
 	}
 
 	counts := make([]int, len(pol.WithinClauses))
 	for i, wc := range pol.WithinClauses {
-		window := time.Duration(wc.Seconds) * time.Second
+		window, _ := withinWindow(wc.Seconds)
 		for _, ts := range timestamps {
 			if now.Sub(ts) <= window {
 				counts[i]++
@@ -395,7 +398,17 @@ func (e *Engine) pruneWindow(pol *config.EventPolicy, eventName string, now time
 
 	maxWindow := time.Duration(0)
 	for _, wc := range pol.WithinClauses {
-		w := time.Duration(wc.Seconds) * time.Second
+		// An out-of-range clause contributes NOTHING to the retention window,
+		// so maxWindow falls through to the 60s default below rather than to a
+		// wrapped one (#8597). Retaining 60s of history for a clause the
+		// evaluator refuses to fire on is the conservative direction: the
+		// alternative, a wrapped sub-second maxWindow, silently discards every
+		// timestamp for EVERY event this policy watches — including the
+		// well-formed clauses beside it.
+		w, ok := withinWindow(wc.Seconds)
+		if !ok {
+			continue
+		}
 		if w > maxWindow {
 			maxWindow = w
 		}
@@ -424,4 +437,40 @@ func (e *Engine) pruneWindow(pol *config.EventPolicy, eventName string, now time
 		pruned = shrunk
 	}
 	rt.windows[eventName] = pruned
+}
+
+// withinWindow converts a within clause's `Seconds` to a Duration, reporting
+// whether the value is inside the range the config layer promises.
+//
+// #8597 (muse-004 K35). `within <seconds>` is bounded to
+// [config.MinEventWithinSeconds, config.MaxEventWithinSeconds] by
+// config.validateEventOptionsWithinAST, and that file's own comment notes the
+// 24h ceiling is what keeps `Seconds * time.Second` inside int64 nanoseconds.
+// But the bound is enforced on the STRICT commit path only: the lenient
+// HA-sync / on-disk Load ingress downgrades an out-of-range clause to a warning
+// and the compiler stores the raw strconv.Atoi int (compiler_services.go), so
+// a peer-synced or persisted value arrives here unbounded — the same ingress
+// the #3751 belt three lines up already exists for.
+//
+// What the wrap does, and why the existing `<= 0` guard cannot see it: the
+// multiply overflows past ~9.2e9 seconds and the residue can be small and
+// POSITIVE (gcd(1e9, 2^64) = 512, so the residues are 512ns multiples). Every
+// `now.Sub(ts) <= window` comparison then fails, all counts land at 0, and the
+// consequence SPLITS by clause shape:
+//
+//   - trigger-until N: `counts[i] > TriggerUntil` is `0 > N` — false, so the
+//     clause PASSES and the policy fires on EVERY event. Event-options is the
+//     self-mutating surface (its actions run `set` and `commit`), so this is an
+//     unauthorized remediation loop, throttled only by the 30s cooldown. This
+//     is the #3751 always-fire class arriving through a numeric path.
+//   - trigger-on N: `counts[i] < TriggerOn` — the policy never fires, a dead
+//     remediation.
+//
+// Returning !ok makes both halves fail CLOSED, which is the direction the
+// #3751 belt already chose for the same ingress.
+func withinWindow(seconds int) (time.Duration, bool) {
+	if seconds < config.MinEventWithinSeconds || seconds > config.MaxEventWithinSeconds {
+		return 0, false
+	}
+	return time.Duration(seconds) * time.Second, true
 }

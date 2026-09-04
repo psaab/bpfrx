@@ -204,6 +204,22 @@ applies a *retain-last-good* policy rather than installing a partial/empty set:
   configured > 0 does the snapshot drop to empty after that interval elapses
   (clearing `StaleSince`/`Hash`), firing an `onUpdate` so enforcement sees
   the now-empty set — an explicit operator opt-in to fail-open-on-stale.
+- **an out-of-range interval falls back; it never wraps (#8597).**
+  `update-interval` and `hold-interval` are bounded to
+  `[1, config.MaxDurationSeconds]` by the strict schema, but the compiler
+  stores them as a raw `strconv.Atoi` int and the tolerant Load /
+  HA-sync ingress downgrades an out-of-range value to a warning (#1960),
+  so the runtime cannot assume the bound. `time.Duration(n) *
+  time.Second` overflows int64 nanoseconds past `MaxDurationSeconds` and
+  the residue can be small and POSITIVE — the half a `<= 0` check cannot
+  see. `feedIntervalSeconds` / `resolveHoldInterval` therefore range-check
+  before the multiply and fall back (never clamp to the maximum, per the
+  #6769 reasoning: a value this far out is a typo or a hostile config,
+  not a request for the largest window allowed).
+  The direction matters most for `hold-interval`: falling back to
+  `retainForever` KEEPS a stale denylist enforced, where the wrap turned
+  "retain forever" into "drop to empty after 512 nanoseconds of failure"
+  — an inversion of the #2050 posture above.
 - **startup is fail-closed.** Before the first successful fetch there is no
   snapshot; `GetPrefixes` returns empty. A policy referencing a feed-backed
   address resolves to nothing until the first good fetch (bounded to seconds).
