@@ -194,21 +194,48 @@ func TestNotifyNextHopChangeGate(t *testing.T) {
 	e.Start()
 	defer e.Stop()
 
+	// #8664: this test mixes two waiting idioms, and only one of them is safe.
+	//
+	//   - "something MUST happen" is polled to a deadline. A fixed budget is
+	//     wrong here: it fails when the actuation is merely LATE, which is a
+	//     property of the machine, not of the engine.
+	//   - "nothing MUST happen" genuinely needs a fixed wait — an absence
+	//     cannot be polled for — but the wait is expressed as a multiple of the
+	//     engine's OWN debounce and throttle rather than a bare literal, so it
+	//     tracks those timings if they are ever retuned.
+	//
+	// Measured rather than assumed: with the budgets cut to 4ms this test fails
+	// at "probe failure did not actuate" and nowhere else, while lengthening
+	// them to 400ms is clean over 20 runs. So the squeezed-budget direction is
+	// the failing one, and it is that single assertion that feels it.
+	//
+	// Enlarging the sleeps was explicitly rejected as the remedy: it converts a
+	// fast flake into a slow one, makes the next occurrence rarer and more
+	// confusing, and leaves the racing assertion racing. So the absence windows
+	// are the SAME 40ms they were — 4 * (5ms + 5ms) — and the only behavioural
+	// change is that the "must happen" assertion polls instead of racing.
+	settle := 4 * (e.debounce + e.throttle)
+
 	// Healthy policies: gateway churn must not actuate.
 	for i := 0; i < 3; i++ {
 		e.NotifyNextHopChange()
 	}
-	time.Sleep(40 * time.Millisecond)
+	time.Sleep(settle)
 	if got := actuations.Load(); got != 0 {
 		t.Fatalf("actuations = %d on healthy policies, want 0", got)
 	}
 
-	// FAILED interface-typed policy: the trigger actuates.
+	// FAILED interface-typed policy: the trigger actuates. POLLED, not slept:
+	// this is a "must happen" assertion and a fixed budget makes it a race
+	// against the scheduler (#8664).
 	failWAN(e)
-	time.Sleep(40 * time.Millisecond)
+	actuateDeadline := time.Now().Add(2 * time.Second)
+	for actuations.Load() == 0 && time.Now().Before(actuateDeadline) {
+		time.Sleep(time.Millisecond)
+	}
 	base := actuations.Load()
 	if base == 0 {
-		t.Fatal("probe failure did not actuate")
+		t.Fatal("probe failure did not actuate within 2s")
 	}
 	r.set("ge-0-0-3", "198.51.100.254")
 	e.NotifyNextHopChange()
@@ -229,10 +256,25 @@ func TestNotifyNextHopChangeGate(t *testing.T) {
 	e2.Start()
 	defer e2.Stop()
 	e2.HandleTransition(transition("WAN", "wan-a", "fail", passResults()))
-	time.Sleep(40 * time.Millisecond)
+	settle2 := 4 * (e2.debounce + e2.throttle)
+	// #8664: the BASELINE is a "must happen" step in disguise, and it had the
+	// same fixed-budget defect as the assertion above. If the transition's own
+	// actuation has not landed when `b2` is taken, it lands during the window
+	// below and is attributed to `NotifyNextHopChange` — the test then reports
+	// the literal-only policy actuating when it did no such thing. Found by
+	// squeezing the budgets after fixing the first site: this one failed at
+	// "literal-only policy actuated: 0 -> 1", which is a FALSE accusation
+	// rather than a missed event, so it would have sent the next reader looking
+	// for a spurious-actuation bug that does not exist.
+	baseDeadline := time.Now().Add(2 * time.Second)
+	for e2cnt.Load() == 0 && time.Now().Before(baseDeadline) {
+		time.Sleep(time.Millisecond)
+	}
 	b2 := e2cnt.Load()
 	e2.NotifyNextHopChange()
-	time.Sleep(40 * time.Millisecond)
+	// An absence cannot be polled for, so this one stays a fixed wait — but
+	// derived from the engine's own timings (#8664).
+	time.Sleep(settle2)
 	if got := e2cnt.Load(); got != b2 {
 		t.Fatalf("literal-only policy actuated on NotifyNextHopChange: %d -> %d", b2, got)
 	}
