@@ -225,11 +225,14 @@ func (d *Daemon) buildSurfaceAScopes(cfg *config.Config) ([]ddns.SurfaceAScope, 
 	if cfg.System.Services != nil && cfg.System.Services.DynamicDNS != nil {
 		dd := cfg.System.Services.DynamicDNS
 		catalog = dd.Providers
-		if dd.ForcedRefreshSeconds > 0 {
-			forced = time.Duration(dd.ForcedRefreshSeconds) * time.Second
+		// #8642: assessed — plain seconds ints behind a `> 0` guard, so the
+		// family applies. Out-of-range falls back to the caller's existing
+		// default rather than clamping.
+		if d := config.SecondsToDuration(dd.ForcedRefreshSeconds, 0); d > 0 {
+			forced = d
 		}
-		if dd.ErrorBackoffMaxSeconds > 0 {
-			backoff = time.Duration(dd.ErrorBackoffMaxSeconds) * time.Second
+		if d := config.SecondsToDuration(dd.ErrorBackoffMaxSeconds, 0); d > 0 { // #8642
+			backoff = d
 		}
 	}
 

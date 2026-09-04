@@ -1029,7 +1029,17 @@ func (s *sender) randomAdvInterval() time.Duration {
 	}
 
 	interval := minI + rand.IntN(maxI-minI+1)
-	d := time.Duration(interval) * time.Second
+	// #8642: bound the conversion, not just the drawn zero.
+	//
+	// The #4525 floor below already covers the dangerous HALF of overflow: a
+	// wrapped value that lands negative or small-positive is `< minAdvInterval`
+	// and gets floored, so the RA hot-loop it was written for cannot happen.
+	// What it does not cover is a wrap landing LARGE positive — the residues are
+	// 512ns multiples across the whole int64 range, not just near zero — which
+	// silently stretches the advertisement interval instead of shrinking it.
+	// Hosts then lose their default route when RouterLifetime expires with no
+	// RA to refresh it. Quieter than a storm and just as much a loss of service.
+	d := config.SecondsToDuration(interval, defaultMaxAdvInterval*time.Second)
 	// #4525: never arm the periodic timer with a 0 (or sub-second) delay. A
 	// drawn 0 — reachable when a legacy/mis-typed max-advertisement-interval
 	// of 1-2s made minI derive to 0 — would Reset the advTimer to fire

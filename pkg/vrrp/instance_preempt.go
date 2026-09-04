@@ -2,6 +2,8 @@ package vrrp
 
 import (
 	"time"
+
+	"github.com/psaab/xpf/pkg/config"
 )
 
 // vrrpInstance preempt policy: the desired/suppressed preempt flags, the
@@ -151,10 +153,10 @@ func (vi *vrrpInstance) shouldPreemptObservedMaster() bool {
 func (vi *vrrpInstance) preemptHoldDuration() time.Duration {
 	vi.mu.RLock()
 	defer vi.mu.RUnlock()
-	if vi.cfg.PreemptHoldTime <= 0 {
-		return 0
-	}
-	return time.Duration(vi.cfg.PreemptHoldTime) * time.Second
+	// #8642: a wrapped hold collapses to ~512ns — immediate preemption of a
+	// live master, which is the behaviour #2082's priority gate exists to
+	// prevent. Fallback 0 preserves the existing "no hold" meaning.
+	return config.SecondsToDuration(vi.cfg.PreemptHoldTime, 0)
 }
 
 // preemptingLiveLowerMaster reports whether the masterDownTimer expiry that is
