@@ -855,6 +855,100 @@ impl Coordinator {
             .collect()
     }
 
+    /// #7209 item 1 (shape ii): rebuild each replayed forward entry's reverse
+    /// companion under the LIVE forwarding table, repair the stored one, and
+    /// return the repairs keyed by companion key.
+    ///
+    /// WHY THE REPLAY IS THE RIGHT PLACE. The companion is synthesized at IMPORT
+    /// time from `Coordinator.forwarding`, and
+    /// `synthesized_synced_reverse_entry` has exactly one early return — on
+    /// `is_reverse`. There is no forwarding-dependent `None` arm, so an import
+    /// taken while that table cannot resolve the reply path does not degrade
+    /// gracefully: it publishes a companion carrying `NoRoute`, ifindex 0 and
+    /// owner RG 0 into all four shared surfaces, and into the kernel session map
+    /// whenever the local-replace guard holds.
+    ///
+    /// Nothing re-derived it. The replay republished `entry.decision` verbatim,
+    /// and the only mechanism that ever rebuilt a companion was
+    /// `prewarm_reverse_synced_sessions_for_owner_rgs` at RG ACTIVATION — which
+    /// a mid-life `apply_snapshot` on an already-active node never reaches. So
+    /// the wrong reply-path row was permanent for any node that did not
+    /// subsequently fail over.
+    ///
+    /// `reconcile` reaches the replay AFTER `snapshot::apply_snapshot` has
+    /// assigned `coord.forwarding = new_forwarding`, so the table read here is
+    /// the new generation's, not the emptied one `stop_inner` left. That
+    /// ordering is what makes the replay a repair point at all, and it is why
+    /// this is the same shape #8171 established for the entries themselves.
+    ///
+    /// Scoped to peer-synced and shared-promoted forwards, mirroring
+    /// `prewarm_reverse_synced_sessions_for_owner_rgs`'s own
+    /// `allow_reverse_prewarm` gate — a locally-originated entry's companion is
+    /// not this path's to rebuild.
+    ///
+    /// Only an ACTUAL disagreement is repaired and counted. A steady-state
+    /// reconcile re-derives the identical value for every companion, so counting
+    /// unconditionally would make the metric a function of how often the box
+    /// reconciles rather than of how often a companion was built from a table
+    /// that could not answer.
+    fn rederived_reverse_companions(
+        &self,
+        entries: &[SyncedSessionEntry],
+    ) -> FastMap<SessionKey, SyncedSessionEntry> {
+        let ha_state = self.ha.rg_runtime.load();
+        let now_secs = monotonic_nanos() / 1_000_000_000;
+        let mut fresh_by_key: FastMap<SessionKey, SyncedSessionEntry> = FastMap::default();
+        for entry in entries {
+            if entry.metadata.is_reverse {
+                continue;
+            }
+            if !(entry.origin.is_peer_synced()
+                || matches!(entry.origin, SessionOrigin::SharedPromote))
+            {
+                continue;
+            }
+            if let Some(reverse) = crate::afxdp::shared_ops::synthesized_synced_reverse_entry(
+                &self.forwarding,
+                ha_state.as_ref(),
+                self.dynamic_neighbors_ref(),
+                entry,
+                now_secs,
+            ) {
+                fresh_by_key.insert(reverse.key.clone(), reverse);
+            }
+        }
+        let mut repairs: FastMap<SessionKey, SyncedSessionEntry> = FastMap::default();
+        let mut repaired = 0u64;
+        for entry in entries {
+            if !entry.metadata.is_reverse {
+                continue;
+            }
+            let Some(fresh) = fresh_by_key.get(&entry.key) else {
+                continue;
+            };
+            if entry.decision == fresh.decision
+                && entry.metadata.owner_rg_id == fresh.metadata.owner_rg_id
+            {
+                continue;
+            }
+            crate::afxdp::shared_ops::publish_shared_session(
+                &self.sessions.synced,
+                &self.sessions.nat,
+                &self.sessions.forward_wire,
+                &self.sessions.owner_rg_indexes,
+                fresh,
+            );
+            repairs.insert(fresh.key.clone(), fresh.clone());
+            repaired += 1;
+        }
+        if repaired > 0 {
+            self.sessions
+                .synced_reverse_rederived
+                .fetch_add(repaired, Ordering::Relaxed);
+        }
+        repairs
+    }
+
     pub(crate) fn replay_synced_sessions(
         &self,
         entries: &[SyncedSessionEntry],
@@ -865,7 +959,25 @@ impl Coordinator {
             return 0;
         }
         let worker_queues = worker_command_queues.values().cloned().collect::<Vec<_>>();
+        // #7209 item 1 (shape ii): rebuild each forward entry's reverse
+        // companion under the LIVE tables before anything is published, so a
+        // companion synthesized from a forwarding table that could not resolve
+        // the reply path is repaired here rather than replayed verbatim.
+        //
+        // DELIBERATELY IN THIS FUNCTION rather than in `replay_preserved_
+        // sessions`, which is where the first draft put it. That wrapper is the
+        // only production caller today, so both placements are correct for
+        // production — but this is the choke point every replay goes through,
+        // and putting the repair in the wrapper left the cell that drives THIS
+        // function unable to observe it. A guard that cannot see the mechanism
+        // it names is not a guard on it.
+        let rebuilt = self.rederived_reverse_companions(entries);
         for entry in entries {
+            // A repaired companion is what gets published and fanned out; the
+            // stored one is also corrected in the shared map, which is the
+            // authority a later prewarm, export or replay reads. Repairing only
+            // one of the two would leave the stale value to be re-adopted.
+            let entry = rebuilt.get(&entry.key).unwrap_or(entry);
             // #1789: a failed replay publish silently loses an arbitrary
             // prefix of synced state after reconcile (was `let _ =`). No
             // binding context here — shared counter.

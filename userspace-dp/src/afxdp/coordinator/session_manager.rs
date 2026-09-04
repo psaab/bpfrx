@@ -102,6 +102,28 @@ pub(in crate::afxdp) struct SessionManager {
     ///
     /// Surfaced via `Coordinator::synced_import_unpublished_total()`.
     pub(in crate::afxdp) synced_import_unpublished: AtomicU64,
+    /// #7209: reverse companions RE-DERIVED at reconcile replay because the
+    /// stored one no longer matched what the live forwarding table resolves.
+    ///
+    /// The companion is synthesized at IMPORT time from `Coordinator.forwarding`
+    /// (`synthesized_synced_reverse_entry`, whose only early return is on
+    /// `is_reverse` — there is no forwarding-dependent `None` arm), so an import
+    /// taken while that table cannot resolve the reply path publishes a
+    /// companion carrying `NoRoute`, ifindex 0 and owner RG 0. Nothing
+    /// downstream re-derived it: the replay republished `entry.decision`
+    /// verbatim, and the only repair was the RG-activation prewarm, which a
+    /// mid-life `apply_snapshot` on an already-ACTIVE node never reaches.
+    ///
+    /// The replay now re-derives under the live table, which is the same shape
+    /// #8171 established for the entries themselves. This counts the repairs so
+    /// the window is MEASURED rather than asserted from the lock graph — a
+    /// nonzero value means an import was taken while the table could not answer,
+    /// which is expected on a standby taking bulk sync before its first apply
+    /// and is the thing to watch once `sync_session` runs off the ServerState
+    /// mutex.
+    ///
+    /// Surfaced via `Coordinator::synced_reverse_rederived_total()`.
+    pub(in crate::afxdp) synced_reverse_rederived: AtomicU64,
     /// #5674: peer-synced session imports REJECTED by the coordinator's
     /// aggregate admission bound (`upsert_synced_session`). Locally-created
     /// sessions are capped per worker at `DEFAULT_MAX_SESSIONS`
@@ -181,6 +203,7 @@ impl SessionManager {
             install_stale_ignored: AtomicU64::new(0),
             synced_import_zone_unresolved: AtomicU64::new(0),
             synced_import_unpublished: AtomicU64::new(0),
+            synced_reverse_rederived: AtomicU64::new(0),
             delete_stale_ignored: AtomicU64::new(0),
             delete_dropped_released: AtomicU64::new(0),
             import_cap_drops: AtomicU64::new(0),

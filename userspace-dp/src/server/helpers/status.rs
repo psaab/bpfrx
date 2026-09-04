@@ -207,6 +207,19 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     // deferred-and-replay path.
     state.status.synced_import_unpublished = state.afxdp.synced_import_unpublished_total();
 
+    // #7209: reverse companions the reconcile replay had to REBUILD because the
+    // stored one disagreed with what the live forwarding table resolves. Wired
+    // rather than parked in UNSURFACED for the reason given above — that
+    // allowlist is deliberately empty (#7398).
+    //
+    // Nonzero means an import was taken while the table could not answer, and
+    // was repaired. Expected on a standby taking bulk sync before its first
+    // apply. It is the instrument for the window scope item 2 opens: once a
+    // reconcile releases the ServerState lock, imports land against a
+    // torn-down table by design, and this is what shows the replay is
+    // repairing them rather than the design being asserted from the lock graph.
+    state.status.synced_reverse_rederived = state.afxdp.synced_reverse_rederived_total();
+
     // #2315: GRE-decap RFC 6040 §4.2 illegal-combination drops (outer CE
     // over a Not-ECT inner). Nonzero = a misbehaving tunnel ingress
     // ECT-marked the outer for un-ECN inner traffic on a congested path.
