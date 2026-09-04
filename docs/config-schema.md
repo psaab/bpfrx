@@ -10011,6 +10011,25 @@ reserved for whole-dataplane selection where a rewrite shim
   empty-tree-compiles-non-nil trap). Regression coverage:
   `pkg/config/compiler_dhcp_ddns_test.go` (dual-AST equality, absent-default,
   TSIG redaction, enum/ttl accept+reject).
+
+  **Every warning above covers BOTH families (#8597 K66).**
+  `validateDDNSBackendWarnings` read only `DHCPServerConfig.DynamicDNS`, so
+  the independent v6 policy #2691 P1b added below got none of them: a
+  `dhcpv6-local-server dynamic-dns` block with `enable` and no
+  `update-server` — or an unsupported `tsig-algorithm`, or an incomplete TSIG
+  tuple, or the reserved `kea-d2` backend — committed with ZERO diagnostics
+  while the byte-identical v4 block warned. The body is now a per-policy
+  helper called once per family, and the label leads each message with the
+  stanza the operator must edit (`dhcp dynamic-dns` / `dhcpv6 dynamic-dns`);
+  the v4 wording is byte-identical to before the split.
+
+  A warned single-family block also says that it governs the OTHER family.
+  `pkg/ddns` `ReconcileScoped` gives a family with no block of its own the
+  other's (the pre-#2663 compatibility rule), so a broken v6-only block
+  silently governs v4 too. That note is attached to warnings rather than
+  emitted on its own, so a healthy single-family config — the historical
+  shape — stays quiet. Regression coverage:
+  `pkg/config/ddns_v6_warn_parity_8597_test.go`.
 - **#2691 P1b (DDNS ScopeKey + independent v4/v6 policy + source binding):**
   three additions to the `dynamic-dns` subtree above.
   - **#2663 — independent v4/v6 policy.** The v4 (`dhcp-local-server`) and v6

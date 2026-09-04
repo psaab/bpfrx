@@ -15,8 +15,53 @@ import (
 // HARD reject would brick a boot on a previously-inert malformed value
 // (plan §7 Q-C). The reconciler/backend degrade safely at runtime (an
 // unusable backend resolves to a no-op and counts a no-backend skip).
+//
+// IT COVERS BOTH FAMILIES (#8597 K66). It used to read only
+// System.DHCPServer.DynamicDNS, so the independent v6 policy #2691 P1b added
+// —  `system services dhcpv6-local-server dynamic-dns`, committable through the
+// SAME schema tree (dhcpDynamicDNSSchema is returned fresh per call for both
+// stanzas) — got none of these diagnostics. Measured before the change: a v4
+// block with `enable` and no update-server warns; the byte-identical v6 block
+// commits with ZERO warnings of any kind, and the same silence covered the
+// security-relevant halves (the #4483 unsigned-UPDATE warning, the #2666 TSIG
+// tuple warning, and the reserved kea-d2 backend).
+//
+// That is worse than a one-family gap, because ReconcileScoped INHERITS: when
+// only one family's block is present the other family uses it, so a broken
+// v6-only block silently governs v4 too. The inheritance note below fires only
+// when that family already produced a warning, so a healthy single-family
+// config — the historical and common shape — stays quiet.
 func validateDDNSBackendWarnings(cfg *Config) []string {
-	d := cfg.System.DHCPServer.DynamicDNS
+	d4 := cfg.System.DHCPServer.DynamicDNS
+	d6 := cfg.System.DHCPServer.DynamicDNSv6
+
+	warnings := ddnsBackendWarningsForPolicy(d4, "dhcp dynamic-dns")
+	v6 := ddnsBackendWarningsForPolicy(d6, "dhcpv6 dynamic-dns")
+
+	// The inheritance surprise, stated where it is actionable. pkg/ddns
+	// ReconcileScoped tests the block for NIL, not for enabled, so this
+	// condition mirrors the runtime exactly.
+	if len(warnings) > 0 && d6 == nil {
+		warnings = append(warnings, "dhcp dynamic-dns is the only dynamic-dns "+
+			"block configured, so it also governs DHCPv6 leases (a family with no "+
+			"block of its own inherits the other's); the warnings above apply to "+
+			"both families")
+	}
+	if len(v6) > 0 && d4 == nil {
+		v6 = append(v6, "dhcpv6 dynamic-dns is the only dynamic-dns block "+
+			"configured, so it also governs DHCPv4 leases (a family with no block "+
+			"of its own inherits the other's); the warnings above apply to both "+
+			"families")
+	}
+	return append(warnings, v6...)
+}
+
+// ddnsBackendWarningsForPolicy is validateDDNSBackendWarnings for ONE family's
+// policy. label prefixes every message and is the operator-facing stanza name
+// ("dhcp dynamic-dns" / "dhcpv6 dynamic-dns"), so a warning names the block the
+// operator has to edit. The v4 strings are byte-identical to what this emitted
+// before the split.
+func ddnsBackendWarningsForPolicy(d *DHCPDynamicDNSConfig, label string) []string {
 	if d == nil || !d.Enabled {
 		return nil
 	}
@@ -29,13 +74,13 @@ func validateDDNSBackendWarnings(cfg *Config) []string {
 	switch backend {
 	case "rfc2136":
 		if d.UpdateServer == "" {
-			warnings = append(warnings, "dhcp dynamic-dns is enabled with "+
+			warnings = append(warnings, label+" is enabled with "+
 				"backend rfc2136 but no update-server is configured; no records "+
 				"will be published until an update-server is set")
 		} else if !ddnsUpdateServerParseable(d.UpdateServer) {
-			warnings = append(warnings, fmt.Sprintf("dhcp dynamic-dns "+
+			warnings = append(warnings, fmt.Sprintf("%s "+
 				"update-server %q is not a valid host or host:port; the backend "+
-				"will fail to send updates", d.UpdateServer))
+				"will fail to send updates", label, d.UpdateServer))
 		}
 		// #4483: an update-server with NO tsig-key sends unsigned UPDATEs and
 		// trusts an UNAUTHENTICATED, forgeable response rcode — a spoofed
@@ -44,7 +89,7 @@ func validateDDNSBackendWarnings(cfg *Config) []string {
 		// publish. WARN-only so a previously-inert config still commits; the
 		// fix is to configure tsig-key/tsig-secret (miekg then verifies the MAC).
 		if d.UpdateServer != "" && d.TSIGKeyName == "" {
-			warnings = append(warnings, "dhcp dynamic-dns update-server is "+
+			warnings = append(warnings, label+" update-server is "+
 				"configured without a tsig-key; DNS UPDATEs are sent unsigned and "+
 				"the server's response rcode is unauthenticated and forgeable — a "+
 				"spoofed NOERROR can record a name as published though nothing was "+
@@ -52,10 +97,10 @@ func validateDDNSBackendWarnings(cfg *Config) []string {
 				"legitimate publish. Set tsig-key/tsig-secret to authenticate updates")
 		}
 		if d.TSIGKeyName != "" && !ddnsTSIGAlgorithmSupported(d.TSIGAlgorithm) {
-			warnings = append(warnings, fmt.Sprintf("dhcp dynamic-dns "+
+			warnings = append(warnings, fmt.Sprintf("%s "+
 				"tsig-algorithm %q is not supported (use hmac-sha1, hmac-sha224, "+
 				"hmac-sha256, hmac-sha384, or hmac-sha512; hmac-md5 is rejected as "+
-				"insecure); the backend will fail to sign updates", d.TSIGAlgorithm))
+				"insecure); the backend will fail to sign updates", label, d.TSIGAlgorithm))
 		}
 		// TSIG tuple completeness (#2666 / #2691 P0): RFC 8945 TSIG needs the
 		// full {key name, algorithm, secret} triple. The backend enables
@@ -70,18 +115,18 @@ func validateDDNSBackendWarnings(cfg *Config) []string {
 		secretSet := d.TSIGSecret.Reveal() != ""
 		switch {
 		case keySet && !secretSet:
-			warnings = append(warnings, "dhcp dynamic-dns tsig-key is set but "+
+			warnings = append(warnings, label+" tsig-key is set but "+
 				"tsig-secret is empty; TSIG signing will use an empty key and the "+
 				"authoritative server will reject updates (BADKEY/BADSIG) — set "+
 				"tsig-secret to complete the TSIG key")
 		case secretSet && !keySet:
-			warnings = append(warnings, "dhcp dynamic-dns tsig-secret is set but "+
+			warnings = append(warnings, label+" tsig-secret is set but "+
 				"tsig-key is empty; without a key name TSIG signing is disabled and "+
 				"the secret is ignored — set tsig-key to enable authenticated "+
 				"updates")
 		}
 	case "kea-d2":
-		warnings = append(warnings, "dhcp dynamic-dns backend kea-d2 is "+
+		warnings = append(warnings, label+" backend kea-d2 is "+
 			"reserved but not implemented (Kea D2 is not in the image); no "+
 			"records will be published with this backend")
 	}
