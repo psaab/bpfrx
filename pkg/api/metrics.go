@@ -256,11 +256,12 @@ type xpfCollector struct {
 	// #7615: the remaining debt-driven retry owners. Each is 1 while its loop
 	// owes a repair, so a node re-driving a failing recovery stops looking
 	// identical to a healthy one.
-	raDeadSenderPending     *prometheus.Desc
-	proxyARPUnresolved      *prometheus.Desc
-	fabricOverlayMissing    *prometheus.Desc
-	managementListenerDown  *prometheus.Desc
-	managementListenerState *prometheus.Desc
+	raDeadSenderPending      *prometheus.Desc
+	proxyARPUnresolved       *prometheus.Desc
+	fabricOverlayMissing     *prometheus.Desc
+	managementListenerDown   *prometheus.Desc
+	managementListenerState  *prometheus.Desc
+	helperCrashEpisodesTotal *prometheus.Desc
 
 	// #3780: 0/1 gauge — 1 while the most recent scheduler-driven policy
 	// republish failed and has not yet converged (stale enforcement past
@@ -871,6 +872,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.fabricOverlayMissing
 	ch <- c.managementListenerDown
 	ch <- c.managementListenerState
+	ch <- c.helperCrashEpisodesTotal
 	ch <- c.configPersistDegraded
 	ch <- c.rollbackHistoryDegraded
 	ch <- c.userspacePolicyContentRejected
@@ -1342,6 +1344,12 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 
+	// #8397: emitted BEFORE the dataplane gate, deliberately. The question
+	// "has this helper been crashing?" is most worth answering when the
+	// dataplane is NOT currently loaded, and gating it behind a load check
+	// would blank the counter in exactly that case.
+	c.collectHelperCrashEpisodes(ch)
+
 	// #3780: scheduler republish-failure is a control-plane signal (the
 	// policy scheduler runs even in config-only mode) — emit it BEFORE
 	// the dataplane gate so stale enforcement past a schedule window
@@ -1594,4 +1602,21 @@ func sortedKeys6800[V any](m map[string]V) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// collectHelperCrashEpisodes emits #8397's
+// xpf_dataplane_helper_crash_episodes_total.
+//
+// Extracted from Collect rather than left inline so it can be driven on its
+// own. The behaviour worth binding is a three-way distinction that an inline
+// `if fn != nil` inside a 200-line Collect cannot be exercised for: 4 episodes
+// emits 4, 0 episodes emits 0 (an absent series reads as healthy to an alert
+// exactly as a zero does), and NO SOURCE emits nothing at all — because a
+// daemon with no dataplane accessor knows "unknown", not "never crashed".
+func (c *xpfCollector) collectHelperCrashEpisodes(ch chan<- prometheus.Metric) {
+	if c.srv == nil || c.srv.helperCrashEpisodesFn == nil {
+		return
+	}
+	ch <- prometheus.MustNewConstMetric(c.helperCrashEpisodesTotal,
+		prometheus.CounterValue, float64(c.srv.helperCrashEpisodesFn()))
 }

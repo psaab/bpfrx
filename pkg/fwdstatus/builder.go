@@ -244,6 +244,21 @@ func Build(
 				fs.HelperNextRestart = rec.NextRestart
 			}
 		}
+		// #8397: crash HISTORY, a separate accessor because it has a separate
+		// lifetime. Asserted independently of HelperCrashState so a build that
+		// has one and not the other still renders what it has -- and, more to
+		// the point, so this block is reachable when the CURRENT record is the
+		// zero value, which is exactly the case history exists for: a helper
+		// that crashed repeatedly and is healthy right now.
+		if hist, ok := dp.(interface {
+			HelperCrashHistory() ([]userspace.HelperCrashEpisode, int)
+		}); ok {
+			episodes, total := hist.HelperCrashHistory()
+			fs.HelperCrashEpisodes = total
+			if len(episodes) > 0 {
+				fs.HelperCrashEpisodesOldest = episodes[0].At
+			}
+		}
 	}
 
 	// --- State ---------------------------------------------------

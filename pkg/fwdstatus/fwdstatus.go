@@ -131,6 +131,22 @@ type ForwardingStatus struct {
 	// carries a time in the PAST with no timer behind it.
 	HelperNextRestart time.Time
 
+	// HelperCrashEpisodes is the #8397 count of crash episodes this daemon has
+	// RECOVERED from, and HelperCrashEpisodesOldest the exit time of the oldest
+	// one still retained.
+	//
+	// One summary row rather than a table, deliberately: this block is already
+	// dense, and the question history answers is "is this recurring?" — which a
+	// count and a window answer completely. The per-episode detail is reachable
+	// through userspace.Manager.HelperCrashHistory() for a future verb.
+	//
+	// The count is NOT bounded by the retention ring. A daemon that recovered
+	// from 40 crashes reports 40 while holding the last 8, because "8 crashes"
+	// and "at least 8 crashes" are different answers to the question being
+	// asked.
+	HelperCrashEpisodes       int
+	HelperCrashEpisodesOldest time.Time
+
 	// (Cluster peer rendering moved to the gRPC handler in #879.
 	// fwdstatus now produces pure single-block output; the handler
 	// composes node0:/node1: blocks externally.)
@@ -210,6 +226,27 @@ func writeHelperCrash(b *strings.Builder, fs *ForwardingStatus) {
 	if !fs.HelperCrashKnown {
 		return
 	}
+
+	// #8397: the RECURRENCE row, emitted ABOVE the recovered-helper early
+	// return below, and that placement is the entire point.
+	//
+	// The guard that follows returns as soon as the helper is healthy — which
+	// is correct for every CURRENT-episode row, and fatal for this one. History
+	// exists precisely for the helper that crashed four times in the last hour
+	// and is running now: `restartHelperAfterCrash` wipes the record on
+	// success, so at that moment `LastExitWasCrash` is false, `RestartPending`
+	// is false, and a row placed after the guard would render in every case
+	// EXCEPT the one it was written for. That failure would be invisible —
+	// a clean crash surface is exactly what a healthy helper is supposed to
+	// look like.
+	if fs.HelperCrashEpisodes > 0 {
+		v := fmt.Sprintf("%d recovered in this daemon", fs.HelperCrashEpisodes)
+		if !fs.HelperCrashEpisodesOldest.IsZero() {
+			v += ", oldest retained " + fs.HelperCrashEpisodesOldest.Format(time.RFC3339)
+		}
+		writeRow(b, "Helper crash episodes", v)
+	}
+
 	if !fs.LastExitWasCrash && !fs.RestartPending {
 		return
 	}
