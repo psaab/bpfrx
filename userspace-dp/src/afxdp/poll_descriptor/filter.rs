@@ -431,6 +431,35 @@ pub(super) fn collect_revoked_flow_cache_keys(
 /// verdict has become a DENY does the ordinary counted evaluator run, so the one
 /// packet that is newly denied is counted, logged and rejected exactly once.
 ///
+/// **THE DECLINE SET, enumerated (#8114).** This function's ONE production call
+/// site (`poll_descriptor/mod.rs`) is an `if let Some(..)` with no `else` arm,
+/// so every `None` here means *the block is skipped and the packet forwards on
+/// the existing session decision*. That makes each `None` fail-OPEN with respect
+/// to a newly added deny, and "declines" reads more neutral than the posture is.
+/// The population is therefore not a list of cases someone noticed — it is every
+/// `None`-producing exit, and it is short enough to state in full:
+///
+/// | exit | condition | can a live deny be missed? |
+/// |------|-----------|----------------------------|
+/// | `flow?` | the caller passed no flow | NO — the sole production call site passes `Some(flow)` literally; reachable only from tests |
+/// | `interface_input_filter(..)?` | no input filter on this ingress + family | NO — there is no filter to deny anything |
+/// | `filter.affects_route_lookup` | a STATIC filter with at least one `routing-instance` term | **YES** — #8114 item 1, still open |
+/// | `FilterRevalidationTarget::Fresh` | the entry's verdict is already derived under the live `(generation, ingress)` | NO — derived, and it was an Accept |
+/// | `FilterRevalidationTarget::NoLocalEntry` | no entry this tuple may safely name | **was YES** — #8114 item 2, closed by `sessionless_static_input_filter_verdict` |
+/// | `static_input_filter_deny_eval` -> `None` | the filter permits the flow | NO |
+///
+/// Two consequences of running the predicate rather than trusting the list.
+/// First, `NoLocalEntry` has THREE sub-populations, not the two #8114 names: the
+/// #2120 transient peer-synced hit, the `max_sessions` reverse-NAT repair, and a
+/// STALE PRIMARY HANDLE (`key_to_handle` resolving to a record whose key differs)
+/// — the third is unlisted, and it is handled by the same arm because the
+/// remedy is identical: derive the verdict, stamp nothing, tear down nothing.
+/// Second, #8114's items 3 and 4 are NOT exits of this function at all — they
+/// are the flow-cache eviction window and the cross-worker `DeleteSynced`
+/// delivery path, downstream of a verdict this function already produced. The
+/// issue groups all four as "the revalidation has a verdict but no place to
+/// apply it", which is true of 1 and 2 and not of 3 and 4.
+///
 /// Why the ingress interface is read off the packet and not off the session: it
 /// is an OBSERVATION of where this direction's traffic actually arrives.
 /// `SessionMetadata::ingress_ifindex` deliberately carries `0` for the reverse
@@ -521,16 +550,137 @@ pub(super) fn evaluate_input_filter_on_session_hit(
     // without a local install. There is nothing local to stamp or tear down; the
     // window is bounded by `maybe_promote_synced_session` installing the entry
     // UNVALIDATED, and it is one of the cases #8114 tracks.
-    let canonical_key = sessions.stale_filter_revalidation_key(session_key, ingress_ifindex)?;
-    revalidate_static_input_filter_on_session_hit(
-        forwarding,
-        sessions,
-        canonical_key,
-        ingress_ifindex,
+    match sessions.filter_revalidation_target(session_key, ingress_ifindex) {
+        // The answer for every packet but one per session per (generation,
+        // ingress): a single hash and a compare, which is what keeps this
+        // affordable on the entire population the feature serves.
+        crate::session::FilterRevalidationTarget::Fresh => None,
+        crate::session::FilterRevalidationTarget::Stale(canonical_key) => {
+            revalidate_static_input_filter_on_session_hit(
+                forwarding,
+                sessions,
+                canonical_key,
+                ingress_ifindex,
+                filter,
+                flow,
+                meta,
+                ingress_zone_override,
+            )
+        }
+        // #8114 item 2: a RESOLVED decision with no local entry to name — the
+        // #2120 transient peer-synced hit, a reverse-NAT repair refused at
+        // `max_sessions`, or a stale primary handle. The packet is being
+        // FORWARDED, so declining here (which is what the old
+        // `Option<SessionKey>` probe forced, by collapsing this onto the same
+        // `None` as "already fresh") left a newly added static deny unapplied to
+        // it. Derive the verdict anyway: it is a function of the flow and the
+        // interface, not of the entry. Only the STAMP and the pair teardown need
+        // an entry, and both are skipped — `revoked_key: None` tells the caller
+        // to drop this packet without revoking anything.
+        crate::session::FilterRevalidationTarget::NoLocalEntry => {
+            sessionless_static_input_filter_verdict(
+                forwarding,
+                filter,
+                flow,
+                meta,
+                ingress_zone_override,
+            )
+        }
+    }
+}
+
+/// #7212/#8114: derive the flow's STATIC input-filter verdict and, on a DENY,
+/// re-run the ordinary counted/logged evaluator so the packet is charged to its
+/// matching `then count` terms and produces its `then log` record exactly once.
+///
+/// `None` = the filter still PERMITS this flow.
+///
+/// Extracted so the two callers — the stale-entry revalidation and the
+/// sessionless derivation — cannot drift on WHAT the verdict is, only on what
+/// they do with it. That is not a tidiness point: the caller drops on the
+/// counted walk's action while tearing down on this one's, so the two walks must
+/// be handed the same `TermMatchExtra` by construction rather than by two sites
+/// remembering to.
+///
+/// The extra is `TermMatchExtra::default()`, deliberately, and NOT the
+/// frame-derived one. `varies_per_packet_within_flow()` is not a complete purity
+/// gate: `port_terms_match` also reads the extra, so any term with a PORT
+/// constraint fails to match when `(is_fragment && !l4_present)` or
+/// `ports_unknown`. An ordinary static shape —
+///
+///     term web       { from destination-port 5201; then accept; }
+///     term deny-rest { then discard; }
+///
+/// — evaluated against a NON-FIRST FRAGMENT of a permitted flow would skip
+/// `web`, fall through to `deny-rest`, and deny a flow the operator permits. One
+/// fragment, whole flow gone. `default()` leaves the fragment gate untriggered
+/// and every per-packet-L4 condition inert (a static filter carries none by
+/// construction), so what remains is exactly the 5-tuple verdict — the right
+/// answer in both directions, not merely the safe one.
+#[cold]
+#[inline(never)]
+fn static_input_filter_deny_eval(
+    forwarding: &ForwardingState,
+    filter: &crate::filter::Filter,
+    flow: &SessionFlow,
+    meta: UserspaceDpMeta,
+    ingress_zone_override: Option<u16>,
+) -> Option<NonPbrInputFilterEval> {
+    let extra = crate::filter::TermMatchExtra::default();
+    let verdict = crate::filter::filter_ref_static_verdict(
         filter,
-        flow,
+        flow.src_ip,
+        flow.dst_ip,
+        meta.protocol,
+        flow.forward_key.src_port,
+        flow.forward_key.dst_port,
+        meta.dscp,
+        extra,
+    );
+    if verdict == crate::filter::FilterAction::Accept {
+        return None;
+    }
+    Some(evaluate_non_pbr_input_filter(
+        forwarding,
+        extra,
+        Some(flow),
         meta,
         ingress_zone_override,
+        false,
+    ))
+}
+
+/// #8114 item 2: the static verdict for a packet whose forwarding decision
+/// RESOLVED but which has no local session entry.
+///
+/// Same derivation as the stale-entry path, and deliberately none of its
+/// side effects: there is no entry to stamp (so the next packet of this tuple
+/// re-derives, which is correct — the state that made it sessionless may have
+/// cleared) and none to tear down (`revoked_key: None`). A DENY still drops
+/// THIS packet, counted and logged, which is the whole gap: before this the
+/// packet forwarded under a filter that denies it.
+///
+/// The two populations that reach here differ in how long they last, and that
+/// is the reason this is not "a bounded transient, ignore it". The #2120
+/// peer-synced hit is bounded — `maybe_promote_synced_session` installs the
+/// entry UNVALIDATED on a later packet and it revalidates before this node
+/// forwards on it as its own. The `max_sessions` reverse-NAT repair
+/// (`install_failed`) lasts as long as the session table is full, which is
+/// precisely when an operator is most likely to be adding a deny.
+#[cold]
+#[inline(never)]
+fn sessionless_static_input_filter_verdict(
+    forwarding: &ForwardingState,
+    filter: &crate::filter::Filter,
+    flow: &SessionFlow,
+    meta: UserspaceDpMeta,
+    ingress_zone_override: Option<u16>,
+) -> Option<SessionHitInputFilterEval> {
+    static_input_filter_deny_eval(forwarding, filter, flow, meta, ingress_zone_override).map(
+        |eval| SessionHitInputFilterEval {
+            eval,
+            revoked_key: None,
+        },
     )
 }
 
@@ -579,71 +729,25 @@ fn revalidate_static_input_filter_on_session_hit(
     meta: UserspaceDpMeta,
     ingress_zone_override: Option<u16>,
 ) -> Option<SessionHitInputFilterEval> {
-    // #7212: the revalidation asks a question about the FLOW, so it evaluates on
-    // the flow's 5-tuple ALONE — `TermMatchExtra::default()`, not the frame.
-    //
-    // `varies_per_packet_within_flow()` is NOT a complete purity gate, and using
-    // the frame-derived extra here was a real defect. That predicate covers the
-    // #1430 DSCP and #2362 per-packet-L4 conditions, but `port_terms_match` also
-    // reads the extra: any term with a PORT constraint fails to match when
-    // `(is_fragment && !l4_present)` or `ports_unknown`. So an ordinary static
-    // shape —
-    //
-    //     term web       { from destination-port 5201; then accept; }
-    //     term deny-rest { then discard; }
-    //
-    // — evaluated against a NON-FIRST FRAGMENT of a permitted flow would skip
-    // `web` (its port constraint fails closed on a fragment), fall through to
-    // `deny-rest`, and REVOKE a session the operator permits. One fragment,
-    // whole flow gone. `TermMatchExtra::default()` leaves the fragment gate
-    // untriggered (`is_fragment = false`, `ports_unknown = false`) and every
-    // per-packet-L4 condition inert (a static filter carries none by
-    // construction), so what remains is exactly the 5-tuple verdict.
-    //
-    // That is the RIGHT answer in both directions, not merely the safe one: a
-    // deny on the flow's port still revokes when a fragment is the packet that
-    // triggers the revalidation, and a permit on the flow's port still protects
-    // it. Whether the FRAGMENT itself is forwarded is a separate question the
-    // ordinary per-packet path answers with the frame-derived extra.
-    //
-    // The counted evaluator below is handed the SAME extra, so the two walks
-    // cannot disagree on the action — which matters, because the caller drops on
-    // the counted walk's action while tearing down on this one's.
-    let extra = crate::filter::TermMatchExtra::default();
-    let verdict = crate::filter::filter_ref_static_verdict(
-        filter,
-        flow.src_ip,
-        flow.dst_ip,
-        meta.protocol,
-        flow.forward_key.src_port,
-        flow.forward_key.dst_port,
-        meta.dscp,
-        extra,
-    );
-    if verdict == crate::filter::FilterAction::Accept {
+    // #8114: the verdict derivation moved to `static_input_filter_deny_eval`,
+    // shared verbatim with the sessionless path so the two cannot drift on WHAT
+    // the verdict is — including the `TermMatchExtra::default()` choice, whose
+    // reasoning now lives on that function.
+    let Some(eval) =
+        static_input_filter_deny_eval(forwarding, filter, flow, meta, ingress_zone_override)
+    else {
         // The filter still permits this flow. Nothing is counted, nothing is
         // logged, and the session — including its NAT translation, which is the
         // reason #5858's family purge was rejected — is untouched. Re-stamp so
         // no later packet of this generation re-derives the same verdict.
         sessions.mark_filter_revalidated(&canonical_key, logical_ingress_ifindex);
         return None;
-    }
+    };
     // DENY: deliberately NOT re-stamped — see the header. The caller revokes the
     // session; if that ever fails to take, the next packet must re-derive this
     // same DENY and drop, not be forwarded under a "judged" stamp.
-    // Newly DENIED. Re-run the ordinary counted evaluator so this packet is
-    // charged to the matching `then count` terms and produces its `then log`
-    // record exactly once, then let the caller run the reject reply, drop the
-    // packet, and revoke the session pair.
     Some(SessionHitInputFilterEval {
-        eval: evaluate_non_pbr_input_filter(
-            forwarding,
-            extra,
-            Some(flow),
-            meta,
-            ingress_zone_override,
-            false,
-        ),
+        eval,
         revoked_key: Some(canonical_key),
     })
 }

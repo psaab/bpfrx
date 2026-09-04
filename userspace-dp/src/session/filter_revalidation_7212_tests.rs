@@ -283,3 +283,60 @@ fn the_published_generation_is_what_gets_stamped_7212() {
     table.set_filter_revalidation_gen(77);
     assert!(!table.filter_revalidation_stale(&k, IF_A));
 }
+
+/// #8114 item 2 — THE CLASSIFICATION. The probe must give THREE answers, and
+/// the two that used to collapse onto `None` need opposite handling.
+///
+/// `Fresh` and `NoLocalEntry` were indistinguishable to the caller before
+/// #8114, because both were `Option::None`. That is the whole defect: the
+/// caller's only production call site is an `if let Some(..)` with no `else`,
+/// so a tuple that names no entry was treated exactly like one whose verdict
+/// was already derived — and the packet forwarded under a filter that may deny
+/// it.
+///
+/// Asserted as an EXACT match on each of the three, not `is_some()`/`is_none()`
+/// over them: a boolean view is what allowed the collapse in the first place,
+/// and re-asserting one here would leave the same hole open under a new name.
+///
+/// Fail-on-revert: make `filter_revalidation_target` return `Fresh` for an
+/// absent key (master's `None`) and the `NoLocalEntry` arm reds.
+#[test]
+fn filter_revalidation_target_separates_no_entry_from_fresh_8114() {
+    let mut table = SessionTable::new();
+    table.set_filter_revalidation_gen(41);
+    let k = key(49152);
+
+    // (a) NO ENTRY. Nothing installed under this tuple at all.
+    assert_eq!(
+        table.filter_revalidation_target(&k, IF_A),
+        FilterRevalidationTarget::NoLocalEntry,
+        "a tuple that names no entry is NOT 'already judged' — reading it as \
+         Fresh is the #8114 fail-open"
+    );
+
+    // (b) STALE. Installed, never revalidated, so a verdict is owed — and the
+    // target carries the CANONICAL key the caller must tear down.
+    install(&mut table, &k, false);
+    assert_eq!(
+        table.filter_revalidation_target(&k, IF_A),
+        FilterRevalidationTarget::Stale(k.clone()),
+        "a fresh install carries no verdict, so its next packet must derive one"
+    );
+
+    // (c) FRESH. Same entry, verdict derived under this (generation, ingress).
+    table.mark_filter_revalidated(&k, IF_A);
+    assert_eq!(
+        table.filter_revalidation_target(&k, IF_A),
+        FilterRevalidationTarget::Fresh,
+        "an entry judged under the live pair must cost nothing further"
+    );
+
+    // (d) ...and freshness is per (generation, ingress): the SAME entry probed
+    // on another interface is stale, not fresh. Without this, (c) would also
+    // pass for a target that ignored the interface half of the stamp.
+    assert_eq!(
+        table.filter_revalidation_target(&k, IF_B),
+        FilterRevalidationTarget::Stale(k.clone()),
+        "no filter on IF_B has judged this entry"
+    );
+}
