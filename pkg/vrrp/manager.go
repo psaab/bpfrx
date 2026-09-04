@@ -669,6 +669,15 @@ func (m *Manager) UpdateInstances(desired []*Instance) error {
 		if m.syncHold {
 			instCfg.Preempt = false
 		}
+		// #8597: bound the CONFIGURED priority here, at the config->instance
+		// boundary, rather than inside newInstance. newInstance is also the
+		// constructor tests use to model states the runtime reaches by
+		// MUTATION — notably the priority-0 resignation the run loop installs
+		// via ResignRG — and clamping there would make the constructor unable
+		// to express a state production genuinely holds. See
+		// clampConfigPriority (instance.go) for why an unbounded config
+		// priority is a resignation beacon rather than a wrong number.
+		instCfg.Priority = clampConfigPriority(instCfg.Priority)
 		vi := newInstance(instCfg, iface, m.eventCh, m.onEventDrop)
 		// Store the real configured preempt value for when sync hold releases.
 		vi.desiredPreempt = inst.Preempt

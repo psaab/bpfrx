@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"fmt"
 	"log/slog"
 	"sort"
 	"time"
@@ -22,7 +23,7 @@ func (m *Manager) UpdateConfig(cfg *config.ClusterConfig) {
 		seen[rg.ID] = true
 		existing, ok := m.groups[rg.ID]
 		if !ok {
-			pri := rg.NodePriorities[m.nodeID]
+			pri := clampNodePriority(rg.ID, rg.NodePriorities[m.nodeID])
 			existing = &RedundancyGroupState{
 				GroupID:       rg.ID,
 				LocalPriority: pri,
@@ -34,7 +35,7 @@ func (m *Manager) UpdateConfig(cfg *config.ClusterConfig) {
 			slog.Info("cluster: new redundancy group",
 				"rg", rg.ID, "priority", pri, "preempt", rg.Preempt)
 		} else {
-			existing.LocalPriority = rg.NodePriorities[m.nodeID]
+			existing.LocalPriority = clampNodePriority(rg.ID, rg.NodePriorities[m.nodeID])
 			existing.Preempt = rg.Preempt
 		}
 	}
@@ -353,4 +354,34 @@ func (m *Manager) LocalPriorities() map[int]int {
 		}
 	}
 	return result
+}
+
+// clampNodePriority bounds a configured redundancy-group node priority into the
+// range the #4880 commit gate enforces, warning once per apply when it has to.
+//
+// #8597 (muse-004 K17): this closes the priority domain where pkg/cluster reads
+// it, exactly as ClampInterfaceMonitorWeight closes the weight domain — see
+// that helper's doc for why the strict gate alone is not enough (the tolerant
+// Store.Load / Store.SyncApply ingress downgrades it to a warning per #1960, so
+// a persisted or peer-pushed config carries the raw value in).
+//
+// BOTH assignment sites in UpdateConfig go through it. The new-group and
+// existing-group branches are two copies of one decision, and a clamp applied
+// to only one of them would leave a config that is re-applied (rather than
+// first applied) still installing the raw value — the more common path on a
+// running box, not the rarer one.
+//
+// With the domain closed here, the uint16 wire cast in buildHeartbeat is an
+// identity and clampWirePriority is a last belt rather than the fix, which is
+// the same relationship clampWireWeight documents for the weight field.
+func clampNodePriority(rgID, pri int) int {
+	bounded, clamped := config.ClampRedundancyGroupNodePriority(pri)
+	if clamped {
+		slog.Warn("cluster: redundancy-group node priority out of range; clamping",
+			"rg", rgID, "configured", pri, "effective", bounded,
+			"range", fmt.Sprintf("%d..%d",
+				config.MinRedundancyGroupNodePriority, config.MaxRedundancyGroupNodePriority),
+			"issue", "#8597")
+	}
+	return bounded
 }

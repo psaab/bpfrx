@@ -50,7 +50,8 @@ alias guard. The detailed rendering semantics documented in the
 ### Non-protocol route operands have a final validity belt (#6795)
 
 The `ip route` / `ipv6 route` renderers — static routes
-(`generateStaticRouteInTable`) and generate-routes (`renderGenerateRoutes`) —
+(`generateStaticRouteInTable`), generate-routes (`renderGenerateRoutes`) and,
+since #8597, the backup-router default (`renderBackupRouter`) —
 interpolate RAW STRINGS from the parser: `sr.Destination`, `nh.Address`,
 `ifName`, `gr.Prefix`. The protocol renderers already have belts
 (`validRouterID` #2980, `validClusterID` / `validBGPOrigin` #4919); these did
@@ -93,6 +94,28 @@ not raw strings: `lease.Gateway` is a `netip.Addr` and `cr.Destination` a
 containing whitespace. `TestDHCPRouteOperandsAreStructurallySafe6795` records
 that measurement so the question is re-asked if either field is ever widened to
 a string.
+
+**`renderBackupRouter` was the one renderer never brought along (#8597).** It
+checked only `BackupRouter == ""` and interpolated both operands raw. The gap
+was a **validator/renderer disagreement**, not merely a missing check:
+`validateBackupRouterDst` (#4808/#2911) rejects a malformed next-hop, a
+malformed destination, and a next-hop/destination FAMILY MISMATCH at strict
+commit, and on the tolerant path downgrades each to a warning ending
+*"(ignored: backup-router default route not installed until corrected)"*. The
+renderer ignored nothing, so the promise in the log was false and the emitted
+line failed the whole managed-section reload — with the log pointing AWAY from
+the cause. **A validator that promises "ignored" owes a renderer that skips**,
+and `TestMalformedBackupRouterIsNotRendered_8597` pins both sides so a future
+change cannot leave the disagreement pointing the other way.
+
+All **three** of the validator's checks are mirrored, not the two an
+operand-shape reading suggests. A v4 next-hop with a v6 destination has two
+individually well-formed operands and still renders `ipv6 route <v6dst>
+<v4nh>`, which frr-reload rejects — the #2891 case the renderer's own
+family-selection comment already describes. That third check compares two
+INDEPENDENT operands, so it uses `frrOperandIsV6` (netip) rather than the
+`strings.Contains(s, ":")` spelling used inline where both operands derive from
+one value: `::ffff:192.168.50.1` contains a colon and is v4.
 
 Not covered here: the `vrf <name>` clause still goes through `sanitizeFRRValue`
 (#5557). That sanitizer maps control bytes to a space — the sink's own separator

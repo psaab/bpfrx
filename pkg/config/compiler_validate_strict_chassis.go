@@ -67,6 +67,44 @@ const (
 	MaxRedundancyGroupNodePriority = 254
 )
 
+// ClampRedundancyGroupNodePriority bounds a configured redundancy-group node
+// priority to [MinRedundancyGroupNodePriority, MaxRedundancyGroupNodePriority].
+// It returns the effective priority and whether clamping occurred.
+//
+// #8597 (muse-004 K17). The sibling of ClampInterfaceMonitorWeight below, for
+// the field the #4880 gate above bounds at commit and nothing bounded at
+// runtime. The gate's own error text names both consumers — "the priority feeds
+// VRRP and truncates to a single wire byte, and the private control-link
+// election reads the raw value" — and the weight case already carries the
+// matching runtime belt. The priority case did not.
+//
+// Reachability is the tolerant ingress, verified by execution rather than
+// argued: a `redundancy-group 1 node 0 priority 65700` is rejected by
+// CompileConfig with that message and compiles clean through
+// CompileConfigLenient with NodePriorities[0] == 65700 intact.
+//
+// The consequence of leaving it unbounded is DUAL PRIMARY, not a wrong display
+// number. buildHeartbeat put `uint16(rg.LocalPriority)` on the wire while
+// election.go compared the raw int, so 65700 advertised as 164: against a peer
+// at 200, the local node saw 65700 > 200 and elected itself, and the peer saw
+// 200 > 164 and elected ITSELF. Two primaries, duplicate VIPs and duplicate
+// RETH virtual MAC on the LAN.
+//
+// Clamping rather than refusing is deliberate, and for the wireRGID reason:
+// declining to advertise a group leaves the peer with `peerGroup == nil`, which
+// election.go turns into "peer has no RG info -> elect local primary" — the fix
+// would reproduce the bug.
+func ClampRedundancyGroupNodePriority(p int) (int, bool) {
+	switch {
+	case p < MinRedundancyGroupNodePriority:
+		return MinRedundancyGroupNodePriority, true
+	case p > MaxRedundancyGroupNodePriority:
+		return MaxRedundancyGroupNodePriority, true
+	default:
+		return p, false
+	}
+}
+
 // MinInterfaceMonitorWeight / MaxInterfaceMonitorWeight bound a
 // redundancy-group `interface-monitor <if> weight <w>` (Junos vSRX 0..255 —
 // the same range the schema already types on the sibling ip-monitoring
