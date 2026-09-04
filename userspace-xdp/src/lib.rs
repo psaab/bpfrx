@@ -859,37 +859,28 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     // rejects it. `R1 bitwise operator &= on pointer prohibited` — a BPF
     // program cannot observe a packet pointer's alignment at all, so neither
     // an in-band probe nor a check-and-refuse variant is implementable.
+    // #8249: the store is OUTLINED. Its live values cost 72 bytes of the ENTRY
+    // frame, and the entry frame is 80% of the 512-byte combined-stack budget
+    // the GRE classification chain has to fit inside. See the function's own
+    // header for the measurement.
+    // `pkt_len` is stored here rather than passed, so the call fits BPF's
+    // five-argument limit WITHOUT packing either interface coordinate into a
+    // wider word. #5173 exists because nothing rejects a REDUCTION of
+    // `ingress_ifindex` by type; a pack/unpack pair around it would be a new
+    // place for exactly that, so the coordinates travel as their own bare u32
+    // arguments and the cheap scalar is the one that moves.
+    write_userspace_meta(meta_ptr, &parsed, ingress_ifindex, rx_queue_index, ctrl);
+    // Stored AFTER the call, not passed into it, so the call fits BPF's
+    // five-argument limit WITHOUT packing either interface coordinate into a
+    // wider word. #5173 exists because nothing rejects a REDUCTION of that
+    // coordinate by type, and a pack/unpack pair around it would be a new place
+    // for exactly that — so the coordinates travel as their own bare u32
+    // arguments and the cheap scalar is the one that moves. It is written
+    // after rather than before because the callee's whole-struct store would
+    // otherwise overwrite it.
     unsafe {
-        *meta_ptr = UserspaceDpMeta {
-            magic: USERSPACE_META_MAGIC,
-            version: USERSPACE_META_VERSION,
-            length: mem::size_of::<UserspaceDpMeta>() as u16,
-            ingress_ifindex,
-            rx_queue_index,
-            ingress_vlan_id: parsed.vlan_id,
-            ingress_pcp: parsed.vlan_pcp,
-            ingress_vlan_present: parsed.vlan_present as u8,
-            ingress_zone: 0,
-            routing_table: 0,
-            l3_offset: parsed.l3_offset,
-            l4_offset: parsed.l4_offset,
-            payload_offset: parsed.payload_offset,
-            pkt_len: packet_len.min(u16::MAX as usize) as u16,
-            addr_family: parsed.addr_family,
-            protocol: parsed.protocol,
-            tcp_flags: parsed.tcp_flags,
-            meta_flags: 0,
-            dscp: parsed.dscp,
-            dscp_rewrite: 0xff,
-            reserved: 0,
-            flow_src_port: parsed.flow_src_port,
-            flow_dst_port: parsed.flow_dst_port,
-            flow_src_addr: parsed.src_addr,
-            flow_dst_addr: parsed.dst_addr,
-            config_generation: ctrl.config_generation,
-            fib_generation: ctrl.fib_generation,
-            reserved2: 0,
-        };
+        core::ptr::addr_of_mut!((*meta_ptr).pkt_len)
+            .write(packet_len.min(u16::MAX as usize) as u16);
     }
 
     record_trace(
@@ -925,6 +916,78 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
 }
 
 #[inline(never)]
+/// #8249: write the per-packet metadata, OUTLINED out of the entry program.
+///
+/// WHY THIS IS NOT INLINE, and it is a stack-budget reason rather than a code
+/// -size one. BPF's limit is 512 bytes COMBINED across a call path. On the
+/// path that matters — the entry program into the native-GRE inner classifier —
+/// master measured 504 of those 512:
+///
+///     entry 400 + dispatcher 0 + classify_native_gre_inner_ipv4 104 = 504
+///
+/// Eight bytes of margin. That is why four unrelated attempts to act on the GRE
+/// region were all rejected with `combined stack size of N calls is too large`
+/// while none of them reached an instruction cap (#8249): they did not have
+/// four different problems, they had one.
+///
+/// Outlining this store moves its live values into THIS frame instead of the
+/// entry's, taking the entry from 400 to 328 and the GRE path from 504 to 432.
+///
+/// MEASURED, not reasoned. Deleting the store entirely also gives 328, so 328
+/// is the floor this move can reach. Writing the same fields one at a time
+/// through the pointer — avoiding the 96-byte struct temporary — recovers only
+/// EIGHT of the 72 bytes, which is what establishes that the cost is the live
+/// values feeding the store rather than the temporary itself. That is also why
+/// the scratch-map lever in CLAUDE.md would not have helped: over half the entry
+/// frame is register SPILL slots, and there is no large named object to move
+/// (`UserspaceDpMeta` is 96 bytes, `ParsedPacket` ~58).
+///
+/// `stack_margin_8249_test.go` pins the resulting margin so this cannot erode
+/// silently back to the eight bytes it started at.
+#[inline(never)]
+fn write_userspace_meta(
+    meta_ptr: *mut UserspaceDpMeta,
+    parsed: &ParsedPacket,
+    ingress_ifindex: u32,
+    rx_queue_index: u32,
+    ctrl: &UserspaceCtrl,
+) {
+    unsafe {
+        *meta_ptr = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: mem::size_of::<UserspaceDpMeta>() as u16,
+            ingress_ifindex,
+            rx_queue_index,
+            ingress_vlan_id: parsed.vlan_id,
+            ingress_pcp: parsed.vlan_pcp,
+            ingress_vlan_present: parsed.vlan_present as u8,
+            ingress_zone: 0,
+            routing_table: 0,
+            l3_offset: parsed.l3_offset,
+            l4_offset: parsed.l4_offset,
+            payload_offset: parsed.payload_offset,
+            // Overwritten by the caller immediately after this store — see
+            // the note at the call site for why it is not an argument.
+            pkt_len: 0,
+            addr_family: parsed.addr_family,
+            protocol: parsed.protocol,
+            tcp_flags: parsed.tcp_flags,
+            meta_flags: 0,
+            dscp: parsed.dscp,
+            dscp_rewrite: 0xff,
+            reserved: 0,
+            flow_src_port: parsed.flow_src_port,
+            flow_dst_port: parsed.flow_dst_port,
+            flow_src_addr: parsed.src_addr,
+            flow_dst_addr: parsed.dst_addr,
+            config_generation: ctrl.config_generation,
+            fib_generation: ctrl.fib_generation,
+            reserved2: 0,
+        };
+    }
+}
+
 fn classify_native_gre_inner(data: usize, data_end: usize, outer: &ParsedPacket) -> u8 {
     let gre_offset = outer.l4_offset as usize;
     let Some(gre) = (unsafe { read_bytes(data, data_end, gre_offset, 4) }) else {
