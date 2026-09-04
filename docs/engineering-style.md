@@ -672,6 +672,43 @@ Three specific traps, all of which cost a real attempt:
 verdict, hermetically tested by `make test-screen-probe-lib` so the ordering
 above is asserted rather than remembered.
 
+### A guard that MODELS a predicate instead of CALLING it fails silently
+
+When a guard needs to know what production computes — which argument a pass is
+handed, which key a lookup uses — **call the production code and observe, or
+instrument the call site and measure. Do not reconstruct it.**
+
+This is not a style preference. Two lanes independently wrote guards over the same
+normalizer predicate, each reconstructing the argument rather than calling the
+pass, and **both were wrong in the same direction**:
+
+| reconstructed | production actually passes |
+|---|---|
+| `("xpfarg","class")` — the census walk's schema placeholder | `node.Keys[0]`, the stanza keyword |
+| `kw := fields[len(fields)-2]` off an inventory path | `("ge-0-0-0","mtu")` — the **instance name** under a named-child container |
+
+One cost a hidden site — admitted count moved 48 -> 49 once admission came from
+*running the pass and asking whether it touched the tree*. The other is latent and
+**sound only by accident**: an arbitrary instance name matches no static rule, and
+a head-only rule happens to match both queries. It goes blind precisely on the
+named-child-with-args shape.
+
+**The asymmetry is what makes this class dangerous.** A model that
+**over**-admits fails loudly the first time it admits something wrong. A model
+that **under**-admits is **silent forever and looks like a clean scope** — there
+is no red, no anomaly, and the guard reports success. Reconstruction errors are
+overwhelmingly of the second kind, because a reconstruction is written from a
+reading of the common case.
+
+Measuring costs one throwaway probe: instrument the production call site, print
+what it passes for three or four representative shapes, and compare against what
+your guard derives. Both lanes above reasoned about it and got it wrong; the probe
+answered it immediately.
+
+**And when two independent implementations of the same model fail the same way,
+that is a fact about the source they are reading, not a coincidence** — expect a
+third, and fix the source rather than the copies.
+
 ### A content-scanning guard is never in anyone's diff scope, so everyone runs it
 
 A merge gate is normally scoped to the packages a diff touches: `git diff
