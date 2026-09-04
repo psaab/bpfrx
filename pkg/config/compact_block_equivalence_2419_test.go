@@ -359,11 +359,28 @@ var filedByDesign = map[string]string{
 // each reads only prop.Children (or FindChild, which searches only children) for
 // a value the compact spelling puts on the stanza's own Keys.
 var filedStillOpen = map[string]string{
-	// compiler_interfaces.go:118-127 -- a FindChild chain
-	// (aeoNode -> lacp -> periodic). FindChild searches only children, so the
-	// compact `lacp periodic fast;` leaves the value on the lacp node's own
-	// Keys and LACPPeriodic stays empty.
-	"interfaces xpfname aggregated-ether-options lacp periodic": "compiler_interfaces.go:125",
+	// #8690 family 4 REPLACED the LACP anchor that used to sit here, and the
+	// replacement is chosen to end the recurrence rather than to postpone it.
+	//
+	// The old anchor was an `empty` site, and an `empty` site is BY DEFINITION
+	// a candidate for the next widening — so it was consumed the moment its own
+	// family was normalized, and any `empty` replacement would be consumed by
+	// whoever takes the next one. lane-8015 lost the same control twice for
+	// exactly this reason and diagnosed it: re-anchor to a PARTIAL site, which
+	// TestNormalizerScopeNeverCoversAPartialSite8690 forbids ANY scope from
+	// covering. The control becomes structurally immune to the sweep instead of
+	// needing a new hand-verification every increment.
+	//
+	// Verified by reading the compiler, which is what membership here requires:
+	// compileInterfaces skips `if child.IsLeaf { continue }` at
+	// compiler_interfaces.go:31, and the compact `ge-0/0/0 mtu 9000;` IS a leaf
+	// (Keys ["ge-0/0/0","mtu","9000"]). So the whole INSTANCE is dropped, not
+	// just the value — measured: the braced spelling compiles mtu=9000 and the
+	// compact one compiles no interface at all.
+	//
+	// It also keeps the property the swap must preserve: a different compiler
+	// file from the other anchor below (compiler_protocols.go).
+	"interfaces xpfname mtu": "compiler_interfaces.go:31",
 	// #8690 family 4 replaced the ospf anchor family 3 put here, which family 4
 	// then normalized -- the SECOND anchor in this map to be invalidated by the
 	// next family to land. That churn was the anchor's fault, not the sweep's:
