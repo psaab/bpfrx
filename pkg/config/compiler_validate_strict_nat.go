@@ -2413,6 +2413,14 @@ func validateNAT64PrefixStrict(cfg *Config, lenient bool) ([]string, error) {
 		// mask (no '/'), an empty mask, a non-numeric mask, an EXTRA '/' segment
 		// (more than two parts), or any length other than 96 is rejected — only
 		// an exact `<ipv6>/96` is supported by the translator.
+		//
+		// #8597 K62: ParseUint permits no sign, so `/+96` is rejected HERE and
+		// accepted by the dataplane backstop (userspace-dp/src/nat64.rs), whose
+		// Rust `parse::<u8>()` allows a leading '+'. Measured: over an
+		// exhaustive length-<=3 corpus the Rust parse accepts 110 tokens this
+		// one rejects — all leading '+' — and rejects none that this one
+		// accepts. The backstop being LAXER is the safe direction; see the note
+		// at that call site before changing either side.
 		mask96 := false
 		if len(parts) == 2 {
 			if m, err := strconv.ParseUint(parts[1], 10, 8); err == nil && m == 96 {

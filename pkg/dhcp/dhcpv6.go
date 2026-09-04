@@ -603,6 +603,53 @@ func (m *Manager) buildDHCPv6RenewModifiers(ifaceName string, opts *DHCPv6Option
 	return mods
 }
 
+// pdHintPrefixLength bounds the configured IA_PD prefix-length hint at the
+// point of USE, and reports whether a hint should be sent at all.
+//
+// #8597 K51. `net.CIDRMask(n, 128)` returns a NIL mask for any n outside
+// [0,128], and `net.IPMask(nil).Size()` is (0, 0) — so an out-of-range
+// preferred-prefix-length did not fail, it silently became an IAPREFIX on the
+// wire with prefix-length 0. The operator asked for a /56 delegation and we
+// SOLICITed a degenerate hint instead: worse than sending no hint, because a
+// hint of 0 is a positive statement to the upstream server rather than an
+// absent preference.
+//
+// The schema bounds this leaf to 0..128 (`preferred-prefix-length`, added in
+// 2e02fc995), and that closes the operator-facing half: a strict `commit`
+// rejects 999 with "integer out of range [0..128]". It does NOT close this
+// one. Store.Load and Store.SyncApply compile through compileTreeLenient,
+// which DOWNGRADES a typed-leaf violation to a slog.Warn and continues
+// (#1319) — deliberately, so a stale persisted config cannot blackout-boot the
+// node and a peer-pushed config cannot alarm-loop HA sync. parseIntLeaf then
+// accepts 999 happily, since it only rejects non-integers. Measured: a tree
+// carrying preferred-prefix-length 999 fails SchemaValidate and still arrives
+// here as PrefixDelegatingPrefixLen=999. A schema ceiling is a commit gate, not
+// an invariant; anything downstream that would be UNSOUND on a violating value
+// has to bound it itself.
+//
+// This is the outbound twin of the #6531 guard ~60 lines below, which rejects
+// the same degenerate mask arriving from the upstream server. That one already
+// treats a nil mask as untrusted input; this one had not, even though the value
+// reaches us over the same tolerant path.
+//
+// Fall back to "no hint" rather than clamping to 128 (the #8642 doctrine): a
+// clamp invents an operator intent we cannot know, while 0/absent is the
+// sentinel this leaf already documents for "not set", and IA_PD without a hint
+// is well-formed — the server picks the length.
+func pdHintPrefixLength(ifaceName string, prefLen int) (int, bool) {
+	if prefLen <= 0 {
+		// The documented "not set" sentinel. Not an error; send no hint.
+		return 0, false
+	}
+	if prefLen > 128 {
+		slog.Warn("DHCPv6: ignoring out-of-range IA_PD preferred-prefix-length; sending no length hint",
+			"interface", ifaceName, "preferred-prefix-length", prefLen,
+			"valid", "0..128", "issue", "#8597")
+		return 0, false
+	}
+	return prefLen, true
+}
+
 // buildDHCPv6Modifiers constructs DHCPv6 message modifiers from interface options.
 func (m *Manager) buildDHCPv6Modifiers(ifaceName string, opts *DHCPv6Options) []dhcpv6.Modifier {
 	var mods []dhcpv6.Modifier
@@ -630,11 +677,11 @@ func (m *Manager) buildDHCPv6Modifiers(ifaceName string, opts *DHCPv6Options) []
 	for _, iaType := range opts.IATypes {
 		if iaType == "ia-pd" {
 			var hintPrefix *dhcpv6.OptIAPrefix
-			if opts.PDPrefLen > 0 {
+			if n, ok := pdHintPrefixLength(ifaceName, opts.PDPrefLen); ok {
 				hintPrefix = &dhcpv6.OptIAPrefix{
 					Prefix: &net.IPNet{
 						IP:   net.IPv6zero,
-						Mask: net.CIDRMask(opts.PDPrefLen, 128),
+						Mask: net.CIDRMask(n, 128),
 					},
 				}
 			}

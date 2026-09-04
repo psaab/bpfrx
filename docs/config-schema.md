@@ -207,6 +207,22 @@ sibling aspect files in the same package (`schema_security.go`,
    the compiler accepted MUST still load (`TestLoad_ToleratesStored*`
    in `pkg/configstore`).
 
+   The corollary binds every CONSUMER of a typed leaf: **a schema range
+   is a commit gate, not an invariant.** Code downstream of the compiler
+   may not assume a leaf's value is inside its declared range — on the
+   tolerant path it is not. Anything that would be UNSOUND on a
+   violating value has to bound it itself, at the point of use. A bound
+   placed in the COMPILER (rather than in `setSchema`) does hold on
+   every ingress path, which is why the two look interchangeable and are
+   not. #8597 has one of each: K51 (`preferred-prefix-length`) was
+   schema-bounded only, so 999 reached `net.CIDRMask(999, 128)`, got a
+   nil mask, and egressed an IA_PD hint with wire prefix-length 0 —
+   fixed at the consumer (`pdHintPrefixLength`, `pkg/dhcp/dhcpv6.go`);
+   K54 (`icmp-type`) looked identical but was already safe, because
+   `resolveICMPTypeToken` range-checks in the compiler and diverts an
+   out-of-range token to `UnknownICMPTypes`. When you rely on a range,
+   check WHERE it is enforced.
+
 Because completion (3) and validation (4) read the SAME node, they cannot
 drift — typing a leaf fixes both `set ... ?` help and `commit check`
 rejection together.

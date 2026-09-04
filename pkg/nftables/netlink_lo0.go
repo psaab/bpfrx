@@ -451,6 +451,36 @@ func nftLo0LogPrefix(term string) string {
 	return p
 }
 
+// intsToU8 narrows resolved ICMP type/code values to the bytes nftables
+// matches on.
+//
+// #8597 K54, REFUTED — recorded here so the next reader does not add the guard
+// that is not needed. The finding was that `uint8(v)` truncates silently, so a
+// configured icmp-type of 999 would match type 231 instead of being rejected.
+// It does not, and the reason is WHERE the bound lives.
+//
+// The only callers are the two icmpType/icmpCode sites above, whose values come
+// from FilterTerm.ICMPTypes / .ICMPCodes. Those slices are populated solely by
+// resolveICMPTypeToken / resolveICMPCodeToken (pkg/config/filter_match_resolve.go),
+// which accept a numeric token only when `n >= 0 && n <= 255` and otherwise
+// return ok=false, sending the token to UnknownICMPTypes / UnknownICMPCodes
+// instead (#3205/#6806). An out-of-range value can therefore never enter the
+// int slices this function reads.
+//
+// The load-bearing detail is that this bound is in the COMPILER, not in
+// setSchema. A schema `validator` gates only the strict commit path:
+// Store.Load and Store.SyncApply compile through compileTreeLenient, which
+// downgrades a typed-leaf violation to a warning (#1319), so a schema range is
+// not an invariant a downstream consumer may rely on. This one runs on every
+// ingress path, strict and tolerant alike. Measured: a tree carrying
+// `from icmp-type 999` compiled leniently yields ICMPTypes=[] and
+// UnknownICMPTypes=[999].
+//
+// Contrast #8597 K51 (pkg/dhcp/dhcpv6.go, pdHintPrefixLength), which was the
+// same shape but REAL precisely because its only bound was a schema validator.
+// If a future change resolves ICMP tokens without that 0..255 check — or adds a
+// third caller reading ints from somewhere else — this conversion becomes
+// unsound and the guard belongs at that new source, not here.
 func intsToU8(vals []int) []uint8 {
 	out := make([]uint8, 0, len(vals))
 	for _, v := range vals {
