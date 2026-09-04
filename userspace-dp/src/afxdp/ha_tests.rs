@@ -4046,21 +4046,52 @@ fn an_import_under_an_emptied_forwarding_table_publishes_a_dead_reverse_companio
     );
 }
 
-/// #7209 item 2: the reconcile's replay does NOT re-derive a reverse companion,
-/// so a dead one survives the reconcile that would have to repair it.
+/// #7209 item 1 (shape ii): the reconcile's replay RE-DERIVES a reverse
+/// companion under the live tables, repairing one that was synthesized from a
+/// forwarding table which could not resolve the reply path.
 ///
-/// This is the half that turns the cell above from an oddity into a blocker.
-/// `replay_synced_sessions` publishes `entry.decision` verbatim and re-queues
-/// the entry to each worker; there is no re-synthesis anywhere in it. So the
-/// dead companion an import created during a lock-released window is still dead
-/// on the far side of the reconcile, and the only mechanism that ever rebuilds
-/// it — `prewarm_reverse_synced_sessions_for_owner_rgs` at RG activation — is
-/// not reached by a mid-life `apply_snapshot` on an already-active node.
+/// REPLACES a characterization cell that asserted the opposite. That one pinned
+/// the pre-fix behaviour — the replay republished `entry.decision` verbatim —
+/// so that the blocker on scope item 2 was a red rather than a paragraph. It
+/// did its job: it went red the moment the repair landed, and its failure
+/// message carried the instruction for this rewrite.
+///
+/// Three assertions, and the third is the one that keeps the metric honest:
+///
+///   1. the replayed companion resolves under the LIVE table;
+///   2. the SHARED MAP is repaired too, not just the replayed copy — that map
+///      is the authority a later prewarm, export or replay reads, so fixing
+///      only one of the two would leave the stale value to be re-adopted;
+///   3. a steady-state replay, where the stored companion already agrees with
+///      what the table resolves, does NOT bump the counter. Without that leg a
+///      counter bumped on every replayed companion passes the first two and
+///      becomes a function of how often the box reconciles rather than of how
+///      often a companion was built from a table that could not answer.
 #[test]
-fn the_reconcile_replay_does_not_repair_a_dead_reverse_companion_7209() {
+fn the_reconcile_replay_rederives_a_dead_reverse_companion_7209() {
     let mut coordinator = Coordinator::new();
     // The window: torn-down forwarding, exactly as `stop_inner(false)` leaves.
     coordinator.forwarding = ForwardingState::default();
+    // HA state goes in FIRST, and the ordering is load-bearing rather than
+    // setup. `update_ha_state` runs `prewarm_reverse_synced_sessions_for_owner_
+    // rgs` on an RG ACTIVATION, which re-synthesizes every companion — so
+    // calling it after the import would repair the companion before the replay
+    // ever ran, and this cell would pass its disposition assertions for the
+    // prewarm's reason rather than the replay's. Measured: it did, and only the
+    // counter assertion caught it. Activating here, with no sessions yet, makes
+    // the prewarm a no-op and leaves the replay as the only repair path.
+    coordinator.update_ha_state(&[
+        HAGroupStatus {
+            rg_id: 1,
+            active: true,
+            ..HAGroupStatus::default()
+        },
+        HAGroupStatus {
+            rg_id: 2,
+            active: true,
+            ..HAGroupStatus::default()
+        },
+    ]);
     let entry = SyncedSessionEntry {
         key: test_key(),
         decision: test_decision(),
@@ -4076,26 +4107,39 @@ fn the_reconcile_replay_does_not_repair_a_dead_reverse_companion_7209() {
         coordinator.upsert_synced_session(entry.clone()),
         SyncedImportOutcome::Applied
     );
+    assert_eq!(
+        coordinator
+            .sessions
+            .synced
+            .lock()
+            .expect("synced")
+            .get(&reverse_key)
+            .expect("companion")
+            .decision
+            .resolution
+            .disposition,
+        ForwardingDisposition::NoRoute,
+        "the fixture must start from a DEAD companion, or the repair below has \
+         nothing to repair and this cell passes vacuously"
+    );
 
-    // The reconcile now completes: forwarding comes back, and the replay runs
-    // over the live shared map (#8171). This is the node's ONLY chance to
-    // notice, short of an RG activation.
+    // The reconcile now completes: `apply_snapshot` installs the new table
+    // BEFORE `bring_up_workers` reaches the replay, which is what makes the
+    // replay a repair point at all.
     coordinator.forwarding = test_forwarding_state_split_rgs();
     let replay_entries = coordinator.snapshot_shared_session_entries();
     assert!(
         replay_entries.iter().any(|e| e.key == reverse_key),
-        "the companion must be IN the replay set, or this cell is asserting \
-         that the replay left alone something it never saw"
+        "the companion must be IN the replay set, or this cell asserts a repair \
+         of something the replay never saw"
     );
     let queues: BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>> =
         BTreeMap::from([(0u32, Arc::new(Mutex::new(VecDeque::new())))]);
+    let before = coordinator.synced_reverse_rederived_total();
     let replayed = coordinator.replay_synced_sessions(&replay_entries, &queues, -1);
-    assert!(
-        replayed > 0,
-        "the replay processed nothing, so it cannot be evidence about what a \
-         replay does"
-    );
+    assert!(replayed > 0, "the replay processed nothing");
 
+    // (2) the SHARED MAP — the authority — is what must be repaired.
     let after = coordinator
         .sessions
         .synced
@@ -4104,20 +4148,65 @@ fn the_reconcile_replay_does_not_repair_a_dead_reverse_companion_7209() {
         .get(&reverse_key)
         .cloned()
         .expect("companion after replay");
-    assert_eq!(
+    assert_ne!(
         after.decision.resolution.disposition,
         ForwardingDisposition::NoRoute,
-        "THE REPLAY REPAIRED THE COMPANION. If that is now true, \
-         `replay_synced_sessions` grew a re-synthesis step and #7209 scope \
-         item 2 lost its blocker — which is good news, and this cell is the \
-         wrong description of the code. Re-derive the sequencing before \
-         deleting it: the point it was pinning is that a lock released inside \
-         `reconcile` exposes an EMPTY forwarding table to `sync_session`, and \
-         nothing downstream re-derived what an import built from it"
+        "the replay left the companion resolving to NOTHING. It was synthesized \
+         from an empty forwarding table and the reconcile that reinstalled the \
+         table is the only thing that ever re-derives it on a node that does \
+         not subsequently fail over (#7209)"
     );
+    assert!(
+        after.metadata.owner_rg_id > 0,
+        "the repaired companion still carries owner RG 0, so it was not \
+         re-derived under the live table"
+    );
+    // The OTHER surface, and it was unbound until a mutation said so. Repairing
+    // the shared map alone leaves the kernel session map and every worker's
+    // SessionTable holding the dead row — arguably the worse half, since that
+    // is the copy packets are actually matched against. Measured: a mutant that
+    // repaired the shared map and replayed the stale entry passed the whole
+    // suite before this assertion existed.
+    let queued = queues
+        .get(&0)
+        .expect("worker 0 queue")
+        .lock()
+        .expect("queue")
+        .iter()
+        .find_map(|cmd| match cmd {
+            WorkerCommand::UpsertSynced(e) if e.key == reverse_key => Some(e.clone()),
+            _ => None,
+        })
+        .expect("the companion must be fanned out to the worker at all");
+    assert_ne!(
+        queued.decision.resolution.disposition,
+        ForwardingDisposition::NoRoute,
+        "the worker was handed the DEAD companion even though the shared map \
+         was repaired. The shared map is the authority a later prewarm reads, \
+         but this is the copy that reaches the kernel session map and the \
+         worker SessionTables — repairing one without the other leaves packets \
+         matched against the row the repair was for (#7209)"
+    );
+
     assert_eq!(
-        after.metadata.owner_rg_id, 0,
-        "the replay re-derived the companion's owner RG"
+        coordinator.synced_reverse_rederived_total(),
+        before + 1,
+        "the repair must be COUNTED — it is the instrument that makes the \
+         import-under-an-unanswerable-table window measurable rather than \
+         argued from the lock graph (#7209)"
+    );
+
+    // (3) CONTROL: replaying again, with nothing changed, must be inert.
+    let steady_entries = coordinator.snapshot_shared_session_entries();
+    let steady_before = coordinator.synced_reverse_rederived_total();
+    coordinator.replay_synced_sessions(&steady_entries, &queues, -1);
+    assert_eq!(
+        coordinator.synced_reverse_rederived_total(),
+        steady_before,
+        "a steady-state replay, whose stored companion already agrees with the \
+         live table, was counted as a repair. The metric then climbs with \
+         reconcile frequency and stops meaning 'a companion was built from a \
+         table that could not answer' (#7209)"
     );
 }
 

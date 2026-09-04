@@ -1421,7 +1421,7 @@ one. Neither exposes an empty table — and the barrier is the call that matters
 because it is the one that can exceed the Go side's 3 s session round-trip
 budget and take the rest of a #5380 bulk batch down with it.
 
-### Why phases 2 and 3 are blocked
+### Why phases 2 and 3 were blocked, and what unblocked them
 
 Releasing the lock there exposes `forwarding = ForwardingState::default()` to a
 concurrent `sync_session`, and the import's DERIVED state is computed from it:
@@ -1431,28 +1431,46 @@ concurrent `sync_session`, and the import's DERIVED state is computed from it:
    landing in the window persists;
 2. `synthesized_synced_reverse_entry` has exactly one early return, on
    `is_reverse` — there is no forwarding-dependent `None` arm — so the reverse
-   companion is still built, from nothing, and published;
-3. `replay_synced_sessions` publishes `entry.decision` VERBATIM and re-queues
-   the entry. It never re-synthesizes, so the reconcile does not repair it.
+   companion is still built, from nothing, and published.
 
-Today that is latent rather than live: the only way to reach it without a lock
-move is a standby taking bulk sync before its first apply, and RG activation
-re-derives the companion through
-`prewarm_reverse_synced_sessions_for_owner_rgs` before it can matter. A mid-life
-`apply_snapshot` on an already-ACTIVE node reaches no activation, so a lock
-release is exactly what turns it into a permanent wrong reply-path row.
+**Leg 3 no longer holds, and removing it is what unblocks these two phases.**
+It used to read: *"`replay_synced_sessions` publishes `entry.decision` VERBATIM
+and re-queues the entry. It never re-synthesizes, so the reconcile does not
+repair it."* That was true when this section was written and is not now. The
+replay REBUILDS each forward entry's companion under the live table
+(`rederived_reverse_companions`, called from `replay_synced_sessions`) and
+repairs **both** surfaces — the shared map, which is the authority a later
+prewarm or export reads, and the replayed copy, which is what reaches the
+kernel session map and the worker `SessionTable`s. Repairs are counted on
+`xpf_userspace_synced_reverse_rederived_total`.
 
-All three legs are pinned in `ha_tests.rs` as characterization cells
+`reconcile` reaches the replay AFTER `snapshot::apply_snapshot` has assigned
+`coord.forwarding = new_forwarding`, so the table read there is the new
+generation's rather than the emptied one — which is the ordering that makes the
+replay a repair point at all, and the same shape #8171 established for the
+entries themselves.
+
+So an import taken against a torn-down table is now repaired by the end of the
+same reconcile, on every node, without needing an RG activation. Before this,
+the only repair was `prewarm_reverse_synced_sessions_for_owner_rgs` at
+activation, which a mid-life `apply_snapshot` on an already-ACTIVE node never
+reaches — so the wrong reply-path row was permanent for any node that did not
+subsequently fail over.
+
+Legs 1 and 2 remain pinned in `ha_tests.rs`
 (`stop_inner_empties_the_forwarding_table_that_a_released_lock_would_expose_7209`,
-`an_import_under_an_emptied_forwarding_table_publishes_a_dead_reverse_companion_7209`,
-`the_reconcile_replay_does_not_repair_a_dead_reverse_companion_7209`) so the
-prerequisite is a red rather than a paragraph.
+`an_import_under_an_emptied_forwarding_table_publishes_a_dead_reverse_companion_7209`),
+and the repair itself by
+`the_reconcile_replay_rederives_a_dead_reverse_companion_7209`, which replaced
+the characterization cell that pinned the old leg 3. That cell went red the
+moment the repair landed, which is what a characterization cell is for.
 
-### Measured cost of the two candidate remedies
+### Measured cost of the two candidate remedies — shape (ii) was taken
 
-#7209 leaves item 1's shape open between refusing the companion when its inputs
+#7209 left item 1's shape open between refusing the companion when its inputs
 are absent, and deferring the synthesis to the replay. Implementing each as a
-mutation and running the full binary suite separates them:
+mutation and running the full binary suite separated them, and **shape (ii)
+landed on that evidence**:
 
 | shape | cells red |
 |---|---|

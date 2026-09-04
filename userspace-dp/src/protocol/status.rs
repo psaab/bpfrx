@@ -461,6 +461,16 @@ pub(crate) struct ProcessStatus {
     /// genuinely closed by the snapshot-wide mutex.
     #[serde(default)]
     pub synced_import_unpublished: u64,
+    /// #7209: reverse companions RE-DERIVED at reconcile replay because the
+    /// stored one disagreed with what the live forwarding table resolves.
+    /// Surfaced as `xpf_userspace_synced_reverse_rederived_total`.
+    ///
+    /// Additive / defaulted, same reasoning as the field above: it decodes to 0
+    /// against a helper that predates it, which reads as "never happened" — and
+    /// on such a helper the replay genuinely never re-derived anything, so 0 is
+    /// the truthful value rather than a silent gap.
+    #[serde(default)]
+    pub synced_reverse_rederived: u64,
     /// #2315: GRE-decap frames dropped by the RFC 6040 §4.2 decap-side
     /// ECN combine because the outer header carried a CE mark over an
     /// inner packet that was Not-ECT (the illegal combination — a

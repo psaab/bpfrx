@@ -531,6 +531,7 @@ test-deploy-lib:
 test-mutate-lib:
 	bash ./scripts/mutate-selftest.sh
 	bash ./scripts/go-test-json-selftest.sh
+	bash ./scripts/no-git-stash-selftest.sh
 
 # Self-test the #1875 shared-cluster lock cell (with-cluster.sh contention
 # matrix) and the #4020 destructive-smoke lock preamble (every reboot/

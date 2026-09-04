@@ -69,6 +69,40 @@ func openTraceFile(name string) (*os.File, string, error) {
 	// the shared /var/log — is what prevents a trace filename from ever landing
 	// on an unrelated system-log inode, and 0700 keeps non-root users from
 	// planting anything the root daemon would open here.
+	//
+	// #8482: Lstat FIRST, because MkdirAll stats THROUGH a symlink. If
+	// traceLogDir is a pre-existing symlink to a directory, MkdirAll succeeds
+	// and returns nil — and the O_NOFOLLOW open below then applies to
+	// <target>/<name>, a real file at the redirected location rather than a
+	// symlink, so it passes too. The file hardening is intact and the parent is
+	// what moved. Six prior reviews marked this confinement VERIFIED SAFE and
+	// each of them checked the file.
+	//
+	// Severity, stated so it is not re-filed higher: this is defence in depth,
+	// NOT a live escape. Planting that symlink needs write access to /var/log,
+	// which is 0755 and root-owned, so the trigger and the write are two
+	// different capabilities held by two different parties. What it buys is
+	// converting "someone already had write access to /var/log" from a full
+	// trace-redirection primitive into a failed open.
+	//
+	// A DANGLING symlink already failed here (MkdirAll: file exists), so the
+	// case this closes is specifically a symlink to an existing directory.
+	if fi, err := os.Lstat(traceLogDir); err == nil {
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return nil, "", fmt.Errorf("trace dir %s is a symlink; refusing to "+
+				"write root-owned flow telemetry through it (#8482)", traceLogDir)
+		}
+		if !fi.IsDir() {
+			return nil, "", fmt.Errorf("trace dir %s exists and is not a directory "+
+				"(mode %v); refusing to write flow telemetry (#8482)",
+				traceLogDir, fi.Mode())
+		}
+	} else if !os.IsNotExist(err) {
+		// Fail closed on any error that is not "absent" — an EACCES or a
+		// dangling-link EIO here means we cannot establish what the path is,
+		// and MkdirAll would be deciding that for us.
+		return nil, "", fmt.Errorf("stat trace dir %s: %w", traceLogDir, err)
+	}
 	if err := os.MkdirAll(traceLogDir, 0o700); err != nil {
 		return nil, "", fmt.Errorf("create trace dir %s: %w", traceLogDir, err)
 	}
