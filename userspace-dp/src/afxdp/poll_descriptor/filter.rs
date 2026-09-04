@@ -343,6 +343,14 @@ pub(super) struct SessionHitInputFilterEval {
     /// evaluator so a packet the filter drops is counted and logged exactly as a
     /// session-MISS packet would be.
     pub(super) eval: NonPbrInputFilterEval,
+    /// #8114 item 1: which evaluator produced `eval.cached_log`, so the emitted
+    /// record names the same source the session-MISS path would have named for
+    /// the same term. A verdict from a matched `routing-instance` term is
+    /// `FilterLogSource::Pbr` — that is what `ingress_route_table_override`
+    /// stamps on it — and everything else is `Input`. Getting this wrong does
+    /// not change what is dropped; it mislabels the record an operator
+    /// correlates against, which is worse than not logging.
+    pub(super) log_source: FilterLogSource,
     /// #7212: `Some(canonical key)` when this verdict came from a STATIC-filter
     /// REVALIDATION rather than a per-packet re-evaluation, so a non-`Accept`
     /// action REVOKES the session — both directions, plus its flow-cache slots
@@ -443,7 +451,7 @@ pub(super) fn collect_revoked_flow_cache_keys(
 /// |------|-----------|----------------------------|
 /// | `flow?` | the caller passed no flow | NO — the sole production call site passes `Some(flow)` literally; reachable only from tests |
 /// | `interface_input_filter(..)?` | no input filter on this ingress + family | NO — there is no filter to deny anything |
-/// | `filter.affects_route_lookup` | a STATIC filter with at least one `routing-instance` term | **YES** — #8114 item 1, still open |
+/// | `filter.affects_route_lookup` | *(removed)* — the verdict is now COMPOSED from the routing-instance walk plus the non-routing walk | **was YES** — #8114 item 1, closed by `static_input_filter_deny_eval`'s PBR arm |
 /// | `FilterRevalidationTarget::Fresh` | the entry's verdict is already derived under the live `(generation, ingress)` | NO — derived, and it was an Accept |
 /// | `FilterRevalidationTarget::NoLocalEntry` | no entry this tuple may safely name | **was YES** — #8114 item 2, closed by `sessionless_static_input_filter_verdict` |
 /// | `static_input_filter_deny_eval` -> `None` | the filter permits the flow | NO |
@@ -459,6 +467,13 @@ pub(super) fn collect_revoked_flow_cache_keys(
 /// delivery path, downstream of a verdict this function already produced. The
 /// issue groups all four as "the revalidation has a verdict but no place to
 /// apply it", which is true of 1 and 2 and not of 3 and 4.
+///
+/// With items 1 and 2 closed, NO exit of this function can miss a live deny:
+/// every remaining `None` is either "there is no filter", "the filter permits
+/// this flow", or "this flow was already judged under the live pair". The table
+/// is kept rather than deleted because that is a property worth being able to
+/// re-check against a future exit, and a list of closed items is what makes a
+/// NEW one visible.
 ///
 /// Why the ingress interface is read off the packet and not off the session: it
 /// is an OBSERVATION of where this direction's traffic actually arrives.
@@ -510,6 +525,7 @@ pub(super) fn evaluate_input_filter_on_session_hit(
                 false,
             ),
             revoked_key: None,
+            log_source: FilterLogSource::Input,
         });
     }
     // #7212: a purely STATIC filter.
@@ -527,9 +543,6 @@ pub(super) fn evaluate_input_filter_on_session_hit(
     // declining is the only honest answer available here. It leaves such filters
     // exactly where they were before #7212 — no revocation — rather than
     // inventing a wrong one; a routing-aware static evaluator is #8114.
-    if filter.affects_route_lookup {
-        return None;
-    }
     // ONE probe answers both questions: which entry does this WIRE tuple name,
     // and does that entry still lack a verdict derived under the live generation
     // on THIS ingress interface. `None` — the answer for every packet but one
@@ -581,6 +594,7 @@ pub(super) fn evaluate_input_filter_on_session_hit(
             sessionless_static_input_filter_verdict(
                 forwarding,
                 filter,
+                ingress_ifindex,
                 flow,
                 meta,
                 ingress_zone_override,
@@ -617,16 +631,100 @@ pub(super) fn evaluate_input_filter_on_session_hit(
 /// and every per-packet-L4 condition inert (a static filter carries none by
 /// construction), so what remains is exactly the 5-tuple verdict — the right
 /// answer in both directions, not merely the safe one.
+///
+/// **#8114 item 1: the ROUTE-LOOKUP-AFFECTING case.** A filter carrying any
+/// `routing-instance` term used to be declined outright, because the non-routing
+/// walk DEFERS on a matched one — it returns the default `Accept` before the
+/// term's own action is examined — and cannot tell "Accept because nothing
+/// matched" from "Accept because it deferred". #4392 established that
+/// `then { routing-instance X; discard; }` is a DROP.
+///
+/// The verdict is now COMPOSED exactly the way the packet path composes it, so
+/// the two cannot disagree:
+///
+/// - Ask the routing-instance walk first. `Some(r)` means a matched TERMINATING
+///   term carried a routing-instance, which is what
+///   `ingress_route_table_override` acts on: it drops on
+///   `Reject`/`Discard` (`r.action`) and otherwise applies the table override
+///   and forwards. So `r.action` IS the verdict, deny or permit.
+/// - `None` means no PBR term terminated the walk — either a matched
+///   terminating term had no routing-instance, or nothing matched. Production
+///   returns `RouteOverride::None` there and the packet's verdict comes from the
+///   ordinary non-routing walk, so that is what is asked.
+///
+/// The ONLY case where the two walks differ is the matched routing-instance term
+/// with a `discard`/`reject` action — precisely the gap, and precisely why the
+/// old code could not read the deferral as an Accept.
+///
+/// A PLAIN `routing-instance` term (no drop action) is a PERMIT that changes the
+/// route table, so it does NOT revoke. That is deliberate and it is a scope
+/// statement rather than an oversight: #7212 revokes on DENY, and an established
+/// session whose PBR term now points at a different instance keeps the route it
+/// was built with until it ages out. Revoking on a route change is a separate
+/// question with a different blast radius.
 #[cold]
 #[inline(never)]
 fn static_input_filter_deny_eval(
     forwarding: &ForwardingState,
     filter: &crate::filter::Filter,
+    // The LOGICAL ingress this verdict is derived against — needed only to
+    // resolve the log's zone id on the PBR arm, which builds its
+    // `CachedInputFilterLog` here rather than inside `evaluate_non_pbr_input_filter`.
+    logical_ingress_ifindex: i32,
     flow: &SessionFlow,
     meta: UserspaceDpMeta,
     ingress_zone_override: Option<u16>,
-) -> Option<NonPbrInputFilterEval> {
+) -> Option<(NonPbrInputFilterEval, FilterLogSource)> {
     let extra = crate::filter::TermMatchExtra::default();
+    if filter.affects_route_lookup
+        && let Some(pbr) = crate::filter::evaluate_filter_ref_routing_instance_uncounted(
+            filter,
+            flow.src_ip,
+            flow.dst_ip,
+            meta.protocol,
+            flow.forward_key.src_port,
+            flow.forward_key.dst_port,
+            meta.dscp,
+            extra,
+        )
+    {
+        if pbr.action == crate::filter::FilterAction::Accept {
+            // Permitted, with a route-table override. Nothing to revoke.
+            return None;
+        }
+        // DENY from a PBR term. Replay the SAME walk WITH counting so the
+        // revoking packet is charged to its matching `then count` terms and
+        // carries its `then log` record exactly once — the routing-aware twin of
+        // the `evaluate_non_pbr_input_filter` replay below. Same `extra`, so the
+        // counted walk cannot reach a different term than the verdict did.
+        let counted = crate::filter::evaluate_filter_ref_routing_instance_event_counted(
+            filter,
+            flow.src_ip,
+            flow.dst_ip,
+            meta.protocol,
+            flow.forward_key.src_port,
+            flow.forward_key.dst_port,
+            meta.dscp,
+            extra,
+            meta.pkt_len as u64,
+        )?;
+        let ingress_zone_id = filter_log_ingress_zone_id(
+            forwarding,
+            meta,
+            ingress_zone_override,
+            logical_ingress_ifindex,
+        );
+        return Some((
+            NonPbrInputFilterEval {
+                action: counted.action,
+                cached_log: counted.log_match.map(|log_match| CachedInputFilterLog {
+                    log_match,
+                    ingress_zone_id,
+                }),
+            },
+            FilterLogSource::Pbr,
+        ));
+    }
     let verdict = crate::filter::filter_ref_static_verdict(
         filter,
         flow.src_ip,
@@ -640,13 +738,16 @@ fn static_input_filter_deny_eval(
     if verdict == crate::filter::FilterAction::Accept {
         return None;
     }
-    Some(evaluate_non_pbr_input_filter(
-        forwarding,
-        extra,
-        Some(flow),
-        meta,
-        ingress_zone_override,
-        false,
+    Some((
+        evaluate_non_pbr_input_filter(
+            forwarding,
+            extra,
+            Some(flow),
+            meta,
+            ingress_zone_override,
+            false,
+        ),
+        FilterLogSource::Input,
     ))
 }
 
@@ -672,14 +773,24 @@ fn static_input_filter_deny_eval(
 fn sessionless_static_input_filter_verdict(
     forwarding: &ForwardingState,
     filter: &crate::filter::Filter,
+    logical_ingress_ifindex: i32,
     flow: &SessionFlow,
     meta: UserspaceDpMeta,
     ingress_zone_override: Option<u16>,
 ) -> Option<SessionHitInputFilterEval> {
-    static_input_filter_deny_eval(forwarding, filter, flow, meta, ingress_zone_override).map(
-        |eval| SessionHitInputFilterEval {
+    static_input_filter_deny_eval(
+        forwarding,
+        filter,
+        logical_ingress_ifindex,
+        flow,
+        meta,
+        ingress_zone_override,
+    )
+    .map(
+        |(eval, log_source)| SessionHitInputFilterEval {
             eval,
             revoked_key: None,
+            log_source,
         },
     )
 }
@@ -733,9 +844,14 @@ fn revalidate_static_input_filter_on_session_hit(
     // shared verbatim with the sessionless path so the two cannot drift on WHAT
     // the verdict is — including the `TermMatchExtra::default()` choice, whose
     // reasoning now lives on that function.
-    let Some(eval) =
-        static_input_filter_deny_eval(forwarding, filter, flow, meta, ingress_zone_override)
-    else {
+    let Some((eval, log_source)) = static_input_filter_deny_eval(
+        forwarding,
+        filter,
+        logical_ingress_ifindex,
+        flow,
+        meta,
+        ingress_zone_override,
+    ) else {
         // The filter still permits this flow. Nothing is counted, nothing is
         // logged, and the session — including its NAT translation, which is the
         // reason #5858's family purge was rejected — is untouched. Re-stamp so
@@ -749,6 +865,7 @@ fn revalidate_static_input_filter_on_session_hit(
     Some(SessionHitInputFilterEval {
         eval,
         revoked_key: Some(canonical_key),
+        log_source,
     })
 }
 
@@ -760,6 +877,13 @@ pub(super) fn emit_input_filter_log_match(
     flow: &SessionFlow,
     meta: UserspaceDpMeta,
     cached_log: CachedInputFilterLog,
+    // #8114 item 1: the source stamped on the emitted record. `Input` for every
+    // pre-#8114 caller; `Pbr` when the verdict came from a matched
+    // `routing-instance` term, which is what `ingress_route_table_override`
+    // stamps on the same term for a session-MISS packet. Taken as a parameter
+    // rather than hardcoded so the two paths cannot label the same term
+    // differently.
+    log_source: FilterLogSource,
     // #3615: ACTUAL reject-reply outcome. A `then reject` input-filter term
     // whose reply fail-closed (budget/rate/parse/output-filter) — or any
     // reply-free path (accept `then log`, cached-log replay, flowless
@@ -777,7 +901,7 @@ pub(super) fn emit_input_filter_log_match(
         cached_log.log_match.filter_id,
         cached_log.log_match.term_id,
         cached_log.log_match.action,
-        FilterLogSource::Input,
+        log_source,
         // #2520: resolve the AppID via the hot-path app_catalog.lookup so the
         // filter-log RT_FLOW record carries the application, not UNKNOWN.
         resolve_flow_app_id(&forwarding.app_catalog, flow),
@@ -801,7 +925,16 @@ pub(super) fn emit_cached_input_filter_log(
     // #3615: cache-HIT replay is an established (accepted) flow's `then log`
     // record — a rejected flow is never cached — so no reply is enqueued here
     // and reject_reply_enqueued is false.
-    emit_input_filter_log_match(forwarding, event_stream, flow, meta, cached_log, false, now_ns);
+    emit_input_filter_log_match(
+        forwarding,
+        event_stream,
+        flow,
+        meta,
+        cached_log,
+        FilterLogSource::Input,
+        false,
+        now_ns,
+    );
 }
 
 #[inline]

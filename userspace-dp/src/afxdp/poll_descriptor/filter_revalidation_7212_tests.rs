@@ -892,26 +892,29 @@ fn a_deny_verdict_does_not_re_stamp_the_session_7212() {
     assert!(again.revoked_key.is_some());
 }
 
-/// A ROUTE-LOOKUP-AFFECTING filter is deliberately NOT revalidated, even for a
-/// flow one of its plain static terms denies.
+/// #8114 item 1, ON #7212'S OWN FIXTURE. A route-lookup-affecting filter IS
+/// revalidated now, and this is the case #7212 wrote down as the cost of
+/// declining: the flow does NOT match the PBR term, so the walk reaches
+/// `deny-5201` and the revocation was simply lost.
 ///
-/// The static verdict runs the NON-ROUTING walk, which returns the default
-/// Accept the moment it matches a `routing-instance` term — before that term's
-/// own action is examined. #4392 established that
-/// `then { routing-instance blue; discard; }` is a DROP, reached on the
-/// session-MISS path through `ingress_route_table_override`. Reading the
-/// deferral as an Accept would PRESERVE and STAMP a session the routing-aware
-/// evaluation drops, and the stamp would keep it from re-deriving until the next
-/// generation. The walk cannot tell "Accept because nothing matched" from
-/// "Accept because it deferred", so this path declines.
+/// #7212 declined because the static verdict ran the NON-ROUTING walk, which
+/// returns the default Accept the moment it matches a `routing-instance` term —
+/// before that term's own action is examined — and could not tell "Accept
+/// because nothing matched" from "Accept because it deferred". The verdict is
+/// now COMPOSED the way the packet path composes it: ask the routing-instance
+/// walk first, and fall back to the non-routing walk only when it reports that
+/// no PBR term terminated. Here it reports exactly that (the matched
+/// terminating term `deny-5201` carries no routing-instance), so the ordinary
+/// static verdict applies and the session is revoked.
 ///
-/// The fixture is the case that COSTS something, not the case that is safe: the
-/// flow does NOT match the PBR term, so the walk would reach `deny-5201` and
-/// revoke. Declining loses that revocation — a stated limitation (#8114), not an
-/// accident — and pinning it here is what makes a later fix visible as a
-/// deliberate change rather than an incidental one.
+/// The cell KEEPS #7212's fixture-liveness assertions rather than starting
+/// fresh: they are what stop this passing because the filter stopped being
+/// route-lookup-affecting, or because the deny term stopped matching.
+///
+/// Fail-on-revert: restore `if filter.affects_route_lookup { return None; }` and
+/// the revocation assertion reds.
 #[test]
-fn a_route_lookup_affecting_filter_is_not_revalidated_7212() {
+fn a_route_lookup_affecting_filter_is_revalidated_off_its_non_pbr_terms_8114() {
     let forwarding = forwarding_with_input_filter(
         LAN_IFINDEX,
         false,
@@ -961,24 +964,36 @@ fn a_route_lookup_affecting_filter_is_not_revalidated_7212() {
     );
 
     let mut sessions = table_with_session(&flow, 7, None);
-    assert!(
-        evaluate_input_filter_on_session_hit(
-            &forwarding,
-            &mut sessions,
-            &flow.forward_key,
-            &frame(),
-            Some(&flow),
-            meta(LAN_IFINDEX as u32, 0, false),
-            Some(TEST_LAN_ZONE_ID),
-        )
-        .is_none(),
-        "a route-lookup-affecting filter must decline rather than read its own \
-         deferral as an Accept"
+    let hit = evaluate_input_filter_on_session_hit(
+        &forwarding,
+        &mut sessions,
+        &flow.forward_key,
+        &frame(),
+        Some(&flow),
+        meta(LAN_IFINDEX as u32, 0, false),
+        Some(TEST_LAN_ZONE_ID),
+    )
+    .expect(
+        "a PBR term the flow does not match must not cost the revocation its \
+         plain deny term earns",
+    );
+    assert_eq!(hit.eval.action, crate::filter::FilterAction::Discard);
+    assert_eq!(
+        hit.revoked_key.as_ref(),
+        Some(&flow.forward_key),
+        "the verdict came from the ordinary static walk, so it REVOKES the \
+         session, not merely drops the packet"
+    );
+    assert_eq!(
+        hit.log_source,
+        crate::afxdp::event_emit::FilterLogSource::Input,
+        "no routing-instance term produced this verdict, so the record must NOT \
+         claim a PBR source"
     );
     assert!(
         sessions.filter_revalidation_stale(&flow.forward_key, LAN_IFINDEX),
-        "and it must not STAMP the session — a stamp would suppress the \
-         re-derivation a later routing-aware evaluator needs"
+        "a DENY must leave the stamp stale, so a teardown that did not take \
+         cannot turn into a forwarded flow"
     );
 }
 
@@ -1245,4 +1260,197 @@ fn a_fresh_stamp_is_not_re_derived_by_the_8114_sessionless_arm_8114() {
         sessions.lookup(&flow.forward_key, 2_000, 0).is_some(),
         "and the session must be untouched"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #8114 item 1 — a matched `routing-instance` term's own terminal action.
+// ---------------------------------------------------------------------------
+
+/// A PBR term: `from { protocol tcp; destination-port <dport>; } then {
+/// routing-instance blue; <action>; }`, with `count` so the "charged exactly
+/// once" claim is measurable.
+fn pbr_term(name: &str, dport: &str, action: &str) -> FirewallTermSnapshot {
+    FirewallTermSnapshot {
+        name: name.into(),
+        protocols: vec!["tcp".into()],
+        destination_ports: vec![dport.into()],
+        routing_instance: "blue".into(),
+        action: action.into(),
+        count: "pbr-counter".into(),
+        syslog: false,
+        reject_message_type: String::new(),
+        ..Default::default()
+    }
+}
+
+/// THE CASE #8114 item 1 names. `then { routing-instance blue; discard; }` is a
+/// DROP — #4392 established that, and `ingress_route_table_override` returns
+/// `RouteOverride::Drop` for it on the session-MISS path. The revalidation must
+/// reach the same verdict, and it could not before: the non-routing walk returns
+/// the default Accept the moment it matches a routing-instance term, before that
+/// term's own action is read.
+///
+/// Everything asserted here is a thing the old decline got wrong in a DIFFERENT
+/// way, so no single sloppy fix satisfies them all: the action (was: no verdict
+/// at all), the revocation (was: the session survived), the log source (a record
+/// claiming `Input` for a term the miss path logs as `Pbr` is a mislabel an
+/// operator correlates against), and the count (the verdict walk must be
+/// side-effect free, so the packet is charged once by the replay, not twice).
+///
+/// Fail-on-revert: restore `if filter.affects_route_lookup { return None; }` and
+/// the `.expect` reds.
+#[test]
+fn a_pbr_term_that_discards_revokes_the_session_8114() {
+    use std::sync::atomic::Ordering;
+
+    let forwarding = forwarding_with_input_filter(
+        LAN_IFINDEX,
+        false,
+        vec![pbr_term("pbr-drop", "5201", "discard")],
+    );
+    let flow = v4_flow(5201);
+    let filter =
+        crate::filter::interface_input_filter(&forwarding.filter_state, LAN_IFINDEX, false)
+            .expect("the filter is attached");
+    assert!(
+        filter.affects_route_lookup,
+        "fixture liveness: without a routing-instance term this cell is about \
+         nothing"
+    );
+    // The OLD verdict source still reads Accept for this flow — which is the
+    // deferral, and the whole reason the composed verdict exists. Without this
+    // the cell could pass against a filter whose plain terms happened to deny.
+    assert_eq!(
+        crate::filter::filter_ref_static_verdict(
+            filter,
+            flow.src_ip,
+            flow.dst_ip,
+            PROTO_TCP,
+            flow.forward_key.src_port,
+            flow.forward_key.dst_port,
+            0,
+            crate::filter::TermMatchExtra::default(),
+        ),
+        crate::filter::FilterAction::Accept,
+        "fixture liveness: the non-routing walk DEFERS here, so a fix that only \
+         consulted it would still forward this flow"
+    );
+
+    let mut sessions = table_with_session(&flow, 7, None);
+    let hit = evaluate_input_filter_on_session_hit(
+        &forwarding,
+        &mut sessions,
+        &flow.forward_key,
+        &frame(),
+        Some(&flow),
+        meta(LAN_IFINDEX as u32, 0, false),
+        Some(TEST_LAN_ZONE_ID),
+    )
+    .expect("a PBR term that discards must produce a verdict, not a decline");
+    assert_eq!(hit.eval.action, crate::filter::FilterAction::Discard);
+    assert_eq!(
+        hit.revoked_key.as_ref(),
+        Some(&flow.forward_key),
+        "the filter now denies the FLOW, so the session is revoked, not merely \
+         this packet dropped"
+    );
+    assert_eq!(
+        hit.log_source,
+        crate::afxdp::event_emit::FilterLogSource::Pbr,
+        "the verdict came from a routing-instance term; the session-MISS path \
+         logs that term as Pbr and the two must not label it differently"
+    );
+    assert_eq!(
+        filter.terms[0].counter.packets.load(Ordering::Relaxed),
+        1,
+        "charged EXACTLY once: the verdict walk is side-effect free and the \
+         counted replay runs only on the DENY arm. Two means the verdict walk \
+         counted too; zero means the replay did not run"
+    );
+}
+
+/// THE PERMIT CONTROL, and the scope statement. A PLAIN `then { routing-instance
+/// blue; }` term is a permit that changes the route table, so it must NOT revoke
+/// — `ingress_route_table_override` applies the override and forwards.
+///
+/// Without this cell "revoke whenever a PBR term matches" satisfies the cell
+/// above, and that would tear down every session an operator deliberately routes
+/// through a VRF the moment its stamp went stale.
+///
+/// It also pins the scope: an established session whose PBR term now points at a
+/// different instance keeps the route it was built with. #7212 revokes on DENY;
+/// revoking on a route CHANGE is a separate question.
+#[test]
+fn a_plain_pbr_term_does_not_revoke_the_session_8114() {
+    use std::sync::atomic::Ordering;
+
+    let forwarding = forwarding_with_input_filter(
+        LAN_IFINDEX,
+        false,
+        vec![pbr_term("pbr-route", "5201", "accept")],
+    );
+    let flow = v4_flow(5201);
+    let filter =
+        crate::filter::interface_input_filter(&forwarding.filter_state, LAN_IFINDEX, false)
+            .expect("the filter is attached");
+    let mut sessions = table_with_session(&flow, 7, None);
+
+    assert!(
+        evaluate_input_filter_on_session_hit(
+            &forwarding,
+            &mut sessions,
+            &flow.forward_key,
+            &frame(),
+            Some(&flow),
+            meta(LAN_IFINDEX as u32, 0, false),
+            Some(TEST_LAN_ZONE_ID),
+        )
+        .is_none(),
+        "a routing-instance term with no drop action PERMITS the flow; revoking \
+         here tears down every deliberately VRF-routed session"
+    );
+    assert_eq!(
+        filter.terms[0].counter.packets.load(Ordering::Relaxed),
+        0,
+        "and the verdict walk must be side-effect free — a permitted \
+         revalidation charges nothing, exactly as the non-PBR path does"
+    );
+    assert!(
+        sessions.lookup(&flow.forward_key, 2_000, 0).is_some(),
+        "the session survives"
+    );
+}
+
+/// A `then { routing-instance blue; reject; }` term is the other half of #4392's
+/// DROP set, and `enqueue_filter_reject_reply` keys on `FilterAction::Reject`,
+/// so a fix that collapsed both onto `Discard` would silently stop sending the
+/// RST/ICMP the operator asked for.
+#[test]
+fn a_pbr_term_that_rejects_keeps_its_reject_action_8114() {
+    let forwarding = forwarding_with_input_filter(
+        LAN_IFINDEX,
+        false,
+        vec![pbr_term("pbr-reject", "5201", "reject")],
+    );
+    let flow = v4_flow(5201);
+    let mut sessions = table_with_session(&flow, 7, None);
+
+    let hit = evaluate_input_filter_on_session_hit(
+        &forwarding,
+        &mut sessions,
+        &flow.forward_key,
+        &frame(),
+        Some(&flow),
+        meta(LAN_IFINDEX as u32, 0, false),
+        Some(TEST_LAN_ZONE_ID),
+    )
+    .expect("a PBR term that rejects must produce a verdict");
+    assert!(
+        matches!(hit.eval.action, crate::filter::FilterAction::Reject(_)),
+        "the term's REJECT must survive as a Reject — the caller keys the \
+         RST/ICMP reply on it, so collapsing it to Discard silently drops the \
+         reply. got {:?}",
+        hit.eval.action
+    );
+    assert_eq!(hit.revoked_key.as_ref(), Some(&flow.forward_key));
 }

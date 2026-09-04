@@ -20,6 +20,7 @@ pub(crate) use cache_sensitive::{
 };
 pub(crate) use eval::{
     evaluate_filter, evaluate_filter_counted, evaluate_filter_ref_routing_instance_event_counted,
+    evaluate_filter_ref_routing_instance_uncounted,
     evaluate_interface_filter, evaluate_interface_filter_counted,
     evaluate_interface_filter_log_match, evaluate_interface_filter_non_routing_counted,
     evaluate_interface_output_filter, evaluate_interface_output_filter_counted, evaluate_lo0_filter,

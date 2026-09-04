@@ -443,6 +443,99 @@ drops the representative packet, and the #1651 protection is untouched
 everywhere else (a hop pins ≤1 `pending_neigh` entry post-#1771 §2.2, so the
 cache was buying nothing here).
 
+### NAPI bootstrap: why a bound queue can be unable to receive (#8377/#8384)
+
+mlx5 zero-copy consumes the XSK fill ring **during RX NAPI poll**, so a bound
+queue on which NAPI never runs posts no RX WQEs and cannot receive — while its
+fill ring sits **full**. Three things touch that, and the relationship between
+them is not what reading any one of them suggests.
+
+**The probes.** `bootstrapNAPIQueuesLocked`
+(`pkg/dataplane/userspace/process_napi.go`) sends UDP probes with varying
+destination ports, so mlx5 RSS spreads them across queues and each queue sees a
+real hardware RX event. Queue selection is by hash, so this is a
+**coupon-collector** problem: covering `n` queues needs about
+`n·(ln n + ln(1/ε))` draws, not the `2n` an older comment in that file claimed
+while the code sent a hard-coded 30. With that fixed 30:
+
+| queues | E[uncovered] | P(all covered) |
+|---|---|---|
+| 6 | 0.03 | 0.975 |
+| 8 | 0.15 | 0.864 |
+| 16 | 2.31 | **0.099** |
+| 32 | 12.35 | 0.000 |
+
+30 was generous at the **6** queues the loss cluster's mlx5 VFs expose, which is
+why the shortfall has not been seen in-fleet; #8374 raised the per-interface
+binding count to `min(rx, BindingQueuesPerIface)` and made 8- and 16-queue
+interfaces reachable. The count is now derived — `napiProbeCount`, floored at
+the historical 30 so no already-covered interface regresses, and clamped at
+`BindingQueuesPerIface` because covering queues that can hold no binding buys
+nothing and would make a 64-queue NIC send ~500 packets per bringup.
+
+**The two wake paths that look like they make the probes redundant, and do
+not.** `prime_fill_ring_offsets` kicks NAPI per socket at bind
+(`drive_fill_prime_loop` always runs at least one iteration — pinned by
+`already_primed_runs_exactly_one_iteration`, #2481), and `maybe_wake_rx`
+issues `poll(POLLIN)` on every empty RX poll thereafter. It is tempting to
+conclude from those that an uncovered queue self-heals. **It does not, and this
+is the trap in this area** — a draft of the #8377 fix reached exactly that
+conclusion and had to be withdrawn.
+
+Three separate readings of the wake path have now inverted each other, and the
+source does not settle it: `xsk_poll` forwards to `ndo_xsk_wakeup` only when
+`pool->cached_need_wakeup` is set (it is seeded `XDP_WAKEUP_TX` at pool
+creation, so the gate is open), but `mlx5e_xsk_wakeup` then returns 0 without
+triggering NAPI when the channel NAPI is already scheduled
+(`napi_if_scheduled_mark_missed`) or an XSK-TX NOP is already pending
+(`MLX5E_SQ_STATE_PENDING_XSK_TX`).
+
+**The only measurement points at the probes**, and it is in this tree's own
+history:
+
+- `ffe0b5520` — *"Known: mlx5 zero-copy fill ring consumer (frC) stays at 0
+  after daemon restart despite correct XSKMAP registration. XDP_REDIRECT
+  succeeds but packets are silently dropped."* Recorded **with the
+  `poll(POLLIN)` wake already in the tree**.
+- `e0c01ac2b` — added `SO_BUSY_POLL` on all XSK sockets because *"ndo_xsk_wakeup's
+  ICOSQ NOP mechanism fails when NAPI is already scheduled from other
+  sources"*, made the probes re-fire after every rebind, and observed the
+  failure mode directly: *"The ARP/NDP reply for the egress next-hop may hash to
+  an XSK queue that hasn't been bootstrapped yet."*
+
+So **treat the probes as load-bearing**. Do not delete or weaken them on the
+strength of a source reading that one of the wake paths "should" cover it; the
+one piece of hardware evidence says otherwise. Settling it properly needs a NIC
+with more than 8 RX queues bound and per-queue counters read after bootstrap —
+which is also what #8377 asks for before anyone tunes the constant further.
+
+**Three coverage holes that are NOT the coupon-collector shortfall**, found
+while tracing #8377 and left for their own issues rather than folded in:
+
+- `process_napi.go` selects the probe target from IPv4 routes and neighbours
+  only (`netlink.FAMILY_V4`), and `continue`s when it finds none. An interface
+  with no v4 gateway and no usable v4 neighbour — an IPv6-only segment — gets
+  **zero** probes, which is a larger hole than any probe-count arithmetic.
+- The 2 s debounce in `bootstrapNAPIQueuesAsyncLocked` silently drops the
+  "startup-prewarm" invocation when it lands within 2 s of "startup".
+- With `defer_workers` (RETH/HA bringup) the helper skips the worker spawn, so
+  there are no XSK sockets at all during the probe window.
+
+**Do not reach for a fill-ring term as the health signal either (#8384).** In
+this failure the ring is **full** — primed at bind and never consumed — so both
+a "fill ring is not empty" predicate and the `rx_fill_ring_empty_descs` kernel
+counter read healthy in exactly the state they would be added for. That counter
+increments when the driver wants a descriptor and finds none; if the driver
+never runs, it stays at 0. It is a good signal for fill-ring starvation under
+load and a useless one for a queue that never started. `rx_wakeups` — already
+per-binding and already on the wire, though unrendered — is tempting as the
+"was this queue ever kicked" signal and is **also** wrong: it counts wake
+ATTEMPTS, and the whole difficulty above is that an attempt can be inert. And a
+runtime liveness term does not belong in `binding.ready` regardless: forwarding admission
+(`maps_sync.go`) and HA standby fitness (`manager_ha.go`) both read it as "may
+I use this binding", so a term that can go false under load sheds capacity
+exactly when it is needed and declares a busy node unfit to take over.
+
 ### The `bind-interface`-only secure tunnel, and why it needed a row (#7949)
 
 The block above assumes a LAN→tunnel packet *reaches* an egress that names the
@@ -2648,6 +2741,44 @@ stopped.
 **Tuning guidelines:**
 - Set `workers` to match NIC RSS queue count (`ethtool -L <dev> combined N`)
 - Set `ring-entries` to 16384 for ≥20 Gbps throughput.
+  **Bound is not fed, and the sizing term is BOUND (#8378).** The RSS
+  indirection table is reshaped to feed only `[0, active)` where `active` is
+  `min(workers, bound)` (`pkg/daemon/rss_indirection.go`, `computeWeightVector`),
+  while the planner binds `min(rx_queues, BindingQueuesPerIface)` per interface
+  (#8374). When `workers < bound` the remaining bound queues are registered,
+  bound, ready and heartbeating **while receiving nothing** — and each still
+  holds its own UMEM:
+
+  | workers | hw queues | bound | RSS feeds | bound-but-idle | idle UMEM @ ring=16384 |
+  |---|---|---|---|---|---|
+  | 2 | 6 | 6 | 2 | 4 | ~640 MB |
+  | 4 | 6 | 6 | 4 | 2 | ~320 MB |
+  | 8 | 32 | 16 | 8 | 8 | ~1.25 GB |
+
+  This is **deliberate**, not a leak. Feeding only `[0, workers)` is what gives
+  #785 its 1:1 worker-to-queue mapping, so a worker owns one queue rather than
+  round-robining several; the idle bindings are the price of that choice. The
+  bindings are also OWNED, not orphaned — `planning.rs` mints
+  `worker_id = queue_id % workers`, so every bound queue is in some worker's
+  set and is polled each iteration.
+
+  What changed is the price, not the design: before #7497/#8374 the planner
+  bound the global minimum across all candidates, so `bound` was small and
+  usually close to `workers`. Now the gap is `bound - workers` on every
+  interface independently.
+
+  **Size the box on BOUND bindings, not on workers.** The `bindings × 160 MB`
+  rule below counts every bound queue, including the idle ones.
+
+  The alternative — planning `min(rx, 16, workers)` so no unfed binding is ever
+  created — is NOT taken, and the reason is a cost that is easy to miss:
+  `handlers/rebind.rs` clears every binding and calls `Coordinator::reconcile`
+  → `tear_down`, which **stops all the running workers**. There is no per-slot
+  rebind path. So coupling the plan to `workers` would turn
+  `set system dataplane workers N` from a knob into a full dataplane teardown
+  and rebuild — on a 16-queue box, fifteen healthy sockets destroyed to change
+  a number. That trade is only worth revisiting once a per-slot rebind exists.
+
   UMEM cost per binding at ring=16384 — **160 MB for EVERY driver**:
     - mlx5 / native XDP: `reserved_tx (min(ring/2, 8192)) + 2 × ring_entries` = `8192 + 32768 = 40960 frames × 4 KB = 160 MB per binding`
     - virtio_net: prefers `ring_entries` for reserved TX, but that is **clamped to

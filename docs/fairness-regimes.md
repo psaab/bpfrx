@@ -380,6 +380,24 @@ A measurement run **PASSES** iff ALL of:
    reads `verdict`, which is how the confound survived to be cited. It exits
    2 (undetermined), never 0.
 
+   **The second target now exists, so that void is clearable.** #8259's
+   blocker was not the check but the lab: the standing target is external
+   hardware with no management path, and the firewall's WAN neighbour table
+   held exactly two entries — the target and the upstream router — so there
+   was nowhere to move a flow to. `test/incus/mouse-target-setup.sh`
+   provisions `xpf-mouse-target` at `172.16.80.201`, an incus container with
+   an SR-IOV VF tagged into VLAN 80, running the same service grid
+   (`target-services.sh`'s contract: iperf3 5200-5211, echo 6200-6211, plus
+   port 7). `loss-userspace-cluster.env` defaults `MOUSE_TARGET_V4` to it, so
+   the void check passes on the standing cluster with no per-run flag — and a
+   run that deliberately wants both flows on one host, to reproduce an older
+   measurement, overrides it.
+
+   **What that does NOT do is make the earlier numbers attributable.** Every
+   verdict taken before this — #7100's FAIL, #7159's PASS, and the 2x2 that
+   followed — was measured with both flows on one host and stays void. They
+   have to be re-taken, not reinterpreted.
+
    **An ABORT is distinguishable from a gate FAIL (#8244).** Every abort path
    in `test-mouse-latency-matrix.sh` used to `exit 1` and write no
    `summary.json` at all, so the only signal was an ABSENCE — and `rc=1` is
@@ -2169,11 +2187,14 @@ starvation is distinguishable in `probe.json` from one that never starved.
 
 ### What this does not fix
 
-- **Attribution of the verdict itself.** #8259 is the separate defect that mice
-  and elephants terminate on the same host, so a loaded/idle ratio cannot
-  separate firewall queueing from target-host service. Loosening this rule lets
-  a concentrated tail produce a FAIL; #8259 is what makes that FAIL mean
-  something. Neither subsumes the other.
+- **Attribution of the verdict itself.** #8259 was the separate defect that
+  mice and elephants terminate on the same host, so a loaded/idle ratio could
+  not separate firewall queueing from target-host service. Loosening this rule
+  lets a concentrated tail produce a FAIL; #8259 is what makes that FAIL mean
+  something, and neither subsumes the other. **The second target is now
+  provisioned** (`test/incus/mouse-target-setup.sh`, `MOUSE_TARGET_V4`), so
+  both halves are in place and the fixture can produce an attributable verdict
+  for the first time — which is the run #1359 item 3 has been waiting on.
 - **The `error_rate >= 0.01` rule**, which #8277 notes is the same shape: a
   connection error rate that rises *because* flows are being starved is a
   result, not a reason to discard the measurement. It was left alone

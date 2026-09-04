@@ -22,6 +22,16 @@
 #   ./test/incus/target-services.sh up       # start what is missing
 #   ./test/incus/target-services.sh down     # stop what this script started
 #
+# #8259 UPDATE — THERE IS NOW A SECOND TARGET, and it is an incus instance.
+# `test/incus/mouse-target-setup.sh` provisions `xpf-mouse-target` at
+# 172.16.80.201: an SR-IOV VF tagged into VLAN 80, running this same grid
+# (iperf3 5200-5211, echo 6200-6211, plus port 7). It exists so a
+# mouse-latency verdict can be ATTRIBUTED — mice on one host, elephants on the
+# other — which #8467's void check has been waiting for. Everything below
+# about the ORIGINAL target at 172.16.80.200 remains true of that host; it is
+# still external, still unmanageable from here, and is still what
+# IPERF_TARGET4 points at.
+#
 # WHY `up` CAN FAIL WITH A DESCRIPTION RATHER THAN A FIX. The target is
 # addressed by IP, and on the standing loss cluster it is external lab
 # hardware: it answers ICMP on ge-0-0-2.80 but is not an incus instance in any

@@ -319,6 +319,10 @@ pub(super) fn flush_session_deltas(
     shared_owner_rg_indexes: &SharedSessionOwnerRgIndexes,
     recent_session_deltas: &Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
     peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
+    // #8114 item 4: the same queues keyed by worker id, so a `DeleteSynced` a
+    // full sibling queue REFUSES can be attributed and that sibling's NAT
+    // holder bit released on its behalf.
+    worker_commands_by_id: &BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
     event_stream: &Option<crate::event_stream::EventStreamWorkerHandle>,
     forwarding: &ForwardingState,
     // #5468: per-drain-cycle aggregate lossless-wedge latch (see doc above).
@@ -521,11 +525,31 @@ pub(super) fn flush_session_deltas(
                 &shared_owner_rg_indexes,
                 &reverse_key,
             );
-            replicate_session_delete(peer_worker_commands, &delta.key);
+            // #8114 item 4: repair the sibling NAT holder bit a refused
+            // `DeleteSynced` would otherwise strand. The forward key carries
+            // the reservation; the reverse call self-gates on `is_reverse` and
+            // is a no-op for it, exactly as `handle_delete_synced` is.
+            replicate_session_delete_repairing(
+                peer_worker_commands,
+                worker_commands_by_id,
+                forwarding,
+                &delta.key,
+                delta.decision.nat,
+                delta.metadata.is_reverse,
+                crate::afxdp::wg::counters::monotonic_now_ns(),
+            );
             // #1069: reuse the reverse_key already computed above instead of
             // recomputing it. reverse_session_key is pure on its inputs and
             // delta + nat are not modified between the two replicate calls.
-            replicate_session_delete(peer_worker_commands, &reverse_key);
+            replicate_session_delete_repairing(
+                peer_worker_commands,
+                worker_commands_by_id,
+                forwarding,
+                &reverse_key,
+                delta.decision.nat,
+                true,
+                crate::afxdp::wg::counters::monotonic_now_ns(),
+            );
             if cfg!(feature = "debug-log") {
                 debug_log!(
                     "SESS_DELETE_DONE: bpf_entries_after={}",

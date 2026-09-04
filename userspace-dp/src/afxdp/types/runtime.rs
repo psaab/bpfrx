@@ -698,6 +698,22 @@ pub(in crate::afxdp) struct WorkerContext<'a> {
     pub(in crate::afxdp) recent_exceptions: &'a Arc<Mutex<ExceptionEventRing>>,
     pub(in crate::afxdp) last_resolution: &'a Arc<Mutex<Option<ResolutionEvent>>>,
     pub(in crate::afxdp) peer_worker_commands: &'a [Arc<Mutex<VecDeque<WorkerCommand>>>],
+    /// #8114 item 4: the SAME queues as `peer_worker_commands` plus this
+    /// worker's own, but KEYED BY WORKER ID.
+    ///
+    /// It exists because a `DeleteSynced` refused by a full sibling queue
+    /// leaves that sibling holding a NAT reservation it will now never release,
+    /// and the repair — `release_source_nat_allocation_for_worker` — must name
+    /// the worker whose holder bit to drop. `peer_worker_commands` cannot: the
+    /// ids are dropped where the slice is built (`reconcile/bringup.rs` maps
+    /// `.filter(|(id, _)| **id != worker_id).map(|(_, queue)| queue.clone())`).
+    ///
+    /// Releasing for a worker that WILL still process its delete is safe
+    /// (idempotent); releasing for one that is still FORWARDING the flow is
+    /// not — its port could be handed to another flow — so "release for every
+    /// worker" is not a substitute for the id.
+    pub(in crate::afxdp) worker_commands_by_id:
+        &'a BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
     pub(in crate::afxdp) dnat_fds: &'a DnatTableFds,
     pub(in crate::afxdp) rg_epochs: &'a [AtomicU32; MAX_RG_EPOCHS],
     /// #1620: cold-path latency histogram sample mask. Loaded once
@@ -708,6 +724,23 @@ pub(in crate::afxdp) struct WorkerContext<'a> {
     /// Read on every session-miss packet at the poll_descriptor
     /// pre-eval gate.
     pub(in crate::afxdp) cold_path_sample_mask: u64,
+}
+
+/// #8114 item 4: the empty `worker_commands_by_id` a `WorkerContext` fixture
+/// uses when it is not exercising the dropped-delete repair.
+///
+/// Returned by reference from a `OnceLock` so a fixture can name it inline
+/// without a local binding, and EMPTY on purpose: the repair resolves a refused
+/// queue to its worker id by `Arc` identity against this map, so an empty one
+/// means "no id resolved, no repair attempted" and every pre-#8114 fixture keeps
+/// its exact behaviour. A cell that means to exercise the repair builds a real
+/// map holding the same `Arc`s it puts in `peer_worker_commands`.
+#[cfg(test)]
+pub(in crate::afxdp) fn empty_worker_commands_by_id()
+-> &'static BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>> {
+    static EMPTY: std::sync::OnceLock<BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>> =
+        std::sync::OnceLock::new();
+    EMPTY.get_or_init(BTreeMap::new)
 }
 
 /// #945: mutable telemetry context for `poll_binding_process_descriptor`.
