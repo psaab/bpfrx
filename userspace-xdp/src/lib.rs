@@ -1700,6 +1700,30 @@ fn is_ipv6_link_local(ip: [u8; 16]) -> bool {
     ip[0] == 0xfe && (ip[1] & 0xc0) == 0x80
 }
 
+/// #8249: `#[inline(always)]` is LOAD-BEARING for verifier headroom, not a
+/// performance hint.
+///
+/// Without it LLVM emits `parse_l4` as a BPF SUBPROGRAM, and a BPF-to-BPF call
+/// is verified once per distinct calling state. `parse_l4` is reached from
+/// `parse_ipv4`, `parse_ipv6` and both GRE inner classifiers, so the callee's
+/// protocol dispatch was being walked from every one of them. Measured on the
+/// real kernel verifier (`make generate` -> `shimverify`, no
+/// `XPF_SHIM_ALLOW_LOW_HEADROOM`):
+///
+/// Both figures measured at commit `a02e55248`, and quoted against the 15%
+/// install-blocking floor (~850,000 processed insns) rather than the 1,000,000
+/// kernel cap — a shape that fits under the cap can still be unshippable
+/// (#8241).
+///
+/// | | processed insns | total_states | slack to the 15% floor |
+/// |---|---:|---:|---:|
+/// | subprogram, at `a02e55248` | 795,764 | 43,377 | 54,236 |
+/// | inlined, at `a02e55248` | 497,050 | 25,509 | 352,950 |
+///
+/// 298,714 instructions and 41% of the verifier's states. Removing this
+/// attribute does not fail a test — it silently spends a third of the object's
+/// budget, which is how the shim reached 0.92% headroom before #4555.
+#[inline(always)]
 fn parse_l4(
     data: usize,
     data_end: usize,
