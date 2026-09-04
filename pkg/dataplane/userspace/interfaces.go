@@ -283,14 +283,14 @@ func sampleLiveXfrmNetdevs() map[string]bool {
 // sample. buildSnapshot does NOT use it: a build that also produces fabric
 // parents must share one sample across both, via buildInterfaceSnapshotsFrom.
 func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
-	if cfg == nil || len(cfg.Interfaces.Interfaces) == 0 {
+	if !snapshotHasInterfaceRows(cfg) {
 		return nil
 	}
 	return buildInterfaceSnapshotsFrom(cfg, sampleLiveXfrmNetdevs())
 }
 
 func buildInterfaceSnapshotsFrom(cfg *config.Config, liveXfrm map[string]bool) []InterfaceSnapshot {
-	if cfg == nil || len(cfg.Interfaces.Interfaces) == 0 {
+	if !snapshotHasInterfaceRows(cfg) {
 		return nil
 	}
 	zoneByInterface := buildInterfaceZoneMap(cfg)
@@ -520,6 +520,17 @@ func buildInterfaceSnapshotsFrom(cfg *config.Config, liveXfrm map[string]bool) [
 			idents = append(idents, egressRowIdentity{owner: name, identity: unitIdentity, isUnit: true})
 		}
 	}
+	// #7949: append a row for every secure tunnel the operator named ONLY
+	// through `bind-interface` and then zoned. Placed BEFORE stampEgressZones
+	// so the synthesized rows take part in the #6722 egress decision like any
+	// other row — a row stamped with no EgressZone could not claim an egress
+	// zone in the helper (forwarding_build/interfaces.rs:172 requires
+	// corroboration) and would be adjudication-inert, which is the whole point
+	// of adding it. It appends to `out` and `idents` TOGETHER: stampEgressZones
+	// returns early unless the two slices are the same length, so growing one
+	// alone would silently disable the egress decision for the entire snapshot.
+	out, idents = appendBindInterfaceOnlySecureTunnelRows(
+		cfg, out, idents, authored, zoneByInterface, ifaceRoutingInstance, liveXfrm)
 	// #6722: decide each ifindex's EGRESS zone here, from the operator's authored
 	// bindings and this loop's own aliasing, and stamp the answer on every row.
 	stampEgressZones(cfg, out, idents, authored)

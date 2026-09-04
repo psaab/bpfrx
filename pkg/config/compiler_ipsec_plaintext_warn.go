@@ -97,6 +97,22 @@ import ()
 // agree; it cannot live here, because snapshotSecureTunnel is unexported in
 // pkg/dataplane/userspace.
 //
+// #7949 NARROWED WHAT "AN OPERATOR WHO ZONES A VPN INTERFACE HAS BEEN TOLD
+// SOMETHING UNTRUE" MEANS, and the direction matters. This advisory is about
+// the INGRESS half — the plaintext the kernel XFRM stack delivers ON the
+// xfrmi, which is still kernel-forwarded and still unadjudicated (#8276 owns
+// that half; the exclusion above is what makes it so). It is NOT about the
+// EGRESS half. Before #7949 a `bind-interface`-only tunnel produced no
+// interface row at all, so its LAN -> tunnel direction resolved NoRoute and was
+// slow-path reinjected to the kernel too; that direction is now adjudicated
+// whenever the operator zones the tunnel, exactly as the same tunnel written
+// WITH a `set interfaces` stanza already was.
+//
+// So the warning stays, unchanged and unconditional, but a reader must not
+// take it as saying the zone does nothing. It says the zone does not govern
+// the DECRYPTED traffic. Widening it back to "the zone is inert" would now be
+// the false statement.
+//
 // An AST pre-walk (like validateSecureTunnelBindInterfaceAST) rather than a
 // typed-Config pass, so it runs on the group-expanded, inactive-pruned tree in
 // compileExpanded: an apply-groups-inherited bind-interface is covered and an
