@@ -13,6 +13,9 @@ mod lifecycle;
 /// module that computes it.
 pub(crate) use lifecycle::REVOCATION_FLOW_CACHE_WINDOW_DESCRIPTORS;
 use lifecycle::poll_binding;
+/// #8586: the flat (whole-`bindings`) flow-cache eviction the worker loop's
+/// reconcile uses; the split-borrow sibling stays private to `poll_binding`.
+pub(in crate::afxdp) use lifecycle::invalidate_flow_cache_slots_for_keys;
 
 // #959 Phase 1: per-worker debug counters live in worker/telemetry.rs.
 mod telemetry;

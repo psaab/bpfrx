@@ -116,16 +116,57 @@ things about it are load-bearing:
   the per-call `DeleteReplicationOutcome` is the same pair without the
   cross-test racing a process-wide counter has.
 
-**NOT repaired, and it is the half the issue names first.** The refused
-sibling also never deletes its LOCAL session-table entry and never
-invalidates its flow-cache slots, so it can keep serving the revoked
-session until the entry ages out. Neither is reachable from the deleting
-thread — both live behind that worker's `&mut SessionTable` and its own
-per-binding caches — and the signal that would have to reach it cannot
-travel through the queue that is full. Closing it needs a per-worker
-overflow epoch plus a local reconcile against shared authority, which is
-a design decision of its own: the naive form (sweep local entries absent
-from the shared map) can delete live locally-owned sessions.
+**The other half — the sibling's own session entry and flow-cache slots
+— is repaired by the refused worker itself (#8586).** It is not reachable
+from the deleting thread (both live behind that worker's `&mut
+SessionTable` and its per-binding caches), and the signal cannot travel
+through the queue that is full, so it goes out of band:
+
+- `SESSION_DELETE_DROP_EPOCH[worker_id]` is bumped at the refusal, next
+  to #8576's NAT repair and for the same resolved worker id.
+- The worker loop compares it once per pass — one relaxed load — and on a
+  change runs `reconcile_peer_synced_against_shared` plus the flat
+  flow-cache eviction. A burst raises exactly ONE reconcile per pass
+  however many refusals it caused, because the epoch is compared and not
+  counted down.
+
+**Why the trigger is the DELETE drop and not queue pressure**, measured
+rather than assumed (#8586, `loss:xpf-userspace-fw0`): ordinary session
+establishment pins the queue at the 4096 cap and discards 85,668 commands
+over 32,768 creates while dropping **zero** deletes — what is lost there
+is `UpsertSynced` replicas, whose content the shared map still holds. A
+trigger on queue depth would run the whole-table walk continuously
+through normal traffic and reconcile nothing. The harmful loss is
+confined to a revocation burst or an RG activation: one `clear security
+flow session` over 32,770 entries refused 30,786 delete replicas, all
+attributed and NAT-repaired (`dropped - repaired = 0`).
+
+**Why the reconcile is scoped by `SessionOrigin::is_peer_synced()`**, and
+the exclusions are the safety property:
+
+- `SharedPromote` is EXCLUDED and is the one a reader expects to be in.
+  It is synced-DERIVED but no longer peer-AUTHORITATIVE — the origin an
+  entry receives after local traffic promoted it — so this node owns it
+  and its absence from the shared map is not evidence it should die.
+  `loop_body`'s "synced-derived, never create-counted" arm DOES include
+  it; that classification answers a different question and using it here
+  would be the bug.
+- `FabricPuntSeed` and `MissingNeighborSeed` are transient-local by
+  construction (never HA-exported, never Open-delta'd), so they are live
+  local sessions ABSENT from the shared map by design. The naive "drop
+  what the shared map does not have" sweep deletes them on its first
+  pass; `is_peer_synced()` excludes them.
+
+The reconcile releases no NAT, removes no shared state and replicates no
+delete: the deleting worker already did all three (#8576), and repeating
+any of them would double-process a pair or recurse. It holds the
+shared-map lock across the membership FILTER only, never across the table
+walk — sibling workers take that lock on their packet path.
+
+**Still not covered:** a refusal whose worker id could not be resolved
+bumps no epoch, because there is no worker to name. Those are the
+`SESSION_DELETE_REPLICA_DROPPED - SESSION_DELETE_REPLICA_DROP_REPAIRED`
+remainder, measured at 0 across 30,786 refusals.
 
 `teardown_tcp_rst_flow` still uses the non-repairing
 `replicate_session_delete`. It is currently unreachable —
