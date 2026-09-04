@@ -134,6 +134,10 @@ var userspaceShimAllowedMapTypes = map[string]ebpf.MapType{
 	"userspace_cpumap":         ebpf.CPUMap,
 	"userspace_ctrl":           ebpf.Array,
 	"userspace_fallback_stats": ebpf.PerCPUArray, // #4113 (F13): per-CPU, lost-update-free
+	// #8249: per-CPU, and required to be so — native XDP runs one program
+	// instance per RX queue on distinct CPUs, so a shared array would let one
+	// CPU's fragment sighting decide another CPU's packet.
+	"userspace_v6frag_scratch": ebpf.PerCPUArray,
 
 	"userspace_heartbeat":        ebpf.Array,
 	"userspace_ingress_ifaces":   ebpf.Hash,
