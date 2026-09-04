@@ -149,6 +149,14 @@ fn enqueue_tx_owned_below_cap_does_not_touch_overflow_counter() {
 // so re-measuring both is the guard being ANSWERED. `size_of` stays 2304 — the
 // bytes came out of tail padding, again.
 //
+// #8108 re-measured the two OFFSETS again (2176 -> 2184, 2304 -> 2312) when the
+// unconditional `session_delta_high_water` counter joined the cold run. Same
+// lockstep, verified the way the paragraph above requires: both build
+// configurations green on one set of literals. `size_of` did NOT move this time
+// — still 2368 — so the 64-byte unit #7156's field opened had room for this one.
+// That is the second time the "tail padding is now full" prediction has not
+// held, which is why this guard pins the OFFSETS separately from the size.
+//
 // #7156 re-measured all three moving literals (size 2304 -> 2368, offsets
 // 2168 -> 2176 and 2296 -> 2304) when the unconditional `pending_neigh_visits`
 // counter joined that run. Same lockstep, and verified the way the paragraph
@@ -172,14 +180,14 @@ fn admission_attempt_instrument_leaves_four_pinned_layout_values_unchanged_6304(
     );
     assert_eq!(
         std::mem::offset_of!(BindingLiveState, pending_tx_admitted),
-        2176,
+        2184,
         "#6304/#6114: ...nor the OFFSET of the admission counter whose \
          cacheline this is all about. A `cfg(test)` field ahead of it moves \
          this to 2160 while leaving the size assert above satisfied"
     );
     assert_eq!(
         std::mem::offset_of!(BindingLiveState, delta_loss_pending),
-        2304,
+        2312,
         "#6304: ...nor the offset of the last-declared field, which is the \
          sentinel for a `cfg(test)` member appended at the END of the struct — \
          that shape moves this to 2288 and trips nothing else"

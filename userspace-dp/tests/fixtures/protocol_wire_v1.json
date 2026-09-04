@@ -171,6 +171,7 @@
     "session_delta_drained": 0,
     "session_delta_dropped": 0,
     "session_delta_generated": 0,
+    "session_delta_high_water": 0,
     "session_delta_pending": 0,
     "session_expires": 0,
     "session_hits": 0,

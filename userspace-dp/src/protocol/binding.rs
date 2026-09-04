@@ -480,6 +480,13 @@ pub(crate) struct BindingStatus {
     pub session_delta_generated: u64,
     #[serde(rename = "session_delta_dropped", default)]
     pub session_delta_dropped: u64,
+
+    /// #8108: the greatest depth `pending_session_deltas` has reached on this
+    /// binding. A HIGH-WATER mark, not a depth: the buffer drains, so a depth
+    /// sampled at 1 Hz misses a revocation burst unless the sample lands inside
+    /// it. `default` so an older helper decodes 0 rather than failing the parse.
+    #[serde(rename = "session_delta_high_water", default)]
+    pub session_delta_high_water: u64,
     #[serde(rename = "session_delta_drained", default)]
     pub session_delta_drained: u64,
     #[serde(rename = "policy_denied_packets", default)]
