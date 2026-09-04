@@ -602,3 +602,31 @@ userspace WRITES into a TUN, and whether the AF_XDP binding on it
 succeeds or leaves the slot absent (which would take `BINDING_MISSING` ->
 `drop_degraded_transit`, a broader drop than the source-selected one).
 All three need hardware; the arithmetic above is from the source.
+
+**A fourth hardware-gated item, from #8276's B2 pricing.** The in-process
+half of the capture bridge is measured and committed
+(`userspace-dp/benches/b2_capture_bridge.rs`, #8545). Against the
+2,797 ns/packet budget derived from #5275's appliance measurement
+(4.29 Gbit/s v4 = 357,500 pps), a 1500-byte copy costs 25.4 ns (0.9%), a
+same-thread queue handoff 111 ns (4.0%), and a **cross-thread round trip
+12,648 ns — 452% of budget**. So Option E *as a per-packet cross-thread
+mechanism* is priced OUT: one-way it is ~2.3x the whole budget before the
+capture syscall, before adjudication, before re-inject. What survives is
+same-thread adjudication, or a batched handoff at **B >= 3** frames per
+wake.
+
+What is NOT priced, and cannot be inferred from a userspace channel
+benchmark, is the **kernel half** — an nfqueue round trip, or an
+AF_PACKET read plus an authoritative re-inject. For the two shapes that
+survive, that is the dominant unknown and it decides B2. It needs a box
+where XFRM SAs and netfilter can be driven against real traffic — the
+same hardware the three items above are waiting on.
+
+Two caveats that must travel with those numbers. The ns figures are from a
+dev box while the pps budget is an appliance measurement, so the 2.3x is
+an order-of-magnitude indication, not a verdict; one run of
+`cargo bench --bench b2_capture_bridge` on the loss userspace cluster
+converts it, and the instrument is already committed. And the pooled-slot
+row must not be read as "allocation is free" — that shape takes an extra
+per-slot mutex the owned shape does not, so the near-equality is not a
+clean isolation of allocation cost.
