@@ -151,6 +151,32 @@ those types into the self-contained spec structs in `netlink_spec.go`.
 - IPv6 DSCP spans the low nibble of byte 0 and the high nibble of byte 1
   of the v6 header — a 2-byte payload + `Bitwise{0x0fc0}` (§12.3), NOT the
   IPv4-TOS byte.
+- **A prefix reaching the TOP of the key space gets a start element and NO
+  end (#8597).** An anonymous interval set encodes each member as a start
+  key plus an `IntervalEnd` key at the first address the prefix does NOT
+  cover. For `0.0.0.0/0`, `::/0` or `128.0.0.0/1` there is no such
+  address, and `prefixNext` used to fall back to the UNSPECIFIED address
+  — the BOTTOM of the range. Verified by installing the set in a private
+  netns and reading it back (the kernel stores exactly what it is sent):
+
+  ```
+  {0.0.0.0/0, 10.0.0.0/8}     00000000, 00000000!end, 0a000000, 0b000000!end
+    -> the /0 member is a ZERO-WIDTH interval: a term that must match
+       everything matches nothing.  Fail-CLOSED.
+
+  {128.0.0.0/1, 10.0.0.0/8}   00000000!end, 0a000000, 0b000000!end, 80000000
+    -> the wrapped end sorts to the bottom as an end marker with no start
+       before it; 128.0.0.0 is left open to the top anyway.  Fail-OPEN.
+  ```
+
+  Two wrong encodings in opposite directions from one fallback. **The
+  kernel ACCEPTS both** — `Flush` succeeds either way — so an install
+  check cannot see this and the guard reads the elements BACK.
+  `prefixNext` now returns `(addr, ok)` and the builder omits the end
+  element when `ok` is false, which is the representation for an interval
+  running to the end of the range. Dropping the end for prefixes that DO
+  have a valid next address would turn every interval open-ended, a total
+  fail-open; `TestOrdinaryPrefixesStillGetTheirEnd_8597` is that control.
 - The junos-host `iifname { a, b }` anonymous set stores byte-correct
   16-byte NUL-padded keys, but google/nftables v0.3.0 does not emit the
   `NFTA_SET_USERDATA` nft's `list` uses to render string-typed anonymous
