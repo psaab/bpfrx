@@ -12,6 +12,34 @@ This is the deliverable #7949's last comment asks for, and only that:
 **No row is added by this document.** Whether it should exist is decided elsewhere
 (#7167 §3), and R1/R2 of #7949 still bind.
 
+> **RESOLVED (#7949).** The row now exists —
+> `appendBindInterfaceOnlySecureTunnelRows`
+> (`pkg/dataplane/userspace/secure_tunnel_bind_only_7949.go`), gated on an
+> AUTHORED zone reference. This enumeration was the input to that decision and
+> every finding in it held, including the one that was hardest to see: §3.3's
+> default-false row is the failure the implementation is built to avoid, and
+> setting `SecureTunnel: false` on the synthesized row reproduces it exactly —
+> the tunnel ifindex enters the ingress-adjudication set, its netdev enters the
+> name-keyed AF_XDP/RSS allowlist, and the binding plan key moves. That is a
+> mutation run against `TestBindOnlyTunnelConsumerDispositions7949`, not a
+> prediction.
+>
+> Two things the implementation adds to the picture here. (a) The
+> per-consumer question does not have to be answered five times: the SAME
+> tunnel written WITH a stanza already produces this row and has since #5619,
+> so the decision is "the two spellings behave identically" and the test is a
+> field-by-field parity assertion against Shape A rather than five hand-written
+> expectations. (b) §2.2's owed measurement is now moot for the decision — the
+> row carries whatever addresses the live xfrmi has, exactly as the Shape A row
+> for the same tunnel already does, so the magnitude question is not specific
+> to this shape.
+>
+> One correction to #7949's R1, made against the source rather than the issue:
+> an unzoned row would NOT darken the tunnel. Only a zero INGRESS zone is
+> hard-denied (`policy.rs`, #6682); a zero EGRESS zone falls through to
+> `state.default_action`, and that block cites #6713 — the xfrmi egress-zone-0
+> case — as the reason. The zone gate is kept as a scope decision.
+
 ---
 
 ## 1. The finding that reframes the issue: the hinge is one flag, and it explains the original error
