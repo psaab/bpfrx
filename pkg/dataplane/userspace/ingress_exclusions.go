@@ -324,18 +324,27 @@ var netdevExclusionClasses = []netdevExclusionClass{
 // with a claim it could not support, and a review leg was right to
 // refuse it.
 //
-//  1. IT COLLAPSES THE WHOLE BOX TO ONE QUEUE — the load-bearing
-//     reason, and the one that is provable without a NIC. An xfrm
+//  1. IT BINDS A NETDEV THE DATAPLANE CANNOT TRANSMIT INTO. An xfrm
 //     interface has exactly ONE RX queue: `ip -d link` reports
 //     `numrxqueues 1` and `/sys/class/net/<if>/queues` holds a single
 //     `rx-0` (measured in a netns). That single queue is what
-//     userspaceRXQueueCount reads and ships, and the Rust planner takes
-//     the GLOBAL MINIMUM across every candidate
-//     (replan_bindings_from_candidates, planning.rs). So ONE zoned
-//     xfrmi drags every physical interface on the box down to one queue
-//     and one worker — the #3091 ~6 Gbps single-worker regression by a
-//     different route. secure_tunnel_would_collapse_the_global_queue_count
-//     (userspace-dp/src/main_tests.rs) is the fail-on-revert guard.
+//     userspaceRXQueueCount reads and ships. Admitting it mints an
+//     AF_XDP binding on a netdev with no egress path back from this
+//     dataplane, and spends a slot against MAX_BINDING_SLOTS.
+//
+//     BEFORE #7497 the harm was GLOBAL: the Rust planner took the
+//     MINIMUM queue count across every candidate
+//     (replan_bindings_from_candidates, planning.rs), so ONE zoned
+//     xfrmi dragged every physical interface on the box down to one
+//     queue and one worker — the #3091 ~6 Gbps single-worker regression
+//     by a different route. #7497 gave each interface its own
+//     min(rx_queues, 16), so the tunnel now costs one binding and no
+//     other interface's queue count moves. The guard named
+//     secure_tunnel_would_collapse_the_global_queue_count was retired
+//     with that change (it had become true with the exclusion deleted);
+//     secure_tunnel_adds_nothing_to_the_binding_plan and
+//     binding_candidate_excludes_secure_tunnel are the live
+//     fail-on-revert guards (userspace-dp/src/main_tests.rs).
 //
 //  2. AND IT CANNOT BE HALF-ADMITTED. "Adjudicate but do not bind" is
 //     not available: an ifindex in the shim's ingress map with no READY

@@ -2502,10 +2502,18 @@ stopped.
 **Tuning guidelines:**
 - Set `workers` to match NIC RSS queue count (`ethtool -L <dev> combined N`)
 - Set `ring-entries` to 16384 for ≥20 Gbps throughput.
-  UMEM cost per binding at ring=16384:
+  UMEM cost per binding at ring=16384 — **160 MB for EVERY driver**:
     - mlx5 / native XDP: `reserved_tx (min(ring/2, 8192)) + 2 × ring_entries` = `8192 + 32768 = 40960 frames × 4 KB = 160 MB per binding`
-    - virtio_net: `ring_entries + 2 × ring_entries` = `3 × 16384 × 4 KB = 192 MB per binding`
-  `binding_frame_count_for_driver` in `userspace-dp/src/afxdp/bind.rs` is authoritative.
+    - virtio_net: prefers `ring_entries` for reserved TX, but that is **clamped to
+      `MAX_RESERVED_TX_FRAMES` (8192)**, so it arrives at the same
+      `8192 + 32768 = 40960 frames × 4 KB = 160 MB per binding`.
+      (This entry previously read `3 × ring_entries` = 192 MB. That ignored the
+      clamp and over-stated virtio by 20%; corrected in #7497.)
+    - Below the clamp the drivers do differ — at ring=8192, mlx5 is 80 MB and
+      virtio_net is 96 MB.
+  `binding_frame_count_for_driver` in `userspace-dp/src/afxdp/bind.rs` is authoritative,
+  and `umem_sizing_contract_tests` in the same file pins all four figures so a change
+  to the clamp cannot silently invalidate an operator's hugepage reservation.
   At 8192, `iperf3 -P 12 @ 25 Gbps` sees 92-170K retrans/30s and median 16.9 Gbps due
   to kernel-side TX ring fill stalls (`ethtool -S` shows `tx_xsk_full` accumulating).
   Raising to 16384 dropped retrans to 0-1900/30s and lifted the median to 21.5 Gbps
@@ -2521,20 +2529,61 @@ stopped.
 
   **Reserve via `/etc/sysctl.d/99-xpf-hugepages.conf`:**
   ```
-  vm.nr_hugepages = 600
+  vm.nr_hugepages = 1440
   ```
-  Apply with `sysctl --system` (or reboot). 600 × 2 MiB = 1.2 GiB covers one NIC's
-  UMEM at ring=16384. Verify with `grep HugePages_ /proc/meminfo` — `HugePages_Total`
-  must be ≥ 560 before xpfd starts, else `MAP_HUGETLB` will fail silently and the
-  daemon will fall back to THP which is not guaranteed to promote all pages.
+  **Size the pool from the TOTAL binding count, not from one NIC:**
+  ```
+  pages = 80 × Σ over every binding candidate of min(rx_queues, 16)
+  ```
+  Since #7497 each interface contributes its own queue count rather than one
+  global minimum, so the binding count is that SUM. Binding candidates include
+  the **fabric IPVLAN parent**, which is the interface most often missed in a
+  hand count. This value covers the reference topology (3 candidates × 6 queues
+  = 18 bindings); it replaces a previous `600`, which was derived from one NIC's
+  6 bindings and covered only 7 of those 18.
+
+  **The appliance image ships NO reservation.** `scripts/image/bake.py` writes
+  `/etc/sysctl.d/99-xpf.conf` with forwarding and BPF-JIT settings only; nothing
+  in the bake or the deploy installs `99-xpf-hugepages.conf`. That is correct for
+  the default `ring-entries` (a binding is ~10 MiB at 1024, so no pool is needed),
+  but it means raising `ring-entries` to 16384 on a baked appliance takes the THP
+  fallback on **every** binding unless the operator adds the reservation in the
+  same change. Sizing a blind reservation at bake time would be worse — a pool is
+  taken from ordinary memory for the whole boot, and the appliance's RAM is not
+  known then.
+
+  Apply with `sysctl --system` (or reboot). Verify with `grep HugePages_ /proc/meminfo`.
+  If the pool cannot back a UMEM, `MAP_HUGETLB` fails and the daemon falls back to
+  THP, which is advisory and not guaranteed to promote all pages. That fallback is
+  no longer silent — the helper logs
+  `xpf-ha: WARNING: the 2 MB hugepage pool could not back this UMEM`, once, with the
+  per-binding page count and the remedy, plus a running total of unbacked UMEM on
+  each subsequent allocation.
+
+  **This memory does not appear in RSS.** It is hugetlb-backed, so `/proc/<pid>/status`
+  `VmRSS` understates the dataplane footprint by more than an order of magnitude.
+  It is also not mlocked, so `RLIMIT_MEMLOCK` does not bound it. Measure it with
+  `Private_Hugetlb` in `/proc/<pid>/smaps_rollup`.
+
+  **Measured, `loss:xpf-userspace-fw1`, mlx5, `--ring-entries 16384`, 3 binding
+  candidates × 6 RX queues = 18 bindings (#7497 acceptance criterion 1):**
+    - `smaps_rollup`: `Private_Hugetlb: 2949120 kB` = **2.81 GiB**, `Rss: 133244 kB`
+      (130 MiB), `Locked: 0 kB`
+    - `/proc/meminfo`: `HugePages_Total: 1500`, `HugePages_Free: 60` — **96% of the
+      pool consumed**
+    - allocation breakdown: 6 × 160 MiB single-binding areas + 6 × 320 MiB
+      shared-UMEM group areas (a group is sized as the SUM of its members) = 2880 MiB
+    - i.e. exactly 18 × 160 MiB, matching `binding_frame_count_for_driver`
 
   **Measurement on loss:xpf-userspace-fw0 (8 GiB VM, kernel 7.0.0-rc7, mlx5 ConnectX):**
     - ring=8192 (no hugepages needed): median 16.9 Gbps, stddev 1.7
     - ring=16384 without hugepages: median 20.4 Gbps, stddev 1.7
     - ring=16384 with 600 hugepages: **median 22.1 Gbps, stddev 1.5** ← campaign target
 - Ensure VM has enough vCPUs: workers + 2 (daemon + kernel headroom)
-- Ensure VM has enough RAM: `workers × bindings × 160 MB + 2 GB` base (at 16384 ring,
-  mlx5 driver; 192 MB for virtio_net)
+- Ensure VM has enough RAM: `bindings × 160 MB + 2 GB` base (at 16384 ring, either
+  driver). **UMEM is allocated per BINDING, not per worker × binding** — the previous
+  `workers × bindings × 160 MB` here double-counted and over-stated the reference
+  topology by 6×. `bindings` is `Σ min(rx_queues, 16)` over all binding candidates.
 
 ### Config-snapshot protocol version (#5488)
 
