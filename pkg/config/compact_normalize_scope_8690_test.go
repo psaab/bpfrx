@@ -35,7 +35,7 @@ import (
 // priority 200` failure. Empty-equivalence is reported alongside, because it is
 // still the cheapest evidence when it holds.
 func TestCompactNormalizeScopePreservesCompiledResult8690(t *testing.T) {
-	var admitted, violating, disarmed []string
+	var admitted, violating, disarmed, fixtureLimited []string
 	emptyEquivalent := 0
 	seamObserved := 0
 	for _, s := range collectCompactSites() {
@@ -112,9 +112,45 @@ func TestCompactNormalizeScopePreservesCompiledResult8690(t *testing.T) {
 		// the pass disabled. If it was rejected there and is accepted with the
 		// pass on, the pass is not normalizing a spelling — it is disarming a
 		// gate, and that has to be a deliberate registered decision.
-		if compileStrict8690(t, elidedText, true) != nil &&
-			compileStrict8690(t, elidedText, false) == nil {
-			disarmed = append(disarmed, siteKey)
+		// THREE STATES, not two. The harmful case is a rejection becoming an
+		// ACCEPTANCE. But a site can also fail with the pass enabled for an
+		// unrelated reason — the census fixture supplies one synthesized value
+		// per leaf, and it is not always type-valid for that leaf's validator
+		// (`dhcpv6 ... fixed-address` gets an IPv4 literal, so it trades "has
+		// no fixed-address" for "is not an IPv6 address").
+		//
+		// A two-state test folds that third case into "safe", because the
+		// pass-enabled compile did not succeed. That is the fixture answering,
+		// not the site: under a type-valid value the same site might well
+		// compile clean and be a real disarm. So it is counted and named
+		// separately rather than silently passing.
+		// LIMITATION, stated because this arm's failure condition is coarser
+		// than the harm it is named for. A rejection becoming an acceptance is
+		// harmful only when the gate was refusing the packed SPELLING on
+		// purpose. There is a second, benign kind: a gate that rejects because
+		// the elided spelling DROPPED something, where the pass repairs the
+		// drop and the acceptance is the correct outcome. Measured example —
+		// `nat source rule-set <r> rule <r> match source-address 10.0.0.0/8;`
+		// is refused by the #8430 empty-match gate without the pass ("the
+		// dataplane reads an EMPTY match set as UNCONSTRAINED ... would
+		// translate EVERY packet") and compiles clean with it, because the
+		// criterion survives. That is the pass working.
+		//
+		// Both shapes trip the condition below, so a widening that legitimately
+		// resolves a drop-caused gate will red here and needs a human decision
+		// rather than a mechanical fix. The #6662 login case is the harmful
+		// kind: the braced form was always accepted, nothing was dropped, and
+		// the gate existed to refuse that spelling across an HA version skew.
+		// Distinguishing them automatically would need the gates themselves to
+		// declare which kind they are; until then this arm reports and a person
+		// classifies.
+		if off := compileStrict8690(t, elidedText, true); off != nil {
+			switch on := compileStrict8690(t, elidedText, false); {
+			case on == nil:
+				disarmed = append(disarmed, siteKey)
+			case on.Error() != off.Error():
+				fixtureLimited = append(fixtureLimited, siteKey)
+			}
 		}
 		// SEAM LIVENESS. The check above reads "rejected without the pass,
 		// accepted with it". If skipCompactNormalize stopped being honoured,
@@ -138,6 +174,7 @@ func TestCompactNormalizeScopePreservesCompiledResult8690(t *testing.T) {
 	sort.Strings(admitted)
 	sort.Strings(violating)
 	sort.Strings(disarmed)
+	sort.Strings(fixtureLimited)
 
 	// DEGENERACY GUARD: a walk that admitted nothing would report a clean scope
 	// for the same reason a correct one does.
@@ -167,6 +204,15 @@ func TestCompactNormalizeScopePreservesCompiledResult8690(t *testing.T) {
 			len(violating), violating)
 	}
 
+	if len(fixtureLimited) > 0 {
+		t.Logf("#8690: %d admitted site(s) could not have their gate status "+
+			"measured, because the census fixture's value fails a different "+
+			"validator with the pass enabled: %v.\n"+
+			"These are NOT known-safe — a type-valid value might compile clean "+
+			"and make them real disarms. They are reported rather than folded "+
+			"into the clean count so the distinction stays visible.",
+			len(fixtureLimited), fixtureLimited)
+	}
 	if len(disarmed) > 0 {
 		t.Errorf("%d site(s) in the normalizer's scope are REJECTED at strict "+
 			"commit with the pass disabled and ACCEPTED with it enabled: %v.\n"+
@@ -339,5 +385,54 @@ func TestCompactNormalizeRunsAtBothCompileEntryPoints8690(t *testing.T) {
 			"the brace-elided normalizer, so a cluster peer compiles this " +
 			"credential differently from the node that authored it while both " +
 			"report a clean commit — the #8597 K51 asymmetry class (#8690)")
+	}
+}
+
+// The consequential member of family 3, asserted on the compiled config.
+//
+// `system services ssh root-login deny;` decides whether root may log in at
+// all. Brace-elided, the value used to be dropped and the field compiled to
+// "", which is not "deny" — the operator wrote a lockout and got the daemon's
+// default, on a commit that reported success. That is the same shape as
+// #8689's IS-IS authentication key and family 2's zone screen binding: a
+// security control silently absent rather than loudly wrong.
+//
+// The seam supplies the positive half. Without it this cell would assert only
+// that two spellings agree, which they would also do if the pass were removed
+// and BOTH dropped the value — the vacuous green that "assert the agreement"
+// is otherwise vulnerable to.
+func TestElidedSSHRootLoginReachesTheDaemon8690(t *testing.T) {
+	const braced = `system { services { ssh { root-login deny; } } }`
+	const elided = `system { services { ssh root-login deny; } }`
+
+	b, e := compileText(t, braced), compileText(t, elided)
+	if b == nil || e == nil {
+		t.Fatalf("both spellings must compile (braced=%v elided=%v)", b != nil, e != nil)
+	}
+	if b.System.Services.SSH.RootLogin != "deny" {
+		t.Fatalf("fixture is wrong: the braced spelling must set root-login, got %q",
+			b.System.Services.SSH.RootLogin)
+	}
+	if e.System.Services.SSH.RootLogin != "deny" {
+		t.Errorf("brace-elided `ssh root-login deny` compiled to RootLogin=%q, not \"deny\". "+
+			"The operator wrote a root lockout and the daemon received the default, "+
+			"on a commit that reported success (#8690)", e.System.Services.SSH.RootLogin)
+	}
+
+	// POSITIVE CONTROL: with the pass disabled the elided spelling must NOT
+	// carry the value. If it does, this cell is not observing the pass and
+	// would stay green if the pass were deleted.
+	tree, perrs := NewParser(elided).Parse()
+	if len(perrs) > 0 {
+		t.Fatalf("parse: %v", perrs)
+	}
+	off, err := compileConfigWithOpts(tree, compileOpts{skipCompactNormalize: true})
+	if err != nil || off == nil {
+		t.Fatalf("un-normalized compile failed: %v", err)
+	}
+	if off.System.Services.SSH.RootLogin == "deny" {
+		t.Error("with the normalizer DISABLED the elided spelling still carried " +
+			"root-login, so this cell is not observing the pass and would stay " +
+			"green if the pass were removed (#8690)")
 	}
 }

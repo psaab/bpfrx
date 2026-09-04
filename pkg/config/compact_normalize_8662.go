@@ -206,6 +206,86 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		return true
 	}
 
+	// #8690, the SYSTEM surface — 44 sites out of the 61 the census
+	// lists under `system`. Scoped by (container, head) PAIR per family 2's
+	// rule, and the 17 exclusions are the whole point of this increment.
+	//
+	// WHAT WAS EXCLUDED, AND WHY THE INVENTORY MARKER COULD NOT SAY SO:
+	//
+	// 15 sites are GATE-DISARMING — compiled through the strict path with this
+	// pass disabled they are REJECTED, and with it enabled they are ACCEPTED.
+	// That is the whole `system login` subtree (`class` and its six children,
+	// `user`, the four `authentication` leaves, `class`, `uid`) plus
+	// `dhcp-local-server ... static-binding <b> fixed-address`. Every one of
+	// them measures `empty`, so the inventory marker calls them safe: it
+	// records whether a READER consumes the packed tail, and these are held by
+	// a GATE that refuses the packed spelling. The pass runs before the commit
+	// gates, so a rewritten tree reaches them with nothing left to refuse.
+	//
+	// 1 site is UNMEASURABLE rather than safe:
+	// `dhcpv6-local-server ... static-binding <b> fixed-address`. Its census
+	// fixture supplies an IPv4 literal, so with the pass enabled it fails a
+	// DIFFERENT validator ("is not an IPv6 address") instead of compiling. A
+	// two-state safe/unsafe test reads that as "no gate was disarmed", which is
+	// the fixture answering rather than the site. It shares its pair with the
+	// v4 site above, so excluding that pair covers both.
+	//
+	// 1 site is UNREACHABLE by a pair rule at all:
+	// `services web-management api-auth user <name> password`. Its container is
+	// WILDCARD-NAMED, so production passes the actual username as the container
+	// keyword -- `("alice", "password")`, never a fixed token. A pair rule for
+	// it would be dead code that reads like coverage. Admitting it needs a
+	// head-only rule, which is a different safety argument than this increment
+	// makes, so it stays out.
+	//
+	// The pairs below were MEASURED by instrumenting the production call site,
+	// not reconstructed from the inventory path. Those disagree: the path
+	// carries a schema placeholder where production passes the stanza keyword,
+	// so `system login class <c> allow-commands` is ("class", "allow-commands")
+	// to production and ("xpfarg", "allow-commands") to a path reader.
+	switch containerKeyword + " " + head {
+	case
+		"api-auth api-key",
+		"autoupdate url",
+		"coalescence adaptive",
+		"coalescence rx-usecs",
+		"coalescence tx-usecs",
+		"configuration archive-sites",
+		"configuration transfer-interval",
+		"dataplane binary",
+		"dataplane claim-host-tunables",
+		"dataplane cpu-governor",
+		"dataplane netdev-budget",
+		"dataplane poll-mode",
+		"dataplane ring-entries",
+		"dataplane state-file",
+		"dataplane workers",
+		"dhcp-local-server group",
+		"dhcpv6-local-server group",
+		"group interface",
+		"group pool",
+		"http interface",
+		"https interface",
+		"ntp server",
+		"ntp threshold",
+		"pool dns-server",
+		"pool static-binding",
+		"shared-umem artifact-file",
+		"shared-umem interface",
+		"shared-umem mode",
+		"shared-umem phase0-artifact-file",
+		"ssh client-alive-count-max",
+		"ssh client-alive-interval",
+		"ssh connection-limit",
+		"ssh key-exchange",
+		"ssh root-login",
+		"static-binding host-name",
+		"system backup-router",
+		"system domain-search",
+		"system name-server",
+		"system time-zone":
+		return true
+	}
 	switch containerKeyword + " " + head {
 	case "zones security-zone",
 		"security-zone screen",
