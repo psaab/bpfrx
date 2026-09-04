@@ -502,22 +502,22 @@ type Server struct {
 	peerLookupFn func(client, server net.Addr) authz.PeerIdentity
 	// peerLocalityFn is Config.PeerLocalityFn; nil means
 	// authz.PeerCouldBeLocalNow (#5561).
-	peerLocalityFn    func(client, server net.Addr) bool
-	store             *configstore.Store
-	dp                apiRuntimeDataPlane
-	eventBuf          *logging.EventBuffer
-	gc                *conntrack.GC
-	routing           *routing.Manager
-	frr               *frr.Manager
-	ipsec             *ipsec.Manager
-	dhcp              *dhcp.Manager
-	vrrpMgr           *vrrp.Manager
+	peerLocalityFn func(client, server net.Addr) bool
+	store          *configstore.Store
+	dp             apiRuntimeDataPlane
+	eventBuf       *logging.EventBuffer
+	gc             *conntrack.GC
+	routing        *routing.Manager
+	frr            *frr.Manager
+	ipsec          *ipsec.Manager
+	dhcp           *dhcp.Manager
+	vrrpMgr        *vrrp.Manager
 	// #8321 finding 15: see Config.VRRPLocalPrioritiesFn.
 	vrrpLocalPrioritiesFn func() map[int]int
-	commitFn          func(ctx context.Context, authority configstore.CommitAuthority, comment string) (*config.Config, error)
-	commitConfirmedFn func(ctx context.Context, authority configstore.CommitAuthority, minutes int) (*config.Config, error)
-	compileHealthFn   func() CompileHealthSnapshot
-	bootstrapImportFn func() BootstrapImportSnapshot
+	commitFn              func(ctx context.Context, authority configstore.CommitAuthority, comment string) (*config.Config, error)
+	commitConfirmedFn     func(ctx context.Context, authority configstore.CommitAuthority, minutes int) (*config.Config, error)
+	compileHealthFn       func() CompileHealthSnapshot
+	bootstrapImportFn     func() BootstrapImportSnapshot
 	// #7181: applied state of the host-inbound nft surface; nil = unwired.
 	hostInboundAppliedFn                 func() HostInboundAppliedSnapshot
 	configPersistDegradedFn              func() bool

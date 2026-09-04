@@ -534,4 +534,3 @@ func isTimeout(err error, ne *net.Error) bool {
 	}
 	return false
 }
-

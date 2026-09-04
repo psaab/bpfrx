@@ -171,4 +171,3 @@ func TestStaticNATSchemaAcceptsFromZone(t *testing.T) {
 		t.Fatalf("SchemaValidate(good) rejected a valid static-nat from-zone: %v", err)
 	}
 }
-
