@@ -118,8 +118,35 @@ func validateInjectPacketRequestForHelper(req InjectPacketRequest, status Proces
 	// BuildInjectPacketRequest can carry an out-of-range slot that never
 	// passed parseBindingSlot. Reject it at the helper seam before it
 	// selects an out-of-bounds binding-array slot.
-	if req.Slot >= dataplane.BindingArrayMaxEntries {
-		return fmt.Errorf("inject slot %d out of range [0, %d)", req.Slot, dataplane.BindingArrayMaxEntries)
+	//
+	// #8597: bounded on the SLOT dimension, not the composed-index one. This
+	// compared against BindingArrayMaxEntries (MaxInterfaces *
+	// BindingQueuesPerIface = 1048576), which bounds the composed index
+	// `ifindex*BindingQueuesPerIface + queue` into userspace_bindings.
+	// `req.Slot` is not that: the helper looks it up in maps keyed by the
+	// planner's dense slot, which BindingSlotMapMaxEntries (4096) bounds —
+	// and applyUserspaceHelperStatusLocked fail-closes on any binding whose
+	// Slot reaches it. constants.go states the distinction and warns against
+	// exactly this substitution: the two are "NOT interchangeable even though
+	// both are 'the binding bound' in casual speech (#7497) ... a check
+	// against the larger value admits slots these maps cannot address".
+	//
+	// DEFENSIVE, and currently unreachable — nothing today can exploit the
+	// looser bound. The helper resolves an inject slot by map lookup and
+	// returns "unknown binding slot" for anything not live, and a live slot
+	// is always below 4096 by the fail-closed check above. The change buys an
+	// earlier refusal with a truthful ceiling, not a fix for a live defect.
+	//
+	// It is NOT the #8597 K79 finding, which is refuted: K79 claimed
+	// `uint16(req.Slot)` truncates the default emit-on-wire source port for
+	// "legal high binding slots". Slots at that magnitude are not legal, which
+	// is why the truncation cannot be reached — and reading THIS line's
+	// constant as the definition of "legal" is what made the row look live.
+	// The parse-side bound in control.go keeps its documented value; its
+	// #5449 cells pin 1048575 as accepted there, and changing an operator-
+	// facing grammar is not what this note justifies.
+	if req.Slot >= dataplane.BindingSlotMapMaxEntries {
+		return fmt.Errorf("inject slot %d out of range [0, %d)", req.Slot, dataplane.BindingSlotMapMaxEntries)
 	}
 	if !req.EmitOnWire {
 		return nil
