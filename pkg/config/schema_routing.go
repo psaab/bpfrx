@@ -304,9 +304,15 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 		"export":              {desc: "Export policy", args: 1, multi: true, placeholder: "<policy-name>", children: nil},
 		"area": {desc: "OSPF area", args: 1, placeholder: "<area-id>", keyValidator: ValidateOSPFArea, children: map[string]*schemaNode{
 			"interface": {desc: "Interface", args: 1, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: map[string]*schemaNode{
-				"passive":        {desc: "Passive interface", children: nil},
-				"no-passive":     {desc: "Non-passive interface", children: nil},
-				"interface-type": {desc: "Interface type", args: 1, placeholder: "<type>", children: nil},
+				"passive":    {desc: "Passive interface", children: nil},
+				"no-passive": {desc: "Non-passive interface", children: nil},
+				"interface-type": {desc: "Interface type", args: 1, placeholder: "<type>",
+					// #8481: typed. The token is written VERBATIM into the FRR managed
+					// section (`ip ospf network %s`), and one line vtysh rejects fails
+					// the entire reload — see schema_ospf_interface_type_8481.go.
+					valueType: ValueEnumOf, valueDesc: "OSPF network type",
+					valueExamples: OSPFNetworkTypes,
+					validator:     ValidateOSPFInterfaceType, children: nil},
 				// #8443: modeled ONLY so it is REFUSED — see
 				// schema_ospf_authentication_8443.go.
 				"authentication-type": unmodeledOSPFAuthTypeLeaf(),
@@ -797,9 +803,15 @@ var schemaRoutingInstances = &schemaNode{desc: "Routing instance configuration",
 			"passive":             {desc: "Passive mode", children: nil},
 			"area": {desc: "OSPF area", args: 1, placeholder: "<area-id>", keyValidator: ValidateOSPFArea, children: map[string]*schemaNode{
 				"interface": {desc: "Interface", args: 1, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: map[string]*schemaNode{
-					"passive":        {desc: "Passive interface", children: nil},
-					"no-passive":     {desc: "Non-passive interface", children: nil},
-					"interface-type": {desc: "Interface type", args: 1, placeholder: "<type>", children: nil},
+					"passive":    {desc: "Passive interface", children: nil},
+					"no-passive": {desc: "Non-passive interface", children: nil},
+					"interface-type": {desc: "Interface type", args: 1, placeholder: "<type>",
+						// #8481: typed. The token is written VERBATIM into the FRR managed
+						// section (`ip ospf network %s`), and one line vtysh rejects fails
+						// the entire reload — see schema_ospf_interface_type_8481.go.
+						valueType: ValueEnumOf, valueDesc: "OSPF network type",
+						valueExamples: OSPFNetworkTypes,
+						validator:     ValidateOSPFInterfaceType, children: nil},
 					// #8443: modeled ONLY so it is REFUSED — see
 					// schema_ospf_authentication_8443.go.
 					"authentication-type": unmodeledOSPFAuthTypeLeaf(),

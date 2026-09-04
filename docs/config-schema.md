@@ -6285,6 +6285,55 @@ No `#1960` lenient opt is needed and that was verified rather than assumed:
 persisted or peer-synced config carrying one of these spellings cannot brick a
 boot. Pinned by `schema_ospf_authentication_8443_test.go`.
 
+**A typed leaf whose constraint is the CONSUMER's grammar — OSPF
+`interface-type` (#8481).** `protocols ospf ... interface <n> interface-type`
+carried an arity and a placeholder but no `valueType` and no `validator`. The
+issue reported the consequence as "commits green and leaves the interface on the
+default broadcast type", i.e. inert. **That premise is wrong, and wrong in the
+dangerous direction.** `compiler_protocols.go` stored the token verbatim into
+`OSPFInterface.NetworkType` and `pkg/frr/protocols_render.go` writes it verbatim
+into the managed section. Measured by rendering the section directly:
+
+| authored | emitted into `frr.conf` |
+|---|---|
+| `interface-type point-to-point` | `ip ospf network point-to-point` |
+| `interface-type p2p` | `ip ospf network p2p` |
+| `interface-type "bogus value"` | `ip ospf network bogus value` |
+| `interface-type ""` | (no line) |
+
+vtysh rejects a network type it does not know, and **one rejected line fails the
+entire managed-section reload** (#1880/#2223) — taking down all dynamic routing,
+not just OSPF. That is the same consequence #8443's empty-key guard was written
+for, three lines below this render site in the same file. The leaf was not
+inert; it was a way to break FRR from a clean commit.
+
+So the constraint this leaf is validated against is **vtysh's grammar**, not
+anything the xpf compiler checks — the compiler checks nothing and passes the
+token through. `OSPFNetworkTypes` (`schema_ospf_interface_type_8481.go`) is that
+set, and `CanonicalOSPFNetworkType` is the single source both the validator and
+the compiler consult, so the accepted set and the rendered set cannot drift. That
+drift is the specific shape #8443 called out: *"a per-leaf allowlist authored
+independently of the renderer's recognised set drifts right back open."*
+
+**The Junos spellings are accepted and translated, which is a deliberate scope
+choice beyond the issue's suggested shape.** `p2p`, `nbma` and `p2mp` are what
+Juniper's documentation tells an operator to write, and xpf's product claim is
+native Junos syntax. Validating against the FRR set alone would convert today's
+broken reload into a hard rejection of valid Junos syntax — better, but still a
+refusal of the exact spelling the product claims to accept. `broadcast` and
+`point-to-point` are spelled the same in both and deliberately have no alias
+entry, so a later reader does not read absence as an oversight.
+
+**The compiler canonicalizes rather than trusting the validator to have run, and
+that is the no-brick half.** `compileTreeLenient` (`Store.Load` / `SyncApply`)
+downgrades every `SchemaValidate` violation to a warning and continues, so a
+config an older binary persisted with `interface-type p2P` reaches the compiler
+UNVALIDATED. Passing it through would emit `ip ospf network p2P` and fail the
+managed-section reload on a boot the operator did not initiate — the gate would
+have converted a commit-time defect into a boot-time outage. An unresolvable
+value is therefore DROPPED on the tolerant path, pinned by
+`TestOSPFInterfaceTypeUnresolvableIsDroppedNotPassedThrough8481`.
+
 
 **More production flips — `security ike proposal` (Phase-1 crypto, #4313).**
 The Phase-1 IKE proposal container (`security ike proposal <name>`) now sets
