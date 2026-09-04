@@ -4006,8 +4006,23 @@ fn shim_index_path_has_one_construction_and_one_lookup() {
         //                       fn's param, its                   read on the
         //                       struct init and                   packet path
         //                       its key mix
+        //
+        //  #8249 moved this row 22 -> 25, deliberately. The metadata store was
+        //  OUTLINED out of the entry program to recover 72 bytes of its stack
+        //  frame (the GRE call path was at 504 of BPF's 512-byte combined
+        //  limit), so the coordinate is now also written at the new call site,
+        //  as that function's PARAMETER, and as its struct-literal field
+        //  shorthand. Three code mentions, no prose ones — the comment there
+        //  describes the coordinate rather than spelling it, exactly so this
+        //  row tracks code and not wording.
+        //
+        //  What it is NOT: a pack/unpack of the coordinate. An earlier revision
+        //  folded it and the queue index into one u64 to fit BPF's five-argument
+        //  limit, which would have created precisely the by-type reduction site
+        //  this test exists to make expensive. `pkt_len` is stored at the call
+        //  site instead, so both coordinates still travel as bare u32s.
         ("binding_index.rs",     3,               4,               3),
-        ("lib.rs",               22,              3,               17),
+        ("lib.rs",               25,              3,               17),
     ];
 
     // ---- …and `ctx` may not be rebound AT ALL. ---------------------------

@@ -1392,7 +1392,20 @@ authoritative list; quick recap:
 - Branch merges lose packet range — re-read `ctx->data` / `ctx->data_end`
   after any branch.
 - 512-byte combined stack across call frames — push large locals into
-  scratch maps; mark big helpers `__noinline`.
+  scratch maps; mark big helpers `__noinline`. **But check what the frame
+  is actually made of first (#8249).** In the Rust AF_XDP shim the entry
+  program's 400-byte frame had no large named object to move —
+  `UserspaceDpMeta` is 96 bytes and `ParsedPacket` ~58 — and over half of
+  it (216 bytes) was register SPILL slots from a ~470-line fully-inlined
+  function. The scratch-map lever would not have touched the dominant
+  term. What worked was OUTLINING work out of the entry program so its
+  live values occupy a callee's frame instead: worth 72 bytes. Writing
+  the same struct field-by-field through the pointer, to avoid the
+  96-byte temporary, was worth only 8 — which is what established that
+  the cost was the live VALUES feeding the store, not the temporary.
+  `shim_stack_margin_8249_test.go` decodes per-function frames straight
+  out of the shipped object and pins the margin; run it before assuming
+  which lever applies.
 - Variable-offset packet pointers lose range when `var_off` is wide
   (0xffff). Use a constant offset from a validated pointer.
 - Mask `meta->l3_offset` (u16) with `& 0x3F` before packet-pointer
