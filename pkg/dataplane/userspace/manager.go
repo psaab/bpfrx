@@ -511,6 +511,25 @@ func (m *Manager) ApplyConfig(ctx context.Context, cfg *config.Config) (*datapla
 	return m.LastApplyResult(), nil
 }
 
+// ForwardingSupported reports whether a capability gate has disarmed transit
+// forwarding, for #8447's xpf_dataplane_forwarding_supported metric.
+//
+// Reads the SAME field `desiredForwardingArmedLocked` gates on
+// (`m.lastStatus.Capabilities.ForwardingSupported`), so the metric and the
+// arm/disarm decision cannot disagree about why traffic stopped. A metric
+// derived from a second copy of this state would be free to read healthy while
+// the bindings were disarmed, which is the failure this exists to end.
+//
+// Note this is the CAPABILITY gate, not the HA arming decision below it: a
+// standby node with capabilities intact reports true here while legitimately
+// not forwarding. Distinguishing an intentional standby from a disarmed box is
+// what the reasons list is for, and it is on `show chassis forwarding`.
+func (m *Manager) ForwardingSupported() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lastStatus.Capabilities.ForwardingSupported
+}
+
 func (m *Manager) LastApplyResult() *dataplane.ApplyResult {
 	m.mu.Lock()
 	defer m.mu.Unlock()

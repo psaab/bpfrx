@@ -236,6 +236,35 @@ func (c *xpfCollector) initControlPlaneDescriptors() {
 			"Per-episode detail is on `show chassis forwarding`.",
 		nil, nil,
 	)
+	// #8447: whether the userspace dataplane is FORWARDING at all.
+	//
+	// A capability gate can set ForwardingSupported=false and disarm every
+	// binding, which takes rx to 0 while the interfaces stay up and the config
+	// commits cleanly. The documented case is persistent-NAT on a chassis
+	// cluster (#1449): leases are helper-local and not HA-synchronized, so the
+	// dataplane declines to forward rather than forward with semantics it
+	// cannot honour. That is deliberate. What was missing is any signal an
+	// ALERT could key on -- the only surface was a line inside a `show` nobody
+	// runs when the symptom is "the link went down", and #8447 spent five
+	// rounds of cluster measurement rediscovering it.
+	//
+	// A gauge rather than a state set, because the states are exhaustive and
+	// binary: 1 and 0 are both carried by the one series, so there is no
+	// absent-series-reads-as-healthy hazard here. The REASONS are not labels --
+	// they are an unbounded operator-facing list, and a label set that grows
+	// with config content is a cardinality problem. They are on
+	// `show chassis forwarding` and in the #8503 disarm warning.
+	c.forwardingSupported = prometheus.NewDesc(
+		"xpf_dataplane_forwarding_supported",
+		"1 when the userspace dataplane is forwarding transit, 0 when a "+
+			"capability gate has disarmed it (#8447). 0 means the interfaces are "+
+			"up and the config committed cleanly and NO transit is being "+
+			"processed -- the failure presents as a connectivity problem rather "+
+			"than a configuration one. The reasons are on "+
+			"`show chassis forwarding` and in the disarm warning; the commonest "+
+			"is persistent-NAT on a chassis-cluster member (#1449).",
+		nil, nil,
+	)
 	c.schedulerRepublishFailed = prometheus.NewDesc(
 		"xpf_scheduler_republish_failed",
 		"1 while the most recent scheduler-driven policy republish "+

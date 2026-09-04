@@ -142,25 +142,18 @@ func deriveUserspaceCapabilities(cfg *config.Config) UserspaceCapabilities {
 	return caps
 }
 
+// userspaceConfigUsesPersistentSourceNAT delegates to config.
+//
+// #8447: the body moved to pkg/config so the COMMIT-TIME ADVISORY and this
+// CAPABILITY GATE read one predicate. They must agree by construction: an
+// advisory that stops firing for a config that still disarms forwarding is
+// silence that reads exactly like safety, and this gate stopping traffic
+// without the advisory is the defect #8447 was filed for.
+//
+// Kept as a named wrapper rather than inlining the call, because the gate's
+// own comments and tests refer to it by this name and the indirection is free.
 func userspaceConfigUsesPersistentSourceNAT(cfg *config.Config) bool {
-	if cfg == nil {
-		return false
-	}
-	for _, rs := range cfg.Security.NAT.Source {
-		if rs == nil {
-			continue
-		}
-		for _, rule := range rs.Rules {
-			if rule == nil || rule.Then.PoolName == "" {
-				continue
-			}
-			pool := cfg.Security.NAT.SourcePools[rule.Then.PoolName]
-			if pool != nil && pool.PersistentNAT != nil {
-				return true
-			}
-		}
-	}
-	return false
+	return config.UsesPersistentSourceNATPool(cfg)
 }
 
 func userspaceSupportsThreeColorPolicers(cfg *config.Config) bool {
