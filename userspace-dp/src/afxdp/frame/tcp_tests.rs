@@ -1256,3 +1256,87 @@ fn tcp_payload_offset_refuses_a_non_tcp_frame_7699() {
     frame[ETH_HDR_LEN + 9] = 17; // UDP
     assert_eq!(tcp_payload_offset(&frame), None);
 }
+
+// #8597 K37: `parse_tcp_reply_source` must DECLINE a non-first fragment.
+//
+// On a non-first fragment the bytes at the L4 offset are payload. Without the
+// gate this function reads ports, seq, ack and flags out of attacker-chosen
+// data and the three builders that call it reflect them into a SYN-ACK or an
+// RST.
+//
+// WHY NO END-TO-END CELL. The packet path cannot currently deliver such a frame
+// here: the shim substitutes `PROTO_FRAGMENT_NO_L4` for a non-first fragment's
+// protocol before `parse_l4`, so `meta.protocol` is not TCP and `meta.tcp_flags`
+// is 0 — which is what stops all three callers. That defence lives in another
+// crate and is keyed on `meta`, while THIS function reads the frame. So the
+// direct call is the only instrument that can distinguish a gated function from
+// an ungated one, and a passing end-to-end test would be measuring the shim.
+//
+// Note what does NOT protect it: the `protocol != PROTO_TCP` check below the
+// gate reads the protocol byte from the FRAME's IP header, and a fragmented TCP
+// datagram says TCP (6) in EVERY fragment. Fragmentation does not touch that
+// field.
+fn frag_v4_tcp_frame_8597_k37() -> Vec<u8> {
+    let mut frame = reject_v4_tcp_frame(TCP_FLAG_SYN, 0x1111_2222, 0);
+    // IPv4 flags/fragment-offset is bytes 6..8 of the IP header, which starts at
+    // frame offset 14. A non-zero offset makes this a NON-FIRST fragment.
+    frame[20] = 0x00;
+    frame[21] = 0x01;
+    frame
+}
+
+fn frag_v6_tcp_frame_8597_k37() -> Vec<u8> {
+    let mut eth = eth_header(0x86dd);
+    eth[0..6].copy_from_slice(&[0x02, 0, 0, 0, 0, 0xdd]);
+    eth[6..12].copy_from_slice(&[0x02, 0, 0, 0, 0, 0xcc]);
+    // next-header = 44 (Fragment), payload = 8 (frag hdr) + 20 (TCP).
+    let ip = ipv6_header(8 + 20, 44);
+    // RFC 8200 §4.5: next-header, reserved, offset<<3 | flags, identification.
+    // offset_units 1 -> the 0xFFF8 mask is non-zero, i.e. NOT the first fragment.
+    let frag = [6u8, 0, 0x00, 0x08, 0xde, 0xad, 0xbe, 0xef];
+    let tcp = tcp_header_skeleton(TCP_FLAG_SYN, 5);
+    let mut frame = Vec::with_capacity(14 + 40 + 8 + 20);
+    frame.extend_from_slice(&eth);
+    frame.extend_from_slice(&ip);
+    frame.extend_from_slice(&frag);
+    frame.extend_from_slice(&tcp);
+    frame
+}
+
+#[test]
+fn parse_tcp_reply_source_declines_a_non_first_fragment_8597_k37() {
+    assert!(
+        parse_tcp_reply_source(&frag_v4_tcp_frame_8597_k37()).is_none(),
+        "a v4 non-first fragment carries PAYLOAD at the L4 offset; parsing it as a \
+         TCP header reflects attacker-chosen bytes into a SYN-ACK or RST"
+    );
+    assert!(
+        parse_tcp_reply_source(&frag_v6_tcp_frame_8597_k37()).is_none(),
+        "a v6 non-first fragment (Fragment Header, non-zero offset) must decline \
+         for the same reason"
+    );
+}
+
+// ANTI-OVER-REJECT, and it is what makes the pair meaningful: the gate must
+// reject non-first fragments WITHOUT rejecting ordinary TCP, or the syn-cookie
+// and reject-RST paths silently stop replying at all.
+#[test]
+fn parse_tcp_reply_source_still_accepts_unfragmented_tcp_8597_k37() {
+    let v4 = reject_v4_tcp_frame(TCP_FLAG_SYN, 0x1111_2222, 0);
+    let p4 = parse_tcp_reply_source(&v4).expect("an ordinary v4 TCP frame must still parse");
+    assert_eq!(p4.seq, 0x1111_2222, "the parse must be intact, not merely non-None");
+
+    let v6 = reject_v6_tcp_frame(TCP_FLAG_SYN, 0x3333_4444, 0);
+    let p6 = parse_tcp_reply_source(&v6).expect("an ordinary v6 TCP frame must still parse");
+    assert_eq!(p6.seq, 0x3333_4444);
+
+    // A FIRST fragment (offset 0, More-Fragments set) still carries a real TCP
+    // header and must be accepted — the gate keys on the OFFSET, not on the
+    // presence of fragmentation.
+    let mut first = reject_v4_tcp_frame(TCP_FLAG_SYN, 0x5555_6666, 0);
+    first[20] = 0x20; // MF set, offset 0
+    first[21] = 0x00;
+    let pf = parse_tcp_reply_source(&first)
+        .expect("a FIRST fragment has a real TCP header and must still parse");
+    assert_eq!(pf.seq, 0x5555_6666);
+}
