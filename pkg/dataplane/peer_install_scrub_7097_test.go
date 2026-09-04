@@ -1,12 +1,15 @@
 package dataplane
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -71,18 +74,46 @@ import (
 // "and nothing else" guarantee in this file's header was therefore weaker than
 // it read — it held for whole-field zeroing and said nothing about a field the
 // scrub merely edits. `changedFields` below closes that.
-var partiallyScrubbedSessionFields = map[string]uint64{
-	"LogFlags": uint64(LogFlagUserspaceTunnelEndpoint),
-}
+//
+// #8612 UPDATE: this map is now EMPTY, and that is the fix rather than a
+// regression. It held `LogFlags -> LogFlagUserspaceTunnelEndpoint`, asserting
+// that the scrub clears the tunnel bit. It does not any more: the bit describes
+// a value that is now preserved, so clearing it would again make the flag and
+// the value disagree. The entry was a guard asserting the erasure was correct.
+// The map itself is kept -- the next partially-scrubbed field needs it, and the
+// machinery below is what makes such a field visible at all.
+var partiallyScrubbedSessionFields = map[string]uint64{}
 
 var nodeLocalSessionFields = map[string]bool{
 	"FibIfindex":     true,
 	"FibVlanID":      true,
 	"FibDmac":        true,
 	"FibSmac":        true,
-	"FibGen":         true,
 	"IngressIfindex": true,
 	"IngressVlanID":  true,
+}
+
+// #8612: fields whose node-locality is CONDITIONAL, mapped to the LogFlags bit
+// that makes them cluster-stable. With the bit CLEAR the field is node-local and
+// must be zeroed; with it SET the field must SURVIVE untouched.
+//
+// `FibGen` is the only one, and it is here rather than in the list above because
+// the two readings are genuinely different data. As a FIB generation it is this
+// node's number and worthless on the peer. Under
+// LogFlagUserspaceTunnelEndpoint it is a `config.StableTunnelEndpointID` --
+// FNV-1a over the interface NAME alone -- which pkg/config/tunnelid.go
+// documents as crossing the cluster in this exact field, identical on both
+// nodes by construction. Zeroing it destroys an identity the receiver cannot
+// re-derive, because every local re-derivation on that path is seeded from the
+// ifindex the same scrub zeroed.
+//
+// THIS MAP EXISTS BECAUSE THE CENSUS COULD NOT OTHERWISE SEE THE CASE, which is
+// the same reason `partiallyScrubbedSessionFields` was added: a field that is
+// sometimes scrubbed and sometimes not satisfies neither directional check
+// above, so before #8612 it could only be declared unconditionally -- and it
+// was, which is how a guard came to assert the erasure was correct.
+var conditionallyNodeLocalSessionFields = map[string]uint64{
+	"FibGen": uint64(LogFlagUserspaceTunnelEndpoint),
 }
 
 // fillNonZero sets every settable field of a struct to a non-zero sentinel, so
@@ -152,6 +183,18 @@ func changedFields(before, after reflect.Value) map[string]bool {
 	return out
 }
 
+// scrubGateSet reports whether the LogFlags gate bit was set on the PRE-scrub
+// value. It reads `before` deliberately: the scrub may legitimately change
+// LogFlags, so the arm a field should be judged under is the one the row
+// arrived in, not the one it leaves in.
+func scrubGateSet(before reflect.Value, gate uint64) bool {
+	f := before.FieldByName("LogFlags")
+	if !f.IsValid() {
+		return false
+	}
+	return f.Uint()&gate != 0
+}
+
 func assertScrubCensus(t *testing.T, before, after reflect.Value) {
 	t.Helper()
 	scrubbed := zeroedFields(before, after)
@@ -168,10 +211,59 @@ func assertScrubCensus(t *testing.T, before, after reflect.Value) {
 		}
 	}
 	for name := range scrubbed {
-		if !nodeLocalSessionFields[name] {
-			t.Errorf("the scrub zeroes %s, which is NOT declared node-local. Either "+
-				"it is node-local and this list is stale, or the scrub is destroying "+
-				"a field the peer legitimately owns (#7097)", name)
+		if nodeLocalSessionFields[name] {
+			continue
+		}
+		// #8612: a conditional field may legitimately be zeroed -- but only on
+		// the arm where its gate bit is CLEAR. Zeroing it with the bit SET is
+		// the defect this issue is about, and is caught by the conditional
+		// block below rather than silently excused here.
+		if gate, ok := conditionallyNodeLocalSessionFields[name]; ok {
+			if scrubGateSet(before, gate) {
+				continue // reported precisely below
+			}
+			continue
+		}
+		t.Errorf("the scrub zeroes %s, which is NOT declared node-local. Either "+
+			"it is node-local and this list is stale, or the scrub is destroying "+
+			"a field the peer legitimately owns (#7097)", name)
+	}
+
+	// #8612: the CONDITIONAL arm. Each declared field is node-local only when
+	// its gate bit is clear; with the bit set the value is cluster-stable and
+	// must survive. Both directions are asserted, so neither "always zero it"
+	// (the pre-#8612 erasure) nor "never zero it" (which would leak this node's
+	// FIB generation onto a peer row) passes.
+	for name, gate := range conditionallyNodeLocalSessionFields {
+		b := before.FieldByName(name)
+		a := after.FieldByName(name)
+		if !b.IsValid() || !a.IsValid() {
+			t.Errorf("conditionally-node-local field %s is not present on this "+
+				"struct — the declaration is stale (#8612)", name)
+			continue
+		}
+		if b.Uint() == 0 {
+			t.Fatalf("the fixture left %s at zero, so neither arm of the "+
+				"conditional assertion can distinguish preserved from scrubbed — "+
+				"fillNonZero must seed it (#8612)", name)
+		}
+		if scrubGateSet(before, gate) {
+			if a.Uint() != b.Uint() {
+				t.Errorf("%s was scrubbed to %#x with its gate bit %#x SET, but under "+
+					"that bit the field is a StableTunnelEndpointID — a pure fold of "+
+					"the interface NAME that both nodes compute identically and that "+
+					"pkg/cluster/sync_protocol.go encodes on the wire. Zeroing it "+
+					"destroys an identity the receiver cannot re-derive, because the "+
+					"local fallback is seeded from the ifindex this same scrub zeroes "+
+					"(#8612)", name, a.Uint(), gate)
+			}
+			continue
+		}
+		if a.Uint() != 0 {
+			t.Errorf("%s survived the scrub with its gate bit %#x CLEAR. Without that "+
+				"bit the field is a node-local FIB generation, and a peer row "+
+				"inheriting this node's number renders a confidently wrong answer "+
+				"(#7097)", name, gate)
 		}
 	}
 
@@ -182,6 +274,14 @@ func assertScrubCensus(t *testing.T, before, after reflect.Value) {
 	changed := changedFields(before, after)
 	for name := range changed {
 		if nodeLocalSessionFields[name] {
+			continue
+		}
+		// #8612: conditional fields get BOTH their directions asserted in the
+		// dedicated block below, which is stricter than this one — it checks the
+		// value against the gate rather than merely allowing a change. Skipping
+		// here would be a hole if that block did not exist; it does, and the
+		// `!b.IsValid()` arm there fails if a declaration goes stale.
+		if _, ok := conditionallyNodeLocalSessionFields[name]; ok {
 			continue
 		}
 		mask, declared := partiallyScrubbedSessionFields[name]
@@ -432,4 +532,169 @@ func TestClusterSyncedInstallSitesDelegateTheScrub7097(t *testing.T) {
 			}
 		})
 	}
+}
+
+// #8612: the OTHER arm. Every cell above seeds LogFlags via fillNonZero, which
+// sets the tunnel bit, so they all exercise "gate SET -> FibGen preserved". With
+// only those, `ScrubNodeLocal` could stop zeroing FibGen ALTOGETHER and the
+// suite would stay green — a peer row would then inherit this node's FIB
+// generation, which is the #7097 defect the conditional was carved out of.
+//
+// These two clear the bit first, so the field is judged as the node-local FIB
+// generation it is in that state.
+func TestScrubZeroesFibGenWhenTheTunnelBitIsClear8612(t *testing.T) {
+	t.Run("v4", func(t *testing.T) {
+		var val SessionValue
+		fillNonZero(t, reflect.ValueOf(&val).Elem())
+		val.LogFlags &^= LogFlagUserspaceTunnelEndpoint
+		if val.FibGen == 0 {
+			t.Fatal("fixture must seed a non-zero FibGen or the assertion is vacuous")
+		}
+		before := reflect.ValueOf(val)
+		val.ScrubNodeLocal()
+		if val.FibGen != 0 {
+			t.Errorf("FibGen survived the scrub as %#x with the tunnel bit CLEAR — "+
+				"in that state it is a node-local FIB generation (#7097)", val.FibGen)
+		}
+		assertScrubCensus(t, before, reflect.ValueOf(val))
+	})
+	t.Run("v6", func(t *testing.T) {
+		var val SessionValueV6
+		fillNonZero(t, reflect.ValueOf(&val).Elem())
+		val.LogFlags &^= LogFlagUserspaceTunnelEndpoint
+		before := reflect.ValueOf(val)
+		val.ScrubNodeLocal()
+		if val.FibGen != 0 {
+			t.Errorf("v6 FibGen survived the scrub as %#x with the tunnel bit CLEAR "+
+				"(#7097)", val.FibGen)
+		}
+		assertScrubCensus(t, before, reflect.ValueOf(val))
+	})
+}
+
+// #8612: and the arm the fix is FOR, asserted directly rather than only through
+// the reflective census — a reader looking for "what does this change do" should
+// find one cell that says it in field terms.
+func TestScrubPreservesTheTunnelEndpointIdentity8612(t *testing.T) {
+	t.Run("v4", func(t *testing.T) {
+		var val SessionValue
+		fillNonZero(t, reflect.ValueOf(&val).Elem())
+		val.LogFlags |= LogFlagUserspaceTunnelEndpoint
+		wantGen, wantFlags := val.FibGen, val.LogFlags
+		val.ScrubNodeLocal()
+		if val.FibGen != wantGen {
+			t.Errorf("the tunnel endpoint id was scrubbed to %#x, want %#x preserved. "+
+				"It is a StableTunnelEndpointID — a fold of the interface NAME both "+
+				"nodes compute identically (#1873) — not a node-local number (#8612)",
+				val.FibGen, wantGen)
+		}
+		if val.LogFlags&LogFlagUserspaceTunnelEndpoint == 0 {
+			t.Errorf("the tunnel bit was cleared though its value survives; flag and "+
+				"value must agree, and they now agree by KEEPING both (#8612)")
+		}
+		if val.LogFlags != wantFlags {
+			t.Errorf("LogFlags changed to %#x, want %#x — the scrub must not edit "+
+				"flags the peer owns (#8612)", val.LogFlags, wantFlags)
+		}
+		// The ifindex is still scrubbed: that IS node-local, and it is why the
+		// local re-derivation cannot rebuild the identity on its own.
+		if val.FibIfindex != 0 {
+			t.Errorf("FibIfindex must still be scrubbed (#7097)")
+		}
+	})
+	t.Run("v6", func(t *testing.T) {
+		var val SessionValueV6
+		fillNonZero(t, reflect.ValueOf(&val).Elem())
+		val.LogFlags |= LogFlagUserspaceTunnelEndpoint
+		wantGen := val.FibGen
+		val.ScrubNodeLocal()
+		if val.FibGen != wantGen {
+			t.Errorf("v6 tunnel endpoint id scrubbed to %#x, want %#x (#8612)",
+				val.FibGen, wantGen)
+		}
+		if val.LogFlags&LogFlagUserspaceTunnelEndpoint == 0 {
+			t.Errorf("v6 tunnel bit cleared though its value survives (#8612)")
+		}
+	})
+}
+
+// #8612: carrying the tunnel endpoint id across the cluster is safe ONLY while
+// every reader of FibGen tests the flag that says which of its two meanings it
+// holds. That is true today at exactly two sites, and this cell is what keeps it
+// true: a new reader that tests `FibGen != 0` alone would read a peer's tunnel
+// endpoint id as this node's FIB generation.
+//
+// The claim is a POPULATION claim, so it is measured rather than asserted. The
+// scan reports what it found beside what is expected, and fails on a mismatch in
+// EITHER direction — a new unguarded reader, or the guarded ones disappearing
+// (which would mean the pattern stopped matching and the census had gone blind).
+func TestEveryFibGenReaderIsFlagGated8612(t *testing.T) {
+	root := headroomRepoRoot(t)
+	readRe := regexp.MustCompile(`\.FibGen\b`)
+	writeRe := regexp.MustCompile(`\.FibGen\s*=|FibGen:`)
+	gateRe := regexp.MustCompile(`LogFlagUserspaceTunnelEndpoint`)
+	// The wire codec moves the field verbatim in both directions and cannot
+	// interpret it, so it is not a reader in the sense this cell is about.
+	codec := filepath.Join("pkg", "cluster", "sync_protocol.go")
+
+	var guarded, unguarded []string
+	err := filepath.WalkDir(filepath.Join(root, "pkg"), func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".go") ||
+			strings.HasSuffix(path, "_test.go") {
+			return err
+		}
+		rel, _ := filepath.Rel(root, path)
+		if rel == codec {
+			return nil
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		lines := strings.Split(string(raw), "\n")
+		for i, line := range lines {
+			if !readRe.MatchString(line) || writeRe.MatchString(line) {
+				continue
+			}
+			if strings.HasPrefix(strings.TrimSpace(line), "//") {
+				continue
+			}
+			// Same line, or the two above it — a gate further away than that is
+			// not this read's gate (the #8241 census learned the same lesson
+			// about inheriting evidence from distant prose).
+			lo := i - 2
+			if lo < 0 {
+				lo = 0
+			}
+			where := fmt.Sprintf("%s:%d", rel, i+1)
+			if gateRe.MatchString(strings.Join(lines[lo:i+1], "\n")) {
+				guarded = append(guarded, where)
+			} else {
+				unguarded = append(unguarded, where)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+
+	// DEGENERACY / POSITIVE CONTROL. A scan that matched nothing looks identical
+	// to a clean tree, and the clean answer is the one we want to be able to
+	// trust. If this fires, the pattern has stopped matching — not the readers.
+	if len(guarded) == 0 {
+		t.Fatalf("the census found NO flag-gated FibGen reader. The two known ones "+
+			"(manager_sessionsync_request.go) must match, or this cell is blind and "+
+			"its silence means nothing (#8612). unguarded=%v", unguarded)
+	}
+	if len(unguarded) > 0 {
+		t.Errorf("FibGen is read WITHOUT testing LogFlagUserspaceTunnelEndpoint at "+
+			"%d site(s): %v.\nSince #8612 the field carries a cluster-stable tunnel "+
+			"endpoint id when that bit is set and a node-local FIB generation when it "+
+			"is not, so a reader that does not test the bit will interpret a peer's "+
+			"tunnel id as this node's generation. Test the flag, or read through a "+
+			"helper that does.", len(unguarded), unguarded)
+	}
+	t.Logf("#8612 FibGen reader census: %d guarded, %d unguarded — %v",
+		len(guarded), len(unguarded), guarded)
 }
