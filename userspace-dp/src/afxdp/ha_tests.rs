@@ -4538,3 +4538,234 @@ fn both_purge_call_sites_release_against_new_forwarding_8138() {
         );
     }
 }
+
+// ── #8015: a standalone reverse import is refused ────────────────────────
+//
+// A reverse entry is DERIVED state. Every legitimate reverse companion in the
+// shared `synced` map is produced by `synthesized_synced_reverse_entry` riding
+// with the forward it was derived from, so an entry that arrives already
+// flagged `is_reverse` is either a redundant duplicate of one this node builds
+// better, or — if its own forward was refused — a permit with nothing anchoring
+// it, which a later delete of that forward cannot remove
+// (`delete_synced_session_gen` derives the companion from the STORED forward,
+// and there is none).
+//
+// WHAT MAKES THIS A MEASUREMENT AND NOT AN ASSERTION OF THE OBVIOUS. Leg (a)
+// is the control and it carries the load: it re-measures the fact the whole
+// simplification rests on — a FORWARD-only import leaves a COMPLETE PAIR, two
+// entries, because the helper synthesizes and publishes the companion itself.
+// Without leg (a) a refusal of every import at all would satisfy leg (b), and
+// the cell would be green for a helper that had stopped importing sessions.
+//
+// PARENT-RED recipe: delete the `if entry.metadata.is_reverse { return ... }`
+// early return in `upsert_synced_session`. Leg (b)'s outcome assertion fails
+// (`Applied`, not `RejectedStandaloneReverse`) and its publish assertion fails
+// with the lone reverse in the shared map. Target-count = 1 gate site.
+#[test]
+fn upsert_synced_session_refuses_standalone_reverse_8015() {
+    let mut coordinator = Coordinator::new();
+    coordinator.forwarding = test_forwarding_state_with_fabric();
+    let commands = Arc::new(Mutex::new(VecDeque::new()));
+    coordinator.workers.register(
+        0,
+        WorkerRuntimeRecord::for_test(test_worker_handle(commands.clone())),
+        None,
+    );
+
+    // (a) CONTROL — a forward-only import leaves a COMPLETE PAIR.
+    let forward = synced_entry_port(1000, 0);
+    let forward_key = forward.key.clone();
+    let companion_key = reverse_session_key(&forward.key, forward.decision.nat);
+    assert_eq!(
+        coordinator.upsert_synced_session(forward),
+        SyncedImportOutcome::Applied,
+        "an ordinary forward import must apply"
+    );
+    {
+        let synced = coordinator.sessions.synced.lock().expect("shared sessions");
+        assert_eq!(
+            synced.len(),
+            2,
+            "a FORWARD-only import must leave TWO entries — the forward and the \
+             companion the helper synthesizes for it. This is the fact the Go-side \
+             deletion of the explicit reverse rests on, and it is also why the \
+             #5674 entry cap is sized at 2x the logical ceiling (#8015)"
+        );
+        assert!(
+            synced.contains_key(&forward_key),
+            "the forward key must be published"
+        );
+        let companion = synced
+            .get(&companion_key)
+            .expect("the synthesized reverse companion must be published with its forward");
+        assert!(
+            companion.metadata.is_reverse,
+            "the synthesized companion must carry is_reverse"
+        );
+    }
+
+    // (b) SUBJECT — the same shape, arriving pre-flagged as a reverse, is
+    // refused: not published, not fanned out, and reported with its own reason
+    // token so the caller can tell it from a transport failure.
+    let mut standalone = synced_entry_port(2000, 0);
+    standalone.metadata.is_reverse = true;
+    let standalone_key = standalone.key.clone();
+    assert_eq!(
+        coordinator.upsert_synced_session(standalone),
+        SyncedImportOutcome::RejectedStandaloneReverse,
+        "an import that arrives already flagged is_reverse has no forward to be \
+         derived from and must be refused (#8015)"
+    );
+    assert_eq!(
+        SyncedImportOutcome::RejectedStandaloneReverse.refusal_reason(),
+        Some("standalone-reverse"),
+        "the refusal must carry a stable reason token — Go discriminates a \
+         SEMANTIC refusal from a transport failure on the token, and a transport \
+         failure gates HA takeover-readiness (#5247)"
+    );
+    {
+        let synced = coordinator.sessions.synced.lock().expect("shared sessions");
+        assert!(
+            !synced.contains_key(&standalone_key),
+            "a refused standalone reverse must not be published; publishing it is \
+             precisely the reverse-only orphan #8015 removes (#8015)"
+        );
+        assert_eq!(
+            synced.len(),
+            2,
+            "the refusal must leave the map exactly as leg (a) left it"
+        );
+    }
+    let pending = commands.lock().expect("commands");
+    assert!(
+        !pending.iter().any(
+            |cmd| matches!(cmd, WorkerCommand::UpsertSynced(entry) if entry.key == standalone_key),
+        ),
+        "a refused standalone reverse must not be fanned out to any worker queue"
+    );
+    // The control's fan-out DID happen — the refusal is selective, not a blanket
+    // block on the whole fan-out path.
+    assert!(
+        pending.iter().any(
+            |cmd| matches!(cmd, WorkerCommand::UpsertSynced(entry) if entry.key == forward_key),
+        ),
+        "the admitted forward must still reach the worker queue — without this the \
+         cell would pass for a helper that stopped fanning out entirely"
+    );
+    // #310, the invariant the deleted Go pre-install was added for: the worker
+    // must hold the COMPANION before RG activation. No `update_ha_state` has run
+    // in this cell, so the queue entry below is the companion arriving at import
+    // — strictly earlier than the pre-install could deliver it.
+    assert!(
+        pending.iter().any(
+            |cmd| matches!(cmd, WorkerCommand::UpsertSynced(entry) if entry.key == companion_key),
+        ),
+        "the synthesized companion must be fanned out to the worker WITH its \
+         forward, at import and before any RG activation — that is the #310 \
+         invariant the deleted Go pre-install existed to provide (#8015)"
+    );
+}
+
+// #8015: the historical orphan scenario, driven end to end.
+//
+// A cap-rejected FORWARD followed by its separate `is_reverse=1` companion is
+// exactly the sequence that used to leave a reverse-only entry: the cap gate is
+// forward-only, so the companion skipped it and published with nothing to anchor
+// it, and a later delete of that forward removed nothing because
+// `delete_synced_session_gen` derives the companion from the STORED forward.
+// Both halves are now refused, so the map is unchanged by the pair.
+//
+// The final leg re-measures the third fact the refiling rested on and that no
+// later pass re-checked: a forward DELETE takes its synthesized companion with
+// it, leaving zero.
+//
+// PARENT-RED recipe: delete the `is_reverse` early return in
+// `upsert_synced_session`. The over-ceiling companion then publishes and the
+// `synced_len_after == synced_len_before` assertion fails by exactly one entry —
+// the "+1 orphan" by name.
+#[test]
+fn cap_rejected_forward_leaves_no_orphan_reverse_8015() {
+    let mut coordinator = Coordinator::new();
+    coordinator.forwarding = test_forwarding_state_with_fabric();
+    const LOGICAL_CEILING: u16 = 1;
+    coordinator.synced_import_cap_override = LOGICAL_CEILING as usize;
+    let commands = Arc::new(Mutex::new(VecDeque::new()));
+    coordinator.workers.register(
+        0,
+        WorkerRuntimeRecord::for_test(test_worker_handle(commands.clone())),
+        None,
+    );
+
+    // Fill the map to its 2N ENTRY cap with one admitted forward (which brings
+    // its companion, so 2 entries == the cap for LOGICAL_CEILING = 1).
+    let seed = synced_entry_port(1000, 0);
+    let seed_key = seed.key.clone();
+    let seed_companion = reverse_session_key(&seed.key, seed.decision.nat);
+    assert_eq!(
+        coordinator.upsert_synced_session(seed),
+        SyncedImportOutcome::Applied
+    );
+    let synced_len_before = coordinator
+        .sessions
+        .synced
+        .lock()
+        .expect("shared sessions")
+        .len();
+    assert_eq!(
+        synced_len_before, 2,
+        "the seed forward must have filled the 2N entry cap with its companion"
+    );
+
+    // The orphaning sequence: a NEW forward is cap-rejected, then the companion
+    // the old Go mirror would have sent right behind it.
+    let over = synced_entry_port(2000, 0);
+    let over_key = over.key.clone();
+    assert_eq!(
+        coordinator.upsert_synced_session(over),
+        SyncedImportOutcome::RejectedCapacity,
+        "the over-ceiling forward must be cap-rejected — otherwise this cell is \
+         not driving the scenario it is named for"
+    );
+    let mut trailing_reverse = synced_entry_port(2000, 0);
+    trailing_reverse.key = reverse_session_key(&over_key, trailing_reverse.decision.nat);
+    trailing_reverse.metadata.is_reverse = true;
+    let trailing_key = trailing_reverse.key.clone();
+    assert_eq!(
+        coordinator.upsert_synced_session(trailing_reverse),
+        SyncedImportOutcome::RejectedStandaloneReverse
+    );
+
+    {
+        let synced = coordinator.sessions.synced.lock().expect("shared sessions");
+        assert!(
+            !synced.contains_key(&trailing_key),
+            "the trailing companion of a cap-rejected forward must not publish — \
+             it is the '+1 orphan' this change removes (#8015)"
+        );
+        assert_eq!(
+            synced.len(),
+            synced_len_before,
+            "a cap-rejected forward and its trailing companion must leave the \
+             shared map EXACTLY as they found it"
+        );
+    }
+
+    // Fact 3, re-measured: a forward delete takes its synthesized companion.
+    coordinator.delete_synced_session(seed_key.clone());
+    let synced = coordinator.sessions.synced.lock().expect("shared sessions");
+    assert!(
+        !synced.contains_key(&seed_key),
+        "the forward must be removed by its own delete"
+    );
+    assert!(
+        !synced.contains_key(&seed_companion),
+        "a forward delete must take the synthesized companion with it — \
+         `delete_synced_session_gen` derives it from the stored forward (#8015)"
+    );
+    assert_eq!(
+        synced.len(),
+        0,
+        "forward delete must leave ZERO entries: the pair is complete on the way \
+         in and on the way out"
+    );
+}

@@ -1037,27 +1037,41 @@ synthesized reverse always rides with its forward (a rejected forward
 returns BEFORE publishing its reverse, so no half-sync), and a lone
 reverse import is never independently rejected at a boundary slot.
 
-**Where that lone reverse actually comes from (#6413).** Not "off the wire
-from a peer" — an earlier framing had it that way and it is wrong. A
-peer-received reverse never reaches the coordinator at all: Go's
+**The "+1 orphan" corner is closed (#8015).** Because the gate is
+forward-only, a lone `is_reverse=1` import used to skip it and publish as
+a bounded orphan with no matching forward whenever the map was AT the 2N
+cap and its own forward was cap-rejected. #6413 assessed that as
+self-inflicted, bounded by the local session rate and low-harm — which it
+was, since the orphan's tuple and decision were the FORWARD's own, so it
+admitted the reply direction of a flow this node had itself just
+adjudicated, not any unsolicited inbound flow. What made it worth
+removing rather than documenting is that it could OUTLIVE its forward:
+`delete_synced_session_gen` derives the companion to remove from the
+STORED forward, and after a refusal there is no stored forward, so a
+later delete of that forward removed nothing and the reverse survived
+until `reap_expired_sessions` idled it out.
+
+#8015 removes it at both ends. The only sender was Go's
+`mirrorSessionPairV4`/`V6` explicit companion pre-install (#310), which
+is deleted — the mirror sends the forward alone and this function
+synthesizes the companion, earlier and against live node-local state —
+and `upsert_synced_session` now REFUSES an entry that arrives already
+flagged `is_reverse`, returning
+`SyncedImportOutcome::RejectedStandaloneReverse` (wire token
+`synced-import-refused:standalone-reverse`) before any other decision. A
+reverse entry is DERIVED state and can never be standalone authority.
+The peer path never produced one in the first place: Go's
 `SetClusterSyncedSessionV4`/`V6` early-return on
 `!shouldMirrorUserspaceSession(val.IsReverse)` and write ONLY the BPF
-mirror, so only FORWARD peer imports transit the helper, which then
-synthesizes their reverse companion locally
-(`synthesized_synced_reverse_entry`). The only `is_reverse=1` entry that
-reaches the gate is the **local mirror** companion that
-`mirrorSessionPairV4`/`V6` (#310) pre-install as a SEPARATE `upsert`,
-dispatched via `server/handlers/sync_session.rs`, which calls
-`upsert_synced_session` unconditionally for any `is_reverse`.
+mirror, so only FORWARD peer imports transit the helper. Pinned by
+`upsert_synced_session_refuses_standalone_reverse_8015`
+(`afxdp/ha_tests.rs`), whose control leg re-measures the
+forward-only-leaves-two-entries fact the cap's 2x sizing depends on.
 
-**The +1 orphan corner (#6413).** Pairing at this boundary is not perfect,
-and the text should not imply it is. If the shared `synced` map is AT the
-2N entry cap and the local mirror's FORWARD is cap-rejected, its separate
-`is_reverse=1` companion still skips the forward-only gate and publishes
-as a bounded **+1 orphan** with no matching forward. That is
-self-inflicted, bounded by the local session rate, low-harm, and NOT the
-peer-DoS vector this cap targets — the Go reverse filter already excludes
-the peer path entirely.
+The refusal carries no counter of its own, deliberately: with the sender
+deleted and the peer path excluded, no shipped daemon can produce the
+condition, and a metric that can only read zero says nothing. The typed
+outcome already reaches the caller through the control response.
 
 A REPLACE of an existing
 synced key is always allowed (it does not grow the map) so an in-flight

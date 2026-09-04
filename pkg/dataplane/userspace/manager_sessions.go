@@ -9,9 +9,8 @@ package userspace
 
 import (
 	"errors"
-	"strings"
 	"fmt"
-	"log/slog"
+	"strings"
 
 	"github.com/cilium/ebpf"
 	"github.com/psaab/xpf/pkg/dataplane"
@@ -41,68 +40,50 @@ func (m *Manager) SetSessionV4(key dataplane.SessionKey, val dataplane.SessionVa
 	if !shouldMirrorUserspaceSession(val.IsReverse) {
 		return nil
 	}
-	m.mirrorSessionPairV4(key, val)
+	m.mirrorSessionV4(key, val)
 	return nil
 }
 
-// mirrorSessionPairV4 mirrors a forward session and its pre-installed reverse
-// companion (#310) to the Rust helper.
+// mirrorSessionV4 mirrors a locally installed forward session to the Rust
+// helper. ONE upsert, not two (#8015).
 //
-// #5007: it resolves BOTH requests against ONE consistent config snapshot by
-// building them under a single uninterrupted m.mu hold — BEFORE any control
-// socket I/O drops the lock — then transmits both. buildSessionSyncRequestV4
-// resolves egress/zone/tunnel-endpoint metadata from m.lastSnapshot (and the
-// compile result); a concurrent ApplyConfig publishes a new m.lastSnapshot
-// while holding m.mu, so resolving both requests during one continuous hold
-// guarantees the forward/reverse pair derives from the SAME snapshot.
-// Transmitting only after both builds preserves the deliberate "socket I/O
-// must not block snapshot publishes" property (the transmit drops m.mu for the
-// send).
+// It used to send the forward AND an explicitly built `is_reverse=1` companion
+// (#310, "the Rust worker must have the companion before RG activation"). That
+// second request was redundant: `upsert_synced_session`
+// (`userspace-dp/src/afxdp/ha/session_import.rs`) calls
+// `synthesized_synced_reverse_entry` for EVERY non-reverse import — a total
+// function, `Some` on every forward — and publishes both halves through
+// `publish_shared_session`, which is why the #5674 aggregate ENTRY cap is sized
+// at 2x the logical session ceiling. So a single forward upsert already leaves
+// a complete pair, and it leaves a BETTER one: the helper resolves the
+// companion's egress/FIB, fabric/tunnel and owner-RG against live node-local
+// state, where this side could only copy the forward's (#5698). Synthesis also
+// happens AT IMPORT, which is strictly earlier than this pre-install, so #310's
+// invariant is satisfied by the request that remains.
 //
-// #5698: the transmit goes through syncSessionPairLocked, which holds
-// m.sessionMu for BOTH requests. The single m.mu unlock says nothing about
-// session-socket ordering — the per-request path frees m.sessionMu between
-// requests, and a concurrent generation-0 forward delete landing in that gap
-// removes both halves in the helper, after which this pair's already-built
-// explicit reverse re-creates a standalone reverse-only permit. One
-// m.sessionMu hold removes the gap. It does not make the pair ATOMIC: a
-// transport failure on the reverse still leaves the forward installed alone.
-func (m *Manager) mirrorSessionPairV4(key dataplane.SessionKey, val dataplane.SessionValue) {
+// What the second request added was a failure mode. If the helper REFUSED the
+// forward (a semantic refusal such as `RejectedCapacity`, not a transport
+// failure — those abort the batch) the explicit reverse still went out and
+// published alone: a reverse-only entry with no forward, which no later forward
+// delete removes because `delete_synced_session_gen` derives the companion from
+// the STORED forward and there is none. Sending one request removes that state
+// rather than reporting it; the helper additionally REFUSES a standalone
+// `is_reverse=1` upsert now, so the shape cannot be reintroduced from any
+// sender.
+//
+// With one request the #5007 single-snapshot build and the #5698 contiguous
+// transmit are both vacuous — there is no second half to resolve against a
+// different `m.lastSnapshot` or to be interleaved away from — so this takes the
+// ordinary per-request path. The mirror stays best-effort: the IPC error is
+// dropped because the periodic session sync reconciles a transient miss, and a
+// single request can no longer half-apply.
+func (m *Manager) mirrorSessionV4(key dataplane.SessionKey, val dataplane.SessionValue) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.proc == nil {
 		return
 	}
-	reqs := make([]SessionSyncRequest, 0, 2)
-	reqs = append(reqs, m.buildSessionSyncRequestV4("upsert", key, &val))
-	// Pre-install the reverse companion so the Rust worker has it before
-	// RG activation, avoiding activation-time synthesis (#310).
-	if val.ReverseKey.Protocol != 0 {
-		revVal := val
-		revVal.IsReverse = 1
-		revVal.ReverseKey = key
-		revVal.IngressZone = val.EgressZone
-		revVal.EgressZone = val.IngressZone
-		// #7917: clear everything the REPLY direction has not observed — the
-		// forward egress (re-resolved locally) AND the #4983 ingress identity.
-		// The ingress half was missing: the companion inherited the FORWARD
-		// direction's ingress binding, which `pkg/dataplane/types.go` names as a
-		// legitimate-`0` population precisely because a prediction of where the
-		// reply will arrive is not an observation of where it did. Since #7095
-		// that also means clearing `IngressIfaceFold` — the wire request derives
-		// its ingress identity from the fold, so leaving it set stamps the
-		// forward binding onto the companion the helper receives.
-		revVal.ResetUnobservedForReverseCompanion()
-		reqs = append(reqs, m.buildSessionSyncRequestV4("upsert", val.ReverseKey, &revVal))
-	}
-	// Snapshot reads are complete; transmit both requests under ONE sessionMu
-	// hold so nothing interleaves between the halves (#5698). The mirror upsert
-	// stays best-effort — the periodic session sync reconciles a transient miss
-	// — so the IPC error is still not propagated. What is no longer discarded
-	// is a PARTIAL application (#7179): a pair the helper never applied
-	// self-heals, a lone reverse it did apply does not, and dropping the result
-	// on the floor made those two indistinguishable.
-	m.recordSessionPairResult("v4", m.syncSessionPairLocked(reqs...))
+	_ = m.syncSessionV4Locked("upsert", key, &val)
 }
 
 func (m *Manager) SetClusterSyncedSessionV4(key dataplane.SessionKey, val dataplane.SessionValue) error {
@@ -223,51 +204,19 @@ func (m *Manager) SetSessionV6(key dataplane.SessionKeyV6, val dataplane.Session
 	if !shouldMirrorUserspaceSession(val.IsReverse) {
 		return nil
 	}
-	m.mirrorSessionPairV6(key, val)
+	m.mirrorSessionV6(key, val)
 	return nil
 }
 
-// mirrorSessionPairV6 is the IPv6 analogue of mirrorSessionPairV4 — see that
-// method for the #5007 single-snapshot rationale and the #5698 contiguous-
-// transmit rationale. It builds the forward request and its reverse companion
-// under one uninterrupted m.mu hold, then transmits both through
-// syncSessionPairLocked (one m.sessionMu hold for the pair).
-func (m *Manager) mirrorSessionPairV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) {
+// mirrorSessionV6 is the IPv6 analogue of mirrorSessionV4 — see that method
+// for why the explicit reverse companion is gone (#8015).
+func (m *Manager) mirrorSessionV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.proc == nil {
 		return
 	}
-	reqs := make([]SessionSyncRequest, 0, 2)
-	reqs = append(reqs, m.buildSessionSyncRequestV6("upsert", key, &val))
-	// Pre-install the reverse companion so the Rust worker has it before
-	// RG activation, avoiding activation-time synthesis (#310).
-	if val.ReverseKey.Protocol != 0 {
-		revVal := val
-		revVal.IsReverse = 1
-		revVal.ReverseKey = key
-		revVal.IngressZone = val.EgressZone
-		revVal.EgressZone = val.IngressZone
-		// #7917: clear everything the REPLY direction has not observed — the
-		// forward egress (re-resolved locally) AND the #4983 ingress identity.
-		// The ingress half was missing: the companion inherited the FORWARD
-		// direction's ingress binding, which `pkg/dataplane/types.go` names as a
-		// legitimate-`0` population precisely because a prediction of where the
-		// reply will arrive is not an observation of where it did. Since #7095
-		// that also means clearing `IngressIfaceFold` — the wire request derives
-		// its ingress identity from the fold, so leaving it set stamps the
-		// forward binding onto the companion the helper receives.
-		revVal.ResetUnobservedForReverseCompanion()
-		reqs = append(reqs, m.buildSessionSyncRequestV6("upsert", val.ReverseKey, &revVal))
-	}
-	// Snapshot reads are complete; transmit both requests under ONE sessionMu
-	// hold so nothing interleaves between the halves (#5698). The mirror upsert
-	// stays best-effort — the periodic session sync reconciles a transient miss
-	// — so the IPC error is still not propagated. What is no longer discarded
-	// is a PARTIAL application (#7179): a pair the helper never applied
-	// self-heals, a lone reverse it did apply does not, and dropping the result
-	// on the floor made those two indistinguishable.
-	m.recordSessionPairResult("v6", m.syncSessionPairLocked(reqs...))
+	_ = m.syncSessionV6Locked("upsert", key, &val)
 }
 
 func (m *Manager) SetClusterSyncedSessionV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) error {
@@ -388,10 +337,9 @@ func (m *Manager) DeleteSessionV6(key dataplane.SessionKeyV6) error {
 // (#5096). syncSessionRequestsLocked drops and reacquires m.mu once per chunk,
 // giving a concurrent snapshot publish a window between chunks, and takes
 // m.sessionMu once per REQUEST so live session installs can interleave INSIDE a
-// chunk. A chunk this large deliberately stays interleavable: the contiguous
-// transmit (syncSessionPairLocked, #5698) is capped at sessionPairMaxRequests
-// precisely because holding m.sessionMu across 256 round trips would starve
-// those installs for minutes.
+// chunk. A chunk this large deliberately stays interleavable: holding
+// m.sessionMu across 256 round trips would starve live session installs for
+// minutes (#5380).
 const sessionHelperDeleteChunk = 256
 
 // BatchDeleteSessions deletes a batch of IPv4 sessions from the BPF mirror AND
@@ -587,33 +535,6 @@ func (m *Manager) deleteHelperSessionsV6(keys []dataplane.SessionKeyV6) error {
 		}
 	}
 	return firstErr
-}
-
-// recordSessionPairResult surfaces a pair transmit that left the helper
-// holding state the control plane did not intend (#7179).
-//
-// Only the orphaned-reverse outcome is reported. A pair the helper never
-// applied is benign and already logged at Debug per request; warning on it
-// would fire on every transient helper hiccup and bury the case that matters.
-// The counter advances on EVERY occurrence while the log stays per-event,
-// because a condition that recurs is different information from one that
-// happened once.
-func (m *Manager) recordSessionPairResult(family string, res sessionPairResult) {
-	if !res.orphanedReverse() {
-		return
-	}
-	m.sessionPairOrphanedReverse.Add(1)
-	slog.Warn("userspace session pair left a reverse-only entry in the helper: "+
-		"the forward was refused while its explicit reverse was applied",
-		"family", family, "err", res.firstErr,
-		"orphaned_total", m.sessionPairOrphanedReverse.Load())
-}
-
-// SessionPairOrphanedReverseTotal reports how many pair transmits left a
-// reverse-only entry in the helper. Exported for the status/metrics surface so
-// the condition is observable without reading the log.
-func (m *Manager) SessionPairOrphanedReverseTotal() uint64 {
-	return m.sessionPairOrphanedReverse.Load()
 }
 
 // ErrSessionCountersUnsupported reports that the running helper does not

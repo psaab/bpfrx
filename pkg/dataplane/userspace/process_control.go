@@ -241,11 +241,12 @@ func (m *Manager) sessionSocketPath() string {
 // THIS round trip alone, so unrelated session-socket callers interleave freely
 // between consecutive calls. That is the right discipline for a bulk batch (a
 // delete chunk is up to sessionHelperDeleteChunk requests — holding sessionMu
-// across the whole chunk would starve live session installs), but NOT for a
-// forward/reverse pair, which must not be split. A caller that needs a group of
-// requests to reach the helper with nothing in between takes sessionMu itself
-// and drives requestSessionSyncLocked per request — see syncSessionPairLocked
-// (#5698).
+// across the whole chunk would starve live session installs), and since #8015
+// it is the discipline for EVERY session-socket caller: the local mirror sends
+// one upsert, so no group has to reach the helper with nothing in between. A
+// future caller that needs that takes sessionMu itself and drives
+// requestSessionSyncLocked per request, which is why the unlocked inner stays
+// separable.
 func (m *Manager) requestSessionSync(req ControlRequest) error {
 	m.sessionMu.Lock()
 	defer m.sessionMu.Unlock()
