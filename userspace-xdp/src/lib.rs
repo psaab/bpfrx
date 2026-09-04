@@ -1723,6 +1723,42 @@ fn is_ipv6_link_local(ip: [u8; 16]) -> bool {
 /// 298,714 instructions and 41% of the verifier's states. Removing this
 /// attribute does not fail a test — it silently spends a third of the object's
 /// budget, which is how the shim reached 0.92% headroom before #4555.
+///
+/// It also answers a request rather than being an opportunistic saving. #8274
+/// step 3 (worker WireGuard decap) spent ~110,000 insns and left this trend in
+/// its PR body, measured at `dc9c9d801`: "master 31.38% -> step 2 23.20% ->
+/// 20.42% ... two thirds of the margin is gone ... buy headroom back rather
+/// than assume it is there". Re-measured at `a02e55248`, a descendant of
+/// `dc9c9d801`, the 795,764 / 20.42% control above IS that figure, so this
+/// change puts back more than all of what step 3 spent.
+///
+/// THE COST, so a later editor prices it before growing this function:
+/// `#[inline(always)]` on a fn reached from FOUR call sites multiplies its code
+/// by four. That is a large net win today only because the per-calling-state
+/// re-verification it removes is worth far more than the duplication it adds.
+/// Grow `parse_l4` and you pay 4x — re-measure before assuming the trade still
+/// holds.
+///
+/// NOT IN TENSION with `classify_native_gre_inner*` two hundred lines up, which
+/// are deliberately `#[inline(never)]`. They are the opposite shape: LARGE
+/// (1,848 and 2,160 bytes) and reached from ONE call site each, so outlining
+/// buys state isolation for a cold path and costs no repeated walk. `parse_l4`
+/// is small and reached from four, so outlining bought nothing and paid four
+/// walks. The lever is bidirectional; the shape decides the direction, and
+/// "make them consistent" would be a regression whichever way it was applied.
+///
+/// A NOTE ON THE FIGURES ABOVE, dated on purpose. The control is 795,764 at
+/// `a02e55248` — the FOURTH baseline this file has carried inside a single
+/// issue's lifetime. Its three predecessors are kept here as the evidence for
+/// that volatility, not as live numbers, and none can be re-dated: the earlier
+/// investigations never recorded the shas. What they CAN be measured against is
+/// the constant that actually blocks an install, the 15% floor at 850,000 insns
+/// — 777,901, then 801,448, then 686,201, all against that same floor.
+///
+/// So a headroom number here without the sha it was measured at is a trap.
+/// #8249 twice sent someone to reason against a baseline that had already
+/// moved, which is most of what that issue cost. #8241 is the census that now
+/// refuses an undated figure; date yours, or state the floor.
 #[inline(always)]
 fn parse_l4(
     data: usize,
