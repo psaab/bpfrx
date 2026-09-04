@@ -44,7 +44,7 @@ func TestRenderRuleMarksUnavailableHitCounters(t *testing.T) {
 	c := &ctl{client: &fakeBpfrxClient{getPoliciesResp: unpublishedPoliciesResp()}}
 
 	out := captureStdout(t, func() {
-		if err := c.showPoliciesFiltered("trust", "untrust"); err != nil {
+		if err := c.showPoliciesFiltered("trust", "untrust", false); err != nil {
 			t.Fatalf("showPoliciesFiltered: %v", err)
 		}
 	})
@@ -91,7 +91,7 @@ func TestRenderRuleHealthyCountersUnchanged(t *testing.T) {
 
 	c := &ctl{client: &fakeBpfrxClient{getPoliciesResp: resp}}
 	detail := captureStdout(t, func() {
-		if err := c.showPoliciesFiltered("trust", "untrust"); err != nil {
+		if err := c.showPoliciesFiltered("trust", "untrust", false); err != nil {
 			t.Fatalf("showPoliciesFiltered: %v", err)
 		}
 	})

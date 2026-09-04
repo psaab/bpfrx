@@ -182,7 +182,7 @@ func TestShowPoliciesFilteredUnscopedGlobalRendersAny(t *testing.T) {
 	// No from/to filter: the unscoped global is selected and its header must use
 	// the canonical "any" scope.
 	out := captureStdout(t, func() {
-		if err := c.showPoliciesFiltered("", ""); err != nil {
+		if err := c.showPoliciesFiltered("", "", false); err != nil {
 			t.Fatalf("showPoliciesFiltered: %v", err)
 		}
 	})
