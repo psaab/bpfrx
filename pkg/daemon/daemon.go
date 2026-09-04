@@ -1264,6 +1264,11 @@ type Daemon struct {
 	directAddStableLLFn    func(int)
 	directRemoveStableLLFn func(int)
 
+	// linkDelFn removes a network interface. Defaults to netlink.LinkDel;
+	// overridden in tests so the #8372 fabric-overlay reaper can be driven
+	// without netlink. nil in production.
+	linkDelFn func(netlink.Link) error
+
 	// linkByNameFn resolves a network interface by name. Defaults to
 	// netlink.LinkByName; overridden in tests.
 	linkByNameFn func(string) (netlink.Link, error)

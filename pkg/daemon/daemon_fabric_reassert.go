@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/vishvananda/netlink"
+
 	"github.com/psaab/xpf/pkg/config"
 )
 
@@ -99,7 +101,55 @@ func (d *Daemon) missingFabricOverlays(cfg *config.Config) []deferredIPVLAN {
 	return out
 }
 
-// reassertFabricIPVLANOnce re-creates one round of missing fabric overlays.
+// staleFabricOverlays returns fabric IPVLANs that EXIST on the box but which
+// the active config does not name.
+//
+// #8372: the reassert loop only ever CREATED. `reassertFabricIPVLANOnce` had
+// zero deletes, and the two mechanisms that look like they should reap a stale
+// overlay do not: `CleanupFabricIPVLANs` is reachable only from the
+// `xpfd cleanup` subcommand -- the daemon never removes these links when it
+// exits -- and the stale-overlay sweep inside `applyInterfaces` runs on the
+// next interface apply, i.e. the next COMMIT.
+//
+// So a fabric IPVLAN recreated by the deferred `OnXSKBound` closure after a
+// later apply dropped it persisted for the daemon's lifetime and past it,
+// healable only by an operator action. That is HA-relevant: it carries the
+// fabric / session-sync address, possibly on a parent the config no longer
+// designates.
+//
+// #6791 designated this loop the persistent recovery owner; it owned only the
+// create half. This is the other half, and it re-reads the active config every
+// 30 s, which is exactly the information needed.
+func (d *Daemon) staleFabricOverlays(cfg *config.Config) []netlink.Link {
+	configured := make(map[string]bool)
+	config.RangeInterfaces(cfg, func(ifName string, ifCfg *config.InterfaceConfig) {
+		if ifCfg.LocalFabricMember == "" || !strings.HasPrefix(ifName, "fab") {
+			return
+		}
+		configured[config.LinuxIfName(ifName)] = true
+	})
+	var out []netlink.Link
+	for _, name := range fabricOverlayNames() {
+		if configured[name] {
+			continue
+		}
+		link, err := d.fabricLinkByName(name)
+		if err != nil || link == nil {
+			continue // absent is the desired state
+		}
+		// Only ever an IPVLAN we could have made. A same-named device of
+		// another type is not ours, and deleting it would be this reaper
+		// causing the outage it exists to prevent.
+		if _, ok := link.(*netlink.IPVlan); !ok {
+			continue
+		}
+		out = append(out, link)
+	}
+	return out
+}
+
+// reassertFabricIPVLANOnce re-creates one round of missing fabric overlays and
+// reaps one round of stale ones.
 //
 // It takes applySem BEFORE reading ActiveConfig, for the reason #4001 gave the
 // proxy-ARP loop: reading the config outside the semaphore lets a tick capture a
@@ -116,8 +166,13 @@ func (d *Daemon) reassertFabricIPVLANOnce(ctx context.Context) {
 	if d.store == nil {
 		return
 	}
-	if cfg := d.store.ActiveConfig(); cfg == nil || len(d.missingFabricOverlays(cfg)) == 0 {
-		return // cheap path: nothing configured, or everything already up
+	// #8372: the cheap-path gate must consider BOTH directions. A stale overlay
+	// is an EXTRA device, not a missing one, so `len(missing) == 0` is exactly
+	// the state a stale overlay produces -- gating on it alone would make the
+	// reaper unreachable in the only case it exists for.
+	if cfg := d.store.ActiveConfig(); cfg == nil ||
+		(len(d.missingFabricOverlays(cfg)) == 0 && len(d.staleFabricOverlays(cfg)) == 0) {
+		return // cheap path: nothing configured, and nothing extra
 	}
 	if err := d.applySem.Acquire(ctx, 1); err != nil {
 		return // ctx cancelled (daemon shutdown) — do not reconcile.
@@ -137,5 +192,33 @@ func (d *Daemon) reassertFabricIPVLANOnce(ctx context.Context) {
 			continue
 		}
 		slog.Info("fabric IPVLAN re-asserted", "parent", ov.parent, "name", ov.name)
+	}
+
+	// Reap AFTER the ensure, in the same pass and under the same semaphore.
+	//
+	// Ordering matters for the race the issue warns about. `OnXSKBound` runs on
+	// its own goroutine and can be creating an overlay concurrently, so a reap
+	// can in principle delete a link that path is mid-way through building. The
+	// ordering does not prevent that -- nothing can, without joining a
+	// goroutine nobody joins -- but it makes the outcome CONVERGENT rather than
+	// oscillating: the set is re-derived from the current config on every pass,
+	// so a configured overlay deleted by a racing reap is recreated by the next
+	// ensure 30 s later, and a stale one recreated by a racing closure is reaped
+	// by the next pass. The closure fires ONCE per manager lifetime
+	// (`xskBoundNotified`), so the race window is the startup one and does not
+	// recur.
+	for _, link := range d.staleFabricOverlays(cfg) {
+		name := ""
+		if link.Attrs() != nil {
+			name = link.Attrs().Name
+		}
+		slog.Warn("fabric IPVLAN present but not in the active config — reaping",
+			"name", name)
+		if err := d.fabricLinkDel(link); err != nil {
+			slog.Error("fabric IPVLAN reap failed; will retry",
+				"name", name, "err", err)
+			continue
+		}
+		slog.Info("fabric IPVLAN reaped", "name", name)
 	}
 }
