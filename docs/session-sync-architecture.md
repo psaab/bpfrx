@@ -1673,6 +1673,58 @@ Only sessions owned by the local node for the ingress zone are sent.
 The sweep is deliberately separate from userspace deltas. It is still the only
 way the kernel conntrack path exports incremental session creation.
 
+#### Attributing sweep volume (#7842)
+
+Since #6965 mirrored ordinary transit sessions into the conntrack maps, the
+sweep and the authoritative delta stream cover **overlapping** populations, so a
+transit session created and still alive at the next sweep is sent twice. The
+duplication is bounded at **one extra copy per session**, not a repeating cost —
+the sweep's filter is `Created >= lastSweepTime`, so once a session is behind the
+window it is never re-sent. At `syncHeaderSize` (12) + a 220-byte v4 payload that
+is **232 bytes per new transit session**.
+
+The overlap is not exact, and the difference is worth stating because it bounds
+how much of the sweep's volume is genuinely redundant. The sweep gates on
+`ShouldSyncZone(val.IngressZone)` unconditionally. The delta stream
+(`shouldSyncUserspaceDelta`, daemon_ha_userspace_stream.go:28) has THREE branches:
+a fabric-redirect arm and a fallback arm that both use
+`ShouldSyncZone(ingressZone)`, but a middle arm — taken whenever the delta
+carries `OwnerRGID > 0` — that uses `IsPrimaryForRGFn(delta.OwnerRGID)` instead.
+`ShouldSyncZone` resolves zone → RG through `zoneRGMap` and then asks the same
+primary question, so the two agree when `zoneRGMap[ingressZone] ==
+delta.OwnerRGID` and can diverge when they do not. A session the delta stream
+admits on RG ownership but whose ingress zone the sweep declines (or the
+reverse) is sent ONCE, not twice.
+
+**Both producers increment the same `stats.SessionsSent`.** The sweep queues via
+`queueMessage(msg, &s.stats.SessionsSent, "sweep_v4")` and the delta stream via
+`QueueSessionV4` → the identical counter; the `source` string reaches only the
+send-queue-overflow warning. So `SessionsSent` is their SUM, and #7842's own
+proposal to settle the question by "measuring `stats.SessionsSent` and
+`stats.Errors` at a realistic connection rate" **cannot** settle it — a
+duplicate and an original are indistinguishable in that counter. Two runs on the
+loss userspace cluster produced totals that could not be attributed for exactly
+that reason.
+
+`stats.SweepSessionsSent` is the mirror-sweep **sub-total** of `SessionsSent`
+(a sweep send increments both), so the delta stream's share is the difference.
+`show chassis cluster statistics` renders it under `Session create` as
+`of which mirror sweep`. `sync_sweep_volume_attribution_7842_test.go` pins the
+relationship from both sides — a sweep send must move both counters, a
+delta-stream send must move only the total.
+
+**The overflow knee is arithmetic, and it is what any "leave it as-is" decision
+rests on.** `sendCh` holds 4096 messages and the userspace sweep runs every 15 s
+(`SessionSyncSweepProfile`), and the walk has **no per-pass budget** — it queues
+every matching session in one unbounded pass. So a sweep window containing more
+than 4096 new transit sessions can exhaust the queue: roughly **273 new transit
+flows/sec**, worst case with no concurrent drain. Below that the sweep costs one
+232-byte duplicate per session and buys the only recovery path for a
+daemon→peer queue drop (`syncBackfillNeeded`, whose only consumers are in the
+sweep). Above it, overflow is self-feeding: an overflowing sweep declines to
+advance `lastSweepTime`, so the next pass replays a window that has meanwhile
+grown.
+
 ### Delete Journal
 
 Delete messages are queued immediately from conntrack GC callbacks. If the peer

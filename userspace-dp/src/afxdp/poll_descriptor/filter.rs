@@ -1871,14 +1871,26 @@ mod filter_log_egress_zone_tests {
             !fw.egress.contains_key(&SHARED_TUNNEL_IFINDEX_6722),
             "precondition: MAC-less, so no egress row"
         );
+        // #7509 retarget of this cell's non-vacuity guard. It used to read "the
+        // map the log site must NOT read carries a nonzero zone for this
+        // ifindex", which stopped holding once INGRESS refused the inherited
+        // zone too. The replacement is the guard that still discriminates: an
+        // UNCONTESTED ifindex in the SAME state logs a real zone here, so
+        // "logs 0" cannot pass on a state with no zones in it.
+        assert_eq!(
+            filter_log_egress_zone_id(&fw, ZONED_TUNNEL_IFINDEX_6722),
+            TEST_SIBLING_VPN_ZONE_ID_6722,
+            "control: the unambiguous sibling ifindex 43 still logs `vpnb` in this \
+             same state"
+        );
         assert_eq!(
             fw.ifindex_to_zone_id
                 .get(&SHARED_TUNNEL_IFINDEX_6722)
                 .copied()
                 .unwrap_or(0),
-            TEST_SIBLING_VPN_ZONE_ID_6722,
-            "precondition: the map the log site must NOT read carries a real \
-             nonzero zone for this ifindex"
+            0,
+            "and after #7509 the INGRESS map refuses the shared ifindex as well, so \
+             both halves agree that ifindex 42 names no zone"
         );
         assert_eq!(
             filter_log_egress_zone_id(&fw, SHARED_TUNNEL_IFINDEX_6722),

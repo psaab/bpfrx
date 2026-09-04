@@ -188,6 +188,10 @@ func (s *SessionSync) syncSweep() int {
 			s.stampInstallGenV4(key, &val)
 			msg := encodeSessionV4(key, val)
 			if s.queueMessage(msg, &s.stats.SessionsSent, "sweep_v4") {
+				// #7842: attribute this send to the sweep. A sub-total of
+				// SessionsSent, not a separate population -- the delta
+				// stream's share is SessionsSent - SweepSessionsSent.
+				s.stats.SweepSessionsSent.Add(1)
 				count++
 			} else {
 				overflow = true
@@ -207,6 +211,7 @@ func (s *SessionSync) syncSweep() int {
 			s.stampInstallGenV6(key, &val)
 			msg := encodeSessionV6(key, val)
 			if s.queueMessage(msg, &s.stats.SessionsSent, "sweep_v6") {
+				s.stats.SweepSessionsSent.Add(1)
 				count++
 			} else {
 				overflow = true
