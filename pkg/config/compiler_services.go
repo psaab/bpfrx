@@ -1184,7 +1184,28 @@ func compileRPM(node *Node, svc *ServicesConfig) error {
 		}
 
 		for _, testInst := range namedInstances(probeInst.node.FindChildren("test")) {
-			test := &RPMTest{Name: testInst.name}
+			// #8436: find-or-create the TEST too, one level below the probe.
+			// The probe above was already fixed; this was not, and it is the
+			// same defect one layer down — a second `test T { ... }` block
+			// constructed a fresh RPMTest and overwrote the first under one
+			// map key, so everything the first block set was silently
+			// discarded while the flat-set spelling merged.
+			//
+			// It survived seven batches of #8436 because the CENSUS could not
+			// see it: its synthesized probe omits the required `target`, so
+			// the compile failed and the site was counted as
+			// "a spelling did not parse or compile" rather than checked. That
+			// skip is now itself pinned (dupConservationSkipped8436), so the
+			// next container the census cannot probe is a recorded decision
+			// instead of a silent count.
+			//
+			// THE DIFFERENT-NAMES CASE IS PRESERVED BY CONSTRUCTION: the
+			// lookup is keyed on the test NAME, so two blocks naming different
+			// tests occupy different keys and both survive.
+			test := probe.Tests[testInst.name]
+			if test == nil {
+				test = &RPMTest{Name: testInst.name}
+			}
 
 			for _, prop := range testInst.node.Children {
 				switch prop.Name() {
