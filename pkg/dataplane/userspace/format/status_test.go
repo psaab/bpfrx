@@ -265,14 +265,20 @@ func TestFormatStatusSummaryShowsNAT64FragDropped(t *testing.T) {
 func TestFormatStatusSummaryShowsNAT64ExthdrIneligible(t *testing.T) {
 	status := userspace.ProcessStatus{
 		Bindings: []userspace.BindingStatus{
-			{Slot: 0, Nat64ExthdrIneligible: 6},
-			{Slot: 1, Nat64ExthdrIneligible: 9},
+			{Slot: 0, Nat64ExthdrIneligible: 6, Nat64IneligibleProtocol: 4},
+			{Slot: 1, Nat64ExthdrIneligible: 9, Nat64IneligibleProtocol: 8},
 		},
 	}
 
 	out := FormatStatusSummary(status)
 	if !strings.Contains(out, "NAT64 ext-header ineligible drops:15") {
 		t.Fatalf("summary missing NAT64 ext-header ineligible drop row (want 15):\n%s", out)
+	}
+	// #8670: the protocol-ineligibility row aggregates across bindings like its
+	// siblings. A DISTINCT total (12, not 15) so a row that accidentally
+	// rendered the ext-header aggregate cannot pass this.
+	if !strings.Contains(out, "NAT64 ineligible-protocol drops:12") {
+		t.Fatalf("summary missing NAT64 ineligible-protocol drop row (want 12):\n%s", out)
 	}
 }
 

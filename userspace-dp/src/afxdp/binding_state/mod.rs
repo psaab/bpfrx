@@ -350,6 +350,16 @@ pub(in crate::afxdp) struct BindingLiveState {
     /// counter; a non-zero value flags AH-protected or active-extension traffic
     /// aimed at a NAT64 prefix. Distinct from the source/pool/fragment counters.
     pub(super) nat64_exthdr_ineligible: AtomicU64,
+    /// #8670: cumulative fail-closed NAT64 PROTOCOL-ineligibility drops — a
+    /// packet addressed to a Pref64 destination whose IP protocol stateful
+    /// NAT64 does not translate (RFC 6146 covers TCP, UDP and ICMP only), so it
+    /// arrives flowless and is refused at the Pref64-destination gate.
+    /// Surfaced as the `NAT64 ineligible-protocol drops` operator counter; a
+    /// non-zero value flags tunnel traffic (ESP, GRE, IPIP) or a routing
+    /// protocol aimed at a NAT64 prefix, which is an architectural mismatch
+    /// rather than a fragmentation or capacity problem. Distinct from the
+    /// fragment counter (a real fragment) and the ext-header counter.
+    pub(super) nat64_ineligible_protocol: AtomicU64,
     /// #4477: cumulative source-NAT allocation failures (rule matched, no
     /// translated mapping could be allocated — missing/empty/invalid/exhausted
     /// pool, wrong family, or a non-first fragment on a port-translating rule).
@@ -883,10 +893,17 @@ pub(in crate::afxdp) struct BindingLiveState {
 // happened: the tail padding is now full, so `size_of` moved a whole 64-byte
 // alignment unit rather than absorbing the field. An unchanged 2304 would now
 // be the surprising result.
-const _: [(); 2368] = [(); std::mem::size_of::<BindingLiveState>()];
 const _: [(); 64] = [(); std::mem::align_of::<BindingLiveState>()];
-const _: [(); 2184] = [(); std::mem::offset_of!(BindingLiveState, pending_tx_admitted)];
-const _: [(); 2312] = [(); std::mem::offset_of!(BindingLiveState, delta_loss_pending)];
+//
+// #8670 added `nat64_ineligible_protocol` and hit the INVERSE of the case
+// above: `size_of` stayed 2368 (the 64-byte alignment unit #7156 opened still
+// had room) while both offsets moved 2184 -> 2192 and 2312 -> 2320. That is
+// exactly the reading the #6664 note warns about — an unchanged `size_of` is
+// not evidence the field failed to land, and here it is the OFFSETS that
+// carried the proof. Verified in both configurations per the note above.
+const _: [(); 2368] = [(); std::mem::size_of::<BindingLiveState>()];
+const _: [(); 2192] = [(); std::mem::offset_of!(BindingLiveState, pending_tx_admitted)];
+const _: [(); 2320] = [(); std::mem::offset_of!(BindingLiveState, delta_loss_pending)];
 
 impl BindingLiveState {
     pub(super) fn new() -> Self {
@@ -973,6 +990,7 @@ impl BindingLiveState {
             nat64_ineligible_source: AtomicU64::new(0),
             nat64_ineligible_dest: AtomicU64::new(0),
             nat64_exthdr_ineligible: AtomicU64::new(0),
+            nat64_ineligible_protocol: AtomicU64::new(0),
             nat_alloc_fail: AtomicU64::new(0),
             nat_frag_untranslated_dropped: AtomicU64::new(0),
             slow_path_packets: AtomicU64::new(0),

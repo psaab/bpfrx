@@ -590,6 +590,9 @@ mod tests_nat64_tunnel;
 #[path = "tests_nat64_overlap_8115.rs"]
 mod tests_nat64_overlap_8115;
 #[cfg(test)]
+#[path = "tests_nat64_protocol_ineligible_8670.rs"]
+mod tests_nat64_protocol_ineligible_8670;
+#[cfg(test)]
 #[path = "tests_gre_local_delivery.rs"]
 mod tests_gre_local_delivery;
 #[cfg(test)]
@@ -762,6 +765,23 @@ pub(in crate::afxdp) struct BatchCounters {
     // ext-header ineligible drops` operator counter. Distinct from the
     // source/pool/fragment counters — this is an ext-header input reject.
     nat64_exthdr_ineligible: u64,
+    // #8670: fail-closed NAT64 PROTOCOL-ineligibility drops — an IPv6 packet
+    // addressed to a Pref64 destination whose IP protocol stateful NAT64 does
+    // not translate. RFC 6146 specifies stateful NAT64 for TCP, UDP and ICMP
+    // only; everything else (GRE 47, ESP 50, OSPF 89, SCTP 132, IPIP 4, PIM
+    // 103 — measured) has no L4 identity the shim can resolve, so it stays
+    // flowless and reaches the Pref64-destination gate on the flowless transit
+    // arm untranslated. A Pref64 is a translation namespace, not a forwardable
+    // destination, so refusing is correct; what was WRONG is that the refusal
+    // was attributed to `nat64_frag_dropped`. These packets are not fragments,
+    // and that counter is surfaced to operators as `NAT64 fragment drops`, so a
+    // broken IPsec (ESP) or GRE tunnel across a NAT64 prefix reported a
+    // FRAGMENTATION problem and sent the operator to PMTU. Flushed to
+    // BindingLiveState.nat64_ineligible_protocol and surfaced as the `NAT64
+    // ineligible-protocol drops` operator counter. Distinct from the
+    // fragment counter (that one is a real fragment) and from the ext-header
+    // counter (AH/Routing/Mobility, attributed first at both sites).
+    nat64_ineligible_protocol: u64,
     // #4477: source-NAT allocation failures — a source-NAT rule matched but no
     // translated mapping could be allocated (missing/empty/invalid pool,
     // exhausted port allocator, wrong family, or a non-first fragment on a
@@ -1004,6 +1024,20 @@ impl BatchCounters {
         self.nat64_exthdr_ineligible += 1;
     }
 
+    /// #8670: record one fail-closed NAT64 protocol-ineligibility drop — a
+    /// packet addressed to a Pref64 destination carrying an IP protocol
+    /// stateful NAT64 does not translate (RFC 6146 covers TCP, UDP and ICMP
+    /// only). Bumped from the Pref64-destination gate on the flowless transit
+    /// arm, which attributes by reason in the same order the TX dispatcher
+    /// does: ext-header first, then fragment, then protocol. Batched like the
+    /// sibling nat64 drop counters and flushed to
+    /// `BindingLiveState.nat64_ineligible_protocol`.
+    #[inline]
+    pub(in crate::afxdp) fn record_nat64_ineligible_protocol(&mut self) {
+        self.touched = true;
+        self.nat64_ineligible_protocol += 1;
+    }
+
     fn flush(&mut self, live: &BindingLiveState) {
         if !self.touched {
             return;
@@ -1116,6 +1150,13 @@ impl BatchCounters {
             live.nat64_exthdr_ineligible
                 .fetch_add(self.nat64_exthdr_ineligible, Ordering::Relaxed);
             self.nat64_exthdr_ineligible = 0;
+        }
+        // #8670: fail-closed NAT64 protocol-ineligibility tally, batched like
+        // the sibling nat64 drop counters above.
+        if self.nat64_ineligible_protocol != 0 {
+            live.nat64_ineligible_protocol
+                .fetch_add(self.nat64_ineligible_protocol, Ordering::Relaxed);
+            self.nat64_ineligible_protocol = 0;
         }
         // #4477: source-NAT allocation-failure tally.
         if self.nat_alloc_fail != 0 {
