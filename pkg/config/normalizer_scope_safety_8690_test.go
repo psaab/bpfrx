@@ -27,35 +27,93 @@ func TestNormalizerScopeNeverCoversAPartialSite8690(t *testing.T) {
 	if len(shapes) == 0 {
 		t.Fatal("no inventory shapes; this cell is blind")
 	}
+	// ADMISSION COMES FROM THE PASS, NOT FROM A RE-DERIVED MODEL OF IT (#8690).
+	//
+	// This loop used to reconstruct the pair from the inventory path —
+	// `head := fields[len(fields)-1]; kw := fields[len(fields)-2]` — and ask
+	// `compactNormalizeInScope(kw, head)`. That is the same re-derivation the
+	// scope guard in compact_normalize_scope_8690_test.go documents as WRONG,
+	// applied to the more dangerous half of the rule.
+	//
+	// Production calls the predicate with `node.Keys[0]`, which is:
+	//
+	//	wildcard container   `interfaces { ge-0-0-0 mtu 1500; }`  -> ("ge-0-0-0", "mtu")  the INSTANCE NAME
+	//	named child w/ args  `system { login { user u1 class X; } }` -> ("user", "class") the KEYWORD
+	//	plain child          `term t1 { then metric 5; }`         -> ("then", "metric")   the keyword
+	//
+	// The inventory path carries the schema ARG PLACEHOLDER in that position,
+	// so for the ten `interfaces xpfname <leaf>` / `bridge-domains xpfname
+	// <leaf>` partials this cell asked ("xpfname", …) while production asks
+	// (<instance name>, …). It happened to be SOUND — production's keyword
+	// there is an arbitrary instance name no static rule can match, and a
+	// head-only rule matches both spellings — but sound BY ACCIDENT, not by
+	// construction.
+	//
+	// It goes blind the moment a partial site appears under a named-child-with-
+	// args container: production would ask ("user", "uid") while this cell asks
+	// ("xpfarg", "uid"), match nothing, and report a clean scope for a widening
+	// that truncates a tail something reads. That is not hypothetical — `system
+	// login user <u> uid` became a live site during #8697, and the identical
+	// ("user", "class") shape already caused a real miss in #8708.
+	//
+	// So ask the pass. Build the elided spelling, run it, and require that the
+	// pass leave the site ALONE. No model, no drift, and the answer is
+	// production's own.
 	partials := 0
+	examined := 0
+	byKey := map[string]bool{}
 	for site, shape := range shapes {
-		if shape != "partial" {
-			continue
-		}
-		partials++
-		// Reconstruct the (container keyword, head) pair the normalizer would
-		// see: the fold is at the container's last token, and the head is the
-		// leaf. Inventory lines are "<container...> <leaf>".
-		fields := strings.Fields(site)
-		if len(fields) < 2 {
-			continue
-		}
-		head := fields[len(fields)-1]
-		kw := fields[len(fields)-2]
-		if compactNormalizeInScope(kw, head) {
-			t.Errorf("site %q is shape PARTIAL — something consumes part of its tail — but the "+
-				"normalizer's scope covers the pair (%q, %q). Truncating it can remove a value "+
-				"that is currently read, on a config that commits clean (#8690)", site, kw, head)
+		if shape == "partial" {
+			partials++
+			byKey[site] = true
 		}
 	}
-	// DEGENERACY CONTROL: if no partial sites remain, the loop above asserts
-	// nothing and would pass on any scope whatsoever.
+	for _, s := range collectCompactSites() {
+		if len(s.container) == 0 || strings.HasPrefix(s.container[0], "groups") {
+			continue
+		}
+		siteKey := strings.Join(s.container, " ") + " " + s.leaf
+		if !byKey[siteKey] {
+			continue
+		}
+		parent := s.container[:len(s.container)-1]
+		stanza := s.container[len(s.container)-1]
+		v1, _, ok := synthPair(s.node)
+		if !ok {
+			continue
+		}
+		elided := nest(parent, contextFor(parent)+stanza+" "+s.leaf+" "+v1+";")
+		probe, perrs := NewParser(elided).Parse()
+		if len(perrs) > 0 || probe == nil {
+			continue
+		}
+		examined++
+		if normalizeCompactStanzas(probe) != 0 {
+			t.Errorf("site %q is shape PARTIAL — something consumes part of its tail — but the "+
+				"normalizer TOUCHES it. Truncating it can remove a value that is currently "+
+				"read, on a config that commits clean (#8690)", siteKey)
+		}
+	}
+	// DEGENERACY CONTROL, in two parts.
+	//
+	// The first is the original: with no partial sites left the loop asserts
+	// nothing and would pass against any scope whatsoever.
 	if partials == 0 {
 		t.Fatal("no PARTIAL sites left in the inventory — this cell can no longer catch a scope " +
 			"that crosses into one, and its silence means nothing. Re-derive it against whatever " +
 			"now distinguishes safe from unsafe sites")
 	}
-	t.Logf("#8690: %d partial sites checked against the normalizer's scope", partials)
+	// The second is NEW and is the one the re-derivation made necessary: this
+	// loop can now SKIP a partial site (unsynthesizable value, unparseable
+	// spelling, absent from the census walk) and a skip is silent. A site this
+	// cell did not examine is not a site it found safe, so the count must
+	// reconcile against the inventory rather than being reported as-is.
+	if examined != partials {
+		t.Errorf("examined %d of %d PARTIAL sites — %d were skipped and are therefore "+
+			"UNCHECKED, not safe. A partial site the guard cannot reach is exactly "+
+			"the one a widening can cross into unobserved (#8690)", examined, partials, partials-examined)
+	}
+	t.Logf("#8690: %d of %d PARTIAL sites driven through the real pass", examined, partials)
 }
 
 // The consequential member of family 2, asserted on the compiled config with a
