@@ -537,6 +537,43 @@ fn parse_tcp_reply_source(frame: &[u8]) -> Option<TcpReplySource> {
         6 => libc::AF_INET6 as u8,
         _ => return None,
     };
+    // #8597 K37: DECLINE a non-first fragment, the same gate `clamp_tcp_mss`
+    // takes 250 lines above.
+    //
+    // On a non-first fragment the bytes at `l4` are PAYLOAD, not a TCP header,
+    // so every field below — ports, seq, ack, flags — would be read from
+    // attacker-chosen data and then reflected into a SYN-ACK or an RST by the
+    // three builders that call this.
+    //
+    // The protocol check further down does NOT cover this, and that is the
+    // subtle part: it reads the protocol byte out of the FRAME's IP header,
+    // where a fragmented TCP datagram still says TCP (6) in every fragment.
+    // Fragmentation does not change that field.
+    //
+    // NOT REACHABLE TODAY, and the defence is remote enough to be worth naming
+    // rather than relying on. The shim substitutes `PROTO_FRAGMENT_NO_L4` for a
+    // non-first fragment's protocol BEFORE `parse_l4` (`userspace-xdp/src/lib.rs`
+    // `parse_ipv4`), so `meta.protocol` is not `PROTO_TCP` and `meta.tcp_flags`
+    // is 0 — which is what actually stops all three callers: the two syn-cookie
+    // builders need SYN flags from screen, and `reject_reply.rs` branches on
+    // `meta.protocol == PROTO_TCP` and takes the ICMP arm instead.
+    //
+    // So the invariant protecting this function lives in a different crate, is
+    // keyed on `meta` while this function reads the FRAME, and no test here can
+    // red without it. That is precisely the kind of guard worth making local.
+    match addr_family as i32 {
+        libc::AF_INET => {
+            if ipv4_is_non_first_fragment(ip) {
+                return None;
+            }
+        }
+        libc::AF_INET6 => {
+            if ipv6_is_non_first_fragment(ip) {
+                return None;
+            }
+        }
+        _ => return None,
+    }
     let l4 = frame_l4_offset(frame, addr_family)?;
     let tcp = frame.get(l4..l4 + TCP_MIN_HEADER_LEN)?;
     let protocol = match addr_family as i32 {

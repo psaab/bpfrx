@@ -477,6 +477,31 @@ type pendingDropWarn struct {
 	droppedCooldown uint64
 }
 
+// pendingDebug is a slog.Debug record captured under s.mu and emitted after
+// the deferred Unlock, for exactly the reason pendingDropWarn exists (#2287).
+//
+// #8597: the #2287 fix moved the drop WARNING out from under the lock but left
+// two `slog.Debug("... reconnecting")` emits on the same failure path under it.
+// Under `xpfd --debug` those records are enabled, so slog.Default() — a
+// SyslogSlogHandler in the daemon — synchronously forwards them to this same
+// client's Send, which re-locks the already-held s.mu on the same goroutine and
+// wedges the caller (the dataplane event reader) forever. The #2287 cells could
+// not see it because their base handler sits at Info, where slog.Debug
+// short-circuits before reaching the handler.
+type pendingDebug struct {
+	msg string
+	err error
+}
+
+// emit emits the captured debug record. It MUST be called with s.mu NOT held
+// (via a defer ordered to run after the Unlock). A nil receiver is a no-op.
+func (d *pendingDebug) emit(remoteAddr string) {
+	if d == nil {
+		return
+	}
+	slog.Debug(d.msg, "addr", remoteAddr, "err", d.err)
+}
+
 // noteDrop bumps the appropriate drop counter and, subject to the ≤1/s gate,
 // returns a snapshot describing a warning the CALLER must emit after releasing
 // s.mu (see pendingDropWarn). It returns nil when the rate-limit gate swallows
@@ -598,7 +623,11 @@ func (s *SyslogClient) Send(severity int, msg string) error {
 	// client's Send and self-deadlocks (#2287). Defers run LIFO, so this
 	// emit-defer (registered first) runs after the Unlock-defer.
 	var pendingWarn *pendingDropWarn
-	defer func() { pendingWarn.emit(s.remoteAddr) }()
+	var pendingDbg *pendingDebug
+	defer func() {
+		pendingDbg.emit(s.remoteAddr)
+		pendingWarn.emit(s.remoteAddr)
+	}()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -620,7 +649,8 @@ func (s *SyslogClient) Send(severity int, msg string) error {
 				pendingWarn = s.noteDrop(dropWrite, err)
 				return err
 			}
-			slog.Debug("syslog send failed, reconnecting", "addr", s.remoteAddr, "err", err)
+			// Captured, not emitted: this runs under s.mu (#8597).
+			pendingDbg = &pendingDebug{msg: "syslog send failed, reconnecting", err: err}
 			if rerr := s.reconnect(); rerr != nil {
 				// Cooldown or dial failure: drop and continue. The event
 				// reader must make forward progress regardless.
@@ -729,7 +759,11 @@ func (s *SyslogClient) SendBinary(data []byte) error {
 	// See Send: the drop warning is emitted after the deferred Unlock to avoid
 	// the slog re-entrancy self-deadlock (#2287).
 	var pendingWarn *pendingDropWarn
-	defer func() { pendingWarn.emit(s.remoteAddr) }()
+	var pendingDbg *pendingDebug
+	defer func() {
+		pendingDbg.emit(s.remoteAddr)
+		pendingWarn.emit(s.remoteAddr)
+	}()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -746,7 +780,8 @@ func (s *SyslogClient) SendBinary(data []byte) error {
 				pendingWarn = s.noteDrop(dropWrite, err)
 				return err
 			}
-			slog.Debug("syslog binary send failed, reconnecting", "addr", s.remoteAddr, "err", err)
+			// Captured, not emitted: this runs under s.mu (#8597).
+			pendingDbg = &pendingDebug{msg: "syslog binary send failed, reconnecting", err: err}
 			if rerr := s.reconnect(); rerr != nil {
 				if rerr == errReconnectCooldown {
 					pendingWarn = s.noteDrop(dropCooldown, err)
