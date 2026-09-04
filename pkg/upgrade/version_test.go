@@ -20,32 +20,32 @@ func TestValidateVersionSegment(t *testing.T) {
 	}
 
 	invalid := []string{
-		"",                 // empty
-		".",                // relative
-		"..",               // parent
-		"../escape",        // traversal
-		"a/b",              // separator
-		"/abs",             // leading separator
-		".hidden",          // leading dot (dotfile namespace)
-		"ver with space",   // whitespace
-		"tab\there",        // tab
-		"new\nline",        // newline
-		"cr\rret",          // carriage return
-		"ctrl\x01char",     // control char
-		"del\x7fchar",      // DEL
-		"trailing ",        // trailing space
+		"",                   // empty
+		".",                  // relative
+		"..",                 // parent
+		"../escape",          // traversal
+		"a/b",                // separator
+		"/abs",               // leading separator
+		".hidden",            // leading dot (dotfile namespace)
+		"ver with space",     // whitespace
+		"tab\there",          // tab
+		"new\nline",          // newline
+		"cr\rret",            // carriage return
+		"ctrl\x01char",       // control char
+		"del\x7fchar",        // DEL
+		"trailing ",          // trailing space
 		"...current.partial", // leading-dot dotfile collision
-		"1.0.0é",           // non-ASCII (parity with shell tr -d [:graph:])
-		"veré",             // non-ASCII rune
+		"1.0.0é",             // non-ASCII (parity with shell tr -d [:graph:])
+		"veré",               // non-ASCII rune
 		// #5713 M41: '%' is a systemd unit specifier — a version carrying it
 		// would rewrite the pinned ExecStart path when substituted into the
 		// unit drop-in. These MUST be rejected (fail-on-revert: without the
 		// strict allowlist, '%' passes as a "safe path segment" and lands in
 		// ExecStart, where systemd expands it).
-		"%i",       // bare systemd instance specifier
-		"1.0%n",    // %n = unit name
-		"100%",     // trailing percent
-		"%%",       // escaped percent (still not a legal version char)
+		"%i",    // bare systemd instance specifier
+		"1.0%n", // %n = unit name
+		"100%",  // trailing percent
+		"%%",    // escaped percent (still not a legal version char)
 		// Other systemd argv metacharacters, also illegal in Debian/semver.
 		"1.0.0$x",  // env-var expansion
 		`1.0.0"x`,  // argv quote

@@ -28,8 +28,9 @@ import (
 //     ExecStart, and systemd EXPANDED it — silently rewriting argv[0] to an
 //     unintended binary after the upgrade STOP. This was M41.
 //   - '$' triggers systemd environment-variable expansion.
-//   - '"', '\'', '\\', and backtick are consumed by systemd's argv
+//   - '"', '\”, '\\', and backtick are consumed by systemd's argv
 //     quote/escape splitting and can alter the resolved executable path.
+//
 // None of these is legal in a Debian/semver version, so the allowlist
 // rejects them fail-closed rather than substituting them into ExecStart.
 //

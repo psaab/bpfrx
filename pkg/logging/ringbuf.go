@@ -135,7 +135,6 @@ const (
 	closeReasonHostInbound = 6
 )
 
-
 const (
 	eventTypeSessionOpen  = 1
 	eventTypeSessionClose = 2
@@ -952,12 +951,12 @@ func DecodeRawEventRecord(data []byte) (EventRecord, bool) {
 	}
 
 	rec := EventRecord{
-		Time:            eventTimeFromWire(evt.Timestamp),
-		Type:            eventTypeName(evt.EventType),
-		SrcAddr:         srcStr,
-		DstAddr:         dstStr,
-		Protocol:        protoName(evt.Protocol),
-		ProtocolNum:     evt.Protocol,
+		Time:        eventTimeFromWire(evt.Timestamp),
+		Type:        eventTypeName(evt.EventType),
+		SrcAddr:     srcStr,
+		DstAddr:     dstStr,
+		Protocol:    protoName(evt.Protocol),
+		ProtocolNum: evt.Protocol,
 		// #7531: empty for a lifecycle event (see recordActionName).
 		Action:          recordActionName(evt.EventType, evt.Action),
 		PolicyID:        evt.PolicyID,

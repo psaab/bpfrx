@@ -12,13 +12,13 @@ func TestCanonicalInterfaceUnitRef5878(t *testing.T) {
 	cases := []struct {
 		in, want string
 	}{
-		{"ge-0/0/0.01", "ge-0/0/0.1"}, // leading zero
-		{"ge-0/0/0.1", "ge-0/0/0.1"},  // already canonical
-		{"ge-0/0/0.+1", "ge-0/0/0.1"}, // redundant sign
-		{"ge-0/0/0.00", "ge-0/0/0.0"}, // zero alias
-		{"ge-0/0/0.-0", "ge-0/0/0.0"}, // signed zero
-		{"ge-0/0/0", "ge-0/0/0"},      // bare interface — unchanged
-		{"ge-0/0/0.", "ge-0/0/0."},    // trailing dot (bare) — unchanged
+		{"ge-0/0/0.01", "ge-0/0/0.1"},          // leading zero
+		{"ge-0/0/0.1", "ge-0/0/0.1"},           // already canonical
+		{"ge-0/0/0.+1", "ge-0/0/0.1"},          // redundant sign
+		{"ge-0/0/0.00", "ge-0/0/0.0"},          // zero alias
+		{"ge-0/0/0.-0", "ge-0/0/0.0"},          // signed zero
+		{"ge-0/0/0", "ge-0/0/0"},               // bare interface — unchanged
+		{"ge-0/0/0.", "ge-0/0/0."},             // trailing dot (bare) — unchanged
 		{"ge-0/0/0.tenant", "ge-0/0/0.tenant"}, // malformed suffix — unchanged (rejected at commit by #5933)
 		{"ge-0/0/0.99999", "ge-0/0/0.99999"},   // out-of-range — unchanged
 	}

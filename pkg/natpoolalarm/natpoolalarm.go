@@ -110,8 +110,8 @@ type Monitor struct {
 	tick   time.Duration
 	nowFn  func() time.Time
 
-	mu      sync.Mutex
-	active  map[string]*alarmState
+	mu     sync.Mutex
+	active map[string]*alarmState
 	// #7361: pools whose alarm is STRUCTURALLY INAPPLICABLE, with the reason.
 	// Separate from `active` because this is not a raised alarm — it never
 	// clears on utilization and must never emit a raise/clear syslog. It is a

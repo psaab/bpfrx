@@ -15,18 +15,18 @@ func TestValidateCryptHash(t *testing.T) {
 		"$6$saltsalt$abc123def456",
 		"$6$rounds=656000$salt$hash", // sha512crypt rounds param ('=' case)
 		"$5$rounds=5000$salt$hash",
-		"$y$j9T$saltsalt$hashhash",   // yescrypt (Debian 13 default)
+		"$y$j9T$saltsalt$hashhash",    // yescrypt (Debian 13 default)
 		"$2b$10$abcdefghijklmnopqrst", // bcrypt
 		"$2a$10$abcdefghijklmnopqrst",
 		"$2y$10$abcdefghijklmnopqrst",
-		"$1$salt$hash",         // md5crypt
-		"$7$salt$hash",         // scrypt
-		"$gy$j9T$salt$hash",    // gost-yescrypt
-		"!$6$salt$hash",        // locked-but-restorable
-		"!!$6$salt$hash",       // locked-but-restorable (double bang)
-		"*",                    // bare lock sentinel
-		"!",                    // bare lock sentinel
-		"!!",                   // bare lock sentinel
+		"$1$salt$hash",      // md5crypt
+		"$7$salt$hash",      // scrypt
+		"$gy$j9T$salt$hash", // gost-yescrypt
+		"!$6$salt$hash",     // locked-but-restorable
+		"!!$6$salt$hash",    // locked-but-restorable (double bang)
+		"*",                 // bare lock sentinel
+		"!",                 // bare lock sentinel
+		"!!",                // bare lock sentinel
 	}
 	for _, in := range accept {
 		if err := ValidateCryptHash(in, nil); err != nil {
@@ -181,9 +181,9 @@ func TestLoginUserEncryptedPasswordSchemaGate(t *testing.T) {
 // user with no usable authentication method (no keys, no usable password).
 func TestLoginUserNoAuthMethodWarning(t *testing.T) {
 	cases := []struct {
-		name      string
-		user      *LoginUser
-		wantWarn  bool
+		name     string
+		user     *LoginUser
+		wantWarn bool
 	}{
 		{"no auth at all", &LoginUser{Name: "op"}, true},
 		{"lock sentinel only", &LoginUser{Name: "op", EncryptedPassword: "!"}, true},

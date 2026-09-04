@@ -19,7 +19,9 @@ import (
 // case-EXACT predicate.
 //
 // FAIL-ON-REVERT: restoring the pre-#5820 predicate
-//   strings.EqualFold(ResolveSessionName(...), filter)
+//
+//	strings.EqualFold(ResolveSessionName(...), filter)
+//
 // makes the case-mismatch assertions below over-match (filter "foo" wrongly
 // matches the "Foo" session, filter "junos-http" wrongly matches the
 // "JUNOS-HTTP" session), turning this test RED — the required fail-on-revert

@@ -2,7 +2,6 @@ package grpcapi
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"net"
 	"syscall"
@@ -54,7 +53,15 @@ func (s *Server) dialPeer() (*grpc.ClientConn, error) {
 	// Try each fabric address; return first successful connection.
 	var lastErr error
 	for _, ip := range peerIPs {
-		peerAddr := fmt.Sprintf("%s:50051", ip)
+		// #8597 (muse-004 K29): net.JoinHostPort, not "%s:port". An IPv6
+		// fabric literal formatted the old way yields `2001:db8::2:50051`,
+		// which grpc.NewClient parses as a bogus host:port — so an IPv6-only
+		// fabric never dials its peer and the failure looks like the peer being
+		// unreachable. #4909 fixed the identical shape in `pkg/cli/peer.go`,
+		// whose comment documents this exact string; this site and the two
+		// fabric LISTENER addresses in `daemon_ha_comms_wiring.go` were the
+		// rest of that class.
+		peerAddr := net.JoinHostPort(ip, "50051")
 		conn, err := grpc.NewClient(peerAddr, dialOpts...)
 		if err != nil {
 			lastErr = err

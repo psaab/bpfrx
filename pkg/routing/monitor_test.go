@@ -154,7 +154,6 @@ func TestInterfaceMonitor_CarrierState(t *testing.T) {
 	}
 }
 
-
 // #8073: a transient LinkByName failure must not silently drop a monitored
 // interface from cluster status.
 //

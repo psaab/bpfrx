@@ -24,10 +24,10 @@ import (
 // code, which is exactly the shape of test that let this survive.
 func TestAnchoredDenySurvivesATrailingSibling8289(t *testing.T) {
 	for _, tc := range []struct {
-		deny      string
-		line      string
-		wantDeny  bool
-		why       string
+		deny     string
+		line     string
+		wantDeny bool
+		why      string
 	}{
 		{"^show version$", "show version", true, "the baseline the operator wrote the rule for"},
 		{"^show version$", "show version configuration", true,

@@ -157,11 +157,17 @@ func (d *Daemon) startFabricGRPCListeners(commsCtx context.Context, syncIP, sync
 	go func() {
 		for i := 0; i < 30; i++ {
 			if d.grpcSrv != nil {
-				grpcAddr := fmt.Sprintf("%s:50051", syncIP)
+				// #8597 (muse-004 K29 siblings): these are LISTEN addresses, and
+				// an IPv6 fabric literal formatted as "%s:50051" yields
+				// `2001:db8::2:50051` — which is not an address, so the fabric
+				// gRPC listener never binds and the peer-proxy path is dark on
+				// an IPv6-only fabric. Same class as the dial site in
+				// `grpcapi/server_diag.go` and as #4909's `pkg/cli/peer.go`.
+				grpcAddr := net.JoinHostPort(syncIP, "50051")
 				if syncLocal1 != "" {
 					// Extract fab1 local IP (syncLocal1 is "ip:4785").
 					fab1Host, _, _ := net.SplitHostPort(syncLocal1)
-					grpcAddr1 := fmt.Sprintf("%s:50051", fab1Host)
+					grpcAddr1 := net.JoinHostPort(fab1Host, "50051")
 					go d.grpcSrv.RunFabricListener(commsCtx, grpcAddr1, vrfDevice)
 					slog.Info("gRPC dual fabric listeners", "fab0", grpcAddr, "fab1", grpcAddr1)
 				}

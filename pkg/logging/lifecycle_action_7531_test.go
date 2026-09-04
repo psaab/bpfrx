@@ -30,9 +30,9 @@ import (
 func lifecycleEvent7531(t *testing.T, eventType uint8, action uint8) EventRecord {
 	t.Helper()
 	evt := &rawEvent{
-		EventType: eventType,
-		Protocol:  6,
-		Action:    action,
+		EventType:  eventType,
+		Protocol:   6,
+		Action:     action,
 		AddrFamily: addrFamilyInet,
 	}
 	return EventRecord{
