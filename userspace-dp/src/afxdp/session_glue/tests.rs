@@ -5717,6 +5717,7 @@ fn flush_session_deltas_without_binding_reaches_global_consumers() {
         observed_tos: 0,
         observed_tcp_flags: 0,
         session_id: 0,
+        bulk_resync: false,
     };
 
     // Synthesize a binding identity with labels only — exactly what the
@@ -5839,6 +5840,7 @@ fn flush_session_deltas_rt_flow_app_id_uses_post_nat_dst_port() {
         observed_tos: 0,
         observed_tcp_flags: 0,
         session_id: 0,
+        bulk_resync: false,
     };
 
     // Drive the production drain loop and return the stamped application_id off
@@ -5987,6 +5989,7 @@ fn flush_session_deltas_session_close_reresolves_policy_id_after_reorder() {
         observed_tos: 0,
         observed_tcp_flags: 0,
         session_id: 0,
+        bulk_resync: false,
     };
 
     let (handle, rx) = crate::event_stream::test_worker_handle(
@@ -6093,6 +6096,7 @@ fn flush_session_deltas_event_stream_drop_latches_out_of_sync() {
         observed_tos: 0,
         observed_tcp_flags: 0,
         session_id: 0,
+        bulk_resync: false,
     };
 
     let ident = BindingIdentity {
@@ -6195,6 +6199,7 @@ fn flush_session_deltas_full_queue_send_is_bounded_and_latches_out_of_sync() {
         observed_tos: 0,
         observed_tcp_flags: 0,
         session_id: 0,
+        bulk_resync: false,
     };
 
     // Saturate the channel: fill every slot with a best-effort filler push so the
@@ -6319,6 +6324,7 @@ fn resync_export_aggregate_lossless_wait_is_bounded_below_heartbeat() {
         observed_tos: 0,
         observed_tcp_flags: 0,
         session_id: 0,
+        bulk_resync: false,
     };
     for _ in 0..capacity {
         handle.push_delta(&open, &forwarding.zone_name_to_id);
@@ -6439,6 +6445,7 @@ fn close_delta_deletes_dnat_table_entry_for_snat_flow() {
             observed_tos: 0,
             observed_tcp_flags: 0,
             session_id: 0,
+            bulk_resync: false,
         }
     };
 
@@ -8709,5 +8716,171 @@ fn an_unattributable_refused_delete_is_counted_but_not_repaired_8114() {
             .pool_allocator
             .debug_is_port_occupied(0, 20000),
         "and the reservation stays exactly where it was"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #8593 — the WIRING: `flush_session_deltas` must route a bulk-export delta to
+// the non-arming push.
+// ---------------------------------------------------------------------------
+
+/// A `BindingLiveState` whose RPC-fallback buffer is already at
+/// `MAX_PENDING_SESSION_DELTAS`, with the loss latch cleared, so the next push
+/// through it is guaranteed to be refused.
+fn saturated_live_8593() -> Arc<BindingLiveState> {
+    let live = Arc::new(BindingLiveState::new());
+    for _ in 0..crate::afxdp::MAX_PENDING_SESSION_DELTAS {
+        live.push_session_delta(crate::protocol::SessionDeltaInfo::default());
+    }
+    let _ = live.take_delta_loss();
+    live
+}
+
+
+/// THE PRODUCER (#8593). `bulk_resync` is only useful if the export's own
+/// deltas carry it and nothing else does. `emit_open_delta_with_origin` is the
+/// sole producer — its only production caller is the worker loop's chunked
+/// owner-RG export — so this pins both directions on the same table.
+///
+/// Fires on: setting `bulk_resync: false` in `emit_open_delta_with_origin` (the
+/// export's drops start arming the latch again), and on setting it `true` in
+/// `push_open_delta`/`push_close_delta` (every incremental drop stops arming,
+/// which deletes the #5290 recovery).
+#[test]
+fn only_the_owner_rg_export_produces_a_bulk_resync_delta_8593() {
+    let mut sessions = SessionTable::new();
+    let key = test_key();
+    assert!(sessions.install_with_protocol(
+        key.clone(),
+        test_decision(),
+        test_metadata(),
+        1_000_000,
+        PROTO_TCP,
+        0x10,
+    ));
+    let install_deltas = sessions.drain_deltas(256);
+    assert!(
+        !install_deltas.is_empty(),
+        "fixture: the install must emit a delta, or neither arm proves anything"
+    );
+    assert!(
+        install_deltas.iter().all(|d| !d.bulk_resync),
+        "an ordinary install emits INCREMENTAL deltas; marking them bulk would \
+         stop every real drop from arming the resync"
+    );
+
+    sessions.emit_open_delta_with_origin(
+        key,
+        test_decision(),
+        test_metadata(),
+        SessionOrigin::ForwardFlow,
+        true,
+    );
+    let export_deltas = sessions.drain_deltas(256);
+    assert_eq!(
+        export_deltas.len(),
+        1,
+        "fixture: the export emits exactly one open delta"
+    );
+    assert!(
+        export_deltas[0].bulk_resync,
+        "the owner-RG export's own delta must be marked, or its overflow \
+         re-arms the latch that triggered the export"
+    );
+}
+
+fn delta_8593(key: &SessionKey, bulk_resync: bool) -> SessionDelta {
+    SessionDelta {
+        kind: SessionDeltaKind::Close,
+        key: key.clone(),
+        decision: test_decision(),
+        metadata: test_metadata(),
+        origin: SessionOrigin::ForwardFlow,
+        fabric_redirect_sync: false,
+        created_ns: 0,
+        last_seen_ns: 0,
+        counters: crate::session::SessionCounters::default(),
+        observed_tos: 0,
+        observed_tcp_flags: 0,
+        session_id: 0,
+        bulk_resync,
+    }
+}
+
+/// Drive `flush_session_deltas` once against a SATURATED fallback buffer and
+/// report whether the per-binding loss latch came out ARMED.
+fn flush_one_and_report_armed_8593(bulk_resync: bool) -> bool {
+    let live = saturated_live_8593();
+    let ident = BindingIdentity {
+        slot: 0,
+        queue_id: 0,
+        worker_id: 0,
+        interface: Arc::<str>::from(""),
+        ifindex: -1,
+    };
+    let dnat_fds = crate::afxdp::checksum::DnatTableFds::default();
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let recent_session_deltas = Arc::new(Mutex::new(VecDeque::new()));
+    let peer_worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = Vec::new();
+    let forwarding = ForwardingState::default();
+    let mut worker_lossless_wedged = false;
+    let dropped_before = live.session_delta_dropped.load(Ordering::Relaxed);
+
+    crate::afxdp::session_delta::flush_session_deltas(
+        &ident,
+        Some(&live),
+        -1,
+        -1,
+        -1,
+        &dnat_fds,
+        &[delta_8593(&test_key(), bulk_resync)],
+        &shared_sessions,
+        &shared_nat_sessions,
+        &shared_forward_wire_sessions,
+        &shared_owner_rg_indexes,
+        &recent_session_deltas,
+        &peer_worker_commands,
+        crate::afxdp::empty_worker_commands_by_id(),
+        &None,
+        &forwarding,
+        &mut worker_lossless_wedged,
+    );
+
+    assert_eq!(
+        live.session_delta_dropped.load(Ordering::Relaxed),
+        dropped_before + 1,
+        "fixture: the flush's push must actually have been REFUSED \
+         (bulk_resync={bulk_resync}) — if it fit, the latch result says nothing \
+         about the routing"
+    );
+    live.take_delta_loss()
+}
+
+/// THE WIRING (#8593). The non-arming push exists; this proves
+/// `flush_session_deltas` REACHES it — and that it does not reach it for an
+/// ordinary incremental delta.
+///
+/// Both arms run the same function over the same saturated buffer with the same
+/// delta, differing only in `bulk_resync`, so the marker is the only thing under
+/// test. A cell that exercised only `BindingLiveState`'s two push methods would
+/// stay green with `flush_session_deltas` calling the arming one
+/// unconditionally, which is the whole defect.
+///
+/// Fail-on-revert: drop the `delta.bulk_resync` branch in
+/// `flush_session_deltas` and the first assertion reds.
+#[test]
+fn flush_session_deltas_routes_a_bulk_export_drop_to_the_non_arming_push_8593() {
+    assert!(
+        !flush_one_and_report_armed_8593(true),
+        "a BULK-EXPORT delta the fallback buffer refused must not arm the \
+         loss-of-sync latch — arming it makes the resync re-trigger itself"
+    );
+    assert!(
+        flush_one_and_report_armed_8593(false),
+        "an INCREMENTAL delta the buffer refused must still arm it (#5290); a \
+         fix that never arms deletes the recovery instead of bounding it"
     );
 }

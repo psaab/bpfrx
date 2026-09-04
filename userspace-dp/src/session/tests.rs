@@ -4044,6 +4044,7 @@ fn reference_update_session(
             observed_tos: 0,
             observed_tcp_flags: 0,
             session_id: 0,
+            bulk_resync: false,
         });
     }
     true
@@ -7169,6 +7170,7 @@ fn open_delta(key: SessionKey) -> SessionDelta {
         observed_tos: 0,
         observed_tcp_flags: 0,
         session_id: 0,
+        bulk_resync: false,
     }
 }
 

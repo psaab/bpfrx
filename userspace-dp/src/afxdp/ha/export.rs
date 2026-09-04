@@ -175,6 +175,7 @@ impl crate::afxdp::Coordinator {
                 // dispatcher, NOT the RT_FLOW exporter, and the SyncedSessionEntry
                 // carries no session id. 0 (unknown).
                 session_id: 0,
+                bulk_resync: false,
             });
         }
         drop(sessions);
