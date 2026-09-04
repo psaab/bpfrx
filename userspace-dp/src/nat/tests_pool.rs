@@ -10498,3 +10498,467 @@ fn deterministic_address_only_mint_records_the_owning_worker_8597_k09() {
          forwarding on (#8597 K09, the #6522 mechanism)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #8597 K63 — the ADDRESS-ONLY synced reservation had no stale-tuple eviction
+// ---------------------------------------------------------------------------
+//
+// `reserve_flow_maybe_persistent` has two branches: an idempotent match that ORs
+// the holder, and the #6528 eviction that retires an incumbent whose translated
+// tuple DISAGREES. `reserve_address_only_maybe_persistent` had only the first —
+// it ORed the holder and returned `existing.translated` without ever comparing
+// it against the tuple the caller asked for.
+//
+// On a SYNCED reservation the peer's tuple is authoritative, so a disagreeing
+// local record means this node holds a different public reverse identity than
+// the peer's session uses: replies land on the wrong flow or are denied. Same
+// misdelivery class as the port-bearing arm, which is why it is fixed here
+// rather than left as the Low it was filed as.
+//
+// WHY #6528's OWN GUARANTEE DID NOT COVER IT, which is the interesting part.
+// That work ends with "the eviction now shares `release_flow`'s
+// `unlink_live_allocation_locked` + `complete_persistent_lease_locked`, so a
+// fifth cannot diverge either." That is true and it is about the sites that
+// EVICT — it makes their teardowns identical. This arm has no teardown to
+// diverge because it never evicted at all. A consistency guarantee over the
+// sites that do a thing says nothing about a site that does not do it.
+
+/// A `port no-translation` rule over a TWO-address pool, so a synced
+/// reservation can legitimately name a different address than the incumbent
+/// holds. A single-address pool cannot express the disagreement at all, which
+/// is why the #6528 fixtures next door could not have caught this.
+fn notrans_two_address_rules_k63() -> Vec<SourceNatRule> {
+    parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "notrans".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "k63-pool".to_string(),
+        pool_addresses: vec!["203.0.113.1/32".to_string(), "203.0.113.2/32".to_string()],
+        port_low: 40000,
+        port_high: 40009,
+        pool_no_translation: true,
+        ..SourceNATRuleSnapshot::default()
+    }])
+}
+
+fn synced_address_only_decision_k63(ip: &str) -> NatDecision {
+    NatDecision {
+        rewrite_src: Some(ip.parse().unwrap()),
+        // Address-only: no translated port, which is what routes the synced
+        // reservation to `reserve_address_only_maybe_persistent`.
+        rewrite_src_port: None,
+        ..NatDecision::default()
+    }
+}
+
+/// THE DEFECT. A synced reservation naming a DIFFERENT address than the
+/// incumbent must retire the incumbent, not silently hand back the old tuple.
+#[test]
+fn synced_address_only_reservation_evicts_a_disagreeing_incumbent_8597_k63() {
+    let rules = notrans_two_address_rules_k63();
+    let local = expect_snat_decision(snat_lookup_6528(
+        &rules, "lan", "10.0.1.50", 40005, "9.9.9.9", 443,
+    ));
+    let incumbent_ip = local.rewrite_src.expect("precondition: an address was minted");
+    assert_eq!(
+        local.rewrite_src_port, None,
+        "precondition: this must be an ADDRESS-ONLY reservation, or the flow \
+         takes the port-bearing arm and this cell tests the wrong function"
+    );
+    assert_eq!(
+        rules[0].pool_allocator.debug_address_only_owners().len(),
+        1,
+        "precondition: the local flow minted one reverse-identity token"
+    );
+
+    // The peer says this flow uses the OTHER pool address.
+    let other = if incumbent_ip.to_string() == "203.0.113.1" {
+        "203.0.113.2"
+    } else {
+        "203.0.113.1"
+    };
+    let key = session_key_from_src("10.0.1.50", 40005, "9.9.9.9", 443);
+    reserve_synced_source_nat_allocation_for_worker(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &key,
+        synced_address_only_decision_k63(other),
+        false,
+        None,
+        NS_PER_SEC,
+        0,
+    );
+
+    let owners = rules[0].pool_allocator.debug_address_only_owners();
+    assert_eq!(
+        owners.len(),
+        1,
+        "exactly one reverse-identity token must remain: the incumbent's is \
+         retired and the peer's is minted. Two means the stale token was left \
+         behind, denying its public identity forever; zero means the eviction \
+         tore down without re-minting (#8597 K63)"
+    );
+    assert!(
+        owners.iter().any(|(k, _)| k.translated_ip.to_string() == other),
+        "the surviving token must name the PEER's address {other}, not the \
+         incumbent's {incumbent_ip}. Before this fix the arm returned \
+         `existing.translated` without ever comparing it, so this node kept a \
+         different public reverse identity than the peer's session uses — \
+         replies land on the wrong flow or are denied (#8597 K63)"
+    );
+}
+
+/// THE ANTI-OVER-REJECT CELL, and it is not optional.
+///
+/// The fix adds an eviction. A guard can be wrong by being absent OR by being
+/// too tight, and only this cell says the boundary is in the right place: a
+/// synced reservation that AGREES with the incumbent — the ordinary case, every
+/// HA re-upsert and every worker 2..N in the fan-out — must take the idempotent
+/// path, keep its token, and not be torn down and re-minted.
+///
+/// Without it, an eviction that fired unconditionally would pass the cell above
+/// perfectly while destroying and recreating a live reservation on every refresh.
+#[test]
+fn synced_address_only_reservation_keeps_an_agreeing_incumbent_8597_k63() {
+    let rules = notrans_two_address_rules_k63();
+    let local = expect_snat_decision(snat_lookup_6528(
+        &rules, "lan", "10.0.1.50", 40005, "9.9.9.9", 443,
+    ));
+    let incumbent_ip = local.rewrite_src.expect("precondition: an address was minted");
+    let before = rules[0].pool_allocator.debug_address_only_owners();
+    assert_eq!(before.len(), 1, "precondition: one token");
+
+    let key = session_key_from_src("10.0.1.50", 40005, "9.9.9.9", 443);
+    reserve_synced_source_nat_allocation_for_worker(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &key,
+        // The peer AGREES with what this node already holds.
+        synced_address_only_decision_k63(&incumbent_ip.to_string()),
+        false,
+        None,
+        NS_PER_SEC,
+        0,
+    );
+
+    let after = rules[0].pool_allocator.debug_address_only_owners();
+    assert_eq!(
+        after.len(),
+        1,
+        "an agreeing synced reservation must not disturb the token count"
+    );
+    assert_eq!(
+        before.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+        after.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+        "the surviving token must be the SAME one",
+    );
+
+    // THE ASSERTION WITH THE POWER, and the first version of this cell did not
+    // have it. Comparing tokens cannot separate "kept" from "torn down and
+    // re-minted": an unconditional eviction re-inserts an IDENTICAL key for the
+    // same flow and tuple, so the count and the keys both match and the cell
+    // passes. Verified — mutating the compare to evict unconditionally left the
+    // earlier version green.
+    //
+    // `reuses_total` is bumped ONLY on the idempotent path, so it is the
+    // observable that distinguishes the two. That is the whole point of an
+    // anti-over-reject cell: a guard can be wrong by being absent or by being
+    // too tight, and only this direction says the boundary sits where it should.
+    assert_eq!(
+        rules[0].pool_allocator.snapshot().reuses_total,
+        1,
+        "an AGREEING synced reservation must take the IDEMPOTENT path, which is \
+         what bumps `reuses_total`. Zero means it was evicted and re-minted \
+         instead — the ordinary case (every HA re-upsert, every worker 2..N of \
+         the fan-out) tearing down and rebuilding a live reservation on each \
+         refresh, which the token comparison above cannot see (#8597 K63)",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #8597 K10 — a persistent lease must not be reused ACROSS allocation modes
+// ---------------------------------------------------------------------------
+//
+// `allocator_key()` is built from the pool name, addresses and port range and
+// does NOT include `no_translation`, so flipping that leaf keeps the SAME
+// allocator and carries its leases across. Both reuse predicates then admitted
+// any lease for the source key:
+//
+//   `reuse_existing_lease_locked`      (port-bearing) — no mode check
+//   `reserve_address_only_persistent`  (address-only) — no mode check
+//
+// A PAT flow reusing an ADDRESS-ONLY lease is the damaging direction. An
+// address-only lease owns NO occupancy bit — that is the whole difference
+// between the modes — so the published decision `(A, S)` holds no bit, and a
+// later flow can mint the same `(A, S)` through `claim()`. Two live flows on one
+// translated identity is the duplicate this allocator exists to prevent, and it
+// arrives from an ordinary two-commit migration rather than a race.
+
+/// Two PERSISTENT rules over one pool name / addresses / range — rule 0 with
+/// `port no-translation` (mints ADDRESS-ONLY leases), rule 1 ordinary PAT.
+/// `allocator_key()` matches, so they share one `PortAllocator` and one lease
+/// table: the shape a `no-translation` flip leaves behind.
+fn shared_mode_persistent_rules_k10() -> Vec<SourceNatRule> {
+    parse_source_nat_rules(&[
+        SourceNATRuleSnapshot {
+            name: "notrans".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            pool_name: "k10-pool".to_string(),
+            pool_addresses: vec!["203.0.113.7/32".to_string()],
+            port_low: 40000,
+            port_high: 40009,
+            pool_no_translation: true,
+            persistent_nat: true,
+            persistent_nat_permit: "any-remote-host".to_string(),
+            persistent_nat_inactivity_timeout: 300,
+            ..SourceNATRuleSnapshot::default()
+        },
+        SourceNATRuleSnapshot {
+            name: "pat".to_string(),
+            from_zone: "lan2".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            pool_name: "k10-pool".to_string(),
+            pool_addresses: vec!["203.0.113.7/32".to_string()],
+            port_low: 40000,
+            port_high: 40009,
+            persistent_nat: true,
+            persistent_nat_permit: "any-remote-host".to_string(),
+            persistent_nat_inactivity_timeout: 300,
+            ..SourceNATRuleSnapshot::default()
+        },
+    ])
+}
+
+/// FIXTURE GUARD, not a property. If `allocator_key()` ever starts
+/// discriminating on `no_translation`, the two rules stop sharing a lease table
+/// and the cross-mode cell below becomes vacuous — testing a collision that can
+/// no longer occur. This fails first and says why.
+#[test]
+fn k10_fixture_rules_really_share_one_allocator_8597() {
+    let rules = shared_mode_persistent_rules_k10();
+    assert_eq!(
+        rules[0].pool_allocator.debug_shared_identity(),
+        rules[1].pool_allocator.debug_shared_identity(),
+        "precondition: the `port no-translation` rule and the PAT rule must \
+         share ONE allocator, which is what lets a lease minted in one mode be \
+         offered to the other (#8597 K10)"
+    );
+}
+
+/// THE DEFECT. An address-only lease must not be handed to a PAT flow, because
+/// it owns no occupancy bit and the PAT decision would publish an identity
+/// nothing holds.
+#[test]
+fn a_pat_flow_does_not_reuse_an_address_only_lease_8597_k10() {
+    let rules = shared_mode_persistent_rules_k10();
+    // Mint the ADDRESS-ONLY lease via the no-translation rule.
+    let ao = expect_snat_decision(snat_lookup_6528(
+        &rules, "lan", "10.0.1.50", 40005, "9.9.9.9", 443,
+    ));
+    assert_eq!(
+        ao.rewrite_src_port, None,
+        "precondition: this must be an ADDRESS-ONLY lease"
+    );
+    {
+        let live = rules[0].pool_allocator.debug_live();
+        let lease = live
+            .persistent_by_source
+            .values()
+            .next()
+            .expect("precondition: one lease");
+        assert!(
+            lease.address_only,
+            "precondition: the lease must be address-only, or this cell tests \
+             the wrong direction"
+        );
+    }
+
+    // The SAME source now matches the PAT rule (the `no-translation` flip).
+    let pat = expect_snat_decision(snat_lookup_6528(
+        &rules, "lan2", "10.0.1.50", 40005, "8.8.8.8", 443,
+    ));
+    let port = pat
+        .rewrite_src_port
+        .expect("the PAT rule must translate a port");
+
+    // The published port must actually be HELD. Before the mode gate the PAT
+    // flow adopted the address-only lease, whose occupancy bit was never taken,
+    // and published a tuple `claim()` would hand to somebody else as well.
+    assert!(
+        rules[0].pool_allocator.debug_is_port_occupied(0, port),
+        "a PAT decision published port {port} without holding its occupancy \
+         bit — it adopted an ADDRESS-ONLY lease, which owns no bit. A later \
+         flow can then mint the same (address, port) and two live flows share \
+         one translated identity (#8597 K10)"
+    );
+}
+
+/// THE ANTI-OVER-REJECT CELL.
+///
+/// The observable is chosen deliberately and it is NOT the translated tuple: a
+/// gate that wrongly refused a legitimate reuse would retire the lease and mint
+/// a fresh one, and on a single-address pool that fresh lease can carry the same
+/// address — so a tuple comparison cannot tell reuse from re-mint. `active_flows`
+/// can: a genuine reuse joins the existing lease and reaches 2, while a
+/// retire-and-re-mint resets it to 1.
+#[test]
+fn a_second_pat_flow_still_joins_its_own_lease_8597_k10() {
+    let rules = shared_mode_persistent_rules_k10();
+    let first = expect_snat_decision(snat_lookup_6528(
+        &rules, "lan2", "10.0.1.60", 40006, "8.8.8.8", 443,
+    ));
+    let first_port = first.rewrite_src_port.expect("PAT translates a port");
+
+    // Same source, DIFFERENT destination: a different SourceNatFlowKey but the
+    // same PersistentSourceKey under `any-remote-host`, so it must JOIN the
+    // lease rather than mint a second identity. This is what persistent NAT is.
+    let second = expect_snat_decision(snat_lookup_6528(
+        &rules, "lan2", "10.0.1.60", 40006, "9.9.9.9", 443,
+    ));
+    assert_eq!(
+        second.rewrite_src_port,
+        Some(first_port),
+        "persistent NAT pins ONE public identity per source: the second flow \
+         must receive the same translated port as the first"
+    );
+
+    let live = rules[0].pool_allocator.debug_live();
+    let lease = live
+        .persistent_by_source
+        .values()
+        .next()
+        .expect("exactly one lease for this source");
+    assert_eq!(
+        lease.active_flows, 2,
+        "both flows must be joined to ONE lease. 1 means the mode gate refused \
+         a legitimate same-mode reuse and the lease was retired and re-minted — \
+         which a translated-tuple comparison cannot see, because a re-mint on a \
+         single-address pool hands back the same address. That is the too-tight \
+         direction, and it is the one this cell exists for (#8597 K10)"
+    );
+    assert!(
+        !lease.address_only,
+        "the surviving lease must be the PAT one"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #8597 K11 — a pool-change re-seed must carry the ADDRESS-ONLY reverse token
+// ---------------------------------------------------------------------------
+//
+// `reseed_retained_from` exists so live translations survive a pool edit. It
+// carried port-bearing flows and SKIPPED address-only ones, with a rationale
+// that is true and not responsive: the record "holds no port bit and is outside
+// the port-reissue defect". That is about PORTS. What an address-only record
+// holds is an `address_only_owners` entry — the #5269 guard that denies a second
+// flow the same public reverse identity — and dropping it left the carried
+// session forwarding with the guard silently gone.
+//
+// The operator-visibility half of the original finding is already closed by
+// `de5d952ca`, which made the report population derive from the struct. The
+// residual is the dropped guard alone, which is what these cells bind.
+
+/// A `port no-translation` rule over a two-address pool, so a pool change can
+/// retain one address and drop the other.
+fn notrans_two_address_rules_k11() -> Vec<SourceNatRule> {
+    parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "notrans".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "k11-pool".to_string(),
+        pool_addresses: vec!["203.0.113.1/32".to_string(), "203.0.113.2/32".to_string()],
+        port_low: 40000,
+        port_high: 40009,
+        pool_no_translation: true,
+        ..SourceNATRuleSnapshot::default()
+    }])
+}
+
+/// THE DEFECT. After a pool change that RETAINS the address, the carried
+/// address-only flow must still own its reverse identity — so a different flow
+/// colliding on that identity is refused, exactly as before the edit.
+#[test]
+fn a_reseed_carries_the_address_only_reverse_token_8597_k11() {
+    let rules = notrans_two_address_rules_k11();
+    let minted = expect_snat_decision(snat_lookup_6528(
+        &rules, "lan", "10.0.1.50", 40005, "9.9.9.9", 443,
+    ));
+    assert_eq!(
+        minted.rewrite_src_port, None,
+        "precondition: an ADDRESS-ONLY reservation"
+    );
+    let held_ip = minted.rewrite_src.expect("an address was minted");
+    assert_eq!(
+        rules[0].pool_allocator.debug_address_only_owners().len(),
+        1,
+        "precondition: one reverse-identity token exists to be carried"
+    );
+    let old_index = if held_ip.to_string() == "203.0.113.1" { 0 } else { 1 };
+
+    // The pool edit: the held address is RETAINED (it maps to a new position).
+    let fresh = PortAllocator::new(2, 40000, 40009);
+    let mut index_map = rustc_hash::FxHashMap::default();
+    index_map.insert(old_index, old_index);
+    let outcome = fresh.reseed_retained_from(&rules[0].pool_allocator, &index_map, NS_PER_SEC);
+
+    assert_eq!(
+        outcome.skipped_address_only, 0,
+        "the token must be CARRIED, not skipped — skipping it is the defect"
+    );
+    assert_eq!(
+        fresh.debug_address_only_owners().len(),
+        1,
+        "the carried reverse-identity token must exist in the NEW allocator. \
+         Zero means the #5269 guard was silently dropped by an ordinary pool \
+         edit, and a colliding arrival is then ADMITTED instead of refused as \
+         exhaustion — a fail-closed protection downgraded by a commit (#8597 K11)"
+    );
+}
+
+/// THE ANTI-OVER-REJECT CELL.
+///
+/// The observable is chosen deliberately. The carry inserts a token and then, on
+/// the SAME pass, must not treat that token as a foreign collision against the
+/// very flow it belongs to — which is exactly what an over-tight carry does:
+/// `reserve_address_only` refuses when `address_only_owners` already holds the
+/// key, so a carry that re-entered for a second holder, or that ran after its
+/// own insert, would count `skipped_address_only` and drop the flow it had just
+/// carried. Counting the outcome is what separates the two; the token being
+/// present cannot, because it is present either way.
+#[test]
+fn a_carried_address_only_token_is_not_a_collision_with_its_own_flow_8597_k11() {
+    let rules = notrans_two_address_rules_k11();
+    let minted = expect_snat_decision(snat_lookup_6528(
+        &rules, "lan", "10.0.1.50", 40005, "9.9.9.9", 443,
+    ));
+    let held_ip = minted.rewrite_src.expect("an address was minted");
+    let old_index = if held_ip.to_string() == "203.0.113.1" { 0 } else { 1 };
+
+    let fresh = PortAllocator::new(2, 40000, 40009);
+    let mut index_map = rustc_hash::FxHashMap::default();
+    index_map.insert(old_index, old_index);
+    let outcome = fresh.reseed_retained_from(&rules[0].pool_allocator, &index_map, NS_PER_SEC);
+
+    assert_eq!(
+        outcome.reseeded, 1,
+        "the carried address-only flow must be counted as RESEEDED. Any other \
+         value means the carry refused the flow it was carrying — the token it \
+         had just inserted read back as a foreign owner — which leaves the \
+         session forwarding with no guard AND reports a refusal the operator \
+         cannot act on (#8597 K11)"
+    );
+    assert_eq!(
+        outcome.skipped_address_only, 0,
+        "and it must not be counted as un-carryable"
+    );
+    assert_eq!(
+        outcome.refused, 0,
+        "nor as a port-bearing refusal — the two outcomes are different \
+         populations and must not be conflated"
+    );
+}
