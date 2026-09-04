@@ -218,6 +218,10 @@ type ControlRequest struct {
 	SessionSync    *SessionSyncRequest       `json:"session_sync,omitempty"`
 	SessionDeltas  *SessionDeltaDrainRequest `json:"session_deltas,omitempty"`
 	SessionExport  *SessionExportRequest     `json:"session_export,omitempty"`
+	// #7919: the 5-tuple for the read-only `session_counters` verb. An ADDED
+	// field, never a redefinition — an old helper ignores it, and this control
+	// plane never sends it to one twice (the first refusal is sticky per call).
+	SessionCounterQuery *SessionCounterQuery `json:"session_counter_query,omitempty"`
 	// IdleLeases carries idle persistent-NAT leases for the import_idle_leases
 	// verb (#8121). omitempty so every other request is byte-identical to
 	// before — the control socket is shared with the 1/s status poll and with
@@ -249,6 +253,12 @@ type ControlResponse struct {
 	SessionDeltas []SessionDeltaInfo `json:"session_deltas,omitempty"`
 	// IdleLeases is the export_idle_leases result (#8121).
 	IdleLeases []IdleLeaseWire `json:"idle_leases,omitempty"`
+	// SessionCounters is the session_counters result (#7919), one row per
+	// worker. Empty for every other verb — callers must NOT read emptiness as
+	// "no worker holds this session": an unimplemented verb is reported by the
+	// helper's `unknown request type` error and surfaces as
+	// ErrSessionCountersUnsupported, never as an empty answer.
+	SessionCounters []SessionCounterRow `json:"session_counters,omitempty"`
 }
 
 type ConfigSnapshot struct {

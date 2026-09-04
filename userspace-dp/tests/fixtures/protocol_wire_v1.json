@@ -335,6 +335,7 @@
     "neighbors": null,
     "packet": null,
     "queue": null,
+    "session_counter_query": null,
     "session_deltas": null,
     "session_export": null,
     "session_sync": null,

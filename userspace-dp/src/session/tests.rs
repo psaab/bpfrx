@@ -8651,3 +8651,57 @@ fn lookup_miss_counters_separate_the_three_causes_7919() {
         "the aliased lookup landed ON this record's handle and must not have          touched or accounted against it"
     );
 }
+
+// #7919: the read that backs the per-session counter query must distinguish
+// "I hold this session and it carries no traffic" from "I do not hold it".
+//
+// Those are the two states the whole verb exists to separate, and they are the
+// same zero at the call site if the accessor returns bare counters. `None` vs
+// `Some(zeroed)` is what keeps them apart.
+#[test]
+fn counters_with_replica_flag_separates_not_held_from_held_and_idle_7919() {
+    let mut table = SessionTable::new();
+    let held = key_v4();
+    let mut absent = key_v4();
+    absent.src_port = held.src_port.wrapping_add(1);
+
+    assert!(table.install_with_protocol(
+        held.clone(),
+        decision(),
+        metadata(),
+        1_000_000_000,
+        PROTO_TCP,
+        0x10,
+    ));
+
+    // HELD AND IDLE: present, counters zero.
+    let (counters, replica) = table
+        .counters_with_replica_flag(&held)
+        .expect("a held session must be reported as held even with no traffic");
+    assert_eq!(
+        (counters.fwd_packets, counters.rev_packets),
+        (0, 0),
+        "a freshly installed session has no volume yet"
+    );
+    assert!(!replica, "a locally installed session is not a replica");
+
+    // NOT HELD: absent entirely. This is the state that must NOT look like the
+    // one above.
+    assert!(
+        table.counters_with_replica_flag(&absent).is_none(),
+        "a key this table does not hold must report None, not a zeroed row — \
+         collapsing them answers neither of the questions the query asks"
+    );
+
+    // And once traffic is accounted, the held row carries it.
+    for _ in 0..321u32 {
+        table.account_packet(&held, 1500, 0x10, 0);
+    }
+    let (counters, _) = table
+        .counters_with_replica_flag(&held)
+        .expect("still held after accounting");
+    assert_eq!(
+        counters.fwd_packets, 321,
+        "the accessor must report the LIVE counters, not a snapshot from install"
+    );
+}

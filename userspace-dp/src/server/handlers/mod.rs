@@ -20,6 +20,7 @@
 // parameter substitution. See
 // `docs/pr/1345-server-handlers-split/plan.md` for the full design.
 
+mod session_counters;
 mod binding;
 mod export;
 mod forwarding;
@@ -95,6 +96,7 @@ pub(crate) fn handle_stream(
         status: None,
         session_deltas: Vec::new(),
         idle_leases: Vec::new(),
+        session_counters: Vec::new(),
     };
     let mut persist_state = false;
     // Capture suppress_status before the match — bool is Copy so this
@@ -102,6 +104,10 @@ pub(crate) fn handle_stream(
     // dispatcher from future partial-move concerns on `request`.
     let suppress_status = request.suppress_status;
     let neighbor_replace = request.neighbor_replace;
+    // #7919: two-phase like the exports — the locked arm only KICKS the
+    // broadcast; the bounded wait runs after the lock drops, so a stalled
+    // worker cannot hold the control plane for the wait's duration.
+    let mut counter_query_wait: Option<crate::afxdp::SessionCounterQueryWait> = None;
 
     // #2962: the owner-RG session export must NOT block under the global
     // ServerState lock. The locked `match` arm only KICKS the export
@@ -284,6 +290,15 @@ pub(crate) fn handle_stream(
                 // handle. The blocking push loop runs after the lock drops.
                 all_export = export::all_kick(&mut guard, &mut response);
             }
+            "session_counters" => {
+                // #7919 READ-ONLY diagnostic. Locked phase only: broadcast the
+                // query and capture the wait handle.
+                counter_query_wait = session_counters::kick(
+                    &mut guard,
+                    request.session_counter_query.as_ref(),
+                    &mut response,
+                );
+            }
             "rebind" => rebind::handle(&mut guard, &mut response, &mut persist_state),
             "stop_workers" => stop_workers::handle(&mut guard, &mut persist_state),
             "shutdown" => {
@@ -328,6 +343,10 @@ pub(crate) fn handle_stream(
     // ServerState lock RELEASED, so the control plane stays responsive while
     // one export drains. Status is then re-derived under a fresh short-lived
     // lock acquisition (the wait is already done).
+    // #7919: bounded wait for the per-worker replies, lock-free.
+    if let Some(wait) = counter_query_wait {
+        response.session_counters = session_counters::collect(wait);
+    }
     if let Some(wait) = export_wait {
         export::owner_rg_collect(wait, &mut response, &mut persist_state);
         if !suppress_status {

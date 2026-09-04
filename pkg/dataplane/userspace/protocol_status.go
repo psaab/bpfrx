@@ -951,3 +951,38 @@ type ExceptionStatus struct {
 	RuleName         string    `json:"rule_name,omitempty"`
 	PoolName         string    `json:"pool_name,omitempty"`
 }
+
+// #7919: the per-session counter QUERY — a READ-ONLY diagnostic that reports
+// what EACH worker's own session table holds for one 5-tuple.
+//
+// WHY IT EXISTS. `show security flow session` reports a session's volume from
+// the shared BPF conntrack mirror. When a row reads Pkts: 0 for a flow that is
+// demonstrably moving traffic, two explanations survive and need opposite
+// fixes: the owning worker's table holds the volume and the mirror lost it, or
+// no worker's table holds it and the mirror is faithfully reporting nothing
+// that was ever accounted. Nothing else can separate them — the shared session
+// table carries no counters, and the per-worker high-water is monotonic over
+// the process lifetime, so a large value on a worker whose current flow reads 0
+// may be residue from an earlier flow that worker owned.
+type SessionCounterQuery struct {
+	SrcIP    string `json:"src_ip"`
+	DstIP    string `json:"dst_ip"`
+	SrcPort  uint16 `json:"src_port"`
+	DstPort  uint16 `json:"dst_port"`
+	Protocol uint8  `json:"protocol"`
+}
+
+// SessionCounterRow is one worker's reply. Three states are distinct and none
+// may be collapsed: Answered=false (it did not reply before the deadline — not
+// an answer), Answered && !Found (it replied: it does not hold this session),
+// and Answered && Found (it holds it; Counters are what its copy says).
+type SessionCounterRow struct {
+	WorkerID   uint32 `json:"worker_id"`
+	Answered   bool   `json:"answered"`
+	Found      bool   `json:"found"`
+	Replica    bool   `json:"replica"`
+	FwdPackets uint64 `json:"fwd_packets"`
+	FwdBytes   uint64 `json:"fwd_bytes"`
+	RevPackets uint64 `json:"rev_packets"`
+	RevBytes   uint64 `json:"rev_bytes"`
+}

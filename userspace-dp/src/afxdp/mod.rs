@@ -91,6 +91,9 @@ mod ha;
 // #6785: the control handler needs the synced-import outcome type and its
 // refusal-token prefix.
 pub use ha::{SyncedImportOutcome, SYNCED_IMPORT_REFUSED_PREFIX};
+// #7919: the per-session counter query's wait handle + reply row, used by the
+// control-socket handler's two-phase dispatch.
+pub(crate) use ha::{SessionCounterQueryWait, WorkerSessionCounters};
 #[path = "icmp.rs"]
 mod icmp;
 mod icmp_embed;
