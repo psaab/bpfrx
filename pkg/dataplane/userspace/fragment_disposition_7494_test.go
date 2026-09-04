@@ -404,19 +404,31 @@ func TestV6FixtureReachesTheWalk(t *testing.T) {
 	}
 }
 
-// TestV6NonFirstFragmentExposuresAreStillLive_7494 is the BUILT form of the v6
-// gap. #7494's v4 half has a measured fix (+92 insns, protocol sentinel); the
-// v6 half does not -- four structurally different channels were rejected by the
-// kernel verifier, so the sighting cannot currently be consumed for IPv6.
+// TestV6NonFirstFragmentIsNeutralisedForBothExposures_7494 is the inverted form
+// of the cell that used to assert these exposures were LIVE.
 //
-// A comment saying that goes stale and nothing enforces it. This cell asserts
-// the exposures are STILL LIVE for IPv6, so the suite cannot go green and read
-// as "fragments are handled" while half of both exposures is untouched.
+// #7494's v4 half landed at +92 instructions; the v6 half could not be
+// consumed at all -- four structurally different channels were rejected by the
+// kernel verifier. #8249 established why: reading a SECOND value out of the
+// extension-header walk defeats the verifier's state merging at the loop exit,
+// and that cost multiplies against every stateful region downstream. Laundering
+// the sighting through a per-CPU slot makes `protocol` depend on an opaque map
+// read instead of the walk's exit state, which verifies.
 //
-// It must be re-pointed, not deleted, when the v6 half lands. Tracked as #8249;
-// four channels are measured REJECT there with their total_states, so nobody
-// re-derives the dead ends.
-func TestV6NonFirstFragmentExposuresAreStillLive_7494(t *testing.T) {
+// So this now asserts the FIXED invariant, on the same two fixtures the old
+// cell used, and it fails if either exposure comes back:
+//
+//   - a non-first fragment with a payload-keyed session planted must NOT be
+//     handed to the kernel. The payload-derived tuple can no longer be built,
+//     so the session cannot match and the packet is adjudicated by the full
+//     dataplane instead.
+//   - a non-first fragment whose payload byte is 0x00 must NOT be dropped.
+//     That byte used to be read as a TCP data-offset nibble, which made a
+//     packet's disposition selectable by an off-path party choosing a byte.
+//
+// Both now take the SAME disposition as the first-fragment control, which is
+// the point: the fragment's own payload no longer influences its fate.
+func TestV6NonFirstFragmentIsNeutralisedForBothExposures_7494(t *testing.T) {
 	coll := fragLoad(t)
 	frag := ipv6Frame(0x00b8, 0x50) // offset 23 => NON-FIRST fragment
 
@@ -430,12 +442,30 @@ func TestV6NonFirstFragmentExposuresAreStillLive_7494(t *testing.T) {
 	lowRet, dLow := fragRun(t, coll, ipv6Frame(0x00b8, 0x00))
 	t.Logf("v6 non-first fragment, payload byte 0x00 -> ret=%d reasons=%v", lowRet, dLow)
 
-	if dHit["PASS_TO_KERNEL"] == 0 && dLow["PARSE_FAIL"] == 0 {
-		t.Errorf("neither v6 exposure reproduced (session-collision=%v, "+
-			"payload-drop=%v). IF THE #7494 v6 HALF HAS LANDED THIS RED IS "+
-			"EXPECTED and is the goal -- re-point this cell at the fixed "+
-			"invariant rather than deleting it. If it has NOT landed, the v6 "+
-			"fixture has stopped reaching the code it targets", dHit, dLow)
+	if dHit["PASS_TO_KERNEL"] != 0 {
+		t.Errorf("exposure #1 is back: a v6 non-first fragment with a "+
+			"payload-keyed session was handed to the KERNEL (%v). The sentinel "+
+			"substitution in parse_ipv6 must make a non-first fragment a "+
+			"guaranteed session miss -- a payload-derived tuple must never "+
+			"reach the session lookup (#7494/#8249)", dHit)
+	}
+	if dLow["PARSE_FAIL"] != 0 {
+		t.Errorf("exposure #5 is back: a v6 non-first fragment was DROPPED "+
+			"because of its own payload byte (%v). That byte is read as a TCP "+
+			"data-offset nibble only if the fragment reaches parse_l4's TCP "+
+			"arm; the sentinel routes it to the unknown-protocol arm, which "+
+			"cannot fail. A drop here is a disposition chosen by an off-path "+
+			"party (#7494/#8249)", dLow)
+	}
+
+	// NON-VACUITY. Both assertions above are absence checks, and an absence
+	// holds for free if the fixture stopped reaching the code. The first-
+	// fragment control in TestV6FixtureReachesTheWalk proves the walk is
+	// entered; this proves these two frames produced a real disposition rather
+	// than nothing at all.
+	if len(dHit) == 0 || len(dLow) == 0 {
+		t.Fatalf("a fixture produced NO disposition at all (hit=%v, low=%v) -- "+
+			"the absence assertions above would hold for free", dHit, dLow)
 	}
 }
 
