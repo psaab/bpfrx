@@ -538,8 +538,8 @@ impl FlowCacheEntry {
             forwarding,
             decision.resolution.egress_ifindex,
             meta,
-            Some(&tx_selection_wire_key),
-            Some(&flow.forward_key),
+            &tx_selection_wire_key,
+            &flow.forward_key,
         );
         // #3777: the cos TX-selection rebuild folds an interface INPUT filter's
         // `then count` handles into `tx_selection.filter_counters` when the

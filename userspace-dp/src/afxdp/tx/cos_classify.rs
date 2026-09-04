@@ -107,15 +107,153 @@ pub(in crate::afxdp) fn classify_generated_reply(
     }
 }
 
+/// #8367: which tuple a cached TX-selection descriptor is resolved from.
+///
+/// Both variants carry a REQUIRED post-NAT on-wire key, and that requirement is
+/// the point of the type. An interface `filter output` is applied on the EGRESS
+/// interface AFTER NAT (#3642), so there is no correct descriptor to build
+/// without one — yet before #8367 the flowless arm took `flow_key: None` and
+/// silently substituted the ingress (PRE-NAT) `meta` for three separate reads:
+/// the filter FAMILY, the matched ADDRESSES and the PROTOCOL. Under plain
+/// SNAT/DNAT that made the verdict *confidently wrong* rather than merely
+/// absent — it populated `.drop`, `.reject`, `.reject_message`, `.filter_log`
+/// and the counter/policer handles from a tuple the packet no longer carries,
+/// so a `from source-address <pool>` term did not match a packet whose on-wire
+/// source IS the pool address, and a `then log` recorded the pre-translation
+/// addresses for a packet that left with different ones.
+///
+/// Encoding the key as a required field of the variant, rather than an `Option`
+/// the caller may omit, is the fix: a caller that wants a filter verdict must
+/// supply the tuple the packet leaves with, and cannot get a wrong one by
+/// default. A caller that wants only the CoS queue asks for the queue — see
+/// [`resolve_cached_cos_tx_queue_id`], which is what the port-mirror path
+/// (`mirror::mirror_cos_queue_id`, the only production caller that ever reached
+/// the flowless arm) now uses.
+pub(in crate::afxdp) enum CachedTxTuple<'a> {
+    /// A flow-bearing packet. `egress_wire_key` is the POST-NAT on-wire tuple
+    /// (#3642) driving the egress OUTPUT filter family + match and the CoS
+    /// queue; `ingress_flow_key` is the PRE-NAT ingress tuple the INPUT filter
+    /// originally matched (#5158, Junos applies input filters BEFORE NAT). They
+    /// are the same key for a non-NAT flow.
+    Flow {
+        egress_wire_key: &'a SessionKey,
+        ingress_flow_key: &'a SessionKey,
+    },
+    /// A FLOWLESS packet — a non-first IP fragment or a non-query ICMP
+    /// error/control packet, both of which carry no usable L4 ports
+    /// (#2344/#3290). `wire_l3` is the POST-NAT L3-only on-wire tuple, built the
+    /// way the flow-bearing path builds its wire key
+    /// (`forward_request::l3_wire_session_flow_from_meta` -> `forward_wire_key`),
+    /// so family, addresses and protocol move together BY CONSTRUCTION rather
+    /// than as three reads that can drift apart. Its ports are never read: this
+    /// arm evaluates through the PORTLESS evaluator (#7992).
+    Flowless { wire_l3: &'a SessionKey },
+}
+
 pub(in crate::afxdp) fn resolve_cached_cos_tx_selection(
     forwarding: &ForwardingState,
     egress_ifindex: i32,
     meta: UserspaceDpMeta,
-    flow_key: Option<&SessionKey>,
+    flow_key: &SessionKey,
 ) -> CachedTxSelectionDescriptor {
     // Non-NAT / single-key callers: the ingress input-filter re-walk uses the
     // same tuple as the output filter (there is no post-NAT/pre-NAT split).
-    resolve_cached_cos_tx_selection_impl(forwarding, egress_ifindex, meta, flow_key, flow_key)
+    resolve_cached_cos_tx_selection_impl(
+        forwarding,
+        egress_ifindex,
+        meta,
+        CachedTxTuple::Flow {
+            egress_wire_key: flow_key,
+            ingress_flow_key: flow_key,
+        },
+    )
+}
+
+/// #8367: cached TX-selection for a FLOWLESS packet. `wire_l3` is REQUIRED and
+/// must be the POST-NAT on-wire L3 tuple — the same value the flow-bearing seed
+/// path derives with `forward_wire_key(&flow.forward_key, decision.nat)` and the
+/// fresh flowless arm derives with `l3_wire_session_flow_from_meta` (#7656).
+/// Passing the raw ingress `meta` tuple here for a NAT'd packet reintroduces the
+/// #8367 defect; there is deliberately no entry point that lets the key be
+/// omitted, because "no tuple" and "the pre-NAT tuple" are not the same answer
+/// and only one of them is honest.
+pub(in crate::afxdp) fn resolve_cached_cos_tx_selection_flowless(
+    forwarding: &ForwardingState,
+    egress_ifindex: i32,
+    meta: UserspaceDpMeta,
+    wire_l3: &SessionKey,
+) -> CachedTxSelectionDescriptor {
+    resolve_cached_cos_tx_selection_impl(
+        forwarding,
+        egress_ifindex,
+        meta,
+        CachedTxTuple::Flowless { wire_l3 },
+    )
+}
+
+/// #8367: the CoS queue id alone, for a caller that consumes a queue and
+/// nothing else — today the port-mirror / span path
+/// (`mirror::mirror_cos_queue_id`).
+///
+/// For a flow-bearing packet this is the full descriptor's `queue_id`, byte for
+/// byte what the mirror path resolved before. For a FLOWLESS one it is the
+/// behavior-aggregate lookup alone (DSCP -> inet-precedence -> 802.1p -> the
+/// interface default queue), which is 5-tuple independent (#hb166 T-6(m)) and
+/// was already computed BEFORE and INDEPENDENTLY of the output-filter block
+/// whose verdict this caller discards — so the value is unchanged and the
+/// mirror path no longer asks for fields it throws away.
+///
+/// That split is what lets the flowless descriptor arm REQUIRE a post-NAT wire
+/// key. The mirror caller has no `NatDecision` to synthesize one from, and
+/// threading a decision through the mirror path to populate fields the mirror
+/// path discards would be a poor trade; asking for what it actually consumes
+/// costs nothing and removes the last caller that could reach a filter verdict
+/// with no tuple to compute it from.
+pub(in crate::afxdp) fn resolve_cached_cos_tx_queue_id(
+    forwarding: &ForwardingState,
+    egress_ifindex: i32,
+    meta: UserspaceDpMeta,
+    flow_key: Option<&SessionKey>,
+) -> Option<u8> {
+    match flow_key {
+        Some(flow_key) => {
+            resolve_cached_cos_tx_selection(forwarding, egress_ifindex, meta, flow_key).queue_id
+        }
+        None => forwarding
+            .cos
+            .interfaces
+            .get(&egress_ifindex)
+            .map(|iface| flowless_cos_ba_queue_id(iface, meta)),
+    }
+}
+
+/// The behavior-aggregate (BA) queue for a FLOWLESS packet: DSCP classifier ->
+/// inet-precedence classifier -> 802.1p classifier -> the interface default
+/// queue (#hb166 T-6(m) / #6847). 5-tuple independent by construction, which is
+/// why it is the one part of a flowless CoS resolution that needs no post-NAT
+/// wire key (#8367) — an EF fragment lands in its BA queue whether or not the
+/// caller can supply a tuple.
+///
+/// Shared by the two sites #8367 needed to keep in agreement: the cached
+/// flowless descriptor arm and the mirror queue-only entry point, which MUST
+/// return the same queue or the split would be a behaviour change wearing the
+/// shape of a refactor. It is NOT the file's only spelling of the chain —
+/// `resolve_cos_tx_selection_internal`'s flowless arm takes a
+/// `ForwardPacketMeta` rather than a `UserspaceDpMeta`, and
+/// `reclassify_cached_ba_queue` ends the chain with `.or(Some(default))`
+/// instead of `.unwrap_or(default)` because its caller needs the `Option`.
+/// Folding those in is a separate change with its own risk.
+fn flowless_cos_ba_queue_id(iface: &CoSInterfaceConfig, meta: UserspaceDpMeta) -> u8 {
+    resolve_cos_dscp_classifier_queue_id(iface, meta.dscp)
+        .or_else(|| resolve_cos_inet_precedence_classifier_queue_id(iface, meta.dscp))
+        .or_else(|| {
+            resolve_cos_ieee8021_classifier_queue_id(
+                iface,
+                meta.ingress_pcp,
+                meta.ingress_vlan_present != 0,
+            )
+        })
+        .unwrap_or(iface.default_queue)
 }
 
 /// #5158: cached-seed TX-selection variant for the POST-NAT transit forward
@@ -130,141 +268,167 @@ pub(in crate::afxdp) fn resolve_cached_cos_tx_selection_prenat(
     forwarding: &ForwardingState,
     egress_ifindex: i32,
     meta: UserspaceDpMeta,
-    egress_wire_key: Option<&SessionKey>,
-    ingress_flow_key: Option<&SessionKey>,
+    egress_wire_key: &SessionKey,
+    ingress_flow_key: &SessionKey,
 ) -> CachedTxSelectionDescriptor {
     resolve_cached_cos_tx_selection_impl(
         forwarding,
         egress_ifindex,
         meta,
-        egress_wire_key,
-        ingress_flow_key,
+        CachedTxTuple::Flow {
+            egress_wire_key,
+            ingress_flow_key,
+        },
     )
+}
+
+/// #8367: the FLOWLESS arm of the cached TX-selection descriptor, split out of
+/// `resolve_cached_cos_tx_selection_impl` so its post-NAT wire key is a required
+/// parameter rather than an omitted `Option`.
+///
+/// `wire_l3` is the POST-NAT on-wire L3 tuple. Every read that used to fall back
+/// to the ingress `meta` — the output-filter FAMILY, the matched ADDRESSES and
+/// the PROTOCOL — now comes from it, as ONE choice rather than three. That is
+/// the property #7656 established on the fresh (`resolve_cos_tx_selection_at`)
+/// flowless arm and #8367 brings here: a mixture — egress family with ingress
+/// addresses — selects the right filter and then cannot match any
+/// address-bearing term in it, which no address-less fixture can see.
+fn cached_cos_tx_selection_flowless(
+    forwarding: &ForwardingState,
+    egress_ifindex: i32,
+    meta: UserspaceDpMeta,
+    wire_l3: &SessionKey,
+) -> CachedTxSelectionDescriptor {
+    let iface = forwarding.cos.interfaces.get(&egress_ifindex);
+    // #hb166 T-6(m): fragments / flowless packets carry no 5-tuple but
+    // still carry a DSCP (and 802.1p PCP). Behavior-aggregate
+    // classification is 5-tuple-independent — resolve it from `meta` so
+    // an EF fragment lands in its BA queue instead of straddling the
+    // default queue. Filter forwarding-class / rewrite needs the flow
+    // key, so those stay unset (as before).
+    let queue_id = iface.map(|iface| flowless_cos_ba_queue_id(iface, meta));
+    // #3995: flowless packets still resolve the loss-priority-aware CoS
+    // rewrite from their own DSCP/PCP (default LOW when unclassified).
+    let dscp_rewrite = queue_id.and_then(|queue_id| {
+        resolve_cos_queue_lp_rewrite(
+            forwarding,
+            egress_ifindex,
+            queue_id,
+            meta.dscp,
+            meta.ingress_pcp,
+            meta.ingress_vlan_present != 0,
+        )
+    });
+    // #6055: bring this cached flowless arm to PARITY with the #5467 fix on
+    // `resolve_cos_tx_selection_internal`'s flowless arm. Before this gate the
+    // cached flowless arm returned `drop:false, reject:false, filter_log:None`
+    // WITHOUT ever evaluating the interface `filter output` — a LATENT
+    // fail-open: any caller that reads `.drop`/`.reject` from a flowless
+    // result (a future seed/mirror refactor) would silently wave a
+    // would-be-dropped flowless packet (a non-first IP fragment / non-query
+    // ICMP error/control packet, #2344/#3290) past an egress `then discard`/
+    // `reject` term. Evaluate the output filter against the packet's own
+    // POST-NAT L3 tuple (src/dst/protocol from `wire_l3`; L4 ports absent) and
+    // honor the drop/reject/log verdict exactly as the flow-keyed arm below
+    // does, so an L3-matching deny FAILS CLOSED.
+    //
+    // Uses the cache-replay eval the flow-keyed arm uses — it captures
+    // `then count`/policer handles into the descriptor and applies
+    // `TermMatchExtra::default()`, which fails every per-packet-L4 term
+    // (tcp-flags/icmp-type/icmp-code/is-fragment/flex) closed. The flow-cache
+    // SEED path already DECLINES caching for a filter carrying such a term
+    // (`interface_output_filter_has_per_packet_l4_match`, flow_cache.rs), so no
+    // per-packet-L4 output term reaches this arm; only an L3-only
+    // (`from source-address`/`destination-address`/`protocol`/bare `then`) term
+    // takes effect, matching the #5467 flowless contract. The `drop` bit is the
+    // OUTPUT filter's terminal action only (a three-color policer runs at
+    // replay via `apply_cached_three_color_policers`), identical to the
+    // flow-keyed arm's #3608 convention.
+    //
+    // #8367: family, addresses and protocol are read as ONE choice from
+    // `wire_l3`. They used to be three independent reads of the ingress `meta`,
+    // which is the PRE-NAT tuple for any translated packet: `from
+    // source-address <pool>` did not match a packet whose on-wire source IS the
+    // pool address, and `from source-address <private range>` matched one that
+    // no longer carries it. Junos applies an interface `filter output` on the
+    // egress interface AFTER NAT (#3642).
+    let is_v6 = wire_l3.addr_family as i32 == libc::AF_INET6;
+    let mut drop = false;
+    let mut reject = false;
+    // #6854: meaningless unless `reject`; see CoSTxSelection.reject_message.
+    let mut reject_message = crate::filter::RejectMessage::ADMIN_PROHIBITED;
+    let mut filter_log = None;
+    let mut filter_counters = crate::filter::CachedFilterCounters::default();
+    let mut three_color_policers = crate::filter::CachedThreeColorPolicers::default();
+    // #6236 PR-2C: fold the `needs_tx_eval` precheck and the output-filter
+    // fetch into ONE lookup — `interface_output_filter_needing_tx_eval`
+    // borrows the filter gated on `Filter::needs_tx_eval()`, replacing the
+    // separate bool accessor + `.get()` + re-`filter(needs_tx_eval)`.
+    if let Some(output_filter) = crate::filter::interface_output_filter_needing_tx_eval(
+        &forwarding.filter_state,
+        egress_ifindex,
+        is_v6,
+    ) {
+        // #7992: the PORTLESS evaluator. This arm has no flow, so it has no
+        // ports — and literal `0, 0` is not "no port", it is a port value a
+        // term can match on. `destination-port-except 22` matches everything
+        // that is not 22, and 0 is not 22, so the exception matched and an
+        // egress `then discard` fired on a packet whose real port was
+        // excepted. Port-bearing terms now DECLINE here in both directions,
+        // which matches this arm's stated contract that only L3-only terms
+        // take effect.
+        let output_result = crate::filter::evaluate_filter_ref_tx_selection_cached_portless(
+            output_filter,
+            wire_l3.src_ip,
+            wire_l3.dst_ip,
+            wire_l3.protocol,
+            meta.dscp,
+        );
+        drop = output_result.action != crate::filter::FilterAction::Accept;
+        reject = matches!(output_result.action, crate::filter::FilterAction::Reject(_));
+        reject_message = if let crate::filter::FilterAction::Reject(m) = output_result.action {
+            m
+        } else {
+            crate::filter::RejectMessage::ADMIN_PROHIBITED
+        };
+        filter_log = output_result.log_match;
+        filter_counters = output_result.counters;
+        three_color_policers = output_result.three_color_policers;
+    }
+    CachedTxSelectionDescriptor {
+        queue_id,
+        dscp_rewrite,
+        drop,
+        reject,
+        reject_message,
+        filter_counters,
+        three_color_policers,
+        filter_log,
+        // Flowless packets are re-resolved per packet (no cache entry),
+        // so there is nothing to mark for hit-path re-classification.
+        ba_reclassify: false,
+    }
 }
 
 fn resolve_cached_cos_tx_selection_impl(
     forwarding: &ForwardingState,
     egress_ifindex: i32,
     meta: UserspaceDpMeta,
-    flow_key: Option<&SessionKey>,
-    ingress_flow_key: Option<&SessionKey>,
+    tuple: CachedTxTuple<'_>,
 ) -> CachedTxSelectionDescriptor {
-    let iface = forwarding.cos.interfaces.get(&egress_ifindex);
-    let Some(flow_key) = flow_key else {
-        // #hb166 T-6(m): fragments / flowless packets carry no 5-tuple but
-        // still carry a DSCP (and 802.1p PCP). Behavior-aggregate
-        // classification is 5-tuple-independent — resolve it from `meta` so
-        // an EF fragment lands in its BA queue instead of straddling the
-        // default queue. Filter forwarding-class / rewrite needs the flow
-        // key, so those stay unset (as before).
-        let queue_id = iface.map(|iface| {
-            resolve_cos_dscp_classifier_queue_id(iface, meta.dscp)
-                .or_else(|| resolve_cos_inet_precedence_classifier_queue_id(iface, meta.dscp))
-                .or_else(|| {
-                    resolve_cos_ieee8021_classifier_queue_id(
-                        iface,
-                        meta.ingress_pcp,
-                        meta.ingress_vlan_present != 0,
-                    )
-                })
-                .unwrap_or(iface.default_queue)
-        });
-        // #3995: flowless packets still resolve the loss-priority-aware CoS
-        // rewrite from their own DSCP/PCP (default LOW when unclassified).
-        let dscp_rewrite = queue_id.and_then(|queue_id| {
-            resolve_cos_queue_lp_rewrite(
-                forwarding,
-                egress_ifindex,
-                queue_id,
-                meta.dscp,
-                meta.ingress_pcp,
-                meta.ingress_vlan_present != 0,
-            )
-        });
-        // #6055: bring this cached flowless arm to PARITY with the #5467 fix on
-        // `resolve_cos_tx_selection_internal`'s flowless arm. Before this gate the
-        // cached flowless arm returned `drop:false, reject:false, filter_log:None`
-        // WITHOUT ever evaluating the interface `filter output` — a LATENT
-        // fail-open: any caller that reads `.drop`/`.reject` from a `flow_key=None`
-        // result (a future seed/mirror refactor) would silently wave a
-        // would-be-dropped flowless packet (a non-first IP fragment / non-query
-        // ICMP error/control packet, #2344/#3290) past an egress `then discard`/
-        // `reject` term. Evaluate the output filter against the packet's own L3
-        // tuple (src/dst/protocol from `meta`; L4 ports forced to 0 since the
-        // header is absent) and honor the drop/reject/log verdict exactly as the
-        // flow-keyed arm below does, so an L3-matching deny FAILS CLOSED.
-        //
-        // Uses the cache-replay eval (`evaluate_filter_ref_tx_selection_cached`)
-        // the flow-keyed arm uses — it captures `then count`/policer handles into
-        // the descriptor and applies `TermMatchExtra::default()`, which fails
-        // every per-packet-L4 term (tcp-flags/icmp-type/icmp-code/is-fragment/
-        // flex) closed. The flow-cache SEED path already DECLINES caching for a
-        // filter carrying such a term (`interface_output_filter_has_per_packet_l4_match`,
-        // flow_cache.rs), so no per-packet-L4 output term reaches this arm; only
-        // an L3-only (`from source-address`/`destination-address`/`protocol`/bare
-        // `then`) term takes effect, matching the #5467 flowless contract. Ports
-        // are 0, so a port-BEARING term never matches (no spurious drop). The
-        // `drop` bit is the OUTPUT filter's terminal action only (a three-color
-        // policer runs at replay via `apply_cached_three_color_policers`),
-        // identical to the flow-keyed arm's #3608 convention.
-        let is_v6 = meta.addr_family as i32 == libc::AF_INET6;
-        let mut drop = false;
-        let mut reject = false;
-        // #6854: meaningless unless `reject`; see CoSTxSelection.reject_message.
-        let mut reject_message = crate::filter::RejectMessage::ADMIN_PROHIBITED;
-        let mut filter_log = None;
-        let mut filter_counters = crate::filter::CachedFilterCounters::default();
-        let mut three_color_policers = crate::filter::CachedThreeColorPolicers::default();
-        // #6236 PR-2C: fold the `needs_tx_eval` precheck and the output-filter
-        // fetch into ONE lookup — `interface_output_filter_needing_tx_eval`
-        // borrows the filter gated on `Filter::needs_tx_eval()`, replacing the
-        // separate bool accessor + `.get()` + re-`filter(needs_tx_eval)`.
-        if let Some(output_filter) = crate::filter::interface_output_filter_needing_tx_eval(
-            &forwarding.filter_state,
-            egress_ifindex,
-            is_v6,
-        ) && let Some((src_ip, dst_ip)) = ForwardPacketMeta::from(meta).l3_addrs()
-        {
-            // #7992: the PORTLESS evaluator. This arm has no flow, so it has no
-            // ports — and literal `0, 0` is not "no port", it is a port value a
-            // term can match on. `destination-port-except 22` matches everything
-            // that is not 22, and 0 is not 22, so the exception matched and an
-            // egress `then discard` fired on a packet whose real port was
-            // excepted. Port-bearing terms now DECLINE here in both directions,
-            // which matches this arm's stated contract that only L3-only terms
-            // take effect.
-            let output_result = crate::filter::evaluate_filter_ref_tx_selection_cached_portless(
-                output_filter,
-                src_ip,
-                dst_ip,
-                meta.protocol,
-                meta.dscp,
-            );
-            drop = output_result.action != crate::filter::FilterAction::Accept;
-            reject = matches!(output_result.action, crate::filter::FilterAction::Reject(_));
-            reject_message = if let crate::filter::FilterAction::Reject(m) = output_result.action {
-                m
-            } else {
-                crate::filter::RejectMessage::ADMIN_PROHIBITED
-            };
-            filter_log = output_result.log_match;
-            filter_counters = output_result.counters;
-            three_color_policers = output_result.three_color_policers;
+    // #8367: exhaustive, no `_` arm. A third tuple shape (a future caller with a
+    // different post-NAT provenance) must be made to state which arm it takes
+    // rather than falling into whichever one happens to be the wildcard.
+    let (flow_key, ingress_flow_key) = match tuple {
+        CachedTxTuple::Flowless { wire_l3 } => {
+            return cached_cos_tx_selection_flowless(forwarding, egress_ifindex, meta, wire_l3);
         }
-        return CachedTxSelectionDescriptor {
-            queue_id,
-            dscp_rewrite,
-            drop,
-            reject,
-            reject_message,
-            filter_counters,
-            three_color_policers,
-            filter_log,
-            // Flowless packets are re-resolved per packet (no cache entry),
-            // so there is nothing to mark for hit-path re-classification.
-            ba_reclassify: false,
-        };
+        CachedTxTuple::Flow {
+            egress_wire_key,
+            ingress_flow_key,
+        } => (egress_wire_key, ingress_flow_key),
     };
+    let iface = forwarding.cos.interfaces.get(&egress_ifindex);
 
     // #3642: select the output-filter family from the (post-NAT) wire key the
     // caller passes, not `meta.addr_family`. For a NAT64 flow the egress family
@@ -276,8 +440,7 @@ fn resolve_cached_cos_tx_selection_impl(
     // on the pre-NAT `ingress_flow_key` and the ingress-side family, NOT the
     // post-NAT egress wire key `flow_key`/`is_v6` (#3642, correct only for the
     // OUTPUT filter). For a non-NAT flow both keys — and both families — match.
-    let ingress_key = ingress_flow_key.unwrap_or(flow_key);
-    let ingress_is_v6 = ingress_key.addr_family as i32 == libc::AF_INET6;
+    let ingress_is_v6 = ingress_flow_key.addr_family as i32 == libc::AF_INET6;
     // #6236 PR-2C: one lookup for both the gate and the walk. The borrow is gated
     // on `Filter::needs_tx_eval()`, so `has_output_tx_eval` is just `.is_some()`
     // and `output_filter` needs no second `.get()` or re-`filter(needs_tx_eval)`.
@@ -361,11 +524,11 @@ fn resolve_cached_cos_tx_selection_impl(
             // post-NAT egress wire key the output filter used above).
             let ingress_result = crate::filter::evaluate_filter_ref_tx_selection_cached(
                 ingress_filter,
-                ingress_key.src_ip,
-                ingress_key.dst_ip,
-                ingress_key.protocol,
-                ingress_key.src_port,
-                ingress_key.dst_port,
+                ingress_flow_key.src_ip,
+                ingress_flow_key.dst_ip,
+                ingress_flow_key.protocol,
+                ingress_flow_key.src_port,
+                ingress_flow_key.dst_port,
                 meta.dscp,
             );
             effective_dscp_rewrite = effective_dscp_rewrite.or(ingress_result.dscp_rewrite);
