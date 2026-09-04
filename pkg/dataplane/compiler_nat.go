@@ -214,24 +214,72 @@ func finalizeNATCounterIDs(result *CompileResult) {
 	}
 }
 
+// nextSourceNATPoolID advances the source-NAT pool numbering, refusing to WRAP.
+//
+// #8597 K75. The numbering is a uint8 incremented per named pool and per
+// anonymous interface-mode pool, with no bound anywhere — so it wrapped
+// silently. Measured before the guard, with 260 named pools each referenced by
+// one SNAT rule:
+//
+//	260 pools -> 256 distinct IDs, 4 colliding IDs, NextPoolID=4
+//	pool ID 0 is shared by [pool256 pool000]
+//
+// and a wrapped NextPoolID then hands compileNAT64's auto-assign branch an id
+// another pool already holds.
+//
+// It saturates rather than rejecting, and warns. Rejecting would fail a commit
+// that works today: nothing indexes a live structure by this id since #8606
+// (see the note on compileNAT), so 256 pools forward correctly right now and a
+// new commit-time refusal would be a regression dressed as a fix. Saturating
+// keeps the aliasing bounded to the last id and makes it AUDIBLE, which is the
+// same exhaustion contract assignNATCounterID uses for the sibling identifier
+// space — that one has a guard and this one did not.
+//
+// The cap is the uint8 range, NOT MAX_NAT_POOLS (32). The 32 is the legacy
+// eBPF map's ABI, and those maps are no longer written on the only production
+// compile path; capping the allocator there would reject working configs.
+func nextSourceNATPoolID(cur uint8, poolName string) uint8 {
+	if cur == maxSourceNATPoolID {
+		slog.Warn("source NAT pool IDs exhausted; further pools reuse the last id",
+			"pool", poolName, "max", maxSourceNATPoolID)
+		return cur
+	}
+	return cur + 1
+}
+
+// maxSourceNATPoolID is the largest assignable source-NAT pool id — the uint8
+// range the numbering is declared in, not a policy limit.
+const maxSourceNATPoolID uint8 = 255
+
 // compileNAT resolves the source- and destination-NAT configuration into the
 // identifiers and runtime state that OUTLIVE the compile, and rejects the
 // configurations that cannot be enforced.
 //
 // What escapes this function, i.e. what it exists for after #6420:
 //
-//   - result.PoolIDs / result.NextPoolID — the source-NAT pool numbering the
-//     operator surfaces read back through ApplyResult (`show security nat
-//     source pool`, the REST/gRPC pool views, the Prometheus pool metrics) and
-//     that compileNAT64's auto-assign branch continues from.
+//   - result.PoolIDs / result.NextPoolID — the source-NAT pool numbering that
+//     compileNAT64's auto-assign branch continues from.
+//
+//     THIS USED TO SAY the operator surfaces read the numbering back through
+//     ApplyResult (`show security nat source pool`, the REST/gRPC pool views,
+//     the Prometheus pool metrics). They do not, and have not since #8606
+//     moved every one of them to the helper's live pool status keyed by pool
+//     NAME. Measured for #8597 K75: outside pkg/dataplane the only mentions of
+//     PoolIDs are the two maps.Clone calls in apply.go that copy it into
+//     ApplyResult, and nothing reads it there. Corrected rather than deleted,
+//     because the numbering IS still assigned and still feeds compileNAT64.
+//
 //   - result.NATCounterIDs — the per-rule translation hit counter IDs stamped
 //     onto the userspace config snapshot (buildSnapshotWithSchedulerStateAnd-
 //     NATCounters) and read back by every operator NAT surface.
+//
 //   - result.AddrIDs / result.nextAddrID — the implicit "_snat_match_<cidr>"
 //     address-book entries resolveSNATMatchAddr synthesizes.
+//
 //   - the persistent-NAT table (dp.GetPersistentNAT), which the conntrack GC
 //     and `show security nat source persistent-nat-table` read. This is the
 //     one dataplane call in this file that is NOT a shim no-op.
+//
 //   - the errors: an unknown zone, an unknown pool, and a DNAT match/pool
 //     address that is a prefix rather than a host still fail the compile, and
 //     the #4960 validate-before-mutate pre-pass surfaces them ahead of the
@@ -426,7 +474,7 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 					} else {
 						curPoolID = poolID
 						result.PoolIDs[pool.Name] = curPoolID
-						poolID++
+						poolID = nextSourceNATPoolID(poolID, pool.Name)
 					}
 
 					// Parse pool addresses. They no longer reach nat_pool_ips_*,
@@ -1001,7 +1049,7 @@ func compileNAT64(dp DataPlane, cfg *config.Config, result *CompileResult) error
 			}
 			// Assign next pool ID (after those used by SNAT).
 			newID := result.NextPoolID
-			result.NextPoolID++
+			result.NextPoolID = nextSourceNATPoolID(result.NextPoolID, pool.Name)
 			result.PoolIDs[pool.Name] = newID
 			poolID = newID
 
