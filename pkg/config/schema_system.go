@@ -285,8 +285,14 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 			"deny-commands":       {desc: "Regex of operational commands to deny", args: 1, placeholder: "<regex>", children: nil},
 			"allow-configuration": {desc: "Regex of configuration to allow", args: 1, placeholder: "<regex>", children: nil},
 			"deny-configuration":  {desc: "Regex of configuration to deny", args: 1, placeholder: "<regex>", children: nil},
-			"login-alarms":        {desc: "Display system alarms on login", children: nil},
-			"login-tip":           {desc: "Display a tip on login", children: nil},
+			// #7971: modeled ONLY so they are REFUSED. Not a step toward
+			// implementing the family — see schema_login_regexps_7971.go.
+			"allow-commands-regexps":      unimplementedRegexpsLeaf("allow-commands-regexps"),
+			"deny-commands-regexps":       unimplementedRegexpsLeaf("deny-commands-regexps"),
+			"allow-configuration-regexps": unimplementedRegexpsLeaf("allow-configuration-regexps"),
+			"deny-configuration-regexps":  unimplementedRegexpsLeaf("deny-configuration-regexps"),
+			"login-alarms":                {desc: "Display system alarms on login", children: nil},
+			"login-tip":                   {desc: "Display a tip on login", children: nil},
 		}},
 		// #4895: the login user NAME is a keyed identity token that the daemon
 		// formats verbatim into an /etc/sudoers.d/xpf-<name> NOPASSWD grant.

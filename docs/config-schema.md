@@ -7926,6 +7926,63 @@ reserved for whole-dataplane selection where a rewrite shim
   `TestSchemaValidate_Interfaces_PackedVrrpOneLinerBypassesGate` (schema
   passes, compile rejects) and the
   `compiler_validate_strict_vrrp_priority_5184_test.go` matrix.
+  **#8483 — the same bypass on the two `vrrp-group` TIMER leaves.** The
+  #5184 gate closed `priority`; the identical packed-one-liner hole was
+  still open one leaf over. A census of every validated leaf under
+  `vrrpGroupSchemaNode` — run as one `*ConfigTree` per row handed to both
+  `SchemaValidate` and `CompileConfig`, with a braced control that must
+  REJECT and an in-range packed control that must ACCEPT — found four
+  validated leaves and two uncovered:
+
+  | leaf | schema bound | packed spelling bypasses `SchemaValidate` | compiled-`*Config` backstop before #8483 |
+  |---|---|---|---|
+  | `virtual-address` | `ValueCIDR` | yes | yes — the VIP is separately re-parsed at compile |
+  | `priority` | 1..255 | yes | yes — `validateVRRPGroupPriorityStrict` (#5184) |
+  | `advertise-interval` | 1..40 | yes | **no** |
+  | `preempt hold-time` | 1..3600 | yes | **no** |
+
+  `advertise-interval` is the sharp one and the reason this is a defect
+  rather than an inconsistency. It is SECONDS at the config layer,
+  converted seconds→ms (`pkg/vrrp/vrrp.go`) and then ms→centiseconds
+  (`uint16(cfg.AdvertiseInterval / 10)`, `instance_send.go`) into the
+  VRRPv3 Max Advert Int field, which `pkg/vrrp/packet.go` writes under a
+  12-bit mask (`p.MaxAdvertInt&0x0FFF`). 4095 cs is the largest interval
+  that survives the wire, so 40 s (4000 cs) is the last whole-second
+  value that encodes and 41 s aliases to 4 cs. The aliasing is silent and
+  ASYMMETRIC: the local advert timer uses the un-narrowed value while the
+  peer's master-down calculation uses the narrowed one, so a packed
+  `advertise-interval 256;` advertises as 10.24 s and the two nodes
+  disagree about how long silence must last before a takeover. A negative
+  survives `strconv.Atoi` into the same `uint16` arithmetic.
+  `preempt hold-time` reaches the runtime un-narrowed
+  (`time.Duration(cfg.PreemptHoldTime) * time.Second`), so its check is a
+  CONSISTENCY gate — the packed spelling agreeing with the bound a
+  structured spelling of the same config is already held to — not a
+  wire-safety one. Both are closed by `validateVRRPGroupTimersStrict`
+  (`compiler_validate_strict_vrrp_timers.go`) at the #5184 call site, with
+  the same `#1960` no-brick downgrade on the tolerant load / peer-sync
+  path (`lenientVRRPGroupTimers`).
+
+  Zero is NOT out of range for either field and the gate must exempt it:
+  it is the compiler's "unset" sentinel (`pkg/vrrp` substitutes the 1 s
+  default for `AdvertiseInterval == 0` and treats `PreemptHoldTime <= 0`
+  as preempt-immediately), so a naive mirror of the priority gate would
+  refuse every `vrrp-group` that simply does not configure a timer.
+
+  **Reachability is narrower than "any operator" and worth stating:** the
+  packed spelling is NOT reachable through `set` — `SetPath` normalizes
+  packed tokens into schema-structured children, so every flat-set
+  spelling was already gated. It is reachable through a hierarchical
+  config file (`load merge` / `load override`) and through **HA peer
+  config sync**, which is what makes it more than a typo: a packed
+  one-liner authored once propagates to the peer. It also means a fixture
+  built the usual way — `ParseSetCommand` + `SetPath` — CANNOT see this
+  class of defect, and #8483 was in fact first recorded as FALSE for
+  exactly that reason. Pinned by
+  `compiler_validate_strict_vrrp_timers_8483_test.go`, whose fixture is
+  hierarchical for that reason and whose accept-side controls (in-range
+  packed, the inclusive 40 boundary, and a group with NO timers set) are
+  what distinguish a working gate from one that rejects everything.
   **#4826 — reth-derived VRID range gate:** #4573 only bounded the
   *explicit* `vrrp-group <id>` slot; a RETH interface's VRRP GroupID is
   separately synthesized as `100 + redundancy-group-id`

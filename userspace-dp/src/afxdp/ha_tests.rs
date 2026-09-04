@@ -3486,19 +3486,27 @@ fn deleting_one_synced_session_leaves_its_neighbours_in_the_reverse_prewarm_inde
         coordinator.upsert_synced_session(survivor.clone()),
         SyncedImportOutcome::Applied
     );
+    // BOTH keys, not just the survivor: the message below claims both are
+    // filed, and a precondition that checks only one of them would let the
+    // fixture drift into a shape where the two sessions do NOT share buckets —
+    // in which case an over-broad sweep is invisible and this cell passes
+    // without exercising anything.
     for rg in [1, 2] {
-        assert!(
-            coordinator
-                .sessions
-                .owner_rg_indexes
-                .reverse_prewarm_sessions
-                .lock()
-                .expect("prewarm index")
-                .get(&rg)
-                .is_some_and(|keys| keys.contains(&survivor.key)),
-            "fixture no longer files BOTH sessions under RG {rg}; an over-broad \
-             sweep would then be invisible here"
-        );
+        for (name, key) in [("doomed", &doomed.key), ("survivor", &survivor.key)] {
+            assert!(
+                coordinator
+                    .sessions
+                    .owner_rg_indexes
+                    .reverse_prewarm_sessions
+                    .lock()
+                    .expect("prewarm index")
+                    .get(&rg)
+                    .is_some_and(|keys| keys.contains(key)),
+                "fixture no longer files the {name} session under RG {rg}; the \
+                 two sessions must share BOTH buckets or an over-broad sweep is \
+                 invisible here"
+            );
+        }
     }
 
     coordinator.delete_synced_session(doomed.key.clone());
@@ -3526,20 +3534,26 @@ fn deleting_one_synced_session_leaves_its_neighbours_in_the_reverse_prewarm_inde
     }
 }
 
-/// #7209: the LIVE-session variant of the same asymmetry — a replace after the
-/// route moved must not leave the key filed under the RG it no longer belongs
-/// to.
+/// #7209: a route move ADDS the new RG's filing, and the residue it leaves is
+/// bounded — the authoritative un-file at delete is what bounds it.
 ///
-/// `upsert_synced_session` refreshes a re-imported key with
-/// `(Some(previous), Some(next))`, and a peer refreshes its synced sessions
-/// continuously. Under the recomputed-removal shape both halves were evaluated
-/// against the CURRENT forwarding, so the replace removed and re-inserted the
-/// same set and the bucket the key was ORIGINALLY filed under simply survived.
-/// The session is still live here, so this is not the permanent leak — it is
-/// the entry appearing under an RG whose activation must then re-derive and
-/// discard it, on the failover critical path, once per moved route per session.
+/// REPLACES a cell that asserted the opposite and was wrong. That cell required
+/// a replace to NARROW the filing to `candidates(now)`, which is precisely the
+/// behaviour that let a refresh taken in a blind-FIB window drop a bucket
+/// nothing could restore (see
+/// `a_refresh_never_drops_a_prewarm_filing_the_current_fib_cannot_rederive_7209`).
+/// It is recorded rather than quietly deleted because it is the reason the
+/// regression shipped: it was written to pin "no accumulation", the strongest
+/// available statement, without asking what the consumer does with an extra
+/// bucket versus a missing one. The consumer discards extras and never looks
+/// for missing ones, so the strongest statement was the wrong one.
+///
+/// What is worth binding is what the old cell was reaching for: accumulation
+/// must not be unbounded. It is not — a live entry accrues at most one bucket
+/// per RG its reply path has ever resolved to, and the delete clears every one
+/// of them.
 #[test]
-fn a_replaced_synced_session_is_refiled_not_accumulated_after_a_route_moves_7209() {
+fn a_route_move_adds_the_new_prewarm_filing_and_delete_clears_all_of_them_7209() {
     let mut coordinator = Coordinator::new();
     coordinator.forwarding = test_forwarding_state_split_rgs();
     let entry = SyncedSessionEntry {
@@ -3556,31 +3570,319 @@ fn a_replaced_synced_session_is_refiled_not_accumulated_after_a_route_moves_7209
         coordinator.upsert_synced_session(entry.clone()),
         SyncedImportOutcome::Applied
     );
+    assert!(
+        filed_under_7209(&coordinator, &entry.key).contains(&2),
+        "fixture no longer files under the FIB-derived RG 2"
+    );
 
-    // ifindex 6 moves from RG 2 back to RG 1, so the FIB-derived bucket
-    // collapses onto the metadata one and RG 2 must be left with nothing.
+    // ifindex 6 is genuinely RE-HOMED from RG 2 to RG 1 — the FIB can answer,
+    // it just answers differently. Distinct from the blind-FIB case, and the
+    // distinction is the whole reason both cells exist.
     coordinator.forwarding = test_forwarding_state_with_fabric();
     assert_eq!(
         coordinator.upsert_synced_session(entry.clone()),
         SyncedImportOutcome::Applied,
         "the replace must be ADMITTED, or the refile below never runs"
     );
+    let after_move = filed_under_7209(&coordinator, &entry.key);
+    assert!(
+        after_move.contains(&1),
+        "the replace did not file the key under the RG its reply path now \
+         resolves to, so an activation of RG 1 would not pre-resolve it"
+    );
+    assert!(
+        after_move.len() <= 8,
+        "the filing set grew past any plausible RG count ({after_move:?}); \
+         accumulation is supposed to be bounded by the RGs this key's reply \
+         path has resolved to, not open-ended"
+    );
 
+    // The bound that makes the residue acceptable: the delete takes ALL of it,
+    // whichever forwarding is live at the time.
+    coordinator.delete_synced_session(entry.key.clone());
+    let after_delete = filed_under_7209(&coordinator, &entry.key);
+    assert!(
+        after_delete.is_empty(),
+        "a DELETED synced session is still filed under RG(s) {after_delete:?}. \
+         The residue a route move leaves is only acceptable because the delete \
+         clears it; without that it is the unbounded strand again (#7209)"
+    );
+}
+
+/// #7209: a session removed through a path that is NOT the coordinator's delete
+/// verb must also leave the reverse-prewarm index — whatever origin the stored
+/// entry carries by then.
+///
+/// `purge_translated_synced_hit` and the LocalDelivery replacement after
+/// `take_synced_local` both drop a peer-synced forward entry via
+/// `remove_shared_session` and neither calls
+/// `refresh_reverse_prewarm_owner_rg_indexes`. A later coordinator delete then
+/// finds no stored entry and refreshes with `(None, None)`, so nothing ever
+/// names the filing again — an unbounded strand with no session behind it,
+/// reached without any route move at all. This drives `remove_shared_session`
+/// directly, which is the choke point all of those paths share.
+///
+/// TWO LEGS, and the second is the one that carries the property. The delete
+/// verb ALSO un-files (`delete_synced_session_gen` refreshes with
+/// `(Some(removed), None)`), so a single-leg cell using a peer-synced origin is
+/// green whether or not `remove_shared_session` does anything at all — the
+/// mechanism it names is masked by the other one. Leg B removes an entry whose
+/// stored origin is `SharedPromote`, which is exactly what
+/// `purge_translated_synced_hit` finds after `maybe_promote_synced_session`
+/// republished the key, and it isolates this mechanism: an implementation that
+/// gates the un-file on the stored entry being peer-synced passes leg A and
+/// reds leg B. Measured — that mutant survived the whole suite before this leg
+/// existed.
+#[test]
+fn a_removal_outside_the_delete_verb_still_unfiles_the_prewarm_key_7209() {
+    for (leg, origin) in [
+        ("A: still peer-synced", SessionOrigin::SyncImport),
+        ("B: promoted before removal", SessionOrigin::SharedPromote),
+    ] {
+        let mut coordinator = Coordinator::new();
+        coordinator.forwarding = test_forwarding_state_split_rgs();
+        let entry = SyncedSessionEntry {
+            key: test_key(),
+            decision: test_decision(),
+            metadata: test_metadata(),
+            origin: SessionOrigin::SyncImport,
+            protocol: PROTO_TCP,
+            tcp_flags: 0x10,
+            generation: 0,
+            session_id: 0,
+        };
+        assert_eq!(
+            coordinator.upsert_synced_session(entry.clone()),
+            SyncedImportOutcome::Applied
+        );
+        assert!(
+            !filed_under_7209(&coordinator, &entry.key).is_empty(),
+            "leg {leg}: fixture filed nothing, so the removal below would prove \
+             nothing"
+        );
+        if origin != SessionOrigin::SyncImport {
+            // What `maybe_promote_synced_session` leaves behind: the same key,
+            // republished with a promoted origin, index untouched.
+            let mut promoted = entry.clone();
+            promoted.origin = origin;
+            assert!(
+                !promoted.origin.is_peer_synced(),
+                "leg {leg}: fixture no longer uses a NON-peer-synced origin, so \
+                 it cannot isolate the un-file from an origin gate"
+            );
+            publish_shared_session(
+                &coordinator.sessions.synced,
+                &coordinator.sessions.nat,
+                &coordinator.sessions.forward_wire,
+                &coordinator.sessions.owner_rg_indexes,
+                &promoted,
+            );
+        }
+
+        remove_shared_session(
+            &coordinator.sessions.synced,
+            &coordinator.sessions.nat,
+            &coordinator.sessions.forward_wire,
+            &coordinator.sessions.owner_rg_indexes,
+            &entry.key,
+        );
+
+        let stranded = filed_under_7209(&coordinator, &entry.key);
+        assert!(
+            stranded.is_empty(),
+            "leg {leg}: a session removed through `remove_shared_session` — the \
+             path `purge_translated_synced_hit` and the LocalDelivery \
+             replacement both take — is still filed for reverse prewarm under \
+             RG(s) {stranded:?}, with no entry behind it. Nothing ever names \
+             that filing again (#7209)"
+        );
+    }
+}
+
+/// #7209: a PROMOTED session's filing must survive promotion and be cleared by
+/// its eventual removal.
+///
+/// `maybe_promote_synced_session` republishes an imported key with
+/// `SessionOrigin::SharedPromote` and does NOT refresh this index, so the
+/// filing made at `SyncImport` time stands — deliberately, since the activation
+/// prewarm accepts `SharedPromote`. But `reverse_prewarm_owner_rg_candidates`
+/// returns EMPTY for a non-peer-synced origin, so any un-file derived from the
+/// stored entry computes nothing once the origin has changed. Promote, then
+/// delete, and the key stranded — with no route move involved.
+///
+/// This is the cell that makes the un-file's unconditionality load-bearing
+/// rather than incidental: an implementation that gates the sweep on
+/// `previous.origin.is_peer_synced()` passes every other cell here and reds
+/// this one.
+#[test]
+fn a_promoted_then_deleted_synced_session_leaves_no_prewarm_key_7209() {
+    let mut coordinator = Coordinator::new();
+    coordinator.forwarding = test_forwarding_state_split_rgs();
+    let entry = SyncedSessionEntry {
+        key: test_key(),
+        decision: test_decision(),
+        metadata: test_metadata(),
+        origin: SessionOrigin::SyncImport,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+        generation: 0,
+        session_id: 0,
+    };
+    assert_eq!(
+        coordinator.upsert_synced_session(entry.clone()),
+        SyncedImportOutcome::Applied
+    );
+    assert!(
+        !filed_under_7209(&coordinator, &entry.key).is_empty(),
+        "fixture filed nothing before the promotion"
+    );
+
+    // What `maybe_promote_synced_session` does to the shared entry: republish
+    // the same key with a promoted origin, no index refresh.
+    let mut promoted = entry.clone();
+    promoted.origin = SessionOrigin::SharedPromote;
+    assert!(
+        !promoted.origin.is_peer_synced(),
+        "fixture no longer exercises a NON-peer-synced origin, which is the \
+         only arrangement in which a candidates-derived un-file computes empty"
+    );
+    publish_shared_session(
+        &coordinator.sessions.synced,
+        &coordinator.sessions.nat,
+        &coordinator.sessions.forward_wire,
+        &coordinator.sessions.owner_rg_indexes,
+        &promoted,
+    );
+
+    coordinator.delete_synced_session(entry.key.clone());
+
+    let stranded = filed_under_7209(&coordinator, &entry.key);
+    assert!(
+        stranded.is_empty(),
+        "a PROMOTED-then-deleted synced session is still filed for reverse \
+         prewarm under RG(s) {stranded:?}. The stored entry's origin is \
+         SharedPromote by then, for which the candidate set is EMPTY, so any \
+         un-file derived from it removes nothing — no route move required \
+         (#7209)"
+    );
+}
+
+/// The RGs `key` is currently filed under for reverse prewarm.
+fn filed_under_7209(coordinator: &Coordinator, key: &SessionKey) -> Vec<i32> {
     let index = coordinator
         .sessions
         .owner_rg_indexes
         .reverse_prewarm_sessions
         .lock()
         .expect("prewarm index");
-    assert!(
-        index.get(&1).is_some_and(|keys| keys.contains(&entry.key)),
-        "the replace dropped the key from the RG it DOES belong to"
+    let mut rgs: Vec<i32> = index
+        .iter()
+        .filter(|(_, keys)| keys.contains(key))
+        .map(|(rg, _)| *rg)
+        .collect();
+    rgs.sort_unstable();
+    rgs
+}
+
+/// #7209: a refresh must never DROP a reverse-prewarm filing it cannot
+/// re-derive.
+///
+/// This is the regression PR #8479 introduced and the reason the removal is no
+/// longer unconditional. That change made every refresh un-file the key from
+/// EVERY bucket and then re-file only what the CURRENT forwarding could name.
+/// When the FIB is momentarily blind to the reply path — a RETH member down and
+/// the route not yet re-homed, or `stop_inner` having emptied `forwarding`
+/// between a failed reconcile and its retry — "what the current forwarding can
+/// name" is a strict SUBSET of the truth, so an ordinary peer refresh landing in
+/// that window silently narrowed the filing and nothing ever restored it.
+///
+/// The direction matters and it is the worse one. An EXTRA bucket costs a
+/// re-synthesis that `prewarm_reverse_synced_sessions_for_owner_rgs` then
+/// discards, because it re-derives the reverse companion under live tables and
+/// re-checks `owner_rg_set.contains(..)` before keeping anything. A MISSING
+/// bucket is not checked at all — the key never enters the candidate set, so the
+/// session is not pre-resolved when that RG activates. Over-filing is absorbed
+/// by the consumer; under-filing is invisible to it.
+///
+/// So the index is add-only across a live entry's transitions, and un-filing
+/// happens exactly once, when the entry is authoritatively REMOVED (which is
+/// what bounds it — see the delete cell).
+#[test]
+fn a_refresh_never_drops_a_prewarm_filing_the_current_fib_cannot_rederive_7209() {
+    let mut coordinator = Coordinator::new();
+    coordinator.forwarding = test_forwarding_state_split_rgs();
+    let entry = SyncedSessionEntry {
+        key: test_key(),
+        decision: test_decision(),
+        metadata: test_metadata(),
+        origin: SessionOrigin::SyncImport,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+        generation: 0,
+        session_id: 0,
+    };
+    assert_eq!(
+        coordinator.upsert_synced_session(entry.clone()),
+        SyncedImportOutcome::Applied
     );
     assert!(
-        !index.get(&2).is_some_and(|keys| keys.contains(&entry.key)),
-        "a re-imported synced session is still filed under RG 2, the RG that \
-         owned its reply path before the route moved. The replace recomputed \
-         both halves against the CURRENT forwarding, so it removed and \
-         re-inserted the same set and never touched the original bucket (#7209)"
+        coordinator
+            .sessions
+            .owner_rg_indexes
+            .reverse_prewarm_sessions
+            .lock()
+            .expect("prewarm index")
+            .get(&2)
+            .is_some_and(|keys| keys.contains(&entry.key)),
+        "fixture no longer files the key under the FIB-derived RG 2, so the \
+         drop this cell exists to catch could not be observed"
     );
+
+    // The reply path goes BLIND: ifindex 6 leaves the egress table (member
+    // down, or `stop_inner` emptied forwarding after a failed reconcile). The
+    // route has NOT been re-homed to another RG — the FIB simply cannot answer
+    // the question right now.
+    coordinator.forwarding.egress.remove(&6);
+    assert_eq!(
+        reverse_prewarm_owner_rg_candidates_for_test(&coordinator, &entry)
+            .contains(&2),
+        false,
+        "fixture no longer makes the FIB BLIND to RG 2 — with RG 2 still \
+         derivable this cell would pass without exercising anything"
+    );
+
+    // An ordinary peer refresh of the same live session lands in that window.
+    assert_eq!(
+        coordinator.upsert_synced_session(entry.clone()),
+        SyncedImportOutcome::Applied
+    );
+
+    assert!(
+        coordinator
+            .sessions
+            .owner_rg_indexes
+            .reverse_prewarm_sessions
+            .lock()
+            .expect("prewarm index")
+            .get(&2)
+            .is_some_and(|keys| keys.contains(&entry.key)),
+        "a peer refresh taken while the FIB could not resolve the reply path \
+         DROPPED the key's RG 2 filing, and nothing restores it. If RG 2 \
+         activates before this key is refreshed again the session never enters \
+         the prewarm candidate set, so its reply path is not pre-resolved at \
+         the failover — the failure mode the un-filing sweep was supposed to \
+         avoid, inverted (#7209)"
+    );
+}
+
+#[cfg(test)]
+fn reverse_prewarm_owner_rg_candidates_for_test(
+    coordinator: &Coordinator,
+    entry: &SyncedSessionEntry,
+) -> FastSet<i32> {
+    super::shared_ops::reverse_prewarm_owner_rg_candidates_for_test(
+        &coordinator.forwarding,
+        coordinator.dynamic_neighbors_ref(),
+        entry,
+    )
 }
