@@ -108,6 +108,26 @@ func runUniformGatesClusterZone(tree *ConfigTree, cfg *Config, opts compileOpts)
 		}
 	}
 
+	// #8483 VRRP timer gate, the same packed-one-liner bypass one leaf over.
+	// The schema gates advertise-interval (1..40) and preempt hold-time
+	// (1..3600) on the structured spellings, and the PACKED hierarchical
+	// one-liner `vrrp-group 1 virtual-address 10.0.1.100/24
+	// advertise-interval 256;` slips both past SchemaValidate for the reason
+	// documented above. advertise-interval is the sharp one: it reaches a
+	// 12-bit centisecond wire field under an 0x0FFF mask, so 256 s advertises
+	// as 10.24 s and the two nodes disagree about the master-down window.
+	// preempt hold-time reaches the runtime un-narrowed, so its check is a
+	// consistency gate rather than a wire-safety one. Lenient on load /
+	// peer-sync (#1960 no-brick), like every sibling gate here.
+	if err := validateVRRPGroupTimersStrict(cfg); err != nil {
+		if opts.lenientVRRPGroupTimers {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("vrrp-group timers (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #4826 reth-derived VRRP VRID wire-width gate. Strict on commit /
 	// commit-check (hard-reject a `redundant-ether-options
 	// redundancy-group <id>` whose id would push the reth-derived VRRP
