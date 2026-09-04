@@ -348,6 +348,14 @@ var gateValuePairs = []struct{ name, v1, v2 string }{
 	// and a fix there cannot be proven by removing an allowlist row.
 	{"pcp", "3", "5"},
 	{"proto", "bgp", "ospf"},
+	// #8481 typed `protocols ospf ... interface <*> interface-type` against the
+	// four network types vtysh accepts, and the compiler now DROPS a value it
+	// cannot resolve rather than passing it to FRR. Without a pair inside that
+	// domain both leaves go inert under every pair above and fall out of
+	// `compared` into `unreachable` — the same shape the `pcp` pair was added
+	// for, and the same remedy: give the gate a valid pair rather than raise a
+	// blind-spot ceiling over a leaf that is genuinely comparable.
+	{"ospfnet", "point-to-point", "broadcast"},
 }
 
 type gateLeaf struct {
