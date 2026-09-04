@@ -73,15 +73,21 @@ func TestVerifiedChildrenClassDivergences8662(t *testing.T) {
 	}
 }
 
-// The zone member #8662 was filed on. It is now CENSUSED (the wildcard-named
-// container shape was admitted to the site model) and it still DIVERGES, so
-// both halves are asserted: the census can see it, and what it sees is wrong.
+// The zone member #8662 was filed on. It was censused by the wildcard-named
+// site-model change, and #8690's policy-enforcement family then NORMALIZED it,
+// so the two spellings now agree.
 //
-// This cell replaces the "still uncovered" pin that stood here. That pin fired
-// exactly when it was supposed to — the moment the census started covering the
-// shape — and named the note to update. A claim about a gap is only useful if
-// it reds when the gap closes.
-func TestWildcardNamedInstanceFoldIsCensusedAndDiverges8662(t *testing.T) {
+// This cell has changed sides twice and that is the point of it. It began as
+// "still uncovered" (the census could not see the shape), became "censused and
+// still diverging" (it could see it, and what it saw was wrong), and is now
+// "normalized" — each transition announced by the cell failing with the reason,
+// rather than by anyone remembering to look. The last transition caught a
+// change I made myself an hour later.
+//
+// Keeping it as an EQUIVALENCE assertion rather than deleting it is deliberate:
+// deleting it would stop the site being checked in either direction, which is
+// the stale-allowlist failure the #2419 inventory exists to prevent.
+func TestWildcardNamedInstanceFoldIsNormalized8662(t *testing.T) {
 	braced := compileText(t, "security { zones { security-zone trust { interfaces ge-0/0/0.0; } } }")
 	elided := compileText(t, "security { zones { security-zone trust interfaces ge-0/0/0.0; } }")
 	if braced == nil || elided == nil {
@@ -92,29 +98,35 @@ func TestWildcardNamedInstanceFoldIsCensusedAndDiverges8662(t *testing.T) {
 	if !bok || !eok {
 		t.Fatalf("both spellings must produce the zone; braced=%v elided=%v", bok, eok)
 	}
-	// POSITIVE HALF: without this the comparison below could be between two
-	// empty slices and would pass on a compiler that read NEITHER spelling.
+	// POSITIVE HALF: the braced spelling must carry the membership, or the
+	// equality below is between two empty slices and passes on a compiler that
+	// reads neither.
 	if len(bz.Interfaces) == 0 {
 		t.Fatal("the braced spelling produced no zone interfaces — the fixture no longer " +
-			"demonstrates membership being read, so the divergence assertion is vacuous")
+			"demonstrates membership being read, so the assertion below is vacuous")
 	}
-	if len(ez.Interfaces) == len(bz.Interfaces) {
-		t.Logf("the wildcard-named-instance fold now AGREES (%v) — the reader was fixed. "+
-			"Remove `security zones security-zone xpfarg interfaces` from %s and update the "+
-			"#8662 note", ez.Interfaces, inventoryPath)
-		t.Fail()
+	if len(ez.Interfaces) != len(bz.Interfaces) {
+		t.Errorf("the brace-elided zone membership compiled to %v, not %v — the zone boots with "+
+			"different members than the operator wrote, and the elided form walks past the "+
+			"strict gate that rejects the braced one for an undefined interface (#8662/#8690)",
+			ez.Interfaces, bz.Interfaces)
 	}
-	// And the census must SEE it, or the inventory cannot track it either way.
-	found := false
-	for _, s := range collectCompactSites() {
-		if strings.Join(s.container, " ") == "security zones security-zone xpfarg" && s.leaf == "interfaces" {
-			found = true
+	// And it must have LEFT the inventory, or the inventory is stale.
+	for _, line := range mustReadInventorySites8662(t) {
+		if line == "security zones security-zone xpfarg interfaces" {
+			t.Error("the site still sits in the inventory although the two spellings now agree; " +
+				"regenerate it, or the file claims a divergence that no longer exists")
 		}
 	}
-	if !found {
-		t.Error("the wildcard-named-instance fold is no longer censused; the site model " +
-			"regressed and this divergence has gone invisible again (#8662)")
+}
+
+func mustReadInventorySites8662(t *testing.T) []string {
+	t.Helper()
+	sites, _ := readInventory(t)
+	if len(sites) == 0 {
+		t.Fatal("inventory has no sites; this cell proves nothing")
 	}
+	return sites
 }
 
 // The wildcard-named shape must not be admitted so broadly that it condemns
