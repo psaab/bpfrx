@@ -77,7 +77,19 @@ pub(super) fn submit_prepared(
                     .and_then(|root| root.queues.get_mut(queue_idx))
                     .and_then(|q| q.flow_fair_state.as_mut())
                 {
-                    for &(bucket, bytes) in &sidecar[..packets as usize] {
+                    // #8597 K36: clamp to the FILLED prefix, mirroring the
+                    // `enq_sidecar` line below. `sidecar` is a fixed
+                    // [(u16, u64); TX_BATCH_SIZE] and `packets` is a count
+                    // returned by `finalise_prepared`; today three independent
+                    // invariants keep it <= `sidecar_len` (the batch build caps
+                    // at TX_BATCH_SIZE, the fill covers the whole batch, and
+                    // sent never exceeds staged), so this cannot currently
+                    // overrun. It is clamped because the cost of being wrong is
+                    // an index-OOB panic on a TX worker -- a fail-closed stall
+                    // with no restart, the supervisor being detection-only --
+                    // and because a `.min()` is a single cmp/cmov on a
+                    // per-batch path. The sibling line already pays it.
+                    for &(bucket, bytes) in &sidecar[..(packets as usize).min(sidecar_len)] {
                         account_flow_bucket_tx(ff, bucket, bytes, now_ns);
                     }
                 }

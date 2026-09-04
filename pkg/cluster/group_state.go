@@ -306,6 +306,32 @@ func (m *Manager) IsLocalPrimary(rgID int) bool {
 	return false
 }
 
+// LocalGroupPrimary reports whether this node is primary for rgID, and whether
+// the manager knows the group at all.
+//
+// #8640: this exists as a distinct accessor because its caller is the
+// proxy-ARP responder, which runs PER INBOUND ARP FRAME on a socket any host on
+// the segment can drive. `GroupState` is the natural-looking call and is wrong
+// there: it copies the whole RedundancyGroupState, allocates for MonitorFails
+// and ReadinessReasons when either is non-empty, and invokes
+// `transferReadinessFn` — an arbitrary readiness computation — outside the
+// lock. That is a per-frame allocation and callback on an attacker-drivable
+// path. `IsLocalPrimary` avoids all of it but collapses "unknown group" into
+// `false`, which the responder must distinguish: unknown has to fall back to
+// the older signal rather than suppress.
+//
+// So: one RLock, one map lookup, no allocation, no callback, and the two facts
+// the caller actually needs.
+func (m *Manager) LocalGroupPrimary(rgID int) (primary bool, known bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	rg, ok := m.groups[rgID]
+	if !ok {
+		return false, false
+	}
+	return rg.State == StatePrimary, true
+}
+
 // IsPeerPrimary reports whether the PEER node is primary for the given RG,
 // per the last heartbeat-advertised peer group state. It returns false when the
 // peer is not alive, the RG is unknown to the peer, or the peer is in any
