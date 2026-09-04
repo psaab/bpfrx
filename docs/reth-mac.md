@@ -638,6 +638,21 @@ UP` log. After it fires, **nothing else recovers the binding and nothing else
 reports it**: per #8384 binding readiness is defined over socket setup only, so
 a bound-but-dead queue reads `Ready`. That log is the only signal.
 
+**And until #8558 it could not fire at all for the commonest fault.** The
+predicate's `busyErr` term is a substring match on the per-binding `LastError`,
+and the helper's fail-closed teardown erased that field before publishing:
+`stop_inner` empties `workers.live`, `refresh_bindings` routes every slot
+through `zero_unbound_slot`, and that ends with `last_error.clear()`. The only
+other route in, `repaired`, needs a forwarding-live (`Ready`) binding, of which
+a fail-closed reconcile leaves none. So a bind EBUSY — which per the section
+below takes the WHOLE dataplane down — reached the manager with no cause on any
+slot, recovery stayed silent, and the `GAVE UP` log never fired either, because
+it lives inside the same predicate. The helper now carries the terminal
+per-slot cause across the teardown (`Coordinator::last_bind_failures`) and
+re-publishes it on every status refresh, which is what makes the recovery
+described above reachable. The barrier-TIMEOUT shortfall still carries no cause
+and still does not reach recovery.
+
 **#7497's stated reason for widening the predicate was wrong, and #8388 closed
 on the correction.** Blocker 5 justified the change with "the realistic failure
 is PARTIAL — fifteen bind, one EBUSY", and #8388 was filed on top of it to

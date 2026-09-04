@@ -91,6 +91,25 @@ func (m *Manager) hasBusyBindingsWedgeLocked(repaired bool) bool {
 	// bind. `!Bound` subsumes `!Ready`, since Ready requires Bound
 	// (`refresh_bindings.rs`), so there is no separate ready term.
 	//
+	// #8558: the `busyErr` term below reads a field the helper's fail-closed
+	// teardown used to ERASE. `stop_inner(false)` empties `workers.live`, so
+	// `refresh_bindings` routes every slot through `zero_unbound_slot`, whose
+	// last act is `last_error.clear()` — and `repaired` cannot stand in,
+	// because it needs a forwarding-live (`Ready`) binding and a fail-closed
+	// reconcile leaves none. So for the DOMINANT outcome of a bind EBUSY this
+	// predicate could not be satisfied at all, and neither could the
+	// `auto-rebind GAVE UP` log that would have reported the gap, since it is
+	// inside the same predicate. The helper now carries the terminal per-slot
+	// cause across the teardown on `Coordinator::last_bind_failures` and
+	// re-publishes it on every refresh (`bind_failure_cause_survives_the_
+	// failclosed_teardown_8558`), so `LastError` is populated for as long as
+	// the fault lasts.
+	//
+	// One shortfall is still invisible: the barrier TIMEOUT case, where a
+	// worker never reported and there is no per-slot cause to attribute.
+	// Recovery does not fire for it, deliberately — see the cap derivation
+	// below, which assumes the rebind is being fired for a teardown race.
+	//
 	// Note what does NOT need filtering here: a TRANSIENT EBUSY never reaches
 	// this predicate. The bind itself retries "Device or resource busy"
 	// specifically, BIND_RETRY_ATTEMPTS (20) x BIND_RETRY_DELAY (250ms) = 5s,

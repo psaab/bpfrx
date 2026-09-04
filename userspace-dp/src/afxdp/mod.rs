@@ -94,6 +94,7 @@ pub use ha::{SyncedImportOutcome, SYNCED_IMPORT_REFUSED_PREFIX};
 // #7919: the per-session counter query's wait handle + reply row, used by the
 // control-socket handler's two-phase dispatch.
 pub(crate) use ha::{SessionCounterQueryWait, WorkerSessionCounters};
+pub(crate) use ha::SessionDomain;
 #[path = "icmp.rs"]
 mod icmp;
 mod icmp_embed;

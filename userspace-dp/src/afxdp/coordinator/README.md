@@ -495,6 +495,44 @@ Differences that matter (#1881):
     reads `bound = false` for it either way, and any cell over the binding
     surface is mutation-insensitive by construction.
 
+- **The bind-failure CAUSE survives the fail-closed teardown (#8558).** The
+  bullet above establishes that a bind failure reports every slot unbound. What
+  it did NOT report was WHY. `stop_inner(false)` empties `workers.live`, so
+  `refresh_bindings` routes every slot through `zero_unbound_slot`, whose last
+  act is `binding.last_error.clear()` — and `hasBusyBindingsWedgeLocked`'s
+  `busyErr` term (Go) is a substring match on exactly that field. Its only other
+  route in, `repaired`, needs a forwarding-live (`Ready`) binding, of which a
+  fail-closed reconcile leaves none. So auto-rebind recovery could not fire for
+  the fault it exists for, silently, while the `auto-rebind GAVE UP` log that
+  would have said so is itself inside the same predicate.
+  - `Coordinator::last_bind_failures` (slot -> reason) holds the causes.
+    `stop_inner` CLEARS it — which is what covers the teardowns that never enter
+    `reconcile` (`Coordinator::stop`, the disarm branch of
+    `reconcile_status_bindings`, the `no_snapshot` path), so a legitimately
+    unbound slot never reports the retired generation's bind error. The
+    `BindIncomplete` arm repopulates it from the #6245 explicit
+    `BindingSetupFailure`s IMMEDIATELY AFTER calling `stop_inner`: that ordering
+    IS the fix, and inverting it is one of the mutations the cells kill.
+  - The restore is in `refresh_bindings`, not in a one-shot write into
+    `bindings`, because `refresh_status` runs the refresh on EVERY control
+    response — a cause restored once is erased within one status poll, well
+    inside the Go predicate's 5s dwell.
+  - It can never mark a HEALTHY slot: the map is consulted only on the branch
+    where a slot has NO `live` entry, and a bound slot always has one.
+  - Cells: `bind_failure_cause_survives_the_failclosed_teardown_8558` (the
+    ordering, plus two further refreshes standing in for the status polls),
+    `a_recovered_reconcile_leaves_no_stale_bind_failure_cause_8558` (the
+    self-clearing fault) and
+    `a_legitimate_teardown_does_not_inherit_the_bind_failure_cause_8558` (a
+    deliberate disarm must not inherit the cause). Manager side:
+    `pkg/dataplane/userspace/wedge_cause_recovery_8558_test.go`.
+  - NOT covered: the TIMEOUT shortfall (`bound: None` — a worker that never
+    reported within `WORKER_STARTUP_BARRIER_TIMEOUT_NS`). It carries no
+    per-slot cause to attribute, so recovery still does not fire for it.
+    Widening the Go predicate to act on a wedge whose cause is unknown is a
+    separate decision: the `maxConsecutiveAutoRebinds` derivation assumes the
+    rebind is being fired for a teardown race.
+
 - **Explicit binding-setup failures in the startup report (#6245).** #5143
   reported a bind failure ONLY by OMISSION — the failed slot was simply absent
   from `WorkerStartupReport.bound_slots`, so the barrier could prove
