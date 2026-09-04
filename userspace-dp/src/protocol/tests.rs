@@ -2986,3 +2986,61 @@ fn firewall_term_syslog_is_additive_both_ways_6853() {
         "a payload that carries syslog=true must be read as true"
     );
 }
+
+/// #8586: the DELETE-specific split of `worker_command_queue_drops` reaches the
+/// wire under its own keys, and neither aliases onto the aggregate or onto each
+/// other.
+///
+/// The aliasing assertions are the point. `dropped - repaired` is read as the
+/// UNATTRIBUTED remainder — refused deletes nothing repaired — so a rename that
+/// serialized both onto one key, or either onto the aggregate, would make that
+/// subtraction report 0 for a box that is losing deletes and repairing none of
+/// them. That is a value indistinguishable from healthy.
+///
+/// The three counters are given DISTINCT values so a swap between any pair is
+/// visible; equal values would let a transposition pass.
+#[test]
+fn process_status_session_delete_replica_counters_roundtrip_8586() {
+    let status = ProcessStatus {
+        worker_command_queue_drops: 7,
+        session_delete_replica_dropped: 5,
+        session_delete_replica_drop_repaired: 2,
+        ..Default::default()
+    };
+    let value: serde_json::Value =
+        serde_json::to_value(&status).expect("serialize ProcessStatus to Value");
+    assert_eq!(value["worker_command_queue_drops"], 7);
+    assert_eq!(value["session_delete_replica_dropped"], 5);
+    assert_eq!(value["session_delete_replica_drop_repaired"], 2);
+
+    let back: ProcessStatus = serde_json::from_value(value).expect("deserialize ProcessStatus");
+    assert_eq!(back.worker_command_queue_drops, 7);
+    assert_eq!(back.session_delete_replica_dropped, 5);
+    assert_eq!(back.session_delete_replica_drop_repaired, 2);
+    assert_eq!(
+        back.session_delete_replica_dropped - back.session_delete_replica_drop_repaired,
+        3,
+        "the unattributed remainder is a SUBTRACTION of two independently \
+         carried fields; if either aliased onto the other it would read 0"
+    );
+
+    // Pre-#8586 payload (keys absent) must decode with zero defaults — an older
+    // helper on one side of a rolling HA upgrade sends exactly that.
+    let mut legacy_value = serde_json::to_value(ProcessStatus {
+        session_delete_replica_dropped: 5,
+        session_delete_replica_drop_repaired: 2,
+        ..Default::default()
+    })
+    .expect("serialize ProcessStatus");
+    let obj = legacy_value
+        .as_object_mut()
+        .expect("ProcessStatus serializes to an object");
+    obj.remove("session_delete_replica_dropped")
+        .expect("new key present before strip");
+    obj.remove("session_delete_replica_drop_repaired")
+        .expect("new key present before strip");
+    let legacy: ProcessStatus =
+        serde_json::from_value(legacy_value).expect("pre-#8586 payload decodes");
+    assert_eq!(legacy.session_delete_replica_dropped, 0);
+    assert_eq!(legacy.session_delete_replica_drop_repaired, 0);
+}

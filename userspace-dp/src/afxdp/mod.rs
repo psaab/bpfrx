@@ -120,6 +120,12 @@ mod session_glue;
 // so the worker loop's loss-of-sync resync path and the session-module resync
 // test can reach them without naming the private `session_glue` module.
 pub(crate) use session_glue::forward_export_candidates_for_owner_rgs;
+/// #8586: the DELETE-specific split of `WORKER_COMMAND_QUEUE_DROPS`, re-exported
+/// so the coordinator status accessors and their wiring cell can name it
+/// without reaching into a private module.
+pub(crate) use session_glue::{
+    SESSION_DELETE_REPLICA_DROPPED, SESSION_DELETE_REPLICA_DROP_REPAIRED,
+};
 // #2653: the unbounded "emit all at once" helper is now a test-only fixture
 // (the production paths use the chunked drain-as-you-export in worker::loop_body).
 #[cfg(test)]

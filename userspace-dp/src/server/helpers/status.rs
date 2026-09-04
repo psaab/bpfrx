@@ -172,6 +172,11 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     // a producer found a full queue, which points at a worker that stopped
     // draining rather than at a fast producer.
     state.status.worker_command_queue_drops = state.afxdp.worker_command_queue_drops_total();
+    // #8586: the DELETE-specific split of the aggregate above.
+    state.status.session_delete_replica_dropped =
+        state.afxdp.session_delete_replica_dropped_total();
+    state.status.session_delete_replica_drop_repaired =
+        state.afxdp.session_delete_replica_drop_repaired_total();
     state.status.shared_session_poison_recoveries =
         state.afxdp.shared_session_poison_recoveries_total();
     // #7398: the three counters below were computed, unit-tested and never

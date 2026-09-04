@@ -383,17 +383,52 @@ pub(crate) struct ProcessStatus {
     /// Read alongside `worker_command_queue_poison_recoveries` and not in
     /// place of it: that counter means a queue was RECOVERED with its
     /// committed prefix intact and nothing was lost, this one means a
-    /// command was DISCARDED. The expected steady-state value is 0, because
-    /// the consumer drains the whole deque in one `core::mem::take` and so
-    /// cannot be outrun by a sustained producer. A rising value therefore
-    /// does not mean "busy"; it means some worker has stopped draining —
-    /// the #925 supervisor caught a `worker_loop` panic and the thread
-    /// exited while its record, and every producer's fan-out over it,
-    /// remained. Surfaced as the Prometheus counter
+    /// command was DISCARDED.
+    ///
+    /// #8586: an earlier revision of this doc said "the expected steady-state
+    /// value is 0, because the consumer drains the whole deque in one
+    /// `core::mem::take` and so cannot be outrun by a sustained producer. A
+    /// rising value therefore does not mean 'busy'; it means some worker has
+    /// stopped draining." That reasoning was true when it was written and #7201
+    /// hollowed it: the consumer now takes a BOUNDED front prefix of at most
+    /// `WORKER_COMMAND_DRAIN_BUDGET` (256) per loop pass, precisely so the
+    /// worker's AF_XDP rings are not left unserviced for the 3.85 ms a full
+    /// 4096-command drain measured. A bounded consumer CAN be outrun.
+    ///
+    /// Measured on `loss:xpf-userspace-fw0` with every worker alive and no
+    /// panic: 709,394 drops against 874,950 replication enqueues (81%) with
+    /// `session_replication_queue_depth_max` pinned at the 4096 cap, under
+    /// ordinary session establishment. So a rising value does NOT by itself
+    /// mean a worker stopped draining, and an operator who reads it that way
+    /// goes looking for a panic that is not there. Pair it with
+    /// `worker_command_queue_poison_recoveries` and the per-worker liveness in
+    /// `worker_runtime` before concluding a thread died. Surfaced as the
+    /// Prometheus counter
     /// `xpf_userspace_worker_command_queue_drops_total`.
     /// Additive / defaulted for backward compatibility.
     #[serde(rename = "worker_command_queue_drops", default)]
     pub worker_command_queue_drops: u64,
+    /// #8586: the subset of the drops above that were cross-worker
+    /// `DeleteSynced` replicas, and the subset of THOSE whose owning worker was
+    /// identified so its NAT teardown could be run on its behalf (#8576).
+    ///
+    /// Two fields, not one, and not folded into the counter above. The
+    /// aggregate says a producer found a full queue; it cannot say whether what
+    /// was lost was an `UpsertSynced` (a replica the shared map still holds) or
+    /// a `DeleteSynced` (a session a sibling worker keeps serving, plus a NAT
+    /// reservation held for the life of the allocator). Those have opposite
+    /// severities, and #8586's whole question — how often the queue reaches the
+    /// cap on the paths where a DELETE is what gets lost — cannot be read off
+    /// the aggregate.
+    ///
+    /// `dropped - repaired` is the UNATTRIBUTED remainder: a refused delete
+    /// whose queue could not be resolved to a worker id, so nothing ran on its
+    /// behalf. A single number could not distinguish "no drops" from "drops
+    /// nobody repaired".
+    #[serde(rename = "session_delete_replica_dropped", default)]
+    pub session_delete_replica_dropped: u64,
+    #[serde(rename = "session_delete_replica_drop_repaired", default)]
+    pub session_delete_replica_drop_repaired: u64,
     /// #2402/#6641: total shared-session mutex poison recoveries (a
     /// worker thread panicked while holding a shared-session or
     /// owner-RG-index mutex; the committed map was recovered and the
