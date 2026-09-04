@@ -2020,6 +2020,26 @@ fn wire_invariant_default_specimens() {
             timeout_ns: 300_000_000_000,
         }),
     );
+    // #8615: the DISPLAY sibling, populated for the same reason — its own
+    // `active_flows` and four inherited fields are `skip_serializing_if`, so a
+    // default specimen would pin almost none of its spellings.
+    s.insert(
+        "display_lease_wire".into(),
+        dump(&DisplayLeaseWire {
+            pool_name: "p1".into(),
+            protocol: 6,
+            src_ip: "10.0.61.102".into(),
+            src_port: 40000,
+            remote_ip: "8.8.8.8".into(),
+            remote_port: 443,
+            translated_ip: "172.16.80.7".into(),
+            translated_port: 51400,
+            address_only: true,
+            remaining_ns: 123,
+            timeout_ns: 300_000_000_000,
+            active_flows: 4,
+        }),
+    );
     s.insert("cos_active_flow_count_status".into(), dump(&CoSActiveFlowCountStatus::default()));
     s.insert("cos_dscp_classifier_entry_snapshot".into(), dump(&CoSDSCPClassifierEntrySnapshot::default()));
     s.insert("cos_dscp_classifier_snapshot".into(), dump(&CoSDSCPClassifierSnapshot::default()));

@@ -102,6 +102,7 @@ pub(crate) fn handle_stream(
         status: None,
         session_deltas: Vec::new(),
         idle_leases: Vec::new(),
+        display_leases: Vec::new(),
         session_counters: Vec::new(),
     };
     let mut persist_state = false;
@@ -308,6 +309,12 @@ pub(crate) fn handle_stream(
             // #8121 part 2: the idle persistent-NAT lease channel. Both verbs
             // take the clock from the coordinator, never from the request.
             "export_idle_leases" => idle_leases::export(&mut guard, &mut response),
+            // #8615: the DISPLAY read. Separate verb, separate response field,
+            // separate record type — the SHOW table needs `active_flows`, which
+            // the sync record is forbidden to carry.
+            "export_persistent_lease_display" => {
+                idle_leases::export_display(&mut guard, &mut response)
+            }
             "import_idle_leases" => {
                 idle_leases::import(&mut guard, &request.idle_leases, &mut response)
             }

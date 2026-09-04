@@ -20,6 +20,12 @@
 //!    what makes this a different record shape rather than an extension of the
 //!    session one.
 //!
+//!    #8615 needs that count for the SHOW table and does NOT relax this rule:
+//!    it adds a SEPARATE `DisplayLeaseRecord` / `DisplayLeaseWire` with its own
+//!    one-way verb, and no conversion into `IdleLeaseRecord` exists. So the
+//!    count is not merely unused on the import path — it is unrepresentable
+//!    there, which is the difference between a rule and a convention.
+//!
 //! 2. **Never carry `expires_at_ns` verbatim.** It is derived from
 //!    `monotonic_nanos()` (`CLOCK_MONOTONIC`), which is boot-relative and
 //!    node-local: a node up ten days reads a value sent by a node up one hour
@@ -76,6 +82,33 @@ pub(crate) struct IdleLeaseRecord {
     pub(crate) timeout_ns: u64,
 }
 
+/// #8615: one persistent lease as the SHOW table needs it — identity, lifetime,
+/// AND the live-flow count.
+///
+/// Deliberately NOT an extension of `IdleLeaseRecord`, and deliberately without
+/// a conversion into it. `IdleLeaseRecord` is what a peer can IMPORT, and design
+/// note 1 forbids carrying `active_flows` on that record for a reason that has
+/// nothing to do with display. Keeping the two types separate is what makes the
+/// rule structural: there is no widening of the import record to review, and no
+/// path by which a count can arrive at `import_idle_lease`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DisplayLeaseRecord {
+    pub(crate) protocol: u8,
+    pub(crate) src_ip: IpAddr,
+    pub(crate) src_port: u16,
+    /// `None` => `permit-any-remote-host`; `Some` => bound to that remote.
+    pub(crate) remote: Option<(IpAddr, u16)>,
+    pub(crate) translated_ip: IpAddr,
+    pub(crate) translated_port: u16,
+    pub(crate) address_only: bool,
+    /// RAW remaining lifetime. Meaningful only when `active_flows == 0`; see
+    /// `export_display_leases`.
+    pub(crate) remaining_ns: u64,
+    pub(crate) timeout_ns: u64,
+    /// The whole reason this record exists. Never sent to a peer.
+    pub(crate) active_flows: u32,
+}
+
 /// What an import did. Every refusal is named rather than folded into a bool,
 /// because they have different operator remedies: a busy port means the two
 /// nodes disagree about who owns an identity, while an unknown address just
@@ -116,6 +149,53 @@ impl PortAllocator {
                 address_only: lease.address_only,
                 remaining_ns: lease.expires_at_ns.saturating_sub(now_ns),
                 timeout_ns: lease.timeout_ns,
+            })
+            .collect()
+    }
+
+    /// #8615: every persistent lease this node would HONOUR, for DISPLAY only.
+    ///
+    /// The filter is `reuse_existing_lease_locked`'s own admission predicate —
+    /// `active_flows > 0 || expires_at_ns > now_ns` (`allocator.rs:2020`) — so
+    /// the table answers exactly "which bindings will this node reuse", rather
+    /// than a separate notion of liveness that could disagree with the
+    /// allocator's.
+    ///
+    /// THIS RECORD MUST NEVER REACH THE SYNC PATH. It carries `active_flows`,
+    /// which this module's design note 1 forbids on the record a peer imports:
+    /// the standby installs a strict SUBSET, so a carried count credits a lease
+    /// for sessions that node does not hold, it never reaches zero, never
+    /// enters `lease_expirations`, and no GC path can reclaim it. That rule is
+    /// about the record an IMPORT can receive. It is kept true here by keeping
+    /// the two record types DISTINCT rather than by discipline at call sites:
+    /// `import_idle_lease` takes an `IdleLeaseRecord`, and no conversion from
+    /// this type to that one exists, so the count is not merely unused on the
+    /// import path — it is unrepresentable there.
+    pub(crate) fn export_display_leases(&self, now_ns: u64) -> Vec<DisplayLeaseRecord> {
+        let live = self.lock_live();
+        live.persistent_by_source
+            .iter()
+            .filter(|(_, lease)| lease.active_flows > 0 || lease.expires_at_ns > now_ns)
+            .map(|(key, lease)| DisplayLeaseRecord {
+                protocol: key.protocol,
+                src_ip: key.src_ip,
+                src_port: key.src_port,
+                remote: key.remote,
+                translated_ip: lease.translated.ip,
+                translated_port: lease.translated.port,
+                address_only: lease.address_only,
+                // RAW remaining, not a display decision. While
+                // `active_flows > 0` this is routinely 0 or negative-clamped,
+                // because `expires_at_ns` was last written at the most recent
+                // reuse and is NOT refreshed per packet — the countdown only
+                // (re)starts when the last flow closes
+                // (`allocator.rs:2246-2250`). Interpreting that is the
+                // presentation layer's job and is done there; carrying a
+                // pre-interpreted number would make the wire disagree with the
+                // allocator it is reporting on.
+                remaining_ns: lease.expires_at_ns.saturating_sub(now_ns),
+                timeout_ns: lease.timeout_ns,
+                active_flows: lease.active_flows,
             })
             .collect()
     }

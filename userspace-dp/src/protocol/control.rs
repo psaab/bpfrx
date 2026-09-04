@@ -521,6 +521,14 @@ pub(crate) struct ControlResponse {
     /// #8121: the `export_idle_leases` result.
     #[serde(rename = "idle_leases", default, skip_serializing_if = "Vec::is_empty")]
     pub idle_leases: Vec<IdleLeaseWire>,
+    /// #8615: the `export_persistent_lease_display` result — the SHOW-table
+    /// population, which unlike `idle_leases` includes bindings with LIVE flows.
+    #[serde(
+        rename = "display_leases",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub display_leases: Vec<DisplayLeaseWire>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -835,6 +843,56 @@ pub(crate) struct IdleLeaseWire {
     pub remaining_ns: u64,
     #[serde(rename = "timeout_ns", default)]
     pub timeout_ns: u64,
+}
+
+/// #8615: one persistent-NAT lease as the SHOW table needs it.
+///
+/// A SEPARATE struct from `IdleLeaseWire`, not a widened one, and that is the
+/// design rather than a stylistic choice. `IdleLeaseWire` is the record a peer
+/// IMPORTS, and `nat/idle_lease_sync_8121.rs`'s first design rule forbids
+/// carrying `active_flows` on it: the standby installs a strict subset, so a
+/// carried count credits a lease for sessions that node does not hold, it never
+/// reaches zero, never enters `lease_expirations`, and no GC path reclaims it.
+///
+/// Keeping the display record distinct means that rule cannot be undone by a
+/// later edit to a shared struct — the import handler deserialises
+/// `IdleLeaseWire`, which has no such field to populate.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct DisplayLeaseWire {
+    #[serde(rename = "pool", default)]
+    pub pool_name: String,
+    #[serde(default)]
+    pub protocol: u8,
+    #[serde(rename = "src_ip", default)]
+    pub src_ip: String,
+    #[serde(rename = "src_port", default)]
+    pub src_port: u16,
+    /// Empty => `permit-any-remote-host`.
+    #[serde(
+        rename = "remote_ip",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub remote_ip: String,
+    #[serde(rename = "remote_port", default, skip_serializing_if = "is_zero_u16")]
+    pub remote_port: u16,
+    #[serde(rename = "translated_ip", default)]
+    pub translated_ip: String,
+    #[serde(rename = "translated_port", default)]
+    pub translated_port: u16,
+    #[serde(rename = "address_only", default, skip_serializing_if = "is_false")]
+    pub address_only: bool,
+    /// RAW remaining lifetime. Meaningful only when `active_flows == 0` — while
+    /// flows are live the allocator does not refresh the deadline, so this is
+    /// routinely 0. The presentation layer interprets it.
+    #[serde(rename = "remaining_ns", default)]
+    pub remaining_ns: u64,
+    #[serde(rename = "timeout_ns", default)]
+    pub timeout_ns: u64,
+    /// The field that is the whole point of this record, and the one that must
+    /// never appear on `IdleLeaseWire`.
+    #[serde(rename = "active_flows", default)]
+    pub active_flows: u32,
 }
 
 fn is_zero_u16(v: &u16) -> bool {
