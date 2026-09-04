@@ -282,14 +282,31 @@ editing cmdtree.
     typed one, and why the same story played out for `feed-server hostname` in
     the sibling URL pass (#8104).
     `pkg/config/ast_secret_redaction_census_8258_test.go` closes it with an
-    agreement predicate: **a leaf is secret-bearing iff the typed route declares
-    its field as `Secret`.** The population is enumerated by REFLECTION over the
-    compiled `Config`, so declaring a new `Secret` field enrols it in the census
-    on the next run whether or not anyone remembers the file exists; an
-    unmapped field fails, and each mapped leaf is verified by planting a secret
-    and rendering all four AST formats. The sibling census for URL-shaped leaves
-    (redacted by transform, not replacement) is
-    `pkg/config/ast_url_redaction_census_8104_test.go`.
+    agreement predicate: **a leaf is secret-bearing iff the typed route redacts
+    its field as a `Secret`.** An unmapped field fails, and each mapped leaf is
+    verified by planting a secret and rendering all four AST formats.
+
+    The population has TWO routes, and the second was found by #8258's own
+    starting point 3 after the first had shipped. A field redacts on the typed
+    surface either because it is DECLARED `Secret` — enumerated by reflection
+    over the compiled `Config`, in
+    `ast_secret_redaction_census_8258_test.go` — or because it is CONVERTED to
+    `Secret` at marshal time, which reflection cannot see because the field's
+    type is still `string`. `SNMPCommunity.Name` is the live instance: a plain
+    string wrapped as `Secret(c.Name)` inside `MarshalJSON`/`MarshalYAML`, and
+    the SNMP v1/v2c community string is the v1/v2c authenticator. That route is
+    enumerated with `go/ast` in
+    `ast_secret_coercion_census_8258_test.go` — a conversion inside a method is
+    a syntactic fact, so it is extracted rather than pattern-matched. Both
+    censuses feed ONE map, so a leaf enrolled by either route gets the same
+    behavioural verdict.
+
+    The general lesson is #8104's own, arriving from the other direction: that
+    census warns that defining a set as "things that call X" is a claim that X
+    is the only route to the behaviour. Defining a set as "things whose TYPE is
+    X" is the same claim, and a conversion is a route the type does not record.
+    The sibling census for URL-shaped leaves (redacted by transform, not
+    replacement) is `pkg/config/ast_url_redaction_census_8104_test.go`.
   - **Listener lifecycle is all-or-nothing (#5058).** `Server.Run` may
     serve both an HTTP and (with `web-management https` + a self-signed
     cert) an HTTPS listener; the two form ONE lifecycle. Run binds both

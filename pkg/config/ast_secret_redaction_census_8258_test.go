@@ -170,6 +170,16 @@ var astLeafForSecretField = map[string]secretLeafClaim{
 	"RootAuthConfig.EncryptedPassword": {
 		set: `set system root-authentication encrypted-password "%s"`,
 	},
+	// #8258 point 3: NOT a `Secret`-typed field. `SNMPCommunity.Name` is a
+	// plain string converted to `Secret` inside MarshalJSON/MarshalYAML, so the
+	// reflection census above cannot see it and the coercion census in
+	// ast_secret_coercion_census_8258_test.go enrols it instead. The secret here
+	// is the CONTAINER-IDENTITY token — the community string IS the SNMP v1/v2c
+	// authenticator, which is why `secretIndices` masks the token after
+	// `community` rather than a child leaf.
+	"SNMPCommunity.Name": {
+		set: `set snmp community "%s" authorization read-only`,
+	},
 	"SNMPv3User.AuthPassword": {
 		set: `set snmp v3 usm local-engine user u1 authentication-sha authentication-password "%s"`,
 	},
@@ -238,8 +248,21 @@ func TestEverySecretFieldIsMapped(t *testing.T) {
 	// The reverse: a mapping for a field that no longer exists is a row that
 	// asserts something about nothing. It passes, it looks like coverage, and
 	// it is exactly the residue that outlives a rename.
+	//
+	// The population for THIS direction is the UNION of the two routes by which
+	// a leaf redacts on the typed surface: declared `Secret` (reflection, this
+	// function) and CONVERTED to `Secret` at marshal time (go/ast, the coercion
+	// census in ast_secret_coercion_census_8258_test.go). A row enrolled by the
+	// coercion route is not reflection-visible and must not be reported as
+	// stale here — that check would be measuring the wrong population, and it
+	// fired on exactly this case when the second route was added (#8258 point
+	// 3). Both routes feed one map so the behavioural verdict covers both with
+	// one implementation.
 	inPopulation := make(map[string]bool, len(population))
 	for _, f := range population {
+		inPopulation[f] = true
+	}
+	for _, f := range secretCoercionCensus(t) {
 		inPopulation[f] = true
 	}
 	for field := range astLeafForSecretField {
