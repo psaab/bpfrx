@@ -314,6 +314,7 @@ run_bash test/incus/newflow-ceiling-selftest.sh
 # ONE of them; there were seven, which is why the census below exists rather
 # than a longer list alone.
 run_bash test/incus/deploy-lib-selftest.sh
+run_bash test/incus/cluster-build-identity-selftest.sh
 run_bash test/incus/cluster-cell-selftest.sh
 run_bash test/incus/cluster-env-selftest.sh
 run_bash test/incus/cos-apply-lib-selftest.sh

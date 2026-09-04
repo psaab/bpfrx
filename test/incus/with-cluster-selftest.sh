@@ -16,6 +16,9 @@ WC="${SCRIPT_DIR}/with-cluster.sh"
 T=$(mktemp -d /tmp/xpf-lock-selftest.XXXXXX)
 trap 'rm -rf "$T"' EXIT
 export XPF_CLUSTER_LOCK="$T/lock"
+# Hermetic: never probe a real cluster for build identity (the lock cell
+# samples it at acquire/release; these cases are about the LOCK).
+export XPF_CLUSTER_BUILD_PROBE=0
 export XPF_CLUSTER_OWNER="$T/owner"
 
 PASS=0
