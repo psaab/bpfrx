@@ -83,60 +83,8 @@ bridge-domains xpfname domain-type	partial
 bridge-domains xpfname routing-interface	partial
 chassis device-map interface	empty
 chassis device-map unmapped-interface-policy	empty
-class-of-service classifiers inet-precedence	empty
-class-of-service interfaces xpfarg classifiers dscp	empty
-class-of-service interfaces xpfarg classifiers ieee-802.1	empty
-class-of-service interfaces xpfarg output-traffic-control-profile	empty
-class-of-service interfaces xpfarg priority-low-min-share	empty
-class-of-service interfaces xpfarg rewrite-rules dscp	empty
-class-of-service interfaces xpfarg rewrite-rules ieee-802.1	empty
-class-of-service interfaces xpfarg scheduler-map	empty
-class-of-service interfaces xpfarg shaping-rate xpfarg burst-size	empty
-class-of-service rewrite-rules exp	empty
-class-of-service rewrite-rules inet-precedence	empty
-class-of-service scheduler-maps	empty
-class-of-service scheduler-maps xpfarg forwarding-class	empty
-class-of-service schedulers	empty
-class-of-service schedulers xpfarg buffer-size	empty
-class-of-service schedulers xpfarg codel-target	empty
-class-of-service schedulers xpfarg equal-flow-target-policy	empty
-class-of-service schedulers xpfarg priority	empty
-class-of-service schedulers xpfarg transmit-rate	empty
-class-of-service traffic-control-profiles	empty
-class-of-service traffic-control-profiles xpfarg delay-buffer-rate	empty
-class-of-service traffic-control-profiles xpfarg guaranteed-rate	empty
-class-of-service traffic-control-profiles xpfarg scheduler-map	empty
-class-of-service traffic-control-profiles xpfarg shaping-rate	empty
 event-options policy	empty
 event-options policy xpfarg within	empty
-firewall family inet filter	empty
-firewall family inet filter xpfarg term	empty
-firewall family inet filter xpfarg term xpfarg from flexible-match-range range	empty
-firewall family inet6 filter	empty
-firewall family inet6 filter xpfarg term	empty
-firewall family inet6 filter xpfarg term xpfarg from flexible-match-range range	empty
-firewall policer	empty
-firewall policer xpfarg if-exceeding bandwidth-limit	empty
-firewall policer xpfarg if-exceeding burst-size-limit	empty
-firewall policer xpfarg then loss-priority	empty
-forwarding-options dhcp-relay group	empty
-forwarding-options dhcp-relay server-group	empty
-forwarding-options family inet6 mode	empty
-forwarding-options port-mirroring instance	empty
-forwarding-options sampling instance	empty
-forwarding-options sampling instance xpfarg family inet output flow-server	empty
-forwarding-options sampling instance xpfarg family inet output flow-server xpfarg port	empty
-forwarding-options sampling instance xpfarg family inet output flow-server xpfarg source-address	empty
-forwarding-options sampling instance xpfarg family inet output flow-server xpfarg version-ipfix-template	empty
-forwarding-options sampling instance xpfarg family inet output flow-server xpfarg version9-template	empty
-forwarding-options sampling instance xpfarg family inet output source-address	empty
-forwarding-options sampling instance xpfarg family inet6 output flow-server	empty
-forwarding-options sampling instance xpfarg family inet6 output flow-server xpfarg port	empty
-forwarding-options sampling instance xpfarg family inet6 output flow-server xpfarg source-address	empty
-forwarding-options sampling instance xpfarg family inet6 output flow-server xpfarg version-ipfix-template	empty
-forwarding-options sampling instance xpfarg family inet6 output flow-server xpfarg version9-template	empty
-forwarding-options sampling instance xpfarg family inet6 output source-address	empty
-forwarding-options sampling instance xpfarg input rate	empty
 interfaces xpfname aggregated-ether-options lacp periodic	empty
 interfaces xpfname aggregated-ether-options link-speed	empty
 interfaces xpfname aggregated-ether-options minimum-links	empty
@@ -167,7 +115,6 @@ policy-options policy-statement xpfarg term	empty
 policy-options policy-statement xpfarg term xpfarg from as-path	empty
 policy-options policy-statement xpfarg term xpfarg from community	empty
 policy-options policy-statement xpfarg term xpfarg from prefix-list	empty
-policy-options policy-statement xpfarg term xpfarg from protocol	empty
 policy-options policy-statement xpfarg term xpfarg then as-path-prepend	partial
 policy-options policy-statement xpfarg term xpfarg then community	partial
 policy-options policy-statement xpfarg term xpfarg then load-balance	partial

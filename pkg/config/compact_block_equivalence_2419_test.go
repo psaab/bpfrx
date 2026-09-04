@@ -303,6 +303,13 @@ var filedFixed = map[string]string{
 	// file exists to prevent.
 	"security log stream xpfarg transport protocol":    "#6821",
 	"security log stream xpfarg transport tls-profile": "#6821",
+	// #8690 family 3 moved this here from filedStillOpen rather than deleting
+	// it, for the same reason #6821 moved its two: a site dropped from both
+	// maps stops being checked in EITHER direction, and the anchor's value is
+	// that it keeps being checked after it is fixed. The class-of-service
+	// classifier binding is now normalized, so the instrument must report it
+	// CLEAN -- and if a future change re-breaks it, this entry is what says so.
+	"class-of-service interfaces xpfarg classifiers dscp": "#8690",
 }
 
 // filedByDesign is the category the inventory did not previously distinguish:
@@ -353,11 +360,16 @@ var filedStillOpen = map[string]string{
 	// compact `lacp periodic fast;` leaves the value on the lacp node's own
 	// Keys and LACPPeriodic stays empty.
 	"interfaces xpfname aggregated-ether-options lacp periodic": "compiler_interfaces.go:125",
-	// compiler_class_of_service.go:228-229 -- FindChild("classifiers") then
-	// FindChildren("dscp"), both child-only. Chosen from a DIFFERENT compiler
-	// file than the anchor above so a fault confined to one file cannot
-	// silence the whole control.
-	"class-of-service interfaces xpfarg classifiers dscp": "compiler_class_of_service.go:229",
+	// #8690 family 3 REPLACED the class-of-service anchor that used to sit
+	// here. It was chosen for being in a different compiler file from the LACP
+	// anchor above, and that property has to survive the swap -- so its
+	// replacement is in compiler_protocols.go rather than anywhere convenient.
+	//
+	// compiler_protocols.go:203-206 -- the ospf area/interface arm walks
+	// `for _, bc := range prop.Children` and switches on "minimum-interval",
+	// so a compact `bfd-liveness-detection minimum-interval 300;` leaves the
+	// value on the container's own Keys and never reaches the switch.
+	"protocols ospf area xpfarg interface xpfarg bfd-liveness-detection minimum-interval": "compiler_protocols.go:206",
 }
 
 type censusResult struct {
