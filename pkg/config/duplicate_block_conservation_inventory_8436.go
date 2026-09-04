@@ -37,9 +37,6 @@ var dupConservationInventory8436 = []string{
 	"protocols ospf area xpfname interface",
 	"protocols ospf3 area xpfname interface",
 	"protocols router-advertisement interface",
-	"security dynamic-address feed-server",
-	"services flow-monitoring version-ipfix template",
-	"services flow-monitoring version9 template",
 	"system ntp server",
 	"system services dynamic-dns provider",
 
