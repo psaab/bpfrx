@@ -1040,7 +1040,9 @@ now split. In that placement the RGs never converge, so every NEW flow
 re-enters the race and pays one packet — measured at 12.5% of an 8-packet
 probe in both address families, unchanged on a fresh probe 45 s later.
 Long-lived TCP absorbs it as one retransmit; short request/response flows
-and UDP (DNS especially) do not.
+and UDP (DNS especially) do not. The remedy is below; this paragraph is kept
+because the two attributions above are what a reader has to have discarded
+before the remedy makes sense.
 
 **Coverage note.** The two RED-on-revert cells listed below drive
 `lan -> wan` — the fixture's only permitted pair — so neither exercises the
@@ -1053,10 +1055,88 @@ counters). Measured: implementing "skip policy for fabric-ingress packets"
 into a full zone-policy bypass — reds that one cell and no other in the
 suite.
 
-The remedy is an open design decision, tracked in #7770: the two standing
-options differ in WHERE the return-path authorisation record lives (get the
-session to the LAN node before the reply, versus have the redirecting node
-keep a punt record), not in implementation detail.
+### The remedy: the punting node adjudicates and seeds (#7770)
+
+The design question the thread posed was WHERE the return-path authorisation
+record lives. It lives on the punting node, and it is an ordinary SESSION.
+
+When a session-MISS packet's resolution is `FabricRedirect` — the flow is about
+to leave across the fabric because the peer owns its egress RG — the punting
+node now evaluates the flow's REAL zone pair and, on a permit, installs a
+`SessionOrigin::FabricPuntSeed` session for it before punting.
+`should_seed_fabric_punt` is the gate and `fabric_punt_seed_metadata` does the
+adjudication (`afxdp/forwarding/fabric.rs`); the arm is in the session-miss
+block of `poll_descriptor`. The peer's return then arrives off the fabric and
+is a session HIT, served by `resolve_flow_session_decision` exactly as return
+traffic is supposed to be — never by policy, which is the thing `wan -> lan`
+can never grant.
+
+**Direction of the change.** It adds no drop site: a deny, an unresolvable zone
+pair or a full session table all leave the packet's disposition untouched and
+the punt proceeds exactly as before, with the peer adjudicating it as it does
+today. Nothing that is permitted today becomes denied. One thing that is denied
+today becomes permitted — the reply of a flow this node itself ingressed and
+its own policy permitted — and that is not a privilege the requester did not
+already hold.
+
+**Why it is not the option that was ruled dead.** "Skip policy for
+fabric-ingress packets" would honour a claim carried in the fabric stamp, which
+on a shared fabric segment during exactly this split is forgeable (#6458's
+accepted residual). The seed is the opposite: it is minted only from a packet
+that ingressed on one of THIS node's own interfaces and passed THIS node's own
+policy. `should_seed_fabric_punt`'s `!fabric_ingress` condition is what
+guarantees that, and it is asserted directly
+(`should_seed_fabric_punt_binds_each_condition_7770`) because inline in the poll
+loop it was unreachable-by-construction and no mutation could bind it.
+
+**Why the record was ALSO said to be dead.** The earlier framing rejected "the
+redirecting node records the session" on the grounds that the redirecting node
+"never evaluates policy for the flow, so it would be minting sessions for
+traffic it never authorised". That was a description of the code, not a
+constraint on it. Adding the evaluation is the difference, and it costs one
+policy lookup on a path that only exists while an RG is split.
+
+**What the seed deliberately is not.** It is NAT-free and is only seeded for a
+flow carrying no ingress translation. The peer's NAT is transparent to the
+punting node — the peer translates on its egress and untranslates on its
+ingress, so the punting node sees tuple `T` outbound and `reverse(T)` inbound
+whatever happened in between — but an ingress DNAT applied on the punting node
+would rewrite the tuple before the punt, so those flows keep the old behaviour
+rather than seeding a key that would not match. It carries no
+`policy_counter*` (the peer counts the policy hit when it adjudicates the
+punted packet; counting here too would double-count every punted flow) and no
+`log_session_*` (one flow must not emit SESSION_CREATE/CLOSE records from two
+nodes). It does not bump `session_creates`, so the punting node's
+operator-visible create accounting is unchanged.
+
+**It never leaves the node.** `SessionOrigin::is_transient_local_seed` covers
+it, so the helper emits no Open delta for it and the owner-RG bulk export skips
+it — the authoritative session for a punted flow is the peer's, and two nodes
+claiming authority for one flow is what #518/#5007 exist to prevent. The Go
+daemon filters the origin as well
+(`transientLocalSeedOrigins`, `pkg/daemon/daemon_ha_userspace_stream.go`),
+belt to that suspenders, because #6599 measured what a FabricRedirect-
+disposition Open delta does when it reaches the peer: it overwrites the owner's
+authoritative session family under latest-generation-wins, and a punt seed is
+the worst shape of that class (right disposition, no NAT). The two lists are
+held in agreement by `TestTransientLocalSeedOriginsLockstepWithRust7770`, which
+parses the helper's own classification rather than restating it.
+
+**The state cost, named.** During a sustained split the punting node now holds
+one session per punted flow where it previously held none, bounded by the same
+`max_sessions` cap as any other session and idling out on the admitting
+application's window. That is the same order as the session count the peer
+already holds for those flows.
+
+RED-on-revert coverage for the remedy:
+`fabric_punt_seed_admits_the_peers_return_7770` (punt seeds; return admitted;
+plus a no-seed control and a denied-punt control, either of which alone would
+let a blanket relaxation pass),
+`fabric_ingress_never_mints_a_punt_seed_7770`, and
+`should_seed_fabric_punt_binds_each_condition_7770`.
+`fabric_ingress_return_traffic_is_denied_on_the_lan_node_7770` is UNCHANGED and
+still green: an unsolicited fabric-ingress return, with no seed behind it, is
+still denied.
 
 RED-on-revert coverage: `afxdp/tests_fabric_zone_stamp.rs`
 `fabric_ingress_syn_ack_seeds_no_reverse_session_6478` and

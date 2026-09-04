@@ -188,6 +188,39 @@ check_manual_failover() {
 		fail "Manual failover: connectivity lost"
 	fi
 
+	# #7770: the FIRST packet of each NEW flow, with the RG split HELD.
+	#
+	# The leg above cannot see this defect and never could. RG1 has moved to
+	# node1 while RG2 (the LAN) stays on node0, which is the LAN/WAN split
+	# #7770 is about, and the split is genuinely held here — the reset below is
+	# the next statement. But `ping -c 3` is read as a BOOLEAN and `ping` exits
+	# 0 if ANY reply arrives, so a probe that loses its first packet and
+	# receives the other two is a PASS. The gate entered the state under test
+	# and reported the healthy value from inside it.
+	#
+	# Three SEPARATE single-packet probes are the instrument. Each `ping`
+	# invocation picks its own ICMP identifier, so each is a distinct flow and
+	# each exercises the first-packet case that #7770 costs; `-c 1` leaves no
+	# later packet to mask it, so the exit status is the measurement and there
+	# is no output to parse (a parse that matches neither branch is how a gate
+	# ends up emitting nothing while summarising "0 failed").
+	#
+	# Pre-fix this is 3 of 3 lost — measured on the loss userspace cluster as
+	# 100% for `ping -c 1` during a held split. It is deliberately NOT tolerant
+	# of one loss: one lost first packet IS the defect, and the same probe in
+	# every other placement in this script is lossless.
+	local newflow_lost=0 i
+	for i in 1 2 3; do
+		if ! incus exec "$CLUSTER_LAN_HOST" -- ping -c 1 -W 2 "$WAN_GW4" &>/dev/null 2>&1; then
+			newflow_lost=$((newflow_lost + 1))
+		fi
+	done
+	if [[ $newflow_lost -eq 0 ]]; then
+		pass "Manual failover: first packet of each new flow survives the RG split (#7770)"
+	else
+		fail "Manual failover: $newflow_lost of 3 new flows lost their FIRST packet across the held RG split (#7770 — the LAN-owning node has no session for a flow the peer adjudicated, so the peer's return hits the wan->lan default deny)"
+	fi
+
 	# Reset failover
 	incus exec "$FW0" -- bash -c "echo 'request chassis cluster failover reset redundancy-group 1' | xpfd cli" &>/dev/null 2>&1 || true
 	sleep 5
