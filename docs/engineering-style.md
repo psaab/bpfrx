@@ -1222,6 +1222,39 @@ they repeatedly bite:
     where events are emitted one per line and cannot splice, or it will report
     a test named `TestR` that does not exist.
 
+  - **The gate target emits the machine-readable stream; the driver does NOT
+    bypass the gate to produce one (#8231).** `make test-go GOTESTJSON=<path>`
+    appends the `go test -json` event stream to that file while leaving stdout
+    byte-identical (`scripts/go-test-json.sh` reconstructs the human stream from
+    the `.Output` fields, which carry every byte the text formatter would have
+    written). `scripts/mutate.sh` sets it per cell and, when a spec row names a
+    target test in an optional 5th TAB column, refines the verdict with
+    `mutation_verdict_for_target`.
+
+    **Do not close the attribution gap by converting the driver to
+    `go test -json` instead. That narrows the gate.** Gating through `make` is
+    why a mutation cell carries `go vet`, the targeted `-race` runs with
+    `-count=2`, and on the Rust side `--release` and `--test-threads=1`. A bare
+    per-package `go test -json` driver buys attribution and pays for it in
+    COVERAGE — and a narrower gate that agrees with the old one is
+    indistinguishable from a sufficient one right up until the day it is not.
+
+    The defect this closes is a FALSE CLAIM OF COVERAGE, not a missing
+    convenience: when a cell's target did not fail but another test in the same
+    package was already red, the count-based verdict is KILLED with rc and count
+    in agreement and nothing looking wrong. Only a NAME refutes it.
+    `scripts/go-test-json-selftest.sh` case 5 is exactly that run, and case 6 is
+    its control — an attribution that returned ESCAPED unconditionally would
+    satisfy case 5 and destroy every real kill.
+
+    Two properties are load-bearing and each has its own case. The default path
+    (`GOTESTJSON` unset) execs `go test` unchanged, so the shared gate acquires
+    no `jq` dependency and no new failure mode. And a set `GOTESTJSON` with no
+    `jq` REFUSES rather than falling back, because a caller that asked for
+    attribution and silently received a stream it cannot attribute over would
+    read an empty file as "no failing tests" — the
+    indistinguishable-from-healthy value this whole mechanism exists to prevent.
+
   - **The Rust half is NOT exposed, and that asymmetry is deliberate.**
     `mutation_rust_failed` keeps its `^test .* \.\.\. FAILED` anchor.
     Measured on a full parallel `cargo test` run of 5217 tests: zero lines

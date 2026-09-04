@@ -262,6 +262,7 @@ run_shell scripts/dist/selftest.sh
 # scores every cross-language mutation as an ESCAPE, which is a claim that the
 # code is untested.
 run_bash scripts/mutate-selftest.sh
+run_bash scripts/go-test-json-selftest.sh
 # AF_XDP reproducer strict-warning build — fail-on-revert gate for #4906
 # (HC-081 uninitialized-counter false PASS). SKIPs on a host without a C
 # toolchain / libbpf-dev / libxdp-dev / xxd.
