@@ -19,6 +19,8 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 REPO="${REPO:?set REPO to the worktree to mutate}"
 SPEC="${1:?usage: mutate.sh <spec.tsv> [out.tsv]}"
+# #8231: per-cell `go test -json` side file, truncated by gate_go before each run.
+GOTESTJSON_LOG="${GOTESTJSON_LOG:-$(mktemp -t mutate-gotest-json.XXXXXX)}"
 OUT="${2:-$REPO/.mutation-results.tsv}"
 WORK="${MUTATE_WORKDIR:-/var/tmp/xpf-mutate-$$}"
 # Scratch goes on real disk: /tmp is a 32G tmpfs here and a full one fails the
@@ -43,12 +45,24 @@ CONFIGURED_GATES="${MUTATE_GATES:-go rust}"
 # --kill-after because a process ignoring SIGTERM would otherwise still hang.
 MUTATE_CELL_TIMEOUT="${MUTATE_CELL_TIMEOUT:-2400}"
 
-gate_go() { (cd "$REPO" && timeout --kill-after=30s "$MUTATE_CELL_TIMEOUT" make test-go) 2>&1; }
+# #8231: the gate target now emits a machine-readable stream ALONGSIDE its
+# normal output, so a KILLED verdict can be attributed to a NAME without
+# bypassing `make` and losing the vet / -race / --release legs that gating
+# through it is for. GOTESTJSON is per-cell: a stale file from a previous cell
+# would attribute this cell's verdict to the previous cell's failures.
+gate_go() {
+	: > "$GOTESTJSON_LOG"
+	(cd "$REPO" && GOTESTJSON="$GOTESTJSON_LOG" timeout --kill-after=30s "$MUTATE_CELL_TIMEOUT" make test-go) 2>&1
+}
 gate_rust() { (cd "$REPO" && timeout --kill-after=30s "$MUTATE_CELL_TIMEOUT" make test-rust) 2>&1; }
 
 printf 'cell\tfile\tlang\tapplied\tbuilt\tcollected\tfailed\tverdict\n' > "$OUT"
 
-while IFS=$'\t' read -r label file old new; do
+# #8231: an OPTIONAL 5th column names the test this cell targets. Four-column
+# specs keep working and keep their count-based verdict — the column is what
+# lets the driver say "the failing test is the one this cell targets" instead of
+# asking the reader to check.
+while IFS=$'\t' read -r label file old new target; do
 	[ -z "${label:-}" ] && continue
 	case "$label" in \#*) continue ;; esac
 
@@ -104,6 +118,18 @@ PY
 	[ $? -eq 124 ] && ext_timedout=yes
 
 	read -r built collected failed verdict < <(mutation_score_log "$lang" "$log" "$applied" "$ext_timedout")
+	# #8231 attribution. Only for go, only when the cell named a target, and only
+	# when the stream actually arrived — an empty or missing side file must NOT
+	# be read as "no failing tests", which is the indistinguishable-from-healthy
+	# value this whole mechanism exists to avoid.
+	attributed=no
+	if [ "$lang" = go ] && [ -n "${target:-}" ] && [ -s "$GOTESTJSON_LOG" ]; then
+		# shellcheck disable=SC2046  # deliberate word-splitting: the helper
+		# takes the failing names as separate arguments.
+		verdict=$(mutation_verdict_for_target "$verdict" "$target" \
+			$(mutation_go_failed_names_json "$GOTESTJSON_LOG"))
+		attributed=yes
+	fi
 	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
 		"$label" "$file" "$lang" "$applied" "$built" "$collected" "$failed" "$verdict" >> "$OUT"
 	echo "[$label] $verdict (collected=$collected failed=$failed log=$log)"
@@ -130,8 +156,13 @@ PY
 	# costs no coverage (#8231). mutation_go_failed_names_json and
 	# mutation_verdict_for_target are for a caller that already has such a
 	# stream — not an invitation to bypass `make` to produce one.
-	if [ "$verdict" = KILLED ]; then
+	if [ "$verdict" = KILLED ] && [ "$attributed" = no ]; then
 		echo "         ^ count-based: confirm the failing test is the one this cell targets"
+		if [ "$lang" = go ] && [ -z "${target:-}" ]; then
+			echo "         ^ add a 5th TAB column naming the target test to attribute it (#8231)"
+		fi
+	elif [ "$verdict" = KILLED ]; then
+		echo "         ^ attributed by NAME to $target (#8231)"
 	fi
 
 	cp "$orig" "$REPO/$file"
