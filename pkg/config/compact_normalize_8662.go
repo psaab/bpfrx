@@ -459,6 +459,164 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		"two-rate peak-information-rate":
 		return true
 	}
+
+	// #8690 family 4: the ROUTING surface — protocols, routing-instances and
+	// routing-options. 80 inventory sites, every one recorded "empty".
+	//
+	// THESE THREE CANNOT BE SPLIT, and that is a measured fact rather than a
+	// convenience. `routing-instances <n> protocols ospf ...` and
+	// `routing-instances <n> routing-options static ...` are the SAME GRAMMAR
+	// re-hosted under an instance, so they resolve to the same (container, head)
+	// pairs as their top-level spellings. Admitting `routing-instances` alone
+	// necessarily admits the matching `protocols` and `routing-options` sites;
+	// the pair set is only closed over all three. Splitting them into separate
+	// increments would have produced an inventory diff much larger than each
+	// increment declared, which is precisely the thing a reviewer is asked to
+	// check.
+	//
+	// `protocols` was deliberately EXCLUDED from family 3 because it holds
+	// `protocols bgp group <g> neighbor <n> peer-as`, one of the sites where a
+	// widening DISARMS a commit gate while measuring empty-equivalent — so the
+	// inventory marker is necessary but not sufficient evidence there. It is
+	// admitted here on a different basis: arm 2 of the widening rule
+	// (TestCompactNormalizeScopePreservesCompiledResult8690) compiles every
+	// admitted site through the strict path with the pass disabled and compares
+	// acceptance, which is the check the marker cannot perform. That guard runs
+	// over whatever scope is current, so it adjudicates these sites rather than
+	// a list adjudicating them.
+	//
+	// ONE PAIR REACHES OUTSIDE the three families: (route, next-hop) is also
+	// used by `services ip-monitoring policy <p> then preferred-route route
+	// <r>`. That site is NOT in the inventory, which is NOT evidence that it
+	// conserves — a site the census cannot see is absent for the same reason a
+	// safe site is. It is admitted on arm 2's verdict, not on its absence.
+	//
+	// Pairs measured by running the pass with an instrumented gate, not derived
+	// from inventory paths (the path carries the schema arg placeholder where
+	// production passes node.Keys[0]).
+	//
+	// ("neighbor", "peer-as") IS DELIBERATELY ABSENT, and arm 2 is what removed
+	// it rather than a list. Admitting it made
+	// TestCompactNormalizeScopePreservesCompiledResult8690 report:
+	//
+	//	1 site(s) in the normalizer's scope are REJECTED at strict commit with
+	//	the pass disabled and ACCEPTED with it enabled:
+	//	[protocols bgp group xpfarg neighbor xpfarg peer-as]
+	//
+	// That is the gate-disarm failure the "empty" marker cannot see: the site
+	// measures empty-equivalent (no reader consumes the tail) AND a commit gate
+	// rejects the packed spelling, so normalizing it would make a configuration
+	// that is refused today start committing clean. `protocols bgp group <g>
+	// neighbor <n> peer-as` therefore stays in the inventory. Retiring its gate
+	// is a separate, deliberate decision — not a side effect of a family sweep.
+	switch containerKeyword + " " + head {
+	case "area interface",
+		"area virtual-link",
+		"authentication md5",
+		"authentication simple-password",
+		"bfd-liveness-detection minimum-interval",
+		"bfd-liveness-detection multiplier",
+		"bgp cluster-id",
+		"bgp export",
+		"bgp group",
+		"bgp import",
+		"bgp local-as",
+		"bgp router-id",
+		"damping half-life",
+		"damping max-suppress",
+		"damping reuse",
+		"damping suppress",
+		"forwarding-table export",
+		"generate route",
+		"group authentication-key",
+		"group description",
+		"group export",
+		"group hold-time",
+		"group import",
+		"group local-address",
+		"group local-as",
+		"group loops",
+		"group multihop",
+		"group neighbor",
+		"group peer-as",
+		"interface authentication-key",
+		"interface authentication-type",
+		"interface cost",
+		"interface dead-interval",
+		"interface default-lifetime",
+		"interface dns-server-address",
+		"interface hello-interval",
+		"interface interface-type",
+		"interface level",
+		"interface link-mtu",
+		"interface max-advertisement-interval",
+		"interface metric",
+		"interface min-advertisement-interval",
+		"interface nat-prefix",
+		"interface nat64prefix",
+		"interface preference",
+		"interface prefix",
+		"interface priority",
+		"interface reachable-time",
+		"interface retransmit-interval",
+		"interface retransmit-timer",
+		"isis authentication-key",
+		"isis authentication-type",
+		"isis export",
+		"isis interface",
+		"isis is-type",
+		"isis level",
+		"isis net",
+		"lldp hold-multiplier",
+		"lldp interface",
+		"lldp transmit-interval",
+		"md5 key",
+		"nat-prefix lifetime",
+		"nat64prefix lifetime",
+		"neighbor authentication-key",
+		"neighbor description",
+		"neighbor export",
+		"neighbor hold-time",
+		"neighbor import",
+		"neighbor local-address",
+		"neighbor local-as",
+		"neighbor loops",
+		"neighbor multihop",
+		"next-hop interface",
+		"ospf area",
+		"ospf export",
+		"ospf reference-bandwidth",
+		"ospf router-id",
+		"ospf3 area",
+		"ospf3 export",
+		"ospf3 router-id",
+		"prefix preferred-lifetime",
+		"prefix valid-lifetime",
+		"prefix-limit maximum",
+		"qualified-next-hop interface",
+		"qualified-next-hop metric",
+		"qualified-next-hop preference",
+		"rib-group inet",
+		"rib-group inet6",
+		"rip authentication-key",
+		"rip authentication-type",
+		"rip group",
+		"rip neighbor",
+		"rip passive-interface",
+		"rip redistribute",
+		"route next-hop",
+		"route next-table",
+		"route policy",
+		"route preference",
+		"route qualified-next-hop",
+		"router-advertisement interface",
+		"routing-options autonomous-system",
+		"routing-options rib",
+		"routing-options rib-groups",
+		"static route",
+		"virtual-link transit-area":
+		return true
+	}
 	return false
 }
 

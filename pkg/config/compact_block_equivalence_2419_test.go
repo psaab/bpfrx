@@ -310,6 +310,10 @@ var filedFixed = map[string]string{
 	// classifier binding is now normalized, so the instrument must report it
 	// CLEAN -- and if a future change re-breaks it, this entry is what says so.
 	"class-of-service interfaces xpfarg classifiers dscp": "#8690",
+	// #8690 family 4 normalized the ospf anchor family 3 had moved into
+	// filedStillOpen, so it moves here rather than being dropped -- the same
+	// rule, applied to an anchor that lived in the other map for one increment.
+	"protocols ospf area xpfarg interface xpfarg bfd-liveness-detection minimum-interval": "#8690",
 }
 
 // filedByDesign is the category the inventory did not previously distinguish:
@@ -360,16 +364,26 @@ var filedStillOpen = map[string]string{
 	// compact `lacp periodic fast;` leaves the value on the lacp node's own
 	// Keys and LACPPeriodic stays empty.
 	"interfaces xpfname aggregated-ether-options lacp periodic": "compiler_interfaces.go:125",
-	// #8690 family 3 REPLACED the class-of-service anchor that used to sit
-	// here. It was chosen for being in a different compiler file from the LACP
-	// anchor above, and that property has to survive the swap -- so its
-	// replacement is in compiler_protocols.go rather than anywhere convenient.
+	// #8690 family 4 replaced the ospf anchor family 3 put here, which family 4
+	// then normalized -- the SECOND anchor in this map to be invalidated by the
+	// next family to land. That churn was the anchor's fault, not the sweep's:
+	// both previous choices were `empty` sites, and an `empty` site is by
+	// definition a candidate for the next widening.
 	//
-	// compiler_protocols.go:203-206 -- the ospf area/interface arm walks
-	// `for _, bc := range prop.Children` and switches on "minimum-interval",
-	// so a compact `bfd-liveness-detection minimum-interval 300;` leaves the
-	// value on the container's own Keys and never reaches the switch.
-	"protocols ospf area xpfarg interface xpfarg bfd-liveness-detection minimum-interval": "compiler_protocols.go:206",
+	// This one is chosen to be DURABLE rather than convenient. It is a site
+	// whose drop shape is "partial", which means something already consumes
+	// part of its tail -- so TestNormalizerScopeNeverCoversAPartialSite8690
+	// FORBIDS any scope from covering it. It cannot be normalized by a family
+	// sweep, so it stays divergent for as long as the partial rule holds, and
+	// the control stops needing a new anchor every increment.
+	//
+	// compiler_routing.go:1073-1083 -- the policy `then` arm walks
+	// `for _, ac := range tc.Children` and switches on the action name, so a
+	// compact `then local-preference 200;` leaves the value on the `then`
+	// node's own Keys and never reaches the switch. Different compiler file
+	// from the LACP anchor above, which is the property this second entry
+	// exists to provide.
+	"policy-options policy-statement xpfarg term xpfarg then local-preference": "compiler_routing.go:1083",
 }
 
 type censusResult struct {
