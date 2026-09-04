@@ -385,26 +385,6 @@ snmp trap-group xpfarg categories	empty
 snmp trap-group xpfarg targets	empty
 snmp trap-group xpfarg version	empty
 snmp v3 usm local-engine user	empty
-system archival configuration archive-sites	empty
-system archival configuration transfer-interval	empty
-system backup-router	empty
-system dataplane binary	empty
-system dataplane claim-host-tunables	empty
-system dataplane coalescence adaptive	empty
-system dataplane coalescence rx-usecs	empty
-system dataplane coalescence tx-usecs	empty
-system dataplane cpu-governor	empty
-system dataplane netdev-budget	empty
-system dataplane poll-mode	empty
-system dataplane ring-entries	empty
-system dataplane shared-umem artifact-file	empty
-system dataplane shared-umem interface	empty
-system dataplane shared-umem mode	empty
-system dataplane shared-umem phase0-artifact-file	empty
-system dataplane state-file	empty
-system dataplane workers	empty
-system domain-search	empty
-system license autoupdate url	empty
 system login class	partial
 system login class xpfarg allow-commands	empty
 system login class xpfarg allow-configuration	empty
@@ -419,30 +399,6 @@ system login user xpfarg authentication ssh-ed25519	empty
 system login user xpfarg authentication ssh-rsa	empty
 system login user xpfarg class	empty
 system login user xpfarg uid	empty
-system name-server	empty
-system ntp server	empty
-system ntp threshold	empty
-system services dhcp-local-server group	empty
-system services dhcp-local-server group xpfarg interface	empty
-system services dhcp-local-server group xpfarg pool	empty
-system services dhcp-local-server group xpfarg pool xpfarg dns-server	empty
-system services dhcp-local-server group xpfarg pool xpfarg static-binding	empty
 system services dhcp-local-server group xpfarg pool xpfarg static-binding xpfarg fixed-address	empty
-system services dhcp-local-server group xpfarg pool xpfarg static-binding xpfarg host-name	empty
-system services dhcpv6-local-server group	empty
-system services dhcpv6-local-server group xpfarg interface	empty
-system services dhcpv6-local-server group xpfarg pool	empty
-system services dhcpv6-local-server group xpfarg pool xpfarg dns-server	empty
-system services dhcpv6-local-server group xpfarg pool xpfarg static-binding	empty
 system services dhcpv6-local-server group xpfarg pool xpfarg static-binding xpfarg fixed-address	empty
-system services dhcpv6-local-server group xpfarg pool xpfarg static-binding xpfarg host-name	empty
-system services ssh client-alive-count-max	empty
-system services ssh client-alive-interval	empty
-system services ssh connection-limit	empty
-system services ssh key-exchange	empty
-system services ssh root-login	empty
-system services web-management api-auth api-key	empty
 system services web-management api-auth user xpfname password	empty
-system services web-management http interface	empty
-system services web-management https interface	empty
-system time-zone	empty
