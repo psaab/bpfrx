@@ -3223,6 +3223,23 @@ fn live_flow_cache_replay_default_reject_message_still_sends_admin_prohibited_76
 // proves nothing about its own power. The second cell exhibits a mismatch the
 // old fixture COULD NOT EXPRESS AT ALL, and it is the reason to believe the
 // first one would have noticed.
+//
+// THE LIMIT OF THIS HARNESS, measured at merge rather than assumed.
+// `production_route_flow` REPLICATES the poll loop's post-parse mutation; it
+// does not invoke the poll loop. So it is a faithful COPY of the production
+// route, not the route itself, and the copy is hand-maintained. Deleting the
+// `forward_key.routing_domain` assignment from `poll_descriptor/mod.rs` leaves
+// BOTH cells here green — that was checked, and it is not a defect in them:
+// the production line is guarded by
+// `tests_routing_domain_7160::a_segment_on_a_routing_instance_member_matches_that_instances_session_7160`,
+// which does go red. Coverage of that line was never this file's job.
+//
+// What the limit DOES mean: if a THIRD post-parse key mutation is added to the
+// poll loop and not mirrored into `production_route_flow`, this file's
+// "agreement" control goes quietly vacuous — the two routes would agree because
+// both are missing the same step, which is a subtler version of the very defect
+// #8262 was filed about. Whoever adds a post-parse mutation to
+// `poll_binding_process_descriptor` owes this helper a line.
 
 /// Build a `SessionFlow` the way production does: parse it out of the frame,
 /// then apply the poll loop's post-parse key mutation.
