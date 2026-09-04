@@ -56,14 +56,36 @@ func (m *Manager) hasBusyBindingsWedgeLocked(repaired bool) bool {
 	}
 	// #7497 blocker 5: fire on a PARTIAL wedge, not only a total one.
 	//
-	// This used to require `bound == 0 && ready == 0` — every binding down. That
-	// was a reasonable precondition when the planner bound `min(rx)` queues
-	// across all candidates, because the binding set was small and a bind
-	// failure plausibly hit all of them at once. It is not reasonable now: with
-	// `Sum min(rx, 16)` bindings the realistic failure is PARTIAL — fifteen bind
-	// and one returns EBUSY — so `bound != 0` and recovery never ran at all.
-	// The predicate did not become wrong; the distribution of failures in front
-	// of it moved.
+	// This used to require `bound == 0 && ready == 0` — every binding down.
+	// Widening it is right, but #8388 measured the justification blocker 5 was
+	// written with and it does not hold, so it is corrected here rather than
+	// left to be re-derived. The claim was: with `Sum min(rx, 16)` bindings the
+	// realistic failure is PARTIAL — fifteen bind and one returns EBUSY — so
+	// `bound != 0` and recovery never ran.
+	//
+	// A BIND failure never produces that shape. The helper's reconcile is a
+	// transaction: the #5143 startup readiness barrier requires `bound ==
+	// planned` for every spawned worker, and on any shortfall
+	// `bring_up_workers` calls `stop_inner(false)`, which stops and joins EVERY
+	// worker — the fifteen that bound included — before the closing
+	// `refresh_bindings` publishes anything. So one EBUSY is reported to this
+	// predicate as `bound == 0` with every registered+armed slot wedged, which
+	// the OLD predicate already fired on. Measured by
+	// `bind_incomplete_leaves_no_bound_sibling_8388` (userspace-dp
+	// `afxdp::coordinator::tests`).
+	//
+	// The shape that IS partial, and the reason to keep the widened predicate,
+	// is the other post-teardown failure class: a #4952 worker-thread SPAWN
+	// failure (`pthread_create` EAGAIN/ENOMEM) at worker K returns WITHOUT
+	// `stop_inner`, so workers `0..K-1` stay live and bound while worker K's
+	// slots are registered+armed and unbound — `bound != 0` with a real wedge,
+	// which the old predicate could not see. Measured by the sibling positive
+	// control `spawn_failure_does_leave_bound_siblings_8388`. Note what is
+	// missing at those slots is a worker THREAD, not a socket, which is why
+	// #8388's proposed per-slot `rebind_slot` verb was closed rather than built:
+	// the global rebind re-runs the whole plan and spawns the missing worker,
+	// and in the bind-failure case above there is nothing healthy left for a
+	// targeted rebind to spare.
 	//
 	// `wedged` counts bindings the helper registered and armed but could not
 	// bind. `!Bound` subsumes `!Ready`, since Ready requires Bound

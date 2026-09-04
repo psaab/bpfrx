@@ -191,6 +191,23 @@ func (a *LegacyDataPlaneAdapter) Load() error {
 	return m.Load()
 }
 
+// BeginControlShutdown forwards the #8526 stop bound to the manager.
+//
+// This pass-through is load-bearing, not boilerplate. The daemon holds the
+// userspace runtime as a *LegacyDataPlaneAdapter (userspace.Boot returns one),
+// and runShutdownSequence reaches this behaviour through an optional-interface
+// type assertion. Without a method here the assertion simply does not match:
+// the daemon stops bounding its control socket, no build fails, and every test
+// in this package still passes because they drive the Manager directly.
+// TestLegacyAdapterForwardsBeginControlShutdown8526 pins the forwarding, and
+// pkg/daemon asserts this type against the daemon's interface at compile time.
+func (a *LegacyDataPlaneAdapter) BeginControlShutdown() {
+	if a == nil || a.manager == nil {
+		return
+	}
+	a.manager.BeginControlShutdown()
+}
+
 func (a *LegacyDataPlaneAdapter) Close() error {
 	m, err := a.managerOrErr()
 	if err != nil {

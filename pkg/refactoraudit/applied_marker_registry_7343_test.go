@@ -47,8 +47,7 @@ type markerStmt struct {
 // here is indistinguishable from an unnoticed marker.
 var notMarkerFiles7343 = map[string][]markerStmt{
 	// Accumulators — appending to a result slice.
-	"pkg/vrrp/instance_vip.go":                                {{`res.applied = append(res.applied, vip)`, 2}},
-	"pkg/dataplane/userspace/manager_sessionsync_transmit.go": {{`res.applied = append(res.applied, i)`, 1}},
+	"pkg/vrrp/instance_vip.go": {{`res.applied = append(res.applied, vip)`, 2}},
 	// #8000: BatchFailoverResult is a local `var res` that is only ever
 	// RETURNED (never assigned into m.*), so these two record what one call
 	// did for its caller. Nothing stores them and nothing re-reads them to

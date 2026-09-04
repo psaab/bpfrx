@@ -4526,6 +4526,212 @@ fn reconcile_bind_incomplete_clears_all_records_6242() {
     );
 }
 
+/// #8388 fixture: three registered AND ARMED bindings on distinct worker ids,
+/// so `bring_up_workers` plans exactly three workers and the resulting
+/// `BindingStatus` rows are the exact shape the Go auto-rebind wedge predicate
+/// reads (`hasBusyBindingsWedgeLocked` counts a binding only when
+/// `Registered && Armed`). `six242_three_worker_bindings` leaves `armed` at its
+/// `false` default, which is fine for the record-level #6242 pins but would put
+/// these cells' rows OUTSIDE the predicate they are about.
+fn wedge8388_three_worker_bindings() -> Vec<BindingStatus> {
+    (0..3u32)
+        .map(|i| BindingStatus {
+            slot: i + 1,
+            worker_id: i,
+            queue_id: i,
+            interface: "ge-0-0-0".into(),
+            ifindex: 10,
+            registered: true,
+            armed: true,
+            ..BindingStatus::default()
+        })
+        .collect()
+}
+
+/// #8388 — THE PREMISE MEASUREMENT. A per-slot bind failure leaves NO bound
+/// sibling, so there is no "one wedged binding among healthy ones" state for a
+/// targeted per-slot rebind to spare.
+///
+/// #8388 proposed a `rebind_slot` control verb (and, per its own follow-up
+/// analysis, the per-slot worker lifecycle + per-slot zero-copy quiesce that
+/// would have to exist first) on this premise: *"with `Sum min(rx, 16)`
+/// bindings the realistic failure is PARTIAL — fifteen bind, one returns
+/// EBUSY"*, so the global `rebind` destroys fifteen healthy sockets to recover
+/// one.
+///
+/// The reconcile is a TRANSACTION, and that is what this measures. The #5143
+/// startup readiness barrier requires `bound == planned` for EVERY spawned
+/// worker; on ANY shortfall `bring_up_workers` calls `stop_inner(false)`, which
+/// stops and joins EVERY worker — the ones that bound their full planned set
+/// included — and `reconcile`'s closing `refresh_bindings` then routes every
+/// now-workerless slot through `zero_unbound_slot`. So the status the Go
+/// manager polls after a bind failure reports ZERO bound slots, not fifteen.
+/// The disproportion #8388 describes is not reachable from a bind failure: by
+/// the time recovery can observe the fault, the healthy siblings are already
+/// gone, and a global rebind is exactly proportionate to a globally-down
+/// dataplane.
+///
+/// This cell measures the OPERATOR- and GO-VISIBLE surface (`BindingStatus`),
+/// which is what the premise is about. The sibling
+/// `reconcile_bind_incomplete_clears_all_records_6242` pins the coordinator
+/// INTERNALS (`workers.records` / `workers.live`) for the same reconcile; the
+/// two are not interchangeable — `refresh_bindings` is what turns the internal
+/// teardown into the reported state, and only the reported state reaches
+/// `hasBusyBindingsWedgeLocked`.
+///
+/// FIXTURE SHAPE IS LOAD-BEARING: three workers, of which TWO bind their full
+/// planned set. A single-worker fixture (the shape
+/// `post_spawn_inthread_bind_failure_fails_closed_5143` uses) satisfies
+/// "nothing is bound" vacuously — there is no sibling to spare — and would stay
+/// green against a per-worker-scoped fail-close.
+///
+/// WHAT THE INSTRUMENT REPORTS IF THE PROPERTY IS FALSE: the sibling positive
+/// control `spawn_failure_does_leave_bound_siblings_8388` runs the SAME
+/// instrument over the OTHER post-teardown failure class (#4952 spawn failure,
+/// which deliberately does NOT `stop_inner`) and reads back a MIXED 2-of-3
+/// bound set. The instrument can see "partial"; this reconcile does not produce
+/// one.
+///
+/// Fail-on-revert / mutation: scope the fail-close to the failing worker — drop
+/// the `coord.stop_inner(false)` from the `BindIncomplete` arm of
+/// `bring_up_workers`, mirroring the #4952 spawn-fail arm — and workers 1 and 2
+/// keep their published `live` state, so `refresh_bindings` takes
+/// `copy_live_snapshot` for their slots and this cell reds on `bound_slots`
+/// being `[2, 3]` instead of empty.
+#[test]
+fn bind_incomplete_leaves_no_bound_sibling_8388() {
+    let mut coordinator = Coordinator::new();
+    let mut bindings = wedge8388_three_worker_bindings();
+    // Worker 0 reports an INCOMPLETE bound set; workers 1 and 2 spawn healthy
+    // and publish bound live state for their full planned sets.
+    coordinator.force_worker_bind_incomplete = 1;
+    coordinator.force_worker_healthy_stub = true;
+
+    let snap = mandatory_ok_snapshot(5);
+    let result = coordinator.reconcile(Some(&snap), &mut bindings, 64);
+
+    assert!(
+        matches!(
+            result,
+            Err(ReconcileError::WorkerBindIncomplete(
+                ReconcileStage::WorkerBindIncomplete(_)
+            ))
+        ),
+        "a post-spawn bind-incomplete must fail the reconcile closed, got {result:?}"
+    );
+
+    // THE MEASUREMENT. Not one bound sibling survives the fail-close.
+    let bound_slots: Vec<u32> = bindings
+        .iter()
+        .filter(|binding| binding.bound)
+        .map(|binding| binding.slot)
+        .collect();
+    assert!(
+        bound_slots.is_empty(),
+        "#8388's premise requires healthy siblings to survive a per-slot bind \
+         failure; the reconcile transaction stops every worker, so the reported \
+         bound set must be EMPTY, got {bound_slots:?}"
+    );
+    assert!(
+        bindings.iter().all(|binding| !binding.ready),
+        "no slot can report ready after a fail-closed reconcile"
+    );
+
+    // The rows STAY registered+armed, which is what makes every one of them a
+    // `wedged` binding for the Go predicate — the reported shape is "all
+    // wedged", never "one wedged among bound siblings".
+    assert!(
+        bindings
+            .iter()
+            .all(|binding| binding.registered && binding.armed),
+        "registered/armed are not touched by the fail-close, so every slot is \
+         counted as wedged by hasBusyBindingsWedgeLocked"
+    );
+    assert_eq!(
+        bindings
+            .iter()
+            .filter(|binding| binding.registered && binding.armed && !binding.bound)
+            .count(),
+        bindings.len(),
+        "the wedge is FLEET-WIDE: every registered+armed slot is unbound"
+    );
+}
+
+/// #8388 — THE POSITIVE CONTROL for the cell above. The same instrument, run
+/// over the OTHER post-teardown failure class, DOES read back a partial set.
+///
+/// A #4952 worker SPAWN failure (`pthread_create` EAGAIN/ENOMEM) at worker K
+/// deliberately returns WITHOUT `stop_inner`: workers `0..K-1` are already
+/// launched and keep running (#6242's differential rollback). So this is the
+/// one reachable state in which some slots report bound and others do not —
+/// and this cell proves the `bindings`-array instrument can see it. Without
+/// this control, `bind_incomplete_leaves_no_bound_sibling_8388` could be green
+/// merely because the instrument never reports `bound` for a stub worker.
+///
+/// It also settles the residual #8388 asks about. The partial state exists, but
+/// what is missing at the unbound slots is a WORKER THREAD, not a socket: a
+/// `rebind_slot` verb cannot `pthread_create`, so the targeted rebind #8388
+/// wants would not repair this either. The global rebind — which re-runs the
+/// whole plan, spawning the missing worker — is the proportionate response.
+///
+/// Fail-on-revert / mutation: make the spawn-fail arm ALSO call
+/// `coord.stop_inner(false)` and the surviving `[1, 2]` bound set collapses to
+/// empty, reding the assertion below (and, symmetrically, telling you the
+/// sibling cell above would then be green for the wrong reason).
+#[test]
+fn spawn_failure_does_leave_bound_siblings_8388() {
+    let mut coordinator = Coordinator::new();
+    let mut bindings = wedge8388_three_worker_bindings();
+    // Workers 0 and 1 launch as healthy stubs (full bound set published);
+    // worker 2's spawn is forced to fail.
+    coordinator.force_worker_spawn_fail = 1;
+    coordinator.force_worker_spawn_fail_skip = 2;
+    coordinator.force_worker_healthy_stub = true;
+
+    let snap = mandatory_ok_snapshot(5);
+    let result = coordinator.reconcile(Some(&snap), &mut bindings, 64);
+
+    assert!(
+        matches!(
+            result,
+            Err(ReconcileError::WorkerSpawn(
+                ReconcileStage::SpawnWorkerFailed { worker_id: 2, .. }
+            ))
+        ),
+        "a partial-success spawn failure must surface as \
+         Err(WorkerSpawn(SpawnWorkerFailed{{worker_id:2}})), got {result:?}"
+    );
+
+    // THE CONTROL: a MIXED set — slots 1 and 2 (workers 0 and 1) bound, slot 3
+    // (the worker that never spawned) not.
+    let bound_slots: Vec<u32> = bindings
+        .iter()
+        .filter(|binding| binding.bound)
+        .map(|binding| binding.slot)
+        .collect();
+    assert_eq!(
+        bound_slots,
+        vec![1, 2],
+        "the launched workers' slots must still report bound — otherwise the \
+         sibling #8388 cell's empty bound set proves nothing about the \
+         fail-close and only that the instrument never reports bound"
+    );
+    let wedged_slots: Vec<u32> = bindings
+        .iter()
+        .filter(|binding| binding.registered && binding.armed && !binding.bound)
+        .map(|binding| binding.slot)
+        .collect();
+    assert_eq!(
+        wedged_slots,
+        vec![3],
+        "exactly the unspawned worker's slot is wedged — a MISSING THREAD, not \
+         a missing socket, so a per-slot socket rebind could not repair it"
+    );
+
+    // Reclaim the two live healthy-stub threads (the next reconcile's teardown).
+    coordinator.stop_inner(false);
+}
+
 /// #6242 — teardown atomicity / no double-clear. `stop_inner` drops each worker
 /// record's FOUR owners (handle + panic + exception ring + last-resolution)
 /// EXACTLY ONCE via the teardown's record publish (#7209: `clear_records`,

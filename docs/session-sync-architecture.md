@@ -131,14 +131,26 @@ census, both directions, plus a struct field-count pin) and
 peer-install site delegates and none has re-grown a private list) are what keep
 the one list complete.
 
-The reverse COMPANION that `mirrorSessionPairV4` / `...V6` synthesize has its
-own reset, `SessionValue.ResetUnobservedForReverseCompanion()`
+A reverse COMPANION has its own reset, distinct from the node-local scrub:
+`SessionValue.ResetUnobservedForReverseCompanion()`
 (`pkg/dataplane/session_reverse_companion.go`, #7917). It clears fields because
 the reverse direction has not OBSERVED them yet, not because they belong to
 another node — a different question with a different answer.
 
-Before #7917 the companion cleared only the cached FIB result, so it inherited
-the FORWARD direction's #4983 ingress identity. `pkg/dataplane/types.go` already
+**Since #8015 the Go control plane builds no reverse companion, so that helper
+has no caller in tree.** The mirror sends the forward alone and the Rust helper
+synthesizes the companion itself (`synthesized_synced_reverse_entry`,
+`userspace-dp/src/afxdp/shared_ops.rs`), where the same rule is applied —
+`ingress_ifindex: 0`, `ingress_vlan_id: 0`, with the reason stated inline — and
+pinned by `synthesized_synced_reverse_entry_carries_no_ingress_identity_7917`
+(`afxdp/session_glue/tests.rs`). The Go function and the table below remain as
+the statement of the RULE, and
+`TestCompanionResetAndNodeLocalScrubAreDifferentRules7917` still pins its
+divergence from `ScrubNodeLocal`, so a future node-local field does not silently
+become a companion reset (or vice versa).
+
+Before #7917 the Go companion cleared only the cached FIB result, so it
+inherited the FORWARD direction's #4983 ingress identity. `pkg/dataplane/types.go` already
 named the companion as the first legitimate-`0` population and gave the reason —
 the forward flow's egress is a PREDICTION of where the reply will arrive, not an
 OBSERVATION of where it did, and routing may be asymmetric — so the code
@@ -268,46 +280,54 @@ yields `ErrKeyNotExist`, not bare `ENOENT`), so this is a consistency fix rather
 than a live-bug fix.
 
 Locally-created forward sessions take a parallel path: `SetSessionV4()` /
-`SetSessionV6()` install into the kernel/BPF maps, then mirror the forward
-entry **and a pre-installed reverse companion** (#310 — so the helper holds the
-reverse before RG activation, avoiding activation-time synthesis) to the local
-Rust helper over the session control socket. Both requests resolve
-egress/zone/tunnel-endpoint metadata from `m.lastSnapshot` and the compile
-result. **#5007 invariant: the forward/reverse pair MUST be resolved against
-ONE consistent snapshot.** The mirror helpers (`mirrorSessionPairV4` /
-`mirrorSessionPairV6`) build BOTH `SessionSyncRequest`s under a single
-uninterrupted `m.mu` hold — completing every snapshot read *before* any socket
-I/O drops the lock — then transmit both. This preserves the deliberate "session
-installs must not block snapshot publishes" property while closing the window
-where a concurrent `ApplyConfig` (which swaps `m.lastSnapshot` under `m.mu`)
-could make the reverse companion resolve against a different snapshot than the
-forward.
+`SetSessionV6()` install into the kernel/BPF maps, then mirror the forward entry
+— and ONLY the forward entry — to the local Rust helper over the session control
+socket. The request resolves egress/zone/tunnel-endpoint metadata from
+`m.lastSnapshot` and the compile result.
 
-**#5698 invariant: the pair's transmit must be CONTIGUOUS.** The `m.mu` unlock
-above is about snapshot publishes and says nothing about session-socket
-ordering — the two locks are independent. The general batch transmit
-(`syncSessionRequestsLocked`) takes `m.sessionMu` once per REQUEST, so the lock
-is free between consecutive requests and any other session-socket caller (an
-operator clear, a policy invalidation, a GC delete, a stale-session
-reconciliation) can land between a pair's forward and its reverse. A
-generation-0 forward delete arriving in that gap removes BOTH halves in the
-helper, and the pair's already-built explicit reverse then re-creates a
-standalone reverse-only permit. The pair mirrors therefore transmit through
-`syncSessionPairLocked`, which takes `m.sessionMu` ONCE for the whole pair.
+**#8015: one upsert, not two.** Until #8015 the mirror also sent an explicitly
+built `is_reverse=1` companion, added under #310 so the helper would hold the
+reverse before RG activation. That second request was redundant:
+`upsert_synced_session` (`userspace-dp/src/afxdp/ha/session_import.rs`) calls
+`synthesized_synced_reverse_entry` for EVERY non-reverse import — a total
+function on forwards — and publishes both halves through
+`publish_shared_session`. A single forward upsert therefore already leaves a
+COMPLETE PAIR; the #5674 aggregate ENTRY cap is sized at 2x the logical session
+ceiling precisely because of it. Synthesis happens AT IMPORT, which is earlier
+than the Go pre-install ever was, so #310's invariant is satisfied by the
+request that remains — and the helper's companion is the better one, because it
+resolves egress/FIB, fabric/tunnel and owner-RG against live node-local state
+where the control plane could only copy the forward's (#5698).
 
-That contiguous hold is deliberately capped at `sessionPairMaxRequests` (2, the
-forward plus its reverse companion). Bulk paths — the delete chunks up to
-`sessionHelperDeleteChunk` (256) and the authoritative clear-all — keep the
-per-request discipline on purpose: holding `m.sessionMu` across a 256-request
-chunk would starve live session installs for minutes, which is exactly the harm
-the #5380 fast-fail exists to bound. An over-cap group falls back to the
-per-request path (logged) rather than trading a rare interleave for an install
-stall.
+What the second request added was a failure mode. If the helper SEMANTICALLY
+refused the forward (`RejectedCapacity` and friends — a transport failure aborts
+the batch instead), the explicit reverse still went out and published alone: a
+reverse-only entry with no forward, which a later delete of that forward does
+not remove, because `delete_synced_session_gen` derives the companion from the
+STORED forward and there is none. It idles out under `reap_expired_sessions`.
+#8015 removes the sender AND closes the door: `upsert_synced_session` now
+REFUSES an entry that arrives already flagged `is_reverse`
+(`SyncedImportOutcome::RejectedStandaloneReverse`, wire token
+`synced-import-refused:standalone-reverse`), because a reverse entry is derived
+state and can never be standalone authority.
 
-**Residual, not closed by #5698:** the pair's transmit is contiguous, not
-atomic. If the SECOND request fails at the transport layer the helper keeps a
-half-installed pair; nothing rolls the first half back. Closing that needs a
-helper-side pair transaction on the wire.
+With one request the #5007 single-snapshot build and the #5698 contiguous
+transmit are both vacuous — there is no second half to resolve against a
+different `m.lastSnapshot`, and none to be interleaved away from — so the mirror
+takes the ordinary per-request path (`syncSessionV4Locked` /
+`syncSessionV6Locked`) and `syncSessionPairLocked` / `sessionPairMaxRequests`
+are gone. Bulk paths are unchanged: the delete chunks (up to
+`sessionHelperDeleteChunk`, 256) and the authoritative clear-all keep the
+per-request `m.sessionMu` discipline on purpose, because holding it across a
+256-request chunk would starve live session installs for minutes — the harm the
+#5380 fast-fail exists to bound.
+
+Pinned by `TestMirrorSessionSendsOnlyTheForwardUpsertV4_8015` / `...V6_8015`
+(`pkg/dataplane/userspace/session_mirror_single_upsert_8015_test.go`), which
+assert the exact request set rather than the absence of a flag, and by
+`upsert_synced_session_refuses_standalone_reverse_8015` (`afxdp/ha_tests.rs`),
+whose control leg re-measures the forward-only-leaves-two-entries fact the
+deletion rests on.
 
 That is only one direction of the userspace integration. Locally-created
 userspace sessions do **not** flow back through `SetClusterSyncedSession*`.

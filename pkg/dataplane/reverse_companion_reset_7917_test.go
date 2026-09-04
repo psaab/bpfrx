@@ -8,12 +8,21 @@ import (
 // #7917: the reverse companion must not inherit the FORWARD direction's ingress
 // identity.
 //
-// `mirrorSessionPairV4`/`V6` synthesize a reverse companion by copying the
-// forward value, swapping the zones, and clearing the cached FIB result. They did
-// not clear the #4983 ingress identity, so the companion carried the forward
+// `mirrorSessionPairV4`/`V6` used to synthesize a reverse companion by copying
+// the forward value, swapping the zones, and clearing the cached FIB result. They
+// did not clear the #4983 ingress identity, so the companion carried the forward
 // direction's ingress binding — a value `pkg/dataplane/types.go` names as a
 // legitimate-`0` population, because a prediction of where the reply will arrive
 // is not an observation of where it did and routing may be asymmetric.
+//
+// #8015 deleted those Go-side companion builders; the helper's
+// `synthesized_synced_reverse_entry` is the only companion builder left and it
+// applies the same rule (pinned by
+// `synthesized_synced_reverse_entry_carries_no_ingress_identity_7917`). These
+// cells outlive that deletion on purpose: they pin the RULE and its divergence
+// from `ScrubNodeLocal`, which is what stops a future node-local field from
+// silently becoming a companion reset — see the note in
+// `session_reverse_companion.go`.
 //
 // These tests use the same census shape as the #7097 scrub guard (fill every
 // field with a sentinel, compare the zeroed set against a declared set in BOTH
