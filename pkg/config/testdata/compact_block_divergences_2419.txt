@@ -150,7 +150,6 @@ interfaces xpfname native-vlan-id	partial
 interfaces xpfname speed	partial
 interfaces xpfname tunnel destination	empty
 interfaces xpfname tunnel keepalive-retry	empty
-interfaces xpfname tunnel key	empty
 interfaces xpfname tunnel mode	empty
 interfaces xpfname tunnel routing-instance destination	partial
 interfaces xpfname tunnel source	empty
@@ -160,8 +159,6 @@ interfaces xpfname tunnel wireguard peer	empty
 interfaces xpfname tunnel wireguard peer xpfarg allowed-ips	empty
 interfaces xpfname tunnel wireguard peer xpfarg endpoint	empty
 interfaces xpfname tunnel wireguard peer xpfarg persistent-keepalive	empty
-interfaces xpfname tunnel wireguard peer xpfarg preshared-key	empty
-interfaces xpfname tunnel wireguard private-key	empty
 interfaces xpfname unit	partial
 policy-options community	empty
 policy-options community xpfarg members	empty
@@ -195,10 +192,8 @@ protocols bgp group xpfarg neighbor xpfarg peer-as	empty
 protocols bgp import	empty
 protocols bgp local-as	empty
 protocols bgp router-id	empty
-protocols isis authentication-type	empty
 protocols isis export	empty
 protocols isis interface	empty
-protocols isis interface xpfarg authentication-type	empty
 protocols isis interface xpfarg bfd-liveness-detection minimum-interval	empty
 protocols isis interface xpfarg level	empty
 protocols isis is-type	empty
@@ -209,7 +204,6 @@ protocols lldp interface	empty
 protocols lldp transmit-interval	empty
 protocols ospf area	empty
 protocols ospf area xpfarg interface	empty
-protocols ospf area xpfarg interface xpfarg authentication md5 xpfarg key	empty
 protocols ospf area xpfarg interface xpfarg bfd-liveness-detection minimum-interval	empty
 protocols ospf area xpfarg virtual-link	empty
 protocols ospf area xpfarg virtual-link xpfarg transit-area	empty
@@ -221,7 +215,6 @@ protocols ospf3 area xpfarg interface	empty
 protocols ospf3 area xpfarg interface xpfarg bfd-liveness-detection minimum-interval	empty
 protocols ospf3 export	empty
 protocols ospf3 router-id	empty
-protocols rip authentication-type	empty
 protocols rip neighbor	empty
 protocols rip passive-interface	empty
 protocols rip redistribute	empty
@@ -235,10 +228,8 @@ protocols router-advertisement interface xpfarg nat-prefix	empty
 protocols router-advertisement interface xpfarg nat64prefix	empty
 protocols router-advertisement interface xpfarg preference	empty
 protocols router-advertisement interface xpfarg prefix	empty
-routing-instances xpfname protocols isis authentication-type	empty
 routing-instances xpfname protocols isis export	empty
 routing-instances xpfname protocols isis interface	empty
-routing-instances xpfname protocols isis interface xpfarg authentication-type	empty
 routing-instances xpfname protocols isis interface xpfarg bfd-liveness-detection minimum-interval	empty
 routing-instances xpfname protocols isis interface xpfarg level	empty
 routing-instances xpfname protocols isis is-type	empty
@@ -319,8 +310,6 @@ security ike policy xpfarg mode	empty
 security ike policy xpfarg proposal-set	empty
 security ike policy xpfarg proposals	empty
 security ike proposal	empty
-security ike proposal xpfarg authentication-algorithm	empty
-security ike proposal xpfarg authentication-method	empty
 security ike proposal xpfarg dh-group	empty
 security ike proposal xpfarg encryption-algorithm	empty
 security ike proposal xpfarg lifetime-seconds	empty
@@ -336,7 +325,6 @@ security ipsec policy	empty
 security ipsec policy xpfarg proposal-set	empty
 security ipsec policy xpfarg proposals	empty
 security ipsec proposal	empty
-security ipsec proposal xpfarg authentication-algorithm	empty
 security ipsec proposal xpfarg dh-group	empty
 security ipsec proposal xpfarg encryption-algorithm	empty
 security ipsec proposal xpfarg lifetime-kilobytes	empty
@@ -350,7 +338,6 @@ security ipsec vpn xpfarg ike gateway	empty
 security ipsec vpn xpfarg ike ipsec-policy	empty
 security ipsec vpn xpfarg local-address	empty
 security ipsec vpn xpfarg local-identity	empty
-security ipsec vpn xpfarg pre-shared-key	empty
 security ipsec vpn xpfarg remote-identity	empty
 security ipsec vpn xpfarg traffic-selector	empty
 security ipsec vpn xpfarg traffic-selector xpfarg local-ip	empty
@@ -432,14 +419,9 @@ system login user xpfarg authentication ssh-ed25519	empty
 system login user xpfarg authentication ssh-rsa	empty
 system login user xpfarg class	empty
 system login user xpfarg uid	empty
-system master-password pseudorandom-function	empty
 system name-server	empty
 system ntp server	empty
 system ntp threshold	empty
-system root-authentication encrypted-password	empty
-system root-authentication ssh-dsa	empty
-system root-authentication ssh-ed25519	empty
-system root-authentication ssh-rsa	empty
 system services dhcp-local-server group	empty
 system services dhcp-local-server group xpfarg interface	empty
 system services dhcp-local-server group xpfarg pool	empty
