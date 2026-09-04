@@ -16,6 +16,25 @@ import (
 // this leaf's value is not observable in the typed config and the cell cannot
 // prove anything.
 func synthPair(n *schemaNode) (string, string, bool) {
+	// #8662: a folded token that is a WILDCARD-NAMED container carries no leaf
+	// value of its own — the token after it is the INSTANCE NAME, and that is
+	// what the compact spelling packs onto the parent. Vary the name.
+	//
+	// This is the shape `security-zone <z> interfaces <if>` uses, and it is why
+	// that site was invisible to this census even after #8679 widened the
+	// predicate to children-bearing tokens: `interfaces` declares args:0 and a
+	// wildcard, so neither the old `args == 1` clause nor a leaf-value
+	// synthesiser could reach it.
+	if n.args == 0 && n.wildcard != nil {
+		w := n.wildcard
+		if len(w.valueExamples) >= 2 {
+			return w.valueExamples[0], w.valueExamples[1], true
+		}
+		if w.valueHint == ValueHintInterfaceName {
+			return "ge-0/0/0.0", "ge-0/0/1.0", true
+		}
+		return "xpfia", "xpfib", true
+	}
 	if len(n.valueExamples) >= 2 {
 		return n.valueExamples[0], n.valueExamples[1], true
 	}
@@ -172,7 +191,19 @@ func collectCompactSites() []compactSite {
 			// whether the compiler reads a folded tail, so predicating the
 			// census on it excluded sites for a reason unrelated to the
 			// property being measured.
-			if ch.wildcard == nil && ch.args == 1 && len(path) >= 1 {
+			// #8662 second half: admit the WILDCARD-NAMED container shape
+			// alongside the arg-valued one. `interfaces` under a security-zone
+			// is args:0 with a wildcard for the interface name, so it was
+			// outside the site model even after the children-bearing widening
+			// — the model assumed an instance is named by an `args` token.
+			//
+			// Measured alone, as its own variable: 15 sites, 9 under groups,
+			// 1 uncompilable, 3 not-observable, 1 EQUIVALENT
+			// (`chassis cluster redundancy-group <n> ip-monitoring family inet`,
+			// read correctly in both spellings) and 1 DIVERGENT — the zone
+			// member this issue was filed on.
+			wildcardNamed := ch.args == 0 && ch.wildcard != nil
+			if (ch.wildcard == nil && ch.args == 1 || wildcardNamed) && len(path) >= 1 {
 				key := strings.Join(path, "/") + "|" + name
 				if !seen[key] {
 					seen[key] = true

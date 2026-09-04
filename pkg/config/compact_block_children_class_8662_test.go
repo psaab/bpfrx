@@ -1,7 +1,6 @@
 package config
 
 import (
-	"os"
 	"strings"
 	"testing"
 )
@@ -74,11 +73,15 @@ func TestVerifiedChildrenClassDivergences8662(t *testing.T) {
 	}
 }
 
-// The gap this change deliberately does NOT close, pinned so it is not
-// mistaken for covered. `security-zone <z> interfaces <if>` names its instance
-// with a WILDCARD, not an `args` token, which is outside the census's site
-// model — a model change, not a predicate relaxation.
-func TestWildcardNamedInstanceFoldIsStillUncovered8662(t *testing.T) {
+// The zone member #8662 was filed on. It is now CENSUSED (the wildcard-named
+// container shape was admitted to the site model) and it still DIVERGES, so
+// both halves are asserted: the census can see it, and what it sees is wrong.
+//
+// This cell replaces the "still uncovered" pin that stood here. That pin fired
+// exactly when it was supposed to — the moment the census started covering the
+// shape — and named the note to update. A claim about a gap is only useful if
+// it reds when the gap closes.
+func TestWildcardNamedInstanceFoldIsCensusedAndDiverges8662(t *testing.T) {
 	braced := compileText(t, "security { zones { security-zone trust { interfaces ge-0/0/0.0; } } }")
 	elided := compileText(t, "security { zones { security-zone trust interfaces ge-0/0/0.0; } }")
 	if braced == nil || elided == nil {
@@ -89,23 +92,46 @@ func TestWildcardNamedInstanceFoldIsStillUncovered8662(t *testing.T) {
 	if !bok || !eok {
 		t.Fatalf("both spellings must produce the zone; braced=%v elided=%v", bok, eok)
 	}
+	// POSITIVE HALF: without this the comparison below could be between two
+	// empty slices and would pass on a compiler that read NEITHER spelling.
 	if len(bz.Interfaces) == 0 {
-		t.Fatal("the braced spelling produced no zone interfaces — fixture no longer demonstrates " +
-			"the membership being read, so this cell proves nothing")
+		t.Fatal("the braced spelling produced no zone interfaces — the fixture no longer " +
+			"demonstrates membership being read, so the divergence assertion is vacuous")
 	}
 	if len(ez.Interfaces) == len(bz.Interfaces) {
-		t.Logf("the wildcard-named-instance fold now AGREES (%v) — this gap is closed; extend the "+
-			"census site model and update the #8662 note", ez.Interfaces)
+		t.Logf("the wildcard-named-instance fold now AGREES (%v) — the reader was fixed. "+
+			"Remove `security zones security-zone xpfarg interfaces` from %s and update the "+
+			"#8662 note", ez.Interfaces, inventoryPath)
 		t.Fail()
 	}
-	// Not censused today, and that is the point of this cell.
+	// And the census must SEE it, or the inventory cannot track it either way.
+	found := false
 	for _, s := range collectCompactSites() {
 		if strings.Join(s.container, " ") == "security zones security-zone xpfarg" && s.leaf == "interfaces" {
-			t.Errorf("the census now covers the wildcard-named-instance fold; this cell's " +
-				"'still uncovered' claim is stale and the #8662 note needs updating")
+			found = true
 		}
 	}
-	if os.Getenv("XPF_GEN_2419") == "1" {
-		t.Skip("regenerating")
+	if !found {
+		t.Error("the wildcard-named-instance fold is no longer censused; the site model " +
+			"regressed and this divergence has gone invisible again (#8662)")
+	}
+}
+
+// The wildcard-named shape must not be admitted so broadly that it condemns
+// containers that ARE read correctly. This is the over-reach control, and its
+// subject is a chassis-cluster site deliberately: that is the area where this
+// issue's prescribed blanket rule broke the shipped HA config.
+func TestWildcardNamedFoldDoesNotCondemnAReadContainer8662(t *testing.T) {
+	const braced = "chassis { cluster { redundancy-group 1 { ip-monitoring { family inet { 10.0.0.1 weight 100; } } } } }"
+	const elided = "chassis { cluster { redundancy-group 1 { ip-monitoring family inet 10.0.0.1 weight 100; } } }"
+	b, e := compileText(t, braced), compileText(t, elided)
+	if b == nil || e == nil {
+		t.Skip("fixture does not compile in this tree; the census's own EQUIVALENT verdict covers this site")
+	}
+	if !cfgEqual(b, e) {
+		t.Error("`chassis cluster redundancy-group <n> ip-monitoring family inet` was measured " +
+			"EQUIVALENT across both spellings when the wildcard-named shape was admitted. If it " +
+			"now diverges, either the compiler regressed or this fixture drifted — check which " +
+			"before adding it to the inventory")
 	}
 }
