@@ -816,6 +816,28 @@ per-path:
     TRANSIENT and a PERMANENT removal failure get the same answer on purpose
     — both mean the window is resolved — and differ only in how long
     `ConfigPersistDegraded()` keeps reporting the undeleted record.
+  - **A boot read failure is REPORTED, not swallowed (#8566).**
+    `recoverPendingConfirmLocked` logged a WARN and returned nil when
+    `ReadConfirm` failed, so `Load` succeeded and the daemon came up with the
+    rollback window GONE — no timer, no debt, and `ConfigPersistDegraded()`
+    false, so /health returned 200 and
+    `xpf_daemon_config_persist_degraded` read 0. The still-UNCONFIRMED config
+    stood permanently, which is the #4577 failure the record exists to
+    prevent, and the only evidence was one log line. Every other way the
+    store ends a boot unsafe raises degraded health; this one did not, so
+    nothing alerted on it. The read failure now logs at ERROR, journals
+    `confirm_recovery_read_error`, and sets `confirmRecoveryReadFailed`,
+    which `ConfigPersistDegraded()` folds in (→ /health 503 + the gauge) and
+    `ConfirmRecoveryReadFailed()` exposes on its own. Three deliberate
+    non-changes: `Load` still SUCCEEDS (refusing to boot on an unreadable
+    transient recovery file would turn a corrupt 200-byte file into an
+    outage — the #1960 no-brick posture); the record is NOT deleted (a
+    decrypt failure can be a transient master-key problem and the window may
+    be readable on a later boot); and no bounded in-`Load` retry split by
+    error class is added, because that is a startup-latency and taxonomy
+    change with its own design. The state is not self-healing — the window
+    is gone — so it clears on operator action: the next successful arm or
+    removal of a confirm record.
   - **The removal debt is KEYED to the record it is owed for (#7675).**
     The retry above re-drove `removeConfirmState()` UNCONDITIONALLY, so it
     deleted whatever `confirm.json` was on disk. An operator who armed a

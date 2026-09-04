@@ -634,7 +634,12 @@ func (s *Store) writeConfirmState(prevTree *config.ConfigTree, deadline time.Tim
 	if err := s.db.WriteConfirm(rec); err != nil {
 		slog.Warn("failed to persist commit-confirmed state; auto-rollback will not "+
 			"survive a crash within the confirm window", "err", err, "issue", "#4577")
+		return
 	}
+	// #8566: a readable record now exists again, so the "boot lost the window"
+	// state is over. It clears on operator action rather than on its own
+	// because nothing else can heal it — the lost window cannot be recovered.
+	s.confirmRecoveryReadFailed = false
 }
 
 // removeConfirmState deletes the persisted pending commit-confirmed state
@@ -685,6 +690,9 @@ func (s *Store) resolveConfirmRemovalLocked(action string) error {
 	}
 	s.confirmRemoveDegraded = false
 	s.confirmRemoveDebtID = ""
+	// #8566: an unreadable record that has now been removed is no longer
+	// standing between the operator and a clean state.
+	s.confirmRecoveryReadFailed = false
 	return nil
 }
 

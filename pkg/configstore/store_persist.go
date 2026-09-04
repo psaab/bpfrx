@@ -157,8 +157,32 @@ func (s *Store) recoverPendingConfirmLocked() error {
 	}
 	rec, err := s.db.ReadConfirm()
 	if err != nil {
-		slog.Warn("failed to read persisted commit-confirmed state; cannot restore the "+
-			"pending auto-rollback window", "err", err, "issue", "#4577")
+		// #8566: this used to be a bare WARN + `return nil`, so `Load` reported
+		// success and the box came up with the rollback window silently gone —
+		// no timer, no debt, and `ConfigPersistDegraded()` false, so /health
+		// returned 200. Every OTHER way the store ends a boot unsafe raises
+		// degraded health; this one did not, so nothing alerted on it.
+		//
+		// `Load` still succeeds: refusing to boot on an unreadable TRANSIENT
+		// recovery file would turn a corrupt 200-byte file into an outage,
+		// which is the #1960 no-brick posture. The state is made VISIBLE
+		// instead, and the record is left in place — a decrypt failure can be a
+		// transient master-key problem and the window may be readable on a
+		// later boot.
+		//
+		// Deliberately NOT added here: a bounded in-`Load` retry split by error
+		// class. That is a startup-latency and taxonomy change with its own
+		// design (the #7675 seed's TRANSIENT/PERMANENT split) and belongs in its
+		// own review, not folded into making the state legible.
+		slog.Error("failed to read persisted commit-confirmed state; the pending auto-rollback "+
+			"window is LOST for this process and the unconfirmed config now stands with no "+
+			"timer — configuration persistence is degraded until a commit or confirm clears it",
+			"err", err, "issue", "#8566")
+		s.confirmRecoveryReadFailed = true
+		s.journalLog(&JournalEntry{
+			Action: "confirm_recovery_read_error",
+			Detail: fmt.Sprintf("pending commit-confirmed record unreadable on boot; auto-rollback window lost: %v", err),
+		})
 		return nil
 	}
 	if rec == nil {
@@ -467,13 +491,27 @@ func canonicalizeTree(tree *config.ConfigTree) *config.ConfigTree {
 // failed to persist to disk on an Option-B path (SyncApply /
 // performAutoRollback) and the background retry has not yet succeeded
 // (#1799), OR a resolved commit-confirmed window's confirm.json removal is not
-// yet durable (#5835). While true, a daemon restart would load a STALE config
-// or resurrect a resolved rollback; /health returns 503 and
-// xpf_daemon_config_persist_degraded reads 1.
+// yet durable (#5835), OR boot recovery could not READ confirm.json and the
+// pending rollback window was lost (#8566). While true, a daemon restart would
+// load a STALE config or resurrect a resolved rollback — or, for #8566, an
+// UNCONFIRMED config is already standing with no rollback; /health returns 503
+// and xpf_daemon_config_persist_degraded reads 1.
 func (s *Store) ConfigPersistDegraded() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.persistDegraded || s.confirmRemoveDegraded
+	return s.persistDegraded || s.confirmRemoveDegraded || s.confirmRecoveryReadFailed
+}
+
+// ConfirmRecoveryReadFailed reports specifically whether boot recovery could not
+// read confirm.json and therefore lost the pending commit-confirmed rollback
+// window (#8566). A strict subset of ConfigPersistDegraded, exposed separately
+// so a caller can distinguish "the window is gone" from a write-side debt that
+// the background retry will heal on its own — this one will not: it clears only
+// when a later arm or removal of a confirm record succeeds.
+func (s *Store) ConfirmRecoveryReadFailed() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.confirmRecoveryReadFailed
 }
 
 // ConfirmRemovalDegraded reports specifically whether a RESOLVED
