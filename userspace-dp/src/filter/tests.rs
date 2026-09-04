@@ -10180,7 +10180,7 @@ fn production_sources_7053() -> Vec<(String, String)> {
             .expect("under src")
             .to_string_lossy()
             .replace('\\', "/");
-        if crate::afxdp::worker_queue::tests::is_fixture(&rel) {
+        if crate::afxdp::worker_queue::tests::is_fixture(&root, &rel) {
             continue;
         }
         let src = std::fs::read_to_string(&path).expect("read source");
