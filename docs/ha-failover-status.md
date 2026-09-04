@@ -319,7 +319,8 @@ state is not alertable — only greppable.
 
 A future change that admits HA persistent-NAT must add full lease sync or
 replay, including tuple-conflict handling for live synced sessions and stale
-lease cleanup.
+lease cleanup. **All three parts now exist** — see the census below — so what
+remains is the decision to admit, not the mechanism to admit with.
 
 ### What the standby DOES rebuild today (#7360, #8132, #8121)
 
@@ -358,15 +359,39 @@ the address is the whole promise. A test that asserts the address while
 why the cells for both live on multi-address pools with that flag OFF and decoy
 flows interleaved.
 
-**What is still not rebuilt: an IDLE lease.** A lease whose flows have all
-closed but whose inactivity window is still open has no session to be derived
-from, so nothing above reaches it. #8121 added the explicit
-`export_idle_leases` / `import_idle_leases` verbs for exactly that population.
-Its wire is pinned across the two languages (`idle_lease_wire` in
-`protocol_wire_v1.json`), and its Rust core has cells — but its live acceptance
-run is blocked by the gate at the top of this section, which disarms forwarding
-for the very configuration the run needs. That circularity is recorded on #8121;
-it is a real dependency, not an oversight.
+**The IDLE lease is rebuilt too, by a different route.** A lease whose flows
+have all closed but whose inactivity window is still open has no session to be
+derived from, so nothing above reaches it. #8121's `export_idle_leases` /
+`import_idle_leases` verbs carry that population explicitly, and the chain is
+wired end to end — allocator verbs, control handler, Go manager, cluster sync
+payload, daemon hook — with the wire pinned across the two languages
+(`idle_lease_wire` in `protocol_wire_v1.json`).
+
+### The population is now claimed COMPLETE, and the claim is bound
+
+Three routes, and between them every lease an active node holds:
+
+| lease | route to the standby |
+|---|---|
+| has live flows, port-translating | rebuilt from the synced sessions (#7360) |
+| has live flows, address-only | rebuilt from the synced sessions (#8132) |
+| idle, inside its timeout | exported and imported (#8121) |
+
+That is an exhaustiveness claim, and defining a population by a mechanism is a
+CLAIM that the mechanism is the only route — which fails silently when a sixth
+site appears that nobody classifies. So it is not left in prose:
+`every_persistent_lease_creation_site_has_a_sync_route_8121` pins the five
+production sites that create a lease, by enclosing function, and reds until a
+new one is classified. It carries a positive control, because a scanner whose
+pattern has rotted compares empty to empty and passes forever.
+
+**What this bears on, and what it does not do.** The gate at the top of this
+section disarms forwarding for every HA persistent-NAT config, and its stated
+reason is that leases are not HA-synchronized. On the census above, that reason
+no longer describes the tree. Re-deciding the gate is deliberately NOT done
+here: it re-arms forwarding for a configuration class that has been disarmed,
+which is a user-facing availability change needing its own verification rather
+than a side effect of the work that removed its premise.
 
 ## What Was Fixed Recently
 
