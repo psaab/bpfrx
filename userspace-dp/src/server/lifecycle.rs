@@ -266,6 +266,7 @@ pub(crate) fn run() -> Result<(), String> {
             synced_import_unknown_routing_domain: 0,
             synced_import_zone_unresolved: 0,
             synced_import_unpublished: 0,
+            synced_reverse_rederived: 0,
             gre_decap_ecn_illegal_drops_total: 0,
             wg_decap_ecn_illegal_drops_total: 0,
             gre_encap_df_oversize_drops_total: 0,
