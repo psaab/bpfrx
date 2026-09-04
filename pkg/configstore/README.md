@@ -378,6 +378,42 @@ inline archive-site passwords).
   adding a second whose JSON name collided with one of the five would make every
   plaintext load fail closed — a brick on upgrade — and the cell says so at the
   point of change.
+- **All three of the guards above read keys with a rule the DECODER does not
+  use (#8597).** `encoding/json` matches an incoming object key to a struct
+  field by preferring an exact match but **accepting a case-insensitive one**.
+  `envelopeKeysPresent` used an exact lowercase lookup, so the guard and the
+  decoder disagreed about what counts as an envelope key, and every body whose
+  key differed only in case fell into the gap. Measured:
+
+  ```
+  {"format": 123}      -> rejected (fail-closed)
+  {"Format": 123}      -> PASSED THROUGH AS PLAINTEXT
+  {"Format":"garbage"} -> PASSED THROUGH AS PLAINTEXT
+  {"Salt": 5}          -> PASSED THROUGH AS PLAINTEXT
+  ```
+
+  Same destination as the three fixes above — empty `ConfigTree`, committed-empty
+  boot, silent for the #4579 reason — reached by flipping one letter's case.
+
+  This is the **fourth** member of the family, and the pattern across all four
+  is worth stating rather than fixing a fifth time: **a guard placed in front of
+  a decoder has to answer the decoder's question, in the decoder's terms.**
+  #4888 tested four of five fields, #7454 tested the wrong error class, #8288
+  tested a hand-maintained subset, and all three matched keys case-sensitively
+  against a case-insensitive decoder.
+
+  `envelopeKeysPresent` now folds before the membership test and returns the
+  CANONICAL lowercase names, so the operator-facing diagnostics do not echo a
+  corrupt body's casing. Case-folding WIDENS the guard, so the over-rejection
+  measurement is repeated for it:
+  `TestPlaintextKeySetCannotCollideWhenFolded_8597` marshals a real
+  `ConfigTree` and fails if any of its top-level keys folds onto an envelope
+  name — the same reasoning as `TestPlaintextTreeCarriesNoEnvelopeKeys8288`,
+  re-run under the wider rule rather than assumed to carry over.
+
+  `TestEnvelopeGuardIsCaseInsensitive_8597` asserts the AGREEMENT between each
+  case-variant body and its lowercase twin, and fails first if the twin is not
+  refused — so it cannot pass by both spellings being accepted.
 - **A wrong JSON TYPE on an envelope field fails closed too (#7454).** #4888's
   guard sits AFTER the initial unmarshal, and that unmarshal swallowed every
   error as *"not the envelope object shape at all — a genuine plaintext body.

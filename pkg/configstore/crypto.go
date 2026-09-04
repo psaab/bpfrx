@@ -484,14 +484,52 @@ func unmarshalEnvelope(data []byte) (encryptedTreeEnvelope, bool, error) {
 // plaintext. Deliberately tolerant of a body that is not an object: `null`, an
 // array, a scalar or garbage keeps the existing plaintext-passthrough
 // behaviour, which the acceptance criteria require unchanged.
+//
+// #8597 (muse-004 K69): the membership test is CASE-INSENSITIVE, because the
+// decoder it guards is.
+//
+// encoding/json matches an incoming object key to a struct field by preferring
+// an exact match but ACCEPTING a case-insensitive one. This probe used an exact
+// lowercase lookup, so the guard and the decoder disagreed about what counts as
+// an envelope key — and every body whose key differed only in case fell into
+// the gap. Measured before the fix:
+//
+//	{"format": 123}      -> rejected (fail-closed)
+//	{"Format": 123}      -> PASSED THROUGH AS PLAINTEXT
+//	{"Format":"garbage"} -> PASSED THROUGH AS PLAINTEXT
+//	{"Salt": 5}          -> PASSED THROUGH AS PLAINTEXT
+//
+// Downstream, json.Unmarshal drops the unknown fields, an EMPTY ConfigTree
+// decodes, and Store.Load boots an active firewall with NO SECURITY POLICY
+// reporting success. Silently: the #4579 plaintext-downgrade warning keys on
+// masterPasswordPRF(tree) != "" and the tree is empty.
+//
+// This is the FOURTH member of that family. #4888 fixed the unknown-format
+// passthrough, #7454 the wrong-JSON-type passthrough, #8288 the `prf`-only
+// passthrough — each strengthening the discriminator, and all three reading the
+// body's keys with a rule the decoder does not use. The lesson the first three
+// did not reach: a guard in front of a decoder has to answer the decoder's
+// question, in the decoder's terms.
+//
+// Over-rejection stays safe for the reason #8288 records: `config.ConfigTree`
+// has exactly one field (`Children`), so a genuine plaintext body's top-level
+// key set is always exactly {"Children"}, whose folded form is "children" — not
+// an envelope name under any casing.
+//
+// The returned names are the CANONICAL lowercase spellings, so the diagnostics
+// that embed them stay stable whatever case the corrupt body used.
 func envelopeKeysPresent(data []byte) []string {
 	var probe map[string]json.RawMessage
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return nil
 	}
+	folded := make(map[string]struct{}, len(probe))
+	for k := range probe {
+		folded[strings.ToLower(k)] = struct{}{}
+	}
 	var present []string
 	for _, k := range []string{"data", "format", "nonce", "prf", "salt"} {
-		if _, ok := probe[k]; ok {
+		if _, ok := folded[k]; ok {
 			present = append(present, k)
 		}
 	}
