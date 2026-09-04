@@ -156,3 +156,21 @@ func TestPackedVRRPTimerGateIsLenientOnLoad8483(t *testing.T) {
 		t.Fatalf("tolerant path dropped the group: %+v", cfg.Interfaces.Interfaces)
 	}
 }
+
+// TestAdvertiseIntervalBoundMatchesTheWire8483 asserts the AGREEMENT between
+// the config-layer bound and the wire arithmetic that justifies it, rather than
+// pinning either one to a literal. A literal on one side encodes which spelling
+// is trusted; this asserts they have not drifted apart. The wire side is
+// derived from the 12-bit RFC 5798 §5.2.7 Max Advert Int field in
+// pkg/vrrp/packet_max_advert_narrowing_8483_test.go.
+func TestAdvertiseIntervalBoundMatchesTheWire8483(t *testing.T) {
+	// centiseconds that fit in the 12-bit wire field, expressed as whole
+	// configured seconds: floor(4095 / 100).
+	const wireMaxWholeSeconds = 4095 / 100
+	if MaxVRRPAdvertiseInterval != wireMaxWholeSeconds {
+		t.Fatalf("the commit-time bound (%d s) and the largest whole second "+
+			"that fits the 12-bit Max Advert Int field (%d s) have drifted "+
+			"apart; one of them is now wrong",
+			MaxVRRPAdvertiseInterval, wireMaxWholeSeconds)
+	}
+}
