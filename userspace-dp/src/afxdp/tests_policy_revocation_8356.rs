@@ -322,3 +322,280 @@ fn an_unresolvable_egress_declines_rather_than_denying_8356() {
         "the session must survive an egress the node cannot yet resolve"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #8618: the ICMP half of the #7323 residual.
+//
+// #8356 declined ICMP outright: a zone policy can match icmp type/code via a
+// junos-ping-style application term (#3020), so where such a term exists the
+// verdict is a property of the PACKET and a frame-independent derivation has no
+// type to offer. #8618 narrows that decline to the case the reasoning describes
+// — `packet_icmp` is read in exactly ONE arm of `CompiledApplications::matches`
+// (`icmp_constraints`), so with no type-constrained PERMIT in the snapshot a
+// type-blind evaluation is not a guess, it is the same answer.
+//
+// THE PAIR THAT MATTERS is `..._revokes_an_established_icmp_session_8618` and
+// `..._a_type_constrained_permit_declines_8618`. Their fixtures are IDENTICAL
+// but for one junos-ping permit, so together they bind the gate's DIRECTION.
+// Either alone is satisfied by a constant: "always revoke" passes the first,
+// "always decline" (i.e. #8356 unchanged, the revert) passes the second.
+//
+// The first is also the POSITIVE CONTROL for the whole group: if the ICMP
+// session key or meta were wrong the packet would never find the session, and
+// every "declines" assertion below would pass vacuously on a session that was
+// never a candidate.
+
+use crate::PolicyApplicationSnapshot;
+
+const ICMP_ID: u16 = 0x1234;
+
+/// `parse_flow_ports` keys an identifier-bearing ICMP query as (identifier, 0);
+/// `build_icmp_echo_frame_v4` stamps identifier 0x1234.
+fn icmp_flow_key() -> crate::session::SessionKey {
+    crate::session::SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        src_ip: IpAddr::V4(SRC),
+        dst_ip: IpAddr::V4(DST),
+        src_port: ICMP_ID,
+        dst_port: 0,
+        discriminator: Default::default(),
+        routing_domain: 0,
+    }
+}
+
+/// A junos-ping-shaped PERMIT: an ICMP application term carrying an echo-request
+/// TYPE constraint, which is what `icmp_constraints` (#3020) is populated from.
+///
+/// Deliberately on a DIFFERENT zone pair (`dmz -> wan`) than the flow under
+/// test. The #8618 predicate is whole-snapshot, so this documents the
+/// coarseness as a property rather than leaving it to be discovered: one
+/// type-constrained permit anywhere declines ICMP box-wide. That is #8356's
+/// behaviour, i.e. the conservative direction.
+fn junos_ping_permit() -> PolicyRuleSnapshot {
+    PolicyRuleSnapshot {
+        name: "ping-elsewhere".into(),
+        from_zone: "dmz".into(),
+        to_zone: "wan".into(),
+        source_addresses: vec!["any".into()],
+        destination_addresses: vec!["any".into()],
+        applications: vec!["junos-ping".into()],
+        application_terms: vec![PolicyApplicationSnapshot {
+            name: "junos-ping".into(),
+            protocol: "icmp".into(),
+            source_port: String::new(),
+            destination_port: String::new(),
+            icmp_type: Some(8),
+            icmp_code: None,
+            inactivity_timeout: None,
+        }],
+        action: "permit".into(),
+        ..Default::default()
+    }
+}
+
+fn drive_one_icmp_packet(permit_lan: bool, with_type_constrained_permit: bool) -> Outcome {
+    let mut snapshot = policy_deny_snapshot();
+    snapshot.generation = 7;
+    snapshot.fib_generation = 9;
+    if permit_lan {
+        snapshot.policies.push(PolicyRuleSnapshot {
+            name: "lan-out".into(),
+            from_zone: "lan".into(),
+            to_zone: "wan".into(),
+            source_addresses: vec!["any".into()],
+            destination_addresses: vec!["any".into()],
+            // `application any` matches every ICMP message regardless of type,
+            // so a verdict resting on it is a FLOW property.
+            applications: vec!["any".into()],
+            application_terms: Vec::new(),
+            action: "permit".into(),
+            ..Default::default()
+        });
+    }
+    if with_type_constrained_permit {
+        snapshot.policies.push(junos_ping_permit());
+    }
+    let forwarding = build_forwarding_state(&snapshot);
+
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, LAN_IFINDEX, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let ha_state = txn_ha_state();
+
+    let mut sessions = SessionTable::new();
+    assert!(
+        sessions.install_with_protocol_with_origin(
+            icmp_flow_key(),
+            decision(WAN_IFINDEX),
+            metadata(false),
+            SessionOrigin::ForwardFlow,
+            122_000_000_000,
+            PROTO_ICMP,
+            0,
+        ),
+        "the fixture must install the ICMP session, or every assertion is vacuous"
+    );
+
+    let frame = build_icmp_echo_frame_v4(SRC, DST, 64);
+    let mut meta = txn_meta_v4(LAN_IFINDEX as u32, 0, frame.len() as u16);
+    meta.protocol = PROTO_ICMP;
+    meta.payload_offset = 42;
+    let (_batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+    Outcome {
+        sessions,
+        revoked: dbg.policy_revoked_sessions,
+    }
+}
+
+/// THE FEATURE. An established ICMP session whose flow the live policy no longer
+/// permits is revoked — the half of #7323's residual #8356 left open.
+///
+/// Also the POSITIVE CONTROL for this group: a wrong ICMP key or meta shows up
+/// here as revoked == 0, rather than silently making the "declines" cells pass
+/// on a session the packet never reached.
+#[test]
+fn a_narrowed_zone_policy_revokes_an_established_icmp_session_8618() {
+    let out = drive_one_icmp_packet(false, false);
+    assert_eq!(
+        out.revoked, 1,
+        "an ICMP session the live policy denies must be revoked once no \
+         type-constrained permit makes the verdict packet-dependent"
+    );
+    assert_eq!(
+        session_count(&out.sessions),
+        0,
+        "the revoked ICMP session must be torn down, not merely counted"
+    );
+}
+
+/// THE HONESTY GATE, and the direction that must never regress. Same fixture as
+/// above plus ONE junos-ping permit: the type-blind derivation could now be
+/// wrong, so it must decline rather than revoke.
+///
+/// If this ever fails, the box is tearing down live ICMP flows on a verdict it
+/// could not derive — strictly worse than the residual #8618 set out to close.
+#[test]
+fn a_type_constrained_permit_declines_the_icmp_re_derivation_8618() {
+    let out = drive_one_icmp_packet(false, true);
+    assert_eq!(
+        out.revoked, 0,
+        "with a junos-ping permit in the snapshot the verdict may depend on the \
+         icmp type, which this derivation does not have — it must decline"
+    );
+    assert_eq!(
+        session_count(&out.sessions),
+        1,
+        "the declined ICMP session must survive, exactly as under #8356"
+    );
+}
+
+/// A still-permitted ICMP flow is not revoked. Guards the blanket-revocation
+/// failure the reverse-companion cell guards for TCP.
+#[test]
+fn a_still_permitted_icmp_flow_survives_the_re_derivation_8618() {
+    let out = drive_one_icmp_packet(true, false);
+    assert_eq!(
+        out.revoked, 0,
+        "policy still permits this ICMP flow; re-deriving must not revoke it"
+    );
+    assert_eq!(session_count(&out.sessions), 1);
+}
+
+/// The predicate is PER PROTOCOL, and this is the only cell that can see it.
+/// The three above all run over ICMPv4, so swapping the two slots — or collapsing
+/// them to one bool — leaves every one of them green while an ICMPv6 flow starts
+/// declining (or, worse, stops declining) for a v4-only junos-ping permit.
+#[test]
+fn the_type_constrained_predicate_is_per_protocol_8618() {
+    let mut snapshot = policy_deny_snapshot();
+    snapshot.policies.push(junos_ping_permit()); // protocol "icmp" = v4 only
+    let forwarding = build_forwarding_state(&snapshot);
+    assert!(
+        forwarding
+            .policy
+            .icmp_verdict_may_depend_on_type(PROTO_ICMP),
+        "a v4 junos-ping permit must make the ICMPv4 verdict type-dependent"
+    );
+    assert!(
+        !forwarding
+            .policy
+            .icmp_verdict_may_depend_on_type(PROTO_ICMPV6),
+        "an ICMPv4-only constraint must NOT decline ICMPv6 — the slots are \
+         independent"
+    );
+    assert!(
+        !forwarding.policy.icmp_verdict_may_depend_on_type(PROTO_TCP),
+        "a non-ICMP protocol can never be type-dependent"
+    );
+}
+
+/// Binds the `PolicyAction::Permit` filter on the #8618 arming, which an
+/// escaped mutation showed nothing else could see.
+///
+/// Only a PERMIT can overturn a type-blind DENY. A type-constrained DENY that
+/// `packet_icmp = None` gates OFF can only make the walk fall through to a
+/// later permit — i.e. more permissive, "do not revoke", which is the residual
+/// staying open exactly as it does today. It can never manufacture the false
+/// DENY the gate exists to prevent, so arming on it would decline for no reason
+/// and leave #7323's residual open on configs that never needed it.
+///
+/// Dropping `&& matches!(.., Permit)` from the arming loop leaves every other
+/// #8618 cell green; this one goes red.
+#[test]
+fn a_type_constrained_deny_does_not_suppress_the_icmp_re_derivation_8618() {
+    let mut snapshot = policy_deny_snapshot();
+    snapshot.generation = 7;
+    snapshot.fib_generation = 9;
+    // A junos-ping-shaped DENY, and NO type-constrained permit anywhere.
+    let mut ping_deny = junos_ping_permit();
+    ping_deny.name = "ping-deny".into();
+    ping_deny.action = "deny".into();
+    snapshot.policies.push(ping_deny);
+    let forwarding = build_forwarding_state(&snapshot);
+
+    assert!(
+        !forwarding
+            .policy
+            .icmp_verdict_may_depend_on_type(PROTO_ICMP),
+        "a type-constrained DENY cannot manufacture a false DENY, so it must \
+         NOT make the verdict type-dependent"
+    );
+
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, LAN_IFINDEX, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let ha_state = txn_ha_state();
+    let mut sessions = SessionTable::new();
+    assert!(sessions.install_with_protocol_with_origin(
+        icmp_flow_key(),
+        decision(WAN_IFINDEX),
+        metadata(false),
+        SessionOrigin::ForwardFlow,
+        122_000_000_000,
+        PROTO_ICMP,
+        0,
+    ));
+    let frame = build_icmp_echo_frame_v4(SRC, DST, 64);
+    let mut meta = txn_meta_v4(LAN_IFINDEX as u32, 0, frame.len() as u16);
+    meta.protocol = PROTO_ICMP;
+    meta.payload_offset = 42;
+    let (_batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+    assert_eq!(
+        dbg.policy_revoked_sessions, 1,
+        "a type-constrained DENY must not suppress the re-derivation — the \
+         residual would stay open on configs that never needed it"
+    );
+}

@@ -1206,6 +1206,28 @@ impl CompiledApplications {
     /// SKIPPED for a flowless fragment ONLY because its L4-constrained term is
     /// inapplicable (→ fail closed the fragment) from a DENY that genuinely
     /// does not apply to this protocol at all (→ let the fragment proceed).
+    /// #8618: does this app set carry an ICMP/ICMPv6 TYPE-constrained term for
+    /// `protocol` — i.e. a junos-ping-style term (#3020) whose match depends on
+    /// the PACKET's icmp type/code rather than on the flow's 5-tuple?
+    ///
+    /// This is deliberately NARROWER than `has_l4_constrained_term`, which also
+    /// answers true for port-bearing terms. The question here is specifically
+    /// "can a verdict for this protocol change with the icmp type", because that
+    /// is the only thing `packet_icmp` influences: `matches()` reads it in
+    /// exactly one arm, the `icmp_constraints` arm below.
+    ///
+    /// `match_any` returns FALSE on purpose. `application any` matches every
+    /// ICMP message regardless of type, so a verdict resting on it is a flow
+    /// property, not a packet property.
+    fn has_icmp_type_constrained_term(&self, protocol: u8) -> bool {
+        if self.match_any {
+            return false;
+        }
+        self.by_protocol
+            .get(&protocol)
+            .is_some_and(|terms| !terms.icmp_constraints.is_empty())
+    }
+
     fn has_l4_constrained_term(&self, protocol: u8) -> bool {
         if self.match_any {
             return false;
@@ -1509,6 +1531,23 @@ pub(crate) struct PolicyState {
     /// set, so a config with no junos-host policy keeps pre-#3019 host-bound
     /// behavior exactly (no risk of newly denying management traffic).
     has_junos_host_rules: bool,
+    /// #8618: does ANY active PERMIT rule in this snapshot carry an ICMP /
+    /// ICMPv6 type-constrained application term (junos-ping and its #3348
+    /// aliases)? Indexed [0] = ICMP, [1] = ICMPv6.
+    ///
+    /// This is a WHOLE-SNAPSHOT predicate over `rules`, not a per-zone-pair one,
+    /// and that is a deliberate choice rather than laziness. Answering it per
+    /// zone pair means reproducing the five-tier applicability selection
+    /// (`zone_pair_index`, from-any, to-any, `both_any_indices`,
+    /// `global_indices`) at a second site. A tier added later and missed here
+    /// would under-report, and under-reporting is the UNSAFE direction: it lets
+    /// `policy_revalidation` act on a DENY that a type-constrained permit would
+    /// have overturned, tearing down a flow the policy allows. Scanning `rules`
+    /// wholesale cannot miss a tier, because every rule is in it. The cost of
+    /// the coarser answer is over-declining — which is exactly the behaviour
+    /// #8356 shipped for all ICMP — so the failure mode is "no worse than
+    /// today" rather than "revokes a permitted flow".
+    icmp_type_constrained_permit: [bool; 2],
     /// #3363: reserved hit counter for the IMPLICIT default-policy verdict
     /// (the result returned when a flow matches no configured zone-pair,
     /// wildcard, or `junos-global` policy). Before #3363 the default path
@@ -1563,6 +1602,8 @@ impl Default for PolicyState {
             books: Vec::new(),
             book_id_to_idx: FxHashMap::default(),
             has_junos_host_rules: false,
+            // #8618: armed in the rule loop; Default carries no rules.
+            icmp_type_constrained_permit: [false; 2],
             default_counter: Arc::new(PolicyRuleCounter::default()),
             default_log_session_init: false,
             default_log_session_close: false,
@@ -1574,6 +1615,30 @@ impl Default for PolicyState {
 }
 
 impl PolicyState {
+    /// #8618: may an ICMP-family zone-policy verdict for `protocol` depend on
+    /// the PACKET's icmp type/code, rather than on the flow alone?
+    ///
+    /// True when some active PERMIT rule carries a type-constrained term
+    /// (junos-ping, #3020). A type-blind evaluation — `packet_icmp = None`,
+    /// which is what every frame-independent caller supplies — cannot match such
+    /// a term, so a DENY it returns may be an artefact of the missing type
+    /// rather than the policy's real answer. A caller that acts on DENY must
+    /// decline when this is true.
+    ///
+    /// False is the common case and the useful one: with no type-constrained
+    /// permit anywhere, `None` yields exactly the verdict a fully-informed
+    /// evaluation would, because `packet_icmp` is read in exactly one arm of
+    /// `CompiledApplications::matches` — the `icmp_constraints` arm — and that
+    /// arm is inert when no term populates it.
+    pub(crate) fn icmp_verdict_may_depend_on_type(&self, protocol: u8) -> bool {
+        match protocol {
+            PROTO_ICMP => self.icmp_type_constrained_permit[0],
+            PROTO_ICMPV6 => self.icmp_type_constrained_permit[1],
+            // Not an ICMP family protocol: `packet_icmp` cannot influence it.
+            _ => false,
+        }
+    }
+
     pub(crate) fn counter_snapshots(&self) -> Vec<PolicyRuleCounterStatus> {
         let mut snapshots: Vec<PolicyRuleCounterStatus> = self
             .rules
@@ -1948,6 +2013,8 @@ pub(crate) fn parse_policy_state_with_counters(
         book_id_to_idx: FxHashMap::default(),
         // #3019: armed below if any rule names the `junos-host` self zone.
         has_junos_host_rules: false,
+        // #8618: armed in the same rule loop, same shape.
+        icmp_type_constrained_permit: [false; 2],
         // #3363: persistent reserved counter for the implicit default-policy
         // verdict. Re-handed from the store under the reserved rule id so the
         // Arc instance is stable across snapshot rebuilds (an in-flight
@@ -2279,6 +2346,24 @@ pub(crate) fn parse_policy_state_with_counters(
             || state.rules[idx].global_to_zone.is_host_scope()
         {
             state.has_junos_host_rules = true;
+        }
+
+        // #8618: arm the ICMP type-constrained PERMIT gate. Only a PERMIT
+        // matters: the question this answers is "could a type-constrained term
+        // have ADMITTED a flow that a type-blind evaluation denies", and only a
+        // permit can overturn a deny in that direction. An `inactive` rule is
+        // excluded because it cannot match at all.
+        if !state.rules[idx].inactive
+            && matches!(state.rules[idx].action, PolicyAction::Permit)
+        {
+            for (slot, proto) in [PROTO_ICMP, PROTO_ICMPV6].into_iter().enumerate() {
+                if state.rules[idx]
+                    .compiled_apps
+                    .has_icmp_type_constrained_term(proto)
+                {
+                    state.icmp_type_constrained_permit[slot] = true;
+                }
+            }
         }
 
         if is_global {
