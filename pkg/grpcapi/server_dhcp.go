@@ -3,6 +3,9 @@ package grpcapi
 import (
 	"context"
 	"fmt"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"time"
 
 	"github.com/psaab/xpf/pkg/dhcp"
@@ -110,7 +113,21 @@ func (s *Server) ClearDHCPClientIdentifier(_ context.Context, req *pb.ClearDHCPC
 
 	if req.Interface != "" {
 		if err := s.dhcp.ClearDUID(req.Interface); err != nil {
-			return nil, fmt.Errorf("clear DUID: %w", err)
+			// #8629 (K94, the finding this issue was split from). Bare, this
+			// surfaced as codes.Unknown, so a caller could not tell a rejected
+			// interface name from a filesystem fault.
+			//
+			// RESIDUAL, stated rather than guessed at: ClearDUID has two error
+			// paths wanting different codes. `duidPath` refuses a crafted
+			// interface name (#4857) -- caller error, ideally InvalidArgument --
+			// while os.Remove failing is a server fault. Both arrive here as a
+			// plain fmt.Errorf string, so they are not distinguishable at this
+			// boundary without string-matching (fragile) or a typed error from
+			// pkg/dhcp (another package). Replicating the path-traversal
+			// validation here would put a second copy of a security check in a
+			// different package, free to drift. Internal is the honest answer
+			// for what is knowable at this boundary.
+			return nil, status.Errorf(codes.Internal, "clear DUID: %v", err)
 		}
 		return &pb.ClearDHCPClientIdentifierResponse{
 			Message: fmt.Sprintf("DHCPv6 DUID cleared for %s", req.Interface),
@@ -118,7 +135,9 @@ func (s *Server) ClearDHCPClientIdentifier(_ context.Context, req *pb.ClearDHCPC
 	}
 
 	if err := s.dhcp.ClearAllDUIDs(); err != nil {
-		return nil, fmt.Errorf("clear all DUIDs: %w", err)
+		// #8629: takes no caller input, so an error here is unambiguously a
+		// server fault.
+		return nil, status.Errorf(codes.Internal, "clear all DUIDs: %v", err)
 	}
 	return &pb.ClearDHCPClientIdentifierResponse{Message: "All DHCPv6 DUIDs cleared"}, nil
 }

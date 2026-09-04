@@ -110,13 +110,20 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 		return nil, status.Errorf(codes.InvalidArgument, "invalid limit %d", req.Limit)
 	}
 
-	// Cursor-based pagination: when page_size > 0, use cursor path.
+	// #8629: both pagination paths are converted HERE rather than at their
+	// five interior returns, for the reason rpcStatus documents — a boundary
+	// conversion covers every current return and every future one, where a
+	// sweep leaves the next added return bare. An error that already carries a
+	// status (the InvalidArgument checks above, and the cursor path's own)
+	// passes through untouched.
 	if req.PageSize > 0 {
-		return s.getSessionsCursor(ctx, req)
+		resp, err := s.getSessionsCursor(ctx, req)
+		return resp, rpcStatus(err)
 	}
 
 	// Legacy limit/offset path (backward compatible).
-	return s.getSessionsLegacy(ctx, req)
+	resp, err := s.getSessionsLegacy(ctx, req)
+	return resp, rpcStatus(err)
 }
 
 // getSessionsCursor implements cursor-based pagination.
@@ -1086,7 +1093,8 @@ func (s *Server) GetZonePairSummary(ctx context.Context, req *pb.GetZonePairSumm
 
 	pairs, err := s.computeZonePairSummary()
 	if err != nil {
-		return nil, err
+		// #8629: a server-side computation failed; the request was well formed.
+		return nil, status.Errorf(codes.Internal, "compute zone-pair summary: %v", err)
 	}
 	resp.ZonePairs = pairs
 
@@ -1298,7 +1306,12 @@ func (s *Server) ClearSessions(ctx context.Context, req *pb.ClearSessionsRequest
 	}
 	filter := s.buildSessionFilter(getReq)
 	if err := filter.validate(); err != nil {
-		return nil, err
+		// #8629: the CALLER's filter is malformed, which is the only site on
+		// this RPC surface where the fault is the caller's. Bare, it surfaced as
+		// codes.Unknown — indistinguishable from a server fault, so a client
+		// could not tell "fix your request" from "retry later". The sibling
+		// check eight lines above already types its rejection this way.
+		return nil, status.Errorf(codes.InvalidArgument, "invalid session filter: %v", err)
 	}
 
 	var agg clearErrors

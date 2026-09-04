@@ -376,7 +376,9 @@ func (s *Server) SystemAction(ctx context.Context, req *pb.SystemActionRequest) 
 			if err != nil {
 				return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 			}
-			return s.executeClusterFailover(ctx, req, op)
+			// #8629: converted at the boundary; see rpcStatus.
+			resp, err := s.executeClusterFailover(ctx, req, op)
+			return resp, rpcStatus(err)
 		}
 		if strings.HasPrefix(req.Action, "userspace-inject:") {
 			provider, err := s.userspaceDataplaneControl()

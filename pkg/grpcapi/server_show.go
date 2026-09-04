@@ -21,7 +21,51 @@ import (
 
 // --- ShowText RPC ---
 
+// rpcStatus converts a handler's error into one carrying a gRPC status code.
+//
+// #8629: 65 error returns on this RPC surface were bare errors, which gRPC
+// surfaces as codes.Unknown — so a caller could not distinguish a malformed
+// request from a server fault. 63 of those 65 are arms of ShowText's single
+// topic dispatch, and every one of them either returns a showXxx helper's
+// error directly or propagates it unchanged.
+//
+// CONVERTING THEM INDIVIDUALLY WOULD BE WORSE THAN THIS. Show topics are added
+// routinely; a sweep leaves the next one bare and produces a surface where some
+// errors carry a meaningful code and most do not, with nothing telling a caller
+// which is which. That non-uniformity is the state the issue says is worse than
+// today's uniform wrongness. Converting at the BOUNDARY covers every current
+// arm and every future one.
+//
+// An error that ALREADY carries a status passes through untouched, which is not
+// a nicety: show helpers return codes.InvalidArgument for a bad zone id and
+// codes.ResourceExhausted for a bounded scan, and a sweep that rewrote every
+// site would have flattened those into Internal.
+//
+// Internal, and not NotFound/FailedPrecondition/Unavailable, is deliberate. No
+// site here distinguishes "no such object" from "failed to render", and
+// inferring a retry contract from an error string would be guessing — a wrong
+// Unavailable is a retry storm against a permanent failure, and a wrong
+// FailedPrecondition makes a transient look permanent. Where the caller cannot
+// be shown to be wrong, Internal is the honest answer.
+func rpcStatus(err error) error {
+	if err == nil {
+		return nil
+	}
+	if _, ok := status.FromError(err); ok {
+		return err
+	}
+	return status.Error(codes.Internal, err.Error())
+}
+
+// ShowText is the boundary that types every error the topic dispatch produces.
+// The body is `showText`; see rpcStatus for why the conversion lives here and
+// not at the 63 individual returns.
 func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.ShowTextResponse, error) {
+	resp, err := s.showText(ctx, req)
+	return resp, rpcStatus(err)
+}
+
+func (s *Server) showText(ctx context.Context, req *pb.ShowTextRequest) (*pb.ShowTextResponse, error) {
 	cfg := s.store.ActiveConfig()
 	var buf strings.Builder
 

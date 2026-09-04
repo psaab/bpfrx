@@ -647,6 +647,11 @@ impl Coordinator {
     }
 
     /// See [`Coordinator::upsert_synced_session`].
+    pub fn synced_session_contains(&self, key: &crate::session::SessionKey) -> bool {
+        self.session_domain.synced_session_contains(key)
+    }
+
+    /// See [`Coordinator::upsert_synced_session`].
     pub fn delete_synced_session(&self, key: crate::session::SessionKey) {
         self.session_domain.delete_synced_session(key)
     }

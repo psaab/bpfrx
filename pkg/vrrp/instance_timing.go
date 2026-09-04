@@ -2,6 +2,8 @@ package vrrp
 
 import (
 	"time"
+
+	"github.com/psaab/xpf/pkg/config"
 )
 
 // vrrpInstance timing: advertisement interval derivation (local vs learned),
@@ -68,11 +70,21 @@ func (vi *vrrpInstance) advertIntervalLocked() time.Duration {
 
 // advertIntervalFromMS converts a configured advertise interval in
 // milliseconds (0 or negative → the 1000 ms default) to a Duration.
+//
+// #8642: the ceiling is as load-bearing as the floor here, and this is the most
+// severe site in that sweep. `vg.AdvertiseInterval` is set by a bare
+// `strconv.Atoi` with no range check (compiler_interfaces.go), the schema
+// ceilings (1..40 for `advertise-interval`, 10..40959 for
+// `reth-advertise-interval`) are downgraded to warnings on the tolerant
+// Store.Load / peer-sync ingress, and the old `ms <= 0` guard was blind to
+// overflow by construction: past MaxDurationMillis the multiply wraps, and with
+// `gcd(1e6, 2^64) = 64` the residue bottoms out at **64ns**.
+//
+// A 64ns advertisement timer on a RETH instance is an advert storm on the
+// 30ms heartbeat HA failover timing is built on — the control-path starvation
+// CLAUDE.md warns about, at ~1.5e7/s.
 func advertIntervalFromMS(ms int) time.Duration {
-	if ms <= 0 {
-		ms = 1000
-	}
-	return time.Duration(ms) * time.Millisecond
+	return config.MillisToDuration(ms, 1000*time.Millisecond)
 }
 
 // effectiveAdvertInterval picks the advertisement interval that drives the
@@ -86,10 +98,11 @@ func effectiveAdvertInterval(localMS int, learned time.Duration) time.Duration {
 	if learned > 0 {
 		return learned
 	}
-	if localMS <= 0 {
-		return 1000 * time.Millisecond
-	}
-	return time.Duration(localMS) * time.Millisecond
+	// #8642: same bound as advertIntervalFromMS — this reads the same
+	// unbounded config int, so guarding only the zero end here would leave the
+	// cold-start path (before any advert has been heard) carrying the overflow
+	// the other path no longer has.
+	return config.MillisToDuration(localMS, 1000*time.Millisecond)
 }
 
 // masterDownInterval returns the master-down timer value.
