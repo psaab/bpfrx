@@ -4,6 +4,32 @@
 // `#[path = "tests.rs"]` from coordinator/mod.rs.
 
 use super::*;
+
+impl Coordinator {
+    /// #7209 test seam: assign `forwarding` AND publish it, which is what every
+    /// production assignment does.
+    ///
+    /// Both production sites that set `self.forwarding`
+    /// (`coordinator/snapshot_refresh.rs`, `Coordinator::stop_inner`) publish on
+    /// the very next lines, so an UNPUBLISHED forwarding is a state the daemon
+    /// never occupies. A fixture that assigned the field alone modelled that
+    /// impossible state, and it stopped being harmless once the peer-synced
+    /// import path started reading the PUBLISHED view: the import would resolve
+    /// against a default forwarding while the test believed it had installed
+    /// one. Fourteen cells said so the moment the read source moved.
+    ///
+    /// It lives in this FIXTURE file, not in `coordinator/mod.rs`, so it stays
+    /// out of `forwarding_publish_population_is_pinned_7015`'s population. That
+    /// canary pins the `.forwarding = ` assignment sites in PRODUCTION source to
+    /// catch a third apply path that forgets its counter prune; adding a
+    /// test-only exception to its list would raise `coordinator/mod.rs` from 1 to
+    /// 2 and mask exactly the apply it exists to catch.
+    pub(crate) fn set_forwarding_for_test(&mut self, forwarding: ForwardingState) {
+        self.forwarding = forwarding;
+        self.publish_runtime_view();
+    }
+}
+
 use crate::INJECT_PACKET_TUPLE_PROTOCOL_VERSION;
 use crate::test_zone_ids::*;
 use crate::{
@@ -5381,14 +5407,13 @@ fn zone_counter_live_coordinator(coord: &mut Coordinator) {
     use crate::afxdp::zone_counters::{flush_recorded_zone_counters, record_zone_traffic};
     let mut baseline = mandatory_ok_snapshot(5);
     baseline.zones = zone_counter_zones(&[100, 200]);
-    coord.forwarding =
-        crate::afxdp::forwarding_build::build_forwarding_state_with_policy_counters_and_previous(
+    coord.set_forwarding_for_test(crate::afxdp::forwarding_build::build_forwarding_state_with_policy_counters_and_previous(
             &baseline,
             &coord.policy_counters,
             &coord.nat_counters,
             None,
         )
-        .expect("the baseline zone snapshot must build");
+        .expect("the baseline zone snapshot must build"));
     record_zone_traffic(&coord.forwarding.zone_counter_slot_map, 100, 200, 64);
     record_zone_traffic(&coord.forwarding.zone_counter_slot_map, 200, 100, 64);
     flush_recorded_zone_counters(
@@ -8230,6 +8255,17 @@ fn f4_filler_key(i: usize) -> crate::session::SessionKey {
 fn f4_seed(coordinator: &mut Coordinator, worker_id: u32) -> crate::nat::TranslatedTuple {
     use crate::nat::NatHolder;
     coordinator.forwarding.source_nat_rules = f4_pool_rules();
+    // #7209: PUBLISH. The synced delete path resolves its allocators through the
+    // published view now, and an unpublished fixture leaves it releasing against
+    // a DEFAULT forwarding with no rules — so the port stays held and the cell
+    // reds for a reason that has nothing to do with what it tests.
+    //
+    // Equivalent in production, and that is checked rather than assumed:
+    // `publish_runtime_view` clones `ForwardingState`, `PortAllocator` derives
+    // `Clone` over an `Arc<PortAllocatorShared>`, so the published rules carry
+    // the SAME allocator state. A deep-cloning allocator would have made this a
+    // real port leak instead of a fixture gap.
+    coordinator.publish_runtime_view();
     let rec = WorkerRuntimeRecord::for_test(gre1881_fake_worker_handle());
     coordinator.workers.register(worker_id, rec, None);
 

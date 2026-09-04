@@ -62,22 +62,17 @@ impl Coordinator {
         self.forwarding
             .ifindex_to_routing_domain
             .insert(ifindex, domain);
+        // #7209: PUBLISH, because the state this seeds is a snapshot apply
+        // installing routing instances, and every production apply publishes.
+        // The peer-synced import path resolves domains against the published
+        // view, so a seed that only mutated the owned field left the import
+        // seeing no routing instances at all — and the two `routing_domain_delete_7160`
+        // cells said so immediately.
+        self.publish_runtime_view();
     }
 
     pub fn routing_domains(&self) -> Vec<u32> {
-        if !self.forwarding.has_routing_domains {
-            return Vec::new();
-        }
-        let mut out: Vec<u32> = self
-            .forwarding
-            .ifindex_to_routing_domain
-            .values()
-            .copied()
-            .filter(|d| *d != 0)
-            .collect();
-        out.sort_unstable();
-        out.dedup();
-        out
+        configured_routing_domains(&self.forwarding)
     }
 
     /// #7160 (#2387): the routing DOMAIN a peer-synced session should be keyed
@@ -99,27 +94,7 @@ impl Coordinator {
     /// re-adjudicates through policy after a failover instead of being taken
     /// over, which is a correctness-preserving degradation, not a bypass.
     pub fn synced_routing_domain(&self, ingress_ifindex: i32, ingress_vlan_id: u16) -> Option<u32> {
-        // No routing instances configured: 0 is not a fallback here, it is the
-        // ONLY domain that exists, and it is the right answer for every
-        // session. Returned as `Some` so a single-instance node never refuses
-        // an import — its behaviour must stay bit-identical to pre-#7160.
-        if !self.forwarding.has_routing_domains {
-            return Some(0);
-        }
-        // Routing instances DO exist and the request named no ingress identity
-        // to resolve one from. This is the third state, and collapsing it into
-        // `Some(0)` is the bug: 0 means THE DEFAULT ROUTING INSTANCE, so a
-        // tenant's session would be filed in another tenant's identity space
-        // and reachable from it. The caller must refuse, not default.
-        if ingress_ifindex <= 0 {
-            return None;
-        }
-        Some(crate::afxdp::forwarding::ingress_routing_domain(
-            &self.forwarding,
-            ingress_ifindex,
-            ingress_vlan_id,
-            None,
-        ))
+        synced_routing_domain_in(&self.forwarding, ingress_ifindex, ingress_vlan_id)
     }
 
     /// #7160 (#2387): count one import refused for an unresolvable routing
@@ -131,4 +106,56 @@ impl Coordinator {
             .import_unknown_routing_domain
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+/// #7209: the routing-domain resolution, over an EXPLICIT `ForwardingState`.
+///
+/// Extracted so the coordinator (which reads its owned field) and the
+/// session-domain handle (which reads the PUBLISHED view) share ONE
+/// implementation. Two copies of a lookup this small is exactly the shape that
+/// drifts silently, and only one of the two copies has tests.
+pub(in crate::afxdp) fn configured_routing_domains(
+    forwarding: &ForwardingState,
+) -> Vec<u32> {
+    if !forwarding.has_routing_domains {
+        return Vec::new();
+    }
+    let mut out: Vec<u32> = forwarding
+        .ifindex_to_routing_domain
+        .values()
+        .copied()
+        .filter(|d| *d != 0)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// #7160 (#2387) resolution over an explicit `ForwardingState`; see
+/// [`configured_routing_domains`] for why it is a free function.
+///
+/// THREE states, and the third is the one that matters. No routing instances
+/// configured: 0 is not a fallback, it is the ONLY domain that exists, returned
+/// as `Some` so a single-instance node never refuses an import — its behaviour
+/// stays bit-identical to pre-#7160. Instances DO exist but the request named
+/// no ingress identity: `None`, because collapsing that into `Some(0)` files a
+/// tenant's session in the DEFAULT instance's identity space, where it is
+/// reachable from it. The caller must refuse, not default.
+pub(in crate::afxdp) fn synced_routing_domain_in(
+    forwarding: &ForwardingState,
+    ingress_ifindex: i32,
+    ingress_vlan_id: u16,
+) -> Option<u32> {
+    if !forwarding.has_routing_domains {
+        return Some(0);
+    }
+    if ingress_ifindex <= 0 {
+        return None;
+    }
+    Some(crate::afxdp::forwarding::ingress_routing_domain(
+        forwarding,
+        ingress_ifindex,
+        ingress_vlan_id,
+        None,
+    ))
 }
