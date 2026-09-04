@@ -459,7 +459,42 @@ pub(super) fn invalidate_flow_cache_slots_for_revoked_sessions(
             .chain(core::iter::once(&mut *current))
             .chain(right.iter_mut())
         {
-            binding.flow.flow_cache.invalidate_slot(&key, binding.ifindex);
+            invalidate_flow_cache_key_on_binding(binding, &key);
+        }
+    }
+}
+
+/// The per-binding step of both eviction walks, single-sourced.
+///
+/// `invalidate_slot` drops only a slot whose key AND ingress_ifindex both match,
+/// so a call on a non-owning binding either no-ops or drops a stale prior-flow
+/// slot with the same tuple — never another live flow's entry.
+#[inline]
+pub(super) fn invalidate_flow_cache_key_on_binding(
+    binding: &mut BindingWorker,
+    key: &SessionKey,
+) {
+    binding.flow.flow_cache.invalidate_slot(key, binding.ifindex);
+}
+
+/// #8586: the FLAT sibling of `invalidate_flow_cache_slots_for_revoked_sessions`.
+///
+/// The split-borrow form exists because `poll_binding` holds one binding
+/// mutably and its siblings as `left`/`right` slices. The #8586 reconcile runs
+/// from the worker LOOP, which owns the whole `bindings` vector, so it needs no
+/// split — and forcing one would be a workaround for a borrow shape that is not
+/// there. Both walk every binding and share the per-binding step above, so they
+/// cannot drift on WHAT an eviction does.
+pub(in crate::afxdp) fn invalidate_flow_cache_slots_for_keys(
+    bindings: &mut [BindingWorker],
+    keys: &[SessionKey],
+) {
+    if keys.is_empty() {
+        return;
+    }
+    for key in keys {
+        for binding in bindings.iter_mut() {
+            invalidate_flow_cache_key_on_binding(binding, key);
         }
     }
 }
