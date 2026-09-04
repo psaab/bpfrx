@@ -15,12 +15,45 @@ impl crate::afxdp::Coordinator {
     /// event stream so the Go shadow conntrack and the HA peer
     /// delete-sync stay coherent (the standby additionally runs its
     /// own purge when IT applies the snapshot).
-    pub(crate) fn purge_remapped_tunnel_sessions(&self, purge_ids: &[u16]) -> usize {
+    ///
+    /// #8138: `release_against` is the forwarding state whose allocators and
+    /// source-NAT rules the purged sessions' reservations must be released
+    /// against — NOT `self.forwarding`.
+    ///
+    /// This is a parameter rather than a read of `self.forwarding` because the
+    /// two production callers hold DIFFERENT states at this point, and one of
+    /// them holds nothing:
+    ///
+    ///   - `coordinator/reconcile/snapshot.rs` — `stop_inner(false)` has already
+    ///     DEFAULTED `coord.forwarding`, so it carries no rules and no
+    ///     allocators. Releasing against it frees nothing while looking like a
+    ///     repair.
+    ///   - `coordinator/snapshot_refresh.rs` — the purge runs BEFORE
+    ///     `self.forwarding = new_forwarding`, so `self.forwarding` is the live
+    ///     previous state.
+    ///
+    /// Both pass `&new_forwarding`, which is correct for both because
+    /// `forwarding_build` carries `iface_nat_allocators` across a rebuild by
+    /// `Arc::clone` — the new state's allocators ARE the objects the import-time
+    /// reservation was taken against.
+    pub(crate) fn purge_remapped_tunnel_sessions(
+        &self,
+        purge_ids: &[u16],
+        release_against: &crate::afxdp::types::ForwardingState,
+    ) -> usize {
         if purge_ids.is_empty() {
             return 0;
         }
         let mut keys = Vec::new();
         let mut deltas = Vec::new();
+        // #8138: the FORWARD entries whose import-time reservation this purge
+        // must release. Reverse entries are excluded at the source: the release
+        // returns immediately on `is_reverse`, so collecting them would call a
+        // function that does nothing and count a repair that did not happen —
+        // the same error #6979 F4 records having measured (counter read 2 for
+        // one stranded reservation).
+        let mut reservations: Vec<(crate::session::SessionKey, crate::nat::NatDecision)> =
+            Vec::new();
         {
             // #6653 sweep: RECOVERING lock. `let Ok(..) else { return 0 }`
             // made the #1873 R-D purge SILENTLY DO NOTHING on a poisoned
@@ -48,6 +81,7 @@ impl crate::afxdp::Coordinator {
                 // Go shadow keys off the forward delta).
                 keys.push(entry.key.clone());
                 if !entry.metadata.is_reverse {
+                    reservations.push((entry.key.clone(), entry.decision.nat));
                     deltas.push(crate::session::SessionDelta {
                         kind: crate::session::SessionDeltaKind::Close,
                         key: entry.key.clone(),
@@ -81,6 +115,44 @@ impl crate::afxdp::Coordinator {
         }
         for key in &keys {
             self.delete_synced_session(key.clone());
+        }
+        // #8138: release the coordinator's import-time reservation.
+        //
+        // `reserve_synced_translation` takes it as `NatHolder::Untracked`
+        // (`ha/session_import.rs`), which contributes no holder bit — so the
+        // teardown sweeps, which CLEAR bits, free nothing against it, and
+        // `delete_synced_session` frees it only on the #6979 F4 dropped-command
+        // route with a worker id. A session purged here before any worker
+        // adopted the reservation therefore strands a `(pool_addr, port)` for
+        // the life of the allocator. Measured before this change:
+        // `purged = 1`, `occupied_after_purge = true`.
+        //
+        // `NatHolder::Untracked` is the CORRECT holder and cannot over-release.
+        // `drop_holder_locked` returns early — keeping the record — whenever any
+        // holder bit remains, and `Untracked.bit()` is 0, so a reservation a
+        // worker HAS adopted is left for that worker's own teardown to free.
+        // Only a record with `holders == 0` (one no worker ever claimed) is
+        // freed here. That is the direction the allocator documents as
+        // deliberate: an under-release leaks a bounded, observable pool port,
+        // an over-release hands a live worker's port to a new flow.
+        let now_ns = crate::afxdp::wg::counters::monotonic_now_ns();
+        for (key, nat) in &reservations {
+            if crate::nat::release_source_nat_allocation(
+                &release_against.iface_nat_allocators,
+                &release_against.source_nat_rules,
+                key,
+                *nat,
+                false,
+                now_ns,
+            ) {
+                // Counted only on an ACTUAL free. #8124's removed repair
+                // incremented unconditionally, which reported a repair that did
+                // not happen — the specific dishonesty this counter must not
+                // reproduce.
+                self.sessions
+                    .tunnel_purge_reservations_released
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         if let Some(es) = self.event_stream.as_ref() {
             let handle = es.worker_handle();

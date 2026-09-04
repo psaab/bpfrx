@@ -607,7 +607,12 @@ pub(super) fn apply_snapshot(
         &new_forwarding,
         snapshot_was_installed,
     );
-    coord.purge_remapped_tunnel_sessions(&tunnel_purge_ids);
+    // #8138: release against `new_forwarding`, NOT `coord.forwarding` —
+    // `stop_inner(false)` has already defaulted the latter (see the comment
+    // above), so it holds no allocators and freeing against it would free
+    // nothing. The allocators are carried across the rebuild by `Arc::clone`,
+    // so `new_forwarding` names the objects the reservation was taken against.
+    coord.purge_remapped_tunnel_sessions(&tunnel_purge_ids, &new_forwarding);
     // #8157: the purge ids travel to the BRINGUP replay instead of being
     // applied to a Vec here. The replay now derives its entries from the live
     // shared map at replay time (see `replay_preserved_sessions`), so the

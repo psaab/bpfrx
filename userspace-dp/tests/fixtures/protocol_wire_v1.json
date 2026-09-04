@@ -997,6 +997,7 @@
     "synced_reverse_rederived": 0,
     "three_color_policer_counters": [],
     "time_exceeded_rate_limited_total": 0,
+    "tunnel_purge_reservations_released": 0,
     "wg_decap_ecn_illegal_drops_total": 0,
     "worker_command_queue_drops": 0,
     "worker_command_queue_poison_recoveries": 0,

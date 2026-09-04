@@ -372,7 +372,13 @@ impl super::Coordinator {
         // "new" and wipe those boot-time entries.
         let tunnel_purge_ids =
             tunnel_remap_purge_ids(&self.forwarding, &new_forwarding, prior_snapshot_installed);
-        self.purge_remapped_tunnel_sessions(&tunnel_purge_ids);
+        // #8138: `self.forwarding` is still the live PREVIOUS state here (the
+        // swap is the next line), so unlike the reconcile caller it is not
+        // defaulted. `new_forwarding` is passed anyway, for one reason: the
+        // allocators are the SAME objects either way (`Arc::clone` carryover),
+        // and taking the argument from the same expression at both call sites
+        // removes the chance of one drifting to the state that frees nothing.
+        self.purge_remapped_tunnel_sessions(&tunnel_purge_ids, &new_forwarding);
         self.forwarding = new_forwarding;
         // #6832 fold r5: the refresh's commit point for the #3651 per-zone
         // counters. Unlike the full reconcile there is no worker bring-up after

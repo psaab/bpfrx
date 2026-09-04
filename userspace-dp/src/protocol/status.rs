@@ -426,6 +426,13 @@ pub(crate) struct ProcessStatus {
     /// `xpf_userspace_session_delete_dropped_released_total`.
     #[serde(rename = "session_delete_dropped_released", default)]
     pub session_delete_dropped_released: u64,
+    /// #8138: import-time `Untracked` NAT reservations the tunnel-remap purge
+    /// released. A purged session whose reservation no worker had adopted would
+    /// otherwise strand its `(pool_addr, port)` for the life of the allocator.
+    /// Counts ACTUAL frees only, never attempts.
+    /// `xpf_userspace_tunnel_purge_reservations_released_total`.
+    #[serde(rename = "tunnel_purge_reservations_released", default)]
+    pub tunnel_purge_reservations_released: u64,
     /// #6600/#7398: peer-synced imports refused because this node could not
     /// reserve the translated NAT port the session names. Sustained growth
     /// means the standby cannot hold the primary's translations, so those
