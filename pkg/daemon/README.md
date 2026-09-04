@@ -1756,6 +1756,41 @@ never lock an operator out of a remote box it manages.
 
 ## Notable gotchas
 
+- **Every shutdown-path `applySem` acquire is BOUNDED (#8597).**
+  `daemon_run_shutdown.go` states the rule at its own drain — *"bound it
+  defensively anyway so a wedged apply cannot block the whole shutdown past the
+  drain budget"*. A census of `applySem` acquires reachable from the shutdown
+  sequence finds exactly two: that drain, and `stopPolicySchedulerLoop`, which
+  used `context.Background()`.
+
+  With an apply wedged, the unbounded one never returned. The scheduler was
+  never cancelled, shutdown never reached the HA relinquish that follows, and
+  systemd's `TimeoutStopSec` ended the process with SIGKILL — no `rg_active`
+  clear, no priority-0 advert, no RA goodbye. A sub-second handover became a
+  blackout, from a contained degradation (one wedged apply) that the bounded
+  drain right above it was written to survive.
+
+  Bounding an acquire has a second half: **do not release a permit you did not
+  take.** The original released unconditionally, which was only safe because
+  the acquire could not fail. On a weight-1 semaphore, releasing without
+  acquiring raises the count above capacity and admits a second holder
+  alongside the wedged apply — from the very path whose purpose is to serialise
+  against it. `TestStopPolicySchedulerLoopDoesNotReleaseASemaphoreItNeverTook_8597`
+  pins that.
+
+  On timeout the call proceeds to the cancel anyway. Bounding the wait is only
+  worth something if the call still does its job: #5308 orders this BEFORE the
+  dataplane teardown so no late scheduler tick runs against a closed runtime.
+
+  **Residual, stated rather than implied:** this does not make the join
+  unconditionally bounded. A tick already parked in `publishPolicyScheduleState`
+  acquires with `d.daemonCtx`, which is the raw parent and is
+  production-uncancelled, so cancelling the scheduler ctx does not release it
+  and `schedulerWg.Wait()` can still block behind the same wedged apply. What
+  the bound removes is the case where the stall happens with no tick in flight
+  at all. Closing the rest needs the scheduler's own ctx to reach its updateFn —
+  a signature/ownership change rather than a bound. Filed as #8660.
+
 - **An unarmed dataplane stops kernel transit forwarding (#5275).** Kernel
   transit forwarding is CONDITIONAL on the dataplane being armed. The daemon
   tracks that as `Daemon.dataplaneArmed` (accessor `DataplaneArmed()`), set

@@ -264,6 +264,33 @@ after HA failover. To make that **structural**, not flag-defended:
   RDNSS until the next RG transition. Scoping supersession per interface fixes
   that while a withdraw NAMING A still supersedes A's restart (both the
   per-interface epoch bump and the `goodbyeWanted` flip fire).
+- **A supersession bump must accompany superseding RESPONSIBILITY (#8597).**
+  #4961 scoped the interface-scoped withdraws' bump to the interfaces they
+  NAME. `WithdrawOnce` then bumped every named interface in a loop that ran
+  BEFORE the busy check — including the ones it went on to SKIP.
+
+  A skip emits nothing, claims nothing, and reports `Skipped`, so the bump
+  superseded work this call took no responsibility for. `finishDrainDecision`
+  starts a changed-config replacement only while
+  `m.ifaceEpoch[name] == e.startIfaceEpoch`, and `applyDeferred` aborts a
+  deferred start on the same comparison — so a concurrent cold-boot
+  `WithdrawOnce` (the daemon runs `runStartupGoodbye` on its own goroutine)
+  made the replacement silently not happen, released the tombstone anyway, and
+  returned nil from BOTH error paths. The interface ended with no RA sender
+  while every caller was told it succeeded, and its hosts kept the router until
+  Router Lifetime (1800 s default) expired.
+
+  The bump now lives INSIDE the claim branch. It is moved, not deleted: on the
+  claimed path this call takes the interface over and emits the goodbye, so a
+  deferred `Apply` start that captured the epoch in `deferredIfaceEpoch` must
+  still be superseded — deleting it would let a deferred start bring the sender
+  back after the operator withdrew it. `WithdrawInterfaces` keeps its
+  unconditional bump, because it flips `goodbyeWanted` on the entry it
+  supersedes and therefore does take over.
+
+  The contrast is the invariant, stated as a test: a `WithdrawOnce` that SKIPS
+  must not cancel a restart, and a `WithdrawInterfaces` naming the same
+  interface still must.
 - **Bounded writes.** Every owner `WriteTo` sets a 1 s write deadline so a
   stuck socket cannot wedge withdrawal; the owner always returns promptly,
   which is what makes owner-performs-the-close safe for both modes.
