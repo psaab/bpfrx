@@ -1166,10 +1166,25 @@ Scope of the fallback:
   an interface-level tunnel. It is Junos parity — `st0.0` and `st0.1` are
   different units and may be in different zones or none, and a unit in no zone
   forwards nothing — and it removes a policy BYPASS: the sibling's zone is a
-  policy set the operator wrote for a different interface. It is reported twice
-  so it is never silent: a commit-time advisory naming the interface and the
-  units (`pkg/config/contested_trunk_zone_advisory_7509.go`) and a per-build
-  runtime warning naming the ifindex.
+  policy set the operator wrote for a different interface. It is reported so it is
+  not silent, and the two reports are NOT equally effective — measured, not
+  assumed:
+
+  - the **runtime warning** from `forwarding_build/interfaces.rs` names the
+    ifindex and the refused zone ids, one line per contested ifindex per build.
+    Observed in the journal on `loss:xpf-userspace-fw0` for a second, unzoned
+    unit added to `gr-0/0/0`:
+    `WARNING ifindex 10 carries a logical unit the operator left out of zone
+    ids [52010]`.
+  - the **commit-time advisory** in
+    `pkg/config/contested_trunk_zone_advisory_7509.go` names the interface and
+    the units, and is produced by the real compiler
+    (`TestBothZoneAdvisoriesReachTheRealCompiler7509`). It does NOT currently
+    reach an operator through the remote `cli`: neither `commit` nor
+    `commit check` rendered it on that box. The already-merged #8402 advisory
+    behaves identically there, measured as a control in the same session, so the
+    gap is in the commit RESPONSE path rather than in either advisory, and it is
+    filed as #8484.
 
   **What would invalidate the rationale (#4308).** Untagged frames have no
   principled unit attribution today because `native-vlan-id` is accepted-only and

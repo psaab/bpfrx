@@ -249,3 +249,71 @@ func TestSharedDeviceUnzonedUnitAdvisorySuppressedOnTolerantPath7509(t *testing.
 		t.Fatalf("tolerant path must be silent; got %v", cfg.Warnings)
 	}
 }
+
+// TestBothZoneAdvisoriesReachTheRealCompiler7509 binds the WIRING, not the
+// functions the cells above call directly.
+//
+// Every other cell in this file invokes `append*AdvisoryLocked` itself, so all
+// of them stay green if the call in `compiler.go` is deleted — and both
+// advisories are reached from TWO sites there (CompileConfig and its sibling).
+// This drives the real `CompileConfig` from real `set` lines and asserts the
+// warning arrives in `cfg.Warnings`, which is the surface the gRPC commit
+// response and the local CLI both read.
+//
+// MEASURED LIMITATION, recorded here because the cell would otherwise read as
+// proof of something it does not show: on the loss userspace cluster the remote
+// `cli` renders NEITHER advisory on `commit` or on `commit check`, and the
+// already-merged #8402 advisory behaves identically — measured as a control on
+// the same box, same session. So the gap is in the commit RESPONSE path, not in
+// this wiring, and it is filed as #8484. The advisory that demonstrably
+// reaches an operator today is the userspace-dp runtime warning
+// (`forwarding_build/interfaces.rs`), which was observed in the journal on that
+// same box for this same config.
+func TestBothZoneAdvisoriesReachTheRealCompiler7509(t *testing.T) {
+	compile := func(t *testing.T, lines []string) *Config {
+		t.Helper()
+		tree := &ConfigTree{}
+		for _, cmd := range lines {
+			p, err := ParseSetCommand(cmd)
+			if err != nil {
+				t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+			}
+			if err := tree.SetPath(p); err != nil {
+				t.Fatalf("SetPath(%q): %v", cmd, err)
+			}
+		}
+		cfg, err := CompileConfig(tree)
+		if err != nil {
+			t.Fatalf("CompileConfig: %v", err)
+		}
+		return cfg
+	}
+
+	// #7509 half: an interface-level tunnel whose unit 1 is in no zone while
+	// unit 0 is. Mirrors the config committed on the cluster during the smoke.
+	shared := compile(t, []string{
+		"set interfaces gr-0/0/0 tunnel source 10.1.1.1",
+		"set interfaces gr-0/0/0 tunnel destination 10.1.1.2",
+		"set interfaces gr-0/0/0 unit 0 family inet address 10.255.192.42/30",
+		"set interfaces gr-0/0/0 unit 1 family inet address 10.255.193.42/30",
+		"set security zones security-zone sfmix interfaces gr-0/0/0.0",
+	})
+	if got := warningsMentioning(shared, "gr-0/0/0.1"); len(got) != 1 {
+		t.Fatalf("the #7509 advisory must survive the REAL compiler; got %d of %d "+
+			"warnings: %v", len(got), len(shared.Warnings), shared.Warnings)
+	}
+
+	// #8402 half, in the same cell so one deleted call site cannot hide behind
+	// the other: a trunk whose units span two zones.
+	contested := compile(t, []string{
+		"set interfaces ge-0/0/9 vlan-tagging",
+		"set interfaces ge-0/0/9 unit 100 vlan-id 100 family inet address 10.100.9.1/24",
+		"set interfaces ge-0/0/9 unit 200 vlan-id 200 family inet address 10.200.9.1/24",
+		"set security zones security-zone lan interfaces ge-0/0/9.100",
+		"set security zones security-zone dmz interfaces ge-0/0/9.200",
+	})
+	if got := warningsMentioning(contested, "more than one security zone"); len(got) != 1 {
+		t.Fatalf("the #8402 advisory must survive the REAL compiler; got %d of %d "+
+			"warnings: %v", len(got), len(contested.Warnings), contested.Warnings)
+	}
+}
