@@ -704,6 +704,23 @@ pub(super) fn mirrored_counters(
     )
 }
 
+/// What one budgeted refresh slice observed, beyond advancing the cursor.
+///
+/// #7919: the slice already walks this worker's forward entries, so the largest
+/// per-session volume it saw rides back with the cursor rather than costing a
+/// second iteration. See `WorkerRuntimeCounters::session_volume_high_water` for
+/// why the caller folds it into a monotonic high-water rather than using it as
+/// a per-cycle value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct RefreshSliceOutcome {
+    /// Resume point for the next slice; 0 means the cycle completed.
+    pub(super) cursor: usize,
+    /// Largest `fwd_packets + rev_packets` on any forward entry this slice
+    /// walked. 0 when the slice walked nothing, or nothing it walked has
+    /// carried traffic.
+    pub(super) max_session_volume: u64,
+}
+
 pub(super) fn refresh_bpf_conntrack_last_seen(
     conntrack_v4_fd: c_int,
     conntrack_v6_fd: c_int,
@@ -712,10 +729,14 @@ pub(super) fn refresh_bpf_conntrack_last_seen(
     now_ns: u64,
     cursor: usize,
     budget: usize,
-) -> usize {
+) -> RefreshSliceOutcome {
     let now_secs = now_ns / 1_000_000_000;
+    // #7919: sampled on the walk below, not by a second pass.
+    let mut max_session_volume: u64 = 0;
 
-    sessions.iter_with_idle_budgeted(cursor, budget, now_ns, |key, _decision, metadata, idle_ns, counters, expires_after_ns| {
+    // #8125 added `expires_after_ns` to this callback; #7919 binds the walk's
+    // return so the observed max can ride back with the cursor.
+    let next = sessions.iter_with_idle_budgeted(cursor, budget, now_ns, |key, _decision, metadata, idle_ns, counters, expires_after_ns| {
         // Only refresh forward entries — reverse entries mirror the forward.
         // #2501: the forward SessionEntry carries BOTH directions' counters
         // (the reverse entry shares them via the canonical forward key the
@@ -724,6 +745,13 @@ pub(super) fn refresh_bpf_conntrack_last_seen(
         if metadata.is_reverse {
             return;
         }
+        // #7919: sample BEFORE the map work and independently of whether the
+        // BPF lookup below succeeds — this measures what the worker's TABLE
+        // holds, which is the question. Folding it in after a successful update
+        // would make an unmirrored session read as no volume, which is the
+        // conflation being investigated.
+        max_session_volume = max_session_volume
+            .max(counters.fwd_packets.saturating_add(counters.rev_packets));
         // #3395: re-resolve the live-row policy_id from the bound rule handle
         // against the current rule table (frozen-at-install id would mis-map
         // after a live policy reorder).
@@ -838,7 +866,11 @@ pub(super) fn refresh_bpf_conntrack_last_seen(
             }
             _ => {}
         }
-    })
+    });
+    RefreshSliceOutcome {
+        cursor: next,
+        max_session_volume,
+    }
 }
 
 pub(super) fn publish_session_map_entry_for_session(

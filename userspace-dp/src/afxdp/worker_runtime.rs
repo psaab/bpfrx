@@ -101,6 +101,28 @@ pub(crate) struct WorkerRuntimeCounters {
     pub thread_cpu_ns: u64,
     pub work_loops: u64,
     pub idle_loops: u64,
+    /// #7919: the largest per-session volume (`fwd_packets + rev_packets`) this
+    /// worker has ever seen on a FORWARD entry of its own session table, as a
+    /// monotonic high-water mark. Sampled on the conntrack-mirror refresh walk,
+    /// which already iterates the table on a budgeted slice — so this adds one
+    /// compare per walked entry and NO new iteration, and nothing on the packet
+    /// path.
+    ///
+    /// WHY IT EXISTS. Every worker holds a copy of every session (measured:
+    /// `session_table_entries` reads 6 on all six workers for three flows), but
+    /// only the worker whose packets land accounts for it — the replication
+    /// types carry no counters field. So "which workers' tables ever hold
+    /// volume" is the axis that separates the two live explanations for #7919's
+    /// zeroed session counters: if only one worker ever sees volume, accounting
+    /// is reaching only that worker; if every worker does, accounting is fine
+    /// and the shared conntrack mirror is losing it.
+    ///
+    /// A high-water rather than a windowed max on purpose: the refresh walk is
+    /// budgeted, so a single cycle may not visit every entry, and a per-cycle
+    /// max would read 0 for a worker whose one busy session simply was not in
+    /// that slice — a zero indistinguishable from "never accounted", which is
+    /// the exact confusion this is built to resolve.
+    pub session_volume_high_water: u64,
     pub cos_queue_lease_acquire_v8_calls: u64,
     pub cos_queue_lease_acquire_v8_granted_bytes: u64,
     /// #1782 Step-1 (§5.2 mechanism (i)): cumulative CoS timer-wheel
@@ -204,6 +226,10 @@ pub(crate) struct WorkerRuntimeAtomics {
     pub thread_cpu_ns: AtomicU64,
     pub work_loops: AtomicU64,
     pub idle_loops: AtomicU64,
+    /// #7919: monotonic high-water of per-session volume seen on the refresh
+    /// walk. Relaxed cumulative slot like the CoS counters; NOT part of the
+    /// seqlock rolling-window tuple.
+    pub session_volume_high_water: AtomicU64,
     pub cos_queue_lease_acquire_v8_calls: AtomicU64,
     pub cos_queue_lease_acquire_v8_granted_bytes: AtomicU64,
     /// #1782 Step-1 (i): timer-wheel tick-advance sum + single-call
@@ -301,6 +327,7 @@ impl WorkerRuntimeAtomics {
             thread_cpu_ns: AtomicU64::new(0),
             work_loops: AtomicU64::new(0),
             idle_loops: AtomicU64::new(0),
+            session_volume_high_water: AtomicU64::new(0),
             cos_queue_lease_acquire_v8_calls: AtomicU64::new(0),
             cos_queue_lease_acquire_v8_granted_bytes: AtomicU64::new(0),
             cos_wheel_ticks_advanced_total: AtomicU64::new(0),
@@ -350,6 +377,8 @@ impl WorkerRuntimeAtomics {
         self.thread_cpu_ns.store(c.thread_cpu_ns, Ordering::Relaxed);
         self.work_loops.store(c.work_loops, Ordering::Relaxed);
         self.idle_loops.store(c.idle_loops, Ordering::Relaxed);
+        self.session_volume_high_water
+            .store(c.session_volume_high_water, Ordering::Relaxed);
         self.cos_queue_lease_acquire_v8_calls
             .store(c.cos_queue_lease_acquire_v8_calls, Ordering::Relaxed);
         self.cos_queue_lease_acquire_v8_granted_bytes.store(
@@ -460,6 +489,7 @@ impl WorkerRuntimeAtomics {
             thread_cpu_ns: self.thread_cpu_ns.load(Ordering::Relaxed),
             work_loops: self.work_loops.load(Ordering::Relaxed),
             idle_loops: self.idle_loops.load(Ordering::Relaxed),
+            session_volume_high_water: self.session_volume_high_water.load(Ordering::Relaxed),
             cos_queue_lease_acquire_v8_calls: self
                 .cos_queue_lease_acquire_v8_calls
                 .load(Ordering::Relaxed),

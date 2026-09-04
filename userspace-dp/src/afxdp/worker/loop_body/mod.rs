@@ -1060,7 +1060,7 @@ pub(crate) fn worker_loop(
             if ct_refresh_cursor == 0 {
                 ct_cycle_start_ns = loop_now_ns;
             }
-            ct_refresh_cursor = refresh_bpf_conntrack_last_seen(
+            let ct_outcome = refresh_bpf_conntrack_last_seen(
                 conntrack_v4_fd,
                 conntrack_v6_fd,
                 &sessions,
@@ -1071,6 +1071,16 @@ pub(crate) fn worker_loop(
                 ct_refresh_cursor,
                 CT_REFRESH_SLICE_BUDGET,
             );
+            ct_refresh_cursor = ct_outcome.cursor;
+            // #7919: fold this slice's largest observed per-session volume into
+            // the worker's monotonic high-water. The walk is budgeted, so a
+            // single slice may miss a busy session; taking the max ACROSS
+            // slices is what makes a reading of 0 mean "this worker's table has
+            // never held a session with traffic" rather than "not in this
+            // slice".
+            wr_counters.session_volume_high_water = wr_counters
+                .session_volume_high_water
+                .max(ct_outcome.max_session_volume);
         }
         // Check if fabric links were updated by the coordinator (e.g. after
         // RG failover when peer MAC was resolved). If so, rebuild the

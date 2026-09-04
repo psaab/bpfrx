@@ -36,6 +36,16 @@ func (c *xpfCollector) emitWorkerRuntime(ch chan<- prometheus.Metric, status dpu
 			prometheus.CounterValue, float64(w.WorkLoops), label)
 		ch <- prometheus.MustNewConstMetric(c.workerIdleLoops,
 			prometheus.CounterValue, float64(w.IdleLoops), label)
+		// #7919: emitted ONLY when the helper reported it. An old helper omits
+		// the wire key, and a 0-valued series here would be read as "this worker
+		// has never carried traffic" -- a measurement it did not make. No series
+		// is the honest encoding of "cannot answer", and it is also what the
+		// helper emits for a genuine never-observed 0, since both mean the same
+		// thing: no positive evidence of volume.
+		if w.SessionVolumeHighWater != nil {
+			ch <- prometheus.MustNewConstMetric(c.workerSessionVolumeHighWater,
+				prometheus.GaugeValue, float64(*w.SessionVolumeHighWater), label)
+		}
 		ch <- prometheus.MustNewConstMetric(c.workerCoSQueueLeaseAcquireV8Calls,
 			prometheus.CounterValue, float64(w.CoSQueueLeaseAcquireV8Calls), label)
 		ch <- prometheus.MustNewConstMetric(c.workerCoSQueueLeaseAcquireV8GrantedBytes,

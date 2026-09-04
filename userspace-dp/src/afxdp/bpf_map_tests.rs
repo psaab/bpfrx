@@ -504,7 +504,9 @@ fn refresh_bpf_conntrack_last_seen_is_budgeted_across_slices() {
     // First slice from the top: cursor advances by EXACTLY the budget and does
     // NOT wrap (the table still has N - BUDGET unwalked slots). fd=-1 => no BPF
     // I/O, but the cursor bookkeeping is exercised.
-    let c1 = refresh_bpf_conntrack_last_seen(-1, -1, &table, &policy, now, 0, BUDGET);
+    // #7919: the slice now returns a RefreshSliceOutcome; the cursor contract it
+    // used to return directly is `.cursor` and is otherwise unchanged.
+    let c1 = refresh_bpf_conntrack_last_seen(-1, -1, &table, &policy, now, 0, BUDGET).cursor;
     assert_eq!(
         c1, BUDGET,
         "first slice must be bounded to the budget, not a full single-pass scan"
@@ -515,7 +517,8 @@ fn refresh_bpf_conntrack_last_seen_is_budgeted_across_slices() {
     let mut cursor = c1;
     let mut slices = 1usize;
     for _ in 0..1024 {
-        let next = refresh_bpf_conntrack_last_seen(-1, -1, &table, &policy, now, cursor, BUDGET);
+        let next =
+            refresh_bpf_conntrack_last_seen(-1, -1, &table, &policy, now, cursor, BUDGET).cursor;
         slices += 1;
         if next != 0 {
             assert!(
@@ -951,4 +954,138 @@ fn conntrack_timeout_column_reports_the_session_window_v6_8125() {
     )
     .expect("a v6 session must map to a v6 conntrack value");
     assert_eq!(no_entry.timeout, 1800);
+}
+
+// #7919: the refresh slice reports the largest per-session volume it walked.
+//
+// This is the instrument that separates the two live explanations for a
+// session row reading `Pkts: 0` while the flow moves traffic. Every worker
+// holds a copy of every session (measured on the reference cluster:
+// `session_table_entries` reads 6 on all six workers for three flows), but only
+// the worker whose packets land accounts for one. So if only one worker's table
+// ever holds volume, accounting reaches only that worker; if every worker's
+// does, accounting is fine and the shared mirror is losing it.
+//
+// Sampled on the walk the refresh already performs — no second iteration, and
+// nothing on the packet path.
+#[test]
+fn a_refresh_slice_reports_the_largest_session_volume_it_walked_7919() {
+    use crate::session::SessionTable;
+    let mut table = SessionTable::new();
+    let policy = crate::policy::PolicyState::default();
+    let install = 1_000_000_000u64;
+
+    let mk_key = |port: u16| SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: 6,
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+        src_port: port,
+        dst_port: 5201,
+        discriminator: Default::default(),
+        routing_domain: 0,
+    };
+    let mk_decision = || SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 12,
+            tx_ifindex: 12,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 50, 1))),
+            neighbor_mac: Some([0, 1, 2, 3, 4, 5]),
+            src_mac: None,
+            tx_vlan_id: 0,
+        },
+        nat: NatDecision::default(),
+    };
+    let mk_metadata = || SessionMetadata {
+        ingress_zone: TEST_LAN_ZONE_ID,
+        egress_zone: TEST_WAN_ZONE_ID,
+        ingress_ifindex: 0,
+        ingress_vlan_id: 0,
+        owner_rg_id: 1,
+        fabric_ingress: false,
+        is_reverse: false,
+        nat64_reverse: None,
+        log_session_init: false,
+        log_session_close: false,
+        policy_id: 0,
+        inactivity_timeout_ns: None,
+        policy_counter_idx: 0,
+        policy_counter: None,
+    };
+    let busy = mk_key(40001);
+    let quiet = mk_key(40002);
+    assert!(table.install_with_protocol(
+        busy.clone(), mk_decision(), mk_metadata(), install, 6, 0x10,
+    ));
+    assert!(table.install_with_protocol(
+        quiet.clone(), mk_decision(), mk_metadata(), install, 6, 0x10,
+    ));
+    for _ in 0..1_234u32 {
+        table.account_packet(&busy, 1500, 0x10, 0);
+    }
+
+    // fd -1: no BPF syscalls run, but the walk still happens — which is exactly
+    // the surface under test.
+    let out = refresh_bpf_conntrack_last_seen(-1, -1, &table, &policy, install + 1, 0, 4096);
+    assert_eq!(
+        out.max_session_volume, 1_234,
+        "the slice must report the busiest walked session's fwd+rev volume"
+    );
+
+    // CONTROL: a table whose sessions have NO traffic reports 0, so a nonzero
+    // reading cannot come from the walk merely having visited entries.
+    let mut idle = SessionTable::new();
+    assert!(idle.install_with_protocol(
+        quiet, mk_decision(), mk_metadata(), install, 6, 0x10,
+    ));
+    let idle_out = refresh_bpf_conntrack_last_seen(-1, -1, &idle, &policy, install + 1, 0, 4096);
+    assert_eq!(
+        idle_out.max_session_volume, 0,
+        "control: an unaccounted table must report 0, or the value above is an \
+         artefact of walking rather than of volume"
+    );
+
+    // And the cursor contract is unchanged by carrying the extra value back.
+    assert_eq!(
+        idle_out.cursor, 0,
+        "a slice that drains the table still wraps its cursor to 0"
+    );
+}
+
+// #7919 WIRE CONTRACT: the high-water is an ADDED key, and an unreported one
+// must be indistinguishable from absent rather than serialized as a 0 a reader
+// could mistake for a measurement.
+#[test]
+fn an_unobserved_session_volume_high_water_stays_off_the_wire_7919() {
+    let mut w = crate::protocol::WorkerRuntimeStatus::default();
+    w.worker_id = 2;
+    let json = serde_json::to_string(&w).expect("serialize");
+    assert!(
+        !json.contains("session_volume_high_water"),
+        "a never-observed high-water must not appear on the wire at all; a 0 \
+         there reads as 'this worker has never carried traffic', which is a \
+         measurement the helper did not make. got: {json}"
+    );
+
+    w.session_volume_high_water = 117_280;
+    let json = serde_json::to_string(&w).expect("serialize");
+    assert!(
+        json.contains("\"session_volume_high_water\":117280"),
+        "an observed high-water must reach the wire under its own key. got: {json}"
+    );
+
+    // An OLD control plane's payload (no such key) must still decode — the
+    // rolling-upgrade direction that makes this an ADD rather than a change.
+    let old: crate::protocol::WorkerRuntimeStatus =
+        serde_json::from_str(r#"{"worker_id":3,"work_loops":7}"#).expect("decode old payload");
+    assert_eq!(old.worker_id, 3);
+    assert_eq!(
+        old.session_volume_high_water, 0,
+        "an absent key decodes to the Rust zero value; the GO side is where \
+         absent-vs-zero is preserved, via a pointer (see \
+         metrics_session_volume_high_water_7919_test.go)"
+    );
 }

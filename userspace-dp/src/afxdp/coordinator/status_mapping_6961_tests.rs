@@ -71,6 +71,7 @@ macro_rules! for_each_shared_scalar {
             thread_cpu_ns,
             work_loops,
             idle_loops,
+            session_volume_high_water,
             cos_queue_lease_acquire_v8_calls,
             cos_queue_lease_acquire_v8_granted_bytes,
             cos_wheel_ticks_advanced_total,

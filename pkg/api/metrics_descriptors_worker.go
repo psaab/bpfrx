@@ -49,6 +49,11 @@ func (c *xpfCollector) initWorkerDescriptors() {
 		"Worker-loop iterations with no useful work (#869).",
 		[]string{"worker_id"}, nil,
 	)
+	c.workerSessionVolumeHighWater = prometheus.NewDesc(
+		"xpf_userspace_worker_session_volume_high_water",
+		"Largest per-session volume (fwd+rev packets) ever seen in this worker's own session table, sampled on the conntrack-mirror refresh walk (#7919). Every worker holds a copy of every session but only the worker whose packets land accounts for one, so a worker reading 0 here has never held a session carrying traffic. ABSENT (no series) when the helper does not report it -- never emitted as a 0 that could be read as a measurement.",
+		[]string{"worker_id"}, nil,
+	)
 	c.workerCoSQueueLeaseAcquireV8Calls = prometheus.NewDesc(
 		"xpf_userspace_worker_cos_queue_lease_acquire_v8_calls_total",
 		"V8 CoS queue-lease acquire calls made by this worker (#1240).",
