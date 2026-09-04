@@ -50,10 +50,22 @@ const (
 	preAuthPeerReserve = 2
 )
 
-// configureConnFn is indirected so tests can bind the #5303 buffer-deferral:
-// the large (256 KiB) session-sync socket buffers must not be sized until AFTER
-// the auth handshake succeeds. Production points it at configureSessionSyncConn.
-var configureConnFn = configureSessionSyncConn
+// configureSyncConn applies the #5303 buffer deferral: the large (256 KiB)
+// session-sync socket buffers must not be sized until AFTER the auth handshake
+// succeeds.
+//
+// It is a METHOD, not a package-level function variable, and that is the whole
+// of #8182 — see SessionSync.configureConn for why a shared global made the
+// guard built on it unable to tell a real revert from a parallel neighbour.
+// A test binds its OWN sync's hook; another SessionSync running concurrently
+// cannot satisfy it.
+func (s *SessionSync) configureSyncConn(conn net.Conn) {
+	if s != nil && s.configureConn != nil {
+		s.configureConn(conn)
+		return
+	}
+	configureSessionSyncConn(conn)
+}
 
 // beginSetup admits a connection into its pre-auth setup window and registers
 // it for shutdown cleanup. For an inbound connection it enforces the #5303

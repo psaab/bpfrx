@@ -126,23 +126,27 @@ func TestPreAuthOutboundBypassesCap(t *testing.T) {
 // TestPreAuthDefersBufferSizingUntilAuth binds the #5303 buffer deferral: the
 // large (256 KiB) socket buffers must not be sized until AFTER the handshake
 // succeeds. It drives handleNewConnection with a keyed node whose handshake
-// FAILS and asserts configureConnFn was never invoked.
+// FAILS and asserts the buffer sizing was never invoked.
 //
-// RED on revert: moving the configureConnFn(conn) call from after the
+// RED on revert: moving the s.configureSyncConn(conn) call from after the
 // handshake-success check back to the top of handleNewConnection (the pre-fix
 // placement) sizes the buffers unconditionally, so it runs even when the
 // handshake fails and this assertion goes RED.
+//
+// #8182: the observation is bound to THIS sync's own hook, not to a package
+// global. The assertion is a NEGATIVE — "this must not have been called" — and
+// a negative over shared state cannot tell a real #5303 revert from a parallel
+// neighbour completing a handshake while the swap is installed. pkg/cluster has
+// 36 t.Parallel() calls and seven test files that reach handleNewConnection, so
+// that neighbour exists. Per-instance, it cannot reach this counter.
 func TestPreAuthDefersBufferSizingUntilAuth(t *testing.T) {
 	var configured atomic.Bool
-	orig := configureConnFn
-	configureConnFn = func(c net.Conn) {
-		configured.Store(true)
-		orig(c)
-	}
-	defer func() { configureConnFn = orig }()
 
 	// Keyed node — a handshake is attempted (and here, forced to fail).
 	s := newAuthSync(t, []byte("psk-secret-key-for-5303-deferral-test"))
+	// Set BEFORE the handleNewConnection goroutine starts: the `go` statement
+	// is the happens-before edge, so this needs no lock and races with nothing.
+	s.configureConn = func(net.Conn) { configured.Store(true) }
 
 	cli, srv := net.Pipe()
 	// Mirror the accept path: register the inbound connection, then run setup.
@@ -170,7 +174,7 @@ func TestPreAuthDefersBufferSizingUntilAuth(t *testing.T) {
 
 	if configured.Load() {
 		t.Fatal("large socket buffers were sized before the handshake succeeded " +
-			"(#5303 deferral reverted): configureConnFn must run only AFTER " +
+			"(#5303 deferral reverted): the buffer sizing must run only AFTER " +
 			"performSyncHandshake succeeds")
 	}
 	// The failed-handshake connection must have released its admission slot.
@@ -208,5 +212,86 @@ func TestStopClosesInFlightSetupConns(t *testing.T) {
 			t.Fatalf("Stop did not close in-flight setup conn %d (#5303 close-on-stop "+
 				"reverted): a stalled pre-auth connection would hang shutdown", i)
 		}
+	}
+}
+
+// TestBufferSizingObservationIsPerSync_8182 is the isolation proof for #8182,
+// and it is the cell the flake needed: it FAILS on the pre-#8182 package-level
+// hook and passes on the per-instance one, so it distinguishes the two designs
+// rather than merely exercising the current one.
+//
+// The defect it pins is a FALSE NEGATIVE. TestPreAuthDefersBufferSizingUntilAuth
+// asserts something must NOT have happened. Over shared global state that
+// assertion cannot tell "the #5303 deferral was reverted" from "a parallel
+// neighbour completed a handshake while my swap was installed" — and
+// pkg/cluster has 36 t.Parallel() calls with seven test files reaching
+// handleNewConnection, so the neighbour is not hypothetical. A guard whose red
+// means "someone else was running" degrades: a real revert becomes
+// indistinguishable from the noise and is waved through by the reflex the noise
+// trains.
+//
+// The scenario below is exactly that neighbour, run deliberately: a SECOND
+// SessionSync completes a SUCCESSFUL handshake — the path that legitimately
+// sizes buffers — while the first sync's observation is installed. The first
+// sync's counter must stay false, because it is watching its own connection and
+// not the package.
+func TestBufferSizingObservationIsPerSync_8182(t *testing.T) {
+	const psk = "psk-secret-key-for-8182-isolation-test"
+
+	// The observer: a sync that never handles a connection at all. If its hook
+	// can be satisfied by anything but its own conn, that is the bug.
+	observer := newAuthSync(t, []byte(psk))
+	var observed atomic.Bool
+	observer.configureConn = func(net.Conn) { observed.Store(true) }
+
+	// The neighbour: two keyed peers completing a real handshake. Its own hook
+	// records separately, and asserting IT fired is what stops this cell from
+	// passing because the neighbour silently did nothing.
+	a := newAuthSyncNode(t, []byte(psk), 0)
+	b := newAuthSyncNode(t, []byte(psk), 1)
+	var neighbourSized atomic.Bool
+	a.configureConn = func(net.Conn) { neighbourSized.Store(true) }
+
+	ca, cb := net.Pipe()
+	t.Cleanup(func() { ca.Close(); cb.Close() })
+
+	if !a.beginSetup(ca, true) {
+		t.Fatal("beginSetup should admit the neighbour's connection")
+	}
+	done := make(chan struct{})
+	go func() {
+		a.handleNewConnection(context.Background(), 0, ca, true)
+		close(done)
+	}()
+	res := <-runHandshake(b, cb, false)
+	if res.err != nil {
+		t.Fatalf("control failed: the neighbour's handshake must SUCCEED, or it "+
+			"never reaches the buffer sizing and this cell proves nothing: %v", res.err)
+	}
+
+	// Give the neighbour's connection path time to reach the sizing call.
+	deadline := time.Now().Add(3 * time.Second)
+	for !neighbourSized.Load() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !neighbourSized.Load() {
+		t.Fatal("control failed: the neighbour completed its handshake but never " +
+			"sized its buffers, so nothing was there to leak into the observer — " +
+			"this cell would pass vacuously")
+	}
+
+	if observed.Load() {
+		t.Fatal("a DIFFERENT SessionSync's successful handshake satisfied this " +
+			"sync's buffer-sizing observation (#8182). The hook is shared, so the " +
+			"#5303 guard built on it reports a revert whenever a parallel " +
+			"neighbour runs — and a real revert becomes indistinguishable from it")
+	}
+
+	ca.Close()
+	cb.Close()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the neighbour's handleNewConnection did not return")
 	}
 }

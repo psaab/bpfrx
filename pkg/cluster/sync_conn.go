@@ -469,7 +469,7 @@ func configureSessionSyncConn(conn net.Conn) {
 func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, conn net.Conn, initiator bool) {
 	// #5303: the caller (acceptLoop / fabricConnectLoop) already admitted this
 	// connection into its pre-auth setup window via beginSetup. NOTE: the large
-	// 256 KiB socket buffers are NOT sized here — configureConnFn is deferred
+	// 256 KiB socket buffers are NOT sized here — the buffer sizing is deferred
 	// until AFTER the handshake succeeds so a connection flood cannot pin socket
 	// memory before proving possession of the PSK.
 
@@ -492,8 +492,8 @@ func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, co
 	}
 	// #5303: only NOW, after auth succeeds, size the large (256 KiB) socket
 	// buffers on the raw TCP connection (before it is wrapped in *authConn, which
-	// would defeat the *net.TCPConn type assertion inside configureConnFn).
-	configureConnFn(conn)
+	// would defeat the *net.TCPConn type assertion inside configureSessionSyncConn).
+	s.configureSyncConn(conn)
 	// Wrap so writeFull seals and receiveLoop verifies per-frame auth when the
 	// connection authenticated; an unauthenticated wrapper is a pass-through.
 	conn = s.wrapSyncConn(fabricIdx, conn, mode, keys)
