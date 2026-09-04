@@ -47,6 +47,24 @@ func (v *SessionValue) ScrubNodeLocal() {
 	v.FibGen = 0
 	v.IngressIfindex = 0
 	v.IngressVlanID = 0
+	// #8612: FibGen is OVERLOADED. daemon_ha_userspace_convert.go stores the
+	// tunnel endpoint id in it and sets LogFlagUserspaceTunnelEndpoint to say
+	// so, because a non-zero FibGen is otherwise a FIB generation and the two
+	// are not distinguishable by value. Zeroing FibGen without clearing that
+	// bit leaves a row asserting it carries a tunnel endpoint it no longer
+	// carries.
+	//
+	// No consumer is fooled TODAY -- both read sites
+	// (manager_sessionsync_request.go:54 and :162) test the flag AND a non-zero
+	// FibGen, so a scrubbed row declines and the peer's id is never adopted.
+	// The point is that "flag set implies value present" holds only by that
+	// convention: a consumer testing the flag alone, which is what a flag is
+	// for, reads a tunnel endpoint id of 0 as meaningful. Clearing the bit with
+	// the value it describes makes the invariant true instead of customary.
+	//
+	// Only this BIT is cleared. LogFlags carries unrelated userspace sync
+	// metadata that the peer legitimately owns.
+	v.LogFlags &^= LogFlagUserspaceTunnelEndpoint
 }
 
 // ScrubNodeLocal is the IPv6 twin. The two structs are separate declarations
@@ -60,4 +78,8 @@ func (v *SessionValueV6) ScrubNodeLocal() {
 	v.FibGen = 0
 	v.IngressIfindex = 0
 	v.IngressVlanID = 0
+	// #8612: see the v4 twin. FibGen is overloaded to carry the tunnel endpoint
+	// id under LogFlagUserspaceTunnelEndpoint, so the bit must be cleared with
+	// the value it describes. Only this bit; LogFlags carries other metadata.
+	v.LogFlags &^= LogFlagUserspaceTunnelEndpoint
 }
