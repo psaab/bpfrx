@@ -847,7 +847,7 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 		// from_seconds multiplies secs*1e9 unchecked (Layer A,
 		// coerceWireSessionTimeout). The presence flags are declared
 		// presence-only so completion still offers them.
-		"tcp-session": {desc: "TCP session options (timeouts, SYN checks)", children: map[string]*schemaNode{
+		"tcp-session": {desc: "TCP session options (timeouts, SYN checks)", closedWorld: true, children: map[string]*schemaNode{
 			"established-timeout": {desc: "Established TCP session timeout in seconds", args: 1, placeholder: "<seconds>",
 				valueType: ValueInteger, valueDesc: "Established TCP session timeout in seconds (0..9223372036)",
 				valueExamples: []string{"1800"}, validator: ValidateInteger(0, MaxDurationSeconds), children: nil},
@@ -864,13 +864,14 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			"no-syn-check-in-tunnel": {desc: "Disable SYN check for tunneled TCP sessions", children: nil},
 			"rst-invalidate-session": {desc: "Invalidate session on TCP RST", children: nil},
 			"no-sequence-check":      {desc: "Disable TCP sequence-number checking for sessions", children: nil},
+			"strict-syn-check":       {desc: "Require SYN as the first packet of a TCP session (accepted-only)", children: nil},
 		}},
-		"udp-session": {desc: "UDP session timeout (default 60 seconds)", children: map[string]*schemaNode{
+		"udp-session": {desc: "UDP session timeout (default 60 seconds)", closedWorld: true, children: map[string]*schemaNode{
 			"timeout": {desc: "UDP session timeout in seconds", args: 1, placeholder: "<seconds>",
 				valueType: ValueInteger, valueDesc: "UDP session timeout in seconds (0..9223372036)",
 				valueExamples: []string{"60"}, validator: ValidateInteger(0, MaxDurationSeconds), children: nil},
 		}},
-		"icmp-session": {desc: "ICMP session timeout (default 60 seconds)", children: map[string]*schemaNode{
+		"icmp-session": {desc: "ICMP session timeout (default 60 seconds)", closedWorld: true, children: map[string]*schemaNode{
 			"timeout": {desc: "ICMP session timeout in seconds", args: 1, placeholder: "<seconds>",
 				valueType: ValueInteger, valueDesc: "ICMP session timeout in seconds (0..9223372036)",
 				valueExamples: []string{"60"}, validator: ValidateInteger(0, MaxDurationSeconds), children: nil},

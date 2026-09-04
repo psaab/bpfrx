@@ -688,6 +688,15 @@ func ValidateConfig(cfg *Config) []string {
 		if flow.PreserveIncomingFragmentSize {
 			flowUnenforced = append(flowUnenforced, "preserve-incoming-fragment-size")
 		}
+		// #8296: `tcp-session strict-syn-check`. docs/feature-gaps.md said
+		// "Commit emits an accepted-only advisory" — it did not: the keyword
+		// appeared in no schema, no compiler and no advisory, so it committed
+		// clean and reached nothing. That is exactly #8296's defect, for a
+		// keyword the tree documents as supported-but-inert. The advisory the
+		// doc promised now exists.
+		if flow.TCPSession != nil && flow.TCPSession.StrictSynCheck {
+			flowUnenforced = append(flowUnenforced, "tcp-session strict-syn-check")
+		}
 		if len(flowUnenforced) > 0 {
 			warnings = append(warnings, fmt.Sprintf(
 				"security flow %s configured but accepted-only — the userspace dataplane does not enforce these knobs (config-only parity, #4231)",
