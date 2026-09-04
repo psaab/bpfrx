@@ -282,7 +282,14 @@ const (
 	// RFC 4861 §4.2: the RA header Router Lifetime is a 16-bit seconds field.
 	// A larger value silently wraps in ndp's uint16(lifetime) (65536 -> 0 =
 	// "not a default router"), so hosts drop their default route.
-	raRouterMaxLifetimeSeconds = 65535
+	//
+	// EXPORTED (#8597, muse-004 K72) because this bound is enforced on the
+	// STRICT commit path only, and the RA sender has to re-apply it: the
+	// tolerant Load / peer-sync ingress downgrades the typed-leaf violation to
+	// a warning, and a NEGATIVE value then marshals to 65535 — the maximum,
+	// not the minimum. It must re-apply THIS constant rather than a copied
+	// 65535, so the gate and the sender cannot disagree about the ceiling.
+	RARouterMaxLifetimeSeconds = 65535
 	// RFC 4861 §4.6.2: the Prefix Information valid/preferred lifetimes are
 	// 32-bit seconds fields (0xffffffff = infinity). A larger value silently
 	// truncates in ndp's uint32(lifetime); bound at the 32-bit maximum.
@@ -293,7 +300,7 @@ const (
 	// silently wraps on the wire. Bound both at the 32-bit millisecond
 	// maximum; 0 is the RFC "unspecified" sentinel (host uses its own
 	// defaults) and is the pre-existing behavior.
-	raReachableRetransMaxMillis = 4294967295
+	RAReachableRetransMaxMillis = 4294967295
 )
 
 var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map[string]*schemaNode{
@@ -556,7 +563,7 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 			// it back to 1800.
 			"default-lifetime": {desc: "Router lifetime advertised to hosts (seconds; 0 = not a default router)", args: 1, placeholder: "<seconds>",
 				valueType: ValueInteger, valueDesc: "router lifetime in seconds (RFC 4861 §4.2 16-bit; 0 = not a default router)",
-				valueExamples: []string{"0", "1800", "9000"}, validator: ValidateInteger(0, raRouterMaxLifetimeSeconds), children: nil},
+				valueExamples: []string{"0", "1800", "9000"}, validator: ValidateInteger(0, RARouterMaxLifetimeSeconds), children: nil},
 			// #2497: link-mtu is advertised verbatim via ndp.NewMTU. RFC 8200
 			// §5 sets the IPv6 minimum link MTU at 1280 bytes; a smaller value
 			// (1-1279) committed today reaches the wire and blackholes hosts
@@ -571,10 +578,10 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 			// hosts could not be tuned. 0 keeps the unspecified default.
 			"reachable-time": {desc: "Reachable Time advertised to hosts (milliseconds; 0 = unspecified)", args: 1, placeholder: "<milliseconds>",
 				valueType: ValueInteger, valueDesc: "RFC 4861 §4.2 Reachable Time in milliseconds (0 = unspecified)",
-				valueExamples: []string{"0", "30000"}, validator: ValidateInteger(0, raReachableRetransMaxMillis), children: nil},
+				valueExamples: []string{"0", "30000"}, validator: ValidateInteger(0, RAReachableRetransMaxMillis), children: nil},
 			"retransmit-timer": {desc: "Retrans Timer advertised to hosts (milliseconds; 0 = unspecified)", args: 1, placeholder: "<milliseconds>",
 				valueType: ValueInteger, valueDesc: "RFC 4861 §4.2 Retrans Timer in milliseconds (0 = unspecified)",
-				valueExamples: []string{"0", "1000"}, validator: ValidateInteger(0, raReachableRetransMaxMillis), children: nil},
+				valueExamples: []string{"0", "1000"}, validator: ValidateInteger(0, RAReachableRetransMaxMillis), children: nil},
 			// #2497: each address is appended to an RFC 8106 RecursiveDNSServer
 			// (RDNSS) option, which is IPv6-only. The runtime skips an
 			// unparseable string but does NOT family-gate, so a bare IPv4

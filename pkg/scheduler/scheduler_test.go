@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -177,7 +178,7 @@ func TestScheduler_InitialState(t *testing.T) {
 		"always-on": {Name: "always-on", AllDay: true}, // all-day = always active
 	}
 
-	s := New(schedCfg, func(activeState map[string]bool) error {
+	s := New(schedCfg, func(_ context.Context, activeState map[string]bool) error {
 		called = true
 		state = activeState
 		return nil
@@ -200,7 +201,7 @@ func TestScheduler_NewPrimedDoesNotNotifyInitialState(t *testing.T) {
 		"always-on": {Name: "always-on", AllDay: true},
 	}
 
-	s, state := NewPrimed(schedCfg, func(activeState map[string]bool) error {
+	s, state := NewPrimed(schedCfg, func(_ context.Context, activeState map[string]bool) error {
 		called = true
 		return nil
 	}, time.Date(2026, 2, 12, 14, 30, 0, 0, time.UTC))
@@ -226,7 +227,7 @@ func TestScheduler_WallClockBackwardStepFailsClosed(t *testing.T) {
 		},
 	}
 	now := time.Date(2026, 2, 12, 12, 0, 0, 0, time.UTC)
-	s, state := NewPrimed(schedCfg, func(activeState map[string]bool) error {
+	s, state := NewPrimed(schedCfg, func(_ context.Context, activeState map[string]bool) error {
 		lastState = activeState
 		return nil
 	}, now)
@@ -234,7 +235,7 @@ func TestScheduler_WallClockBackwardStepFailsClosed(t *testing.T) {
 		t.Fatal("initial state should be active")
 	}
 
-	s.evaluate(now.Add(-1*time.Hour), true)
+	s.evaluate(context.Background(), now.Add(-1*time.Hour), true)
 	if lastState == nil {
 		t.Fatal("expected callback after fail-closed state change")
 	}
@@ -256,7 +257,7 @@ func TestScheduler_WallClockBackwardStepStaysFailClosedUntilClockRecovers(t *tes
 		},
 	}
 	now := time.Date(2026, 2, 12, 12, 0, 0, 0, time.UTC)
-	s, state := NewPrimed(schedCfg, func(activeState map[string]bool) error {
+	s, state := NewPrimed(schedCfg, func(_ context.Context, activeState map[string]bool) error {
 		lastState = activeState
 		return nil
 	}, now)
@@ -271,7 +272,7 @@ func TestScheduler_WallClockBackwardStepStaysFailClosedUntilClockRecovers(t *tes
 	s.lastWallUnixNano = now.Add(time.Hour).UnixNano()
 	s.mu.Unlock()
 
-	s.evaluate(now.Add(time.Second), true)
+	s.evaluate(context.Background(), now.Add(time.Second), true)
 	if lastState == nil || lastState["business-hours"] {
 		t.Fatalf("first backward-step evaluation should fail closed, got state %+v", lastState)
 	}
@@ -279,7 +280,7 @@ func TestScheduler_WallClockBackwardStepStaysFailClosedUntilClockRecovers(t *tes
 
 	// The recovery hold keeps the scheduler closed for more than one tick,
 	// even after the new wall/monotonic samples are internally consistent.
-	s.evaluate(now.Add(time.Minute), true)
+	s.evaluate(context.Background(), now.Add(time.Minute), true)
 	if lastState != nil {
 		t.Fatalf("second rollback evaluation should not notify without state change, got %+v", lastState)
 	}
@@ -287,7 +288,7 @@ func TestScheduler_WallClockBackwardStepStaysFailClosedUntilClockRecovers(t *tes
 		t.Fatal("scheduler should stay inactive during wall-clock recovery hold")
 	}
 
-	s.evaluate(now.Add(3*time.Minute), true)
+	s.evaluate(context.Background(), now.Add(3*time.Minute), true)
 	if lastState == nil || !lastState["business-hours"] {
 		t.Fatalf("scheduler should recover after hold window, got state %+v", lastState)
 	}
@@ -302,14 +303,14 @@ func TestScheduler_MonotonicAdvanceDoesNotFailClosed(t *testing.T) {
 		},
 	}
 	start := time.Now()
-	s, state := NewPrimed(schedCfg, func(map[string]bool) error { return nil }, start)
+	s, state := NewPrimed(schedCfg, func(context.Context, map[string]bool) error { return nil }, start)
 	if !state["business-hours"] {
 		t.Fatal("initial state should be active")
 	}
 
 	// time.Add preserves Go's monotonic reading. This exercises the real
 	// monotonic path; time.Date-only tests would silently skip it.
-	s.evaluate(start.Add(time.Minute), true)
+	s.evaluate(context.Background(), start.Add(time.Minute), true)
 	if s.IsActive("business-hours") == false {
 		t.Fatal("monotonic time advance with matching wall time should stay active")
 	}
@@ -322,7 +323,7 @@ func TestScheduler_ActiveState(t *testing.T) {
 	schedCfg := map[string]*config.SchedulerConfig{
 		"always-on": {Name: "always-on", AllDay: true},
 	}
-	s := New(schedCfg, func(activeState map[string]bool) error { return nil })
+	s := New(schedCfg, func(_ context.Context, activeState map[string]bool) error { return nil })
 
 	state := s.ActiveState()
 	if !state["always-on"] {
@@ -341,7 +342,7 @@ func TestScheduler_Update(t *testing.T) {
 	schedCfg := map[string]*config.SchedulerConfig{
 		"always-on": {Name: "always-on", AllDay: true},
 	}
-	s := New(schedCfg, func(activeState map[string]bool) error {
+	s := New(schedCfg, func(_ context.Context, activeState map[string]bool) error {
 		lastState = activeState
 		return nil
 	})

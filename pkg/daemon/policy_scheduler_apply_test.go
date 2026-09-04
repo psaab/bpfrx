@@ -228,7 +228,7 @@ func TestApplyConfigProtocolAbortPreservesExistingScheduler(t *testing.T) {
 			"old": {Name: "old"},
 		},
 	}
-	oldScheduler, oldState := scheduler.NewPrimed(oldCfg.Schedulers, func(map[string]bool) error { return nil }, testPolicySchedulerApplyNow())
+	oldScheduler, oldState := scheduler.NewPrimed(oldCfg.Schedulers, func(context.Context, map[string]bool) error { return nil }, testPolicySchedulerApplyNow())
 	oldHash, _ := policySchedulerConfigHash(oldCfg)
 	dp := &policySchedulerApplyTestDP{
 		compileErr: dpuserspace.ErrPolicySchedulerProtocolIncompatible,

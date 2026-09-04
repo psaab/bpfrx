@@ -829,13 +829,40 @@ func (s *sender) buildRA() *ndp.RouterAdvertisement {
 		CurrentHopLimit:      64,
 		ManagedConfiguration: s.cfg.ManagedConfig,
 		OtherConfiguration:   s.cfg.OtherStateful,
-		RouterLifetime:       time.Duration(lifetime) * time.Second,
+		// #8597 (muse-004 K72): bound the three RA header timers before they
+		// reach ndp's unsigned marshal. The typed-leaf schema bounds all three
+		// to [0, max] at strict commit, and that gate is STRICT-only: the
+		// tolerant Load / peer-sync ingress downgrades it to a warning, so a
+		// negative or oversized value reaches here intact.
+		//
+		// Measured on the wire before the fix (ndp.MarshalMessage of buildRA):
+		//
+		//	DefaultLifetime = -1  ->  Router Lifetime 65535  (~18 hours)
+		//	ReachableTime   = -1  ->  4294967295 ms          (~49 days)
+		//	RetransTimer    = -1  ->  4294967295 ms
+		//
+		// A NEGATIVE router lifetime therefore advertises this box as a default
+		// router for the MAXIMUM the field can express — the opposite of what a
+		// nonsensical value should mean, and the field's own neutral (0 = "not
+		// a default router") was one clamp away.
+		//
+		// pruneUnmarshalableOptions probes only the OPTIONS for a marshal
+		// abort; the header fields marshal without complaint precisely because
+		// they wrap silently.
+		//
+		// Flooring at 0 does not invent an intent: 0 is the documented neutral
+		// for all three fields — "not a default router" for the lifetime,
+		// "unspecified, use your own defaults" for the other two — and is what
+		// the RA already carried before these leaves existed. Saturating at the
+		// top is the honest encoding of "as long as the field allows" and is
+		// monotone, where wrapping is not.
+		RouterLifetime: time.Duration(clampRAHeaderSeconds(lifetime)) * time.Second,
 		// RFC 4861 §4.2 Reachable Time / Retrans Timer (#4307). ndp
 		// marshals these as ms (Duration/time.Millisecond -> uint32); a
 		// configured 0 keeps the "unspecified" default the RA carried
 		// before these leaves existed.
-		ReachableTime:   time.Duration(s.cfg.ReachableTime) * time.Millisecond,
-		RetransmitTimer: time.Duration(s.cfg.RetransTimer) * time.Millisecond,
+		ReachableTime:   time.Duration(clampRAHeaderMillis(s.cfg.ReachableTime)) * time.Millisecond,
+		RetransmitTimer: time.Duration(clampRAHeaderMillis(s.cfg.RetransTimer)) * time.Millisecond,
 	}
 
 	// Router selection preference.
@@ -1141,4 +1168,34 @@ func classifyAddrAddResult(addErr error) (logAdded bool, err error) {
 	default:
 		return false, addErr
 	}
+}
+
+// clampRAHeaderSeconds bounds the RA header Router Lifetime to the range the
+// 16-bit seconds field can carry, using the SAME constant the commit-time
+// typed-leaf gate uses (#8597, muse-004 K72).
+//
+// Binding to config.RARouterMaxLifetimeSeconds rather than a local 65535 is the
+// point: the gate and the sender must not be able to disagree about where the
+// ceiling is. See the comment at the call site for what the unbounded version
+// put on the wire.
+func clampRAHeaderSeconds(v int) int {
+	if v < 0 {
+		return 0
+	}
+	if int64(v) > config.RARouterMaxLifetimeSeconds {
+		return config.RARouterMaxLifetimeSeconds
+	}
+	return v
+}
+
+// clampRAHeaderMillis bounds the RA header Reachable Time / Retrans Timer to
+// the range their 32-bit millisecond fields can carry (#8597).
+func clampRAHeaderMillis(v int) int {
+	if v < 0 {
+		return 0
+	}
+	if int64(v) > config.RAReachableRetransMaxMillis {
+		return config.RAReachableRetransMaxMillis
+	}
+	return v
 }

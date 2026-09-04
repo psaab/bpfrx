@@ -13,7 +13,7 @@ import (
 func TestStartPolicySchedulerLoopLockedWaitsForDaemonContext(t *testing.T) {
 	sched, _ := scheduler.NewPrimed(map[string]*config.SchedulerConfig{
 		"always": {Name: "always"},
-	}, func(map[string]bool) error { return nil }, time.Now())
+	}, func(context.Context, map[string]bool) error { return nil }, time.Now())
 
 	d := &Daemon{}
 	d.scheduler.Store(sched)
@@ -63,11 +63,30 @@ func TestReconcilePolicySchedulerLockedKeepsByteIdenticalScheduler(t *testing.T)
 	}
 }
 
-func TestPublishPolicyScheduleStateUsesDaemonContext(t *testing.T) {
+// #8660: the property is unchanged — a cancelled context must release a publish
+// parked on the apply semaphore — but WHICH context now matters, and that is the
+// whole of the fix.
+//
+// Before #8660 this cell cancelled `d.daemonCtx` and the publish read that
+// field. It passed, and it was TRUE OF A CONFIGURATION PRODUCTION NEVER HAS:
+// `d.daemonCtx` is the raw parent (`daemon_run.go` says so twice), never
+// cancelled in production, and the nil branch fell back to
+// `context.Background()`, which is uncancellable too. So the cell verified a
+// release path that no running daemon could take, while the path a running
+// daemon DID take was unreleasable — green, and silent about the thing that
+// mattered.
+//
+// The publish now takes the scheduler's ctx as a parameter, so this passes the
+// cancelled ctx as the TICK would, and the assertion is about the production
+// path rather than beside it.
+func TestPublishPolicyScheduleStateReleasesOnSuppliedContext8660(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	d := &Daemon{
-		daemonCtx: ctx,
+		// Deliberately left uncancelled, and it is the control: if the publish
+		// ever reads this field again instead of its parameter, the acquire
+		// becomes unreleasable and this cell times out.
+		daemonCtx: context.Background(),
 		applySem:  semaphore.NewWeighted(1),
 	}
 	if err := d.applySem.Acquire(context.Background(), 1); err != nil {
@@ -77,13 +96,73 @@ func TestPublishPolicyScheduleStateUsesDaemonContext(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		d.publishPolicyScheduleState(0, map[string]bool{"always": true})
+		d.publishPolicyScheduleState(ctx, 0, map[string]bool{"always": true})
 		close(done)
 	}()
 
 	select {
 	case <-done:
 	case <-time.After(500 * time.Millisecond):
-		t.Fatal("publishPolicyScheduleState blocked on apply semaphore after daemon context cancellation")
+		t.Fatal("publishPolicyScheduleState blocked on the apply semaphore " +
+			"after its SUPPLIED context was cancelled. The scheduler tick hands " +
+			"it the scheduler's ctx precisely so schedulerCancel() releases a " +
+			"parked publish; without that, stopPolicySchedulerLoop's " +
+			"schedulerWg.Wait() blocks behind a wedged apply and shutdown never " +
+			"reaches HA relinquish (#8660)")
+	}
+}
+
+// #8660 THE OVER-REJECT CONTROL, and it exists because a mutation showed
+// nothing else could see it.
+//
+// Every other #8660 cell asserts that something RELEASES or RETURNS. That
+// family is satisfied by a publish which never does its work at all: mutating
+// publishPolicyScheduleState to acquire with an already-cancelled context —
+// so it always bails at the acquire and never reaches the update — reds NOTHING
+// in this package. The cells were pinning "returns fast", not "returns
+// correctly", which is the exact distinction between bounding a stall and
+// silently dropping the publish.
+//
+// So this asserts the other direction: with a LIVE context, the publish must
+// WAIT for the apply semaphore rather than skip past it. It is the mirror of
+// TestPublishPolicyScheduleStateReleasesOnSuppliedContext8660 — that one says a
+// cancelled ctx must not block, this one says a live ctx must not proceed
+// without the semaphore.
+func TestPublishPolicyScheduleStateWaitsWhenItsContextIsLive8660(t *testing.T) {
+	d := &Daemon{
+		daemonCtx: context.Background(),
+		applySem:  semaphore.NewWeighted(1),
+	}
+	// A wedged apply holds the only permit.
+	if err := d.applySem.Acquire(context.Background(), 1); err != nil {
+		t.Fatalf("precondition acquire: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		// Epoch 1 against the daemon's zero value, so the publish returns at
+		// the epoch check IMMEDIATELY after the acquire — which is the point:
+		// it proves the acquire happened without needing a store, dataplane and
+		// config fixture for work this cell is not about. A matching epoch
+		// walks into d.store.ActiveConfig() and nil-derefs on a bare Daemon.
+		d.publishPolicyScheduleState(context.Background(), 1, map[string]bool{"always": true})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("publishPolicyScheduleState returned while the apply semaphore was " +
+			"held and its context was LIVE. It must wait for the permit — a " +
+			"publish that skips the acquire has silently dropped the enforcement " +
+			"snapshot, which is a worse failure than the stall #8660 removes and " +
+			"is invisible to every cell that only asserts a prompt return (#8660)")
+	case <-time.After(250 * time.Millisecond):
+		// Still parked, which is correct. Release so the goroutine can finish.
+	}
+	d.applySem.Release(1)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("publishPolicyScheduleState did not proceed after the permit was released")
 	}
 }

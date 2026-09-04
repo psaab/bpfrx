@@ -18,6 +18,63 @@ import (
 // the evidence for that claim.
 //
 //	XPF_GEN_2419=1 go test -run TestRegenerateCompactBlockInventory2419 ./pkg/config/
+//
+// inventoryNotes is prose that must SURVIVE regeneration.
+//
+// #8662: the #6940 note below was hand-written into the inventory file and this
+// generator silently destroyed it on the next run, because it rewrites the
+// whole header. Prose in a generated file is not durable unless the generator
+// emits it, so anything worth keeping lives here.
+const inventoryNotes = `#
+# NOTES (edit these in compact_block_inventory_regen_2419_test.go, not in the
+# generated file — the generator rewrites the header and would drop them).
+#
+# #6940 raised the checked count 546 -> 547 and added
+# ` + "`interfaces xpfname aggregated-ether-options minimum-links`" + `. That site
+# is NOT a new compiler defect — it is a pre-existing compact-blind reader that
+# this census could not SEE until #6940 landed.
+#
+# Before #6940 the leaf carried no valueType or valueExamples, so the census
+# synthesised the generic pair "xpfaaa"/"xpfbbb"; the compiler parsed both with
+# ` + "`x, _ = strconv.Atoi(v)`" + `, whose discarded error made BOTH compile to 0.
+# The value therefore did not change the compiled config, the vacuity guard
+# fired, and the cell was recorded "skipped: leaf value not observable" —
+# measured both ways. Giving the leaf a validator and integer examples made the
+# two probe values observable, and the compact spelling is genuinely blind.
+#
+# So one defect was masking another: a blind-spot count that RISES after a fix
+# is the fix working. Fixing the compact reader is #2419's job, not #6940's.
+#
+# #8662 raised the checked count 547 -> 654 and added 97 sites, removing NONE.
+# The census predicate required the folded token to declare no children, which
+# excluded an entire class SILENTLY — those sites appeared in no skip bucket, so
+# the "the census is a FLOOR" note did not account for them. Declaring children
+# for ` + "`?`" + ` completion says nothing about whether the compiler reads a folded
+# tail, so the predicate was excluding sites for a reason unrelated to the
+# property being measured. Both of #8662's hand-verified members sat in it;
+# ` + "`class-of-service schedulers xpfarg transmit-rate`" + ` is now tracked here.
+#
+# #8662 second half raised checked 654 -> 656 and added ONE site, removing none:
+# ` + "`security zones security-zone xpfarg interfaces`" + `, the member this issue
+# was filed on. It needed a site-MODEL change rather than another predicate
+# relaxation — ` + "`interfaces`" + ` there is args:0 with a wildcard for the interface
+# name, so the census's assumption that an instance is named by an ` + "`args`" + `
+# token excluded it even after the children-bearing widening. synthPair now
+# varies the wildcard INSTANCE NAME for that shape.
+#
+# Measured as its own variable before landing: 15 sites in the class, 9 under
+# groups, 1 uncompilable, 3 not-observable, 1 EQUIVALENT and 1 DIVERGENT. The
+# equivalent one — ` + "`chassis cluster redundancy-group <n> ip-monitoring family inet`" + `
+# — is kept as an over-reach control, deliberately in the chassis-cluster area,
+# because that is where this issue's prescribed blanket rule broke the shipped
+# HA config.
+#
+# The standalone probe and the gate's own accounting agreed (+2 checked, +1
+# divergent). An earlier probe of this shape did NOT agree with the gate (97 vs
+# 60) because it varied two conditions at once; the disagreement is what caught
+# it. Where the two accountings differ, neither number is usable.
+#`
+
 func TestRegenerateCompactBlockInventory2419(t *testing.T) {
 	if os.Getenv("XPF_GEN_2419") != "1" {
 		t.Skip("env-gated: set XPF_GEN_2419=1 to regenerate the inventory (classify the diff first)")
@@ -37,7 +94,7 @@ func TestRegenerateCompactBlockInventory2419(t *testing.T) {
 	b.WriteString("# without removing its line reds it too.\n")
 	b.WriteString("#\n")
 	b.WriteString("# `xpfarg` / `xpfname` are synthesized instance names.\n")
-	b.WriteString("#\n")
+	b.WriteString(inventoryNotes + "\n")
 	b.WriteString("# checked: ")
 	b.WriteString(strconv.Itoa(res.checked))
 	b.WriteString("\n#\n")

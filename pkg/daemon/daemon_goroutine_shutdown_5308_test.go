@@ -153,7 +153,7 @@ func TestStopPinRetryLoopCancelsJoinsNoLateSyscall(t *testing.T) {
 func TestStopPolicySchedulerLoopCancelsJoins(t *testing.T) {
 	sched, _ := scheduler.NewPrimed(map[string]*config.SchedulerConfig{
 		"always": {Name: "always"},
-	}, func(map[string]bool) error { return nil }, time.Now())
+	}, func(context.Context, map[string]bool) error { return nil }, time.Now())
 
 	d := &Daemon{
 		applySem:  semaphore.NewWeighted(1),

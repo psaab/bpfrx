@@ -1,5 +1,7 @@
 package config
 
+import "math"
+
 // PortMirroringInstanceExcludedReason reports why the userspace snapshot
 // builder drops a `forwarding-options port-mirroring` instance outright, or ""
 // when the instance is published.
@@ -46,6 +48,35 @@ func PortMirroringInstanceExcludedReason(inst *PortMirrorInstance) string {
 	}
 	if inst.InputRate < 0 {
 		return "negative input rate"
+	}
+	// #8597 (muse-004 K68): the same wrap, at the other end.
+	//
+	// `Rate: uint32(inst.InputRate)` is the wire field, at TWO sites
+	// (pkg/dataplane/userspace/mirrors.go and pkg/dataplane/compiler.go). A
+	// value above math.MaxUint32 wraps, and `rate 4294967296` wraps to exactly
+	// ZERO — which in this field means MIRROR EVERY PACKET. An operator asking
+	// for the sparsest possible sample gets a full traffic duplicate onto the
+	// output interface.
+	//
+	// That is worse than the negative case this predicate was written for. A
+	// negative rate at least mirrors nothing while the screen lies; a wrapped
+	// zero makes the screen and the behaviour AGREE, and both are the opposite
+	// of what was asked for.
+	//
+	// The sibling knob already has this bound: `forwarding-options sampling`
+	// caps its own InputRate at math.MaxUint32 in pkg/dataplane/userspace/
+	// flow.go with a slog.Warn (#1977). Port mirroring was left out of that
+	// sweep.
+	//
+	// EXCLUDING rather than capping, unlike the sampling sibling, and for two
+	// reasons. It matches the negative case three lines up, so one knob does
+	// not have two different out-of-range behaviours. And a value this far out
+	// of range is a typo or a hostile config, not an operator asking for the
+	// sparsest mirror the wire can encode — capping would invent an intent, the
+	// #6769 argument. The exclusion is annotated on all three show surfaces,
+	// so the operator is told rather than left to infer it from traffic.
+	if int64(inst.InputRate) > math.MaxUint32 {
+		return "input rate above the 32-bit wire field"
 	}
 	return ""
 }

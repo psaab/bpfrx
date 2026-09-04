@@ -2356,16 +2356,25 @@ func validateNPTv6ScopeStrict(cfg *Config, lenient bool) ([]string, error) {
 // Why this exists as a separate predicate from the strict check: the LENIENT
 // path's warning tells the operator what the dataplane will do with the rule.
 // If it fires on a token the dataplane happily accepts, the warning is simply
-// false — the rule is installed and translating while the operator is told it
-// is not. Strict may demand the canonical "/96" spelling (a backstop laxer than
-// its gate is the safe direction); the WARNING must mirror the backstop.
+// false — the rule is installed while the operator is told it is not. Strict
+// may demand the canonical "/96" spelling; the WARNING must mirror the
+// backstop.
 //
-// Do NOT "fix" the divergence by tightening the Rust parse. A leniently-loaded
-// config carrying "/+96" reaches the dataplane either way, and Rust's laxness is
-// what makes that case WORK — it parses to 96, the correct value, byte-identical
-// to a canonical rule (measured). A strict Rust parse would reject it at the
-// dataplane instead, turning NAT64 silently off for that rule-set, which is the
-// exact silent skip this whole gate exists to prevent.
+// Do NOT resolve the divergence by tightening the Rust parse UNILATERALLY —
+// and note the reason, because an earlier revision of this comment gave a
+// different one that does not hold. It argued that a stricter backstop would
+// strand a cleanly-committed rule. It would not: this gate rejects every one of
+// those 110 tokens at commit, so no such rule can exist, and that hazard is
+// vacuous over exactly this set.
+//
+// The reason is that tightening turns a fail-OPEN into a fail-CLOSED, which is
+// a behaviour decision rather than a cleanup. A leniently-loaded "/+96"
+// currently translates with the correct prefix (measured: byte-identical to a
+// canonical rule). Tightened, it would be rejected at the helper and NAT64
+// would be off for that rule-set — a defensible posture, possibly the better
+// one. #8667 owns that call, weighing it against normalising the token when the
+// snapshot is built, or accepting the spelling at commit. Doing it in the Rust
+// parse alone would also paper over the live defect, which is on this side.
 func dataplaneAcceptsNAT64Mask(tok string) bool {
 	// Rust's FromStr accepts at most ONE leading '+', then decimal digits.
 	// TrimPrefix removes exactly one, so "++96" stays malformed for both.
