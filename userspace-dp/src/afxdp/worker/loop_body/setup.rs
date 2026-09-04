@@ -344,6 +344,13 @@ mod worker_setup_harness {
     /// Spawning also matches production, where setup always runs on a freshly
     /// spawned worker.
     pub(super) fn drive_worker_setup(binding_plans: Vec<BindingPlan>) -> SetupObservation {
+        // DO NOT "simplify" this to an inline call. `worker_loop_setup` opens
+        // with `pin_current_thread(worker_id)`, so calling it on the cargo test
+        // thread PINS that thread — and the pin outlives this cell and follows
+        // the thread into whatever test the runner reuses it for. The symptom
+        // would be an unrelated timing flake, weeks later, in a file with no
+        // connection to this one. Spawning also matches production, where setup
+        // always runs on a freshly spawned worker.
         std::thread::spawn(move || {
             let t0 = crate::afxdp::monotonic_nanos();
             let runtime = RuntimeViewChannel::default();
