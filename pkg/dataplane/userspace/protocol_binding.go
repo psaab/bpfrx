@@ -249,6 +249,13 @@ type BindingStatus struct {
 	// is an ext-header input reject. omitempty + the Rust serde `default` keep
 	// cross-version wire safety (an older helper omits it → 0).
 	Nat64ExthdrIneligible uint64 `json:"nat64_exthdr_ineligible,omitempty"`
+	// Nat64IneligibleProtocol (#8670) counts fail-closed drops of a packet
+	// addressed to a Pref64 destination whose IP protocol stateful NAT64 does
+	// not translate — RFC 6146 covers TCP, UDP and ICMP only, so GRE, ESP,
+	// AH, OSPF, SCTP, IPIP and PIM arrive flowless and are refused. Split out
+	// of Nat64FragDropped, which counted them despite their not being
+	// fragments and reported a broken ESP/GRE tunnel as a fragmentation fault.
+	Nat64IneligibleProtocol uint64 `json:"nat64_ineligible_protocol,omitempty"`
 	// #4477: source-NAT allocation failures (a source-NAT rule matched but no
 	// translated mapping could be allocated — missing/empty/invalid/exhausted
 	// pool, wrong family, or a non-first fragment on a port-translating rule);

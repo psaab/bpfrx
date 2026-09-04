@@ -58,6 +58,7 @@ pub(super) fn reset_binding_counters(bindings: &mut [BindingStatus]) {
         binding.nat64_ineligible_source = 0;
         binding.nat64_ineligible_dest = 0;
         binding.nat64_exthdr_ineligible = 0;
+        binding.nat64_ineligible_protocol = 0;
         binding.nat_alloc_fail = 0;
         binding.nat_frag_untranslated_dropped = 0;
         binding.slow_path_packets = 0;

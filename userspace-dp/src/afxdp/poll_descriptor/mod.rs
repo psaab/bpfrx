@@ -4269,7 +4269,41 @@ pub(super) fn poll_binding_process_descriptor(
                             .match_ipv6_dest(dst_v6)
                             .is_some()
                     {
-                        telemetry.counters.record_nat64_frag_dropped();
+                        // #8670: ATTRIBUTE BY REASON, in the same order the TX
+                        // dispatcher uses (`tx/dispatch/mod.rs`) so one packet
+                        // gets one answer regardless of which site refuses it.
+                        //
+                        // This gate unconditionally bumped `nat64_frag_dropped`.
+                        // For a real fragment that is correct and stays. But the
+                        // gate's OTHER population is not fragments at all: every
+                        // IP protocol outside {TCP, UDP, ICMP, ICMPv6} has no L4
+                        // identity the shim can resolve (`metadata_tuple_complete`,
+                        // #6837), so it stays flowless and lands here — measured
+                        // for GRE 47, ESP 50, AH 51, OSPF 89, SCTP 132, IPIP 4 and
+                        // PIM 103, while TCP/UDP translate and forward normally.
+                        //
+                        // The drop is right — RFC 6146 specifies stateful NAT64
+                        // for TCP, UDP and ICMP only, and a Pref64 destination is
+                        // a translation namespace no downstream router can
+                        // deliver. The ATTRIBUTION was wrong, and wrong in the
+                        // direction that costs an operator the most: the counter
+                        // is surfaced as `NAT64 fragment drops`, so a broken ESP
+                        // or GRE tunnel across a NAT64 prefix reported a
+                        // FRAGMENTATION fault and pointed at PMTU — a false
+                        // accusation, not merely a missing number.
+                        if crate::nat64::frame_is_nat64_exthdr_ineligible(
+                            packet_frame,
+                            meta.addr_family as i32,
+                        ) {
+                            telemetry.counters.record_nat64_exthdr_ineligible();
+                        } else if crate::nat64::frame_is_nat64_fragment_drop(
+                            packet_frame,
+                            meta.addr_family as i32,
+                        ) {
+                            telemetry.counters.record_nat64_frag_dropped();
+                        } else {
+                            telemetry.counters.record_nat64_ineligible_protocol();
+                        }
                         binding.scratch.scratch_recycle.push(desc.addr);
                         continue;
                     }

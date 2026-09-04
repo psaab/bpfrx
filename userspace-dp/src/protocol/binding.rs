@@ -641,6 +641,10 @@ pub(crate) struct BindingStatus {
     /// (an older helper omits it and Go/Rust read 0).
     #[serde(rename = "nat64_exthdr_ineligible", default)]
     pub nat64_exthdr_ineligible: u64,
+    /// #8670: fail-closed NAT64 protocol-ineligibility drops (a Pref64-addressed
+    /// packet carrying an IP protocol stateful NAT64 does not translate).
+    #[serde(rename = "nat64_ineligible_protocol", default)]
+    pub nat64_ineligible_protocol: u64,
     /// #4477: source-NAT allocation failures (rule matched, no translated
     /// mapping could be allocated → packet dropped). `default` keeps the same
     /// cross-version wire safety as the siblings above (an older helper omits it

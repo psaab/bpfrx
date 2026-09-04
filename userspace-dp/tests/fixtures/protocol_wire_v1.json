@@ -119,6 +119,7 @@
     "nat64_frag_assoc_evicted": 0,
     "nat64_frag_dropped": 0,
     "nat64_ineligible_dest": 0,
+    "nat64_ineligible_protocol": 0,
     "nat64_ineligible_source": 0,
     "nat64_no_source_pool": 0,
     "nat64_pool_exhausted": 0,
