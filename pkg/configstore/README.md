@@ -794,6 +794,27 @@ per-path:
     A residual case remains by design: an explicit confirm with NO later
     commit + an immediate crash before the retry heals fails SAFE (reverts on
     boot) — consistent with `ConfirmCommit` having returned an error.
+  - **The removal debt is KEYED to the record it is owed for (#7675).**
+    The retry above re-drove `removeConfirmState()` UNCONDITIONALLY, so it
+    deleted whatever `confirm.json` was on disk. An operator who armed a
+    BRAND-NEW `commit confirmed` while a debt was outstanding therefore had
+    the NEW window's crash-recovery file deleted by a retry that believed it
+    was clearing the old one — deterministic, not a race, and invisible: the
+    in-memory timer stays armed and `IsConfirmPending()` is true, so the
+    damage only shows after a restart, when the UNCONFIRMED config stands
+    with no rollback (the #4577 failure the record exists to prevent).
+    `resolveConfirmRemovalLocked` now captures the record's identity
+    (`GuardedHash` + deadline + `FirstCommit`) BEFORE deleting and stores it
+    as `confirmRemoveDebtID`; the retry clears the debt WITHOUT deleting when
+    the record on disk is a different one, because a newer arm's
+    `WriteConfirm` (temp+fsync+rename+dir-fsync) has already durably replaced
+    the record the debt was owed for. Absent or unreadable is deliberately
+    NOT "superseded": an absent record still owes the #4864 directory
+    barrier, and an unreadable one cannot be a fresh arm, so both still
+    re-drive the delete. #5473 had recognised this exact shape for its OWN
+    deferred-resolution debt and drains it at every arm site before
+    `writeConfirmState` writes the fresh record; #5835 added a second debt
+    and did not extend that drain. Keying holds for an arm path that forgets.
 - **Durable deletes match durable writes (#5197).** A delete of a
   secret-bearing artifact fsyncs its parent directory so the removal is
   durable, mirroring the `fsatomic.WriteFileDurable` its writer used — a
