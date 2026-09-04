@@ -414,7 +414,26 @@ fn emit_ipv4_segment(
         let packet = frame_out.get_mut(eth_len..)?;
         packet
             .get_mut(2..4)?
-            .copy_from_slice(&(total_ip_len as u16).to_be_bytes());
+            // #8321 findings 19/20: saturate rather than wrap. Not because the
+            // wrap is reachable today — it is not, and that was measured rather
+            // than assumed (see the reachability note below) — but because
+            // wrapping and saturating differ in KIND at the point they diverge.
+            // A wrap forges a plausible small length; a saturation produces a
+            // value that is wrong on the wire but can never masquerade as
+            // valid. `saturate_len16` is the tree's helper for exactly this and
+            // these were the only two computed-length casts not using it.
+            //
+            // REACHABILITY, recorded so it is not re-derived a fourth time:
+            // total_ip_len = ip_header_len + tcp_header_len + chunk_len, and
+            // chunk_len <= segment_payload_max = mtu - (ip_header_len +
+            // tcp_header_len), so total_ip_len <= mtu. The config layer places
+            // NO upper bound on mtu (`ValidateIntegerMin(1)`, schema_interfaces.go
+            // — the schema cannot express one, which is #8358), but the value
+            // reaching the dataplane is read BACK FROM THE KERNEL
+            // (`mtu = link.Attrs().MTU`, pkg/dataplane/userspace/interfaces.go),
+            // so it is whatever the driver accepted. On every interface this
+            // dataplane forwards on that ceiling is far below 65535.
+            .copy_from_slice(&saturate_len16(total_ip_len).to_be_bytes());
         // #2077: gate the TTL==1 drop on NOT-fabric-ingress,
         // matching the IPv6 hop-limit gate below and the
         // canonical build/rewrite paths (build/ipv4.rs,
@@ -503,7 +522,10 @@ fn emit_ipv6_segment(
         let v6_payload_len = (ip_header_len - 40) + tcp_header_len + chunk_len;
         packet
             .get_mut(4..6)?
-            .copy_from_slice(&(v6_payload_len as u16).to_be_bytes());
+            // #8321 finding 20: the v6 sibling. See the v4 note above for the
+            // reachability argument and for why saturating beats wrapping even
+            // where neither can fire.
+            .copy_from_slice(&saturate_len16(v6_payload_len).to_be_bytes());
         if (meta.meta_flags & 0x80) == 0 && packet[7] <= 1 {
             return None;
         }
@@ -1578,5 +1600,46 @@ mod mode_aware_segmentation_tests {
     /// private helper indirectly.
     fn native_gre_inner_mtu_for_test(outer_mtu: usize) -> usize {
         outer_mtu - 20 - 4
+    }
+}
+
+#[cfg(test)]
+mod saturating_segment_len_8321 {
+    use super::*;
+
+    /// #8321 findings 19/20: the two computed-length casts in this file saturate
+    /// rather than wrap.
+    ///
+    /// The wrap is NOT reachable through the production path, and that was
+    /// measured — see the reachability note at the v4 site. So this cell binds
+    /// the helper's behaviour at the boundary directly, because a cell driving
+    /// the segmenter could only ever exercise lengths the MTU permits and would
+    /// pass identically with a bare cast. A test that cannot distinguish the
+    /// two implementations is not a test of the change.
+    ///
+    /// What it protects is the DIFFERENCE IN KIND: at 65536 a wrap yields 0 — a
+    /// plausible small length that a receiver accepts — while a saturation
+    /// yields 0xffff, wrong on the wire but never mistakable for valid.
+    #[test]
+    fn the_length_field_saturates_rather_than_wrapping_8321() {
+        // The value that separates the two implementations. A bare `as u16`
+        // gives 0 here; this is the whole reason the helper exists.
+        assert_eq!(saturate_len16(65_536), u16::MAX);
+        assert_eq!(65_536_usize as u16, 0, "the wrap this replaces");
+
+        // 65540 -> 4 under a wrap: a small, entirely plausible length.
+        assert_eq!(saturate_len16(65_540), u16::MAX);
+
+        // CONTROL: every in-range value passes through untouched, so the
+        // production path is byte-identical for all reachable inputs. Without
+        // this, a helper that returned u16::MAX unconditionally would satisfy
+        // the assertions above and corrupt every frame.
+        for len in [0usize, 20, 1500, 9216, 65_534, 65_535] {
+            assert_eq!(
+                saturate_len16(len),
+                len as u16,
+                "in-range length {len} must pass through unchanged"
+            );
+        }
     }
 }
