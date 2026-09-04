@@ -1756,6 +1756,41 @@ never lock an operator out of a remote box it manages.
 
 ## Notable gotchas
 
+- **An 802.1Q sub-interface's netdev is named for its VLAN ID, not its unit
+  number — and BOTH sides of a lookup must agree (#8597 K84/K85).**
+  `set interfaces ge-0-0-1 unit 10 vlan-id 100` is created by networkd as
+  `ge-0-0-1.100`. #8321 finding 07 fixed the PRODUCER of the connected-prefix
+  map (`connectedByLogical`, `daemon_run_routehelpers.go`) to key on the VLAN
+  ID. It did not touch the CONSUMERS, which kept deriving their key with
+  `config.LinuxIfName()` — the unit number — so the producer wrote
+  `ge-0-0-1.100`, the consumers looked up `ge-0-0-1.10`, and every VRF-scoped
+  lookup missed. Three consumers shared the assumption:
+  `riMemberLinuxName` (the VRF bind name — the bind failed against a
+  nonexistent device while the commit reported success, leaving the member in
+  the main table), `collectPrefixesForInterface` (a VRF-scoped static next-hop
+  left without interface scope), and the `claimedByVRF` stamp (a VRF-owned
+  interface stayed visible to the GLOBAL table, so a global next-hop could
+  resolve onto a tenant's interface).
+  The rule now lives in one place, `logicalUnitDeviceKey`, called by the
+  producer and by `logicalUnitDeviceKeyForRef` on the consumer side, so the two
+  cannot drift apart again.
+  Three traps for the next reader:
+  - **It is not a substitution of one field for the other.** A unit with no
+    `vlan-id` is not tagged, and `base.<unit>` is correct there. Dropping that
+    fallback passes every tagged-unit cell and breaks every untagged one.
+  - **`config.DHCPLeaseIfName` looks like the same function and is not** — it
+    has no unit-number fallback. Its own doc calls unit number and VLAN ID
+    "distinct concepts, bridged only here", which is precisely the invariant
+    these consumers were violating.
+  - **`config.ResolveKernelIfName` is not a drop-in either**: it additionally
+    resolves reth to the local physical member and maps tunnel devices, neither
+    of which the producer does, so routing a consumer through it trades one
+    miss for a different one (`reth0.50`).
+  A fixture only sees this when **unit number != vlan-id**; the pre-existing
+  cells used units 50/80 with no `vlan-id` and passed against both
+  implementations, which is how the producer-side defect survived to #8321 and
+  the consumer-side to #8597.
+
 - **Every shutdown-path `applySem` acquire is BOUNDED (#8597).**
   `daemon_run_shutdown.go` states the rule at its own drain — *"bound it
   defensively anyway so a wedged apply cannot block the whole shutdown past the

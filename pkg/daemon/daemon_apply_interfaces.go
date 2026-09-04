@@ -342,7 +342,7 @@ func (d *Daemon) bindRoutingInstanceMembers(cfg *config.Config) {
 			continue
 		}
 		for _, ifaceName := range ri.Interfaces {
-			linuxName := riMemberLinuxName(tunMap, ifaceName)
+			linuxName := riMemberLinuxName(cfg, tunMap, ifaceName)
 			if err := d.routing.BindInterfaceToVRF(linuxName, ri.Name); err != nil {
 				slog.Warn("failed to bind interface to VRF",
 					"interface", ifaceName, "linux", linuxName,
