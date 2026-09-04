@@ -1138,9 +1138,35 @@ func (m *Manager) claimWithdrawOnceLocked(configs []*config.RAInterfaceConfig) [
 	// #4961: interface-scoped op — bump only the named interfaces' per-interface
 	// epochs, not the whole-manager fence, so a WithdrawOnce of interface B
 	// cannot cancel interface A's in-flight restart / deferred start.
-	for _, cfg := range configs {
-		m.bumpIfaceEpoch(cfg.Interface)
-	}
+	//
+	// #8597 (muse-004 K19): the bump belongs INSIDE the claim, not in a
+	// preceding loop over every named interface.
+	//
+	// The invariant this package runs on is that a supersession bump
+	// accompanies real superseding RESPONSIBILITY. Withdraw flips the global
+	// fence and owns every drain. WithdrawInterfaces bumps and then flips
+	// goodbyeWanted on the entry it supersedes, so even its already-draining
+	// path takes over the goodbye. The skip path below does NEITHER — it emits
+	// nothing, claims nothing, and reports Skipped — so bumping there
+	// superseded work this call took no responsibility for.
+	//
+	// What that cost: finishDrainDecision starts a changed-config replacement
+	// only while `m.ifaceEpoch[name] == e.startIfaceEpoch`, and applyDeferred
+	// aborts a deferred start on the same comparison. A stray bump made the
+	// replacement silently not happen, the tombstone get released anyway, and
+	// BOTH error returns stay nil — the interface ends with no RA sender while
+	// every caller is told it succeeded, and its hosts keep the router until
+	// Router Lifetime (1800s default) expires. Reproduced before the fix.
+	//
+	// The trigger is routine: the daemon runs runStartupGoodbye in its own
+	// goroutine (pkg/daemon/daemon_ha.go), so a cold-boot WithdrawOnce runs
+	// concurrently with Apply's changed-config restart.
+	//
+	// On the CLAIMED path the bump is still load-bearing and stays: this call
+	// takes the interface over and emits the goodbye, so a deferred Apply start
+	// that captured the epoch in deferredIfaceEpoch must be superseded.
+	// Deleting the bump rather than moving it would let a deferred start bring
+	// the sender back after the operator withdrew it.
 	var toGoodbye []*config.RAInterfaceConfig
 	for _, cfg := range configs {
 		if m.interfaceBusy(cfg.Interface) {
@@ -1148,6 +1174,7 @@ func (m *Manager) claimWithdrawOnceLocked(configs []*config.RAInterfaceConfig) [
 				"interface", cfg.Interface)
 			continue
 		}
+		m.bumpIfaceEpoch(cfg.Interface)
 		m.draining[cfg.Interface] = &drainEntry{cfg: cfg, goodbyeClaimed: true}
 		toGoodbye = append(toGoodbye, cfg)
 	}
