@@ -2342,38 +2342,98 @@ func validateNPTv6ScopeStrict(cfg *Config, lenient bool) ([]string, error) {
 	return warnings, nil
 }
 
+// dataplaneAcceptsNAT64Mask mirrors the Rust loader's NAT64 mask parse EXACTLY,
+// including where it is LAXER than the canonical spelling this package demands
+// at commit.
+//
+// #8597 K62 / #8667. Rust checks `parts[1].parse::<u8>().ok() == Some(96)`, and
+// Rust's integer FromStr permits a leading '+'; Go's strconv.ParseUint permits
+// no sign. So "+96" is rejected by the strict gate and ACCEPTED by the
+// dataplane. Swept exhaustively over all 7240 strings of length <= 3 from
+// [0-9 + - _ space x X . e E]: 110 tokens differ, every one a leading '+', and
+// no token is accepted by Go's ParseUint and rejected by Rust.
+//
+// Why this exists as a separate predicate from the strict check: the LENIENT
+// path's warning tells the operator what the dataplane will do with the rule.
+// If it fires on a token the dataplane happily accepts, the warning is simply
+// false — the rule is installed while the operator is told it is not. Strict
+// may demand the canonical "/96" spelling; the WARNING must mirror the
+// backstop.
+//
+// Do NOT resolve the divergence by tightening the Rust parse UNILATERALLY —
+// and note the reason, because an earlier revision of this comment gave a
+// different one that does not hold. It argued that a stricter backstop would
+// strand a cleanly-committed rule. It would not: this gate rejects every one of
+// those 110 tokens at commit, so no such rule can exist, and that hazard is
+// vacuous over exactly this set.
+//
+// The reason is that tightening turns a fail-OPEN into a fail-CLOSED, which is
+// a behaviour decision rather than a cleanup. A leniently-loaded "/+96"
+// currently translates with the correct prefix (measured: byte-identical to a
+// canonical rule). Tightened, it would be rejected at the helper and NAT64
+// would be off for that rule-set — a defensible posture, possibly the better
+// one. #8667 owns that call, weighing it against normalising the token when the
+// snapshot is built, or accepting the spelling at commit. Doing it in the Rust
+// parse alone would also paper over the live defect, which is on this side.
+func dataplaneAcceptsNAT64Mask(tok string) bool {
+	// Rust's FromStr accepts at most ONE leading '+', then decimal digits.
+	// TrimPrefix removes exactly one, so "++96" stays malformed for both.
+	n, err := strconv.ParseUint(strings.TrimPrefix(tok, "+"), 10, 8)
+	return err == nil && n == 96
+}
+
 // validateNAT64PrefixStrict is the #3886 strict-vs-lenient gate for a NAT64
 // rule-set's `prefix` (`security nat nat64 rule-set <r> prefix <p>`).
 //
 // The prefix is read verbatim into NAT64RuleSnapshot.Prefix
-// (compiler_nat.go:compileNAT64 -> buildNAT64Snapshots) and parsed at
-// dataplane apply by Nat64State::try_from_snapshots (userspace-dp/src/nat64.rs).
+// (compiler_nat.go:compileNAT64 -> buildNAT64Snapshots) and parsed at dataplane
+// apply by Nat64State::from_snapshots_with_previous (userspace-dp/src/nat64.rs).
 // That /96-integrity check REQUIRES the prefix to be `<ipv6-address>/96`: it
 // splits on '/', the token after the first '/' MUST parse as a decimal /96
 // (only /96 is supported by the translator), and the address token before the
-// '/' MUST parse as an IPv6 address. Anything else (a non-/96 length, a missing
-// or garbage mask, a non-IPv6 / malformed address) makes try_from_snapshots
-// return a SnapshotIntegrityError, which propagates via `?` out of
-// build_reconcile_forwarding and ABORTS the whole forwarding rebuild WITHOUT
-// publishing a snapshot. The dataplane is then frozen at the last-good state:
-// every later commit (new sessions, policy, NAT) silently stops reaching the
-// dataplane with no operator feedback. Without this gate a single bad NAT64
-// prefix COMMITS GREEN and wedges the entire control->dataplane pipeline.
+// '/' MUST parse as an IPv6 address.
 //
-// This mirrors the Rust /96-integrity check EXACTLY so anything that would
-// abort the rebuild at runtime is rejected at commit — no commit-accept ->
-// runtime-abort gap. An empty/absent prefix is deliberately OUT OF SCOPE: the
-// Go builder (buildNAT64Snapshots) skips an empty-prefix rule, so it is never
-// emitted on the wire and never reaches the Rust check, so it cannot freeze the
-// rebuild.
+// #8667: WHAT HAPPENS TO A REJECTED RULE CHANGED UNDER THIS GATE, and the
+// description here did not follow. This comment, both operator-facing error
+// strings below, and the call-site rationale in compiler_tailgates.go all said
+// a malformed prefix makes `try_from_snapshots` return a
+// SnapshotIntegrityError that propagates out of build_reconcile_forwarding and
+// ABORTS the whole forwarding rebuild, freezing the dataplane at the last-good
+// snapshot so every later commit silently stops reaching it.
 //
-// Strict (commit / commit-check): hard-reject a non-/96 or malformed prefix.
+// That was true when this gate was written (#3886). #3888 — two issues later —
+// made NAT64 fail SCOPED: `Nat64State::from_snapshots*` is now INFALLIBLE, it
+// SKIPS the offending rule with a loud log line and publishes the remaining
+// NAT64 rules plus the rest of the forwarding snapshot, and the fallible
+// `try_from_snapshots` and its `Nat64UnparseableRule` error variant were
+// REMOVED (see the nat64.rs module doc and policy_snapshot_error.rs). Nothing
+// re-checked the Go side, so the gate kept describing a failure mode that no
+// longer exists. Measured: a snapshot carrying a malformed "64:ff9b::/64"
+// alongside a valid "64:ff9b::/96" yields is_active=true with the VALID rule
+// installed — the bad rule is skipped, nothing is frozen.
+//
+// The real consequence is narrower and still worth a commit gate: a malformed
+// prefix silently disables NAT64 FOR THAT RULE-SET, with no operator-visible
+// signal beyond a helper log line. The gate earns its place on that; it does
+// not need the freeze story, and the freeze story actively misdirects — an
+// operator told "every later config change will not reach the dataplane" will
+// go looking for a wedged pipeline and may roll back good config, when the
+// truth is one missing NAT64 rule.
+//
+// An empty/absent prefix is deliberately OUT OF SCOPE: the Go builder
+// (buildNAT64Snapshots) skips an empty-prefix rule, so it is never emitted on
+// the wire and never reaches the Rust check.
+//
+// Strict (commit / commit-check): hard-reject anything that is not the
+// canonical `<ipv6-address>/96`.
 // Lenient (load / peer-sync, #1960 / #1979 doctrine): return the message as a
 // warning so a config committed before this gate existed (or peer-synced) still
 // BOOTS — fail-closed-on-compile-failure would otherwise brick the daemon on
-// restart. The Rust helper's own try_from_snapshots backstop keeps the previous
-// live forwarding state on the leniently-loaded config, so the bad rule never
-// installs. Same doctrine as validateNPTv6Strict.
+// restart. The lenient verdict uses dataplaneAcceptsNAT64Mask, which mirrors the
+// Rust mask parse EXACTLY rather than requiring the canonical spelling: the
+// warning makes a CLAIM ABOUT THE DATAPLANE, so it must fire only when the
+// dataplane will really skip the rule. Strict may be stricter than the
+// backstop; the warning may not. Same doctrine as validateNPTv6Strict.
 func validateNAT64PrefixStrict(cfg *Config, lenient bool) ([]string, error) {
 	if cfg == nil {
 		return nil, nil
@@ -2382,10 +2442,10 @@ func validateNAT64PrefixStrict(cfg *Config, lenient bool) ([]string, error) {
 	emit := func(msg string) error {
 		if lenient {
 			warnings = append(warnings,
-				msg+" (this NAT64 rule is invalid; on a userspace-dataplane apply/preflight"+
-					" the helper's Nat64State::try_from_snapshots rejects the whole forwarding"+
-					" snapshot and the previous live state is kept, so this rule — and every"+
-					" later config change — will not reach the dataplane until it is corrected)")
+				msg+" (this NAT64 rule is invalid; the dataplane SKIPS this one rule and"+
+					" publishes the rest of the forwarding snapshot, so NAT64 for this"+
+					" rule-set is silently off while every other rule, and subsequent"+
+					" commits, still apply normally — correct the prefix to restore it)")
 			return nil
 		}
 		return fmt.Errorf("%s", msg)
@@ -2422,22 +2482,31 @@ func validateNAT64PrefixStrict(cfg *Config, lenient bool) ([]string, error) {
 		// accepts. The backstop being LAXER is the safe direction; see the note
 		// at that call site before changing either side.
 		//
-		// It is REACHABLE and it fails OPEN. On the lenient path below, emit()
-		// only warns and the loop continues, so `/+96` reaches the dataplane
-		// verbatim and the Rust loader INSTALLS it (measured: prefix_bytes
-		// 00:64:ff:9b:..). The warning emit() attaches says the rule "will not
-		// reach the dataplane until it is corrected" — false for this input.
-		// The control plane then believes a live NAT64 rule is inert. Tracked
-		// as #8667; the fix belongs on this side, not in the Rust parse.
-		mask96 := false
+		// It WAS reachable and it DID fail open: on the lenient path emit()
+		// only warned and the loop continued, so `/+96` reached the dataplane
+		// verbatim and the Rust loader installed it (measured: prefix_bytes
+		// 00:64:ff:9b:.., active, byte-identical to a canonical /96) while the
+		// warning told the operator the rule would not reach the dataplane.
+		// #8667 fixed that here, by splitting the two verdicts below.
+		//
+		// canonical: the spelling a commit must use. dataplaneOK: what the
+		// helper will actually accept. They differ only on a leading '+'.
+		canonical, dataplaneOK := false, false
 		if len(parts) == 2 {
 			if m, err := strconv.ParseUint(parts[1], 10, 8); err == nil && m == 96 {
-				mask96 = true
+				canonical = true
 			}
+			dataplaneOK = dataplaneAcceptsNAT64Mask(parts[1])
 		}
-		if !mask96 {
+		// #8667: on the lenient path the message CLAIMS the dataplane will skip
+		// this rule. Only say that when it is true, or the operator is told a
+		// live rule is inert.
+		if lenient && !canonical && dataplaneOK {
+			continue
+		}
+		if !canonical {
 			if err := emit(fmt.Sprintf(
-				"security nat nat64 rule-set %q prefix %q must be an IPv6 prefix of length /96 (RFC 6052: the well-known 64:ff9b::/96 or a /96 network-specific prefix); any other length, a missing/garbage mask, or an extra '/' segment is rejected by the dataplane, which aborts the entire forwarding rebuild",
+				"security nat nat64 rule-set %q prefix %q must be an IPv6 prefix of length /96 (RFC 6052: the well-known 64:ff9b::/96 or a /96 network-specific prefix); any other length, a missing/garbage mask, or an extra '/' segment makes the dataplane SKIP this rule-set, silently disabling NAT64 for it while the rest of the forwarding snapshot still applies",
 				rs.Name, rs.Prefix)); err != nil {
 				return nil, err
 			}
@@ -2450,7 +2519,7 @@ func validateNAT64PrefixStrict(cfg *Config, lenient bool) ([]string, error) {
 		// NOT V6 and is rejected).
 		if natAddrFamily(parts[0]) != "v6" {
 			if err := emit(fmt.Sprintf(
-				"security nat nat64 rule-set %q prefix %q has an address part %q that is not a valid IPv6 address; the dataplane rejects it and aborts the entire forwarding rebuild",
+				"security nat nat64 rule-set %q prefix %q has an address part %q that is not a valid IPv6 address; the dataplane SKIPS this rule-set, silently disabling NAT64 for it while the rest of the forwarding snapshot still applies",
 				rs.Name, rs.Prefix, parts[0])); err != nil {
 				return nil, err
 			}
