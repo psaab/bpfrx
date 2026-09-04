@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"log/slog"
 	"strings"
@@ -47,7 +48,7 @@ func TestScheduler_RepublishFailClosedAfterBoundedAge(t *testing.T) {
 		lastState map[string]bool
 		failing   = true
 	)
-	updateFn := func(state map[string]bool) error {
+	updateFn := func(_ context.Context, state map[string]bool) error {
 		calls++
 		lastState = state
 		if failing {
@@ -70,7 +71,7 @@ func TestScheduler_RepublishFailClosedAfterBoundedAge(t *testing.T) {
 	// fires updateFn, which FAILS and latches the #3780 pending retry. Not yet
 	// fail-closed: a single failure is within the bounded age.
 	closeT := time.Date(2026, 2, 12, 17, 30, 0, 0, time.UTC)
-	s.evaluate(closeT, true)
+	s.evaluate(context.Background(), closeT, true)
 	if !s.RepublishPending() {
 		t.Fatal("a failed republish must latch pending for retry")
 	}
@@ -84,7 +85,7 @@ func TestScheduler_RepublishFailClosedAfterBoundedAge(t *testing.T) {
 	for tick.Sub(closeT) < RepublishFailClosedAge {
 		tick = tick.Add(60 * time.Second)
 		beforeBound := tick.Sub(closeT) < RepublishFailClosedAge
-		s.evaluate(tick, true)
+		s.evaluate(context.Background(), tick, true)
 		if beforeBound && s.RepublishFailClosed() {
 			t.Fatalf("must not fail-closed before the bounded age (streak=%s, bound=%s)",
 				tick.Sub(closeT), RepublishFailClosedAge)
@@ -117,7 +118,7 @@ func TestScheduler_RepublishFailClosedAfterBoundedAge(t *testing.T) {
 	// deny-lands-first-on-recovery, not packet-path enforcement in a wedged
 	// dataplane (see README "Bounded-age fail-closed").
 	reopen := time.Date(2026, 2, 13, 10, 0, 0, 0, time.UTC)
-	s.evaluate(reopen, true)
+	s.evaluate(context.Background(), reopen, true)
 	if lastState["workhours"] {
 		t.Fatal("fail-closed must build the permit INACTIVE (deny) in the published snapshot even when its window reopens")
 	}
@@ -129,14 +130,14 @@ func TestScheduler_RepublishFailClosedAfterBoundedAge(t *testing.T) {
 	// scheduler then republishes the TRUE window state so the legitimately-open
 	// permit reopens (no permanent false-deny).
 	failing = false
-	s.evaluate(reopen.Add(60*time.Second), true)
+	s.evaluate(context.Background(), reopen.Add(60*time.Second), true)
 	if s.RepublishFailClosed() {
 		t.Fatal("a successful republish must clear fail-closed")
 	}
 	if s.RepublishPending() {
 		t.Fatal("a successful republish must clear the pending retry")
 	}
-	s.evaluate(reopen.Add(120*time.Second), true)
+	s.evaluate(context.Background(), reopen.Add(120*time.Second), true)
 	if !lastState["workhours"] {
 		t.Fatal("after recovery the reopened window must republish the permit ACTIVE (no permanent false-deny)")
 	}
@@ -173,7 +174,7 @@ func TestScheduler_WithinBoundTransientNeverFailsClosed(t *testing.T) {
 		lastState map[string]bool
 		failing   = false
 	)
-	updateFn := func(state map[string]bool) error {
+	updateFn := func(_ context.Context, state map[string]bool) error {
 		calls++
 		lastState = state
 		if failing {
@@ -187,7 +188,7 @@ func TestScheduler_WithinBoundTransientNeverFailsClosed(t *testing.T) {
 
 	// A clean window close: one successful republish, never fail-closed.
 	closeT := time.Date(2026, 2, 12, 17, 30, 0, 0, time.UTC)
-	s.evaluate(closeT, true)
+	s.evaluate(context.Background(), closeT, true)
 	if s.RepublishFailClosed() {
 		t.Fatal("a successful window transition must never be fail-closed")
 	}
@@ -200,19 +201,19 @@ func TestScheduler_WithinBoundTransientNeverFailsClosed(t *testing.T) {
 	// would be observable as a false-deny.
 	reopen := time.Date(2026, 2, 13, 9, 30, 0, 0, time.UTC)
 	failing = true
-	s.evaluate(reopen, true) // republish fails once, latches pending
+	s.evaluate(context.Background(), reopen, true) // republish fails once, latches pending
 	if !s.RepublishPending() {
 		t.Fatal("a failed republish should latch pending")
 	}
 	// A couple more failures, still comfortably within the bound.
 	failing = true
-	s.evaluate(reopen.Add(60*time.Second), true)
+	s.evaluate(context.Background(), reopen.Add(60*time.Second), true)
 	if s.RepublishFailClosed() {
 		t.Fatalf("a transient failure inside the bounded age (%s) must not fail-closed", RepublishFailClosedAge)
 	}
 	// Recover before the bound.
 	failing = false
-	s.evaluate(reopen.Add(120*time.Second), true)
+	s.evaluate(context.Background(), reopen.Add(120*time.Second), true)
 	if s.RepublishFailClosed() || s.RepublishPending() {
 		t.Fatal("recovery inside the bound must leave neither pending nor fail-closed")
 	}

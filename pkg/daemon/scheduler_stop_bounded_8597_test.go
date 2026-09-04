@@ -2,6 +2,9 @@ package daemon
 
 import (
 	"context"
+	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/scheduler"
+	"sync"
 	"testing"
 	"time"
 
@@ -174,5 +177,78 @@ func TestStopPolicySchedulerLoopCancelsEvenAfterTheTimeout_8597(t *testing.T) {
 	}
 	if d.schedulerCancel != nil {
 		t.Error("schedulerCancel must be cleared so a second stop is a no-op")
+	}
+}
+
+// #8660: THE JOIN. A tick parked inside the real scheduler goroutine behind a
+// wedged apply must not stall `stopPolicySchedulerLoop`.
+//
+// This is the residual K23 documented and could not cover: its cells pin the
+// bounded acquire that `stopPolicySchedulerLoop` performs itself, not the
+// `schedulerWg.Wait()` that follows. The tick used to acquire with
+// `d.daemonCtx` — the raw, production-uncancelled parent, with an
+// uncancellable `context.Background()` fallback — so `schedulerCancel()`
+// released nothing and the join blocked behind the same wedged apply that this
+// function's own bound exists to survive.
+//
+// THE OBSERVABLE, named before the assertion was written: "the join returns".
+// A cell that only asserts `stopPolicySchedulerLoop` returns within a timeout
+// would pass on a fixture where the tick was NEVER PARKED — the vacuous shape,
+// where the setup silently fails to create the condition and the assertion
+// reports health. So the tick signals that it has ENTERED the publish, and this
+// cell fails if that signal never arrives.
+func TestStopPolicySchedulerLoopJoinsATickParkedOnAWedgedApply_8660(t *testing.T) {
+	d := &Daemon{
+		applySem: semaphore.NewWeighted(1),
+		// The production shape, deliberately: an UNCANCELLABLE parent. If the
+		// publish ever reaches for this field again instead of the ctx it is
+		// handed, the join has nothing to release it and this cell hangs.
+		daemonCtx: context.Background(),
+	}
+
+	// The wedged apply: taken and never released.
+	if err := d.applySem.Acquire(context.Background(), 1); err != nil {
+		t.Fatalf("precondition acquire: %v", err)
+	}
+
+	entered := make(chan struct{})
+	var once sync.Once
+	sched, _ := scheduler.NewPrimed(
+		map[string]*config.SchedulerConfig{"always": {Name: "always"}},
+		func(ctx context.Context, activeState map[string]bool) error {
+			once.Do(func() { close(entered) })
+			// The real publish, with the ctx the tick hands it.
+			return d.publishPolicyScheduleState(ctx, 0, activeState)
+		}, time.Now())
+	sched.SetTickIntervalForTesting(time.Millisecond)
+	// Between NewPrimed and the first tick nothing changes, so the tick would
+	// correctly decline to notify. Latching the #3780 republish flag is how the
+	// production error path forces a re-fire; used here so a real tick reaches
+	// the publish.
+	sched.LatchRepublishForTesting()
+	d.scheduler.Store(sched)
+	d.startPolicySchedulerLoopLocked()
+
+	// FIXTURE ADEQUACY: the tick must actually be in flight and parked on the
+	// semaphore. Without this the cell measures nothing — a scheduler that
+	// never ticked joins instantly, and "returns fast" would read as "returns
+	// correctly".
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the scheduler tick never entered publishPolicyScheduleState, so " +
+			"no tick was parked on the wedged apply and this cell would pass " +
+			"without exercising the join at all (#8660)")
+	}
+
+	if !stopWithin(t, d, applyCloseoutDrainTimeout+10*time.Second) {
+		t.Fatal("stopPolicySchedulerLoop did not return with a tick parked in " +
+			"publishPolicyScheduleState behind a wedged apply. schedulerCancel() " +
+			"cancels the scheduler ctx, so the parked acquire is released ONLY if " +
+			"the tick acquired with that ctx; acquiring with d.daemonCtx (the raw " +
+			"production-uncancelled parent) leaves schedulerWg.Wait() blocked, " +
+			"shutdown never reaches HA relinquish, and systemd SIGKILLs the " +
+			"process — no rg_active clear, no priority-0 advert, no RA goodbye " +
+			"(#8660)")
 	}
 }

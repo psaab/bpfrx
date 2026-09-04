@@ -50,8 +50,13 @@ func (d *Daemon) reconcilePolicySchedulerLockedAt(cfg *config.Config, now time.T
 		return nil
 	}
 
-	sched, activeState := scheduler.NewPrimed(cfg.Schedulers, func(activeState map[string]bool) error {
-		return d.publishPolicyScheduleState(epoch, activeState)
+	sched, activeState := scheduler.NewPrimed(cfg.Schedulers, func(ctx context.Context, activeState map[string]bool) error {
+		// #8660: the SCHEDULER'S ctx, handed to us by the tick. Not
+		// `d.daemonCtx`, which is the raw production-uncancelled parent — a
+		// tick parked on the semaphore with that one is released by nothing,
+		// so `stopPolicySchedulerLoop`'s `schedulerWg.Wait()` blocked behind a
+		// wedged apply and shutdown never reached HA relinquish.
+		return d.publishPolicyScheduleState(ctx, epoch, activeState)
 	}, now)
 	d.scheduler.Store(sched)
 	d.policySchedulerConfigHash = hash
@@ -67,7 +72,7 @@ func (d *Daemon) policySchedulerActiveStateForApplyLocked(cfg *config.Config, no
 	if sched := d.scheduler.Load(); sched != nil && hash == d.policySchedulerConfigHash {
 		return sched.ActiveState()
 	}
-	_, activeState := scheduler.NewPrimed(cfg.Schedulers, func(map[string]bool) error { return nil }, now)
+	_, activeState := scheduler.NewPrimed(cfg.Schedulers, func(context.Context, map[string]bool) error { return nil }, now)
 	return activeState
 }
 
@@ -184,16 +189,20 @@ func (d *Daemon) stopPolicySchedulerLoop() {
 	// shutdown that reaches the cancel late is strictly better than one that
 	// never reaches it.
 	//
-	// RESIDUAL, stated rather than implied: this does NOT make the join
-	// unconditionally bounded. A tick already parked in
-	// publishPolicyScheduleState acquires with d.daemonCtx, which is the RAW
-	// parent and is production-UNCANCELLED (daemon_run.go), so cancelling the
-	// scheduler ctx does not release it and schedulerWg.Wait() below can still
-	// block behind the same wedged apply. What this change removes is the case
-	// where the stall happens with no tick in flight at all — the common one.
-	// Closing the rest needs the scheduler's own ctx to reach its updateFn,
-	// which is a signature/ownership change rather than a bound. Filed as
-	// #8660 with the three candidate shapes and what each costs.
+	// #8660 CLOSED THE RESIDUAL this comment used to describe. A tick parked in
+	// publishPolicyScheduleState now acquires with the SCHEDULER'S ctx — handed
+	// to the daemon's updateFn as a parameter by the tick that calls it — so
+	// the cancel below releases it and schedulerWg.Wait() returns. It used to
+	// acquire with d.daemonCtx, the RAW production-uncancelled parent
+	// (daemon_run.go states that twice), with a context.Background() fallback
+	// that was uncancellable too: there was no configuration in which cancelling
+	// released a parked tick, so this Wait could still block behind the same
+	// wedged apply that this function's own bounded acquire exists to survive.
+	//
+	// Kept as a note rather than deleted because the ORDER below is what makes
+	// it work: cancel() must run before Wait(), and the cancel is of the ctx the
+	// tick is parked on. Reversing them, or handing the tick a different ctx,
+	// reinstates the stall.
 	acquired := false
 	if d.applySem != nil {
 		acqCtx, cancelAcq := context.WithTimeout(context.Background(), applyCloseoutDrainTimeout)
@@ -224,9 +233,28 @@ func (d *Daemon) stopPolicySchedulerLoop() {
 // tick and which recordSchedulerRepublishResult surfaces as the
 // xpf_scheduler_republish_failed metric (#3780). Shutdown / torn-down /
 // nothing-to-publish cases return nil (no retry, no alarm).
-func (d *Daemon) publishPolicyScheduleState(epoch uint64, activeState map[string]bool) error {
-	ctx := d.daemonCtx
+// publishPolicyScheduleState republishes the enforcement snapshot for one
+// scheduler tick.
+//
+// #8660: `ctx` is the SCHEDULER'S context, supplied by the tick that called us,
+// and acquiring the semaphore with it is what makes shutdown able to join this
+// goroutine. It previously read `d.daemonCtx` with a `context.Background()`
+// fallback — and BOTH of those are uncancellable, so there was no configuration
+// in which a parked acquire could be released. `stopPolicySchedulerLoop` cancels
+// a CHILD of `d.daemonCtx` and then calls `schedulerWg.Wait()`; with the tick
+// waiting on the uncancellable parent the cancel released nothing and the join
+// blocked behind whatever wedged the apply, so shutdown never reached HA
+// relinquish and systemd SIGKILLed the process — no `rg_active` clear, no
+// priority-0 advert, no RA goodbye.
+//
+// The K23 fix bounded the OTHER acquire (`stopPolicySchedulerLoop`'s own). This
+// closes the residual it documented rather than widening any timeout: a longer
+// bound would still be a stall, and would satisfy a wall-clock cell while
+// leaving the join blocked.
+func (d *Daemon) publishPolicyScheduleState(ctx context.Context, epoch uint64, activeState map[string]bool) error {
 	if ctx == nil {
+		// Only a caller that is not the scheduler tick can reach this, and it
+		// has no lifecycle to inherit. Kept total rather than panicking.
 		ctx = context.Background()
 	}
 	if err := d.applySem.Acquire(ctx, 1); err != nil {
