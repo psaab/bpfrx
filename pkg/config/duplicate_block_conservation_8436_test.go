@@ -129,6 +129,12 @@ type dupCensusResult8436 struct {
 	divergent []string
 	verdict   map[string]string // siteKey -> "SILENT" | "rejected-at-commit"
 	skipped   map[string]int
+	// skippedSites is every site the census could not CHECK, by key. Pinned
+	// (dupConservationSkipped8436) for the same reason the non-conserving list
+	// is: a skip is not a pass. `services rpm probe xpfname test` sat in a skip
+	// COUNT for seven batches while silently losing configuration — a number
+	// cannot be read as a defect, and a named set can.
+	skippedSites []string
 }
 
 func runDupConservationCensus8436(t *testing.T) dupCensusResult8436 {
@@ -140,6 +146,10 @@ func runDupConservationCensus8436(t *testing.T) dupCensusResult8436 {
 			res.skipped["under groups (schema re-host, duplicate coverage)"]++
 			continue
 		}
+		note := func(reason string) {
+			res.skipped[reason]++
+			res.skippedSites = append(res.skippedSites, siteKey)
+		}
 		named := s.keyword + " xpfname"
 		ctx := contextFor(s.container)
 		dup := nest(s.container, ctx+
@@ -150,7 +160,7 @@ func runDupConservationCensus8436(t *testing.T) dupCensusResult8436 {
 
 		cd, cm := compileText(t, dup), compileText(t, merged)
 		if cd == nil || cm == nil {
-			res.skipped["a spelling did not parse or compile"]++
+			note("a spelling did not parse or compile")
 			continue
 		}
 		// VACUITY GUARD. If the MERGED form compiles the same as a block
@@ -158,7 +168,7 @@ func runDupConservationCensus8436(t *testing.T) dupCensusResult8436 {
 		// and this site cannot show a loss either way.
 		onlyA := compileText(t, nest(s.container, ctx+named+" { "+s.leafA+" "+s.valA+"; }"))
 		if onlyA == nil || cfgEqual(cm, onlyA) {
-			res.skipped["second leaf not observable in the typed config"]++
+			note("second leaf not observable in the typed config")
 			continue
 		}
 		res.checked++
@@ -251,5 +261,52 @@ func TestDuplicateBlockConservationIsPinned8436(t *testing.T) {
 		t.Errorf("container %q now CONSERVES but is still listed in "+
 			"dupConservationInventory8436 — delete the line; a stale entry hides the next "+
 			"regression at that site (#8436)", d)
+	}
+
+	// #8436: THE SKIP SET IS PINNED TOO, and it is the half that was missing.
+	//
+	// A site the census cannot CHECK is not a site that conserves. `services
+	// rpm probe xpfname test` sat in the "a spelling did not parse or compile"
+	// count for seven batches — the synthesized probe omits the required
+	// `target` — while being a genuine SILENT loss: two `test T` blocks
+	// overwrote each other. The census reported it as a number, and a number
+	// cannot be read as a defect.
+	//
+	// A NEW skip now fails exactly as a new non-conserving container does, and
+	// a stale skip fails too. That makes "the census could not probe this" a
+	// decision someone records rather than the one place a defect can hide from
+	// the guard #8436 asked for.
+	gotSkip := map[string]bool{}
+	for _, k := range res.skippedSites {
+		gotSkip[k] = true
+	}
+	wantSkip := map[string]bool{}
+	for _, k := range dupConservationSkipped8436 {
+		wantSkip[k] = true
+	}
+	var newSkip, goneSkip []string
+	for k := range gotSkip {
+		if !wantSkip[k] {
+			newSkip = append(newSkip, k)
+		}
+	}
+	for k := range wantSkip {
+		if !gotSkip[k] {
+			goneSkip = append(goneSkip, k)
+		}
+	}
+	sort.Strings(newSkip)
+	sort.Strings(goneSkip)
+	for _, k := range newSkip {
+		t.Errorf("NEW unprobed container %q — the census could not build a duplicate "+
+			"fixture for it, so it is neither checked nor listed. That is where a silent "+
+			"reduction hides (it is where `services rpm probe xpfname test` hid). Fix the "+
+			"fixture so the site is CHECKED, or add this line to "+
+			"dupConservationSkipped8436 with the reason it cannot be (#8436)", k)
+	}
+	for _, k := range goneSkip {
+		t.Errorf("container %q is no longer skipped but is still listed in "+
+			"dupConservationSkipped8436 — delete the line; a stale skip entry claims the "+
+			"census cannot see a site it now checks (#8436)", k)
 	}
 }

@@ -53,3 +53,67 @@ var dupConservationInventory8436 = []string{
 	"system services dhcp-local-server group xpfname pool xpfname static-binding",
 	"system services dhcpv6-local-server group xpfname pool xpfname static-binding",
 }
+
+// dupConservationSkipped8436 is every named container the census could not
+// CHECK — the second half of the enumeration, and the half that was missing.
+//
+// A SKIP IS NOT A PASS. Until this list existed the census reported skips as
+// two integers, and `services rpm probe xpfname test` sat inside one of them
+// for seven batches while silently losing configuration: two `test T` blocks
+// overwrote each other, and the synthesized fixture omits the required
+// `target`, so the compile failed and the site was COUNTED rather than checked.
+// A number cannot be read as a defect. (That site is fixed now — see
+// compiler_services.go — but it stays listed, because the census still cannot
+// probe it.)
+//
+// TestDuplicateBlockConservationIsPinned8436 fails on a NEW skip and on a stale
+// one, so a container the census cannot probe is a recorded decision rather
+// than the one place a defect can hide from the guard #8436 asked for.
+var dupConservationSkipped8436 = []string{
+	// ---- "a spelling did not parse or compile" (5). ----
+	//
+	// The synthesized duplicate did not survive commit, which is EITHER
+	// conservation by refusal OR a fixture the census cannot build. The two are
+	// indistinguishable from the census alone, so each was checked BY HAND with
+	// a complete config and the verdict recorded here.
+	//
+	// REFUSED at commit — duplicate policy name in a zone pair is a hard reject
+	// (#3473: the duplicate shares a name-keyed hit counter).
+	"security policies from-zone xpfname xpfname xpfname policy",
+	"security policies global policy",
+	// REFUSED at commit — "duplicate expectation \"any\" conflicts with
+	// \"balanced\"".
+	"class-of-service fairness rss-expectation interface xpfname queue",
+	// CONSERVES. The census fixture omits the required `match rpm-probe`; with a
+	// complete config the duplicate compiles identically to the merged form.
+	"services ip-monitoring policy xpfname then preferred-route route",
+	// DID NOT CONSERVE, now FIXED. The census fixture omits the required
+	// `target`. With a complete config two `test T` blocks overwrote each other
+	// — the probe level had been fixed, the test level one layer down had not.
+	// This is the site that motivated pinning the skip set.
+	"services rpm probe xpfname test",
+
+	// ---- "second leaf not observable in the typed config" (15). ----
+	//
+	// The census's own VACUITY guard, and structurally uninteresting for this
+	// property rather than unverified: the merged form compiles identically to a
+	// block carrying only the first leaf, so the second leaf is invisible to the
+	// typed config and the site cannot show a loss either way. Listed so the set
+	// is BOUNDED — a container that newly becomes unobservable is a change worth
+	// noticing, not a silent drop in coverage.
+	"class-of-service interfaces xpfname unit",
+	"protocols bgp group",
+	"protocols router-advertisement interface xpfname prefix",
+	"routing-options rib xpfname static route",
+	"routing-options rib xpfname static route xpfname qualified-next-hop",
+	"routing-options static route",
+	"routing-options static route xpfname qualified-next-hop",
+	"security ipsec proposal",
+	"security log stream",
+	"system login user",
+	"system services dhcp-local-server group xpfname interface",
+	"system services dhcpv6-local-server group xpfname interface",
+	"system syslog file",
+	"system syslog host",
+	"system syslog user",
+}
