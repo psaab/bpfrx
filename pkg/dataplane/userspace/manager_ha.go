@@ -524,6 +524,30 @@ func (m *Manager) disarmBeforeUnsupportedPublishLocked(snap *ConfigSnapshot) err
 	if !disarm {
 		return nil
 	}
+	// #8447: SAY SO. This is a total forwarding STOP entered deliberately on a
+	// config that COMMITS CLEANLY, and until now the only trace of it was
+	// `Forwarding supported: false` inside a `show` nobody runs when the
+	// symptom is "the link went down". `reason` was computed here purely to
+	// decorate an error string on the failure path, so the SUCCESS path — the
+	// one that actually stops traffic — emitted nothing at all.
+	//
+	// The reasons ARE the operator's diagnosis: on a chassis cluster a source
+	// rule pointing at a `persistent-nat` pool sets ForwardingSupported false
+	// (capabilities.go, "leases are not HA-synchronized"), forwarding is
+	// disarmed here before the publish, and desiredForwardingArmedLocked then
+	// keeps it disarmed while the 1 Hz reconcile short-circuits silently. What
+	// the operator sees is a connectivity outage on a commit that succeeded.
+	//
+	// WARN, not Info: a transition into not-forwarding is a state change, and
+	// it is one-time per publish rather than per-packet or per-tick, so it
+	// cannot flood (the logging rules in CLAUDE.md).
+	slog.Warn("userspace dataplane: DISARMING forwarding — the committed "+
+		"configuration is not supported by this dataplane, so transit will "+
+		"STOP until the unsupported configuration is removed",
+		"reason", reason,
+		"unsupported", strings.Join(caps.UnsupportedReasons, "; "),
+		"policy_content_rejected", len(caps.PolicyContentRejected))
+
 	var status ProcessStatus
 	if err := m.requestLocked(ControlRequest{
 		Type:       "set_forwarding_state",
