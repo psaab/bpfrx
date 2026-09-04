@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"strconv"
 	"syscall"
@@ -411,7 +412,7 @@ func (m *Manager) buildHeartbeat() *HeartbeatPacket {
 	for _, rg := range m.groups {
 		pkt.Groups = append(pkt.Groups, HeartbeatGroup{
 			GroupID:  wireRGID(rg.GroupID),
-			Priority: uint16(rg.LocalPriority),
+			Priority: clampWirePriority(rg.LocalPriority),
 			Weight:   clampWireWeight(rg.Weight),
 			State:    uint8(rg.State),
 		})
@@ -485,6 +486,37 @@ func (m *Manager) localRGIDForWireByte(b uint8) int {
 		}
 	}
 	return int(b)
+}
+
+// clampWirePriority narrows a redundancy-group node priority onto the uint16
+// heartbeat priority field by SATURATING instead of truncating (#8597, K17).
+//
+// Like clampWireWeight, this is the last belt and not the fix. The domain is
+// closed upstream by clampNodePriority (group_state.go), so every value that
+// reaches here is already in [1,254] and this is an identity today.
+//
+// What a bare `uint16(p)` did, and why it is a dual-primary vector rather than
+// a wrong number: the wire carried the truncated value while election.go
+// compared the RAW local int. A local priority of 65700 advertised as 164
+// (65700 - 65536). Against a peer at 200, the local node compared 65700 > 200
+// and elected itself; the peer compared 200 > 164 and elected ITSELF. Both
+// nodes primary, duplicate VIPs and duplicate RETH virtual MAC on the LAN —
+// the second half of the #4880 gate's own threat model, which had a strict
+// commit gate and no runtime belt.
+//
+// Saturating rather than wrapping means a future writer who bypasses
+// clampNodePriority degrades to a bounded, MONOTONIC priority. That property is
+// what the election needs: two nodes can disagree about the exact number and
+// still agree about the winner, but they cannot agree about the winner if one
+// side's value wrapped past the other's.
+func clampWirePriority(p int) uint16 {
+	if p < 0 {
+		return 0
+	}
+	if p > math.MaxUint16 {
+		return math.MaxUint16
+	}
+	return uint16(p)
 }
 
 // clampWireWeight narrows a weight onto the single-byte heartbeat weight field

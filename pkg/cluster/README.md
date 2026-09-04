@@ -840,6 +840,42 @@ peer liveness (`lastSeen`) or drive election.
   enforcing peer would reject and split the cluster (dual-primary). The
   overflow guard is unreachable at the uint8-bounded RG count and fails
   LOUD (`slog.Error`) rather than emitting cleartext.
+- **Wire, narrowing a wide config value onto a narrow field (#8337, #6549,
+  #8597).** Three heartbeat fields are narrower than the config int that
+  feeds them: the RG id byte (`wireRGID`), the weight byte
+  (`clampWireWeight`) and the priority `uint16` (`clampWirePriority`).
+  All three SATURATE rather than truncate, and all three have their
+  domain closed UPSTREAM — `wireRGID` by `MaxRedundancyGroups`,
+  the weight by `rgWeightFromDebt` / `config.ClampInterfaceMonitorWeight`,
+  the priority by `clampNodePriority` in `UpdateConfig` — so the wire
+  narrowing is an identity today and a bounded degradation for any future
+  writer who bypasses it.
+
+  The reason this is a rule rather than three separate fixes: the
+  election compares a LOCAL int against a value that travelled over the
+  wire, so a narrowing that is not order-preserving lets the two nodes
+  compute opposite winners. #8597 is the case that shows saturation alone
+  is NOT sufficient — with both nodes configured above the `uint16`
+  ceiling, both advertisements collapse to 65535 while each node still
+  compares its own raw value, and both elect themselves. **The local
+  decision has to be made on the value that was advertised**, which is
+  what closing the domain upstream achieves and what saturating the cast
+  alone does not.
+
+  A commit-time gate does not substitute for the runtime belt: the #4880
+  priority gate and the #6549 weight gate are STRICT-path only, and the
+  tolerant `Store.Load` / `Store.SyncApply` ingress downgrades both to a
+  warning per #1960 so a persisted or peer-pushed config still boots.
+  Verified by execution rather than argued —
+  `redundancy-group 1 node 0 priority 65700` is rejected by
+  `CompileConfig` and compiles clean through `CompileConfigLenient` with
+  the value intact.
+
+  Clamping rather than REFUSING is deliberate, for the `wireRGID` reason:
+  declining to advertise a group leaves the peer with `peerGroup == nil`,
+  which `election.go` turns into "peer has no RG info -> elect local
+  primary". The refusal would reproduce the dual-primary it was meant to
+  prevent.
 - **Wire, boot-epoch section (#6169).** A signed frame optionally carries
   a 16-byte boot-epoch section `marker(8) + epoch(8, little-endian)`
   inserted **BETWEEN the body and the `XPFA` trailer**

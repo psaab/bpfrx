@@ -16,6 +16,7 @@ package frr
 
 import (
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 
@@ -380,6 +381,54 @@ func renderDHCPDefaults(b *strings.Builder, fc *FullConfig) {
 // gateway with admin distance 250.
 func renderBackupRouter(b *strings.Builder, fc *FullConfig) {
 	if fc.BackupRouter == "" {
+		return
+	}
+	// #8597 (muse-004 K24): the same #6795 belt generateStaticRouteInTable
+	// carries, on the backup-router operands it was never extended to.
+	//
+	// The gap was a VALIDATOR/RENDERER DISAGREEMENT, not a missing check in
+	// isolation. validateBackupRouterDst (compiler_system.go, #4808/#2911)
+	// rejects a malformed next-hop, a malformed destination, and a
+	// next-hop/destination FAMILY MISMATCH at strict commit — and on the
+	// tolerant Store.Load / Store.SyncApply path downgrades each to a warning
+	// whose text ends "(ignored: backup-router default route not installed
+	// until corrected)". This renderer ignored nothing: it interpolated the
+	// value verbatim, so the promise in the log was false and the line it
+	// emitted failed the WHOLE managed-section reload. One vtysh add-batch
+	// exits non-zero on any CMD_WARNING_CONFIG_FAILED, so every other route on
+	// the box goes with it, and the operator's log actively points AWAY from
+	// the cause.
+	//
+	// All THREE of the validator's checks are mirrored, not the two an
+	// operand-shape reading suggests. A v4 next-hop with a v6 destination is
+	// individually well-formed on both operands and still renders
+	// `ipv6 route <v6dst> <v4nh>`, which frr-reload rejects — the #2891 case
+	// the family-selection comment below already describes.
+	//
+	// Skipping is the fail-closed answer, and it is what the validator already
+	// told the operator would happen. The alternative is losing the entire
+	// managed section, which takes the routes that ARE valid with it.
+	if !validFRRNextHopAddress(fc.BackupRouter) {
+		slog.Warn("frr: skipping backup-router default route: next-hop is not a "+
+			"renderable address; a malformed operand fails the entire managed-section "+
+			"reload (the commit-time gate warned this route would be ignored)",
+			"next_hop", fc.BackupRouter, "issue", "#8597")
+		return
+	}
+	if fc.BackupRouterDst != "" && !validFRRRoutePrefix(fc.BackupRouterDst) {
+		slog.Warn("frr: skipping backup-router default route: destination is not a "+
+			"renderable prefix",
+			"next_hop", fc.BackupRouter, "destination", fc.BackupRouterDst,
+			"issue", "#8597")
+		return
+	}
+	if fc.BackupRouterDst != "" &&
+		frrOperandIsV6(fc.BackupRouterDst) != frrOperandIsV6(fc.BackupRouter) {
+		slog.Warn("frr: skipping backup-router default route: destination family does "+
+			"not match next-hop family; FRR rejects a mismatched-family static route "+
+			"and fails the entire managed-section reload (#2891)",
+			"next_hop", fc.BackupRouter, "destination", fc.BackupRouterDst,
+			"issue", "#8597")
 		return
 	}
 	// Match the route prefix family to the next-hop (backup-router) family,

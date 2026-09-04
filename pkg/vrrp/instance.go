@@ -372,7 +372,7 @@ func (vi *vrrpInstance) key() string {
 // its stale value until an unrelated restart.
 func (vi *vrrpInstance) updateConfig(cfg Instance) {
 	vi.mu.Lock()
-	vi.cfg.Priority = cfg.Priority
+	vi.cfg.Priority = clampConfigPriority(cfg.Priority)
 	vi.cfg.Preempt = cfg.Preempt
 	vi.cfg.PreemptHoldTime = cfg.PreemptHoldTime
 	vi.cfg.AdvertiseInterval = cfg.AdvertiseInterval
@@ -764,4 +764,58 @@ func (vi *vrrpInstance) stop() {
 	// tenure, so a clean verdict is honest unless a removal is known to have
 	// failed and not been reconciled.
 	vi.notifyResigned(vi.staleVIPResignErr())
+}
+
+// clampConfigPriority bounds a CONFIGURED VRRP priority to the domain the wire
+// field can carry, before it is stored on the instance.
+//
+// Applied at the two CONFIG entry points — the manager's config->instance
+// install (manager.go) and updateConfig — and deliberately NOT inside
+// newInstance. newInstance is a plain constructor, also used to model states
+// the runtime reaches by MUTATION rather than from config: ResignRG sets
+// cfg.Priority to 0 under the instance lock, and 0 there is the correct
+// representation of a resigning master. Clamping in the constructor made that
+// state unconstructible and broke TestGetPriority_TrackMatrix's
+// priority-0-resign-passthrough case, which was right to fail.
+//
+// #8597 / gemini-review-048 finding 17. `instance_send.go` puts
+// `uint8(priority)` on the wire while the local state machine compares
+// `vi.cfg.Priority` as an int (instance_preempt.go reads it directly, three
+// sites). A configured 256 truncated to 0 — and 0 is not merely a low
+// priority, it is the RFC 5798 RESIGNATION beacon this package uses to hand
+// mastership over (manager.go ResignRG). The node would advertise "take over
+// now" forever while believing itself the most preferred candidate.
+//
+// #8321 recorded this finding's mechanism as real and its REACHABILITY as
+// unestablished: "I have not found such a path and I am not asserting there is
+// none." muse-004 K17 supplies it, and it is verified by execution rather than
+// argued — the `vrrp-group ... priority` leaf carries `ValidateInteger(1, 255)`,
+// which the tolerant Store.Load / Store.SyncApply ingress downgrades to a
+// warning per #1960, exactly as its chassis-cluster sibling does. Both
+// protocols reach a narrow wire field from a wide config int through the same
+// door.
+//
+// The two clamp targets are deliberately different values:
+//
+//   - Below range -> 1, never 0. Clamping to 0 would install the resignation
+//     sentinel from config, which is the bug rather than a bound.
+//   - Above range -> 254, never 255. 255 is the IP-ADDRESS-OWNER priority, and
+//     it carries semantics beyond "most preferred": preemptEnabled() treats an
+//     owner as always-preempting, and track.go exempts it from track-down
+//     demotion. Saturating to 255 would silently grant a config those
+//     properties. 254 is the highest value that means only "most preferred".
+//
+// An explicit 255 is passed through untouched: it is in range and it is how an
+// operator legitimately declares the address owner.
+func clampConfigPriority(p int) int {
+	if p == addressOwnerPriority {
+		return addressOwnerPriority
+	}
+	if p < 1 {
+		return 1
+	}
+	if p > 254 {
+		return 254
+	}
+	return p
 }
