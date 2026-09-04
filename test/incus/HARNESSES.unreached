@@ -54,6 +54,29 @@ test/incus/capture-cold-stall.sh             DIAGNOSTIC: #1782 one-shot evidence
 test/incus/step1-baseline-and-matrix.sh      DIAGNOSTIC: #816 evidence-collection orchestrator; writes into docs/pr/816-step1-rerun/evidence/.
 test/incus/step1-classify.sh                 DIAGNOSTIC: post-hoc classifier over a step1 evidence directory.
 test/incus/step2-sched-switch-capture.sh     DIAGNOSTIC: #821 sched_switch perf capture composed on step1-capture.sh.
+
+# ── DIAGNOSTIC — the #8341 / #8447 persistent-NAT bisect harnesses ──
+#
+# Six one-shot probes written to answer ONE question each during the bisect that
+# split #8447 out of #8341. Each mutates the shared loss cluster's NAT
+# configuration, drives traffic, reads a comparative pair of numbers and prints
+# which reading it supports; none asserts a re-runnable invariant, which is what
+# would make it a GATE. They are listed rather than given recipes because a
+# `make` target implies "run this to check the tree is healthy", and running one
+# of these repoints a live cluster's source-NAT rule at a test pool.
+#
+# #8447 has since been localised — a chassis cluster plus a source rule pointing
+# at a `persistent-nat` pool sets ForwardingSupported=false, which disarms
+# forwarding before the snapshot publish (the #1449 admission boundary). The
+# property that outlives the bisect is bound by Go cells in
+# pkg/dataplane/userspace/pnat_disarm_visibility_8447_test.go, which need no
+# cluster. These stay as the evidence trail.
+test/incus/pnat-catchall-outage-check-8341.sh  DIAGNOSTIC: #8341 severity triage — does retargeting the CATCH-ALL source-NAT rule to a pool break only the probe's flow or ALL transit? Three probes under one committed config; reports a comparison, asserts nothing.
+test/incus/pnat-mint-observability-8341.sh     DIAGNOSTIC: #8341 — is a pool-mode persistent-NAT binding never MINTED, or minted and RECLAIMED before the query lands? Distinguishes three states from timed observations.
+test/incus/pnat-counter-read-8447.sh           DIAGNOSTIC: #8447 — reads the persistent-NAT admission counter pair to separate "refused at admission" from "installed then reclaimed". Declares VOID when the counters are absent or the fixture is not what it claims.
+test/incus/pnat-rule-shape-8447.sh             DIAGNOSTIC: #8447 — controls for RULE SHAPE by running the same A/B behind a dedicated `from`-matched rule instead of the retargeted catch-all.
+test/incus/pnat-upstream-stage-8447.sh         DIAGNOSTIC: #8447 — diffs every counter the node publishes across both arms to localise which stage drops the flow. NOTE: it prints only NON-ZERO deltas and does not assert its metric snapshot is non-empty, so an empty scrape is indistinguishable from "every counter flat"; pnat-wedge-recovery-8447.sh is the run that carries the ABSENT sentinel.
+test/incus/pnat-wedge-recovery-8447.sh         DIAGNOSTIC: #8447 — is the stop a wedge or config-reversible, and does the apply say anything? Four phases with a time control (phase 2b) and a per-phase log census; `rx_now()` prints ABSENT rather than a number when the series is missing.
 scripts/userspace-ha-validation.sh           DIAGNOSTIC: long-form userspace HA validation walkthrough; superseded as a gate by the 8 Makefile HA smokes.
 scripts/userspace-ha-failover-validation.sh  DIAGNOSTIC: long-form failover validation walkthrough; superseded as a gate by `make test-failover`.
 scripts/userspace-native-gre-validation.sh   DIAGNOSTIC: native-GRE validation walkthrough.
