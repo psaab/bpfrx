@@ -4,7 +4,7 @@
 
 use super::super::helpers::{build_synced_session_entry, build_synced_session_key, SyncedKeyIntent};
 use crate::afxdp::SessionDomain;
-use crate::afxdp::SYNCED_IMPORT_REFUSED_PREFIX;
+use crate::afxdp::{SYNCED_DELETE_REFUSED_PREFIX, SYNCED_IMPORT_REFUSED_PREFIX};
 use crate::{ControlResponse, SessionSyncRequest};
 
 /// #7209: served from the SESSION-DOMAIN HANDLE, not from `&mut ServerState`.
@@ -154,15 +154,79 @@ pub(super) fn handle(
                 // flow session` / batch-revoke path) carries no ingress
                 // identity, so the key above resolved domain 0 and the exact
                 // delete cannot reach a session that lives in a routing
-                // instance. Retry once per configured domain so a clear the
-                // operator was told succeeded actually revoked the session.
-                // Empty — and therefore a no-op — in every deployment with no
-                // routing-instance interface membership.
+                // instance.
+                //
+                // #8636: RESOLVE the domain, or REFUSE. This used to delete the
+                // tuple in EVERY configured domain. Routing instances exist to
+                // carry OVERLAPPING address space, so two tenants holding the
+                // same 5-tuple is the normal case rather than a corner — and
+                // the retry then tore down the other tenant's live session. The
+                // rationale it was written under ("a refused delete LEAKS while
+                // an under-matching one removes nothing the 5-tuple did not
+                // already name") is true on the #7188 DISCRIMINATOR axis it was
+                // written for and does not carry to this one: deleting in every
+                // domain removes sessions the 5-tuple names in OTHER TENANTS,
+                // which is precisely removing something it did not name.
+                //
+                // So probe first and act on the count. Same loop, same slow
+                // path, same handful of domains — a lookup instead of a delete.
+                //
+                // WHY REFUSING IS NOW CHEAP, and it was not before today. The
+                // objection to failing closed is that a session survives a
+                // policy invalidation that should have killed it. #8356 changed
+                // that: zone policy is re-derived on the established-session hit
+                // path once per `config_generation`, a commit bumps the
+                // generation and invalidates the flow cache, so the next packet
+                // of a surviving session is judged and revoked if the live
+                // policy denies. And EVERY reason the Go side invalidates for is
+                // a zone-policy change (PolicyDeleted / PolicyModified /
+                // DefaultPolicyChanged), so the populations coincide exactly. A
+                // refused delete therefore leaks for ONE PACKET, not until idle
+                // timeout.
+                //
+                // The residual is where that re-derivation DECLINES — ICMP under
+                // a type-constrained permit (#8618), an unresolvable zone
+                // (`to_id == 0 || from_id == 0`), `NoLocalEntry` — INTERSECTED
+                // with "the tuple is ambiguous", since a unique tuple is deleted
+                // exactly as before. Every member of that intersection fails
+                // toward keeping a session too long rather than tearing down
+                // another tenant's, which is the direction that makes it
+                // acceptable rather than merely small.
                 if key.routing_domain == 0 {
+                    let mut matched: Vec<u32> = Vec::new();
                     for rd in view.routing_domains() {
                         let mut scoped = key.clone();
                         scoped.routing_domain = rd;
-                        domain.delete_synced_session(scoped);
+                        if domain.synced_session_contains(&scoped) {
+                            matched.push(rd);
+                        }
+                    }
+                    match matched.as_slice() {
+                        // No routing-instance copy. The exact delete above was
+                        // the whole job; empty in every deployment with no
+                        // routing-instance interface membership.
+                        [] => {}
+                        // Exactly one domain holds it, so the bare tuple names
+                        // it unambiguously. This is STRICTLY better than the
+                        // old fan-out: it deletes the same session and touches
+                        // no other domain.
+                        [rd] => {
+                            let mut scoped = key.clone();
+                            scoped.routing_domain = *rd;
+                            domain.delete_synced_session(scoped);
+                        }
+                        // Ambiguous: the tuple names a live session in more
+                        // than one tenant and nothing in this request says
+                        // which. Refuse rather than guess. Go tolerates a
+                        // per-key refusal without aborting the batch (#5881),
+                        // so the rest of a clear still proceeds.
+                        _ => {
+                            response.ok = false;
+                            response.error = format!(
+                                "{SYNCED_DELETE_REFUSED_PREFIX}ambiguous-routing-domain                                  (5-tuple matches {} routing instances)",
+                                matched.len()
+                            );
+                        }
                     }
                 }
             }

@@ -82,6 +82,15 @@ pub enum SyncedImportOutcome {
 /// refusal as a transport failure.
 pub const SYNCED_IMPORT_REFUSED_PREFIX: &str = "synced-import-refused:";
 
+/// #8636: the refusal prefix for a DELETE the helper cannot disambiguate.
+///
+/// Deliberately distinct from `SYNCED_IMPORT_REFUSED_PREFIX`. An import refusal
+/// means "this node declined to take a session"; a delete refusal means "this
+/// node kept one it was asked to remove". They need different operator
+/// responses and different alert thresholds, and folding them onto one token
+/// would make a cross-tenant guard firing look like an import problem.
+pub const SYNCED_DELETE_REFUSED_PREFIX: &str = "synced-delete-refused:";
+
 impl SyncedImportOutcome {
     /// The stable reason token, or `None` when the import applied.
     pub fn refusal_reason(self) -> Option<&'static str> {
@@ -648,6 +657,24 @@ impl crate::afxdp::ha::SessionDomain {
             }
         }
         SyncedImportOutcome::Applied
+    }
+
+    /// #8636: does the shared synced map hold an entry under EXACTLY this key?
+    ///
+    /// The ambiguity probe for the domain-scoped delete. It exists because a
+    /// delete built from a bare 5-tuple resolves routing domain 0 ("the sender
+    /// did not state one"), and the handler must then decide between the
+    /// domains that could hold it. Counting matches is what lets it refuse an
+    /// ambiguous delete instead of deleting in every domain and tearing down
+    /// another tenant's live session.
+    ///
+    /// Reads through `lock_shared_recover` for the same reason
+    /// `delete_synced_session_gen` does (#5154): with `.lock().ok()` a poisoned
+    /// mutex reads as None, and an ambiguity check that silently answers "no
+    /// matches" would resolve to "delete nothing" — quiet, and indistinguishable
+    /// from a clean miss.
+    pub fn synced_session_contains(&self, key: &SessionKey) -> bool {
+        lock_shared_recover(&self.sessions.synced).contains_key(key)
     }
 
     pub fn delete_synced_session(&self, key: SessionKey) {
