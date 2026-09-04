@@ -418,6 +418,7 @@ type xpfCollector struct {
 	workerThreadCPUSecsLast60s               *prometheus.Desc
 	workerThreadCPUWindowSecs                *prometheus.Desc
 	workerWorkLoops                          *prometheus.Desc
+	workerSessionVolumeHighWater             *prometheus.Desc
 	workerIdleLoops                          *prometheus.Desc
 	workerCoSQueueLeaseAcquireV8Calls        *prometheus.Desc
 	workerCoSQueueLeaseAcquireV8GrantedBytes *prometheus.Desc

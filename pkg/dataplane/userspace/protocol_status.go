@@ -701,6 +701,20 @@ type WorkerRuntimeStatus struct {
 	ThreadCPUNS uint64 `json:"thread_cpu_ns,omitempty"`
 	WorkLoops   uint64 `json:"work_loops,omitempty"`
 	IdleLoops   uint64 `json:"idle_loops,omitempty"`
+	// SessionVolumeHighWater (#7919) is the monotonic high-water of per-session
+	// volume (fwd+rev packets) this worker has seen in ITS OWN session table on
+	// the conntrack-mirror refresh walk.
+	//
+	// A POINTER on purpose. Every worker holds a copy of every session, but only
+	// the worker whose packets land accounts for one, so "which workers' tables
+	// ever hold volume" is the axis that separates accounting from mirroring.
+	// An OLD helper omits the key entirely, and an absent answer must read as
+	// UNKNOWN rather than as a measured zero — a missing answer decoded as 0
+	// would manufacture exactly the evidence this field exists to gather. nil
+	// means "this helper does not report it"; a non-nil 0 cannot occur, because
+	// the helper skips the key while the value is 0 (both cases mean "no
+	// positive evidence of volume", and neither is a measurement).
+	SessionVolumeHighWater *uint64 `json:"session_volume_high_water,omitempty"`
 	// #1240: cumulative v8 per-worker queue-lease acquire calls and
 	// granted bytes. Scrape with rate() and compare against per-worker
 	// TX throughput to diagnose token-acquisition imbalance.

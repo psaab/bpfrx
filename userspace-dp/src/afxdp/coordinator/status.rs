@@ -1163,6 +1163,7 @@ impl super::Coordinator {
                     idle_block_ns: s.idle_block_ns,
                     thread_cpu_ns: s.thread_cpu_ns,
                     work_loops: s.work_loops,
+                    session_volume_high_water: s.session_volume_high_water,
                     idle_loops: s.idle_loops,
                     cos_queue_lease_acquire_v8_calls: s.cos_queue_lease_acquire_v8_calls,
                     cos_queue_lease_acquire_v8_granted_bytes: s

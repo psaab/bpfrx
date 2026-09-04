@@ -35,6 +35,28 @@ pub struct WorkerRuntimeStatus {
     pub thread_cpu_ns: u64,
     #[serde(rename = "work_loops", default)]
     pub work_loops: u64,
+    /// #7919: monotonic high-water of per-session volume
+    /// (`fwd_packets + rev_packets`) seen in THIS worker's session table on the
+    /// conntrack-mirror refresh walk.
+    ///
+    /// ADDED, never a redefinition: in a rolling HA upgrade the two nodes run
+    /// different binaries on one wire, so the new concept takes a new key. An
+    /// OLD helper simply omits it, and the Go decoder models that as ABSENT
+    /// (`*uint64` nil) rather than 0 — "this helper cannot answer" and "this
+    /// worker has never held a session with traffic" are different facts, and
+    /// conflating them would manufacture exactly the evidence this field exists
+    /// to gather.
+    ///
+    /// `skip_serializing_if` keeps it off the wire while it is 0, so a helper
+    /// that has genuinely observed nothing is indistinguishable from an old
+    /// one — deliberate: both mean "no positive evidence of volume here", and
+    /// neither may be read as a measured zero.
+    #[serde(
+        rename = "session_volume_high_water",
+        default,
+        skip_serializing_if = "is_zero_u64"
+    )]
+    pub session_volume_high_water: u64,
     #[serde(rename = "idle_loops", default)]
     pub idle_loops: u64,
     /// #1240: cumulative v8 per-worker queue-lease acquire calls
@@ -1367,3 +1389,10 @@ pub(crate) struct SessionDeltaInfo {
     pub tunnel_discriminator: u64,
 }
 
+
+/// #7919: `skip_serializing_if` predicate — keeps a never-observed
+/// high-water off the wire rather than emitting a 0 a reader could mistake for
+/// a measurement.
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}

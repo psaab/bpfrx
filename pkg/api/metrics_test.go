@@ -330,6 +330,7 @@ func newCollectorWithWorkerDescsOnly() *xpfCollector {
 		workerThreadCPUWindowSecs:                mk("xpf_userspace_worker_thread_cpu_window_seconds"),
 		workerWorkLoops:                          mk("xpf_userspace_worker_work_loops_total"),
 		workerIdleLoops:                          mk("xpf_userspace_worker_idle_loops_total"),
+		workerSessionVolumeHighWater:             mk("xpf_userspace_worker_session_volume_high_water"),
 		workerCoSQueueLeaseAcquireV8Calls:        mk("xpf_userspace_worker_cos_queue_lease_acquire_v8_calls_total"),
 		workerCoSQueueLeaseAcquireV8GrantedBytes: mk("xpf_userspace_worker_cos_queue_lease_acquire_v8_granted_bytes_total"),
 		// #1782 Step-1 cold-start CoS instruments.
@@ -412,6 +413,7 @@ func collectFromEmitWorkerRuntime(
 		c.workerThreadCPUWindowSecs:                {},
 		c.workerWorkLoops:                          {},
 		c.workerIdleLoops:                          {},
+		c.workerSessionVolumeHighWater:             {},
 		c.workerCoSQueueLeaseAcquireV8Calls:        {},
 		c.workerCoSQueueLeaseAcquireV8GrantedBytes: {},
 		// #1782 Step-1 cold-start CoS instruments.
