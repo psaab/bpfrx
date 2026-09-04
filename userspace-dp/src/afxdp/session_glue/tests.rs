@@ -265,6 +265,7 @@ fn purge_sessions_for_input_dscp_filter_revalidation_removes_family() {
             &shared_forward_wire_sessions,
             &shared_owner_rg_indexes,
             &peer_worker_commands,
+            crate::afxdp::empty_worker_commands_by_id(),
             &forwarding,
             true,
             false,
@@ -5744,6 +5745,7 @@ fn flush_session_deltas_without_binding_reaches_global_consumers() {
         &shared_owner_rg_indexes,
         &recent_session_deltas,
         &peer_worker_commands,
+        crate::afxdp::empty_worker_commands_by_id(),
         &None,
         &forwarding,
         &mut worker_lossless_wedged,
@@ -5888,6 +5890,7 @@ fn flush_session_deltas_rt_flow_app_id_uses_post_nat_dst_port() {
             &shared_owner_rg_indexes,
             &recent_session_deltas,
             &peer_worker_commands,
+            crate::afxdp::empty_worker_commands_by_id(),
             &Some(handle),
             &forwarding,
             &mut worker_lossless_wedged,
@@ -6022,6 +6025,7 @@ fn flush_session_deltas_session_close_reresolves_policy_id_after_reorder() {
         &shared_owner_rg_indexes,
         &recent_session_deltas,
         &peer_worker_commands,
+        crate::afxdp::empty_worker_commands_by_id(),
         &Some(handle),
         &forwarding,
         &mut worker_lossless_wedged,
@@ -6114,6 +6118,7 @@ fn flush_session_deltas_event_stream_drop_latches_out_of_sync() {
         &shared_owner_rg_indexes,
         &recent_session_deltas,
         &peer_worker_commands,
+        crate::afxdp::empty_worker_commands_by_id(),
         &event_stream,
         &forwarding,
         &mut worker_lossless_wedged,
@@ -6225,6 +6230,7 @@ fn flush_session_deltas_full_queue_send_is_bounded_and_latches_out_of_sync() {
         &shared_owner_rg_indexes,
         &recent_session_deltas,
         &peer_worker_commands,
+        crate::afxdp::empty_worker_commands_by_id(),
         &event_stream,
         &forwarding,
         &mut worker_lossless_wedged,
@@ -6352,6 +6358,7 @@ fn resync_export_aggregate_lossless_wait_is_bounded_below_heartbeat() {
             &shared_owner_rg_indexes,
             &recent_session_deltas,
             &peer_worker_commands,
+            crate::afxdp::empty_worker_commands_by_id(),
             &event_stream,
             &forwarding,
             &mut worker_lossless_wedged,
@@ -6472,6 +6479,7 @@ fn close_delta_deletes_dnat_table_entry_for_snat_flow() {
             &shared_owner_rg_indexes,
             &recent_session_deltas,
             &peer_worker_commands,
+            crate::afxdp::empty_worker_commands_by_id(),
             &None,
             &forwarding,
             &mut worker_lossless_wedged,
@@ -6790,6 +6798,7 @@ fn delete_terminal_filtered_session_releases_companion_and_allocator_5622() {
             &shared_forward_wire_sessions,
             &shared_owner_rg_indexes,
             &peer_worker_commands,
+            crate::afxdp::empty_worker_commands_by_id(),
             &forwarding,
             &hit_key,
             hit_decision,
@@ -8440,5 +8449,265 @@ fn a_control_segment_becomes_a_resolvable_association_7699() {
         Some(handle),
         "and the reverse direction must resolve to the SAME handle — that is \
          what makes the reverse companion match and the reply find its session"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #8114 item 4 — a `DeleteSynced` a full sibling queue REFUSES.
+// ---------------------------------------------------------------------------
+
+fn drop8114_key() -> SessionKey {
+    SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: 6,
+        src_ip: "10.0.0.5".parse().unwrap(),
+        dst_ip: "198.51.100.9".parse().unwrap(),
+        src_port: 4000,
+        dst_port: 80,
+        discriminator: Default::default(),
+        routing_domain: 0,
+    }
+}
+
+fn drop8114_filler_key(i: usize) -> SessionKey {
+    let mut key = drop8114_key();
+    key.src_port = 30000 + (i as u16 % 20000);
+    key.dst_port = 81;
+    key
+}
+
+/// A forwarding state whose single source-NAT rule owns a ONE-PORT pool, so
+/// "the port is occupied" is a yes/no an assertion can read directly.
+fn drop8114_forwarding() -> ForwardingState {
+    let mut forwarding = ForwardingState::default();
+    forwarding.source_nat_rules = crate::nat::parse_source_nat_rules(&[
+        crate::SourceNATRuleSnapshot {
+            name: "snat".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            pool_name: "p".to_string(),
+            pool_addresses: vec!["203.0.113.1/32".to_string()],
+            port_low: 20000,
+            port_high: 20000,
+            ..crate::SourceNATRuleSnapshot::default()
+        },
+    ]);
+    forwarding
+}
+
+/// Take the pool reservation for `drop8114_key()` with `worker_id` as the
+/// holder — exactly what that worker's own `UpsertSynced` would have left.
+fn drop8114_reserve(forwarding: &ForwardingState, worker_id: u32) -> crate::nat::NatDecision {
+    use crate::nat::NatHolder;
+    let key = drop8114_key();
+    let translated = crate::nat::TranslatedTuple {
+        ip: "203.0.113.1".parse().unwrap(),
+        port: 20000,
+    };
+    let flow = crate::nat::SourceNatFlowKey {
+        protocol: key.protocol,
+        src_ip: key.src_ip,
+        dst_ip: key.dst_ip,
+        src_port: key.src_port,
+        dst_port: key.dst_port,
+    };
+    let alloc = &forwarding.source_nat_rules[0].pool_allocator;
+    assert!(
+        alloc.reserve_flow(flow, translated, 0, false, 1_000, NatHolder::Worker(worker_id)),
+        "fixture must take the reservation, or every assertion below is vacuous"
+    );
+    assert!(
+        alloc.debug_is_port_occupied(0, 20000),
+        "fixture precondition: the port is occupied before the delete"
+    );
+    let mut nat = crate::nat::NatDecision::default();
+    nat.rewrite_src = Some(translated.ip);
+    nat.rewrite_src_port = Some(translated.port);
+    nat
+}
+
+/// A peer queue plus the id-keyed map that names it — the SAME `Arc`, because
+/// the repair resolves the id by pointer identity.
+fn drop8114_queues(
+    worker_id: u32,
+    fill: bool,
+) -> (
+    Vec<Arc<Mutex<VecDeque<WorkerCommand>>>>,
+    BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
+) {
+    let queue: Arc<Mutex<VecDeque<WorkerCommand>>> = Arc::new(Mutex::new(VecDeque::new()));
+    if fill {
+        let mut pending = queue.lock().expect("fresh mutex");
+        for i in 0..crate::afxdp::worker_queue::MAX_PENDING_WORKER_COMMANDS {
+            pending.push_back(WorkerCommand::DeleteSynced(drop8114_filler_key(i)));
+        }
+        assert_eq!(
+            pending.len(),
+            crate::afxdp::worker_queue::MAX_PENDING_WORKER_COMMANDS,
+            "fixture: the queue must be EXACTLY at capacity so the next push is refused"
+        );
+    }
+    let peers = vec![queue.clone()];
+    let mut by_id = BTreeMap::new();
+    by_id.insert(worker_id, queue);
+    (peers, by_id)
+}
+
+/// THE BINDING (#8114 item 4). A `DeleteSynced` a full sibling queue refuses
+/// must not strand that sibling's NAT reservation: nothing else ever frees it.
+///
+/// `handle_delete_synced` is what a worker DOES with the command, and it drops
+/// that worker's source-NAT and NAT64 holder bits; the port is freed by
+/// whichever worker drops the LAST bit. A worker that never receives the command
+/// never drops its bit — and it is ALIVE, so neither the dead-worker sweep
+/// (#8069) nor the generation-teardown sweep (#7092) can see it. The port is
+/// held for the life of the allocator.
+///
+/// The fixture asserts the DROP ACTUALLY HAPPENED before asserting the repair.
+/// Without that precondition a queue that quietly accepted the push would make
+/// this cell test the ordinary path and prove nothing.
+///
+/// Fail-on-revert: restore `replicate_session_delete`'s discarded
+/// `push_bounded` return (or route this call site back to it) and the port stays
+/// occupied.
+#[test]
+fn a_refused_deletesynced_releases_the_siblings_reservation_8114() {
+    use std::sync::atomic::Ordering;
+
+    let forwarding = drop8114_forwarding();
+    let nat = drop8114_reserve(&forwarding, 3);
+    let (peers, by_id) = drop8114_queues(3, true);
+
+    let global_dropped_before = SESSION_DELETE_REPLICA_DROPPED.load(Ordering::Relaxed);
+
+    let outcome = replicate_session_delete_repairing(
+        &peers,
+        &by_id,
+        &forwarding,
+        &drop8114_key(),
+        nat,
+        false,
+        2_000,
+    );
+
+    assert_eq!(
+        outcome.dropped, 1,
+        "fixture: the DeleteSynced must actually have been REFUSED — if the queue \
+         accepted it, this cell is testing the ordinary path"
+    );
+    assert_eq!(
+        outcome.repaired, 1,
+        "the refused delete must be ATTRIBUTED to worker 3 and repaired; an \
+         unattributed drop is counted but not repaired, and the two must not be \
+         confusable"
+    );
+    // The process-wide counter is the operator signal; asserted only as
+    // monotone, because it is shared with every other test thread in this
+    // binary and an equality on it is a flake on a busy run.
+    assert!(
+        SESSION_DELETE_REPLICA_DROPPED.load(Ordering::Relaxed) > global_dropped_before,
+        "the drop must also reach the process-wide counter"
+    );
+    assert!(
+        !forwarding.source_nat_rules[0]
+            .pool_allocator
+            .debug_is_port_occupied(0, 20000),
+        "the refused DeleteSynced stranded 203.0.113.1:20000 on worker 3. The \
+         worker is ALIVE, so no sweep can see its holder bit, and no replay \
+         re-delivers the command"
+    );
+}
+
+/// THE OVER-RELEASE CONTROL, and the direction of error that matters. When the
+/// push SUCCEEDS the repair must NOT run: that worker will process the command
+/// and drop its own bit, and freeing the port here would hand it to a new flow
+/// while the old one is still being torn down — the rule
+/// `PortAllocator::drop_holder_locked` states.
+///
+/// Fires on: releasing unconditionally instead of only on a refused push. That
+/// is the cheap-looking version of this fix and it is worse than the bug.
+#[test]
+fn a_queued_deletesynced_leaves_the_release_to_its_worker_8114() {
+    use std::sync::atomic::Ordering;
+
+    let forwarding = drop8114_forwarding();
+    let nat = drop8114_reserve(&forwarding, 3);
+    // Queue NOT filled: the push succeeds.
+    let (peers, by_id) = drop8114_queues(3, false);
+
+    let outcome = replicate_session_delete_repairing(
+        &peers,
+        &by_id,
+        &forwarding,
+        &drop8114_key(),
+        nat,
+        false,
+        2_000,
+    );
+
+    assert_eq!(
+        outcome,
+        DeleteReplicationOutcome::default(),
+        "nothing was refused, so neither counter may move"
+    );
+    assert!(
+        forwarding.source_nat_rules[0]
+            .pool_allocator
+            .debug_is_port_occupied(0, 20000),
+        "the port was freed for a worker that is going to free it itself; the \
+         command was QUEUED, so that worker WILL run the teardown"
+    );
+    let pending = peers[0].lock().expect("fresh mutex");
+    assert!(
+        pending
+            .iter()
+            .any(|cmd| matches!(cmd, WorkerCommand::DeleteSynced(k) if *k == drop8114_key())),
+        "and the delete must actually be on the queue"
+    );
+}
+
+/// THE ATTRIBUTION CONTROL. A refused delete whose queue is NOT in the id-keyed
+/// map is counted as a drop and NOT repaired — the id could not be resolved, and
+/// releasing a reservation for an unknown worker is exactly the over-release the
+/// cell above forbids.
+///
+/// This is also what keeps every pre-#8114 fixture honest: they pass an empty
+/// map, so they take this path and behave exactly as they did before.
+///
+/// Fires on: falling back to "release for some worker" when the lookup misses.
+#[test]
+fn an_unattributable_refused_delete_is_counted_but_not_repaired_8114() {
+    use std::sync::atomic::Ordering;
+
+    let forwarding = drop8114_forwarding();
+    let nat = drop8114_reserve(&forwarding, 3);
+    let (peers, _by_id) = drop8114_queues(3, true);
+    let empty: BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>> = BTreeMap::new();
+
+    let outcome = replicate_session_delete_repairing(
+        &peers,
+        &empty,
+        &forwarding,
+        &drop8114_key(),
+        nat,
+        false,
+        2_000,
+    );
+
+    assert_eq!(
+        outcome.dropped, 1,
+        "the drop is real and must be counted even when it cannot be repaired"
+    );
+    assert_eq!(
+        outcome.repaired, 0,
+        "an unresolvable worker id must NOT be repaired — that would clear the \
+         bit of a worker that may still be forwarding the flow"
+    );
+    assert!(
+        forwarding.source_nat_rules[0]
+            .pool_allocator
+            .debug_is_port_occupied(0, 20000),
+        "and the reservation stays exactly where it was"
     );
 }

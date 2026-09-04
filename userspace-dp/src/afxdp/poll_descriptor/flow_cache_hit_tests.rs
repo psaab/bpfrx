@@ -831,6 +831,7 @@ impl LiveCallSiteFixture {
             recent_exceptions: &self.recent_exceptions,
             last_resolution: &self.last_resolution,
             peer_worker_commands: &self.peer_worker_commands,
+            worker_commands_by_id: crate::afxdp::empty_worker_commands_by_id(),
             dnat_fds: &self.dnat_fds,
             rg_epochs: &self.rg_epochs,
             cold_path_sample_mask: 0xff,
