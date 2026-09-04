@@ -149,9 +149,18 @@ func reconcileIPVLANAddrs(link netlink.Link, name string, desired []string) {
 	}
 }
 
+// fabricOverlayNames are every fabric IPVLAN this daemon can create.
+//
+// #8372: single-sourced because two callers now enumerate them —
+// CleanupFabricIPVLANs (the `xpfd cleanup` subcommand) and the reassert loop's
+// reaper. Two hardcoded copies of "which devices are ours" is a rule that
+// silently stops covering a third device, and the reaper's failure mode there
+// is the quiet one: it would simply never notice the new device had gone stale.
+func fabricOverlayNames() []string { return []string{"fab0", "fab1"} }
+
 // CleanupFabricIPVLANs removes all fabric IPVLAN interfaces (fab0, fab1).
 func CleanupFabricIPVLANs() {
-	for _, name := range []string{"fab0", "fab1"} {
+	for _, name := range fabricOverlayNames() {
 		if link, err := netlink.LinkByName(name); err == nil {
 			if _, ok := link.(*netlink.IPVlan); ok {
 				netlink.LinkDel(link)
@@ -402,6 +411,15 @@ func (d *Daemon) fabricLinkByName(name string) (netlink.Link, error) {
 		return d.linkByNameFn(name)
 	}
 	return netlink.LinkByName(name)
+}
+
+// fabricLinkDel removes a link, through a seam so the #8372 reaper is testable
+// without netlink.
+func (d *Daemon) fabricLinkDel(link netlink.Link) error {
+	if d.linkDelFn != nil {
+		return d.linkDelFn(link)
+	}
+	return netlink.LinkDel(link)
 }
 
 func (d *Daemon) fabricNeighList(ifindex, family int) ([]netlink.Neigh, error) {
