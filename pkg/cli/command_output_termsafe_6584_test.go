@@ -306,7 +306,12 @@ func TestMultiLineCommandOutputUsesTheBlockVariant6584(t *testing.T) {
 	for _, tc := range []struct{ file, fn string }{
 		{"../cli/cli_show_system.go", "showDaemonLog"},
 		{"../cli/cli_show_system.go", "showSystemBootMessages"},
-		{"../grpcapi/server_show.go", "ShowText"},
+		// #8629 renamed the body: `ShowText` is now a two-line boundary that
+		// converts bare errors to gRPC status codes and delegates to `showText`,
+		// which is where the forks live. The exported wrapper forks nothing, so
+		// pointing at it made this guard report itself VACUOUS — correctly, and
+		// that self-report is why the rename could not silently disarm it.
+		{"../grpcapi/server_show.go", "showText"},
 		{"../grpcapi/server_show_status.go", "GetSystemInfo"},
 	} {
 		src, err := os.ReadFile(tc.file)
