@@ -271,8 +271,6 @@ schedulers scheduler xpfarg tuesday stop-time	empty
 schedulers scheduler xpfarg wednesday start-time	empty
 schedulers scheduler xpfarg wednesday stop-time	empty
 security address-book global address-set	empty
-security address-book global address-set xpfarg address	empty
-security address-book global address-set xpfarg address-set	empty
 security dynamic-address address-name	empty
 security dynamic-address address-name xpfarg profile feed-name	empty
 security dynamic-address feed-server	empty
@@ -367,28 +365,10 @@ security nat source rule-set	empty
 security nat source rule-set xpfarg rule	empty
 security nat static rule-set	empty
 security nat static rule-set xpfarg rule	empty
-security policies default-policy-log	empty
 security policies from-zone xpfarg xpfarg xpfarg policy	empty
-security policies from-zone xpfarg xpfarg xpfarg policy xpfarg description	empty
-security policies from-zone xpfarg xpfarg xpfarg policy xpfarg then log	empty
-security policies global policy	empty
-security policies global policy xpfarg description	empty
-security policies global policy xpfarg then log	empty
-security pre-id-default-policy then log	empty
 security screen ids-option	empty
 security screen ids-option xpfarg limit-session destination-ip-based	empty
 security screen ids-option xpfarg limit-session source-ip-based	empty
-security zones security-zone	empty
-security zones security-zone xpfarg address-book address-set	empty
-security zones security-zone xpfarg address-book address-set xpfarg address	empty
-security zones security-zone xpfarg address-book address-set xpfarg address-set	empty
-security zones security-zone xpfarg description	empty
-security zones security-zone xpfarg host-inbound-traffic protocols	empty
-security zones security-zone xpfarg host-inbound-traffic system-services	empty
-security zones security-zone xpfarg interfaces	empty
-security zones security-zone xpfarg interfaces xpfname host-inbound-traffic protocols	empty
-security zones security-zone xpfarg interfaces xpfname host-inbound-traffic system-services	empty
-security zones security-zone xpfarg screen	empty
 services flow-monitoring version-ipfix template	empty
 services flow-monitoring version-ipfix template xpfarg flow-active-timeout	empty
 services flow-monitoring version-ipfix template xpfarg flow-inactive-timeout	empty
