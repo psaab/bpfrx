@@ -2,6 +2,7 @@ package userspace
 
 import (
 	"context"
+	"net"
 	"os/exec"
 	"slices"
 	"sync"
@@ -87,7 +88,26 @@ type Manager struct {
 
 	mu        sync.Mutex
 	sessionMu sync.Mutex // separate lock for session sync requests (Phase 3)
-	proc      *exec.Cmd
+	// ctrlIOMu guards ctrlIOConns and ctrlShutdown, the #8526 stop bound on
+	// control-socket round trips. It is a LEAF: nothing holding it acquires
+	// m.mu, and the only legal order is m.mu -> ctrlIOMu. That is what lets
+	// BeginControlShutdown run — and cut an in-flight round trip short —
+	// while another goroutine holds m.mu across that very round trip. See
+	// control_shutdown_8526.go for the hazard and the ordering rule.
+	ctrlIOMu sync.Mutex
+	// ctrlIOConns is the set of control-socket connections whose round trip
+	// is in flight right now. requestDetailedLocked serializes on m.mu, so in
+	// production this holds at most one entry; it is a set rather than a
+	// single field so the bound does not depend on that staying true.
+	ctrlIOConns map[net.Conn]struct{}
+	// ctrlShutdown latches once the PROCESS is stopping, and never clears.
+	// Only BeginControlShutdown sets it, and its only caller is the daemon's
+	// runShutdownSequence, which the process does not return from. Close and
+	// Teardown deliberately do NOT set it: the bootstrap rollback tears the
+	// dataplane down and reuses this object, and a latch there would cap every
+	// later apply at controlShutdownCeiling for the life of the daemon.
+	ctrlShutdown bool
+	proc         *exec.Cmd
 	// procSup is the supervisor record for the CURRENTLY spawned helper
 	// generation: the single goroutine that owns cmd.Wait() for it, plus the
 	// channel that goroutine closes when the child is reaped (#5838).
@@ -670,6 +690,19 @@ func (m *Manager) Load() error {
 }
 
 func (m *Manager) Close() error {
+	// #8526: cut any in-flight control round trip BEFORE taking m.mu. Both
+	// stop paths below block on a mutex that another goroutine may be holding
+	// across a control round trip whose reachable deadline is 67s — 3.35x the
+	// unit's TimeoutStopSec. Cutting first lets this acquisition complete
+	// inside the stop budget instead of being resolved by systemd's SIGKILL.
+	// Ordering is the whole mechanism: moving either call below the Lock makes
+	// it unreachable exactly when it is needed.
+	//
+	// cutInFlightControlIO, not BeginControlShutdown: neither of these methods
+	// is reliably terminal for the Manager (the bootstrap rollback tears down
+	// and reuses the object), so they must not latch the shutdown ceiling. See
+	// control_shutdown_8526.go.
+	m.cutInFlightControlIO()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.stopLocked()
@@ -677,6 +710,7 @@ func (m *Manager) Close() error {
 }
 
 func (m *Manager) Teardown() error {
+	m.cutInFlightControlIO()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.stopLocked()
