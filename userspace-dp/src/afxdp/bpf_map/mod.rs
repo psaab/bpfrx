@@ -627,11 +627,28 @@ pub(super) fn delete_bpf_conntrack_entry(
 ///
 /// Every worker then refreshes its OWN table into the SAME row — the walk
 /// applies no origin filter, the refresh skips only `is_reverse`, and publish
-/// and refresh build the key with the same `bpf_session_key_v4`. With six
-/// combined RX queues on the reference cluster, five writers out of six
-/// published zero over the owner's live volume, which is why
-/// `show security flow session` reported `Pkts: 0, Bytes: 0` for a flow moving
-/// 90 Mbit/s.
+/// and refresh build the key with the same `bpf_session_key_v4`. So a
+/// non-owning worker's lookup hits the owner's row and its `BPF_EXIST` update
+/// succeeds, writing zeros over live volume.
+///
+/// WHAT THIS IS NOT, stated first because the issue number invites the wrong
+/// reading. This is NOT the cause of #7919's reported symptom, and it must not
+/// be cited as one. Measured on the reference cluster, same box, same workload,
+/// deployed sha verified at deploy and re-checked at end of cell: a build WITH
+/// this gate and a build with it reverted produce the IDENTICAL pattern — one
+/// data flow mirroring live counters and advancing, another reading zero on
+/// both. The gate changes nothing observable there, which also means the
+/// fan-out replicas are not reaching this row in production the way the
+/// hermetic path shows they can. #7919's real cause is still open; the current
+/// evidence is two rows rendering one 5-tuple, one live and one zero.
+///
+/// So this is a HARDENING for a hazard that is demonstrable in-process and not
+/// currently observed in production, not a fix for the reported defect. It is
+/// kept because the write it prevents is never desirable — a zero-counter entry
+/// has nothing to contribute to a row that has volume — and because the
+/// replication types make the hazard structural rather than incidental: it
+/// cannot be argued away by a change to timing or ordering, only by a change to
+/// which workers hold the entry.
 ///
 /// WHY THE RULE IS "HAS NOTHING TO CONTRIBUTE" RATHER THAN AN ORIGIN TEST.
 /// Every predicate over `SessionOrigin` gets this wrong somewhere:
