@@ -107,14 +107,38 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 			// have to be recognised by name or `prefer` would be compiled as a
 			// second NTP server and rendered verbatim into a chrony directive
 			// (#4902 types the value for exactly that reason).
+			// #8436: a server named by TWO `server` statements is ONE server.
+			// Before this the address was appended again — rendering a
+			// duplicate chrony `server` directive — and its option entry was
+			// REPLACED, so `server 1.1.1.1 { key 5; }` followed by
+			// `server 1.1.1.1 { version 4; }` compiled to key 0. The flat-set
+			// spelling merges, which is the conservation property #8436 is
+			// about.
+			//
+			// THE DIFFERENT-ADDRESS CASE IS UNTOUCHED: both the dedupe and the
+			// option merge are keyed on the ADDRESS, so two statements naming
+			// different servers still produce two entries with their own
+			// options. That is the only shape this could get wrong, and it has
+			// its own control cell.
+			//
+			// It also has to survive the bracketed spelling. `server [ a b ]`
+			// collapses onto one node's Keys (#2419) and ntpServerValues
+			// returns BOTH addresses from that single node, so the dedupe runs
+			// per address rather than per node — a node-level check would
+			// have discarded the second address of a bracket list.
 			for _, ntpChild := range child.FindChildren("server") {
 				ntpServers, ntpOpts := ntpServerValues(ntpChild)
-				sys.NTPServers = append(sys.NTPServers, ntpServers...)
+				for _, addr := range ntpServers {
+					if !ntpServerListed(sys.NTPServers, addr) {
+						sys.NTPServers = append(sys.NTPServers, addr)
+					}
+				}
 				for addr, opt := range ntpOpts {
 					if sys.NTPServerOptions == nil {
 						sys.NTPServerOptions = map[string]NTPServerOption{}
 					}
-					sys.NTPServerOptions[addr] = opt
+					sys.NTPServerOptions[addr] = mergeNTPServerOption(
+						sys.NTPServerOptions[addr], opt)
 				}
 			}
 			if thNode := child.FindChild("threshold"); thNode != nil {
@@ -788,8 +812,31 @@ var ddnsProviderStringProps = map[string]bool{
 func compileDDNSServices(node *Node, lenient bool) (*DDNSServicesConfig, []string, error) {
 	cat := &DDNSServicesConfig{Providers: map[string]*DDNSProvider{}}
 	var warnings []string
+	// #8436: two `provider P { ... }` blocks are ONE provider. Before this each
+	// block compiled to a fresh object stored under one key, so the second
+	// discarded the first's backend, credentials and endpoint silently — while
+	// the flat-set spelling merged.
+	//
+	// The merge is done by walking BOTH blocks' nodes into one property map and
+	// materialising once, rather than by folding two finished structs
+	// field-by-field. That matters for a struct this wide: a field-wise merge
+	// is a second enumeration of ~21 leaves that a later field would have to be
+	// added to, and forgetting one is a silent loss of exactly the kind this
+	// census exists to find. Walking the nodes has no such list.
+	//
+	// THE DIFFERENT-NAMES CASE IS PRESERVED BY CONSTRUCTION: the grouping is
+	// keyed on the authored provider NAME, so two blocks naming different
+	// providers stay two entries with their own settings.
+	byName := map[string][]*Node{}
+	var order []string
 	for _, inst := range namedInstances(node.FindChildren("provider")) {
-		p := compileDDNSProvider(inst.name, inst.node)
+		if _, seen := byName[inst.name]; !seen {
+			order = append(order, inst.name)
+		}
+		byName[inst.name] = append(byName[inst.name], inst.node)
+	}
+	for _, name := range order {
+		p := compileDDNSProvider(name, byName[name]...)
 		if p == nil {
 			continue
 		}
@@ -883,8 +930,33 @@ func parseDurationSeconds(v string) int {
 // compileDDNSProvider compiles one `provider <name> { ... }` entry. It walks
 // the provider subtree (both AST shapes) for its string leaves. Returns nil for
 // an empty provider block (just a name with no settings).
-func compileDDNSProvider(name string, node *Node) *DDNSProvider {
+// compileDDNSProvider materialises one provider from EVERY block that names it.
+//
+// Variadic since #8436: a duplicate `provider P` block used to overwrite the
+// first, so the walk now accumulates across all of them and the struct is
+// built once at the end. A leaf no block mentions stays absent — the same "a
+// block that never mentions a leaf cannot reset it" property the other #8436
+// sites rely on, here obtained from the accumulated map rather than from switch
+// arms. The two orderings involved are explained at `cur` below; the short form
+// is FIRST-wins within a block, LATER-wins across blocks, which is what the
+// flat-set spelling produces.
+func compileDDNSProvider(name string, nodes ...*Node) *DDNSProvider {
 	props := map[string]string{}
+	// cur is the CURRENT block's properties. The walk writes here, not straight
+	// into props, so the two orderings this function needs can differ (#8436):
+	//
+	//   WITHIN one block, FIRST occurrence wins — the guard below. The walker
+	//   descends children, so one leaf can be seen at several depths, and the
+	//   outermost statement is the authoritative one.
+	//
+	//   ACROSS blocks, the LATER block wins, applied when cur is folded into
+	//   props after each walk. That is what the flat-set spelling does, and it
+	//   is the oracle: `set ... update-server first` then `... second` compiles
+	//   to "second" — measured, not assumed. Before #8436 made this function
+	//   variadic the two blocks never shared a map, so the question could not
+	//   arise; sharing one without this split would have made the FIRST block
+	//   win and quietly inverted a leaf the operator restated.
+	cur := props
 	var walk func(n *Node, isRoot bool)
 	walk = func(n *Node, isRoot bool) {
 		start := 0
@@ -899,8 +971,8 @@ func compileDDNSProvider(name string, node *Node) *DDNSProvider {
 		for i := start; i < len(n.Keys); i++ {
 			k := n.Keys[i]
 			if ddnsProviderStringProps[k] && i+1 < len(n.Keys) {
-				if _, ok := props[k]; !ok {
-					props[k] = n.Keys[i+1]
+				if _, ok := cur[k]; !ok {
+					cur[k] = n.Keys[i+1]
 				}
 				i++
 			}
@@ -909,7 +981,13 @@ func compileDDNSProvider(name string, node *Node) *DDNSProvider {
 			walk(c, false)
 		}
 	}
-	walk(node, true)
+	for _, node := range nodes {
+		cur = map[string]string{}
+		walk(node, true)
+		for k, v := range cur {
+			props[k] = v
+		}
+	}
 
 	p := &DDNSProvider{
 		Name:                 name,
@@ -3202,6 +3280,53 @@ func ntpServerModifierNames() map[string]int {
 //
 // The modifiers attach to the LAST address on the node, matching Junos: the
 // modifier follows the server it qualifies.
+// ntpServerListed reports whether addr is already in the compiled server list.
+//
+// Linear rather than a set because an NTP server list is a handful of entries
+// and the compiled slice is ORDER-SIGNIFICANT — chrony tries sources in the
+// order rendered — so it cannot be replaced by a map without changing what is
+// emitted (#8436).
+func ntpServerListed(servers []string, addr string) bool {
+	for _, s := range servers {
+		if s == addr {
+			return true
+		}
+	}
+	return false
+}
+
+// mergeNTPServerOption folds a later `server <addr> ...` statement's modifiers
+// onto the ones already compiled for that address (#8436).
+//
+// FIELD-WISE, AND IT DEPENDS ON ZERO MEANING UNSET — which is not an assumption
+// but the declared contract of the type: NTPServerOption documents `Key int
+// (0 = unset)`, `Version int (0 = chrony default)` and `RoutingInstance string
+// ("" = default)`. A wholesale assignment is what lost `key 5` when a second
+// statement set only `version`; taking each field only when the later statement
+// actually carries it is the same "a block that never mentions a leaf cannot
+// reset it" property the other #8436 sites get from their `switch` arms, made
+// explicit here because this struct is materialised whole rather than assigned
+// per leaf.
+//
+// Prefer is a bool with no unset state, so it is a logical OR: `prefer` on
+// either statement marks the source preferred, and neither can un-prefer the
+// other. That is the only field whose merge is not "later wins if set", and it
+// is the conservative direction — an operator who wrote `prefer` once gets it.
+func mergeNTPServerOption(base, add NTPServerOption) NTPServerOption {
+	out := base
+	out.Prefer = base.Prefer || add.Prefer
+	if add.Key != 0 {
+		out.Key = add.Key
+	}
+	if add.Version != 0 {
+		out.Version = add.Version
+	}
+	if add.RoutingInstance != "" {
+		out.RoutingInstance = add.RoutingInstance
+	}
+	return out
+}
+
 func ntpServerValues(n *Node) ([]string, map[string]NTPServerOption) {
 	if n == nil {
 		return nil, nil

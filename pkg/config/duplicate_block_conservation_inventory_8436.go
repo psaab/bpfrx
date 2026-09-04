@@ -29,9 +29,18 @@ package config
 // reading the verdict column: a pinned list nobody reads is a list of defects
 // with a checkmark next to it.
 var dupConservationInventory8436 = []string{
-	// ---- SILENT: no commit gate at all. The candidate list. ----
-	"system ntp server",
-	"system services dynamic-dns provider",
+	// ---- SILENT: no commit gate at all. ----
+	//
+	// EMPTY, as of #8436's last batch. Every container the census could reach
+	// that lost configuration silently has been fixed; what remains below is
+	// conservation achieved by REFUSAL, where an operator is told rather than
+	// quietly given a different config.
+	//
+	// An empty section is not the end of the census's job — it is the state in
+	// which the census earns its keep, because the next NEW non-conserving
+	// container now fails TestDuplicateBlockConservationIsPinned8436 as a
+	// regression instead of joining a list. Do not delete the section header:
+	// a future site belongs here with a reason, not silently.
 
 	// ---- Already REJECTED at strict commit (conservation by refusal) (9). ----
 	"applications application",
