@@ -430,7 +430,10 @@ fn ecn_of_tos(tos: u8) -> u8 {
 /// Returns `None` when the outer header is truncated (caller then skips
 /// the combine — a malformed outer never mutates the inner).
 #[inline]
-fn outer_ecn_bits(frame: &[u8], meta: UserspaceDpMeta) -> Option<u8> {
+// #8274: widened from private so the WireGuard worker decap stage can read the
+// outer ECN bits the same way. It is the same read at the same offset; a second
+// copy is the divergence `logical_ingress`'s module comment exists to prevent.
+pub(in crate::afxdp) fn outer_ecn_bits(frame: &[u8], meta: UserspaceDpMeta) -> Option<u8> {
     let l3 = meta.l3_offset as usize;
     match meta.addr_family as i32 {
         // IPv4: TOS/DiffServ is octet 1 of the outer header.
@@ -685,7 +688,13 @@ fn match_tunnel_endpoint(
     None
 }
 
-fn parse_inner_protocol_and_offsets(packet: &[u8], addr_family: u8) -> Option<(u8, u16, u16)> {
+// #8274: widened from private for the WireGuard worker decap stage — the inner
+// packet it hands to `build_logical_ingress_packet` needs exactly these three
+// values, derived exactly this way.
+pub(in crate::afxdp) fn parse_inner_protocol_and_offsets(
+    packet: &[u8],
+    addr_family: u8,
+) -> Option<(u8, u16, u16)> {
     match addr_family as i32 {
         libc::AF_INET => {
             if packet.len() < 20 {

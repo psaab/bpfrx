@@ -684,6 +684,68 @@ impl WgEngine {
     /// only that peer's edge, so a lower-sorted peer's iteration can no longer
     /// drain an edge raised for another peer. `false` if the peer is unknown or
     /// has no pending edge. Slow path (control thread).
+    /// #8274 step 3: a WORKER observed `endpoint` on an authenticated
+    /// transport-data record from `peer_pubkey`. Record it for the control
+    /// thread to adopt.
+    ///
+    /// COMPARE BEFORE WRITING. The control thread's own learning does an
+    /// unconditional `HashMap::insert` per authenticated datagram, which is
+    /// free at control-loop rates and is not free on the dataplane hot path:
+    /// this runs once per transport-data record, i.e. once per packet of every
+    /// WireGuard flow. The steady state — a peer that is not roaming — must
+    /// therefore cost one relaxed load and one compare, and it does: the
+    /// mutex is taken only when the observed endpoint DIFFERS from the pending
+    /// one, and `roamed_endpoint_pending` short-circuits the common case where
+    /// a roam is already queued.
+    ///
+    /// Returns true when something new was recorded, so a caller can count it.
+    pub(crate) fn note_worker_observed_endpoint(
+        &self,
+        peer_pubkey: &[u8; WG_KEY_LEN],
+        endpoint: std::net::SocketAddr,
+    ) -> bool {
+        use std::sync::atomic::Ordering;
+        let Some(peer) = self.peer_arc(peer_pubkey) else {
+            return false;
+        };
+        // Fast path: a roam is already pending and it is the same address, so
+        // there is nothing to say. Checked WITHOUT the lock.
+        if peer.roamed_endpoint_pending.load(Ordering::Relaxed)
+            && let Ok(pending) = peer.roamed_endpoint.try_lock()
+            && *pending == Some(endpoint)
+        {
+            return false;
+        }
+        let mut slot = peer
+            .roamed_endpoint
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *slot == Some(endpoint) {
+            return false;
+        }
+        *slot = Some(endpoint);
+        peer.roamed_endpoint_pending.store(true, Ordering::Relaxed);
+        true
+    }
+
+    /// #8274 step 3: take the endpoint a worker last observed for this peer, if
+    /// any. Drained by the control thread's per-peer pass, exactly where it
+    /// already drains `take_handshake_request`.
+    pub(crate) fn take_worker_observed_endpoint(
+        &self,
+        peer_pubkey: &[u8; WG_KEY_LEN],
+    ) -> Option<std::net::SocketAddr> {
+        use std::sync::atomic::Ordering;
+        let peer = self.peer_arc(peer_pubkey)?;
+        if !peer.roamed_endpoint_pending.swap(false, Ordering::Relaxed) {
+            return None;
+        }
+        peer.roamed_endpoint
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
     pub(crate) fn take_handshake_request(&self, peer_pubkey: &[u8; WG_KEY_LEN]) -> bool {
         use std::sync::atomic::Ordering;
         self.peer_arc(peer_pubkey)

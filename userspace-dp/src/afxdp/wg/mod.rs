@@ -81,6 +81,8 @@ pub(crate) mod allowed_ips;
 // reserved-reason list (tai64n-replay, rate-limit — no increment
 // sites until responder hardening).
 pub(crate) mod counters;
+// #8274 step 3: the worker-side transport-data decap stage.
+pub(crate) mod decap;
 // WireGuard responder-side cookie-reply / MAC2 under-load DoS mitigation
 // (#4094 PR-A). Per-tunnel secret rotation + inbound-initiation load gate
 // + cookie-reply build + MAC2 verify. Kept out of engine.rs (WATCH-tier)
@@ -123,6 +125,9 @@ pub(crate) mod timers;
 #[cfg(test)]
 #[path = "tests.rs"]
 pub(crate) mod tests;
+#[cfg(test)]
+#[path = "decap_tests.rs"]
+mod decap_tests;
 
 // #6422: lock poison-recovery regressions. A sibling of `tests` (not a
 // child of any one production file) because the sites it pins are spread

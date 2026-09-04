@@ -141,6 +141,19 @@ pub(crate) struct BindingWorker {
     /// `WorkerScratch`. Field semantics unchanged; access via
     /// `binding.scratch.scratch_X`.
     pub(crate) scratch: WorkerScratch,
+    /// #8274 step 3: per-worker WireGuard decap output buffer.
+    ///
+    /// Separate from `WorkerScratch` and behind a `RefCell` on purpose. The
+    /// decap stage runs at stage 6, alongside native-GRE decap, and takes only
+    /// a SHARED borrow of the binding — a plain `Vec` here would need
+    /// `&mut binding` at a point where the poll loop holds other borrows. The
+    /// worker is single-threaded inside its own loop, so `RefCell` is
+    /// sufficient and costs no `unsafe`; that is the reasoning
+    /// `wg::scratch`'s own module comment gives, and this is the wiring it has
+    /// been waiting for ("the integration PR will wire
+    /// `WgWorkerScratch::new(UMEM_FRAME_SIZE as usize)` from the dispatch
+    /// side").
+    pub(crate) wg_scratch: crate::afxdp::wg::WgWorkerScratch,
     /// Packets waiting for neighbor resolution. The UMEM frame is held
     /// (not recycled) until the neighbor resolves or the entry times out.
     ///
@@ -579,6 +592,7 @@ impl BindingWorker {
                 cos_prepared_batch_scratch: VecDeque::new(),
             },
             scratch: WorkerScratch::pre_sized(ring_entries),
+            wg_scratch: crate::afxdp::wg::WgWorkerScratch::new(UMEM_FRAME_SIZE as usize),
             // GEMINI-NEXT.md Section 3 cold start: lazy allocation. The
             // 4096-cap is enforced at admission (poll_descriptor.rs check
             // against MAX_PENDING_NEIGH), so pre-allocating that capacity
@@ -721,6 +735,7 @@ impl BindingWorker {
                 cos_prepared_batch_scratch: VecDeque::new(),
             },
             scratch: WorkerScratch::pre_sized(ring_entries),
+            wg_scratch: crate::afxdp::wg::WgWorkerScratch::new(UMEM_FRAME_SIZE as usize),
             pending_neigh: super::types::FastMap::default(),
             pending_neigh_schedule: Default::default(),
             last_neigh_generation: (0, 0),
@@ -836,6 +851,7 @@ impl BindingWorker {
                 cos_prepared_batch_scratch: VecDeque::new(),
             },
             scratch: WorkerScratch::pre_sized(ring_entries),
+            wg_scratch: crate::afxdp::wg::WgWorkerScratch::new(UMEM_FRAME_SIZE as usize),
             pending_neigh: super::types::FastMap::default(),
             pending_neigh_schedule: Default::default(),
             last_neigh_generation: (0, 0),

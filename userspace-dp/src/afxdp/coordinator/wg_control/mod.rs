@@ -524,6 +524,25 @@ fn run_wg_control_loop(
             // attempt machine independently. The earliest deadline
             // across ALL peers gates the poll timeout.
             for pk in &peer_pubkeys {
+                // #8274 step 3: adopt an endpoint a WORKER observed on an
+                // authenticated transport-data record.
+                //
+                // Moving type-4 decap into the AF_XDP worker took this thread's
+                // dominant endpoint-learning signal off its socket — it learns
+                // from authenticated datagrams, and data records are most of
+                // them. Without this drain, learning degrades to
+                // handshake/keepalive cadence and a roaming peer's keepalives
+                // and handshake initiations keep going to the stale address.
+                //
+                // Adopted with the SAME canonicalisation and into the SAME map
+                // as the socket path's own learning below, so a worker-observed
+                // roam and a socket-observed roam are indistinguishable
+                // afterwards — one representation of "where this peer is",
+                // not two that can disagree.
+                if let Some(observed) = engine.take_worker_observed_endpoint(pk) {
+                    effective_endpoints.insert(*pk, canonicalize_endpoint(observed));
+                    last_authenticated_rx.insert(*pk, monotonic_nanos());
+                }
                 let effective_endpoint = effective_endpoints.get(pk).copied();
                 let endpoint_known = effective_endpoint.is_some();
                 let actions = engine.timer_pass_for_peer(pk, now, endpoint_known);
