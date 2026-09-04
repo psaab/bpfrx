@@ -176,6 +176,72 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 	// family label is not a safety property, and this is the case that proves
 	// it. TestNormalizerScopeNeverCoversAPartialSite8690 binds it mechanically
 	// so the next widening cannot make the same mistake by inspection.
+	// #8690 family 4: interfaces. 15 sites, every one drop shape "empty".
+	//
+	// Measured, not taken from the brief: the family was described to me as
+	// 18 empty / 8 partial for interfaces plus 0/2 for bridge-domains. The
+	// inventory says 15 empty / 10 partial across the two. The file is the
+	// instrument.
+	//
+	// The same head-on-both-sides shape as family 3 appears here too:
+	//
+	//	interfaces <if> tunnel destination <addr>                     empty
+	//	interfaces <if> tunnel routing-instance destination <ri>      partial
+	//
+	// so `destination` is admitted under `tunnel` and not under
+	// `routing-instance`. A head-only rule would take both.
+	//
+	// The other ten partials — `interfaces <if> {description,duplex,mtu,speed,
+	// unit,...}` and the two bridge-domains sites — fold at the INSTANCE level,
+	// where production passes the instance name (`ge-0-0-0`) as the container
+	// keyword. No static pair can match them, so they are safe from a pair rule
+	// by construction rather than by being listed. That is worth knowing before
+	// someone "simplifies" this to a head-only match: it is exactly the rule
+	// shape those ten are NOT protected from.
+	//
+	// bridge-domains has ZERO admissible sites — both of its inventory entries
+	// are partial — so there is nothing to normalize there and its verdict is
+	// recorded rather than left looking unstarted.
+	switch containerKeyword + " " + head {
+	//
+	// `lacp periodic` is DELIBERATELY NOT admitted, though it is drop shape
+	// "empty" and would otherwise belong here. It is one of the census's two
+	// hand-verified known-true anchors (filedStillOpen), and normalizing it
+	// made TestCompactBlockEquivalenceInventory2419 red with exactly the right
+	// complaint: "an instrument that stops finding known-true sites reports
+	// clean for the same reason a textual sweep does".
+	//
+	// The file's doctrine is that an anchor CHANGES SIDES rather than leaving,
+	// so fixing it is legitimate — but it owes a replacement that is hand
+	// verified by reading the compiler AND sits in a different compiler file
+	// from the surviving anchor (compiler_protocols.go). I checked
+	// `applications application <a> destination-port` as a candidate and it does
+	// not qualify: applicationDirectLeaves walks BOTH AST shapes deliberately
+	// (#6524), so it is not compact-blind in the way this control requires,
+	// whatever the inventory says about it.
+	//
+	// So 14 of the 15 are normalized and this one is left, with the trade
+	// stated: the anchor keeps the whole census falsifiable across 300+ sites,
+	// and the site it holds is an LACP periodic interval. Fixing it is a
+	// follow-up that begins by hand-verifying a replacement anchor, not by
+	// deleting this comment.
+	case "aggregated-ether-options link-speed",
+		"aggregated-ether-options minimum-links",
+		"gigether-options 802.3ad",
+		"gigether-options redundant-parent",
+		"tunnel destination",
+		"tunnel source",
+		"tunnel mode",
+		"tunnel ttl",
+		"tunnel keepalive-retry",
+		"wireguard listen-port",
+		"wireguard peer",
+		"peer allowed-ips",
+		"peer endpoint",
+		"peer persistent-keepalive":
+		return true
+	}
+
 	// #8690 family 3: policy-options. Taken PER SITE rather than as a family
 	// sweep, because this is the family where a family sweep is actively
 	// harmful: of its 17 inventory sites, 9 are drop shape "empty" and 8 are
@@ -206,6 +272,86 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		return true
 	}
 
+	// #8690, the SYSTEM surface — 44 sites out of the 61 the census
+	// lists under `system`. Scoped by (container, head) PAIR per family 2's
+	// rule, and the 17 exclusions are the whole point of this increment.
+	//
+	// WHAT WAS EXCLUDED, AND WHY THE INVENTORY MARKER COULD NOT SAY SO:
+	//
+	// 15 sites are GATE-DISARMING — compiled through the strict path with this
+	// pass disabled they are REJECTED, and with it enabled they are ACCEPTED.
+	// That is the whole `system login` subtree (`class` and its six children,
+	// `user`, the four `authentication` leaves, `class`, `uid`) plus
+	// `dhcp-local-server ... static-binding <b> fixed-address`. Every one of
+	// them measures `empty`, so the inventory marker calls them safe: it
+	// records whether a READER consumes the packed tail, and these are held by
+	// a GATE that refuses the packed spelling. The pass runs before the commit
+	// gates, so a rewritten tree reaches them with nothing left to refuse.
+	//
+	// 1 site is UNMEASURABLE rather than safe:
+	// `dhcpv6-local-server ... static-binding <b> fixed-address`. Its census
+	// fixture supplies an IPv4 literal, so with the pass enabled it fails a
+	// DIFFERENT validator ("is not an IPv6 address") instead of compiling. A
+	// two-state safe/unsafe test reads that as "no gate was disarmed", which is
+	// the fixture answering rather than the site. It shares its pair with the
+	// v4 site above, so excluding that pair covers both.
+	//
+	// 1 site is UNREACHABLE by a pair rule at all:
+	// `services web-management api-auth user <name> password`. Its container is
+	// WILDCARD-NAMED, so production passes the actual username as the container
+	// keyword -- `("alice", "password")`, never a fixed token. A pair rule for
+	// it would be dead code that reads like coverage. Admitting it needs a
+	// head-only rule, which is a different safety argument than this increment
+	// makes, so it stays out.
+	//
+	// The pairs below were MEASURED by instrumenting the production call site,
+	// not reconstructed from the inventory path. Those disagree: the path
+	// carries a schema placeholder where production passes the stanza keyword,
+	// so `system login class <c> allow-commands` is ("class", "allow-commands")
+	// to production and ("xpfarg", "allow-commands") to a path reader.
+	switch containerKeyword + " " + head {
+	case
+		"api-auth api-key",
+		"autoupdate url",
+		"coalescence adaptive",
+		"coalescence rx-usecs",
+		"coalescence tx-usecs",
+		"configuration archive-sites",
+		"configuration transfer-interval",
+		"dataplane binary",
+		"dataplane claim-host-tunables",
+		"dataplane cpu-governor",
+		"dataplane netdev-budget",
+		"dataplane poll-mode",
+		"dataplane ring-entries",
+		"dataplane state-file",
+		"dataplane workers",
+		"dhcp-local-server group",
+		"dhcpv6-local-server group",
+		"group interface",
+		"group pool",
+		"http interface",
+		"https interface",
+		"ntp server",
+		"ntp threshold",
+		"pool dns-server",
+		"pool static-binding",
+		"shared-umem artifact-file",
+		"shared-umem interface",
+		"shared-umem mode",
+		"shared-umem phase0-artifact-file",
+		"ssh client-alive-count-max",
+		"ssh client-alive-interval",
+		"ssh connection-limit",
+		"ssh key-exchange",
+		"ssh root-login",
+		"static-binding host-name",
+		"system backup-router",
+		"system domain-search",
+		"system name-server",
+		"system time-zone":
+		return true
+	}
 	switch containerKeyword + " " + head {
 	case "zones security-zone",
 		"security-zone screen",
@@ -377,6 +523,164 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		"two-rate committed-information-rate",
 		"two-rate peak-burst-size",
 		"two-rate peak-information-rate":
+		return true
+	}
+
+	// #8690 family 4: the ROUTING surface — protocols, routing-instances and
+	// routing-options. 80 inventory sites, every one recorded "empty".
+	//
+	// THESE THREE CANNOT BE SPLIT, and that is a measured fact rather than a
+	// convenience. `routing-instances <n> protocols ospf ...` and
+	// `routing-instances <n> routing-options static ...` are the SAME GRAMMAR
+	// re-hosted under an instance, so they resolve to the same (container, head)
+	// pairs as their top-level spellings. Admitting `routing-instances` alone
+	// necessarily admits the matching `protocols` and `routing-options` sites;
+	// the pair set is only closed over all three. Splitting them into separate
+	// increments would have produced an inventory diff much larger than each
+	// increment declared, which is precisely the thing a reviewer is asked to
+	// check.
+	//
+	// `protocols` was deliberately EXCLUDED from family 3 because it holds
+	// `protocols bgp group <g> neighbor <n> peer-as`, one of the sites where a
+	// widening DISARMS a commit gate while measuring empty-equivalent — so the
+	// inventory marker is necessary but not sufficient evidence there. It is
+	// admitted here on a different basis: arm 2 of the widening rule
+	// (TestCompactNormalizeScopePreservesCompiledResult8690) compiles every
+	// admitted site through the strict path with the pass disabled and compares
+	// acceptance, which is the check the marker cannot perform. That guard runs
+	// over whatever scope is current, so it adjudicates these sites rather than
+	// a list adjudicating them.
+	//
+	// ONE PAIR REACHES OUTSIDE the three families: (route, next-hop) is also
+	// used by `services ip-monitoring policy <p> then preferred-route route
+	// <r>`. That site is NOT in the inventory, which is NOT evidence that it
+	// conserves — a site the census cannot see is absent for the same reason a
+	// safe site is. It is admitted on arm 2's verdict, not on its absence.
+	//
+	// Pairs measured by running the pass with an instrumented gate, not derived
+	// from inventory paths (the path carries the schema arg placeholder where
+	// production passes node.Keys[0]).
+	//
+	// ("neighbor", "peer-as") IS DELIBERATELY ABSENT, and arm 2 is what removed
+	// it rather than a list. Admitting it made
+	// TestCompactNormalizeScopePreservesCompiledResult8690 report:
+	//
+	//	1 site(s) in the normalizer's scope are REJECTED at strict commit with
+	//	the pass disabled and ACCEPTED with it enabled:
+	//	[protocols bgp group xpfarg neighbor xpfarg peer-as]
+	//
+	// That is the gate-disarm failure the "empty" marker cannot see: the site
+	// measures empty-equivalent (no reader consumes the tail) AND a commit gate
+	// rejects the packed spelling, so normalizing it would make a configuration
+	// that is refused today start committing clean. `protocols bgp group <g>
+	// neighbor <n> peer-as` therefore stays in the inventory. Retiring its gate
+	// is a separate, deliberate decision — not a side effect of a family sweep.
+	switch containerKeyword + " " + head {
+	case "area interface",
+		"area virtual-link",
+		"authentication md5",
+		"authentication simple-password",
+		"bfd-liveness-detection minimum-interval",
+		"bfd-liveness-detection multiplier",
+		"bgp cluster-id",
+		"bgp export",
+		"bgp group",
+		"bgp import",
+		"bgp local-as",
+		"bgp router-id",
+		"damping half-life",
+		"damping max-suppress",
+		"damping reuse",
+		"damping suppress",
+		"forwarding-table export",
+		"generate route",
+		"group authentication-key",
+		"group description",
+		"group export",
+		"group hold-time",
+		"group import",
+		"group local-address",
+		"group local-as",
+		"group loops",
+		"group multihop",
+		"group neighbor",
+		"group peer-as",
+		"interface authentication-key",
+		"interface authentication-type",
+		"interface cost",
+		"interface dead-interval",
+		"interface default-lifetime",
+		"interface dns-server-address",
+		"interface hello-interval",
+		"interface interface-type",
+		"interface level",
+		"interface link-mtu",
+		"interface max-advertisement-interval",
+		"interface metric",
+		"interface min-advertisement-interval",
+		"interface nat-prefix",
+		"interface nat64prefix",
+		"interface preference",
+		"interface prefix",
+		"interface priority",
+		"interface reachable-time",
+		"interface retransmit-interval",
+		"interface retransmit-timer",
+		"isis authentication-key",
+		"isis authentication-type",
+		"isis export",
+		"isis interface",
+		"isis is-type",
+		"isis level",
+		"isis net",
+		"lldp hold-multiplier",
+		"lldp interface",
+		"lldp transmit-interval",
+		"md5 key",
+		"nat-prefix lifetime",
+		"nat64prefix lifetime",
+		"neighbor authentication-key",
+		"neighbor description",
+		"neighbor export",
+		"neighbor hold-time",
+		"neighbor import",
+		"neighbor local-address",
+		"neighbor local-as",
+		"neighbor loops",
+		"neighbor multihop",
+		"next-hop interface",
+		"ospf area",
+		"ospf export",
+		"ospf reference-bandwidth",
+		"ospf router-id",
+		"ospf3 area",
+		"ospf3 export",
+		"ospf3 router-id",
+		"prefix preferred-lifetime",
+		"prefix valid-lifetime",
+		"prefix-limit maximum",
+		"qualified-next-hop interface",
+		"qualified-next-hop metric",
+		"qualified-next-hop preference",
+		"rib-group inet",
+		"rib-group inet6",
+		"rip authentication-key",
+		"rip authentication-type",
+		"rip group",
+		"rip neighbor",
+		"rip passive-interface",
+		"rip redistribute",
+		"route next-hop",
+		"route next-table",
+		"route policy",
+		"route preference",
+		"route qualified-next-hop",
+		"router-advertisement interface",
+		"routing-options autonomous-system",
+		"routing-options rib",
+		"routing-options rib-groups",
+		"static route",
+		"virtual-link transit-area":
 		return true
 	}
 	return false

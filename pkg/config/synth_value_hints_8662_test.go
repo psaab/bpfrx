@@ -64,8 +64,21 @@ func TestHintExposedDivergencesStayVisible8662(t *testing.T) {
 	for _, want := range []string{
 		"interfaces xpfname unit",
 		"system login user xpfarg uid",
-		"protocols ospf reference-bandwidth",
-		"protocols isis interface xpfarg bfd-liveness-detection minimum-interval",
+		// #8690 family 4 normalized the two protocols entries that used to sit
+		// here — `protocols ospf reference-bandwidth` and `protocols isis
+		// interface <i> bfd-liveness-detection minimum-interval` — so they left
+		// the inventory and can no longer serve as "still visible" anchors.
+		// This cell said what to do in its own failure message ("if the compact
+		// reader was FIXED, remove this line and say so"), and this is that.
+		//
+		// The protocols family is REPLACED rather than dropped, because the
+		// point of the list is one anchor per family the synthesis sweep
+		// exposed; losing the family silently narrows what a synthesis
+		// regression would be caught on. The replacement is the one protocols
+		// site family 4 deliberately did NOT normalize — its packed spelling is
+		// rejected by a commit gate, so it stays divergent and stays a valid
+		// anchor.
+		"protocols bgp group xpfarg neighbor xpfarg peer-as",
 	} {
 		if !inInventory(want) {
 			t.Errorf("%q left the inventory. If the compact reader was FIXED, remove this line "+
