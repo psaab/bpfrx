@@ -59,7 +59,9 @@ pub(super) fn tear_down(coord: &mut Coordinator, will_rebind: bool) -> Preserved
     // replay was absent from the captured Vec, never published to the new
     // session map, and never replayed — while still being answered to Go as
     // installed. The replay now reads the live map at replay time instead, so
-    // a late arrival is included by construction. Safe because
+    // a late arrival is included by construction — and since #7209 took
+    // `sync_session` off the `ServerState` mutex, a late arrival is something
+    // that can actually happen rather than a hypothetical. Safe because
     // `stop_inner(false)` does NOT clear `sessions.synced` (the clear is gated
     // on `clear_synced_state`, which only full shutdown passes), so the map
     // survives the teardown intact — see #6652, whose own regression note is

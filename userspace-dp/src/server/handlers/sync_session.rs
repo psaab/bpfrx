@@ -3,12 +3,25 @@
 // sync_req.operation).
 
 use super::super::helpers::{build_synced_session_entry, build_synced_session_key, SyncedKeyIntent};
-use super::super::ServerState;
+use crate::afxdp::SessionDomain;
 use crate::afxdp::SYNCED_IMPORT_REFUSED_PREFIX;
 use crate::{ControlResponse, SessionSyncRequest};
 
+/// #7209: served from the SESSION-DOMAIN HANDLE, not from `&mut ServerState`.
+///
+/// This verb arrives on its own socket and its own thread (#452) but dispatched
+/// through the same `Arc<Mutex<ServerState>>` as `apply_snapshot`, which holds
+/// that mutex across a 10 s worker-readiness barrier, a 500 ms mlx5 teardown
+/// quiesce, worker `join()`s and BPF map-pin opens. Go budgets 3 s for a session
+/// round-trip and #5380 ABORTS the remainder of a bulk batch on the first
+/// transport failure, so the contention cost was never latency — it was up to
+/// 255 dropped session mirrors during the failover this path exists to serve.
+///
+/// Nothing here reads `ServerState`'s other three fields; the handler only ever
+/// touched `guard.afxdp`, and every field it reaches through it is already
+/// shared state (see `afxdp/ha/session_domain.rs`).
 pub(super) fn handle(
-    guard: &mut ServerState,
+    domain: &SessionDomain,
     session_sync: Option<SessionSyncRequest>,
     response: &mut ControlResponse,
 ) {
@@ -55,13 +68,19 @@ pub(super) fn handle(
     // refusal. UNRECOGNIZED is a value this build cannot place, and coercing it
     // into a domain would file the session under an identity we cannot
     // reproduce — the reasoning #7188 refuses on, transferred verbatim.
+    // #7209: ONE load of the published runtime view for the whole request. The
+    // domain resolution, the zone-name map and the per-domain delete retry all
+    // read forwarding; taking three loads would let one request resolve its
+    // domain against one generation and its zones against another — the pairing
+    // defect #6592 closed, reintroduced at the handler layer.
+    let view = domain.view();
     let resolved_domain = match crate::session::routing_domain_from_wire(sync_req.routing_domain) {
-        crate::session::WireRoutingDomain::Present(domain) => Some(domain),
-        crate::session::WireRoutingDomain::Absent => guard
-            .afxdp
-            .synced_routing_domain(sync_req.ingress_ifindex, sync_req.ingress_vlan_id),
+        crate::session::WireRoutingDomain::Present(d) => Some(d),
+        crate::session::WireRoutingDomain::Absent => {
+            view.synced_routing_domain(sync_req.ingress_ifindex, sync_req.ingress_vlan_id)
+        }
         crate::session::WireRoutingDomain::Unrecognized => {
-            guard.afxdp.note_unknown_routing_domain_import();
+            domain.note_unknown_routing_domain_import();
             response.ok = false;
             response.error =
                 format!("{SYNCED_IMPORT_REFUSED_PREFIX}routing-domain-unrecognized");
@@ -70,7 +89,7 @@ pub(super) fn handle(
     };
     match sync_req.operation.as_str() {
         "upsert" if resolved_domain.is_none() => {
-            guard.afxdp.note_unknown_routing_domain_import();
+            domain.note_unknown_routing_domain_import();
             response.ok = false;
             response.error = format!(
                 "{SYNCED_IMPORT_REFUSED_PREFIX}{}",
@@ -81,7 +100,7 @@ pub(super) fn handle(
         }
         "upsert" => match build_synced_session_entry(
             &sync_req,
-            guard.afxdp.zone_name_to_id_ref(),
+            view.zone_name_to_id(),
             resolved_domain.expect("the None arm above already returned"),
         ) {
             Ok(entry) => {
@@ -99,7 +118,7 @@ pub(super) fn handle(
                 // and gates takeover-readiness (#5247), whereas a refusal is the
                 // correct answer from a HEALTHY helper and must not block
                 // failover on a node that is working.
-                let outcome = guard.afxdp.upsert_synced_session(entry);
+                let outcome = domain.upsert_synced_session(entry);
                 if let Some(reason) = outcome.refusal_reason() {
                     response.ok = false;
                     response.error =
@@ -130,7 +149,7 @@ pub(super) fn handle(
             SyncedKeyIntent::Delete,
         ) {
             Ok(key) => {
-                guard.afxdp.delete_synced_session(key.clone());
+                domain.delete_synced_session(key.clone());
                 // #7160 (#2387): a bare-5-tuple delete (the `clear security
                 // flow session` / batch-revoke path) carries no ingress
                 // identity, so the key above resolved domain 0 and the exact
@@ -140,10 +159,10 @@ pub(super) fn handle(
                 // Empty — and therefore a no-op — in every deployment with no
                 // routing-instance interface membership.
                 if key.routing_domain == 0 {
-                    for domain in guard.afxdp.routing_domains() {
+                    for rd in view.routing_domains() {
                         let mut scoped = key.clone();
-                        scoped.routing_domain = domain;
-                        guard.afxdp.delete_synced_session(scoped);
+                        scoped.routing_domain = rd;
+                        domain.delete_synced_session(scoped);
                     }
                 }
             }

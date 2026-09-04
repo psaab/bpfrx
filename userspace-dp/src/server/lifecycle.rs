@@ -365,6 +365,19 @@ pub(crate) fn run() -> Result<(), String> {
     }));
     eprintln!("xpf-userspace-dp: poll_mode={:?}", args.poll_mode);
 
+    // #7209: cloned ONCE, here, while nothing else holds the mutex. The
+    // coordinator never reassigns the fields this mirrors — it only mutates
+    // them through their own interior synchronization — so a handle taken now
+    // observes every later publish rather than freezing a snapshot of startup.
+    // Taking it here rather than per-request is also what keeps the session
+    // socket off the mutex: deriving it from `state` would need the very lock
+    // this exists to avoid.
+    let session_domain = {
+        let guard = state.lock().expect("state poisoned");
+        guard.afxdp.session_domain().clone()
+    };
+    let main_session_domain = session_domain.clone();
+
     // Start the event stream sender (connects to daemon's event listener socket).
     {
         let event_socket_path = derive_event_socket_path(&args.control_socket);
@@ -408,7 +421,13 @@ pub(crate) fn run() -> Result<(), String> {
                             // multi-session debugging chase into one log line
                             // (#1961).
                             if let Err(err) =
-                                handle_stream(stream, &state_file, state.clone(), running.clone())
+                                handle_stream(
+                                    stream,
+                                    &state_file,
+                                    state.clone(),
+                                    running.clone(),
+                                    session_domain.clone(),
+                                )
                             {
                                 eprintln!("xpf-userspace-dp: session request failed: {err}");
                             }
@@ -434,7 +453,13 @@ pub(crate) fn run() -> Result<(), String> {
                 // carries apply_snapshot, where a wire-type mismatch silently
                 // left the helper disabled and forwarding nothing (#1961).
                 if let Err(err) =
-                    handle_stream(stream, &args.state_file, state.clone(), running.clone())
+                    handle_stream(
+                        stream,
+                        &args.state_file,
+                        state.clone(),
+                        running.clone(),
+                        main_session_domain.clone(),
+                    )
                 {
                     eprintln!("xpf-userspace-dp: control request failed: {err}");
                 }

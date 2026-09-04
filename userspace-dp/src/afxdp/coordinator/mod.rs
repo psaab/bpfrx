@@ -48,6 +48,7 @@ pub(crate) use cos_state::SharedCoSState;
 #[cfg(test)]
 pub(crate) use cos_state::PrePublishSiblings;
 pub(in crate::afxdp) use ha_state::HaState;
+pub(in crate::afxdp) use routing_domain::{configured_routing_domains, synced_routing_domain_in};
 pub(crate) use neighbor_manager::NeighborManager;
 /// #7413: re-exported so `main_tests.rs` — the one `neigh-monitor` spawner
 /// outside `coordinator/tests.rs` — can take the same guard. `mod
@@ -64,6 +65,7 @@ pub(in crate::afxdp) use neighbor_manager::{
 pub(in crate::afxdp) use session_manager::SessionManager;
 use supervisor::spawn_supervised_aux;
 pub(in crate::afxdp) use worker_manager::WorkerManager;
+pub(in crate::afxdp) use worker_manager::WorkerRecordsReader;
 // #6242: the per-worker transactional runtime record. Named by `bringup.rs`
 // (construction), `status.rs` / HA control fan-out (cold reads), and the test
 // modules (`status_tests.rs`, `ha_tests.rs`, `tests.rs`) that seed workers.
@@ -241,7 +243,11 @@ pub struct Coordinator {
     /// to a `Mutex<BpfMaps>` or a plain field — a mutex serialises access
     /// without extending any lifetime, and every test would still pass, because
     /// nothing reads these concurrently yet. Rationale on `BpfMaps` itself.
-    pub(crate) bpf_maps: ArcSwap<BpfMaps>,
+    /// #7209: the CELL is shared, not just its contents. A session-domain
+    /// handle holds this same `Arc<ArcSwap<..>>`, so a `store` the coordinator
+    /// makes is visible to a reader that took its handle before the store —
+    /// which a cloned `ArcSwap` would not give.
+    pub(crate) bpf_maps: Arc<ArcSwap<BpfMaps>>,
     pub(crate) slow_path: Option<Arc<SlowPathReinjector>>,
     pub(crate) local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, LocalTunnelDelivery>>>,
     /// #1881: GRE local-origin thread lifecycle entries keyed by
@@ -267,10 +273,20 @@ pub struct Coordinator {
     /// degraded TUN whose `live_mtu` never converges — does not re-issue the
     /// ioctl every tick; the next DISTINCT desired value retries.
     pub(crate) last_slow_path_mtu_reconciled: i32,
+    /// #7209: the lock-free handle onto this coordinator's peer-synced session
+    /// domain, handed to the session-socket thread so `sync_session` need not
+    /// take the `ServerState` mutex.
+    pub(crate) session_domain: crate::afxdp::SessionDomain,
     pub(in crate::afxdp) ha: HaState,
     pub(crate) cos: SharedCoSState,
     pub(crate) neighbors: NeighborManager,
-    pub(in crate::afxdp) sessions: SessionManager,
+    /// #7209: shared behind one `Arc` so a session-domain handle can hold the
+    /// SAME manager the coordinator mutates through, rather than a snapshot of
+    /// it. Every `SessionManager` method already takes `&self` — its maps are
+    /// `Arc<Mutex<..>>` and its counters are atomics — so this needs no
+    /// interior-mutability work and no per-counter `Arc`, which is what the
+    /// abandoned `724ebb5bc` stack was reaching for six counters at a time.
+    pub(in crate::afxdp) sessions: Arc<SessionManager>,
     /// #6471: node-shared live-IKE-exchange table backing the Stage-11
     /// established-vs-forged discriminator on the IPsec secondary path.
     /// Runtime state (NOT config): lives outside `ForwardingState` so a
@@ -305,6 +321,41 @@ pub struct Coordinator {
     /// status surface. Wiring it into the status surface (a wire change)
     /// is a possible follow-up.
     pub(crate) reconcile_quiesce_count: u64,
+    /// #8558: the per-slot TERMINAL bind-failure reasons from the most recent
+    /// fail-closed worker bring-up, keyed by binding slot.
+    ///
+    /// It exists because the fail-closed teardown destroys the diagnostic that
+    /// the recovery keyed on. `bring_up_workers`' `BindIncomplete` arm calls
+    /// `stop_inner(false)`, which empties `workers.live`; `refresh_bindings`
+    /// then routes every now-workerless slot through `zero_unbound_slot`, and
+    /// that ends with `binding.last_error.clear()`. So the `"Device or resource
+    /// busy"` a bind actually returned was gone from the status the Go manager
+    /// polls, and `hasBusyBindingsWedgeLocked`'s `busyErr` term — a substring
+    /// match on exactly that field — could never be true. Its only other route
+    /// in, `repaired`, needs a forwarding-LIVE (`Ready`) binding, of which a
+    /// fail-closed reconcile leaves none. Recovery for the fault it exists for
+    /// was unreachable, silently, while looking alive.
+    ///
+    /// A one-shot restore into `bindings` would not have fixed it: EVERY
+    /// control response runs `refresh_status` -> `refresh_bindings`, so the
+    /// ~1 Hz status poll re-erased it within a second, and the Go predicate
+    /// requires the wedge to persist 5s before firing. The cause therefore has
+    /// to live somewhere the refresh READS, which is what this map is.
+    ///
+    /// LIFECYCLE — cleared by `stop_inner`, populated only by the
+    /// `BindIncomplete` arm immediately after it:
+    /// - every snapshot reconcile clears it in `tear_down` and repopulates only
+    ///   if this bring-up fails, so it always describes the CURRENT state;
+    /// - a `no_snapshot` / disarm / shutdown teardown clears it and never
+    ///   repopulates, so a legitimately-unbound slot reports no error;
+    /// - a PRE-teardown abort (integrity / mandatory-pin) does not reach
+    ///   `stop_inner`, and correctly leaves the previous contents alone — the
+    ///   prior workers are still running and the state did not move.
+    ///
+    /// It can never put an error on a HEALTHY slot: `refresh_bindings` consults
+    /// it only on the branch where a slot has NO `live` entry, and a bound slot
+    /// always has one.
+    pub(crate) last_bind_failures: BTreeMap<u32, String>,
     /// #2522 test seam (per-instance, NOT a process-global): under
     /// `cfg(test)` `tear_down`'s quiesce records its requested duration
     /// here and skips the real `thread::sleep`, so each test asserts
@@ -363,7 +414,12 @@ pub struct Coordinator {
     /// `DEFAULT_MAX_SESSIONS` (131072) entries. Always 0 in release builds
     /// (the field does not exist); per-instance so parallel tests never race.
     #[cfg(test)]
-    pub(crate) synced_import_cap_override: usize,
+    /// #7209: SHARED with the session-domain handle, not copied. The six
+    /// tests that set it do so on this struct after construction; a copied
+    /// `usize` would leave the handle reading 0, so every cap assertion would
+    /// silently measure the production formula instead of the override — a
+    /// test seam that stops seaming without failing.
+    pub(crate) synced_import_cap_override: Arc<std::sync::atomic::AtomicUsize>,
     /// #5166 test seam (per-instance, NOT a process-global): under
     /// `cfg(test)`, `refresh_runtime_snapshot_inner` records a clone of the
     /// `cos.owner_worker_by_queue` map here at the exact instant just before
@@ -430,21 +486,45 @@ pub struct Coordinator {
 
 impl Coordinator {
     pub fn new() -> Self {
+        // #7209: the shared parts are bound to locals first so the
+        // session-domain handle can be built from the SAME values the struct
+        // takes. Building it here rather than on demand is what makes it a
+        // handle onto live state: none of these six is ever REASSIGNED on the
+        // coordinator (checked — zero `self.<field> = ` sites for each), only
+        // mutated through its own interior synchronization, so a handle taken
+        // at construction observes every later change.
+        let bpf_maps = Arc::new(ArcSwap::from_pointee(BpfMaps::default()));
+        let ha = HaState::new();
+        let neighbors = NeighborManager::new();
+        let sessions = Arc::new(SessionManager::new());
+        let workers = WorkerManager::new();
+        #[cfg(test)]
+        let synced_import_cap_override = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let session_domain = crate::afxdp::SessionDomain::new(
+            &sessions,
+            &workers,
+            &ha,
+            &neighbors,
+            &bpf_maps,
+            #[cfg(test)]
+            &synced_import_cap_override,
+        );
         Self {
-            bpf_maps: ArcSwap::from_pointee(BpfMaps::default()),
+            session_domain,
+            bpf_maps,
             slow_path: None,
             local_tunnel_deliveries: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
             tunnel_sources: BTreeMap::new(),
             wg_control_threads: BTreeMap::new(),
             last_slow_path_status: SlowPathStatus::default(),
             last_slow_path_mtu_reconciled: 0,
-            ha: HaState::new(),
+            ha,
             cos: SharedCoSState::new(),
-            neighbors: NeighborManager::new(),
-            sessions: SessionManager::new(),
+            neighbors,
+            sessions,
             ike_exchanges: Arc::new(crate::afxdp::forwarding::IkeExchangeTable::new()),
             pptp_control: Arc::new(crate::session::pptp_control::PptpControlInbox::default()),
-            workers: WorkerManager::new(),
+            workers,
             mirror_targets: Arc::new(ArcSwap::from_pointee(MirrorTargetMap::default())),
             forwarding: ForwardingState::default(),
             policy_counters: PolicyCounterStore::default(),
@@ -457,6 +537,7 @@ impl Coordinator {
             validation: ValidationState::default(),
             reconcile_calls: 0,
             reconcile_quiesce_count: 0,
+            last_bind_failures: BTreeMap::new(),
             #[cfg(test)]
             last_quiesce_ms: 0,
             #[cfg(test)]
@@ -468,7 +549,7 @@ impl Coordinator {
             #[cfg(test)]
             force_worker_healthy_stub: false,
             #[cfg(test)]
-            synced_import_cap_override: 0,
+            synced_import_cap_override: Arc::clone(&synced_import_cap_override),
             #[cfg(test)]
             cos_owner_at_forwarding_publish: None,
             #[cfg(test)]
@@ -536,6 +617,59 @@ impl Coordinator {
     /// `build_synced_session_entry` to translate legacy
     /// `SessionSyncRequest.ingress_zone` strings to u16 IDs when
     /// older peers don't populate the new ID fields.
+    /// #7209: the session-domain handle — a cloneable, lock-free view of
+    /// everything the peer-synced import path touches.
+    ///
+    /// Handed to the session-socket thread at startup so `sync_session` is
+    /// served without the `ServerState` mutex, which `apply_snapshot` holds
+    /// across a 10 s readiness barrier, a 500 ms teardown quiesce, worker
+    /// `join()`s and BPF map-pin opens — past the 3 s round-trip budget Go
+    /// gives it, and #5380 aborts the rest of a bulk batch on the first such
+    /// failure.
+    #[inline]
+    pub(crate) fn session_domain(&self) -> &crate::afxdp::SessionDomain {
+        &self.session_domain
+    }
+
+    /// #7209: the peer-synced import verbs, delegated to the session-domain
+    /// handle that now owns them.
+    ///
+    /// These are thin on purpose. The implementations moved to `SessionDomain`
+    /// so the session socket can drive them without the `ServerState` mutex;
+    /// keeping the coordinator's own surface pointed at the SAME code — rather
+    /// than leaving a second copy behind — is what stops the 87 existing call
+    /// sites from quietly becoming tests of a decommissioned path.
+    pub fn upsert_synced_session(
+        &self,
+        entry: crate::afxdp::SyncedSessionEntry,
+    ) -> crate::afxdp::SyncedImportOutcome {
+        self.session_domain.upsert_synced_session(entry)
+    }
+
+    /// See [`Coordinator::upsert_synced_session`].
+    pub fn delete_synced_session(&self, key: crate::session::SessionKey) {
+        self.session_domain.delete_synced_session(key)
+    }
+
+    /// See [`Coordinator::upsert_synced_session`].
+    pub fn delete_synced_session_gen(&self, key: crate::session::SessionKey, delete_gen: u64) {
+        self.session_domain.delete_synced_session_gen(key, delete_gen)
+    }
+
+    /// See [`Coordinator::upsert_synced_session`].
+    pub(in crate::afxdp) fn synced_import_cap_for(
+        &self,
+        records: &BTreeMap<u32, Arc<WorkerRuntimeRecord>>,
+    ) -> usize {
+        self.session_domain.synced_import_cap_for(records)
+    }
+
+    /// See [`Coordinator::upsert_synced_session`].
+    #[cfg(test)]
+    pub(crate) fn test_install_local_forward_session(&self, idx: u16) {
+        self.session_domain.test_install_local_forward_session(idx)
+    }
+
     pub fn zone_name_to_id_ref(&self) -> &FastMap<String, u16> {
         &self.forwarding.zone_name_to_id
     }
@@ -719,6 +853,16 @@ impl Coordinator {
             maps.map_fd.as_ref(),
             maps.heartbeat_map_fd.as_ref(),
         );
+        // #8558: the recorded bind-failure causes describe the worker set that
+        // was just stopped, so they die with it. Clearing HERE rather than at
+        // the top of `reconcile` is what covers the teardowns that never enter
+        // `reconcile` at all — `Coordinator::stop` (the disarm /
+        // `reconcile_status_bindings` no-forwarding branch) and the
+        // `no_snapshot` shutdown path — so a legitimately-unbound slot never
+        // reports the previous generation's bind error. The `BindIncomplete`
+        // arm repopulates it immediately AFTER calling `stop_inner`, which is
+        // the only ordering that leaves the causes standing.
+        self.last_bind_failures.clear();
         self.mirror_targets
             .store(Arc::new(MirrorTargetMap::default()));
         // #6242: the per-worker panic slots (#925) + exception rings +

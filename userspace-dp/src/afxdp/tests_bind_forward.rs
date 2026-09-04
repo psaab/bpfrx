@@ -930,12 +930,8 @@ fn output_filter_reject_carries_the_configured_icmp_code_6854() {
     // carried across a separate assignment, and the mutation matrix showed that
     // one still free with the fresh path bound. Covering one arm and calling the
     // path tested is the exact mistake this cell exists to correct.
-    let precomputed = crate::afxdp::tx::resolve_cached_cos_tx_selection(
-        &forwarding,
-        12,
-        meta,
-        Some(&flow.forward_key),
-    );
+    let precomputed =
+        crate::afxdp::tx::resolve_cached_cos_tx_selection(&forwarding, 12, meta, &flow.forward_key);
     assert!(
         precomputed.reject,
         "#6854 PREMISE: the precomputed descriptor must classify as a reject, or the arm \
@@ -2417,14 +2413,30 @@ fn measure_c19_flowless_reaches_cached_filter_7174() {
         routing_domain: 0,
     };
     let with_flow =
-        crate::afxdp::tx::resolve_cached_cos_tx_selection(&forwarding, 12, meta, Some(&flow_key));
+        crate::afxdp::tx::resolve_cached_cos_tx_selection(&forwarding, 12, meta, &flow_key);
     println!(
         "\n#7174 ARM A (flow_key = Some, dst_port 22): drop={} reject={}",
         with_flow.drop, with_flow.reject
     );
 
     // ARM B -- the SUBJECT, flowless: exactly what a non-first fragment presents.
-    let flowless = crate::afxdp::tx::resolve_cached_cos_tx_selection(&forwarding, 12, meta, None);
+    //
+    // #8367: the flowless entry point now REQUIRES the POST-NAT on-wire L3
+    // tuple. This fixture applies no NAT, so it is ARM A's key with the ports
+    // stripped -- which is precisely the "flow key is the only axis that
+    // differs" the paragraph below relies on: same addresses, same protocol,
+    // same family, no L4 ports.
+    let flowless_wire = SessionKey {
+        src_port: 0,
+        dst_port: 0,
+        ..flow_key
+    };
+    let flowless = crate::afxdp::tx::resolve_cached_cos_tx_selection_flowless(
+        &forwarding,
+        12,
+        meta,
+        &flowless_wire,
+    );
     // #7992: ARM B must now agree with ARM A. This was a print while the defect
     // was open; it is the assertion the fix owes.
     //
