@@ -1355,6 +1355,80 @@ does not enforce that: `metadata.owner_rg_id` arrives from the peer as a raw
 worth doing and is not done today. The walk runs once per authoritative removal
 (never per refresh) on the control thread, and allocates nothing.
 
+## Which of the four blocking calls can leave the ServerState lock (#7209 item 2)
+
+`sync_session` dispatches through the snapshot-wide `ServerState` mutex, and
+`apply_snapshot` holds that mutex across four blocking calls. Scope item 2 of
+#7209 proposes taking them off the lock with the locked-kick / unlocked-wait
+split already used by #2962, #4054 and #5862. **Two of the four can be; two
+cannot yet**, and the discriminator is what `Coordinator.forwarding` holds at
+that instant — not the duration of the call.
+
+Phase order inside `Coordinator::reconcile`:
+
+| # | phase | `forwarding` there | blocking call | releasable today |
+|---|---|---|---|---|
+| 1 | `snapshot::preflight_map_fds` | previous table, still installed | BPF map-pin opens | **yes** |
+| 2 | `teardown::tear_down` → `stop_inner(false)` | **emptied** | worker `join()` (unbounded) | no |
+| 3 | still in `tear_down`, after `stop_inner` | **emptied** | mlx5 quiesce, 500 ms | no |
+| 4 | `snapshot::apply_snapshot` assigns `coord.forwarding = new_forwarding` | new table installed | — | — |
+| 5 | `bringup::bring_up_workers` | new table | worker-readiness barrier, **10 s** | **yes** |
+
+The map-pin opens run BEFORE the teardown, so a reader in that window sees the
+previous, coherent state. The readiness barrier runs AFTER
+`apply_snapshot` has installed the new table, so a reader there sees the new
+one. Neither exposes an empty table — and the barrier is the call that matters,
+because it is the one that can exceed the Go side's 3 s session round-trip
+budget and take the rest of a #5380 bulk batch down with it.
+
+### Why phases 2 and 3 are blocked
+
+Releasing the lock there exposes `forwarding = ForwardingState::default()` to a
+concurrent `sync_session`, and the import's DERIVED state is computed from it:
+
+1. `stop_inner(false)` empties the table but deliberately KEEPS the shared
+   synced map (`clear_synced_state` is false for a reconcile), so an import
+   landing in the window persists;
+2. `synthesized_synced_reverse_entry` has exactly one early return, on
+   `is_reverse` — there is no forwarding-dependent `None` arm — so the reverse
+   companion is still built, from nothing, and published;
+3. `replay_synced_sessions` publishes `entry.decision` VERBATIM and re-queues
+   the entry. It never re-synthesizes, so the reconcile does not repair it.
+
+Today that is latent rather than live: the only way to reach it without a lock
+move is a standby taking bulk sync before its first apply, and RG activation
+re-derives the companion through
+`prewarm_reverse_synced_sessions_for_owner_rgs` before it can matter. A mid-life
+`apply_snapshot` on an already-ACTIVE node reaches no activation, so a lock
+release is exactly what turns it into a permanent wrong reply-path row.
+
+All three legs are pinned in `ha_tests.rs` as characterization cells
+(`stop_inner_empties_the_forwarding_table_that_a_released_lock_would_expose_7209`,
+`an_import_under_an_emptied_forwarding_table_publishes_a_dead_reverse_companion_7209`,
+`the_reconcile_replay_does_not_repair_a_dead_reverse_companion_7209`) so the
+prerequisite is a red rather than a paragraph.
+
+### Measured cost of the two candidate remedies
+
+#7209 leaves item 1's shape open between refusing the companion when its inputs
+are absent, and deferring the synthesis to the replay. Implementing each as a
+mutation and running the full binary suite separates them:
+
+| shape | cells red |
+|---|---|
+| (i) refuse the companion when the table cannot resolve it | **8** — the three above plus **six pre-existing**, including four capacity/refusal cells and `sync_session_upsert_reports_a_semantic_refusal_on_the_wire_6785` |
+| (ii) re-derive the companion at replay under the live tables | **1** — only the characterization cell written to flip |
+
+Shape (i)'s extra reds are not incidental. `synced_import_cap_for`'s 2x is
+load-bearing *because* `synthesized_synced_reverse_entry` returns `Some` for
+every non-reverse import — the cap counts ENTRIES and each admitted forward
+occupies two. Refusing the companion changes that accounting. (Caveat on the
+measurement: the mutant gates on `forwarding.egress.is_empty()`, so it also
+fires for every fixture built on a default `Coordinator::new()`; the six reds
+are real but their count is a property of the fixture population as much as of
+the shape.) Shape (ii) is the one #8171 already established for the entries
+themselves, and it is empirically the cheap one.
+
 ## Hot-path constants
 
 - `RX_BATCH_SIZE = 64`
