@@ -26,6 +26,10 @@ mod debug_state;
 mod latency;
 mod profile;
 mod session_delta;
+// #8108: the delta-buffer high-water mark.
+#[cfg(test)]
+#[path = "delta_high_water_8108_tests.rs"]
+mod delta_high_water_8108_tests;
 mod snapshot;
 mod tx_inbox;
 
@@ -192,6 +196,19 @@ pub(in crate::afxdp) struct BindingLiveState {
     pub(super) session_expires: AtomicU64,
     pub(super) session_delta_generated: AtomicU64,
     pub(super) session_delta_dropped: AtomicU64,
+    /// #8108: the greatest depth `pending_session_deltas` has reached.
+    ///
+    /// Monotonic within a process, and a HIGH-WATER mark rather than a depth
+    /// gauge because the buffer drains: a depth sampled at 1 Hz sees a
+    /// revocation burst only if the sample lands inside it, and otherwise
+    /// reports a comfortable number for exactly the event being measured.
+    ///
+    /// Paired with `session_delta_dropped` it separates three states the
+    /// existing signals cannot: comfortable (high water well under the cap),
+    /// surviving on luck (high water near the cap, dropped == 0), and lossy
+    /// (dropped > 0). Before this only the third was observable, and only as
+    /// a boolean.
+    pub(super) session_delta_high_water: AtomicU64,
     pub(super) session_delta_drained: AtomicU64,
     pub(super) policy_denied_packets: AtomicU64,
     /// #3326: host-bound (LocalDelivery) packets dropped by the zone
@@ -838,6 +855,16 @@ pub(in crate::afxdp) struct BindingLiveState {
 // green at any one pair of literals, which is what makes that case
 // un-satisfiable by re-measuring.)
 //
+// #8108 re-measured the same two offsets again (2176 -> 2184, 2304 -> 2312)
+// when `session_delta_high_water` joined the cold-counter run. Same legitimate
+// case as #6664 and #7054: the field is UNCONDITIONAL, so both builds shift by
+// the same 8 bytes and re-measuring makes them green together. `size_of` did
+// NOT move -- it is still 2368, so the tail padding absorbed this field too,
+// exactly as it absorbed #7054's. That is now twice the #6664 note's
+// "the next field will move size_of" has failed to hold, which is the reason
+// that note says to check the OFFSETS rather than the size: an unchanged
+// `size_of` is not evidence a field failed to land.
+//
 // The #6664 note's prediction that "the next field added here will move
 // `size_of`" did NOT hold: it is still 2304, because the tail padding had room
 // for a second u64. Recorded so the next reader does not treat an unchanged
@@ -858,8 +885,8 @@ pub(in crate::afxdp) struct BindingLiveState {
 // be the surprising result.
 const _: [(); 2368] = [(); std::mem::size_of::<BindingLiveState>()];
 const _: [(); 64] = [(); std::mem::align_of::<BindingLiveState>()];
-const _: [(); 2176] = [(); std::mem::offset_of!(BindingLiveState, pending_tx_admitted)];
-const _: [(); 2304] = [(); std::mem::offset_of!(BindingLiveState, delta_loss_pending)];
+const _: [(); 2184] = [(); std::mem::offset_of!(BindingLiveState, pending_tx_admitted)];
+const _: [(); 2312] = [(); std::mem::offset_of!(BindingLiveState, delta_loss_pending)];
 
 impl BindingLiveState {
     pub(super) fn new() -> Self {
@@ -908,6 +935,7 @@ impl BindingLiveState {
             session_creates: AtomicU64::new(0),
             session_expires: AtomicU64::new(0),
             session_delta_generated: AtomicU64::new(0),
+            session_delta_high_water: AtomicU64::new(0),
             session_delta_dropped: AtomicU64::new(0),
             session_delta_drained: AtomicU64::new(0),
             policy_denied_packets: AtomicU64::new(0),

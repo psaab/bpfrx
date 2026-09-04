@@ -106,6 +106,7 @@ fn copy_live_snapshot(binding: &mut BindingStatus, snap: BindingLiveSnapshot) {
     binding.session_delta_pending = snap.session_delta_pending;
     binding.session_delta_generated = snap.session_delta_generated;
     binding.session_delta_dropped = snap.session_delta_dropped;
+    binding.session_delta_high_water = snap.session_delta_high_water;
     binding.session_delta_drained = snap.session_delta_drained;
     binding.policy_denied_packets = snap.policy_denied_packets;
     binding.host_inbound_denied_packets = snap.host_inbound_denied_packets;
@@ -330,6 +331,7 @@ fn zero_unbound_slot(binding: &mut BindingStatus) {
     binding.session_delta_pending = 0;
     binding.session_delta_generated = 0;
     binding.session_delta_dropped = 0;
+    binding.session_delta_high_water = 0;
     binding.session_delta_drained = 0;
     binding.policy_denied_packets = 0;
     binding.host_inbound_denied_packets = 0;

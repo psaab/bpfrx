@@ -119,6 +119,8 @@ type BindingStatus struct {
 	SessionDeltaPending   uint64 `json:"session_delta_pending,omitempty"`
 	SessionDeltaGenerated uint64 `json:"session_delta_generated,omitempty"`
 	SessionDeltaDropped   uint64 `json:"session_delta_dropped,omitempty"`
+	// #8108: greatest depth the RPC-fallback delta buffer reached (high water).
+	SessionDeltaHighWater uint64 `json:"session_delta_high_water,omitempty"`
 	SessionDeltaDrained   uint64 `json:"session_delta_drained,omitempty"`
 	PolicyDeniedPackets   uint64 `json:"policy_denied_packets,omitempty"`
 	// #3326: host-bound packets dropped by the zone host-inbound admission

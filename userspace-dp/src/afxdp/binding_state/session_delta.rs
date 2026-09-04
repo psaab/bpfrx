@@ -22,6 +22,25 @@ impl BindingLiveState {
                     return;
                 }
                 pending.push_back(delta);
+                // #8108: record how FULL the buffer got, not how full it is.
+                //
+                // The acceptance measurement this issue asks for -- "a measured
+                // ring-occupancy figure from a revocation burst" -- could not be
+                // taken: `len()` was read only for the cap check above and
+                // nothing retained it, and `delta_loss_pending` is a BOOLEAN
+                // that says "we overflowed at least once", never "we reached
+                // 90%". So there was no way to distinguish a buffer that is
+                // comfortable from one that survives on luck.
+                //
+                // A HIGH-WATER MARK rather than a depth gauge, and that is the
+                // whole point. This buffer DRAINS; a depth sampled at 1 Hz sees
+                // a burst only if the sample lands inside it, and misses it
+                // otherwise -- reporting a healthy-looking small number for
+                // exactly the event being measured. A high-water mark cannot
+                // miss a burst it observed.
+                let depth = pending.len();
+                self.session_delta_high_water
+                    .fetch_max(depth as u64, Ordering::Relaxed);
             }
             Err(_) => {
                 self.session_delta_dropped.fetch_add(1, Ordering::Relaxed);

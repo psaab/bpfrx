@@ -91,6 +91,7 @@ impl BindingLiveState {
             session_delta_pending,
             session_delta_generated: self.session_delta_generated.load(Ordering::Relaxed),
             session_delta_dropped: self.session_delta_dropped.load(Ordering::Relaxed),
+            session_delta_high_water: self.session_delta_high_water.load(Ordering::Relaxed),
             session_delta_drained: self.session_delta_drained.load(Ordering::Relaxed),
             policy_denied_packets: self.policy_denied_packets.load(Ordering::Relaxed),
             host_inbound_denied_packets: self

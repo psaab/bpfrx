@@ -1435,6 +1435,8 @@ pub(crate) struct BindingLiveSnapshot {
     pub(crate) session_delta_pending: u64,
     pub(crate) session_delta_generated: u64,
     pub(crate) session_delta_dropped: u64,
+    /// #8108: greatest depth the RPC-fallback delta buffer has reached.
+    pub(crate) session_delta_high_water: u64,
     pub(crate) session_delta_drained: u64,
     pub(crate) policy_denied_packets: u64,
     /// #3326: host-inbound admission denies on the LocalDelivery path.
