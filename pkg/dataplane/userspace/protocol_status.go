@@ -446,6 +446,12 @@ type ProcessStatus struct {
 	// record, and its producers, behind). Surfaced as
 	// xpf_userspace_worker_command_queue_drops_total.
 	WorkerCommandQueueDrops uint64 `json:"worker_command_queue_drops,omitempty"`
+	// #8586: the DELETE-specific split of the aggregate above.
+	// `Dropped - DropRepaired` is the unattributed remainder — a refused
+	// cross-worker DeleteSynced whose owning worker could not be identified, so
+	// nothing ran #8576's NAT teardown on its behalf.
+	SessionDeleteReplicaDropped      uint64 `json:"session_delete_replica_dropped,omitempty"`
+	SessionDeleteReplicaDropRepaired uint64 `json:"session_delete_replica_drop_repaired,omitempty"`
 	// #2402/#6641: shared-session mutex poison recoveries (a worker
 	// thread panicked while holding a shared-session or owner-RG-index
 	// mutex; the committed map was recovered and the poison cleared --

@@ -469,6 +469,25 @@ impl super::Coordinator {
         crate::afxdp::worker_queue::WORKER_COMMAND_QUEUE_DROPS.load(Ordering::Relaxed)
     }
 
+    /// #8586: cross-worker `DeleteSynced` replicas a full sibling queue refused.
+    /// Surfaced as `xpf_userspace_session_delete_replica_dropped_total`.
+    ///
+    /// Separate from `worker_command_queue_drops_total` because losing a DELETE
+    /// and losing an UPSERT are not the same event: the upsert's content is
+    /// still in the shared map, while a lost delete leaves a sibling serving a
+    /// session that no longer exists AND holding its NAT reservation for the
+    /// life of the allocator (#8576).
+    pub fn session_delete_replica_dropped_total(&self) -> u64 {
+        crate::afxdp::SESSION_DELETE_REPLICA_DROPPED.load(Ordering::Relaxed)
+    }
+
+    /// #8586: the subset of the above whose owning worker was identified, so
+    /// #8576's NAT teardown ran on its behalf. The DIFFERENCE from the counter
+    /// above is the unattributed remainder — a refused delete nothing repaired.
+    pub fn session_delete_replica_drop_repaired_total(&self) -> u64 {
+        crate::afxdp::SESSION_DELETE_REPLICA_DROP_REPAIRED.load(Ordering::Relaxed)
+    }
+
     /// #2402/#6641: total shared-session mutex poison recoveries across
     /// every shared-session and owner-RG-index site (publish, remove,
     /// lookups, index maintenance, and the #5154 HA import

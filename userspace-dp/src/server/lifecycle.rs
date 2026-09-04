@@ -259,6 +259,8 @@ pub(crate) fn run() -> Result<(), String> {
             interface_snat_registry_cap_exhaustion_total: 0,
             worker_command_queue_poison_recoveries: 0,
             worker_command_queue_drops: 0,
+            session_delete_replica_dropped: 0,
+            session_delete_replica_drop_repaired: 0,
             shared_session_poison_recoveries: 0,
             session_install_stale_ignored: 0,
             session_delete_stale_ignored: 0,

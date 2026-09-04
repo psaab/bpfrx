@@ -5384,3 +5384,57 @@ fn sync_session_import_is_applied_while_the_state_lock_is_held_7209() {
         .expect("handler result");
     let _ = std::fs::remove_file(&state_file);
 }
+
+/// #8586 THE WIRING: the DELETE-replica counters must reach their own status
+/// fields, and not each other's.
+///
+/// The protocol cell pins that the two fields SERIALIZE under distinct keys;
+/// this pins that `refresh_status` fills them from the right sources. Both are
+/// needed and neither implies the other — a `refresh_status` that assigned the
+/// same accessor to both would leave the wire cell green while making
+/// `dropped - repaired` (the unattributed remainder #8586 reads) identically 0.
+///
+/// Distinct increments so a transposition is visible; equal ones would let a
+/// swap pass.
+///
+/// The counters are process-wide, so the deltas are measured against a read
+/// taken in this same test binary — the same posture the #6751 cell above
+/// takes, and `make test-rust` runs `--test-threads=1`.
+#[test]
+fn refresh_status_projects_the_delete_replica_counters_8586() {
+    use std::sync::atomic::Ordering;
+
+    let state = new_state(ProcessStatus::default());
+    let mut guard = state.lock().expect("server state");
+
+    let before_dropped =
+        crate::afxdp::SESSION_DELETE_REPLICA_DROPPED.load(Ordering::Relaxed);
+    let before_repaired =
+        crate::afxdp::SESSION_DELETE_REPLICA_DROP_REPAIRED.load(Ordering::Relaxed);
+
+    crate::afxdp::SESSION_DELETE_REPLICA_DROPPED.fetch_add(13, Ordering::Relaxed);
+    crate::afxdp::SESSION_DELETE_REPLICA_DROP_REPAIRED
+        .fetch_add(5, Ordering::Relaxed);
+
+    refresh_status(&mut guard);
+
+    assert_eq!(
+        guard.status.session_delete_replica_dropped,
+        before_dropped + 13,
+        "the refused-delete counter must reach its own status field"
+    );
+    assert_eq!(
+        guard.status.session_delete_replica_drop_repaired,
+        before_repaired + 5,
+        "the repaired-delete counter must reach its own status field, not the \
+         drop counter's"
+    );
+    assert_eq!(
+        guard.status.session_delete_replica_dropped
+            - guard.status.session_delete_replica_drop_repaired,
+        (before_dropped + 13) - (before_repaired + 5),
+        "the UNATTRIBUTED remainder is the difference of the two; a refresh that \
+         filled both from one accessor reports 0 here for a box that is losing \
+         deletes and repairing none of them"
+    );
+}
