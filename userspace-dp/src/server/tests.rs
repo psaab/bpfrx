@@ -5027,3 +5027,112 @@ fn worker_loop_drains_the_pptp_control_inbox_7699() {
          which calls the drain directly (#7699)"
     );
 }
+
+// --- #7919: the session_counters verb -----------------------------------
+
+// The Go side classifies an OLD helper's refusal by matching the literal
+// prefix "unknown request type" (`isUnknownVerbError`,
+// pkg/dataplane/userspace/manager_sessions.go). That match is against wording
+// produced by binaries ALREADY RELEASED, which cannot be changed retroactively
+// — so the wording is a wire contract in everything but name, and rewording it
+// here would silently downgrade "unsupported, ask a newer helper" to a generic
+// error on every mixed-version pair.
+//
+// Pinned as a PREFIX rather than the whole string: the verb name is appended,
+// and pinning the full sentence would red on any new verb for no reason.
+#[test]
+fn the_unknown_verb_wording_the_go_side_matches_on_is_pinned_7919() {
+    let response = run_request(new_state(ProcessStatus::default()), req("session_counters_typo"));
+    assert!(!response.ok);
+    assert!(
+        response.error.starts_with("unknown request type"),
+        "the Go side's isUnknownVerbError matches this prefix on binaries that \
+         are already released; got: {}",
+        response.error
+    );
+}
+
+// A `session_counters` request with NO 5-tuple is REFUSED, not answered with an
+// empty row set. An empty answer to a malformed question is indistinguishable
+// from "no worker holds this session", which is one of the two states the verb
+// exists to separate.
+#[test]
+fn session_counters_without_a_query_is_refused_not_empty_7919() {
+    let response = run_request(new_state(ProcessStatus::default()), req("session_counters"));
+    assert!(
+        !response.ok,
+        "a query with no 5-tuple must be refused, not silently answered"
+    );
+    assert!(
+        response.error.contains("no session_counter_query"),
+        "the refusal must say what was missing; got: {}",
+        response.error
+    );
+    assert!(
+        response.session_counters.is_empty(),
+        "a refused query must carry no rows"
+    );
+}
+
+// An unparseable address is likewise refused rather than defaulted. A
+// `0.0.0.0` fallback would be a plausible-looking key that resolves to no
+// session, reporting "not held" for a question that was never asked.
+#[test]
+fn session_counters_refuses_an_unparseable_address_7919() {
+    let mut request = req("session_counters");
+    request.session_counter_query = Some(crate::protocol::SessionCounterQueryRequest {
+        src_ip: "not-an-ip".to_string(),
+        dst_ip: "172.16.80.200".to_string(),
+        src_port: 40001,
+        dst_port: 5201,
+        protocol: 6,
+    });
+    let response = run_request(new_state(ProcessStatus::default()), request);
+    assert!(!response.ok, "an unparseable address must be refused");
+    assert!(
+        response.error.contains("unparseable src_ip"),
+        "the refusal must name the field; got: {}",
+        response.error
+    );
+
+    // POSITIVE CONTROL: the SAME request with a valid address is accepted, so
+    // the refusal above is about the address and not about the verb being
+    // unreachable or the request shape being wrong.
+    let mut ok_request = req("session_counters");
+    ok_request.session_counter_query = Some(crate::protocol::SessionCounterQueryRequest {
+        src_ip: "10.0.61.102".to_string(),
+        dst_ip: "172.16.80.200".to_string(),
+        src_port: 40001,
+        dst_port: 5201,
+        protocol: 6,
+    });
+    let ok_response = run_request(new_state(ProcessStatus::default()), ok_request);
+    assert!(
+        ok_response.ok,
+        "control: a well-formed query must be accepted (no workers registered \
+         here, so it simply returns no rows); got: {}",
+        ok_response.error
+    );
+}
+
+// Mixed address families are refused: a v4 source with a v6 destination is not
+// a session key this dataplane can hold, and building one would query a tuple
+// that cannot exist.
+#[test]
+fn session_counters_refuses_mixed_address_families_7919() {
+    let mut request = req("session_counters");
+    request.session_counter_query = Some(crate::protocol::SessionCounterQueryRequest {
+        src_ip: "10.0.61.102".to_string(),
+        dst_ip: "2001:559:8585:80::200".to_string(),
+        src_port: 40001,
+        dst_port: 5201,
+        protocol: 6,
+    });
+    let response = run_request(new_state(ProcessStatus::default()), request);
+    assert!(!response.ok, "mixed families must be refused");
+    assert!(
+        response.error.contains("families differ"),
+        "got: {}",
+        response.error
+    );
+}

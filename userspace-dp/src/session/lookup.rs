@@ -438,6 +438,22 @@ impl SessionTable {
             .map(|entry| (entry.decision, entry.metadata.clone(), entry.origin))
     }
 
+    /// #7919: read this key's live per-direction counters and whether the
+    /// entry is a replica, without touching the table.
+    ///
+    /// The pair is returned together on purpose. "This worker holds the session
+    /// and it carries no traffic" and "this worker does not hold it" are
+    /// different facts, and the diagnostic that reads this exists precisely to
+    /// tell them apart — `None` means the second, `Some((zeroed, _))` the first.
+    /// Returning bare counters would collapse them into one zero.
+    pub fn counters_with_replica_flag(
+        &self,
+        key: &SessionKey,
+    ) -> Option<(SessionCounters, bool)> {
+        self.entry_by_key(key)
+            .map(|entry| (entry.counters, entry.origin.is_peer_synced()))
+    }
+
     /// #5152: test-only read of an entry's `first_held_ns` — the standby
     /// bounded-leak HOLD clock (§6.4). Lets the session_glue activation-scan
     /// test assert the clock is PRESERVED for a session that re-resolves to

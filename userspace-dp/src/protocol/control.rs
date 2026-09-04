@@ -206,6 +206,12 @@ pub(crate) struct ControlRequest {
     pub session_deltas: Option<SessionDeltaDrainRequest>,
     #[serde(rename = "session_export", default)]
     pub session_export: Option<SessionExportRequest>,
+    /// #7919: the 5-tuple to report per-worker counters for (`session_counters`
+    /// verb). Absent for every other verb — an ADDED field, never a
+    /// redefinition of one, so an old helper ignores it and an old control
+    /// plane never sends it.
+    #[serde(rename = "session_counter_query", default)]
+    pub session_counter_query: Option<SessionCounterQueryRequest>,
     /// #8121: idle persistent-NAT leases to install (the `import_idle_leases`
     /// verb). Absent for every other verb.
     #[serde(rename = "idle_leases", default, skip_serializing_if = "Vec::is_empty")]
@@ -493,6 +499,17 @@ pub(crate) struct ControlResponse {
     pub ok: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error: String,
+    /// #7919: one row per worker for the `session_counters` verb. Empty for
+    /// every other verb, and empty from a helper that does not implement it —
+    /// the Go caller distinguishes those by the `unknown request type` error,
+    /// never by emptiness, because an unimplemented verb and a genuinely empty
+    /// answer must not read alike.
+    #[serde(
+        rename = "session_counters",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub session_counters: Vec<SessionCounterRowWire>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<ProcessStatus>,
     #[serde(
@@ -834,4 +851,55 @@ pub(crate) struct SessionExportRequest {
     pub owner_rgs: Vec<i32>,
     #[serde(default)]
     pub max: u32,
+}
+
+/// #7919: the 5-tuple a `session_counters` query names.
+///
+/// Addresses are strings for the same reason the rest of this protocol uses
+/// them: a numeric form would have to agree about byte order across two
+/// languages, and every place this protocol has done that has needed a comment
+/// explaining which endianness won.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct SessionCounterQueryRequest {
+    #[serde(default)]
+    pub src_ip: String,
+    #[serde(default)]
+    pub dst_ip: String,
+    #[serde(default)]
+    pub src_port: u16,
+    #[serde(default)]
+    pub dst_port: u16,
+    #[serde(default)]
+    pub protocol: u8,
+}
+
+/// #7919: what ONE worker's own session table holds for the queried 5-tuple.
+///
+/// Three states are deliberately distinct and none may be collapsed:
+///   - `answered = false` — the worker did not reply before the deadline. Not
+///     an answer at all.
+///   - `answered, !found`  — it replied: it does not hold this session.
+///   - `answered, found`   — it holds it; the counters are what its copy says,
+///     and `replica` says whether that copy is a peer-synced/replica origin.
+///
+/// A reading that flattened these into "counters or zero" would answer neither
+/// of the two questions the query exists to separate.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct SessionCounterRowWire {
+    #[serde(default)]
+    pub worker_id: u32,
+    #[serde(default)]
+    pub answered: bool,
+    #[serde(default)]
+    pub found: bool,
+    #[serde(default)]
+    pub replica: bool,
+    #[serde(default)]
+    pub fwd_packets: u64,
+    #[serde(default)]
+    pub fwd_bytes: u64,
+    #[serde(default)]
+    pub rev_packets: u64,
+    #[serde(default)]
+    pub rev_bytes: u64,
 }
