@@ -3568,7 +3568,10 @@ pub(super) fn poll_binding_process_descriptor(
                     if is_nat64_icmp_error {
                         match try_translate_nat64_icmp_error(
                             desc,
-                            raw_frame,
+                            // #8271: the frame to PARSE is the decapped inner
+                            // one, which is what `meta` describes. `raw_frame`
+                            // here is still the encapsulated outer frame.
+                            packet_frame,
                             meta,
                             binding_index,
                             sessions,
@@ -3675,11 +3678,14 @@ pub(super) fn poll_binding_process_descriptor(
                             .unwrap_or(false);
                     if is_embedded_icmp_error {
                         match try_reverse_embedded_icmp_error(
-                            // SAFETY: per the `area` contract in this function's
-                            // header comment.
-                            unsafe { &*area },
                             desc,
-                            raw_frame,
+                            // #8271: as above — the classification directly
+                            // overhead already reads `packet_frame` at
+                            // `meta.l4_offset`, and the helper must read the
+                            // same bytes. It previously received `raw_frame`,
+                            // so a GRE-decapped ICMP error was parsed at inner
+                            // offsets against outer bytes.
+                            packet_frame,
                             meta,
                             binding_index,
                             sessions,

@@ -109,35 +109,23 @@ pub(super) fn try_embedded_icmp_session_match_from_frame(
     session_match::try_embedded_icmp_session_match_from_frame(frame, meta, sessions, now_ns)
 }
 
-/// Extended embedded ICMP session match that returns full NAT
-/// reversal info. Unlike `try_embedded_icmp_session_match`, this also
-/// extracts the original (pre-NAT) source IP and port and resolves
-/// forwarding toward the original client.
-pub(super) fn try_embedded_icmp_nat_match(
-    area: &MmapArea,
-    desc: XdpDesc,
-    meta: UserspaceDpMeta,
-    sessions: &mut SessionTable,
-    forwarding: &ForwardingState,
-    dynamic_neighbors: &Arc<ShardedNeighborMap>,
-    shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
-    shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
-    shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
-    now_ns: u64,
-) -> Option<EmbeddedIcmpMatch> {
-    let frame = area.slice(desc.addr as usize, desc.len as usize)?;
-    try_embedded_icmp_nat_match_from_frame(
-        frame,
-        meta,
-        sessions,
-        forwarding,
-        dynamic_neighbors,
-        shared_sessions,
-        shared_nat_sessions,
-        shared_forward_wire_sessions,
-        now_ns,
-    )
-}
+// #8271: `try_embedded_icmp_nat_match` -- the `(area, desc)` wrapper that
+// sliced the UMEM frame at `desc.addr`/`desc.len` and called the `_from_frame`
+// twin below -- was DELETED rather than left unused.
+//
+// It had exactly one behaviour: pair whatever frame `desc` points at with
+// whatever `meta` it was handed. On a native-GRE-decapped packet those are
+// different packets -- `stage_native_gre_decap` rebinds `meta` to the inner
+// frame while `desc` still references the un-decapped outer one -- and its last
+// caller (`try_reverse_embedded_icmp_error`) was doing precisely that, parsing
+// outer bytes at inner offsets. Two sibling arms of
+// `poll_binding_process_descriptor` had already been fixed for the same pairing
+// (#1885, #1902); these two had not.
+//
+// Removing the wrapper removes the ability to make that mistake, which is worth
+// more than removing this instance of it: every caller must now name the frame
+// it means. Callers that genuinely hold only a descriptor slice it themselves
+// and pass the bytes.
 
 /// Core implementation of embedded ICMP NAT match operating on a
 /// frame slice. Dispatches to the v4 / v6 outer family branch.
