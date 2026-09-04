@@ -56,6 +56,35 @@ package dataplane
 // for instead of a fresh hand-written list. That is exactly the failure #7097
 // documents.
 
+// FibGen IS CONDITIONALLY UNOBSERVED (#8612), and the conditional below is
+// written out in each twin rather than shared, exactly as ScrubNodeLocal writes
+// its list out twice: the two structs are separate declarations and the census
+// reaches both.
+//
+// THIS RESET SWEPT FibGen UP BY NAME, WHICH IS THE MISTAKE #8612 HAD TO UNDO
+// ONE FILE OVER. `LogFlagUserspaceTunnelEndpoint` says FibGen is not a FIB
+// generation at all: it is `config.StableTunnelEndpointID(ifName)`, an FNV-1a
+// fold of the interface NAME, which pkg/config/tunnelid.go documents as
+// crossing the cluster in this exact field, identical on both nodes by
+// construction. A name-derived identity is not an OBSERVATION, so the rule this
+// function states — "clear what the reverse direction has not observed yet" —
+// does not reach it. The reply direction of a tunnelled session traverses the
+// same tunnel; that is config, not a measurement of the first packet.
+//
+// #8612 corrected ScrubNodeLocal for exactly this reason. It did not correct
+// THIS function, and the reason is stated at the top of the file: since #8015
+// there has been no caller, so nothing could make the staleness observable.
+// K74 (#8597) adds the first callers back, which is precisely when the claim
+// has to be re-checked — an unfalsifiable claim in inert code is not a
+// verified one.
+//
+// What zeroing it would have cost is on the record in session_node_local.go:
+// "sessionSyncEgressLocked(0) and sessionSyncTunnelEndpointIDLocked(0) both
+// seed from a scrubbed ifindex and return 0 ... so a peer-imported tunnel
+// session was resolved as if it were not a tunnel session at all". FibGen is
+// carried in the on-map ABI (bpf_session_value.go), unlike IngressIfaceFold, so
+// this one is not merely theoretical at the install sites.
+
 // ResetUnobservedForReverseCompanion clears every field that records something
 // the REVERSE direction has not observed yet. Call it on the copy destined to
 // become a forward session's reverse companion, after the zone swap.
@@ -65,7 +94,10 @@ func (v *SessionValue) ResetUnobservedForReverseCompanion() {
 	v.FibVlanID = 0
 	v.FibDmac = [6]byte{}
 	v.FibSmac = [6]byte{}
-	v.FibGen = 0
+	// #8612: NOT unconditionally — see the note above this function.
+	if v.LogFlags&LogFlagUserspaceTunnelEndpoint == 0 {
+		v.FibGen = 0
+	}
 	// Forward ingress — where the reply will arrive is a prediction, not an
 	// observation, and routing may be asymmetric.
 	v.IngressIfindex = 0
@@ -79,7 +111,10 @@ func (v *SessionValueV6) ResetUnobservedForReverseCompanion() {
 	v.FibVlanID = 0
 	v.FibDmac = [6]byte{}
 	v.FibSmac = [6]byte{}
-	v.FibGen = 0
+	// #8612: see the v4 twin and the note above it.
+	if v.LogFlags&LogFlagUserspaceTunnelEndpoint == 0 {
+		v.FibGen = 0
+	}
 	v.IngressIfindex = 0
 	v.IngressVlanID = 0
 	v.IngressIfaceFold = 0
