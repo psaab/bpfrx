@@ -3,7 +3,6 @@ package configstore
 import (
 	"strings"
 	"testing"
-
 )
 
 // #8442 — an empty forwarding-class name committed GREEN and then made the

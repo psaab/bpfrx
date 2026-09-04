@@ -127,8 +127,8 @@ func TestVerifyAuth_CollidingUsernameLength(t *testing.T) {
 		authProto string
 		userName  string // length == truncLen
 	}{
-		{"sha-12char-username", "sha", "abcdefghijkl"},                 // 12 chars, truncLen 12
-		{"md5-12char-username", "md5", "abcdefghijkl"},                 // 12 chars, truncLen 12
+		{"sha-12char-username", "sha", "abcdefghijkl"},                   // 12 chars, truncLen 12
+		{"md5-12char-username", "md5", "abcdefghijkl"},                   // 12 chars, truncLen 12
 		{"sha256-24char-username", "sha256", "abcdefghijklmnopqrstuvwx"}, // 24 chars, truncLen 24
 	}
 	for _, c := range cases {

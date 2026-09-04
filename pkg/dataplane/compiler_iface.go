@@ -1202,8 +1202,13 @@ func buildInterfaceNetworkdModels(cfg *config.Config, result *CompileResult, see
 			// under its kernel name if the .link rename was lost. Search
 			// by the expected RETH virtual MAC.
 			rgID := effectiveCfg.RedundancyGroup
-			expectedMAC := net.HardwareAddr{0x02, 0xbf, 0x72,
-				byte(cfg.Chassis.Cluster.ClusterID), byte(rgID), byte(clusterNodeID)}
+			// #8340 (K105): the SAME construction the daemon programs, not a
+			// second copy of the literal. This is a search KEY — a format drift
+			// in one copy would make the recovery search find nothing and drop
+			// the RETH member silently, which is the failure this path exists
+			// to prevent.
+			expectedMAC := config.RethVirtualMAC(
+				cfg.Chassis.Cluster.ClusterID, rgID, clusterNodeID)
 			physIface = findInterfaceByMAC(expectedMAC)
 			if physIface != nil {
 				slog.Info("found RETH member under kernel name",

@@ -137,7 +137,7 @@ func TestTheDisarmSaysWhyItStoppedForwarding8447(t *testing.T) {
 	// announce a disarm. "Forwarding disarmed" alone tells an operator nothing
 	// they cannot already see from the outage.
 	for _, want := range []string{
-		"persistent-nat", // the operator's own configuration keyword
+		"persistent-nat",  // the operator's own configuration keyword
 		"HA-synchronized", // why it is refused
 	} {
 		if !strings.Contains(got, want) {

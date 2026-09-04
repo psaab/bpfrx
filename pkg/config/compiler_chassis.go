@@ -154,8 +154,8 @@ func validateDeviceMapStrict(cfg *Config) error {
 	// what the operator actually typed.
 	type firstUse struct{ spelling, identity string }
 	seenName := make(map[string]firstUse) // canonical Linux name -> first use
-	seenPCI := make(map[string]string)  // pci addr -> first logical name
-	seenMAC := make(map[string]string)  // mac -> first logical name
+	seenPCI := make(map[string]string)    // pci addr -> first logical name
+	seenMAC := make(map[string]string)    // mac -> first logical name
 
 	for _, e := range dm.Entries {
 		if e.LogicalName == "" {

@@ -55,6 +55,7 @@
 //     dropping the flock, so the file is already empty the instant the
 //     NEXT acquirer can flock it — closing the flock->truncate scheduling
 //     gap that truncate-on-acquire alone would leave open.
+//
 // Both are f.Truncate(0) on the HELD fd. os.Remove is deliberately NOT
 // used: flock binds the inode (open file description), so unlinking the
 // path while another fd has it open / awaits it lets a fresh O_CREAT

@@ -94,9 +94,9 @@ func TestEmptySecurityIdentitiesRejectedAtCommit7525(t *testing.T) {
 			tree := buildTree7525(t, tc.lines...)
 			_, err := CompileConfig(tree)
 			if err == nil {
-				t.Fatalf("an empty identity COMMITTED. It is stripped during "+
-					"normalization and an empty zone set matches as `any`, so this "+
-					"widens silently rather than failing — and the userspace preflight "+
+				t.Fatalf("an empty identity COMMITTED. It is stripped during " +
+					"normalization and an empty zone set matches as `any`, so this " +
+					"widens silently rather than failing — and the userspace preflight " +
 					"rejects the same reference, so the two halves disagree (#7525)")
 			}
 			if !strings.Contains(err.Error(), tc.want) {

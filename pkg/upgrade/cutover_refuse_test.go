@@ -41,7 +41,7 @@ func TestRefuseBeforeStop_NoPreviousVersion(t *testing.T) {
 	// transition, so a re-run after re-seeding does NOT resume a stale
 	// empty-prev journal and get stuck.
 	if _, serr := os.Stat(cfg.JournalPath); !os.IsNotExist(serr) {
-		t.Error("a journal was persisted on the unsanctioned-first-cut refusal "+
+		t.Error("a journal was persisted on the unsanctioned-first-cut refusal " +
 			"(a re-run after re-seeding would resume it and stay stuck)")
 	}
 }
@@ -270,7 +270,7 @@ func TestFlipFailure_FirstCutRestartsDaemon(t *testing.T) {
 	// would let a re-run skip STOP, run flip/start as a no-op against the
 	// already-running unit, and mark the cut COMMITTED without a real restart.
 	if _, serr := os.Stat(cfg.JournalPath); !os.IsNotExist(serr) {
-		t.Error("journal not cleared after a first-cut flip-failure restart "+
+		t.Error("journal not cleared after a first-cut flip-failure restart " +
 			"(a re-run would skip STOP and falsely commit)")
 	}
 	// Prove it: a clean re-run (daemon-reload now succeeds) must do a REAL
@@ -288,7 +288,7 @@ func TestFlipFailure_FirstCutRestartsDaemon(t *testing.T) {
 		}
 	}
 	if !sawStop {
-		t.Error("re-run did not STOP the unit — it resumed a stale journal and "+
+		t.Error("re-run did not STOP the unit — it resumed a stale journal and " +
 			"committed without a real restart")
 	}
 }
