@@ -3912,6 +3912,94 @@ fn interface_vlan_id_out_of_range_fails_closed() {
     }
 }
 
+/// #8597 K39: the 4096..=65535 gap #2410 left open. A VLAN in that band fits a
+/// `u16`, so the old bound accepted it — and `TxVlanTag::from` then masks it
+/// with `0x0fff`, emitting the frame on a DIFFERENT, live VLAN.
+///
+/// fail-on-revert: restoring the bound to `u16::MAX` makes both `expect_err`s
+/// below red, because 4097 and 4096 are perfectly representable as `u16`.
+#[test]
+fn interface_vlan_id_above_the_12_bit_field_fails_closed_8597_k39() {
+    // 4097 & 0x0fff == 1. Not a large VLAN downstream — VLAN 1, which on most
+    // switches is a live L2 domain the operator never named.
+    let err = vlan_snapshot_err_8597_k39(4097);
+    match err {
+        crate::policy::SnapshotIntegrityError::InterfaceVlanOutOfRange { interface, vlan_id } => {
+            assert_eq!(interface, "ge-0/0/2");
+            assert_eq!(vlan_id, 4097);
+        }
+        other => panic!("expected InterfaceVlanOutOfRange, got {other:?}"),
+    }
+
+    // 4096 is the worse one, and it is a DIFFERENT harm class rather than a
+    // bigger version of the same. 4096 & 0x0fff == 0, and `TxVlanTag::from`
+    // computes `present: vid > 0`, so `present` is false, `header_len()`
+    // returns 14, and the frame is emitted with NO TAG on an interface
+    // configured as tagged — landing in the native VLAN or dropped by the
+    // switch, not merely mis-delivered.
+    match vlan_snapshot_err_8597_k39(4096) {
+        crate::policy::SnapshotIntegrityError::InterfaceVlanOutOfRange { vlan_id, .. } => {
+            assert_eq!(vlan_id, 4096);
+        }
+        other => panic!("expected InterfaceVlanOutOfRange for 4096, got {other:?}"),
+    }
+}
+
+/// #8597 K39 ANTI-OVER-REJECT, and it is the assertion that decides whether the
+/// bound is right rather than merely tight.
+///
+/// The commit gate is `ValidateInteger(1, 4094)`
+/// (`pkg/config/schema_interfaces.go`), so no committed config reaches either
+/// boundary — this guards the tolerant load path. 4095 is accepted because it
+/// is REPRESENTABLE in the 12-bit field and does not alias; rejecting it would
+/// make this boundary stricter than the wire, which is a different claim from
+/// the one K39 is about (#6773: the boundary admits exactly the
+/// wire-representable range).
+#[test]
+fn interface_vlan_id_at_the_12_bit_boundary_is_accepted_8597_k39() {
+    for vlan in [1, 50, 4094, 4095] {
+        let snapshot = ConfigSnapshot {
+            interfaces: vec![InterfaceSnapshot {
+                name: "ge-0/0/2".into(),
+                ifindex: 23,
+                parent_ifindex: 22,
+                vlan_id: vlan,
+                hardware_addr: "02:00:00:00:00:23".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        try_build_forwarding_state_with_policy_counters(
+            &snapshot,
+            &crate::policy::PolicyCounterStore::default(),
+        )
+        .unwrap_or_else(|e| {
+            panic!("VLAN {vlan} is representable in the 12-bit field and must be \
+                    accepted; the bound must not over-reject what the commit gate \
+                    permits (max 4094). got {e:?}")
+        });
+    }
+}
+
+fn vlan_snapshot_err_8597_k39(vlan_id: i32) -> crate::policy::SnapshotIntegrityError {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "ge-0/0/2".into(),
+            ifindex: 23,
+            parent_ifindex: 22,
+            vlan_id,
+            hardware_addr: "02:00:00:00:00:23".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    try_build_forwarding_state_with_policy_counters(
+        &snapshot,
+        &crate::policy::PolicyCounterStore::default(),
+    )
+    .expect_err("a VLAN outside the 12-bit field must fail closed, not be masked")
+}
+
 /// #2410 anti-over-reject: an in-range VLAN (and the negative "no VLAN"
 /// sentinel) still build, byte-identical to the old `.max(0) as u16`.
 #[test]
