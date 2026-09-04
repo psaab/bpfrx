@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -33,7 +34,7 @@ func TestSchedulerRepublishFailClosedGaugeReadsSSOTLatch_5669(t *testing.T) {
 	// Install a healthy scheduler whose latch is NOT fail-closed.
 	sched, _ := scheduler.NewPrimed(map[string]*config.SchedulerConfig{
 		"workhours": {Name: "workhours", StartTime: "09:00:00", StopTime: "17:00:00"},
-	}, func(map[string]bool) error { return nil }, time.Now())
+	}, func(context.Context, map[string]bool) error { return nil }, time.Now())
 	d.scheduler.Store(sched)
 	if sched.RepublishFailClosed() {
 		t.Fatal("precondition: a freshly-primed healthy scheduler must not be fail-closed")

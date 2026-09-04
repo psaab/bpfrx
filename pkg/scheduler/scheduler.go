@@ -13,10 +13,29 @@ import (
 // Scheduler periodically evaluates time windows for named schedulers
 // and notifies a callback when any scheduler's active state changes.
 type Scheduler struct {
-	mu               sync.RWMutex
-	schedulers       map[string]*config.SchedulerConfig
-	active           map[string]bool
-	updateFn         func(activeState map[string]bool) error
+	mu         sync.RWMutex
+	schedulers map[string]*config.SchedulerConfig
+	active     map[string]bool
+	// #8660: updateFn receives the SCHEDULER'S ctx, not one it reaches for.
+	//
+	// The daemon's updateFn acquires a semaphore, and which ctx it acquires
+	// with decides whether shutdown can join this goroutine. It used to reach
+	// for `d.daemonCtx` — the raw, production-uncancelled parent — so
+	// cancelling the scheduler released nothing and `schedulerWg.Wait()`
+	// blocked behind a wedged apply. The cancellable ctx already existed one
+	// frame up, in `Run`; it was simply not passed down.
+	//
+	// Taking it as a PARAMETER rather than storing it makes that a type
+	// obligation: the next updateFn is handed the right ctx instead of having
+	// to know which of two to reach for, which is the defect itself.
+	updateFn func(ctx context.Context, activeState map[string]bool) error
+	// #8660: the tick interval, defaulting to defaultTickInterval. It exists
+	// so a test can bind `Run`'s ctx-threading END TO END rather than calling
+	// `evaluate` directly — a cell that calls `evaluate` cannot see `Run`
+	// handing down the wrong context, which is exactly the defect #8660 fixed.
+	// Verified by mutation: with `Run` passing context.Background(), an
+	// evaluate-level cell stays green.
+	tickInterval     time.Duration
 	lastEval         time.Time
 	lastWallUnixNano int64
 	unsafeUntil      time.Time
@@ -74,35 +93,51 @@ const (
 // returns that map without firing updateFn from inside the constructor. Daemon
 // apply paths use this when they already hold their own serialization lock and
 // must publish the initial state as part of the same apply transaction.
-func NewPrimed(schedulers map[string]*config.SchedulerConfig, updateFn func(activeState map[string]bool) error, now time.Time) (*Scheduler, map[string]bool) {
+func NewPrimed(schedulers map[string]*config.SchedulerConfig, updateFn func(ctx context.Context, activeState map[string]bool) error, now time.Time) (*Scheduler, map[string]bool) {
 	s := &Scheduler{
 		schedulers: schedulers,
 		active:     make(map[string]bool),
 		updateFn:   updateFn,
 	}
-	s.evaluate(now, false)
+	// notify=false: updateFn is not fired from the constructor, so this ctx
+	// is never observed by a callback.
+	s.evaluate(context.Background(), now, false)
 	return s, s.ActiveState()
 }
 
 // New creates a Scheduler with the given scheduler configs and update callback.
 // updateFn is called whenever any scheduler's active state changes, receiving
 // the current active state of all schedulers.
-func New(schedulers map[string]*config.SchedulerConfig, updateFn func(activeState map[string]bool) error) *Scheduler {
+func New(schedulers map[string]*config.SchedulerConfig, updateFn func(ctx context.Context, activeState map[string]bool) error) *Scheduler {
 	s, _ := NewPrimed(schedulers, updateFn, time.Now())
 	// Preserve the historical constructor contract: New notifies on initial
 	// state. NewPrimed is the no-notify variant for callers that publish the
 	// initial state under an external lock.
 	if len(s.active) > 0 {
-		s.notifyActiveState()
+		// #8660: the constructor has no lifecycle of its own — the caller has
+		// not started Run yet — so this notify is not something shutdown can
+		// or needs to interrupt. `New` has no production caller in any case;
+		// the daemon builds through NewPrimed.
+		s.notifyActiveState(context.Background())
 	}
 	return s
 }
 
 // Run starts the evaluation loop, checking every 60 seconds. It blocks until
 // the context is cancelled.
+// defaultTickInterval is the production evaluation period. Unchanged by #8660;
+// named so the seam beside it cannot drift from it silently.
+const defaultTickInterval = 60 * time.Second
+
 func (s *Scheduler) Run(ctx context.Context) {
 	slog.Info("scheduler: starting evaluation loop")
-	ticker := time.NewTicker(60 * time.Second)
+	s.mu.RLock()
+	interval := s.tickInterval
+	s.mu.RUnlock()
+	if interval <= 0 {
+		interval = defaultTickInterval
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -111,7 +146,7 @@ func (s *Scheduler) Run(ctx context.Context) {
 			slog.Info("scheduler: stopping evaluation loop")
 			return
 		case t := <-ticker.C:
-			s.evaluate(t, true)
+			s.evaluate(ctx, t, true)
 		}
 	}
 }
@@ -139,12 +174,15 @@ func (s *Scheduler) Update(schedulers map[string]*config.SchedulerConfig) {
 	s.mu.Lock()
 	s.schedulers = schedulers
 	s.mu.Unlock()
-	s.evaluate(time.Now(), true)
+	// #8660: no production caller — the daemon never calls Update, it builds a
+	// fresh scheduler on reconcile. A background ctx keeps the signature total
+	// rather than inventing a lifecycle this path does not have.
+	s.evaluate(context.Background(), time.Now(), true)
 }
 
 // evaluate checks each scheduler against the current time and fires the
 // callback if any state changed.
-func (s *Scheduler) evaluate(now time.Time, notify bool) {
+func (s *Scheduler) evaluate(ctx context.Context, now time.Time, notify bool) {
 	s.mu.Lock()
 
 	changed := false
@@ -211,7 +249,7 @@ func (s *Scheduler) evaluate(now time.Time, notify bool) {
 	cp := copyActiveState(newActive)
 	updateFn := s.updateFn
 	s.mu.Unlock()
-	err := updateFn(cp)
+	err := updateFn(ctx, cp)
 	s.mu.Lock()
 	s.recordRepublishResultLocked(err, now)
 	s.mu.Unlock()
@@ -315,7 +353,7 @@ func (s *Scheduler) wallClockDiscontinuousLocked(now time.Time) bool {
 	return false
 }
 
-func (s *Scheduler) notifyActiveState() {
+func (s *Scheduler) notifyActiveState(ctx context.Context) {
 	s.mu.RLock()
 	if s.updateFn == nil {
 		s.mu.RUnlock()
@@ -324,7 +362,7 @@ func (s *Scheduler) notifyActiveState() {
 	cp := copyActiveState(s.active)
 	updateFn := s.updateFn
 	s.mu.RUnlock()
-	err := updateFn(cp)
+	err := updateFn(ctx, cp)
 	s.mu.Lock()
 	s.recordRepublishResultLocked(err, time.Now())
 	s.mu.Unlock()

@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -30,7 +31,7 @@ func TestScheduler_RepublishFailureRetriesUntilConverged(t *testing.T) {
 		lastState map[string]bool
 		failing   = true
 	)
-	updateFn := func(state map[string]bool) error {
+	updateFn := func(_ context.Context, state map[string]bool) error {
 		calls++
 		lastState = state
 		if failing {
@@ -56,7 +57,7 @@ func TestScheduler_RepublishFailureRetriesUntilConverged(t *testing.T) {
 	// evaluate fires updateFn, which FAILS. The transition must stay
 	// pending for retry.
 	closeT := time.Date(2026, 2, 12, 17, 30, 0, 0, time.UTC)
-	s.evaluate(closeT, true)
+	s.evaluate(context.Background(), closeT, true)
 	if calls != 1 {
 		t.Fatalf("window close should fire updateFn once, got %d", calls)
 	}
@@ -75,7 +76,7 @@ func TestScheduler_RepublishFailureRetriesUntilConverged(t *testing.T) {
 	// but because the prior republish failed, evaluate MUST re-fire
 	// updateFn. This is the self-heal that revert kills.
 	nextT := closeT.Add(1 * time.Minute)
-	s.evaluate(nextT, true)
+	s.evaluate(context.Background(), nextT, true)
 	if calls != 2 {
 		t.Fatalf("pending republish must be retried on the next tick even without a state change, got %d calls", calls)
 	}
@@ -86,7 +87,7 @@ func TestScheduler_RepublishFailureRetriesUntilConverged(t *testing.T) {
 	// The transient failure clears; the retry converges and clears the
 	// pending flag.
 	failing = false
-	s.evaluate(nextT.Add(1*time.Minute), true)
+	s.evaluate(context.Background(), nextT.Add(1*time.Minute), true)
 	if calls != 3 {
 		t.Fatalf("pending republish must fire again, got %d calls", calls)
 	}
@@ -95,7 +96,7 @@ func TestScheduler_RepublishFailureRetriesUntilConverged(t *testing.T) {
 	}
 
 	// Converged steady state: no change, not pending → no further fires.
-	s.evaluate(nextT.Add(2*time.Minute), true)
+	s.evaluate(context.Background(), nextT.Add(2*time.Minute), true)
 	if calls != 3 {
 		t.Fatalf("converged steady state must not re-fire updateFn, got %d calls", calls)
 	}
@@ -110,7 +111,7 @@ func TestScheduler_SuccessfulRepublishNeverLatchesPending(t *testing.T) {
 		"workhours": {Name: "workhours", StartTime: "09:00:00", StopTime: "17:00:00"},
 	}
 	var calls int
-	updateFn := func(map[string]bool) error {
+	updateFn := func(context.Context, map[string]bool) error {
 		calls++
 		return nil
 	}
@@ -118,7 +119,7 @@ func TestScheduler_SuccessfulRepublishNeverLatchesPending(t *testing.T) {
 	s, _ := NewPrimed(schedCfg, updateFn, now)
 
 	// Close the window: one successful republish, no pending.
-	s.evaluate(time.Date(2026, 2, 12, 17, 30, 0, 0, time.UTC), true)
+	s.evaluate(context.Background(), time.Date(2026, 2, 12, 17, 30, 0, 0, time.UTC), true)
 	if calls != 1 {
 		t.Fatalf("window close should fire once, got %d", calls)
 	}
@@ -126,7 +127,7 @@ func TestScheduler_SuccessfulRepublishNeverLatchesPending(t *testing.T) {
 		t.Fatal("a successful republish must not latch pending")
 	}
 	// A subsequent no-change tick must not re-fire.
-	s.evaluate(time.Date(2026, 2, 12, 17, 31, 0, 0, time.UTC), true)
+	s.evaluate(context.Background(), time.Date(2026, 2, 12, 17, 31, 0, 0, time.UTC), true)
 	if calls != 1 {
 		t.Fatalf("no-change tick after a successful republish must not re-fire, got %d", calls)
 	}
