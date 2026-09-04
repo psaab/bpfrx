@@ -631,6 +631,10 @@ func (m *Manager) FormatStatistics() string {
 		fmt.Fprintf(&b, "    %-32s %-12s %s\n", "Service name", "Sent", "Received")
 		fmt.Fprintf(&b, "    %-32s %-12d %d\n", "Session create",
 			syncStats.SessionsSent, syncStats.SessionsReceived)
+		// #7842: the mirror-sweep SUB-TOTAL of the line above, so an operator
+		// can tell a duplicate backstop copy from an authoritative delta.
+		fmt.Fprintf(&b, "    %-32s %-12d %s\n", "  of which mirror sweep",
+			syncStats.SweepSessionsSent, "")
 		fmt.Fprintf(&b, "    %-32s %-12d %d\n", "Session close",
 			syncStats.DeletesSent, syncStats.DeletesReceived)
 		fmt.Fprintf(&b, "    %-32s %-12d %d\n", "Config",
@@ -784,6 +788,8 @@ func (m *Manager) FormatDataPlaneStatistics() string {
 	fmt.Fprintf(&b, "    %-32s %-12s %s\n", "Service name", "Sent", "Received")
 	fmt.Fprintf(&b, "    %-32s %-12d %d\n", "Session create",
 		syncStats.SessionsSent, syncStats.SessionsReceived)
+	fmt.Fprintf(&b, "    %-32s %-12d %s\n", "  of which mirror sweep",
+		syncStats.SweepSessionsSent, "")
 	fmt.Fprintf(&b, "    %-32s %-12d %d\n", "Session close",
 		syncStats.DeletesSent, syncStats.DeletesReceived)
 	fmt.Fprintf(&b, "    %-32s %-12d %d\n", "Config",
