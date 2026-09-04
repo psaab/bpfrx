@@ -1875,6 +1875,19 @@ type compileOpts struct {
 	// persisted or peer-synced config an older binary accepted still BOOTS
 	// (#1960 no-brick). Same doctrine as lenientVRRPGroupID.
 	lenientVRRPGroupPriority bool
+	// lenientVRRPGroupTimers (#8483) downgrades the VRRP timer gate
+	// (validateVRRPGroupTimersStrict) from a hard compile error to a
+	// cfg.Warnings entry. Same bypass as lenientVRRPGroupPriority, one leaf
+	// over: the PACKED hierarchical one-liner `vrrp-group 1 virtual-address
+	// 10.0.1.100/24 advertise-interval 256;` packs the timer onto the
+	// instance node's Keys, which walkInstanceChildren consumes as an
+	// unvalidated identity token, so a value the schema leaf's
+	// ValidateInteger would refuse commits cleanly. advertise-interval then
+	// reaches a 12-bit centisecond wire field and aliases silently. The
+	// tolerant load / peer-sync paths downgrade to a warning so an
+	// already-persisted or peer-synced config an older binary accepted still
+	// BOOTS (#1960 no-brick).
+	lenientVRRPGroupTimers bool
 	// lenientRethVRRPGroupID (#4826) downgrades the reth-derived VRRP VRID
 	// wire-width gate (validateRethVRRPGroupIDStrict) from a hard compile
 	// error to a cfg.Warnings entry. The strict commit / commit-check path
@@ -2644,6 +2657,7 @@ func lenientCompileOpts() compileOpts {
 		lenientChassisRG:                       true,
 		lenientVRRPGroupID:                     true,
 		lenientVRRPGroupPriority:               true,
+		lenientVRRPGroupTimers:                 true,
 		lenientRethVRRPGroupID:                 true,
 		lenientIfNameCollision:                 true,
 		lenientRethMember:                      true,
