@@ -198,11 +198,18 @@ type Config struct {
 	// ConfigPersistDegradedFn surfaces the configstore's persist-degraded
 	// state via /health and the xpf_daemon_config_persist_degraded gauge
 	// (#1799, mirrors the CompileHealthFn pattern). Returning true means
-	// the RUNNING active config failed to persist to disk (HA SyncApply
-	// or commit-confirmed auto-rollback hit a write error) and the
-	// background retry has not yet succeeded — a daemon restart would
-	// load a stale config. /health returns 503 while degraded. Optional;
-	// if nil, the check and gauge are omitted.
+	// config persistence is degraded, which now covers three causes: the
+	// RUNNING active config failed to persist to disk (HA SyncApply or
+	// commit-confirmed auto-rollback hit a write error) and the background
+	// retry has not yet succeeded — a daemon restart would load a stale
+	// config (#1799); a RESOLVED commit-confirmed record's removal is not
+	// yet durable, so a restart could resurrect its rollback (#5835); or
+	// boot recovery could not READ confirm.json, so the pending rollback
+	// window is already lost and an UNCONFIRMED config is standing with no
+	// timer (#8566). The last one is not self-healing — the window cannot
+	// be recovered — and clears only when a later arm or removal of a
+	// confirm record succeeds. /health returns 503 while degraded.
+	// Optional; if nil, the check and gauge are omitted.
 	ConfigPersistDegradedFn func() bool
 	// RollbackHistoryDegradedFn surfaces the configstore's
 	// rollback-history-degraded state via /health and the

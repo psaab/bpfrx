@@ -189,6 +189,28 @@ type confirmRecord struct {
 	// check and behaves exactly as #4577, preserving the cross-upgrade
 	// auto-rollback hatch (confirmRecord evolves via additive JSON fields).
 	GuardedHash string `json:"guarded_hash,omitempty"`
+	// Resolved marks this record as a RESOLUTION TOMBSTONE (#8565): the window
+	// it describes was already resolved — confirmed, superseded, or rolled back
+	// — and only the DURABLE DELETION of this file was still owed. Recovery must
+	// therefore neither re-arm its timer nor revert to its PrevTree; it must
+	// finish the deletion.
+	//
+	// Without it, "window pending" and "window RESOLVED but the deletion failed"
+	// are the same bytes on disk. #5835's GuardedHash check separates them only
+	// when the resolution CHANGED the active config; a confirmation does not
+	// change it at all (`ConfirmCommit` / `ConfirmPendingOnDemotion` replace no
+	// tree), so the hash still matches and recovery reverts a config the
+	// operator explicitly confirmed.
+	//
+	// Written durably BEFORE the delete it precedes, and only at the point the
+	// removal is actually reached — which #5473 already defers until the
+	// resolving write is durable — so a tombstone never marks a window whose
+	// resolution did not take effect. A tombstone write that itself fails
+	// degrades to exactly the pre-#8565 behaviour, never worse.
+	//
+	// Additive, per this file's own contract: an older reader ignores the
+	// unknown field and behaves as it does today.
+	Resolved bool `json:"resolved,omitempty"`
 }
 
 // confirmPath returns the path to the pending commit-confirmed state file.

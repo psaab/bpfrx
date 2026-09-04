@@ -791,9 +791,53 @@ per-path:
     no re-arm) rather than reverting an unrelated, already-confirmed
     generation. A legacy record (empty `GuardedHash`, pre-#5835) skips the
     check and recovers exactly as #4577, preserving the cross-upgrade hatch.
-    A residual case remains by design: an explicit confirm with NO later
-    commit + an immediate crash before the retry heals fails SAFE (reverts on
-    boot) — consistent with `ConfirmCommit` having returned an error.
+  - **A resolved record carries a TOMBSTONE (#8565).** The `GuardedHash`
+    binding above separates "pending" from "resolved" only when the
+    resolution CHANGED the active config. A confirmation changes nothing —
+    `ConfirmCommit` and `ConfirmPendingOnDemotion` replace no tree — so the
+    hash still matched and recovery treated a resolved-but-undeleted record
+    as LIVE: past the deadline it REVERTED a config the operator had
+    explicitly confirmed, and inside the window it re-armed the rollback over
+    it. This README previously recorded that as a residual that "fails SAFE
+    … consistent with `ConfirmCommit` having returned an error"; that
+    rationale covers only the one path that HAS an error to return.
+    `ConfirmPendingOnDemotion` returns a bool and the plain-commit / HA-sync
+    paths discard the error, so on those the operator's confirmation was
+    reverted with no diagnostic anywhere. `resolveConfirmRemovalLocked` now
+    writes the record back with `Resolved` set (an additive JSON field)
+    DURABLY BEFORE deleting it, and `recoverPendingConfirmLocked` finishes the
+    owed deletion instead of acting on it. Which way it errs: a tombstoned
+    record is ignored, so the CONFIRMED config stands — #4577 is untouched
+    because an UNRESOLVED record carries no tombstone and still reverts. The
+    tombstone is written only where the removal is actually reached, which
+    #5473 already defers until the resolving write is durable, so it can
+    never mark a window whose resolution did not take effect; and a tombstone
+    write that itself fails degrades to exactly the pre-#8565 behaviour. A
+    TRANSIENT and a PERMANENT removal failure get the same answer on purpose
+    — both mean the window is resolved — and differ only in how long
+    `ConfigPersistDegraded()` keeps reporting the undeleted record.
+  - **A boot read failure is REPORTED, not swallowed (#8566).**
+    `recoverPendingConfirmLocked` logged a WARN and returned nil when
+    `ReadConfirm` failed, so `Load` succeeded and the daemon came up with the
+    rollback window GONE — no timer, no debt, and `ConfigPersistDegraded()`
+    false, so /health returned 200 and
+    `xpf_daemon_config_persist_degraded` read 0. The still-UNCONFIRMED config
+    stood permanently, which is the #4577 failure the record exists to
+    prevent, and the only evidence was one log line. Every other way the
+    store ends a boot unsafe raises degraded health; this one did not, so
+    nothing alerted on it. The read failure now logs at ERROR, journals
+    `confirm_recovery_read_error`, and sets `confirmRecoveryReadFailed`,
+    which `ConfigPersistDegraded()` folds in (→ /health 503 + the gauge) and
+    `ConfirmRecoveryReadFailed()` exposes on its own. Three deliberate
+    non-changes: `Load` still SUCCEEDS (refusing to boot on an unreadable
+    transient recovery file would turn a corrupt 200-byte file into an
+    outage — the #1960 no-brick posture); the record is NOT deleted (a
+    decrypt failure can be a transient master-key problem and the window may
+    be readable on a later boot); and no bounded in-`Load` retry split by
+    error class is added, because that is a startup-latency and taxonomy
+    change with its own design. The state is not self-healing — the window
+    is gone — so it clears on operator action: the next successful arm or
+    removal of a confirm record.
   - **The removal debt is KEYED to the record it is owed for (#7675).**
     The retry above re-drove `removeConfirmState()` UNCONDITIONALLY, so it
     deleted whatever `confirm.json` was on disk. An operator who armed a
