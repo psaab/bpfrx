@@ -79,10 +79,62 @@ func proxyARPHostSuffix(addr string) string {
 // /31 is the RFC 3021 point-to-point exception: both addresses are usable, so
 // neither is excluded. v6 has no broadcast address and no reserved host id in
 // the general case, so every address in the block is expanded.
+// proxyARPUnmap4In6 converts a v4-mapped prefix (`::ffff:a.b.c.d/N`) to its v4
+// equivalent, converting the MASK as well as the address. Every other prefix is
+// returned unchanged, so this is a no-op for genuine v6 and for plain v4.
+//
+// #8631: two layers classified the identical literal differently. The installer
+// (`pkg/dataplane/proxyarp.go`) asks `addr.Is6() && !addr.Is4In6()`, so a
+// `::ffff:` block is v4 and installs as AF_INET. The expansion here asked
+// `addr.Is4()`, which is FALSE for a 4-in-6 address, so the same literal
+// expanded under v6 rules — no network-address skip, and a `/128` suffix. A
+// v4-mapped block therefore expanded into host entries the installer then
+// treated as v4, including the network address no host ARPs for.
+//
+// THE MASK IS THE TRAP, and it is why this is not `Unmap()` and done. A
+// prefix length on a 4-in-6 address is in v6 bit-space: `::ffff:10.0.0.0/126`
+// describes four addresses, and the v4-equivalent mask is `126 - 96 = 30`.
+// Unmapping the address while keeping `Bits()` at 126 constructs a v4 address
+// with a /126 mask — not a narrower answer, an INVALID one, and everything
+// downstream is then wrong in a new way.
+//
+// `Bits() < 96` is left ALONE rather than converted. Such a prefix does not
+// denote a v4 block at all (`/64` would convert to a nonsensical `-32`), and it
+// already fails closed: it is over the expansion cap, so it survives to
+// `proxyARPNonHostPrefixError` and is rejected at commit. Converting it would
+// replace a clear refusal with a malformed prefix.
+//
+// That floor and the `IsValid` check below are REDUNDANT with each other, and
+// deliberately so — deleting the floor leaves every #8631 cell green, which was
+// measured rather than assumed. `netip.PrefixFrom` returns an invalid prefix
+// for a negative length, so the backstop catches the same inputs. The floor is
+// kept because it states the INTENT ("below /96 is not a v4 block") where
+// `IsValid` only states the mechanism, and a reader deleting either one should
+// know the other still holds rather than discovering it from a green suite.
+func proxyARPUnmap4In6(p netip.Prefix) netip.Prefix {
+	addr := p.Addr()
+	if !addr.Is4In6() || p.Bits() < 96 {
+		return p
+	}
+	q := netip.PrefixFrom(addr.Unmap(), p.Bits()-96)
+	if !q.IsValid() {
+		return p
+	}
+	return q
+}
+
 func expandProxyARPPrefix(value string) []string {
 	p, err := netip.ParsePrefix(value)
 	if err != nil {
 		return []string{value}
+	}
+	// #8631: decide v4-ness ONCE, here, on the same rule the installer uses.
+	// `value` is re-derived so every return below — including the single-host
+	// early return — emits the normalized literal rather than a v4 address
+	// still wearing a v6 mask.
+	if q := proxyARPUnmap4In6(p); q != p {
+		p = q
+		value = q.String()
 	}
 	addr := p.Addr()
 	if p.Bits() == addr.BitLen() {
@@ -128,6 +180,9 @@ func expandProxyARPPrefix(value string) []string {
 // asked about is bounded below by the caller's cap check, and a v6 prefix
 // shorter than /120 is reported as over-cap without ever forming the count.
 func proxyARPPrefixHostCount(p netip.Prefix) (int, bool) {
+	// #8631: normalize here too, so the count and the expansion cannot
+	// disagree about what a `::ffff:` block is. Both callers reach this.
+	p = proxyARPUnmap4In6(p)
 	bits := p.Addr().BitLen() - p.Bits()
 	if bits < 0 {
 		return 0, false
@@ -158,6 +213,10 @@ func proxyARPNonHostPrefixError(iface, addr string) error {
 	if err != nil {
 		return nil // the parse arm of the gate owns this one
 	}
+	// #8631: a mapped single host (`::ffff:10.0.0.1/128`) is a v4 /32, so
+	// normalize before the single-host test or it is misread as multi-host.
+	// The error text below still quotes the address AS AUTHORED.
+	p = proxyARPUnmap4In6(p)
 	if p.Bits() == p.Addr().BitLen() {
 		return nil
 	}
