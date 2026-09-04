@@ -54,13 +54,25 @@ const inventoryNotes = `#
 # property being measured. Both of #8662's hand-verified members sat in it;
 # ` + "`class-of-service schedulers xpfarg transmit-rate`" + ` is now tracked here.
 #
-# STILL NOT COVERED, and deliberately so: a container whose instance is named by
-# a WILDCARD rather than by an arg. ` + "`security zones security-zone <z> interfaces <if>`" + `
-# is the verified example — braced it compiles to [ge-0/0/0.0], elided to [],
-# and the elided form walks past the strict gate that rejects the braced one for
-# an undefined interface. This census's site model assumes the instance name is
-# an ` + "`args`" + ` token, so covering that shape is a model change rather than a
-# predicate relaxation, and it is left to a follow-up rather than bolted on.
+# #8662 second half raised checked 654 -> 656 and added ONE site, removing none:
+# ` + "`security zones security-zone xpfarg interfaces`" + `, the member this issue
+# was filed on. It needed a site-MODEL change rather than another predicate
+# relaxation — ` + "`interfaces`" + ` there is args:0 with a wildcard for the interface
+# name, so the census's assumption that an instance is named by an ` + "`args`" + `
+# token excluded it even after the children-bearing widening. synthPair now
+# varies the wildcard INSTANCE NAME for that shape.
+#
+# Measured as its own variable before landing: 15 sites in the class, 9 under
+# groups, 1 uncompilable, 3 not-observable, 1 EQUIVALENT and 1 DIVERGENT. The
+# equivalent one — ` + "`chassis cluster redundancy-group <n> ip-monitoring family inet`" + `
+# — is kept as an over-reach control, deliberately in the chassis-cluster area,
+# because that is where this issue's prescribed blanket rule broke the shipped
+# HA config.
+#
+# The standalone probe and the gate's own accounting agreed (+2 checked, +1
+# divergent). An earlier probe of this shape did NOT agree with the gate (97 vs
+# 60) because it varied two conditions at once; the disagreement is what caught
+# it. Where the two accountings differ, neither number is usable.
 #`
 
 func TestRegenerateCompactBlockInventory2419(t *testing.T) {
