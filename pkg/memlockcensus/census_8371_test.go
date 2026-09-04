@@ -35,6 +35,9 @@ func repoRoot(t *testing.T) string {
 
 var funcLine = regexp.MustCompile(`^func\s+([A-Za-z0-9_]+)`)
 
+// selfFile is this scanner's own path. See the exclusion in scanTree.
+const selfFile = "pkg/memlockcensus/census_8371_test.go"
+
 // scanTree returns every (file, test) that calls rlimit.RemoveMemlock, read
 // from the tree rather than from the registry — so the two can disagree.
 func scanTree(t *testing.T) []Site {
@@ -48,6 +51,23 @@ func scanTree(t *testing.T) []Site {
 	}
 	var got []Site
 	for _, rel := range strings.Fields(string(out)) {
+		// This package's own file is excluded, and the reason is not
+		// convenience. It contains `rlimit.RemoveMemlock()` twice — once in
+		// TestMemlockGuardsAreInertHere, which CALLS it to report whether the
+		// privilege exists, and once inside this scanner, which greps for the
+		// literal. Neither is a guard whose protection is conditional; the
+		// first is the report and the second is the instrument.
+		//
+		// This shipped broken and turned master red, and the reason it passed
+		// pre-merge is worth recording: `git grep` reads TRACKED files only, and
+		// the file was still untracked when the suite was run in the authoring
+		// worktree. The scanner could not see itself until the commit landed —
+		// so the pre-merge green was real and was measuring a tree that no
+		// longer existed a moment later. A scanner that reads the index must be
+		// exercised against a tree where its own file is committed.
+		if rel == selfFile {
+			continue
+		}
 		b, err := os.ReadFile(filepath.Join(root, rel))
 		if err != nil {
 			t.Fatalf("read %s: %v", rel, err)
@@ -173,4 +193,45 @@ func TestMemlockGuardsAreInertHere(t *testing.T) {
 			"execute them, and it did not.", b.String())
 	}
 	t.Log(b.String())
+}
+
+// TestTheScannerExcludesItselfAndOnlyItself pins the exclusion that unbroke
+// master, in both directions.
+//
+// The forward half: this package's own file must not be censused. It contains
+// `rlimit.RemoveMemlock()` twice — the report calls it, the scanner greps for
+// the literal — and neither is a guard whose protection is conditional.
+//
+// The reverse half is the one that matters. An exclusion is a hole, and a hole
+// widened by one character stops the census seeing an entire package. So the
+// constant is asserted to name a file that EXISTS and to be a single file, not
+// a prefix or a directory — the two ways this would silently grow.
+func TestTheScannerExcludesItselfAndOnlyItself(t *testing.T) {
+	root := repoRoot(t)
+
+	if _, err := os.Stat(filepath.Join(root, selfFile)); err != nil {
+		t.Fatalf("selfFile %q does not exist: %v — an exclusion naming a path that "+
+			"is not there excludes nothing, and would have gone unnoticed", selfFile, err)
+	}
+	if !strings.HasSuffix(selfFile, "_test.go") {
+		t.Errorf("selfFile %q is not a single _test.go file. A directory or prefix "+
+			"here would silently drop every guard beneath it from the census, which "+
+			"is the failure this whole package exists to prevent", selfFile)
+	}
+
+	// The scan must still see guards in the tree — an exclusion that swallowed
+	// everything would leave the census trivially satisfied by an empty
+	// registry, which reads exactly like a clean tree.
+	tree := scanTree(t)
+	if len(tree) < 40 {
+		t.Fatalf("the scan found only %d guards after the self-exclusion; it saw "+
+			"%d before this change landed. The exclusion is too wide.",
+			len(tree), len(Registry))
+	}
+	for _, s := range tree {
+		if s.File == selfFile {
+			t.Errorf("the scanner censused itself (%s -> %s) — the exclusion is not "+
+				"taking effect", s.File, s.Test)
+		}
+	}
 }
