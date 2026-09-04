@@ -151,6 +151,31 @@ pub(in crate::afxdp) fn drain_pending_fill(binding: &mut BindingWorker, now_ns: 
     true
 }
 
+/// The unforced half of `maybe_wake_rx`'s gate, extracted so the throttle can
+/// be tested without a bound socket (#8377).
+///
+/// WHAT THIS IS. A rate limiter on the steady-state RX keep-alive wake: at most
+/// one `poll(POLLIN)` per `RX_WAKE_MIN_INTERVAL_NS`, and only after
+/// `RX_WAKE_IDLE_POLLS` consecutive empty polls. Without the throttle the wake
+/// fires on every empty poll and costs a syscall per loop iteration.
+///
+/// WHAT THIS IS NOT — recorded because a draft of #8377's fix asserted it was.
+/// This is NOT a guarantee that a queue which has never seen a hardware RX
+/// event gets its fill ring consumed. The syscall it eventually issues reaches
+/// `mlx5e_xsk_wakeup`, which returns 0 without triggering NAPI when the channel
+/// NAPI is already scheduled (`napi_if_scheduled_mark_missed`) or an XSK-TX NOP
+/// is already pending (`MLX5E_SQ_STATE_PENDING_XSK_TX`) — and `e0c01ac2b`
+/// records measuring exactly that: "ndo_xsk_wakeup's ICOSQ NOP mechanism fails
+/// when NAPI is already scheduled from other sources". The Go NAPI probes
+/// (`pkg/dataplane/userspace/process_napi.go`) remain load-bearing for cold
+/// bringup; do not delete them on the strength of this path.
+///
+/// Behaviour-identical to the two sequential early returns it replaces.
+fn rx_wake_due(empty_rx_polls: u32, last_rx_wake_ns: u64, now_ns: u64) -> bool {
+    empty_rx_polls >= RX_WAKE_IDLE_POLLS
+        && now_ns.saturating_sub(last_rx_wake_ns) >= RX_WAKE_MIN_INTERVAL_NS
+}
+
 pub(in crate::afxdp) fn maybe_wake_rx(binding: &mut BindingWorker, force: bool, now_ns: u64) {
     // After submitting fill ring entries, we must kick NAPI so the driver
     // consumes them and posts new RX WQEs. Without this, mlx5 increments
@@ -163,10 +188,11 @@ pub(in crate::afxdp) fn maybe_wake_rx(binding: &mut BindingWorker, force: bool, 
     // fill ring starvation on idle interfaces with zero-copy mlx5.
     if !force {
         binding.timers.empty_rx_polls = binding.timers.empty_rx_polls.saturating_add(1);
-        if binding.timers.empty_rx_polls < RX_WAKE_IDLE_POLLS {
-            return;
-        }
-        if now_ns.saturating_sub(binding.timers.last_rx_wake_ns) < RX_WAKE_MIN_INTERVAL_NS {
+        if !rx_wake_due(
+            binding.timers.empty_rx_polls,
+            binding.timers.last_rx_wake_ns,
+            now_ns,
+        ) {
             return;
         }
     }
@@ -412,4 +438,61 @@ mod tests {
         assert_eq!(telemetry.dbg_tx_completion_ring_available_max, 13);
     }
 
+    // #8377: the steady-state RX keep-alive throttle. Both bounds, both
+    // directions.
+    //
+    // This asserts the RATE LIMITER, not a cold-start guarantee — an earlier
+    // draft of this cell claimed the latter, and it does not hold (see
+    // `rx_wake_due`'s doc comment for why, and for the measurement that
+    // settled it). What it does pin is that the gate cannot latch SHUT: a
+    // binding whose RX is permanently empty still reaches the wake, so the
+    // poll loop cannot end up counting empty polls forever without ever
+    // issuing the syscall it counts them for.
+    //
+    // `last_rx_wake_ns` is seeded from `monotonic_nanos()` at binding
+    // construction, NOT zero — `timers.rs` documents that it is deliberately
+    // not `Default` for exactly that reason — so the interval term is
+    // exercised against a realistic elapsed time rather than against 0, which
+    // would satisfy it trivially.
+    #[test]
+    fn rx_wake_fires_for_a_queue_that_never_receives_8377() {
+        let now_ns: u64 = 5_000_000_000;
+        // Constructed 1 ms ago; RX empty ever since.
+        let born_ns: u64 = now_ns - 1_000_000;
+
+        // Below the poll floor the gate stays shut — the throttle is real.
+        for polls in 0..RX_WAKE_IDLE_POLLS {
+            assert!(
+                !rx_wake_due(polls, born_ns, now_ns),
+                "rx_wake_due opened at {polls} empty polls, below the \
+                 RX_WAKE_IDLE_POLLS={RX_WAKE_IDLE_POLLS} floor; the wake would \
+                 fire on every empty poll and cost a syscall per iteration"
+            );
+        }
+        // At the floor it opens.
+        assert!(
+            rx_wake_due(RX_WAKE_IDLE_POLLS, born_ns, now_ns),
+            "rx_wake_due never opens for a binding whose RX is permanently \
+             empty; the keep-alive wake has latched shut and the poll loop \
+             would spin counting empty polls without ever waking"
+        );
+
+        // The interval term, at its boundary in BOTH directions. A single
+        // sample on one side of a threshold cannot see an inverted comparison.
+        let last = now_ns - RX_WAKE_MIN_INTERVAL_NS;
+        assert!(
+            rx_wake_due(RX_WAKE_IDLE_POLLS, last, now_ns),
+            "exactly RX_WAKE_MIN_INTERVAL_NS since the last wake must open the gate"
+        );
+        assert!(
+            !rx_wake_due(RX_WAKE_IDLE_POLLS, last + 1, now_ns),
+            "one nanosecond short of RX_WAKE_MIN_INTERVAL_NS must not open the gate"
+        );
+
+        // A clock that has gone backwards must not open the gate by underflow.
+        assert!(
+            !rx_wake_due(RX_WAKE_IDLE_POLLS, now_ns + 1_000_000, now_ns),
+            "a backwards clock must saturate to 0, not wrap to a huge interval"
+        );
+    }
 }
