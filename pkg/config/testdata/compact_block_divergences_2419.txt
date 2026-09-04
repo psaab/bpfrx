@@ -60,9 +60,9 @@
 # 60) because it varied two conditions at once; the disagreement is what caught
 # it. Where the two accountings differ, neither number is usable.
 #
-# checked: 656
+# checked: 677
 #
-# skipped (leaf value not observable in the typed config): 255
+# skipped (leaf value not observable in the typed config): 234
 # skipped (a spelling did not parse or compile): 45
 # skipped (no two distinct synthesizable values): 17
 # skipped (under groups (schema re-host, duplicate coverage)): 806
@@ -108,6 +108,7 @@ class-of-service traffic-control-profiles xpfarg guaranteed-rate
 class-of-service traffic-control-profiles xpfarg scheduler-map
 class-of-service traffic-control-profiles xpfarg shaping-rate
 event-options policy
+event-options policy xpfarg within
 firewall family inet filter
 firewall family inet filter xpfarg term
 firewall family inet filter xpfarg term xpfarg from flexible-match-range range
@@ -148,6 +149,7 @@ interfaces xpfname mtu
 interfaces xpfname native-vlan-id
 interfaces xpfname speed
 interfaces xpfname tunnel destination
+interfaces xpfname tunnel keepalive-retry
 interfaces xpfname tunnel key
 interfaces xpfname tunnel mode
 interfaces xpfname tunnel routing-instance destination
@@ -160,6 +162,7 @@ interfaces xpfname tunnel wireguard peer xpfarg endpoint
 interfaces xpfname tunnel wireguard peer xpfarg persistent-keepalive
 interfaces xpfname tunnel wireguard peer xpfarg preshared-key
 interfaces xpfname tunnel wireguard private-key
+interfaces xpfname unit
 policy-options community
 policy-options community xpfarg members
 policy-options policy-statement
@@ -180,12 +183,14 @@ policy-options prefix-list
 protocols bgp cluster-id
 protocols bgp export
 protocols bgp group xpfarg neighbor
+protocols bgp group xpfarg neighbor xpfarg bfd-liveness-detection minimum-interval
 protocols bgp group xpfarg neighbor xpfarg description
 protocols bgp group xpfarg neighbor xpfarg export
 protocols bgp group xpfarg neighbor xpfarg hold-time
 protocols bgp group xpfarg neighbor xpfarg import
 protocols bgp group xpfarg neighbor xpfarg local-address
 protocols bgp group xpfarg neighbor xpfarg local-as
+protocols bgp group xpfarg neighbor xpfarg loops
 protocols bgp group xpfarg neighbor xpfarg peer-as
 protocols bgp import
 protocols bgp local-as
@@ -194,6 +199,7 @@ protocols isis authentication-type
 protocols isis export
 protocols isis interface
 protocols isis interface xpfarg authentication-type
+protocols isis interface xpfarg bfd-liveness-detection minimum-interval
 protocols isis interface xpfarg level
 protocols isis is-type
 protocols isis level
@@ -204,12 +210,15 @@ protocols lldp transmit-interval
 protocols ospf area
 protocols ospf area xpfarg interface
 protocols ospf area xpfarg interface xpfarg authentication md5 xpfarg key
+protocols ospf area xpfarg interface xpfarg bfd-liveness-detection minimum-interval
 protocols ospf area xpfarg virtual-link
 protocols ospf area xpfarg virtual-link xpfarg transit-area
 protocols ospf export
+protocols ospf reference-bandwidth
 protocols ospf router-id
 protocols ospf3 area
 protocols ospf3 area xpfarg interface
+protocols ospf3 area xpfarg interface xpfarg bfd-liveness-detection minimum-interval
 protocols ospf3 export
 protocols ospf3 router-id
 protocols rip authentication-type
@@ -230,16 +239,20 @@ routing-instances xpfname protocols isis authentication-type
 routing-instances xpfname protocols isis export
 routing-instances xpfname protocols isis interface
 routing-instances xpfname protocols isis interface xpfarg authentication-type
+routing-instances xpfname protocols isis interface xpfarg bfd-liveness-detection minimum-interval
 routing-instances xpfname protocols isis interface xpfarg level
 routing-instances xpfname protocols isis is-type
 routing-instances xpfname protocols isis level
 routing-instances xpfname protocols isis net
 routing-instances xpfname protocols ospf area
 routing-instances xpfname protocols ospf area xpfarg interface
+routing-instances xpfname protocols ospf area xpfarg interface xpfarg bfd-liveness-detection minimum-interval
 routing-instances xpfname protocols ospf area xpfarg virtual-link
 routing-instances xpfname protocols ospf area xpfarg virtual-link xpfarg transit-area
+routing-instances xpfname protocols ospf reference-bandwidth
 routing-instances xpfname protocols ospf3 area
 routing-instances xpfname protocols ospf3 area xpfarg interface
+routing-instances xpfname protocols ospf3 area xpfarg interface xpfarg bfd-liveness-detection minimum-interval
 routing-instances xpfname protocols ospf3 export
 routing-instances xpfname protocols ospf3 router-id
 routing-instances xpfname routing-options static route
@@ -438,6 +451,7 @@ system login user xpfarg authentication ssh-dsa
 system login user xpfarg authentication ssh-ed25519
 system login user xpfarg authentication ssh-rsa
 system login user xpfarg class
+system login user xpfarg uid
 system master-password pseudorandom-function
 system name-server
 system ntp server

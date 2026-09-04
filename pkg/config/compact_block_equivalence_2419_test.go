@@ -38,6 +38,49 @@ func synthPair(n *schemaNode) (string, string, bool) {
 	if len(n.valueExamples) >= 2 {
 		return n.valueExamples[0], n.valueExamples[1], true
 	}
+	// #8662 fixture sweep: a leaf that declares no examples used to fall
+	// straight through to the invented pair "xpfaaa"/"xpfbbb". Many leaves
+	// REJECT that — `unit xpfaaa` is not a unit number — so BOTH spellings
+	// compiled to nothing, the vacuity guard fired, and the site was recorded
+	// "leaf value not observable". That verdict was about the FIXTURE, not the
+	// leaf, and it made 103 sites unrulable.
+	//
+	// The schema already says what these leaves take. valueHint is the
+	// strongest signal and is what `?` completion uses, so synthesising from it
+	// costs nothing and cannot drift from the schema's own idea of the value.
+	switch n.valueHint {
+	case ValueHintUnitNumber:
+		return "0", "1", true
+	case ValueHintInterfaceName:
+		return "ge-0/0/0.0", "ge-0/0/1.0", true
+	case ValueHintZoneName:
+		return "xpfzonea", "xpfzoneb", true
+	case ValueHintAddressName, ValueHintPolicyAddress:
+		return "xpfaddra", "xpfaddrb", true
+	case ValueHintAppName, ValueHintPolicyApp:
+		return "xpfappa", "xpfappb", true
+	case ValueHintAppSetName:
+		return "xpfapsa", "xpfapsb", true
+	case ValueHintPolicyName:
+		return "xpfpola", "xpfpolb", true
+	case ValueHintPoolName:
+		return "xpfpoola", "xpfpoolb", true
+	case ValueHintScreenProfile:
+		return "xpfscra", "xpfscrb", true
+	case ValueHintStreamName:
+		return "xpfstra", "xpfstrb", true
+	}
+	// A numeric-looking placeholder (`<n>`, `<0..128>`, `<seconds>`) means the
+	// invented identifier will be rejected. Prefer two small integers.
+	if ph := strings.ToLower(n.placeholder); ph != "" {
+		if strings.ContainsAny(ph, "0123456789") ||
+			strings.Contains(ph, "number") || strings.Contains(ph, "count") ||
+			strings.Contains(ph, "seconds") || strings.Contains(ph, "priority") ||
+			strings.Contains(ph, "weight") || strings.Contains(ph, "cost") ||
+			strings.Contains(ph, "metric") || strings.Contains(ph, "id") {
+			return "1", "2", true
+		}
+	}
 	switch n.valueType {
 	case ValueInteger:
 		return "1", "2", true
