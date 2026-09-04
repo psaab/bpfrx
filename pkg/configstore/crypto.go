@@ -582,11 +582,22 @@ func prfHash(prf string) (func() hash.Hash, error) {
 	}
 }
 
+// maxMasterKeyFileSize bounds a master-key file read (#8597). The key is
+// exactly 32 bytes; the ceiling is generous enough that a legitimate file with
+// a trailing newline or a future longer key still reads, and small enough that
+// a corrupt or hostile file is refused before it is materialised rather than
+// after.
+const maxMasterKeyFileSize = 4096
+
 // readMasterKey reads an existing master key — never creates one.
 // Used by the decrypt path to avoid overwriting a lost key.
 func (db *DB) readMasterKey() ([]byte, error) {
 	path := db.masterKeyPath()
-	data, err := os.ReadFile(path)
+	// #8597 (muse-004 K70): bounded. The contract is EXACTLY 32 bytes and the
+	// length is checked three lines down — but only after the whole file is
+	// resident, so a huge file was fully read and then rejected. Bounding at
+	// maxMasterKeyFileSize refuses it before the allocation.
+	data, err := ReadBoundedFile(path, maxMasterKeyFileSize)
 	if err != nil {
 		return nil, fmt.Errorf("read master key: %w", err)
 	}
@@ -598,7 +609,8 @@ func (db *DB) readMasterKey() ([]byte, error) {
 
 func (db *DB) readOrCreateMasterKey() ([]byte, error) {
 	path := db.masterKeyPath()
-	if data, err := os.ReadFile(path); err == nil {
+	// #8597 (muse-004 K70): bounded — see readMasterKey.
+	if data, err := ReadBoundedFile(path, maxMasterKeyFileSize); err == nil {
 		if len(data) != 32 {
 			return nil, fmt.Errorf("invalid master key length in %s", path)
 		}

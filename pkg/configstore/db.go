@@ -262,7 +262,11 @@ func (db *DB) WriteConfirm(rec *confirmRecord) error {
 // + skip restore, keep the loaded active config, never panic), so a degenerate
 // record can no longer drive a bogus empty rollback.
 func (db *DB) ReadConfirm() (*confirmRecord, error) {
-	data, err := os.ReadFile(db.confirmPath())
+	// #8597 (muse-004 K70): BOUNDED. This module's own answer to an unbounded
+	// authoritative read is ReadBoundedFile (#6753/#4909) — which also refuses a
+	// non-regular file — and the most privileged reads on the boot path were the
+	// ones still using os.ReadFile.
+	data, err := ReadBoundedFile(db.confirmPath(), MaxConfigSize)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -344,7 +348,10 @@ func (db *DB) DeleteConfirm() error {
 // but defaults true so an absent-DB caller never sees a spurious
 // never-committed signal). A legacy (no-envelope) DB also reads committed.
 func (db *DB) readTreeMeta(path string) (*config.ConfigTree, bool, error) {
-	data, err := os.ReadFile(path)
+	// #8597 (muse-004 K70): BOUNDED — see ReadConfirm above. This is the SSOT
+	// the daemon must load to take over, so it was the least bounded read of
+	// the most important file.
+	data, err := ReadBoundedFile(path, MaxConfigSize)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, true, nil

@@ -1320,7 +1320,11 @@ func (s *Store) DeleteRescueConfig() error {
 // LoadRescueConfig returns the rescue configuration text, or "" if none.
 func (s *Store) LoadRescueConfig() (string, error) {
 	path := s.rescuePath()
-	data, err := os.ReadFile(path)
+	// #8597 (muse-004 K70): the rescue config is a configuration TEXT and gets
+	// the same ceiling every other configuration ingress gets. Not named by the
+	// finding, which listed two sites; a census of os.ReadFile in this package
+	// found six.
+	data, err := ReadBoundedFile(path, MaxConfigSize)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return "", nil
