@@ -2382,6 +2382,67 @@ func dataplaneAcceptsNAT64Mask(tok string) bool {
 	return err == nil && n == 96
 }
 
+// NormaliseNAT64PrefixForSnapshot strips a leading "+" from a NAT64 prefix's MASK before it
+// reaches the forwarding snapshot.
+//
+// #8667: the Go and Rust validators disagree on exactly one character class.
+// Go parses the mask with strconv.ParseUint, which permits no sign; Rust parses
+// it with `parse::<u8>()`, which accepts a leading "+". A sweep over every
+// string of length <= 3 from [0-9 + - _ space x X . e E] found 110 tokens the
+// dataplane accepts and the control plane rejects — every one a leading "+" —
+// and zero the other way. So `64:ff9b::/+96` was rejected at commit, retained
+// verbatim by the tolerant load path, and then INSTALLED and translating, with
+// the control plane telling the operator the rule was inert.
+//
+// Normalising HERE — at snapshot build — rather than in the parser is the whole
+// point of the choice (#8667's decision comment):
+//
+//   - The strict commit gate is untouched. It validates `cfg`, in pkg/config,
+//     and still demands a canonical `/96`; an operator writing `/+96` is still
+//     told to fix it at their next commit. Normalising in the parser would have
+//     softened that.
+//   - Nothing stops forwarding. Rejecting on the lenient path instead would
+//     turn off NAT64 for a rule-set that is translating correctly right now, at
+//     the next reload — and the population reaching this path includes HA
+//     peer-synced configs, so it would drop a rule on the standby that the
+//     active is forwarding. A box translating before an upgrade and not after
+//     is the outcome the tolerant-load doctrine exists to prevent.
+//   - The divergence DISAPPEARS rather than being made survivable: after this
+//     the two parsers cannot disagree about this token, because only one
+//     spelling reaches the one that was lax.
+//
+// The sign is stripped for ANY mask value, not just 96. The disagreement is
+// about the character class, so removing it makes the two agree everywhere
+// rather than at one value: `/+64` normalises to `/64`, which both reject, as
+// both already did by different routes.
+//
+// Anything that is not exactly "<addr>/<mask>" is returned unchanged — this
+// normalises a spelling, it does not repair a malformed prefix, and the
+// existing validation owns that.
+//
+// IT LIVES HERE ON PURPOSE, AND MOVING IT TO ITS CALL SITE WOULD DELETE THE
+// ABILITY TO TEST IT. This function, dataplaneAcceptsNAT64Mask and the strict
+// gate all have to agree about one token, and `pkg/dataplane/userspace` — where
+// it is called — imports this package. So the import edge runs one way, and a
+// test asserting all three agree can only exist on THIS side of it.
+//
+// That is a placement chosen for the invariant rather than for locality, which
+// is the kind of thing a later reader tidies toward the call site without
+// noticing what it costs: the agreement test cannot follow, and the three
+// silently stop being checked against each other. If this needs to move, move
+// TestNAT64MaskGrammarsAgreeOnWhatReachesTheDataplane8667 with it, or establish
+// first that it can still see all three.
+func NormaliseNAT64PrefixForSnapshot(prefix string) string {
+	addr, mask, ok := strings.Cut(prefix, "/")
+	if !ok {
+		return prefix
+	}
+	if !strings.HasPrefix(mask, "+") {
+		return prefix
+	}
+	return addr + "/" + strings.TrimPrefix(mask, "+")
+}
+
 // validateNAT64PrefixStrict is the #3886 strict-vs-lenient gate for a NAT64
 // rule-set's `prefix` (`security nat nat64 rule-set <r> prefix <p>`).
 //

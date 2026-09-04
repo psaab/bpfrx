@@ -180,7 +180,6 @@ policy-options prefix-list
 protocols bgp cluster-id
 protocols bgp export
 protocols bgp group xpfarg neighbor
-protocols bgp group xpfarg neighbor xpfarg authentication-key
 protocols bgp group xpfarg neighbor xpfarg description
 protocols bgp group xpfarg neighbor xpfarg export
 protocols bgp group xpfarg neighbor xpfarg hold-time
@@ -191,11 +190,9 @@ protocols bgp group xpfarg neighbor xpfarg peer-as
 protocols bgp import
 protocols bgp local-as
 protocols bgp router-id
-protocols isis authentication-key
 protocols isis authentication-type
 protocols isis export
 protocols isis interface
-protocols isis interface xpfarg authentication-key
 protocols isis interface xpfarg authentication-type
 protocols isis interface xpfarg level
 protocols isis is-type
@@ -215,7 +212,6 @@ protocols ospf3 area
 protocols ospf3 area xpfarg interface
 protocols ospf3 export
 protocols ospf3 router-id
-protocols rip authentication-key
 protocols rip authentication-type
 protocols rip neighbor
 protocols rip passive-interface
@@ -230,11 +226,9 @@ protocols router-advertisement interface xpfarg nat-prefix
 protocols router-advertisement interface xpfarg nat64prefix
 protocols router-advertisement interface xpfarg preference
 protocols router-advertisement interface xpfarg prefix
-routing-instances xpfname protocols isis authentication-key
 routing-instances xpfname protocols isis authentication-type
 routing-instances xpfname protocols isis export
 routing-instances xpfname protocols isis interface
-routing-instances xpfname protocols isis interface xpfarg authentication-key
 routing-instances xpfname protocols isis interface xpfarg authentication-type
 routing-instances xpfname protocols isis interface xpfarg level
 routing-instances xpfname protocols isis is-type
@@ -361,13 +355,6 @@ security log stream xpfarg host
 security nat destination pool
 security nat destination rule-set
 security nat destination rule-set xpfarg rule
-security nat destination rule-set xpfarg rule xpfarg match application
-security nat destination rule-set xpfarg rule xpfarg match destination-address
-security nat destination rule-set xpfarg rule xpfarg match destination-address-name
-security nat destination rule-set xpfarg rule xpfarg match destination-port
-security nat destination rule-set xpfarg rule xpfarg match protocol
-security nat destination rule-set xpfarg rule xpfarg match source-address
-security nat destination rule-set xpfarg rule xpfarg match source-address-name
 security nat nat64 rule-set
 security nat nat64 rule-set xpfarg prefix
 security nat nat64 rule-set xpfarg source-pool
@@ -378,31 +365,14 @@ security nat source pool xpfarg port-overloading-factor
 security nat source pool xpfarg routing-instance
 security nat source rule-set
 security nat source rule-set xpfarg rule
-security nat source rule-set xpfarg rule xpfarg match application
-security nat source rule-set xpfarg rule xpfarg match destination-address
-security nat source rule-set xpfarg rule xpfarg match destination-address-name
-security nat source rule-set xpfarg rule xpfarg match destination-port
-security nat source rule-set xpfarg rule xpfarg match source-address
-security nat source rule-set xpfarg rule xpfarg match source-address-name
 security nat static rule-set
 security nat static rule-set xpfarg rule
-security nat static rule-set xpfarg rule xpfarg match destination-address
-security nat static rule-set xpfarg rule xpfarg match destination-port
-security nat static rule-set xpfarg rule xpfarg match source-address
 security policies default-policy-log
 security policies from-zone xpfarg xpfarg xpfarg policy
 security policies from-zone xpfarg xpfarg xpfarg policy xpfarg description
-security policies from-zone xpfarg xpfarg xpfarg policy xpfarg match application
-security policies from-zone xpfarg xpfarg xpfarg policy xpfarg match destination-address
-security policies from-zone xpfarg xpfarg xpfarg policy xpfarg match source-address
 security policies from-zone xpfarg xpfarg xpfarg policy xpfarg then log
 security policies global policy
 security policies global policy xpfarg description
-security policies global policy xpfarg match application
-security policies global policy xpfarg match destination-address
-security policies global policy xpfarg match from-zone
-security policies global policy xpfarg match source-address
-security policies global policy xpfarg match to-zone
 security policies global policy xpfarg then log
 security pre-id-default-policy then log
 security screen ids-option

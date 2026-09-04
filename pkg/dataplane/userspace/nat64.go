@@ -108,7 +108,7 @@ func buildNAT64Snapshots(cfg *config.Config) []NAT64RuleSnapshot {
 		}
 		out = append(out, NAT64RuleSnapshot{
 			Name:                       rs.Name,
-			Prefix:                     rs.Prefix,
+			Prefix:                     config.NormaliseNAT64PrefixForSnapshot(rs.Prefix),
 			PoolAddresses:              poolAddresses,
 			NoV6FragHeader:             noV6FragHeader,
 			DeterministicBlockSize:     detBlockSize,

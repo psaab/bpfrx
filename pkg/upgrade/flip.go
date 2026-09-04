@@ -154,12 +154,24 @@ var kernelArmRestampJournalPath = DefaultKernelJournalPath
 func (r *Runner) repointSymlink(linkPath, relTarget string) error {
 	dir := filepath.Dir(linkPath)
 	tmp := filepath.Join(dir, "."+filepath.Base(linkPath)+".tmp")
-	_ = os.Remove(tmp)
+	// #8597 (muse-004 K55): RemoveAll, not Remove.
+	//
+	// A stale DIRECTORY at the temp path — manual intervention, or a previous
+	// run that died between MkdirAll and Symlink — makes os.Remove fail, and
+	// the Symlink below then fails EEXIST. The symlink flip is the step that
+	// makes an upgrade take effect, so a leftover directory wedges every
+	// subsequent attempt until someone removes it by hand.
+	//
+	// The sibling seed path already fixed exactly this and says so:
+	// pkg/upgrade/runtime/seed.go's RemoveAll carries the reasoning, and the
+	// stagedgen atomic-symlink helper uses RemoveAll too. flip.go — the one
+	// that performs the actual cutover — was the copy left behind.
+	_ = os.RemoveAll(tmp)
 	if err := os.Symlink(relTarget, tmp); err != nil {
 		return fmt.Errorf("create temp symlink: %w", err)
 	}
 	if err := os.Rename(tmp, linkPath); err != nil {
-		_ = os.Remove(tmp)
+		_ = os.RemoveAll(tmp)
 		return fmt.Errorf("rename symlink into place: %w", err)
 	}
 	if err := fsatomic.SyncDir(dir); err != nil {
@@ -175,12 +187,13 @@ func (r *Runner) repointSymlinkAbs(linkPath, absTarget string) error {
 		return err
 	}
 	tmp := filepath.Join(dir, "."+filepath.Base(linkPath)+".tmp")
-	_ = os.Remove(tmp)
+	// #8597 (muse-004 K55): RemoveAll — see repointSymlink above.
+	_ = os.RemoveAll(tmp)
 	if err := os.Symlink(absTarget, tmp); err != nil {
 		return fmt.Errorf("create temp symlink: %w", err)
 	}
 	if err := os.Rename(tmp, linkPath); err != nil {
-		_ = os.Remove(tmp)
+		_ = os.RemoveAll(tmp)
 		return fmt.Errorf("rename symlink into place: %w", err)
 	}
 	if err := fsatomic.SyncDir(dir); err != nil {
