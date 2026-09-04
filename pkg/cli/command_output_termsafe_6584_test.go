@@ -89,7 +89,14 @@ var declaredUnsanitizedForks = []forkExemption{
 	{"../cli", "cli_show_system.go", "showSystemProcesses",
 		"ps aux — argv of root-controlled processes. Tracked separately"},
 	{"../cli", "cli_show_system.go", "showSystemNTP",
-		"chronyc -n / ntpq -pn / timedatectl — numeric-mode NTP status. Tracked separately"},
+		"FOUR forks, and the reason differs per fork (#8597). `chronyc -n sources`, " +
+			"`ntpq -pn` and `timedatectl show --property=NTPSynchronized --value` are " +
+			"numeric-mode or fixed-property status and stay raw. The fourth, " +
+			"`chronyc tracking`, carries NO `-n`: its Reference-ID parenthetical is a " +
+			"REVERSE-DNS-RESOLVED hostname, so printChronyTracking now sanitizes every " +
+			"field it prints. The pre-#8597 reason said \"chronyc -n / ntpq -pn / " +
+			"timedatectl — numeric-mode NTP status\", which was true of three forks and " +
+			"silent about the fourth. Tracked separately"},
 	{"../cli", "cli_clear.go", "handleClearArp",
 		"ip -4 neigh flush — output only in an error string. Tracked separately"},
 	{"../cli", "cli_clear.go", "handleClearIPv6",

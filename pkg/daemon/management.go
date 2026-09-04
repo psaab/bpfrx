@@ -294,6 +294,36 @@ func (m *managementReconciler) startLocked(ctx context.Context, next api.Config)
 //   - converged and serving → StateListening: reports the ACTUAL bound address
 //     from the live server (EffectiveHTTPAddr — so an ephemeral :0 resolves to
 //     its concrete port).
+//
+// effectiveHTTPSListener returns the effective STATE of the HTTPS REST listener
+// (#8597 K86), asking the server what is actually serving rather than trusting
+// the converged fingerprint — the same question the commit-path reconcile asks
+// with `next.TLS && !m.srv.HTTPSServing()`, applied to the steady state.
+//
+// Disabled when TLS is not configured; Failed when it IS configured and nothing
+// is serving (boot bind failure, or an unexpected serve exit that left the leg
+// installed-but-dead); else Listening on the actual bound address.
+func (m *managementReconciler) effectiveHTTPSListener() sysservices.Listener {
+	if m == nil {
+		return sysservices.Listener{State: sysservices.StateDisabled}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.curSet || !m.cur.tls {
+		return sysservices.Listener{State: sysservices.StateDisabled}
+	}
+	var bound string
+	if m.srv != nil {
+		bound = m.srv.EffectiveHTTPSAddr()
+	}
+	if bound == "" {
+		// Configured but not serving: report Failed against the address the
+		// reconciler last tried, not a stale Listening on a dead socket.
+		return sysservices.Listener{Addr: m.cur.httpsAddr, State: sysservices.StateFailed}
+	}
+	return sysservices.Listener{Addr: bound, State: sysservices.StateListening}
+}
+
 func (m *managementReconciler) effectiveHTTPListener() sysservices.Listener {
 	if m == nil {
 		return sysservices.Listener{State: sysservices.StateDisabled}

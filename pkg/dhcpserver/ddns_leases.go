@@ -176,11 +176,52 @@ func (a *ddnsLeaseAccum) note(addr string) {
 // the merged active set is empty — a genuinely-missing `.1`/`.2`/current file
 // (os.IsNotExist) simply contributes nothing.
 func parseActiveLeases(path string, family int, now time.Time) ([]ddnsLease, error) {
+	paths := keaLFCLeaseFilePaths(path)
+
+	// #8597 (muse-004 K52): the three files are opened SEQUENTIALLY, so a
+	// SUCCESSFUL kea-lfc rotation landing mid-read silently drops rows.
+	//
+	// lease_lfc.go documents the success swap as ".output -> .2, unlink .1". If
+	// that lands between our open(.2) and our open(.1) we read:
+	//
+	//	old .2      the stale compacted set
+	//	.1          MISSING (just unlinked) — every append since the last
+	//	            compaction, gone
+	//	current     near-empty (just rotated)
+	//
+	// and the merged result is a plausible-looking set that is missing all
+	// recent leases. The destructive DDNS diff's precondition is a
+	// "trusted-empty / trusted-set" read, and a routine successful rotation
+	// violates it with nothing to show for it.
+	//
+	// This is NOT the case §Invariant-3 argues about. That argument is about a
+	// CRASH-interrupted cleanup, where .1 stays intact and is read, and it is
+	// sound — I am not disputing it. The gap is the SUCCESSFUL rotation, where
+	// .1 is deliberately removed.
+	//
+	// The fix is DETECTION rather than prevention, and it reuses the fail-safe
+	// this file already has: any anomaly makes the whole family untrusted, the
+	// error propagates, and Reconcile SKIPS the destructive diff for one cycle.
+	// Preventing the race would mean holding all three descriptors open across
+	// the parse, which narrows the window without closing it — the rotation can
+	// still land between the first two opens. Detecting it closes the harmful
+	// outcome outright, and a skipped reconcile cycle self-heals on the next
+	// one.
+	before := leaseSetIdentity(paths)
+
 	acc := newDDNSLeaseAccum()
-	for _, f := range keaLFCLeaseFilePaths(path) {
-		if err := parseActiveLeasesFileInto(f, family, now, acc); err != nil {
+	for _, f := range paths {
+		if err := parseLeaseFileFn(f, family, now, acc); err != nil {
 			return nil, err
 		}
+	}
+
+	if after := leaseSetIdentity(paths); !leaseSetIdentityStable(before, after) {
+		return nil, fmt.Errorf(
+			"kea lease file set rotated during read (%s): a successful kea-lfc swap "+
+				"landed mid-read, so the merged set may be missing every lease appended "+
+				"since the last compaction — refusing to treat it as authoritative "+
+				"(#8597)", path)
 	}
 	out := make([]ddnsLease, 0, len(acc.order))
 	for _, addr := range acc.order {
@@ -514,4 +555,51 @@ func identity6(duid, iaid string) string {
 		return "duid:" + duid + "/" + iaid
 	}
 	return "duid:" + duid
+}
+
+// parseLeaseFileFn is the per-file parse seam. Production is
+// parseActiveLeasesFileInto; a test replaces it to make the mid-read rotation
+// K52 describes DETERMINISTIC rather than raced for.
+var parseLeaseFileFn = parseActiveLeasesFileInto
+
+// leaseSetIdentity captures which of the LFC set's files exist and which inodes
+// they are, so a rotation that happened during the read can be detected
+// afterwards (#8597).
+//
+// A nil entry means "did not exist", which is a legitimate steady state for
+// .1/.2 and must compare equal to itself — the point is CHANGE, not presence.
+func leaseSetIdentity(paths []string) []os.FileInfo {
+	out := make([]os.FileInfo, len(paths))
+	for i, p := range paths {
+		fi, err := os.Stat(p)
+		if err != nil {
+			continue // absent, or unreadable: recorded as nil
+		}
+		out[i] = fi
+	}
+	return out
+}
+
+// leaseSetIdentityStable reports whether the LFC file set is unchanged between
+// two identity snapshots.
+//
+// os.SameFile is the comparison rather than mtime or size: kea-lfc's swap is a
+// RENAME, so the path keeps its name and gets a new inode, and a size or
+// timestamp comparison can collide on a rotation that produces a same-sized
+// file within the timestamp's resolution. Appearing and disappearing both
+// count as change — an unlinked .1 is exactly the row-losing case.
+func leaseSetIdentityStable(before, after []os.FileInfo) bool {
+	if len(before) != len(after) {
+		return false
+	}
+	for i := range before {
+		switch {
+		case before[i] == nil && after[i] == nil:
+		case before[i] == nil || after[i] == nil:
+			return false
+		case !os.SameFile(before[i], after[i]):
+			return false
+		}
+	}
+	return true
 }

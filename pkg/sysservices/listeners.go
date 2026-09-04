@@ -82,6 +82,17 @@ type Listeners struct {
 	// daemon never started it), StateFailed on a boot bind failure, else
 	// StateListening.
 	HTTP Listener
+	// HTTPS is the HTTPS REST listener (#8597 K86). StateDisabled when TLS is
+	// not configured, StateFailed when it IS configured but no leg is serving
+	// (a boot bind failure, or an unexpected serve-loop exit that left the leg
+	// installed-but-dead), else StateListening with the actual bound address.
+	//
+	// Before #8597 this row did not exist and `mgmtListenerDown` asked only the
+	// HTTP leg, so a dead HTTPS leg was reported healthy on every surface AND
+	// was never re-driven by the always-on reassert loop — repair waited for the
+	// operator's next commit, which is the one event a broken management plane
+	// makes hard to deliver.
+	HTTPS Listener
 }
 
 // Lines renders the gRPC / HTTP REST listener rows for `show system services`,
@@ -92,5 +103,6 @@ func (l Listeners) Lines() []string {
 	return []string{
 		fmt.Sprintf("  gRPC:           %s", l.GRPC.render()),
 		fmt.Sprintf("  HTTP REST:      %s", l.HTTP.render()),
+		fmt.Sprintf("  HTTPS REST:     %s", l.HTTPS.render()),
 	}
 }

@@ -205,12 +205,12 @@ func TestRIMemberLinuxNameResolvesPerUnitTunnels(t *testing.T) {
 		"ge-0/0/1.5": "ge-0-0-1.5", // non-tunnel unit>0: literal, unchanged
 	}
 	for in, want := range cases {
-		if got := riMemberLinuxName(tunMap, in); got != want {
+		if got := riMemberLinuxName(nil, tunMap, in); got != want {
 			t.Errorf("riMemberLinuxName(%q) = %q, want %q", in, got, want)
 		}
 	}
 	// Nil/empty map (no tunnels configured): literal transform only.
-	if got := riMemberLinuxName(nil, "gr-0/0/0.1"); got != "gr-0-0-0.1" {
+	if got := riMemberLinuxName(nil, nil, "gr-0/0/0.1"); got != "gr-0-0-0.1" {
 		t.Errorf("riMemberLinuxName(nil, gr-0/0/0.1) = %q, want gr-0-0-0.1", got)
 	}
 }

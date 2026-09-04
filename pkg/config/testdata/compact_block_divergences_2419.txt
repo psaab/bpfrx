@@ -60,395 +60,409 @@
 # 60) because it varied two conditions at once; the disagreement is what caught
 # it. Where the two accountings differ, neither number is usable.
 #
-# checked: 656
+# checked: 677
 #
-# skipped (leaf value not observable in the typed config): 255
+# skipped (leaf value not observable in the typed config): 234
 # skipped (a spelling did not parse or compile): 45
 # skipped (no two distinct synthesizable values): 17
 # skipped (under groups (schema re-host, duplicate coverage)): 806
 #
-applications application
-applications application xpfarg alg
-applications application xpfarg description
-applications application xpfarg destination-port
-applications application xpfarg icmp-code
-applications application xpfarg icmp-type
-applications application xpfarg inactivity-timeout
-applications application xpfarg protocol
-applications application xpfarg source-port
-applications application xpfarg term
-applications application xpfarg timeout
-applications application-set
-bridge-domains xpfname domain-type
-bridge-domains xpfname routing-interface
-chassis device-map interface
-chassis device-map unmapped-interface-policy
-class-of-service classifiers inet-precedence
-class-of-service interfaces xpfarg classifiers dscp
-class-of-service interfaces xpfarg classifiers ieee-802.1
-class-of-service interfaces xpfarg output-traffic-control-profile
-class-of-service interfaces xpfarg priority-low-min-share
-class-of-service interfaces xpfarg rewrite-rules dscp
-class-of-service interfaces xpfarg rewrite-rules ieee-802.1
-class-of-service interfaces xpfarg scheduler-map
-class-of-service interfaces xpfarg shaping-rate xpfarg burst-size
-class-of-service rewrite-rules exp
-class-of-service rewrite-rules inet-precedence
-class-of-service scheduler-maps
-class-of-service scheduler-maps xpfarg forwarding-class
-class-of-service schedulers
-class-of-service schedulers xpfarg buffer-size
-class-of-service schedulers xpfarg codel-target
-class-of-service schedulers xpfarg equal-flow-target-policy
-class-of-service schedulers xpfarg priority
-class-of-service schedulers xpfarg transmit-rate
-class-of-service traffic-control-profiles
-class-of-service traffic-control-profiles xpfarg delay-buffer-rate
-class-of-service traffic-control-profiles xpfarg guaranteed-rate
-class-of-service traffic-control-profiles xpfarg scheduler-map
-class-of-service traffic-control-profiles xpfarg shaping-rate
-event-options policy
-firewall family inet filter
-firewall family inet filter xpfarg term
-firewall family inet filter xpfarg term xpfarg from flexible-match-range range
-firewall family inet6 filter
-firewall family inet6 filter xpfarg term
-firewall family inet6 filter xpfarg term xpfarg from flexible-match-range range
-firewall policer
-firewall policer xpfarg if-exceeding bandwidth-limit
-firewall policer xpfarg if-exceeding burst-size-limit
-firewall policer xpfarg then loss-priority
-forwarding-options dhcp-relay group
-forwarding-options dhcp-relay server-group
-forwarding-options family inet6 mode
-forwarding-options port-mirroring instance
-forwarding-options sampling instance
-forwarding-options sampling instance xpfarg family inet output flow-server
-forwarding-options sampling instance xpfarg family inet output flow-server xpfarg port
-forwarding-options sampling instance xpfarg family inet output flow-server xpfarg source-address
-forwarding-options sampling instance xpfarg family inet output flow-server xpfarg version-ipfix-template
-forwarding-options sampling instance xpfarg family inet output flow-server xpfarg version9-template
-forwarding-options sampling instance xpfarg family inet output source-address
-forwarding-options sampling instance xpfarg family inet6 output flow-server
-forwarding-options sampling instance xpfarg family inet6 output flow-server xpfarg port
-forwarding-options sampling instance xpfarg family inet6 output flow-server xpfarg source-address
-forwarding-options sampling instance xpfarg family inet6 output flow-server xpfarg version-ipfix-template
-forwarding-options sampling instance xpfarg family inet6 output flow-server xpfarg version9-template
-forwarding-options sampling instance xpfarg family inet6 output source-address
-forwarding-options sampling instance xpfarg input rate
-interfaces xpfname aggregated-ether-options lacp periodic
-interfaces xpfname aggregated-ether-options link-speed
-interfaces xpfname aggregated-ether-options minimum-links
-interfaces xpfname description
-interfaces xpfname duplex
-interfaces xpfname encapsulation
-interfaces xpfname gigether-options 802.3ad
-interfaces xpfname gigether-options redundant-parent
-interfaces xpfname mtu
-interfaces xpfname native-vlan-id
-interfaces xpfname speed
-interfaces xpfname tunnel destination
-interfaces xpfname tunnel mode
-interfaces xpfname tunnel routing-instance destination
-interfaces xpfname tunnel source
-interfaces xpfname tunnel ttl
-interfaces xpfname tunnel wireguard listen-port
-interfaces xpfname tunnel wireguard peer
-interfaces xpfname tunnel wireguard peer xpfarg allowed-ips
-interfaces xpfname tunnel wireguard peer xpfarg endpoint
-interfaces xpfname tunnel wireguard peer xpfarg persistent-keepalive
-policy-options community
-policy-options community xpfarg members
-policy-options policy-statement
-policy-options policy-statement xpfarg term
-policy-options policy-statement xpfarg term xpfarg from as-path
-policy-options policy-statement xpfarg term xpfarg from community
-policy-options policy-statement xpfarg term xpfarg from prefix-list
-policy-options policy-statement xpfarg term xpfarg from protocol
-policy-options policy-statement xpfarg term xpfarg then as-path-prepend
-policy-options policy-statement xpfarg term xpfarg then community
-policy-options policy-statement xpfarg term xpfarg then load-balance
-policy-options policy-statement xpfarg term xpfarg then local-preference
-policy-options policy-statement xpfarg term xpfarg then metric
-policy-options policy-statement xpfarg term xpfarg then metric-type
-policy-options policy-statement xpfarg term xpfarg then next-hop
-policy-options policy-statement xpfarg term xpfarg then origin
-policy-options prefix-list
-protocols bgp cluster-id
-protocols bgp export
-protocols bgp group xpfarg neighbor
-protocols bgp group xpfarg neighbor xpfarg description
-protocols bgp group xpfarg neighbor xpfarg export
-protocols bgp group xpfarg neighbor xpfarg hold-time
-protocols bgp group xpfarg neighbor xpfarg import
-protocols bgp group xpfarg neighbor xpfarg local-address
-protocols bgp group xpfarg neighbor xpfarg local-as
-protocols bgp group xpfarg neighbor xpfarg peer-as
-protocols bgp import
-protocols bgp local-as
-protocols bgp router-id
-protocols isis export
-protocols isis interface
-protocols isis interface xpfarg level
-protocols isis is-type
-protocols isis level
-protocols isis net
-protocols lldp hold-multiplier
-protocols lldp interface
-protocols lldp transmit-interval
-protocols ospf area
-protocols ospf area xpfarg interface
-protocols ospf area xpfarg virtual-link
-protocols ospf area xpfarg virtual-link xpfarg transit-area
-protocols ospf export
-protocols ospf router-id
-protocols ospf3 area
-protocols ospf3 area xpfarg interface
-protocols ospf3 export
-protocols ospf3 router-id
-protocols rip neighbor
-protocols rip passive-interface
-protocols rip redistribute
-protocols router-advertisement interface
-protocols router-advertisement interface xpfarg default-lifetime
-protocols router-advertisement interface xpfarg dns-server-address
-protocols router-advertisement interface xpfarg link-mtu
-protocols router-advertisement interface xpfarg max-advertisement-interval
-protocols router-advertisement interface xpfarg min-advertisement-interval
-protocols router-advertisement interface xpfarg nat-prefix
-protocols router-advertisement interface xpfarg nat64prefix
-protocols router-advertisement interface xpfarg preference
-protocols router-advertisement interface xpfarg prefix
-routing-instances xpfname protocols isis export
-routing-instances xpfname protocols isis interface
-routing-instances xpfname protocols isis interface xpfarg level
-routing-instances xpfname protocols isis is-type
-routing-instances xpfname protocols isis level
-routing-instances xpfname protocols isis net
-routing-instances xpfname protocols ospf area
-routing-instances xpfname protocols ospf area xpfarg interface
-routing-instances xpfname protocols ospf area xpfarg virtual-link
-routing-instances xpfname protocols ospf area xpfarg virtual-link xpfarg transit-area
-routing-instances xpfname protocols ospf3 area
-routing-instances xpfname protocols ospf3 area xpfarg interface
-routing-instances xpfname protocols ospf3 export
-routing-instances xpfname protocols ospf3 router-id
-routing-instances xpfname routing-options static route
-routing-options autonomous-system
-routing-options forwarding-table export
-routing-options generate route
-routing-options static route
-schedulers scheduler
-schedulers scheduler xpfarg daily start-time
-schedulers scheduler xpfarg daily stop-time
-schedulers scheduler xpfarg friday start-time
-schedulers scheduler xpfarg friday stop-time
-schedulers scheduler xpfarg monday start-time
-schedulers scheduler xpfarg monday stop-time
-schedulers scheduler xpfarg saturday start-time
-schedulers scheduler xpfarg saturday stop-time
-schedulers scheduler xpfarg start-time
-schedulers scheduler xpfarg stop-time
-schedulers scheduler xpfarg sunday start-time
-schedulers scheduler xpfarg sunday stop-time
-schedulers scheduler xpfarg thursday start-time
-schedulers scheduler xpfarg thursday stop-time
-schedulers scheduler xpfarg tuesday start-time
-schedulers scheduler xpfarg tuesday stop-time
-schedulers scheduler xpfarg wednesday start-time
-schedulers scheduler xpfarg wednesday stop-time
-security address-book global address-set
-security address-book global address-set xpfarg address
-security address-book global address-set xpfarg address-set
-security dynamic-address address-name
-security dynamic-address address-name xpfarg profile feed-name
-security dynamic-address feed-server
-security dynamic-address feed-server xpfarg feed-name
-security dynamic-address feed-server xpfarg feed-name xpfarg path
-security dynamic-address feed-server xpfarg hold-interval
-security dynamic-address feed-server xpfarg hostname
-security dynamic-address feed-server xpfarg update-interval
-security dynamic-address feed-server xpfarg url
-security flow aging early-ageout
-security flow aging high-watermark
-security flow aging low-watermark
-security flow icmp-session timeout
-security flow multicast-session-lifetime
-security flow route-change-timeout
-security flow tcp-session closing-timeout
-security flow tcp-session established-timeout
-security flow tcp-session initial-timeout
-security flow tcp-session time-wait-timeout
-security flow traceoptions file
-security flow traceoptions flag
-security flow traceoptions packet-filter
-security flow traceoptions packet-filter xpfarg destination-prefix
-security flow traceoptions packet-filter xpfarg protocol
-security flow traceoptions packet-filter xpfarg source-prefix
-security flow udp-session timeout
-security ike gateway
-security ike gateway xpfarg address
-security ike gateway xpfarg external-interface
-security ike gateway xpfarg ike-policy
-security ike gateway xpfarg local-address
-security ike gateway xpfarg local-certificate
-security ike gateway xpfarg nat-traversal
-security ike gateway xpfarg version
-security ike policy
-security ike policy xpfarg mode
-security ike policy xpfarg proposal-set
-security ike policy xpfarg proposals
-security ike proposal
-security ike proposal xpfarg dh-group
-security ike proposal xpfarg encryption-algorithm
-security ike proposal xpfarg lifetime-seconds
-security ipsec gateway
-security ipsec gateway xpfarg address
-security ipsec gateway xpfarg external-interface
-security ipsec gateway xpfarg ike-policy
-security ipsec gateway xpfarg local-address
-security ipsec gateway xpfarg local-certificate
-security ipsec gateway xpfarg nat-traversal
-security ipsec gateway xpfarg version
-security ipsec policy
-security ipsec policy xpfarg proposal-set
-security ipsec policy xpfarg proposals
-security ipsec proposal
-security ipsec proposal xpfarg dh-group
-security ipsec proposal xpfarg encryption-algorithm
-security ipsec proposal xpfarg lifetime-kilobytes
-security ipsec proposal xpfarg lifetime-seconds
-security ipsec proposal xpfarg protocol
-security ipsec vpn
-security ipsec vpn xpfarg bind-interface
-security ipsec vpn xpfarg df-bit
-security ipsec vpn xpfarg establish-tunnels
-security ipsec vpn xpfarg ike gateway
-security ipsec vpn xpfarg ike ipsec-policy
-security ipsec vpn xpfarg local-address
-security ipsec vpn xpfarg local-identity
-security ipsec vpn xpfarg remote-identity
-security ipsec vpn xpfarg traffic-selector
-security ipsec vpn xpfarg traffic-selector xpfarg local-ip
-security ipsec vpn xpfarg traffic-selector xpfarg remote-ip
-security ipsec vpn xpfarg vpn-monitor destination-ip
-security ipsec vpn xpfarg vpn-monitor source-interface
-security log format
-security log mode
-security log profile
-security log profile xpfarg stream-name
-security log source-interface
-security log stream xpfarg host
-security nat destination pool
-security nat destination rule-set
-security nat destination rule-set xpfarg rule
-security nat nat64 rule-set
-security nat nat64 rule-set xpfarg prefix
-security nat nat64 rule-set xpfarg source-pool
-security nat proxy-arp interface
-security nat proxy-arp interface xpfarg address
-security nat source pool
-security nat source pool xpfarg port-overloading-factor
-security nat source pool xpfarg routing-instance
-security nat source rule-set
-security nat source rule-set xpfarg rule
-security nat static rule-set
-security nat static rule-set xpfarg rule
-security policies default-policy-log
-security policies from-zone xpfarg xpfarg xpfarg policy
-security policies from-zone xpfarg xpfarg xpfarg policy xpfarg description
-security policies from-zone xpfarg xpfarg xpfarg policy xpfarg then log
-security policies global policy
-security policies global policy xpfarg description
-security policies global policy xpfarg then log
-security pre-id-default-policy then log
-security screen ids-option
-security screen ids-option xpfarg limit-session destination-ip-based
-security screen ids-option xpfarg limit-session source-ip-based
-security zones security-zone
-security zones security-zone xpfarg address-book address-set
-security zones security-zone xpfarg address-book address-set xpfarg address
-security zones security-zone xpfarg address-book address-set xpfarg address-set
-security zones security-zone xpfarg description
-security zones security-zone xpfarg host-inbound-traffic protocols
-security zones security-zone xpfarg host-inbound-traffic system-services
-security zones security-zone xpfarg interfaces
-security zones security-zone xpfarg interfaces xpfname host-inbound-traffic protocols
-security zones security-zone xpfarg interfaces xpfname host-inbound-traffic system-services
-security zones security-zone xpfarg screen
-services flow-monitoring version-ipfix template
-services flow-monitoring version-ipfix template xpfarg flow-active-timeout
-services flow-monitoring version-ipfix template xpfarg flow-inactive-timeout
-services flow-monitoring version-ipfix template xpfarg template-refresh-rate seconds
-services flow-monitoring version9 template
-services flow-monitoring version9 template xpfarg flow-active-timeout
-services flow-monitoring version9 template xpfarg flow-inactive-timeout
-services flow-monitoring version9 template xpfarg template-refresh-rate seconds
-services rpm probe
-snmp community
-snmp community xpfarg clients
-snmp trap-group
-snmp trap-group xpfarg categories
-snmp trap-group xpfarg targets
-snmp trap-group xpfarg version
-snmp v3 usm local-engine user
-system archival configuration archive-sites
-system archival configuration transfer-interval
-system backup-router
-system dataplane binary
-system dataplane claim-host-tunables
-system dataplane coalescence adaptive
-system dataplane coalescence rx-usecs
-system dataplane coalescence tx-usecs
-system dataplane cpu-governor
-system dataplane netdev-budget
-system dataplane poll-mode
-system dataplane ring-entries
-system dataplane shared-umem artifact-file
-system dataplane shared-umem interface
-system dataplane shared-umem mode
-system dataplane shared-umem phase0-artifact-file
-system dataplane state-file
-system dataplane workers
-system domain-search
-system license autoupdate url
-system login class
-system login class xpfarg allow-commands
-system login class xpfarg allow-configuration
-system login class xpfarg deny-commands
-system login class xpfarg deny-configuration
-system login class xpfarg idle-timeout
-system login class xpfarg permissions
-system login user
-system login user xpfarg authentication encrypted-password
-system login user xpfarg authentication ssh-dsa
-system login user xpfarg authentication ssh-ed25519
-system login user xpfarg authentication ssh-rsa
-system login user xpfarg class
-system name-server
-system ntp server
-system ntp threshold
-system services dhcp-local-server group
-system services dhcp-local-server group xpfarg interface
-system services dhcp-local-server group xpfarg pool
-system services dhcp-local-server group xpfarg pool xpfarg dns-server
-system services dhcp-local-server group xpfarg pool xpfarg static-binding
-system services dhcp-local-server group xpfarg pool xpfarg static-binding xpfarg fixed-address
-system services dhcp-local-server group xpfarg pool xpfarg static-binding xpfarg host-name
-system services dhcpv6-local-server group
-system services dhcpv6-local-server group xpfarg interface
-system services dhcpv6-local-server group xpfarg pool
-system services dhcpv6-local-server group xpfarg pool xpfarg dns-server
-system services dhcpv6-local-server group xpfarg pool xpfarg static-binding
-system services dhcpv6-local-server group xpfarg pool xpfarg static-binding xpfarg fixed-address
-system services dhcpv6-local-server group xpfarg pool xpfarg static-binding xpfarg host-name
-system services ssh client-alive-count-max
-system services ssh client-alive-interval
-system services ssh connection-limit
-system services ssh key-exchange
-system services ssh root-login
-system services web-management api-auth api-key
-system services web-management api-auth user xpfname password
-system services web-management http interface
-system services web-management https interface
-system time-zone
+applications application	empty
+applications application xpfarg alg	empty
+applications application xpfarg description	empty
+applications application xpfarg destination-port	empty
+applications application xpfarg icmp-code	empty
+applications application xpfarg icmp-type	empty
+applications application xpfarg inactivity-timeout	empty
+applications application xpfarg protocol	empty
+applications application xpfarg source-port	empty
+applications application xpfarg term	empty
+applications application xpfarg timeout	empty
+applications application-set	empty
+bridge-domains xpfname domain-type	partial
+bridge-domains xpfname routing-interface	partial
+chassis device-map interface	empty
+chassis device-map unmapped-interface-policy	empty
+class-of-service classifiers inet-precedence	empty
+class-of-service interfaces xpfarg classifiers dscp	empty
+class-of-service interfaces xpfarg classifiers ieee-802.1	empty
+class-of-service interfaces xpfarg output-traffic-control-profile	empty
+class-of-service interfaces xpfarg priority-low-min-share	empty
+class-of-service interfaces xpfarg rewrite-rules dscp	empty
+class-of-service interfaces xpfarg rewrite-rules ieee-802.1	empty
+class-of-service interfaces xpfarg scheduler-map	empty
+class-of-service interfaces xpfarg shaping-rate xpfarg burst-size	empty
+class-of-service rewrite-rules exp	empty
+class-of-service rewrite-rules inet-precedence	empty
+class-of-service scheduler-maps	empty
+class-of-service scheduler-maps xpfarg forwarding-class	empty
+class-of-service schedulers	empty
+class-of-service schedulers xpfarg buffer-size	empty
+class-of-service schedulers xpfarg codel-target	empty
+class-of-service schedulers xpfarg equal-flow-target-policy	empty
+class-of-service schedulers xpfarg priority	empty
+class-of-service schedulers xpfarg transmit-rate	empty
+class-of-service traffic-control-profiles	empty
+class-of-service traffic-control-profiles xpfarg delay-buffer-rate	empty
+class-of-service traffic-control-profiles xpfarg guaranteed-rate	empty
+class-of-service traffic-control-profiles xpfarg scheduler-map	empty
+class-of-service traffic-control-profiles xpfarg shaping-rate	empty
+event-options policy	empty
+event-options policy xpfarg within	empty
+firewall family inet filter	empty
+firewall family inet filter xpfarg term	empty
+firewall family inet filter xpfarg term xpfarg from flexible-match-range range	empty
+firewall family inet6 filter	empty
+firewall family inet6 filter xpfarg term	empty
+firewall family inet6 filter xpfarg term xpfarg from flexible-match-range range	empty
+firewall policer	empty
+firewall policer xpfarg if-exceeding bandwidth-limit	empty
+firewall policer xpfarg if-exceeding burst-size-limit	empty
+firewall policer xpfarg then loss-priority	empty
+forwarding-options dhcp-relay group	empty
+forwarding-options dhcp-relay server-group	empty
+forwarding-options family inet6 mode	empty
+forwarding-options port-mirroring instance	empty
+forwarding-options sampling instance	empty
+forwarding-options sampling instance xpfarg family inet output flow-server	empty
+forwarding-options sampling instance xpfarg family inet output flow-server xpfarg port	empty
+forwarding-options sampling instance xpfarg family inet output flow-server xpfarg source-address	empty
+forwarding-options sampling instance xpfarg family inet output flow-server xpfarg version-ipfix-template	empty
+forwarding-options sampling instance xpfarg family inet output flow-server xpfarg version9-template	empty
+forwarding-options sampling instance xpfarg family inet output source-address	empty
+forwarding-options sampling instance xpfarg family inet6 output flow-server	empty
+forwarding-options sampling instance xpfarg family inet6 output flow-server xpfarg port	empty
+forwarding-options sampling instance xpfarg family inet6 output flow-server xpfarg source-address	empty
+forwarding-options sampling instance xpfarg family inet6 output flow-server xpfarg version-ipfix-template	empty
+forwarding-options sampling instance xpfarg family inet6 output flow-server xpfarg version9-template	empty
+forwarding-options sampling instance xpfarg family inet6 output source-address	empty
+forwarding-options sampling instance xpfarg input rate	empty
+interfaces xpfname aggregated-ether-options lacp periodic	empty
+interfaces xpfname aggregated-ether-options link-speed	empty
+interfaces xpfname aggregated-ether-options minimum-links	empty
+interfaces xpfname description	partial
+interfaces xpfname duplex	partial
+interfaces xpfname encapsulation	partial
+interfaces xpfname gigether-options 802.3ad	empty
+interfaces xpfname gigether-options redundant-parent	empty
+interfaces xpfname mtu	partial
+interfaces xpfname native-vlan-id	partial
+interfaces xpfname speed	partial
+interfaces xpfname tunnel destination	empty
+interfaces xpfname tunnel keepalive-retry	empty
+interfaces xpfname tunnel mode	empty
+interfaces xpfname tunnel routing-instance destination	partial
+interfaces xpfname tunnel source	empty
+interfaces xpfname tunnel ttl	empty
+interfaces xpfname tunnel wireguard listen-port	empty
+interfaces xpfname tunnel wireguard peer	empty
+interfaces xpfname tunnel wireguard peer xpfarg allowed-ips	empty
+interfaces xpfname tunnel wireguard peer xpfarg endpoint	empty
+interfaces xpfname tunnel wireguard peer xpfarg persistent-keepalive	empty
+interfaces xpfname unit	partial
+policy-options community	empty
+policy-options community xpfarg members	empty
+policy-options policy-statement	empty
+policy-options policy-statement xpfarg term	empty
+policy-options policy-statement xpfarg term xpfarg from as-path	empty
+policy-options policy-statement xpfarg term xpfarg from community	empty
+policy-options policy-statement xpfarg term xpfarg from prefix-list	empty
+policy-options policy-statement xpfarg term xpfarg from protocol	empty
+policy-options policy-statement xpfarg term xpfarg then as-path-prepend	partial
+policy-options policy-statement xpfarg term xpfarg then community	partial
+policy-options policy-statement xpfarg term xpfarg then load-balance	partial
+policy-options policy-statement xpfarg term xpfarg then local-preference	partial
+policy-options policy-statement xpfarg term xpfarg then metric	partial
+policy-options policy-statement xpfarg term xpfarg then metric-type	partial
+policy-options policy-statement xpfarg term xpfarg then next-hop	partial
+policy-options policy-statement xpfarg term xpfarg then origin	partial
+policy-options prefix-list	empty
+protocols bgp cluster-id	empty
+protocols bgp export	empty
+protocols bgp group xpfarg neighbor	empty
+protocols bgp group xpfarg neighbor xpfarg bfd-liveness-detection minimum-interval	empty
+protocols bgp group xpfarg neighbor xpfarg description	empty
+protocols bgp group xpfarg neighbor xpfarg export	empty
+protocols bgp group xpfarg neighbor xpfarg hold-time	empty
+protocols bgp group xpfarg neighbor xpfarg import	empty
+protocols bgp group xpfarg neighbor xpfarg local-address	empty
+protocols bgp group xpfarg neighbor xpfarg local-as	empty
+protocols bgp group xpfarg neighbor xpfarg loops	empty
+protocols bgp group xpfarg neighbor xpfarg peer-as	empty
+protocols bgp import	empty
+protocols bgp local-as	empty
+protocols bgp router-id	empty
+protocols isis export	empty
+protocols isis interface	empty
+protocols isis interface xpfarg bfd-liveness-detection minimum-interval	empty
+protocols isis interface xpfarg level	empty
+protocols isis is-type	empty
+protocols isis level	empty
+protocols isis net	empty
+protocols lldp hold-multiplier	empty
+protocols lldp interface	empty
+protocols lldp transmit-interval	empty
+protocols ospf area	empty
+protocols ospf area xpfarg interface	empty
+protocols ospf area xpfarg interface xpfarg bfd-liveness-detection minimum-interval	empty
+protocols ospf area xpfarg virtual-link	empty
+protocols ospf area xpfarg virtual-link xpfarg transit-area	empty
+protocols ospf export	empty
+protocols ospf reference-bandwidth	empty
+protocols ospf router-id	empty
+protocols ospf3 area	empty
+protocols ospf3 area xpfarg interface	empty
+protocols ospf3 area xpfarg interface xpfarg bfd-liveness-detection minimum-interval	empty
+protocols ospf3 export	empty
+protocols ospf3 router-id	empty
+protocols rip neighbor	empty
+protocols rip passive-interface	empty
+protocols rip redistribute	empty
+protocols router-advertisement interface	empty
+protocols router-advertisement interface xpfarg default-lifetime	empty
+protocols router-advertisement interface xpfarg dns-server-address	empty
+protocols router-advertisement interface xpfarg link-mtu	empty
+protocols router-advertisement interface xpfarg max-advertisement-interval	empty
+protocols router-advertisement interface xpfarg min-advertisement-interval	empty
+protocols router-advertisement interface xpfarg nat-prefix	empty
+protocols router-advertisement interface xpfarg nat64prefix	empty
+protocols router-advertisement interface xpfarg preference	empty
+protocols router-advertisement interface xpfarg prefix	empty
+routing-instances xpfname protocols isis export	empty
+routing-instances xpfname protocols isis interface	empty
+routing-instances xpfname protocols isis interface xpfarg bfd-liveness-detection minimum-interval	empty
+routing-instances xpfname protocols isis interface xpfarg level	empty
+routing-instances xpfname protocols isis is-type	empty
+routing-instances xpfname protocols isis level	empty
+routing-instances xpfname protocols isis net	empty
+routing-instances xpfname protocols ospf area	empty
+routing-instances xpfname protocols ospf area xpfarg interface	empty
+routing-instances xpfname protocols ospf area xpfarg interface xpfarg bfd-liveness-detection minimum-interval	empty
+routing-instances xpfname protocols ospf area xpfarg virtual-link	empty
+routing-instances xpfname protocols ospf area xpfarg virtual-link xpfarg transit-area	empty
+routing-instances xpfname protocols ospf reference-bandwidth	empty
+routing-instances xpfname protocols ospf3 area	empty
+routing-instances xpfname protocols ospf3 area xpfarg interface	empty
+routing-instances xpfname protocols ospf3 area xpfarg interface xpfarg bfd-liveness-detection minimum-interval	empty
+routing-instances xpfname protocols ospf3 export	empty
+routing-instances xpfname protocols ospf3 router-id	empty
+routing-instances xpfname routing-options static route	empty
+routing-options autonomous-system	empty
+routing-options forwarding-table export	empty
+routing-options generate route	empty
+routing-options static route	empty
+schedulers scheduler	empty
+schedulers scheduler xpfarg daily start-time	empty
+schedulers scheduler xpfarg daily stop-time	empty
+schedulers scheduler xpfarg friday start-time	empty
+schedulers scheduler xpfarg friday stop-time	empty
+schedulers scheduler xpfarg monday start-time	empty
+schedulers scheduler xpfarg monday stop-time	empty
+schedulers scheduler xpfarg saturday start-time	empty
+schedulers scheduler xpfarg saturday stop-time	empty
+schedulers scheduler xpfarg start-time	empty
+schedulers scheduler xpfarg stop-time	empty
+schedulers scheduler xpfarg sunday start-time	empty
+schedulers scheduler xpfarg sunday stop-time	empty
+schedulers scheduler xpfarg thursday start-time	empty
+schedulers scheduler xpfarg thursday stop-time	empty
+schedulers scheduler xpfarg tuesday start-time	empty
+schedulers scheduler xpfarg tuesday stop-time	empty
+schedulers scheduler xpfarg wednesday start-time	empty
+schedulers scheduler xpfarg wednesday stop-time	empty
+security address-book global address-set	empty
+security address-book global address-set xpfarg address	empty
+security address-book global address-set xpfarg address-set	empty
+security dynamic-address address-name	empty
+security dynamic-address address-name xpfarg profile feed-name	empty
+security dynamic-address feed-server	empty
+security dynamic-address feed-server xpfarg feed-name	empty
+security dynamic-address feed-server xpfarg feed-name xpfarg path	empty
+security dynamic-address feed-server xpfarg hold-interval	empty
+security dynamic-address feed-server xpfarg hostname	empty
+security dynamic-address feed-server xpfarg update-interval	empty
+security dynamic-address feed-server xpfarg url	empty
+security flow aging early-ageout	empty
+security flow aging high-watermark	empty
+security flow aging low-watermark	empty
+security flow icmp-session timeout	empty
+security flow multicast-session-lifetime	empty
+security flow route-change-timeout	empty
+security flow tcp-session closing-timeout	empty
+security flow tcp-session established-timeout	empty
+security flow tcp-session initial-timeout	empty
+security flow tcp-session time-wait-timeout	empty
+security flow traceoptions file	empty
+security flow traceoptions flag	empty
+security flow traceoptions packet-filter	empty
+security flow traceoptions packet-filter xpfarg destination-prefix	empty
+security flow traceoptions packet-filter xpfarg protocol	empty
+security flow traceoptions packet-filter xpfarg source-prefix	empty
+security flow udp-session timeout	empty
+security ike gateway	empty
+security ike gateway xpfarg address	empty
+security ike gateway xpfarg external-interface	empty
+security ike gateway xpfarg ike-policy	empty
+security ike gateway xpfarg local-address	empty
+security ike gateway xpfarg local-certificate	empty
+security ike gateway xpfarg nat-traversal	empty
+security ike gateway xpfarg version	empty
+security ike policy	empty
+security ike policy xpfarg mode	empty
+security ike policy xpfarg proposal-set	empty
+security ike policy xpfarg proposals	empty
+security ike proposal	empty
+security ike proposal xpfarg dh-group	empty
+security ike proposal xpfarg encryption-algorithm	empty
+security ike proposal xpfarg lifetime-seconds	empty
+security ipsec gateway	empty
+security ipsec gateway xpfarg address	empty
+security ipsec gateway xpfarg external-interface	empty
+security ipsec gateway xpfarg ike-policy	empty
+security ipsec gateway xpfarg local-address	empty
+security ipsec gateway xpfarg local-certificate	empty
+security ipsec gateway xpfarg nat-traversal	empty
+security ipsec gateway xpfarg version	empty
+security ipsec policy	empty
+security ipsec policy xpfarg proposal-set	empty
+security ipsec policy xpfarg proposals	empty
+security ipsec proposal	empty
+security ipsec proposal xpfarg dh-group	empty
+security ipsec proposal xpfarg encryption-algorithm	empty
+security ipsec proposal xpfarg lifetime-kilobytes	empty
+security ipsec proposal xpfarg lifetime-seconds	empty
+security ipsec proposal xpfarg protocol	empty
+security ipsec vpn	empty
+security ipsec vpn xpfarg bind-interface	empty
+security ipsec vpn xpfarg df-bit	empty
+security ipsec vpn xpfarg establish-tunnels	empty
+security ipsec vpn xpfarg ike gateway	empty
+security ipsec vpn xpfarg ike ipsec-policy	empty
+security ipsec vpn xpfarg local-address	empty
+security ipsec vpn xpfarg local-identity	empty
+security ipsec vpn xpfarg remote-identity	empty
+security ipsec vpn xpfarg traffic-selector	empty
+security ipsec vpn xpfarg traffic-selector xpfarg local-ip	empty
+security ipsec vpn xpfarg traffic-selector xpfarg remote-ip	empty
+security ipsec vpn xpfarg vpn-monitor destination-ip	empty
+security ipsec vpn xpfarg vpn-monitor source-interface	empty
+security log format	empty
+security log mode	empty
+security log profile	empty
+security log profile xpfarg stream-name	empty
+security log source-interface	empty
+security log stream xpfarg host	empty
+security nat destination pool	empty
+security nat destination rule-set	empty
+security nat destination rule-set xpfarg rule	empty
+security nat nat64 rule-set	empty
+security nat nat64 rule-set xpfarg prefix	empty
+security nat nat64 rule-set xpfarg source-pool	empty
+security nat proxy-arp interface	empty
+security nat proxy-arp interface xpfarg address	empty
+security nat source pool	empty
+security nat source pool xpfarg port-overloading-factor	empty
+security nat source pool xpfarg routing-instance	empty
+security nat source rule-set	empty
+security nat source rule-set xpfarg rule	empty
+security nat static rule-set	empty
+security nat static rule-set xpfarg rule	empty
+security policies default-policy-log	empty
+security policies from-zone xpfarg xpfarg xpfarg policy	empty
+security policies from-zone xpfarg xpfarg xpfarg policy xpfarg description	empty
+security policies from-zone xpfarg xpfarg xpfarg policy xpfarg then log	empty
+security policies global policy	empty
+security policies global policy xpfarg description	empty
+security policies global policy xpfarg then log	empty
+security pre-id-default-policy then log	empty
+security screen ids-option	empty
+security screen ids-option xpfarg limit-session destination-ip-based	empty
+security screen ids-option xpfarg limit-session source-ip-based	empty
+security zones security-zone	empty
+security zones security-zone xpfarg address-book address-set	empty
+security zones security-zone xpfarg address-book address-set xpfarg address	empty
+security zones security-zone xpfarg address-book address-set xpfarg address-set	empty
+security zones security-zone xpfarg description	empty
+security zones security-zone xpfarg host-inbound-traffic protocols	empty
+security zones security-zone xpfarg host-inbound-traffic system-services	empty
+security zones security-zone xpfarg interfaces	empty
+security zones security-zone xpfarg interfaces xpfname host-inbound-traffic protocols	empty
+security zones security-zone xpfarg interfaces xpfname host-inbound-traffic system-services	empty
+security zones security-zone xpfarg screen	empty
+services flow-monitoring version-ipfix template	empty
+services flow-monitoring version-ipfix template xpfarg flow-active-timeout	empty
+services flow-monitoring version-ipfix template xpfarg flow-inactive-timeout	empty
+services flow-monitoring version-ipfix template xpfarg template-refresh-rate seconds	empty
+services flow-monitoring version9 template	empty
+services flow-monitoring version9 template xpfarg flow-active-timeout	empty
+services flow-monitoring version9 template xpfarg flow-inactive-timeout	empty
+services flow-monitoring version9 template xpfarg template-refresh-rate seconds	empty
+services rpm probe	empty
+snmp community	empty
+snmp community xpfarg clients	empty
+snmp trap-group	empty
+snmp trap-group xpfarg categories	empty
+snmp trap-group xpfarg targets	empty
+snmp trap-group xpfarg version	empty
+snmp v3 usm local-engine user	empty
+system archival configuration archive-sites	empty
+system archival configuration transfer-interval	empty
+system backup-router	empty
+system dataplane binary	empty
+system dataplane claim-host-tunables	empty
+system dataplane coalescence adaptive	empty
+system dataplane coalescence rx-usecs	empty
+system dataplane coalescence tx-usecs	empty
+system dataplane cpu-governor	empty
+system dataplane netdev-budget	empty
+system dataplane poll-mode	empty
+system dataplane ring-entries	empty
+system dataplane shared-umem artifact-file	empty
+system dataplane shared-umem interface	empty
+system dataplane shared-umem mode	empty
+system dataplane shared-umem phase0-artifact-file	empty
+system dataplane state-file	empty
+system dataplane workers	empty
+system domain-search	empty
+system license autoupdate url	empty
+system login class	partial
+system login class xpfarg allow-commands	empty
+system login class xpfarg allow-configuration	empty
+system login class xpfarg deny-commands	empty
+system login class xpfarg deny-configuration	empty
+system login class xpfarg idle-timeout	empty
+system login class xpfarg permissions	empty
+system login user	partial
+system login user xpfarg authentication encrypted-password	empty
+system login user xpfarg authentication ssh-dsa	empty
+system login user xpfarg authentication ssh-ed25519	empty
+system login user xpfarg authentication ssh-rsa	empty
+system login user xpfarg class	empty
+system login user xpfarg uid	empty
+system name-server	empty
+system ntp server	empty
+system ntp threshold	empty
+system services dhcp-local-server group	empty
+system services dhcp-local-server group xpfarg interface	empty
+system services dhcp-local-server group xpfarg pool	empty
+system services dhcp-local-server group xpfarg pool xpfarg dns-server	empty
+system services dhcp-local-server group xpfarg pool xpfarg static-binding	empty
+system services dhcp-local-server group xpfarg pool xpfarg static-binding xpfarg fixed-address	empty
+system services dhcp-local-server group xpfarg pool xpfarg static-binding xpfarg host-name	empty
+system services dhcpv6-local-server group	empty
+system services dhcpv6-local-server group xpfarg interface	empty
+system services dhcpv6-local-server group xpfarg pool	empty
+system services dhcpv6-local-server group xpfarg pool xpfarg dns-server	empty
+system services dhcpv6-local-server group xpfarg pool xpfarg static-binding	empty
+system services dhcpv6-local-server group xpfarg pool xpfarg static-binding xpfarg fixed-address	empty
+system services dhcpv6-local-server group xpfarg pool xpfarg static-binding xpfarg host-name	empty
+system services ssh client-alive-count-max	empty
+system services ssh client-alive-interval	empty
+system services ssh connection-limit	empty
+system services ssh key-exchange	empty
+system services ssh root-login	empty
+system services web-management api-auth api-key	empty
+system services web-management api-auth user xpfname password	empty
+system services web-management http interface	empty
+system services web-management https interface	empty
+system time-zone	empty

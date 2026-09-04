@@ -159,18 +159,58 @@ func (s ScopeKey) scopePrefix() string {
 	if s == (ScopeKey{}) {
 		return ""
 	}
-	// Fixed field order; the family int (4/6) keeps it human-readable. The
-	// terminating "#" separates the scope prefix from the identity|address
-	// suffix so a scope value containing '|' cannot alias an identity.
+	// #8597 (muse-004 K49): every VARIABLE field is LENGTH-PREFIXED, so no
+	// value can forge a field boundary.
+	//
+	// The previous encoding was `f4/if=%s/u=%d/ri=%s/rg=%d/pid=%s` with an
+	// optional `/fqdn=%s`, and its comment asserted that "/fqdn=" could not
+	// alias an earlier field because "pid is the last fixed field and the value
+	// cannot contain /fqdn=". PolicyID is a raw provider name from config
+	// (daemon_ddns_surface_a.go sets PolicyID = b.Provider) and the `provider`
+	// schema leaf carries NO validator, so it can contain anything. Measured:
+	//
+	//	{PolicyID: "p/fqdn=a.example"}              -> f4/if=ge-0-0-0/u=0/ri=/rg=0/pid=p/fqdn=a.example#
+	//	{PolicyID: "p", FQDN: "a.example"}          -> f4/if=ge-0-0-0/u=0/ri=/rg=0/pid=p/fqdn=a.example#
+	//
+	// Byte-identical, for two scopes the reconciler must keep apart. Interface
+	// and RoutingInstance are equally injectable; PolicyID is only the easiest.
+	//
+	// The consequence is ownership confusion inside the reconciler: two scopes
+	// sharing a prefix share their gating (`gatedScope`), their runtime state
+	// (`m.runtime`), and their owned-record keys — so a withdraw reasoned about
+	// one endpoint can act on the other's records, and one provider's backoff
+	// can suppress a healthy provider's publishes.
+	//
+	// Length-prefixing rather than rejecting a charset at commit, deliberately:
+	// a schema validator is a COMMIT gate, not an invariant. The tolerant
+	// Store.Load / peer-sync ingress downgrades a typed-leaf violation to a
+	// warning (#1319/#1960), so a persisted or peer-pushed provider name
+	// reaches this function whatever the schema says. The fix has to be where
+	// the ambiguity is.
+	//
+	// The idiom is this package's own: dhcpBackendFingerprint uses
+	// `writeField := func(s string) { fmt.Fprintf(&sb, "%d:%s|", len(s), s) }`
+	// for exactly this reason.
+	//
+	// Safe to change the encoding: scopePrefix is never persisted. It is an
+	// IN-MEMORY map key (ownedRecordKey, gatedScope, m.runtime), rebuilt every
+	// run from the record fields, and ownedRecord's JSON carries no prefix. The
+	// one compat property that IS load-bearing — a ZERO scope yielding the
+	// empty string, so a pre-P1b store's records key exactly as they did — is
+	// preserved by the early return above and asserted by a cell.
+	//
+	// The FQDN is now written UNCONDITIONALLY. With a length prefix an empty
+	// value encodes as "0:" and cannot be confused with an absent one, so the
+	// conditional that the old comment existed to defend is no longer needed.
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "f%d/if=%s/u=%d/ri=%s/rg=%d/pid=%s",
-		int(s.Family), s.Interface, s.Unit, s.RoutingInstance, s.RGOwner, s.PolicyID)
-	// Append the FQDN axis only when set so an FQDN-less (lease) scope keeps its
-	// pre-#2903 prefix byte-for-byte. "/fqdn=" cannot alias an earlier field
-	// (pid is the last fixed field and the value cannot contain "/fqdn=").
-	if s.FQDN != "" {
-		fmt.Fprintf(&sb, "/fqdn=%s", s.FQDN)
-	}
+	writeField := func(v string) { fmt.Fprintf(&sb, "%d:%s|", len(v), v) }
+	fmt.Fprintf(&sb, "f%d|", int(s.Family))
+	writeField(s.Interface)
+	fmt.Fprintf(&sb, "%d|", s.Unit)
+	writeField(s.RoutingInstance)
+	fmt.Fprintf(&sb, "%d|", s.RGOwner)
+	writeField(s.PolicyID)
+	writeField(s.FQDN)
 	sb.WriteByte('#')
 	return sb.String()
 }
