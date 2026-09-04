@@ -790,7 +790,23 @@ func compileDynamicAddress(node *Node, sec *SecurityConfig) error {
 	}
 
 	for _, inst := range namedInstances(node.FindChildren("feed-server")) {
-		fs := &FeedServer{Name: inst.name}
+		// #8436: FIND-OR-CREATE, not construct-and-overwrite. Two hierarchical
+		// blocks with one name are ONE object in Junos, and the flat-set
+		// spelling already merges them; constructing a fresh value per block
+		// made the LAST block win and silently discarded the first's
+		// configuration. Silently, because there is no commit gate on this
+		// container — reachable through a hierarchical file, `load merge` or
+		// `load override`, not through `set`.
+		//
+		// Merging is safe field-by-field for the same reason as the other
+		// sites in this family: every scalar is assigned inside a
+		// `switch prop.Name()` arm, so a block that does not mention a leaf
+		// never reaches its assignment and cannot reset it, and the slice
+		// fields append rather than replace.
+		fs, found := sec.DynamicAddress.FeedServers[inst.name]
+		if !found || fs == nil {
+			fs = &FeedServer{Name: inst.name}
+		}
 
 		for _, prop := range inst.node.Children {
 			switch prop.Name() {
@@ -1275,7 +1291,23 @@ func compileFlowMonitoring(node *Node, svc *ServicesConfig) error {
 			Templates: make(map[string]*NetFlowV9Template),
 		}
 		for _, tmplInst := range namedInstances(v9Node.FindChildren("template")) {
-			tmpl := &NetFlowV9Template{Name: tmplInst.name}
+			// #8436: FIND-OR-CREATE, not construct-and-overwrite. Two hierarchical
+			// blocks with one name are ONE object in Junos, and the flat-set
+			// spelling already merges them; constructing a fresh value per block
+			// made the LAST block win and silently discarded the first's
+			// configuration. Silently, because there is no commit gate on this
+			// container — reachable through a hierarchical file, `load merge` or
+			// `load override`, not through `set`.
+			//
+			// Merging is safe field-by-field for the same reason as the other
+			// sites in this family: every scalar is assigned inside a
+			// `switch prop.Name()` arm, so a block that does not mention a leaf
+			// never reaches its assignment and cannot reset it, and the slice
+			// fields append rather than replace.
+			tmpl, found := v9cfg.Templates[tmplInst.name]
+			if !found || tmpl == nil {
+				tmpl = &NetFlowV9Template{Name: tmplInst.name}
+			}
 			for _, prop := range tmplInst.node.Children {
 				switch prop.Name() {
 				case "flow-active-timeout":
@@ -1317,7 +1349,23 @@ func compileFlowMonitoring(node *Node, svc *ServicesConfig) error {
 			Templates: make(map[string]*NetFlowIPFIXTemplate),
 		}
 		for _, tmplInst := range namedInstances(ipfixNode.FindChildren("template")) {
-			tmpl := &NetFlowIPFIXTemplate{Name: tmplInst.name}
+			// #8436: FIND-OR-CREATE, not construct-and-overwrite. Two hierarchical
+			// blocks with one name are ONE object in Junos, and the flat-set
+			// spelling already merges them; constructing a fresh value per block
+			// made the LAST block win and silently discarded the first's
+			// configuration. Silently, because there is no commit gate on this
+			// container — reachable through a hierarchical file, `load merge` or
+			// `load override`, not through `set`.
+			//
+			// Merging is safe field-by-field for the same reason as the other
+			// sites in this family: every scalar is assigned inside a
+			// `switch prop.Name()` arm, so a block that does not mention a leaf
+			// never reaches its assignment and cannot reset it, and the slice
+			// fields append rather than replace.
+			tmpl, found := ipfixCfg.Templates[tmplInst.name]
+			if !found || tmpl == nil {
+				tmpl = &NetFlowIPFIXTemplate{Name: tmplInst.name}
+			}
 			for _, prop := range tmplInst.node.Children {
 				switch prop.Name() {
 				case "flow-active-timeout":
