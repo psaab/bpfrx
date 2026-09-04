@@ -493,9 +493,27 @@ else
 		# #8640 made on this same address.
 		pass "only the RG owner answers proxy-ARP for $POOL_NAT_ADDR"
 	else
-		# Neither the known state nor the fixed one. #8314 produced exactly this
-		# and it is strictly worse than the defect it replaced, so it stays a
-		# hard failure rather than a tracked gap.
+		# THIS BRANCH IS NOT LEFTOVER SCAFFOLDING, and it is the reason this
+		# cell has three states rather than two. Do not collapse it.
+		#
+		# Reading the two branches above as "known_gap became pass/fail" invites
+		# simplifying the whole block to `if fw1 == 0: pass` — which would delete
+		# this arm, and this arm is the only thing that distinguishes "the owner
+		# answers and the standby does not" from "NOBODY answers". Those look
+		# identical to any assertion phrased about the standby alone.
+		#
+		# It is a state that actually happened: #8314 gated proxy-ARP on RG
+		# ownership, was merged, and was REVERTED by #8342 because
+		# `ip neigh show proxy` came back EMPTY ON BOTH NODES — the failure moved
+		# from two answerers to zero, which breaks pool-mode NAT outright rather
+		# than merely duplicating an answer. The cause was borrowing
+		# `isRethMasterState`, whose own doc says it returns false when no
+		# instances exist for the RG: safe for the DHCP relay it came from, an
+		# outage here.
+		#
+		# So the assertion above is deliberately two-sided — the owner MUST
+		# answer (fw0 >= 1), not merely "the standby must not" — and this arm
+		# catches the half that a one-sided phrasing would pass.
 		fail "the RG OWNER does not answer proxy-ARP for $POOL_NAT_ADDR (fw0=$fw0_proxy fw1=$fw1_proxy). Gating the owner is the OPPOSITE failure and breaks pool-mode NAT outright — this is the #8314 over-correction, not the #8297 defect"
 	fi
 
