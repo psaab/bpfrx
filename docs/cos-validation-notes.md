@@ -1337,4 +1337,65 @@ Scope: the flow **cache** replay arm is unaffected for NAT64 —
 `flow_cache::should_cache` excludes NAT64 (`&& !decision.nat.nat64`), so a
 NAT64 flow is never cached. Its equivalent pre-NAT address staleness under
 plain SNAT/DNAT (a v4 SNAT'd fragment logging its pre-translation source)
-is real but family-invariant, and is tracked separately.
+is real but family-invariant. It was split out as #8367 and is settled
+below.
+
+### Plain SNAT/DNAT — the non-NAT64 half (#8367)
+
+Two things were owed here, and they turned out to be different in kind.
+Neither is what the issue title suggests, which is worth stating plainly
+before someone re-derives it.
+
+**The fresh flowless arm was already correct — and untested.**
+`forward_request.rs` builds `flowless_wire_flow` with
+`l3_wire_session_flow_from_meta(meta, decision.nat)`, and the
+`forward_wire_key` inside it rewrites `src_ip`/`dst_ip` from
+`nat.rewrite_src`/`rewrite_dst` **unconditionally** — only the address
+FAMILY and the ICMP/ICMPv6 protocol swap sit behind `if nat.nat64`. So
+#7656 fixed plain SNAT/DNAT on this arm as a side effect the day it
+landed. But every #7656 cell is NAT64, so the behaviour was right *by side
+effect* with nothing to notice it regressing: narrowing
+`l3_wire_session_flow_from_meta` to `if nat.nat64 { forward_wire_key(..) }
+else { pre.forward_key }` — the exact scope boundary #7656's own body drew
+— left the whole suite green.
+
+`flowless_snat_egress_output_filter_matches_the_postnat_tuple_8367`
+(`tests_fragment.rs`) binds it end to end: interface SNAT lan -> wan, one
+datagram, `from source-address` terms carrying the pre- and the post-NAT
+source in turn, the flow-bearing first fragment as the positive control
+and the flowless non-first fragment as the subject. It asserts the event
+COUNT (which binds the site that decides whether the term MATCHES) and the
+event's `src_ip` (which binds the site that decides which tuple the record
+CARRIES) — two different reads of the same key that revert independently,
+so a cell asserting only that a log exists would pass on a record
+attributed to the wrong tuple.
+
+**The cached flowless arm was stale, and unreachable.**
+`resolve_cached_cos_tx_selection_impl`'s flowless arm read the ingress
+`meta` in all three places. It could not be reached with a wrong tuple in
+production, though, and that changes what the fix is for: `flow_cache.rs`
+always seeds with a flow key, and the only caller that reached the
+flowless arm — `mirror_cos_queue_id` — consumed `.queue_id` alone, which
+is computed before and independently of the filter block. The staleness
+was a trap armed for the next caller, not a live defect, and it would have
+presented as "the output filter matched the wrong address" long after the
+commit that armed it.
+
+That framing is why the arm was not simply emptied. #6055 populated
+`.drop` / `.reject` / `.filter_log` here DELIBERATELY, so a future caller
+would fail CLOSED rather than wave a would-be-dropped fragment past an
+egress `then discard`; returning "not evaluated" would restore exactly the
+fail-open #6055 removed. A pre-NAT tuple, though, makes those fields
+*confidently wrong* rather than merely absent, which is worse than either.
+
+#8367 resolves that by making the key REQUIRED instead of patching the
+three reads. `CachedTxTuple` has two variants — `Flow { egress_wire_key,
+ingress_flow_key }` and `Flowless { wire_l3 }` — and both carry a post-NAT
+key as a required field; there is no entry point that lets it be omitted.
+The mirror path asks for what it actually consumes
+(`resolve_cached_cos_tx_queue_id`, byte-identical result: behavior-
+aggregate classification is 5-tuple independent), so nothing can obtain a
+filter verdict without supplying the tuple that verdict must be computed
+on. Bound by `cached_flowless_output_filter_matches_the_postnat_source_8367`
+and `cached_flowless_output_filter_reads_family_and_protocol_from_the_wire_key_8367`
+in `cos_classify_tests.rs`.

@@ -566,10 +566,11 @@ sync.
     descriptor builder, `afxdp/tx/cos_classify.rs`) kept a flowless
     (`flow_key = None`) arm that returned `drop:false, reject:false,
     filter_log:None` WITHOUT evaluating the output filter. That arm is
-    UNREACHABLE for enforcement today (the seed caller always passes
-    `Some(&key)`; the mirror caller reads only `.queue_id`), so there is no
-    active bypass — but any future caller reading `.drop`/`.reject` from a
-    `flow_key = None` result would silently reintroduce the #5467 fail-open.
+    UNREACHABLE for enforcement today (the seed caller always passes a flow
+    key; the mirror caller read only `.queue_id`, and since #8367 asks for the
+    queue alone), so there is no active bypass — but any future caller reading
+    `.drop`/`.reject` from a flowless result would silently reintroduce the
+    #5467 fail-open.
     The cached flowless arm now evaluates the output filter through the SAME
     entry the flow-keyed cached arm uses
     (`interface_output_filter_needs_tx_eval` +
@@ -586,6 +587,52 @@ sync.
     gated on `l4_present`, an over-block that is fail-CLOSED and pre-existing on
     both the #3291 input and this output flowless path) is left as a tracked
     follow-up.
+  - **#8367 — the cached flowless arm's tuple must be POST-NAT, and the key is
+    now REQUIRED rather than defaulted:** the #6055 arm above evaluated the
+    output filter from three INDEPENDENT reads of the ingress `meta` — the
+    filter FAMILY (`meta.addr_family`), the matched ADDRESSES
+    (`ForwardPacketMeta::from(meta).l3_addrs()`) and the PROTOCOL
+    (`meta.protocol`). `meta` is the PRE-NAT tuple for any translated packet,
+    and Junos applies an interface `filter output` on the EGRESS interface
+    AFTER NAT (#3642), so under plain SNAT/DNAT a `from source-address <pool>`
+    term did not match a packet whose on-wire source IS the pool address, and a
+    `from source-address <private range>` term matched one that no longer
+    carries it. #7656 fixed the same defect on the FRESH flowless arm, but only
+    reached this one for NAT64 — and `flow_cache::should_cache` excludes NAT64
+    (`&& !decision.nat.nat64`), so the cached arm's entire population is exactly
+    the plain SNAT/DNAT case #7656 could not touch. **Measured before changing
+    anything, and it changes what the fix is for:** the arm was UNREACHABLE with
+    a wrong tuple. `flow_cache.rs` always seeds with a flow key, and
+    `mirror_cos_queue_id` — the only caller that reached the flowless arm —
+    consumed `.queue_id`, which is computed BEFORE and INDEPENDENTLY of the
+    filter block. So this is HARDENING of a trap armed for the next caller, not
+    an outage repair, and the trap would have presented as "the output filter
+    matched the wrong address" long after the commit that armed it. The arm was
+    not simply emptied instead: #6055 populated those fields deliberately so a
+    future caller fails CLOSED, and returning "not evaluated" restores exactly
+    the fail-open #6055 removed — while a pre-NAT tuple is *confidently wrong*,
+    which is worse than either. The fix is therefore a TYPE change rather than
+    three patched reads: `CachedTxTuple::{Flow{egress_wire_key,
+    ingress_flow_key}, Flowless{wire_l3}}` makes the post-NAT key a REQUIRED
+    field of both variants (`resolve_cached_cos_tx_selection{,_prenat,_flowless}`
+    take `&SessionKey`, not `Option`), and the mirror path asks for what it
+    consumes — `resolve_cached_cos_tx_queue_id`, whose flowless answer is the
+    behavior-aggregate lookup alone and therefore byte-identical to what it got
+    before. A caller that wants `.drop` must supply the tuple to get it and
+    cannot get a wrong one by default. On the FRESH arm nothing changed: it has
+    been post-NAT for any NAT since #7656 (`forward_wire_key` rewrites
+    `src`/`dst` unconditionally; only family and the ICMP/ICMPv6 swap are gated
+    on `nat.nat64`) — but every #7656 cell is NAT64, so that was right by side
+    effect and unbound: narrowing `l3_wire_session_flow_from_meta` to
+    `if nat.nat64 { forward_wire_key(..) }` left 5251 of 5252 cells green.
+    Cells: `flowless_snat_egress_output_filter_matches_the_postnat_tuple_8367`
+    (`tests_fragment.rs`, end-to-end interface SNAT, address-bearing terms on
+    both the pre- and post-NAT source, flow-bearing positive control, and
+    separate assertions for the MATCH site and the log-ATTRIBUTION site — each
+    reverts independently),
+    `cached_flowless_output_filter_matches_the_postnat_source_8367` and
+    `cached_flowless_output_filter_reads_family_and_protocol_from_the_wire_key_8367`
+    (`cos_classify_tests.rs`).
   - **#5690 — generic embedded-ICMP NAT reversal on the flowless arm:** an
     inbound non-query ICMP error (Time-Exceeded, Dest-Unreachable, PTB,
     Parameter-Problem, Redirect) referencing a NAT'd flow is itself FLOWLESS

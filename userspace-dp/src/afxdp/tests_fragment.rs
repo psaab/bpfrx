@@ -467,6 +467,196 @@ fn flowless_non_first_fragment_inherits_ordinary_snat_translation_5689() {
     );
 }
 
+/// #8367: on the FLOWLESS TX path under plain SNAT, the egress interface
+/// `filter output` must be MATCHED — and its `then log` event ATTRIBUTED —
+/// against the POST-NAT (on-wire) tuple, not the pre-translation one.
+///
+/// #7656 established that contract, but only for NAT64, where the staleness is
+/// a FAMILY change and therefore loud: the wrong-family filter was selected
+/// outright. This is the non-NAT64 half. The family is unchanged and only the
+/// addresses move, so nothing about the packet looks wrong — a
+/// `from source-address <pool>` term simply does not match a packet whose
+/// on-wire source IS the pool address, and a `then log` records a source the
+/// packet never carried on the wire.
+///
+/// # The fixture, and why it is shaped this way
+///
+/// Interface SNAT lan -> wan rewrites 10.0.61.100 to the wan interface address
+/// 172.16.80.8. Two fragments of ONE datagram go through:
+///
+/// * the FIRST fragment has a flow, so it takes the flow-bearing path, which
+///   has used the post-NAT wire key since #3642. It is the POSITIVE CONTROL —
+///   its `1` proves the term is well-formed, TX-eligible, attached to the
+///   interface the packet actually leaves by, and reachable on this fixture, so
+///   the flowless value beside it is about the flowless packet and not about a
+///   dead fixture.
+/// * the NON-FIRST fragment is FLOWLESS (#2344) and inherits the first's SNAT
+///   decision through the ordinary-NAT fragment association (#5689/#6095). It
+///   is the packet under test.
+///
+/// The term is ADDRESS-BEARING and its expected value DIFFERS between the two
+/// tuples. That is the #7656 fixture warning carried over verbatim: an
+/// address-less term fires on whichever tuple the evaluator was handed and
+/// cannot distinguish "matched the post-NAT tuple" from "matched the pre-NAT
+/// one". On #7656 a family-only half-fix passed the address-less cell and was
+/// caught only by an address-bearing one — and here there is no family signal
+/// at all, since both tuples are IPv4.
+///
+/// # Two sites, and the assertions are split across both
+///
+/// `forward_request.rs` feeds the post-NAT flowless key to TWO consumers:
+/// `resolve_cos_tx_selection_at_prenat` (which decides whether the term MATCHES)
+/// and `apply_cos_drop_side_effects` (which decides which tuple the event
+/// CARRIES). The event COUNT binds the first; the event's `src_ip` binds the
+/// second. Asserting only that a log exists would pass on a record attributed
+/// to the wrong tuple, which is the #7656 defect one layer down on this code.
+#[test]
+fn flowless_snat_egress_output_filter_matches_the_postnat_tuple_8367() {
+    // (label, the term's `from source-address`, want_first, want_flowless)
+    for (label, term_source, want_first, want_flowless) in [
+        // The PRE-NAT source. The packet arrived with it and no longer carries
+        // it on the wire, so neither packet may match.
+        (
+            "pre-NAT source term: the ingress tuple must no longer match",
+            "10.0.61.100/32",
+            0u64,
+            0u64,
+        ),
+        // The POST-NAT source — the wan interface address interface-SNAT
+        // rewrote to. Both packets leave with it, so both must match.
+        (
+            "post-NAT source term: the on-wire tuple must match",
+            "172.16.80.8/32",
+            1u64,
+            1u64,
+        ),
+    ] {
+        let mut snapshot = policy_deny_snapshot();
+        snapshot.default_policy = "permit".to_string();
+        snapshot.policies.clear();
+        snapshot.neighbors = vec![frag_transit_wan_neighbor()];
+        snapshot.source_nat_rules = vec![SourceNATRuleSnapshot {
+            name: "snat-lan-wan".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            interface_mode: true,
+            ..Default::default()
+        }];
+        // `then accept` + `then log` on the WAN egress: both packets MUST still
+        // forward, so a drop can never be mistaken for the property under test.
+        snapshot.interfaces[1].filter_output_v4 = "postnat-src".to_string();
+        snapshot.filters = vec![FirewallFilterSnapshot {
+            name: "postnat-src".to_string(),
+            family: "inet".to_string(),
+            terms: vec![FirewallTermSnapshot {
+                name: "by-source".to_string(),
+                source_addresses: vec![term_source.to_string()],
+                source_constrained: true,
+                action: "accept".to_string(),
+                log: true,
+                ..Default::default()
+            }],
+        }];
+        let forwarding = build_forwarding_state(&snapshot);
+
+        let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+        binding.interface = Arc::<str>::from("reth1.0");
+        let mut sessions = SessionTable::new();
+        let ha_state = BTreeMap::new();
+
+        // (1) FIRST fragment (MF=1, offset 0): seeds the session, applies
+        //     interface SNAT, installs the ordinary-NAT fragment association.
+        //     Both packets use the CAPTURING runner so they share one clock —
+        //     mixing runners hands them clocks billions of nanoseconds apart and
+        //     the association the first installs is not valid for the second.
+        let first = udp_frag_frame_5689(0x2000, 0xbeef);
+        let (_b1, dbg1, first_handle, _rx1) = txn_run_descriptor_capturing_events(
+            &mut binding,
+            &mut sessions,
+            &forwarding,
+            &ha_state,
+            &first,
+            udp_frag_meta_5689(),
+        );
+        assert_eq!(dbg1.forward, 1, "{label}: the first fragment must forward");
+        assert_eq!(
+            dbg1.nat_applied_snat, 1,
+            "{label} PREMISE: the first fragment must be SNAT'd, or the post-NAT \
+             source term below is being matched against a packet that was never \
+             translated"
+        );
+        assert_eq!(
+            first_handle.dataplane_event_stats().filter_log.sent,
+            want_first,
+            "{label}: flow-bearing first fragment (the positive control)"
+        );
+
+        // (2) NON-FIRST fragment (offset 1, same IPv4 id): FLOWLESS. Consults
+        //     the association and inherits the SNAT decision, so it leaves with
+        //     the same on-wire source as the first fragment.
+        let non_first = udp_frag_frame_5689(0x0001, 0xbeef);
+        let (_b2, dbg2, second_handle, rx2) = txn_run_descriptor_capturing_events(
+            &mut binding,
+            &mut sessions,
+            &forwarding,
+            &ha_state,
+            &non_first,
+            udp_frag_meta_5689(),
+        );
+        assert_eq!(
+            dbg2.forward, 1,
+            "{label}: the non-first fragment must forward — the defect under test \
+             is a mis-matched filter on a correctly forwarded packet"
+        );
+        assert_eq!(
+            dbg2.nat_applied_snat, 1,
+            "{label} PREMISE: the non-first fragment must INHERIT the SNAT \
+             translation (#5689). Without this it leaves untranslated and the \
+             pre-NAT source would legitimately match"
+        );
+        assert_eq!(
+            second_handle.dataplane_event_stats().filter_log.sent,
+            want_flowless,
+            "{label}: FLOWLESS non-first fragment. A 0 on the post-NAT arm means \
+             the egress output filter is still being MATCHED against the ingress \
+             (pre-NAT) tuple — family, addresses and protocol must all come from \
+             the synthesized post-NAT wire key (l3_wire_session_flow_from_meta), \
+             not from `meta`"
+        );
+
+        if want_flowless == 0 {
+            continue;
+        }
+        // The record must carry the POST-NAT addresses. The count above binds
+        // the MATCH site; this binds the ATTRIBUTION site, which is a different
+        // read of the same key — reverting it alone keeps the count at 1 and
+        // logs 10.0.61.100 for a packet that left as 172.16.80.8.
+        let event = rx2
+            .try_recv()
+            .expect("a filter-log event frame must have been queued")
+            .decode_dataplane_event()
+            .expect("filter-log payload must decode");
+        assert_eq!(
+            event.kind,
+            crate::event_stream::codec::DataplaneEventKind::FilterLog
+        );
+        assert_eq!(
+            event.src_ip,
+            "172.16.80.8".parse::<std::net::IpAddr>().expect("src"),
+            "{label}: the filter-log record must carry the POST-NAT source the \
+             packet actually left with. 10.0.61.100 here is the pre-translation \
+             source — a WRONG record rather than a missing one, which is worse \
+             for anyone reading logs to reconstruct a flow"
+        );
+        assert_eq!(
+            event.dst_ip,
+            "172.16.80.200".parse::<std::net::IpAddr>().expect("dst"),
+            "{label}: and the destination, which this SNAT does not translate"
+        );
+    }
+}
+
 
 #[test]
 fn nat_nonfirst_fragment_assoc_miss_fails_closed_6122() {
