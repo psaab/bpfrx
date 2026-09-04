@@ -91,31 +91,13 @@ func RenderSourceRuleDetail(ctx context.Context, w io.Writer, cfg *config.Config
 			// which a tolerant load can still admit) displayed an action it
 			// does not have and will not perform. That is the worst possible
 			// output for the one rule shape an operator most needs to find.
-			action := "none"
-			switch {
-			case rule.Then.PoolName != "":
-				action = "pool " + rule.Then.PoolName
-			case rule.Then.Off:
-				action = "off"
-			case rule.Then.Interface:
-				action = "interface"
-			}
+			action := SourceRuleAction(rule)
 			// #7363: the FULL match on BOTH sides. The source renderer had the
 			// same singular-field shape as the destination one, so a fix to
 			// only one would leave `show security nat source rule` still
 			// rendering a name-scoped rule as 0.0.0.0/0.
-			srcMatch := natMatchAddresses(
-				rule.Match.SourceAddress, rule.Match.SourceAddresses,
-				rule.Match.SourceAddressName, rule.Match.SourceAddressNames)
-			if srcMatch == "" {
-				srcMatch = "0.0.0.0/0"
-			}
-			dstMatch := natMatchAddresses(
-				rule.Match.DestinationAddress, rule.Match.DestinationAddresses,
-				rule.Match.DestinationAddressName, rule.Match.DestinationAddressNames)
-			if dstMatch == "" {
-				dstMatch = "0.0.0.0/0"
-			}
+			srcMatch := RuleMatchSource(rule)
+			dstMatch := RuleMatchDestination(rule)
 			fmt.Fprintf(w, "source NAT rule: %s\n", rule.Name)
 			fmt.Fprintf(w, "  Rule-set: %s                        ID: %d\n", rs.Name, ruleIdx)
 			fmt.Fprintf(w, "    From zone: %s    To zone: %s\n", rs.FromZone, rs.ToZone)
