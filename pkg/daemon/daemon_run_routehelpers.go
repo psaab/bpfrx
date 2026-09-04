@@ -157,7 +157,25 @@ func inferIPv6StaticNextHopInterfaces(cfg *config.Config, overlay []config.Route
 		for _, unitNum := range unitNums {
 			unit := ifc.Units[unitNum]
 			logical := base
-			if unitNum != 0 {
+			// #8321 finding 07: the netdev is named for the VLAN ID, not the
+			// unit number. An 802.1q sub-interface where they differ --
+			// `set interfaces ge-0-0-1 unit 10 vlan-id 100` -- is created by
+			// networkd as `ge-0-0-1.100`, and formatting `ge-0-0-1.10` here made
+			// the FRR static route name an interface that does not exist, so
+			// zebra flagged it inactive and blackholed the route.
+			//
+			// Every other site in this tree already does it this way, which is
+			// what makes the convention unambiguous rather than a judgement:
+			// daemon_dhcp.go:311-315 (the shape mirrored here, including the
+			// unit fallback), daemon_ha_vip.go:327/393/678, and
+			// daemon_neighbor.go:130. This was the one that did not.
+			//
+			// The fallback matters: a unit with NO vlan-id is not a tagged
+			// sub-interface, and there `base.<unit>` is correct -- which is why
+			// this is not simply a substitution of one field for the other.
+			if unit.VlanID > 0 {
+				logical = fmt.Sprintf("%s.%d", base, unit.VlanID)
+			} else if unitNum != 0 {
 				logical = fmt.Sprintf("%s.%d", base, unitNum)
 			}
 			// ipv6OnUnit tracks whether this logical unit participates in
