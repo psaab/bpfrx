@@ -10,6 +10,7 @@ import (
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/nat"
+	"github.com/psaab/xpf/pkg/natshow"
 )
 
 // runtimeSourceNATPools returns the userspace helper's live source-NAT pool
@@ -467,18 +468,16 @@ func (s *Server) natRuleStatsHandler(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		for _, rule := range rs.Rules {
-			action := "interface"
-			if rule.Then.PoolName != "" {
-				action = "pool " + rule.Then.PoolName
-			}
-			srcMatch := "0.0.0.0/0"
-			if rule.Match.SourceAddress != "" {
-				srcMatch = rule.Match.SourceAddress
-			}
-			dstMatch := "0.0.0.0/0"
-			if rule.Match.DestinationAddress != "" {
-				dstMatch = rule.Match.DestinationAddress
-			}
+			// #8580: one shared computation for every surface. This copy
+			// defaulted to "interface", so a `then source-nat off` exemption
+			// was reported as its exact opposite and an ACTIONLESS rule as
+			// translating (#7640); and it read only the singular address
+			// field, so an address-book-scoped rule reported as matching
+			// EVERYTHING (#7363). Both had been fixed in pkg/natshow and left
+			// live here.
+			action := natshow.SourceRuleAction(rule)
+			srcMatch := natshow.RuleMatchSource(rule)
+			dstMatch := natshow.RuleMatchDestination(rule)
 
 			var hitPkts, hitBytes uint64
 			if cr != nil {
