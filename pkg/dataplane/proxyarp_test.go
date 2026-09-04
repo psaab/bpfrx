@@ -38,28 +38,46 @@ func captureProxySysctl(t *testing.T, fail bool) *[]sysctlWrite {
 	return &writes
 }
 
-// TestEnableProxyResponders_IPv4 is the core #2160 regression: a static-NAT
-// (or any) proxy-ARP'd IPv4 external address on an interface must enable the
-// per-interface net.ipv4.conf.<if>.proxy_arp sysctl. Before the fix the
-// reconcile installed the NTF_PROXY neighbor entry but never enabled the
-// sysctl, so the kernel ignored the entry and never answered ARP. This test
-// fails on pre-fix code (no write is performed).
+// TestEnableProxyResponders_IPv4 was the #2160 regression: it asserted that a
+// proxy-ARP'd IPv4 address ENABLES net.ipv4.conf.<if>.proxy_arp.
+//
+// #8637 INVERTED it, because #2160's fix never did what it claimed. #2160's own
+// example is `proxy-arp ge-0/0/1 address 10.0.2.50/32` on an interface carrying
+// 10.0.2.10/24 — the proxied address is inside that interface's OWN connected
+// subnet, so `rt->dst.dev == dev` and every arm of arp_process's proxy branch
+// declines: `arp_fwd_proxy` returns 0 on its first line BEFORE reading this
+// sysctl. Setting it cannot have answered #2160's ARP, and measurement on the
+// loss userspace cluster confirms it does not. The same-L2 case was genuinely
+// fixed only by #8621's userspace responder.
+//
+// What the sysctl DID do is answer for addresses nobody configured — measured
+// both ways on hardware, see proxyResponderSysctlEnabledFor. So the assertion
+// is inverted rather than deleted: the write must still HAPPEN (skipping it
+// would leave a stale proxy_arp=1 across an upgrade) and must be a DISABLE.
+//
+// RED ON REVERT: make proxyResponderSysctlEnabledFor return true for AF_INET
+// and this fails.
 func TestEnableProxyResponders_IPv4(t *testing.T) {
 	writes := captureProxySysctl(t, false)
 
-	n := enableProxyResponders(map[string]map[int]struct{}{
+	enableProxyResponders(map[string]map[int]struct{}{
 		"ge-0-0-1": {unix.AF_INET: {}},
 	})
 
-	if n != 1 {
-		t.Fatalf("enabled count = %d, want 1", n)
-	}
 	if len(*writes) != 1 {
-		t.Fatalf("got %d sysctl writes, want 1: %+v", len(*writes), *writes)
+		t.Fatalf("got %d sysctl writes, want 1 — the interface must still be "+
+			"written (to 0); skipping leaves a stale proxy_arp=1 on every box an "+
+			"older build already set it on: %+v", len(*writes), *writes)
 	}
 	w := (*writes)[0]
-	if w.iface != "ge-0-0-1" || w.family != unix.AF_INET || !w.enable {
-		t.Fatalf("write = %+v, want {ge-0-0-1, AF_INET, enable}", w)
+	if w.iface != "ge-0-0-1" || w.family != unix.AF_INET {
+		t.Fatalf("write = %+v, want {ge-0-0-1, AF_INET, ...}", w)
+	}
+	if w.enable {
+		t.Fatalf("proxy_arp was ENABLED for v4. It cannot answer for a same-subnet " +
+			"proxied address (which is what #2160 was), and the pneigh arm answers " +
+			"different-device targets without it — so its only distinct effect is " +
+			"answering ARP for unconfigured addresses (#8637)")
 	}
 }
 

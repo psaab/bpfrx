@@ -125,6 +125,51 @@ func enableProxyResponders(ifaceFamilies map[string]map[int]struct{}) int {
 	return toggleProxyResponders(ifaceFamilies, true)
 }
 
+// proxyResponderSysctlEnabledFor reports whether the per-interface kernel proxy
+// responder sysctl should be turned ON for a family, given that this interface
+// has a desired proxy entry.
+//
+// #8637: IPv4 is NO. The `proxy_arp` sysctl was added by #2160 and it never did
+// the job it was added for.
+//
+// #2160's own example is `proxy-arp ge-0/0/1 address 10.0.2.50/32`, and
+// `ge-0-0-1` carries `10.0.2.10/24` — so the proxied address is inside the
+// CONNECTED SUBNET of the very interface the ARP request arrives on. For that
+// topology `rt->dst.dev == dev`, and every arm of `arp_process`'s proxy branch
+// declines: `arp_fwd_proxy` returns 0 on its FIRST line before it ever reads
+// this sysctl, the `pneigh_lookup` arm is guarded by `rt->dst.dev != dev`, and
+// only `arp_fwd_pvlan` could answer — which #2160 names parenthetically and
+// which nothing sets. The issue was closed on a change that cannot have fixed
+// it; the same-L2 case was genuinely fixed only by #8621's userspace responder.
+//
+// MEASURED on the loss userspace cluster, with the pneigh entry installed
+// manually so the #8621 responder could not confound the reading:
+//
+//	target routed out a DIFFERENT device, entry present:
+//	    proxy_arp=1 -> answered      proxy_arp=0 -> STILL ANSWERED
+//	target routed out a DIFFERENT device, NO entry:
+//	    proxy_arp=1 -> ANSWERED      proxy_arp=0 -> silent
+//
+// The first row is the pneigh arm, which has no sysctl term and needs none. The
+// second row is the sysctl's ONLY distinct contribution: answering for
+// addresses nobody configured. That is the over-answer #2197 item 3 asked to
+// remove for Junos parity, and it is on by default in every config that uses
+// `proxy-arp` at all — including WAN and untrust interfaces.
+//
+// So turning it off loses nothing that ever worked and removes an unbounded
+// ARP-answering posture. Per-address behaviour is now carried by the pneigh
+// entries (different-device) and by the #8621 responder (same-device), both of
+// which answer only for configured addresses.
+//
+// IPv6 is YES and the asymmetry has a reason. `ndisc_recv_ns` gates on
+// `forwarding && proxy_ndp && pndisc_is_router(...)` — a REQUIRED CONJUNCT, not
+// an alternative path — so clearing `proxy_ndp` would break v6 proxy NDP
+// entirely. v4's pneigh arm has no sysctl term; v6's does. #2197 item 3 already
+// scoped itself v4-only; this is why.
+func proxyResponderSysctlEnabledFor(family int) bool {
+	return family == unix.AF_INET6
+}
+
 // disableProxyResponders writes "0" to the per-interface proxy responder
 // sysctl for every (interface, family) pair in ifaceFamilies. It is the
 // #2475 teardown cleanup: a day-2 commit that removes proxy-arp from an
@@ -158,9 +203,15 @@ func toggleProxyResponders(ifaceFamilies map[string]map[int]struct{}, enable boo
 			if _, ok := fams[family]; !ok {
 				continue
 			}
-			if err := proxyARPSysctlSeam(iface, family, enable); err != nil {
+			// #8637: v4 is driven to 0 even on the ENABLE pass. Not merely
+			// "stop setting it" — an upgrade from a build that set it would
+			// otherwise leave a stale proxy_arp=1 on every interface already
+			// carrying a proxy-arp entry, so the over-answer would survive the
+			// change on exactly the deployments that have it today.
+			want := enable && proxyResponderSysctlEnabledFor(family)
+			if err := proxyARPSysctlSeam(iface, family, want); err != nil {
 				verb := "enable"
-				if !enable {
+				if !want {
 					verb = "disable"
 				}
 				slog.Warn("proxy-arp: failed to "+verb+" proxy responder sysctl",
