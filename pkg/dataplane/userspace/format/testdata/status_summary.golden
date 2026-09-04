@@ -72,6 +72,7 @@ Userspace dataplane helper:
   NAT64 ineligible-source drops:4
   NAT64 ineligible-destination drops:6
   NAT64 ext-header ineligible drops:7
+  NAT64 ineligible-protocol drops:11
   NAT frag untranslated drops:9
 Source NAT pools:
   Pool                 Rule                 Persist Permit           LiveFlows   UsedPorts  Leases     Alloc      Reuse      Exhaust   
