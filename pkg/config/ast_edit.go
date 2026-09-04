@@ -413,6 +413,10 @@ func (t *ConfigTree) SetPathQuotedGrouped(path []string, quoted, grouped []bool)
 	}
 	current := &t.Children
 	schema := setSchema
+	// #8657: true when the walk has just descended into a `valueList` node, so
+	// the tokens now being read are its MODIFIERS and must land as siblings of
+	// each other rather than nesting.
+	inValueListModifiers := false
 	i := 0
 
 	for i < len(path) {
@@ -646,6 +650,77 @@ func (t *ConfigTree) SetPathQuotedGrouped(path []string, quoted, grouped []bool)
 			// child (e.g. `interface`) attaches under this node.
 		}
 
+		// #8657: a schema node that declares NO sub-structure cannot be a
+		// container, so descending into it is always wrong. Emit it as a leaf
+		// and continue at THIS level, making the next token a SIBLING.
+		//
+		// Without this, `set system ntp server 1.2.3.4 prefer version 4` built
+		//
+		//	[server 1.2.3.4]
+		//	  [prefer]
+		//	    [version 4]      <- a CHILD of prefer
+		//
+		// and the compiler, which scans SIBLINGS of the server node, saw only
+		// the first modifier. Everything after it was unreachable, so exactly
+		// one modifier survived and which one depended on authoring ORDER. The
+		// hierarchical spelling of the same config produced siblings and kept
+		// both, so one configuration compiled two ways — the dual-shape
+		// divergence class CLAUDE.md warns about.
+		//
+		// SCOPED TO valueList MODIFIERS, and the scope was measured rather than
+		// reasoned. The obvious wider rule — "any node declaring no
+		// sub-structure cannot be a container" — is true in the abstract and
+		// breaks 23 cells across `pkg/api`, `pkg/cli` and `pkg/config`: the
+		// `applications` / `application-set` bodies rely on the existing
+		// descent for repeated childless keywords, and flattening them turns
+		// one definition with members into several duplicate definitions.
+		//
+		// So this fires only for a modifier of a `valueList` node — the leaf
+		// shape that declares BOTH values and modifier children, which is the
+		// only place successive modifiers are expected to be siblings. A
+		// container, a wildcard node, a compound key and every non-valueList
+		// parent are untouched. `args` are already consumed into nodeKeys
+		// above, so the leaf carries its own value.
+		if inValueListModifiers && childSchema.children == nil && childSchema.wildcard == nil {
+			// Absorb this modifier's own trailing VALUE tokens before emitting
+			// it. `schema` here is the valueList node, so its children are the
+			// modifier keywords: a following token that names one is the NEXT
+			// modifier (a sibling), and anything else is a value belonging to
+			// THIS one.
+			//
+			// Without this the arm emits `1 + args` tokens and orphans the
+			// rest as bogus siblings, which the #2419 differential gate caught
+			// on `static route ... next-hop <gw> interface a b` — a site that
+			// agreed across all six spellings before and would have started
+			// disagreeing. The gate found it; it was not reasoned out.
+			nodeKeys = append([]string(nil), nodeKeys...)
+			for i < len(path) {
+				if _, sib := schema.children[path[i]]; sib {
+					break
+				}
+				nodeKeys = append(nodeKeys, path[i])
+				i++
+			}
+			dup := false
+			for _, n := range *current {
+				if n.IsLeaf && keysEqual(n.Keys, nodeKeys) {
+					refreshDupKeysQuoted(n, quotedRange(keyStart, i))
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				modLeaf := &Node{
+					Keys:   append([]string(nil), nodeKeys...),
+					IsLeaf: true,
+				}
+				modLeaf.setKeysQuoted(quotedRange(keyStart, i))
+				modLeaf.setKeysBracketed(groupedRange(keyStart, i))
+				*current = append(*current, modLeaf)
+			}
+			continue
+		}
+
 		// This is a container (or a leaf with trailing value tokens).
 		// Find or create matching node.
 		found := false
@@ -665,6 +740,7 @@ func (t *ConfigTree) SetPathQuotedGrouped(path []string, quoted, grouped []bool)
 			*current = append(*current, newNode)
 			current = &newNode.Children
 		}
+		inValueListModifiers = childSchema.valueList
 		schema = childSchema
 	}
 
