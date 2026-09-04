@@ -6220,6 +6220,72 @@ AND the value validator). As with the other flips, the reject fires only on the
 strict commit path; `compileTreeLenient` downgrades it to a warning on
 `Store.Load` / `SyncApply`.
 
+**More production flips — the OSPF interface `authentication` subtree (#8443).**
+#8473 closed the IS-IS and RIP half of #8443, where `authentication-type` is a
+real free-form leaf and an unrecognised value downgraded md5 to plaintext. OSPF's
+half is a DIFFERENT GRAMMAR and was left open deliberately: OSPF has no
+`authentication-type` leaf at all, and the algorithm is the CHILD KEYWORD of a
+nested block —
+
+```
+interface ge-0/0/0.0 { authentication { md5 <key-id> { key "s"; } } }
+interface ge-0/0/0.0 { authentication { simple-password "s"; } }
+```
+
+`compiler_protocols.go` assigns `OSPFInterface.AuthType` ONLY from a matched
+`md5` / `simple-password`, so there is no free-form value to type-check and the
+#8473 instrument could not reach it. A keyword matching neither left
+`AuthType == ""` and the renderer emitted nothing, so the adjacency came up
+**UNAUTHENTICATED** while `show configuration` echoed the operator's
+authentication block back at them. Measured before the flip, every row
+committing clean:
+
+| authored | compiled | rendered |
+|---|---|---|
+| `authentication { md5 1 { key "SEKRIT"; } }` | `AuthType="md5"` | correct |
+| `authentication { md5-typo 1 { key "SEKRIT"; } }` | `AuthType=""` | **nothing — UNAUTHENTICATED** |
+| `authentication { md5 1 { keyy "SEKRIT"; } }` | `AuthType="md5" AuthKey=""` | nothing (#8473's empty-key guard) |
+| `authentication-type md5;` | `AuthType=""` | **nothing — UNAUTHENTICATED** |
+
+The failure direction is what makes it a defect rather than an inconvenience:
+the operator believes the adjacency is protected and every surface they can
+check agrees with them.
+
+Two mechanisms close it, because those are two different shapes. The first three
+rows are unmodeled keywords INSIDE a modeled subtree, so `closedWorld: true` on
+the `authentication` node is the right instrument — and because closed-world
+inherits DOWN (`childClosed := closed || childSchema.closedWorld`), the same
+flag also catches the misspelled `key` child of `md5`. The fourth row is a leaf
+that does not exist under OSPF at all, which closing `authentication`'s world
+cannot see; it is modeled in `schema_ospf_authentication_8443.go` SOLELY so it is
+refused, in the shape #7971 established for the login-class `*-regexps` family
+(`ValueEnumOf` + an unconditional validator — `ValueAny` would leave the
+validator uninvoked and reproduce the silent-accept).
+
+**Scope was a decision, not an omission.** Closing the whole OSPF `interface`
+world would also catch the fourth row; it was measured, and the `pkg/config`
+suite stayed green with all eight `protocols … interface` nodes closed. It is
+not done here because it converts EVERY unmodeled protocol leaf from inert to
+refused, which is the #8296 class and a larger decision than #8443's scope.
+`TestOSPFAuthGateDidNotCloseTheInterfaceWorld8443` reds if a later change makes
+that flip incidentally, so it has to be taken deliberately rather than inherited.
+
+Both OSPF schema copies are flipped — `protocols ospf` and
+`routing-instances <name> protocols ospf`. That is the #8258 sibling-surface
+class, and it is load-bearing here: every top-level cell passes against a fix
+applied to one copy only, so the routing-instance copy has its own cells.
+Mutations confirm it — dropping `closedWorld` from the routing-instance copy
+alone, or removing the refused leaf from it alone, each reds exactly one cell,
+and that cell is the dedicated one.
+
+No `#1960` lenient opt is needed and that was verified rather than assumed:
+`compileTreeStrict` backs every operator commit and `CheckText`, while
+`Store.Load` / `SyncApply` go through `compileTreeLenient`, which downgrades any
+`SchemaValidate` violation to a `slog.Warn` and continues (`store.go`). A
+persisted or peer-synced config carrying one of these spellings cannot brick a
+boot. Pinned by `schema_ospf_authentication_8443_test.go`.
+
+
 **More production flips — `security ike proposal` (Phase-1 crypto, #4313).**
 The Phase-1 IKE proposal container (`security ike proposal <name>`) now sets
 `closedWorld:true` (`schema_security.go`) after adding the one missing leaf
