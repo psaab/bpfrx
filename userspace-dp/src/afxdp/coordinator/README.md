@@ -458,6 +458,43 @@ Differences that matter (#1881):
   `post_spawn_inthread_bind_failure_fails_closed_5143` + handler-level
   `full_apply_post_spawn_inthread_bind_failure_fails_closed_no_persist_5143`).
 
+- **What the two post-teardown failure classes leave on the REPORTED binding
+  surface (#8388).** The bullets above describe the coordinator internals; what
+  reaches an operator, and what the Go manager's auto-rebind wedge predicate
+  (`hasBusyBindingsWedgeLocked`) reads, is the `BindingStatus` array that
+  `reconcile`'s closing `refresh_bindings` writes on the failure path too. The
+  two classes differ there, and the difference is load-bearing enough that #8388
+  was filed against the wrong half of it:
+  - **Bind-incomplete (#5143) is ALL-OR-NOTHING.** `stop_inner(false)` empties
+    `workers.live`, so every slot routes through `zero_unbound_slot` and the
+    reported set has ZERO bound slots — including the workers that bound their
+    FULL planned set. One EBUSY on one queue is reported as a fleet-wide wedge,
+    not as "one wedged binding among fifteen healthy ones". #8388 proposed a
+    per-slot `rebind_slot` verb (and the per-slot worker lifecycle + per-slot
+    zero-copy quiesce it would need first) to stop the global `rebind` from
+    destroying those fifteen; there are none to destroy, so it was closed
+    rather than built. Measured by `bind_incomplete_leaves_no_bound_sibling_8388`
+    — a THREE-worker fixture, two of which bind fully; the one-worker shape
+    `post_spawn_inthread_bind_failure_fails_closed_5143` uses satisfies it
+    vacuously.
+  - **Spawn-failure (#4952) IS partial**, by design: the arm returns without
+    `stop_inner`, `workers.live` survives, and the launched workers' slots keep
+    reporting bound while the unspawned worker's slots are registered, armed and
+    unbound. This is the one reachable mixed shape — and what is missing at those
+    slots is a worker THREAD, not a socket, so a targeted socket rebind could not
+    repair it; the global rebind re-runs the whole plan and spawns the missing
+    worker. Measured by `spawn_failure_does_leave_bound_siblings_8388`, which is
+    also the POSITIVE CONTROL for the cell above: it proves the same instrument
+    reads back a partial set when one exists, so the empty bound set in the
+    bind-incomplete cell is a property of the reconcile and not of the test
+    scaffolding.
+  - Both cells depend on the `#[cfg(test)]` stub workers publishing
+    `BindingLiveState::set_bound` for every slot they REPORT bound (the publish a
+    real `worker_loop` makes from `BindingWorker::create`). Without it a
+    "healthy" stub is healthy only in its startup report, `refresh_bindings`
+    reads `bound = false` for it either way, and any cell over the binding
+    surface is mutation-insensitive by construction.
+
 - **Explicit binding-setup failures in the startup report (#6245).** #5143
   reported a bind failure ONLY by OMISSION — the failed slot was simply absent
   from `WorkerStartupReport.bound_slots`, so the barrier could prove
