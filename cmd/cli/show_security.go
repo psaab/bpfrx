@@ -108,7 +108,8 @@ func (c *ctl) handleShowSecurity(args []string) error {
 				toZone = args[i]
 			}
 		}
-		return c.showPoliciesFiltered(fromZone, toZone)
+		// #8321 finding 10: honour `global` instead of silently widening.
+		return c.showPoliciesFiltered(fromZone, toZone, len(args) >= 2 && args[1] == "global")
 	case "screen":
 		if len(args) >= 2 && args[1] == "ids-option" && len(args) >= 3 {
 			if len(args) >= 4 && args[3] == "detail" {
@@ -335,7 +336,19 @@ func (c *ctl) showZones() error {
 	return nil
 }
 
-func (c *ctl) showPoliciesFiltered(fromZone, toZone string) error {
+// showPoliciesFiltered renders the policy inventory, optionally narrowed.
+//
+// #8321 finding 10: `globalOnly` exists because `show security policies global`
+// was VALIDATED as a keyword by isPolicyFilterKeyword and then had no branch —
+// so the remote CLI accepted it, dropped it, and returned the ENTIRE policy
+// database. An operator asking which global policies exist got every zone-pair
+// policy too, with nothing saying the filter had been ignored.
+//
+// The local CLI has handled it since #3357 (`globalOnly := args[1] == "global"`,
+// cli_show_security_dispatch.go), so this was a local/remote divergence rather
+// than a missing feature — the discriminator was already here, in the
+// `FromZone == "*" && ToZone == "*"` branch below.
+func (c *ctl) showPoliciesFiltered(fromZone, toZone string, globalOnly bool) error {
 	resp, err := c.client.GetPolicies(c.ctx(), &pb.GetPoliciesRequest{})
 	if err != nil {
 		return fmt.Errorf("%v", err)
@@ -432,6 +445,13 @@ func (c *ctl) showPoliciesFiltered(fromZone, toZone string) error {
 				renderRule(rule)
 				fmt.Println()
 			}
+			continue
+		}
+		// #8321 finding 10: past this point the group is a ZONE PAIR, which
+		// `global` asks to exclude. Placed after the global branch rather than
+		// at the top of the loop so a scoped global (#3148) — which lives in
+		// the "*"/"*" group but carries per-rule zones — is still rendered.
+		if globalOnly {
 			continue
 		}
 		if fromZone != "" && pi.FromZone != fromZone {
