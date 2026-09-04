@@ -222,6 +222,15 @@ pub(super) fn bring_up_workers(
                 // typed bind-incomplete identity is recorded once, after the
                 // teardown, and survives.
                 coord.stop_inner(false);
+                // #8558: `stop_inner` above emptied `workers.live`, which is
+                // what makes `refresh_bindings` route every slot through
+                // `zero_unbound_slot` and erase the per-slot `last_error` the
+                // bind actually produced. Re-record the causes on the
+                // coordinator, AFTER the teardown that clears the map, so the
+                // status the Go manager polls carries them for as long as the
+                // fault lasts. Ordering is the whole fix: recorded before
+                // `stop_inner` they would be cleared again.
+                record_bind_failure_causes(coord, &stage);
                 coord.last_reconcile_stage = stage.clone();
                 return Err(WorkerBringUpError::BindIncomplete(stage));
             }
@@ -786,10 +795,31 @@ fn spawn_workers(
                     interface: "ge-0-0-1".to_string(),
                     queue_id: slot,
                     phase: BindingSetupPhase::Private,
-                    reason: "forced private bind failure (test seam #6245)".to_string(),
+                    // #8558: shaped like the real `bind.rs` failure text so the
+                    // cause a cell reads back is the cause production
+                    // publishes — including the "Device or resource busy"
+                    // substring `hasBusyBindingsWedgeLocked` keys on. The
+                    // original seam wording is retained verbatim inside it, so
+                    // the #6245 stage-rendering cell that pins that phrase is
+                    // unaffected.
+                    reason: "libxdp private bind(flags=0x0004): Device or resource \
+busy — forced private bind failure (test seam #6245)"
+                        .to_string(),
                 })
                 .into_iter()
                 .collect();
+            // #8558: mirror `worker_loop_setup`'s `live.set_error(reason)` on
+            // the slot whose bind failed. The stub is the only in-process stand
+            // -in for a real bind failure, and a stub that reports the shortfall
+            // without publishing the cause into its `BindingLiveState` would let
+            // a fix that reads the cause from `live` (rather than from the
+            // fail-closed stage) look correct here while doing nothing in
+            // production — `stop_inner` drops `live` before anything reads it.
+            for failure in &stub_failures {
+                if let Some(live) = stub_lives.get(&failure.slot) {
+                    live.set_error(failure.reason.clone());
+                }
+            }
             let stub_stop = stop.clone();
             let stub_heartbeat = heartbeat.clone();
             let stub_tx = startup_report_tx.clone();
@@ -1088,6 +1118,33 @@ fn start_post_readiness_neighbor_services(coord: &mut Coordinator) {
 /// hangs/dies inside setup consumes the full budget. Reads a moved-value report
 /// off the channel — no shared mutable state, so the channel's send→recv
 /// establishes the happens-before for the reported set.
+/// #8558: re-record the TERMINAL per-slot bind-failure causes a fail-closed
+/// bring-up produced, so `Coordinator::refresh_bindings` can re-publish them
+/// into `BindingStatus::last_error` on every subsequent status refresh.
+///
+/// Extracted rather than inlined in the `BindIncomplete` arm because the
+/// SELECTION — which slots get which reason — is the part a guard has to bind.
+/// Inline it and the only thing a cell can reach is the arm as a whole.
+///
+/// Scope is deliberately the EXPLICIT failures only (#6245's per-slot
+/// `BindingSetupFailure`). The timeout / no-report shortfall (`bound: None`)
+/// carries no per-slot cause to attribute, and inventing one would put a
+/// reason on slots that may well have bound. That sub-case therefore still
+/// reaches the Go wedge predicate with an empty `last_error`, and recovery
+/// still does not fire for it — widening the predicate to cover a wedge whose
+/// cause is unknown is a separate decision, because the `maxConsecutiveAuto
+/// Rebinds` derivation assumes the rebind is being fired for a teardown race.
+fn record_bind_failure_causes(coord: &mut Coordinator, stage: &ReconcileStage) {
+    let ReconcileStage::WorkerBindIncomplete(shortfall) = stage else {
+        return;
+    };
+    for failure in &shortfall.failures {
+        coord
+            .last_bind_failures
+            .insert(failure.slot, failure.reason.clone());
+    }
+}
+
 fn await_readiness(
     startup_report_rx: &mpsc::Receiver<WorkerStartupReport>,
     spawned_worker_ids: &[u32],

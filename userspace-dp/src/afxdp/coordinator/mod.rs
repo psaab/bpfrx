@@ -305,6 +305,41 @@ pub struct Coordinator {
     /// status surface. Wiring it into the status surface (a wire change)
     /// is a possible follow-up.
     pub(crate) reconcile_quiesce_count: u64,
+    /// #8558: the per-slot TERMINAL bind-failure reasons from the most recent
+    /// fail-closed worker bring-up, keyed by binding slot.
+    ///
+    /// It exists because the fail-closed teardown destroys the diagnostic that
+    /// the recovery keyed on. `bring_up_workers`' `BindIncomplete` arm calls
+    /// `stop_inner(false)`, which empties `workers.live`; `refresh_bindings`
+    /// then routes every now-workerless slot through `zero_unbound_slot`, and
+    /// that ends with `binding.last_error.clear()`. So the `"Device or resource
+    /// busy"` a bind actually returned was gone from the status the Go manager
+    /// polls, and `hasBusyBindingsWedgeLocked`'s `busyErr` term — a substring
+    /// match on exactly that field — could never be true. Its only other route
+    /// in, `repaired`, needs a forwarding-LIVE (`Ready`) binding, of which a
+    /// fail-closed reconcile leaves none. Recovery for the fault it exists for
+    /// was unreachable, silently, while looking alive.
+    ///
+    /// A one-shot restore into `bindings` would not have fixed it: EVERY
+    /// control response runs `refresh_status` -> `refresh_bindings`, so the
+    /// ~1 Hz status poll re-erased it within a second, and the Go predicate
+    /// requires the wedge to persist 5s before firing. The cause therefore has
+    /// to live somewhere the refresh READS, which is what this map is.
+    ///
+    /// LIFECYCLE — cleared by `stop_inner`, populated only by the
+    /// `BindIncomplete` arm immediately after it:
+    /// - every snapshot reconcile clears it in `tear_down` and repopulates only
+    ///   if this bring-up fails, so it always describes the CURRENT state;
+    /// - a `no_snapshot` / disarm / shutdown teardown clears it and never
+    ///   repopulates, so a legitimately-unbound slot reports no error;
+    /// - a PRE-teardown abort (integrity / mandatory-pin) does not reach
+    ///   `stop_inner`, and correctly leaves the previous contents alone — the
+    ///   prior workers are still running and the state did not move.
+    ///
+    /// It can never put an error on a HEALTHY slot: `refresh_bindings` consults
+    /// it only on the branch where a slot has NO `live` entry, and a bound slot
+    /// always has one.
+    pub(crate) last_bind_failures: BTreeMap<u32, String>,
     /// #2522 test seam (per-instance, NOT a process-global): under
     /// `cfg(test)` `tear_down`'s quiesce records its requested duration
     /// here and skips the real `thread::sleep`, so each test asserts
@@ -457,6 +492,7 @@ impl Coordinator {
             validation: ValidationState::default(),
             reconcile_calls: 0,
             reconcile_quiesce_count: 0,
+            last_bind_failures: BTreeMap::new(),
             #[cfg(test)]
             last_quiesce_ms: 0,
             #[cfg(test)]
@@ -719,6 +755,16 @@ impl Coordinator {
             maps.map_fd.as_ref(),
             maps.heartbeat_map_fd.as_ref(),
         );
+        // #8558: the recorded bind-failure causes describe the worker set that
+        // was just stopped, so they die with it. Clearing HERE rather than at
+        // the top of `reconcile` is what covers the teardowns that never enter
+        // `reconcile` at all — `Coordinator::stop` (the disarm /
+        // `reconcile_status_bindings` no-forwarding branch) and the
+        // `no_snapshot` shutdown path — so a legitimately-unbound slot never
+        // reports the previous generation's bind error. The `BindIncomplete`
+        // arm repopulates it immediately AFTER calling `stop_inner`, which is
+        // the only ordering that leaves the causes standing.
+        self.last_bind_failures.clear();
         self.mirror_targets
             .store(Arc::new(MirrorTargetMap::default()));
         // #6242: the per-worker panic slots (#925) + exception rings +
