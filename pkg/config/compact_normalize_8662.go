@@ -176,6 +176,72 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 	// family label is not a safety property, and this is the case that proves
 	// it. TestNormalizerScopeNeverCoversAPartialSite8690 binds it mechanically
 	// so the next widening cannot make the same mistake by inspection.
+	// #8690 family 4: interfaces. 15 sites, every one drop shape "empty".
+	//
+	// Measured, not taken from the brief: the family was described to me as
+	// 18 empty / 8 partial for interfaces plus 0/2 for bridge-domains. The
+	// inventory says 15 empty / 10 partial across the two. The file is the
+	// instrument.
+	//
+	// The same head-on-both-sides shape as family 3 appears here too:
+	//
+	//	interfaces <if> tunnel destination <addr>                     empty
+	//	interfaces <if> tunnel routing-instance destination <ri>      partial
+	//
+	// so `destination` is admitted under `tunnel` and not under
+	// `routing-instance`. A head-only rule would take both.
+	//
+	// The other ten partials — `interfaces <if> {description,duplex,mtu,speed,
+	// unit,...}` and the two bridge-domains sites — fold at the INSTANCE level,
+	// where production passes the instance name (`ge-0-0-0`) as the container
+	// keyword. No static pair can match them, so they are safe from a pair rule
+	// by construction rather than by being listed. That is worth knowing before
+	// someone "simplifies" this to a head-only match: it is exactly the rule
+	// shape those ten are NOT protected from.
+	//
+	// bridge-domains has ZERO admissible sites — both of its inventory entries
+	// are partial — so there is nothing to normalize there and its verdict is
+	// recorded rather than left looking unstarted.
+	switch containerKeyword + " " + head {
+	//
+	// `lacp periodic` is DELIBERATELY NOT admitted, though it is drop shape
+	// "empty" and would otherwise belong here. It is one of the census's two
+	// hand-verified known-true anchors (filedStillOpen), and normalizing it
+	// made TestCompactBlockEquivalenceInventory2419 red with exactly the right
+	// complaint: "an instrument that stops finding known-true sites reports
+	// clean for the same reason a textual sweep does".
+	//
+	// The file's doctrine is that an anchor CHANGES SIDES rather than leaving,
+	// so fixing it is legitimate — but it owes a replacement that is hand
+	// verified by reading the compiler AND sits in a different compiler file
+	// from the surviving anchor (compiler_protocols.go). I checked
+	// `applications application <a> destination-port` as a candidate and it does
+	// not qualify: applicationDirectLeaves walks BOTH AST shapes deliberately
+	// (#6524), so it is not compact-blind in the way this control requires,
+	// whatever the inventory says about it.
+	//
+	// So 14 of the 15 are normalized and this one is left, with the trade
+	// stated: the anchor keeps the whole census falsifiable across 300+ sites,
+	// and the site it holds is an LACP periodic interval. Fixing it is a
+	// follow-up that begins by hand-verifying a replacement anchor, not by
+	// deleting this comment.
+	case "aggregated-ether-options link-speed",
+		"aggregated-ether-options minimum-links",
+		"gigether-options 802.3ad",
+		"gigether-options redundant-parent",
+		"tunnel destination",
+		"tunnel source",
+		"tunnel mode",
+		"tunnel ttl",
+		"tunnel keepalive-retry",
+		"wireguard listen-port",
+		"wireguard peer",
+		"peer allowed-ips",
+		"peer endpoint",
+		"peer persistent-keepalive":
+		return true
+	}
+
 	// #8690 family 3: policy-options. Taken PER SITE rather than as a family
 	// sweep, because this is the family where a family sweep is actively
 	// harmful: of its 17 inventory sites, 9 are drop shape "empty" and 8 are
