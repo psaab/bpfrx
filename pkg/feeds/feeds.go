@@ -223,8 +223,44 @@ func warnPlaintextFeed(name, url string) {
 // denylist). Only an explicit positive value arms the drop-after-N-seconds
 // opt-in.
 func resolveHoldInterval(seconds int) time.Duration {
-	if seconds <= 0 {
+	if seconds <= 0 || int64(seconds) > config.MaxDurationSeconds {
 		return retainForever
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+// feedIntervalSeconds converts a feed `seconds` knob to a Duration, falling
+// back for anything outside the accepted range.
+//
+// #8597 (muse-004 K34), the sibling of the #6769 flow-export fix and the #5723
+// RPM fix that were never brought along to this package. `update-interval` and
+// `hold-interval` are bounded to [1, config.MaxDurationSeconds] by the strict
+// schema (schema_security.go), but the compiler stores them as a plain int from
+// strconv.Atoi with NO range check, and the lenient HA-sync / on-disk Load
+// ingress DOWNGRADES an out-of-range value to a warning rather than rejecting
+// it (#1960 no-brick). So a peer-synced or persisted pathological value reaches
+// this package unbounded.
+//
+// The multiply overflows int64 nanoseconds past MaxDurationSeconds, and the
+// wrapped product can be small and POSITIVE — the dangerous half, because both
+// consumers only reject `<= 0`. gcd(1e9, 2^64) = 512, so the smallest positive
+// residue is 512ns: `update-interval 20211507185753197` armed a 512ns ticker,
+// i.e. a self-inflicted HTTP fetch storm against every feed server.
+//
+// Falling back rather than clamping to the maximum is the #6769 decision,
+// reused deliberately: a value this far out of range is a typo or a hostile
+// config, not an operator asking for the largest window we allow.
+//
+// The direction each fallback errs in:
+//   - update-interval falls back to the 1h default, so a wrapped value refreshes
+//     LESS often, never more. The failure it prevents is availability.
+//   - hold-interval falls back to retainForever, so a wrapped value KEEPS the
+//     last-good snapshot instead of dropping a DENY feed to empty. That is the
+//     #2050 fail-closed direction; the wrap's own behaviour was the opposite,
+//     turning "retain forever" into "drop after 512ns of failure".
+func feedIntervalSeconds(seconds int, fallback time.Duration) time.Duration {
+	if seconds <= 0 || int64(seconds) > config.MaxDurationSeconds {
+		return fallback
 	}
 	return time.Duration(seconds) * time.Second
 }
@@ -276,10 +312,7 @@ func (m *Manager) Apply(ctx context.Context, daCfg *config.DynamicAddressConfig)
 			if baseURL == "" {
 				continue
 			}
-			interval := time.Duration(fsCfg.UpdateInterval) * time.Second
-			if interval <= 0 {
-				interval = time.Hour
-			}
+			interval := feedIntervalSeconds(fsCfg.UpdateInterval, time.Hour)
 			hold := resolveHoldInterval(fsCfg.HoldInterval)
 
 			plan := func(name, url string) {

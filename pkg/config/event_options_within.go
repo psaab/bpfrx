@@ -55,12 +55,20 @@ import (
 // defense-in-depth, pkg/eventengine/engine.go).
 
 const (
-	// minEventWithinSeconds / maxEventWithinSeconds bound a within
+	// MinEventWithinSeconds / MaxEventWithinSeconds bound a within
 	// time-interval. The upper bound (24h) also caps the time.Duration
 	// overflow window (H12): the engine multiplies Seconds by time.Second
 	// (1e9 ns), which overflows int64 past ~9.2e9 s — 86400 is far below it.
-	minEventWithinSeconds = 1
-	maxEventWithinSeconds = 86400
+	//
+	// EXPORTED (#8597, muse-004 K35) because that overflow argument only holds
+	// where this bound holds, and this bound is enforced on the STRICT commit
+	// path alone: the lenient HA-sync / on-disk Load ingress downgrades an
+	// out-of-range clause to a warning and keeps the raw int. The engine's
+	// runtime belt therefore has to re-check the range, and it must re-check
+	// it against THIS constant rather than a copied 86400 — two layers that
+	// disagree about where the ceiling is would be the defect, not the fix.
+	MinEventWithinSeconds = 1
+	MaxEventWithinSeconds = 86400
 
 	// minEventTriggerCount / maxEventTriggerCount bound a trigger event
 	// count. A count is a number of matching events in the window; it is not
@@ -179,12 +187,12 @@ func validateEventWithinClause(policy string, w *Node, emit func(string, ...any)
 	if err != nil {
 		return emit("event-options policy %q within %q: time-interval is not a "+
 			"valid integer (expected %d..%d seconds)",
-			policy, secTok, minEventWithinSeconds, maxEventWithinSeconds)
+			policy, secTok, MinEventWithinSeconds, MaxEventWithinSeconds)
 	}
-	if sec < minEventWithinSeconds || sec > maxEventWithinSeconds {
+	if sec < MinEventWithinSeconds || sec > MaxEventWithinSeconds {
 		return emit("event-options policy %q within %d: time-interval out of range "+
 			"(expected %d..%d seconds)",
-			policy, sec, minEventWithinSeconds, maxEventWithinSeconds)
+			policy, sec, MinEventWithinSeconds, MaxEventWithinSeconds)
 	}
 
 	// trigger — a within clause with no trigger gates nothing; the engine

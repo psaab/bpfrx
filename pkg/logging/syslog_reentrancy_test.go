@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log"
 	"log/slog"
 	"net"
 	"os"
@@ -17,11 +18,28 @@ import (
 // restores it on cleanup. The deadlock under test (#2287) only manifests when
 // slog.Default() routes back into the failing client, so the regression tests
 // must install a real SyslogSlogHandler as the default.
+//
+// The stdlib `log` writer has to be restored too (#8597). slog.SetDefault
+// re-points log.Default()'s output at a handlerWriter around the new handler —
+// EXCEPT when the handler is slog's own internal defaultHandler, a case the
+// stdlib skips precisely to avoid recursing into log.Output. Restoring `prev`
+// hits that skip, so log.Default() keeps writing into the test's
+// SyslogSlogHandler after the test ends. A later test's slog record then takes
+// the stdlib log mutex, reaches the leftover handler, sends to its failing
+// client, and the client's drop warning re-enters log.Output on the same
+// goroutine — a deadlock on log's global mutex, in a test that never touched
+// syslog. Capturing and restoring the writer and flags scopes the swap to the
+// test that asked for it.
 func withSlogDefault(t *testing.T, h slog.Handler) {
 	t.Helper()
 	prev := slog.Default()
+	prevWriter, prevFlags := log.Writer(), log.Flags()
 	slog.SetDefault(slog.New(h))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+		log.SetOutput(prevWriter)
+		log.SetFlags(prevFlags)
+	})
 }
 
 // TestSelfReferentialSendNoDeadlock is the #2287 fix-on-revert proof for the

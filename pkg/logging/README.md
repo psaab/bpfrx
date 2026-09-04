@@ -519,6 +519,23 @@ connectionless and exempt:
   goroutine. `noteDrop` therefore only *captures* the warning snapshot
   under the lock; the caller emits it via a `defer` ordered to run
   after the `Unlock`. The ≤1/s gate is preserved.
+- **The reconnect `slog.Debug` is emitted after the lock too (#8597).**
+  #2287 moved the drop WARNING out from under `s.mu` and left two
+  `slog.Debug("... reconnecting")` emits on the same failure path under
+  it — one in `Send`, one in `SendBinary`. Under `xpfd --debug` those
+  records are enabled, so they take the identical route back into the
+  locked client and wedge the caller. `pendingDebug` mirrors
+  `pendingDropWarn`: capture under the lock, emit from the same
+  after-`Unlock` defer.
+  The reason this survived the #2287 fix is worth keeping: the #2287
+  regression cells install a base handler at the DEFAULT level (Info),
+  where `slog.Debug` short-circuits in `slog.Default().Enabled()` and
+  never reaches `Handle`. The defect lived on an axis those fixtures
+  hold constant, not in a branch they miss.
+  `syslog_debug_under_lock_8597_test.go` re-runs the #2287 wiring with a
+  Debug-level base handler, and carries a control cell asserting Debug
+  really is enabled there — without it the deadlock cells would pass
+  whether or not the emit sits under the lock.
 - **Handler re-entrancy guard (#2287).** As defense-in-depth,
   `SyslogSlogHandler.Handle` tracks the set of goroutine IDs currently
   inside its syslog-forwarding section. If a client `Send` emits any
