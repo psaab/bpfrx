@@ -16,6 +16,28 @@
 //! FILTER; not doing the same when a commit narrows ZONE POLICY is the
 //! asymmetry, not a safe default.
 //!
+//! # ICMP scope (#8618)
+//!
+//! #8356 shipped declining ICMP outright, leaving #7323's residual open for
+//! that protocol alone. #8618 narrows the decline to the configs where it is
+//! actually earned. `packet_icmp` is read in exactly ONE place in policy
+//! evaluation — the `icmp_constraints` arm of `CompiledApplications::matches`
+//! (#3020, junos-ping) — so when no active PERMIT rule carries a
+//! type-constrained term, that arm is inert and this derivation's type-blind
+//! `None` returns precisely the verdict a fully-informed evaluation would.
+//! There is nothing to be dishonest about, and declining would leave the
+//! residual open for no reason.
+//!
+//! Where such a permit DOES exist the decline stands, and it must: a type-blind
+//! evaluation would fail to match the type-specific permit, manufacture a DENY,
+//! and revoke a flow the policy allows. That is strictly worse than the
+//! residual. The gating predicate
+//! (`PolicyState::icmp_verdict_may_depend_on_type`) is whole-snapshot and so
+//! deliberately conservative — one junos-ping permit anywhere declines ICMP
+//! box-wide, i.e. exactly #8356 — because a per-zone-pair answer would mean
+//! reproducing the five-tier applicability selection at a second site, and a
+//! tier missed there fails in the direction that revokes live flows.
+//!
 //! # THREE things here deliberately do NOT mirror #7212
 //!
 //! **1. FORWARD ONLY.** The filter stamp is per-direction on purpose. This one
@@ -90,17 +112,35 @@ pub(super) fn revalidate_zone_policy_on_session_hit(
     if metadata.is_reverse {
         return None;
     }
-    // GATE 1b: DECLINE for ICMP. A zone policy can match on ICMP type/code via
-    // an application term, so an ICMP verdict is a property of the PACKET, not
-    // of the flow — and this derivation is deliberately frame-independent, so it
-    // has no type to offer. Evaluating with no type would fail to match a
-    // type-specific term and manufacture a DENY for a flow the policy permits;
-    // stamping a single packet's type as the flow's verdict would be just as
-    // wrong in the other direction. Declining leaves ICMP exactly where #7323
-    // left it — the residual stays open for ICMP alone — rather than inventing
-    // a verdict this function cannot honestly derive. Same reasoning the static
-    // input-filter walk uses to decline a route-lookup-affecting filter.
-    if matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6) {
+    // GATE 1b: DECLINE for ICMP, but ONLY when the type actually matters.
+    //
+    // #8356 declined ICMP outright, and the reasoning was right as far as it
+    // went: a zone policy can match on ICMP type/code via an application term
+    // (junos-ping, #3020), so where such a term exists an ICMP verdict is a
+    // property of the PACKET, not of the flow. This derivation is deliberately
+    // frame-independent and has no type to offer, so evaluating with `None`
+    // would fail to match a type-specific PERMIT and manufacture a DENY for a
+    // flow the policy allows — and revoking on that tears down a live,
+    // permitted flow. Stamping one packet's type as the flow's verdict would be
+    // just as wrong in the other direction.
+    //
+    // #8618 narrows the decline to the case that reasoning actually describes.
+    // `packet_icmp` is read in exactly ONE place in policy evaluation — the
+    // `icmp_constraints` arm of `CompiledApplications::matches`. When no active
+    // PERMIT rule carries a type-constrained term, that arm is inert and a
+    // type-blind evaluation returns exactly the verdict a fully-informed one
+    // would. There is then nothing to be dishonest about, and declining would
+    // leave #7323's residual open for no reason.
+    //
+    // The predicate is whole-snapshot and therefore conservative (see
+    // `PolicyState::icmp_verdict_may_depend_on_type`): one junos-ping permit
+    // anywhere declines ICMP box-wide, which is precisely #8356's behaviour.
+    // The failure mode of the coarseness is "no worse than before", never "acts
+    // on a verdict it could not derive".
+    if forwarding
+        .policy
+        .icmp_verdict_may_depend_on_type(meta.protocol)
+    {
         return None;
     }
     // GATE 2: one probe answers both "which entry does this WIRE tuple name"
@@ -204,9 +244,11 @@ fn zone_policy_deny_on_session_hit(
         flow.forward_key.src_port,
         flow.forward_key.dst_port,
         // Frame-INDEPENDENT, like #7212's static walk: no ICMP type/code is
-        // supplied. ICMP flows are declined outright above rather than
-        // evaluated with `None` here, because `None` would silently fail to
-        // match a type-specific application term and manufacture a DENY.
+        // supplied. #8618: an ICMP flow only reaches here when the snapshot has
+        // no type-constrained PERMIT term, so `None` is not a loss of
+        // information — the `icmp_constraints` arm it would feed is inert and
+        // the verdict is identical to a fully-informed evaluation. Gate 1b
+        // declines the flows for which that is not true.
         None,
         // Byte count is used only by policers/counters, neither of which this
         // side-effect-free derivation touches.
