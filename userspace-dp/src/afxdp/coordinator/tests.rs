@@ -4732,6 +4732,241 @@ fn spawn_failure_does_leave_bound_siblings_8388() {
     coordinator.stop_inner(false);
 }
 
+/// #8558 — THE WIRING CELL. The bind-failure cause must survive the fail-closed
+/// teardown **and every subsequent status refresh**, because that ordering is
+/// the defect.
+///
+/// `bring_up_workers`' `BindIncomplete` arm calls `stop_inner(false)`, which
+/// empties `workers.live`; `refresh_bindings` then routes every now-workerless
+/// slot through `zero_unbound_slot`, whose last act is
+/// `binding.last_error.clear()`. So the `"Device or resource busy"` the bind
+/// actually returned was erased before any status left the helper, and
+/// `hasBusyBindingsWedgeLocked`'s `busyErr` term — a substring match on exactly
+/// that field — could never be true. Its only other route in, `repaired`, needs
+/// a forwarding-LIVE (`Ready`) binding, of which a fail-closed reconcile leaves
+/// none. Recovery for the fault it exists for was unreachable while looking
+/// alive.
+///
+/// THE SECOND REFRESH IS THE POINT, and it is what a hand-built fixture cannot
+/// see. `refresh_status` runs `refresh_bindings` on EVERY control response, so
+/// a fix that restored the cause once — into the `bindings` array at the end of
+/// `reconcile`, say — is erased by the next ~1 Hz status poll, well inside the
+/// 5s dwell the Go predicate requires before it acts. The existing Go cells
+/// (`partial_wedge_recovery_7497_test.go`) construct a `BindingStatus` with the
+/// error already in it, so they stay green against either version; only driving
+/// the real teardown-then-refresh-then-refresh order separates them.
+///
+/// Fixture is three workers, one binding short — the same shape as the #8388
+/// cells, so the healthy siblings are present and the assertion below that they
+/// carry NO cause is not vacuous.
+///
+/// Fail-on-revert / mutations:
+/// - Delete the `record_bind_failure_causes(coord, &stage)` call from the
+///   `BindIncomplete` arm (master's behaviour): the first `last_error`
+///   assertion reds with an empty string.
+/// - Move that call ABOVE `coord.stop_inner(false)`: `stop_inner` clears the
+///   map it just wrote and the same assertion reds. Ordering IS the fix.
+/// - Delete the restore in `Coordinator::refresh_bindings`: the cause never
+///   reaches `BindingStatus` at all and the same assertion reds.
+#[test]
+fn bind_failure_cause_survives_the_failclosed_teardown_8558() {
+    let mut coordinator = Coordinator::new();
+    let mut bindings = wedge8388_three_worker_bindings();
+    coordinator.force_worker_bind_incomplete = 1;
+    coordinator.force_worker_healthy_stub = true;
+
+    let snap = mandatory_ok_snapshot(5);
+    let result = coordinator.reconcile(Some(&snap), &mut bindings, 64);
+    assert!(
+        matches!(
+            result,
+            Err(ReconcileError::WorkerBindIncomplete(
+                ReconcileStage::WorkerBindIncomplete(_)
+            ))
+        ),
+        "the fixture must reach the fail-closed bind-incomplete arm, got {result:?}"
+    );
+
+    // The failing slot is worker 0's only planned slot (slot 1): the seam drops
+    // the SMALLEST planned slot and reports it as the explicit failure.
+    let failed = &bindings[0];
+    assert_eq!(failed.slot, 1, "fixture drift: worker 0 owns slot 1");
+    assert!(
+        failed
+            .last_error
+            .to_lowercase()
+            .contains("resource busy"),
+        "the reconcile that stopped every worker must still publish WHY slot {} \
+         could not bind — this is the exact substring \
+         hasBusyBindingsWedgeLocked's busyErr term matches, and master left it \
+         empty. got {:?}",
+        failed.slot,
+        failed.last_error
+    );
+
+    // The siblings bound; they have no cause, and must not inherit one.
+    for binding in &bindings[1..] {
+        assert!(
+            binding.last_error.is_empty(),
+            "slot {} did not fail its bind and must carry no cause, got {:?}",
+            binding.slot,
+            binding.last_error
+        );
+    }
+
+    // THE ORDERING HALF. Two more refreshes — the ~1 Hz status polls that follow
+    // the failed reconcile. The cause must still be there on both; the Go
+    // predicate does not act until it has seen the wedge for 5s, so a cause that
+    // survives only the reconcile's own refresh is a cause that never fires
+    // recovery.
+    for poll in 1..=2 {
+        coordinator.refresh_bindings(&mut bindings);
+        assert!(
+            bindings[0]
+                .last_error
+                .to_lowercase()
+                .contains("resource busy"),
+            "status poll {poll} erased the bind-failure cause; the Go wedge \
+             predicate needs it to persist past the 5s dwell. got {:?}",
+            bindings[0].last_error
+        );
+        assert!(
+            bindings[1..]
+                .iter()
+                .all(|binding| binding.last_error.is_empty()),
+            "status poll {poll} spread the cause onto a slot that did not fail"
+        );
+    }
+}
+
+/// #8558 — THE MIDDLE STATE: a fault that self-clears must leave nothing behind.
+///
+/// Runs both reconciles on ONE coordinator, which is what makes it the
+/// transient case rather than two independent snapshots: the first fails closed
+/// and records the cause, the second (the retry a rebind or a commit drives)
+/// succeeds. Afterwards every slot is bound and carries no error, so the Go
+/// wedge predicate reads `wedged == 0`, returns false, and resets
+/// `consecutiveFailedAutoRebinds` — recovery is armed again for the NEXT fault
+/// rather than spending a budget on a fault that is gone.
+///
+/// This is the state a wrong fix breaks silently. A cause made permanent (or
+/// cleared only on a path this sequence does not take) leaves a healthy box
+/// advertising `"Device or resource busy"` on bound slots, and a rebind storm
+/// is what that buys once anything re-reads it.
+///
+/// Fail-on-revert / mutation: delete `self.last_bind_failures.clear()` from
+/// `stop_inner` and the recorded-state assertion reds (the map still holds
+/// slot 1's cause after the successful reconcile). The `last_error` assertions
+/// alone would NOT catch that — a bound slot has a `live` entry, so
+/// `refresh_bindings` takes `copy_live_snapshot` and never consults the map —
+/// which is exactly why the mechanism is asserted alongside the observable.
+#[test]
+fn a_recovered_reconcile_leaves_no_stale_bind_failure_cause_8558() {
+    let mut coordinator = Coordinator::new();
+    let mut bindings = wedge8388_three_worker_bindings();
+    coordinator.force_worker_bind_incomplete = 1;
+    coordinator.force_worker_healthy_stub = true;
+
+    let snap = mandatory_ok_snapshot(5);
+    let first = coordinator.reconcile(Some(&snap), &mut bindings, 64);
+    assert!(
+        matches!(first, Err(ReconcileError::WorkerBindIncomplete(_))),
+        "phase 1 must fail closed, got {first:?}"
+    );
+    assert!(
+        !coordinator.last_bind_failures.is_empty(),
+        "phase 1 must have recorded a cause, or phase 2 proves nothing"
+    );
+
+    // Phase 2: the fault is gone. The seam's bind-incomplete budget was spent by
+    // phase 1, so every worker now comes up as a healthy stub and binds its full
+    // planned set.
+    let second = coordinator.reconcile(Some(&snap), &mut bindings, 64);
+    assert!(
+        second.is_ok(),
+        "phase 2 must succeed — the fault self-cleared, got {second:?}"
+    );
+
+    assert!(
+        coordinator.last_bind_failures.is_empty(),
+        "the recovered reconcile must drop the recorded cause; a retained one \
+         re-publishes 'resource busy' the moment anything unbinds those slots"
+    );
+    for binding in &bindings {
+        assert!(
+            binding.bound,
+            "slot {} must be bound after the recovered reconcile",
+            binding.slot
+        );
+        assert!(
+            binding.last_error.is_empty(),
+            "slot {} still reports {:?} after a successful reconcile",
+            binding.slot,
+            binding.last_error
+        );
+    }
+
+    // And the refresh that follows (the next status poll) must not resurrect it.
+    coordinator.refresh_bindings(&mut bindings);
+    assert!(
+        bindings.iter().all(|binding| binding.last_error.is_empty()),
+        "a status poll after recovery re-published a stale cause"
+    );
+
+    coordinator.stop_inner(false);
+}
+
+/// #8558 — the OTHER direction: a slot that is unbound for a LEGITIMATE reason
+/// must not inherit the previous fault's cause.
+///
+/// After a fail-closed reconcile has recorded causes, a disarm (`should_run
+/// _afxdp` false -> `Coordinator::stop`) or a config-cleared teardown unbinds
+/// every slot on purpose. Those slots take the same `zero_unbound_slot` branch
+/// the restore hangs off, so a cause that outlives its worker set would be
+/// re-published onto them — an operator reading "Device or resource busy" on a
+/// box that was simply disarmed, and a false `busyErr` waiting for whatever
+/// re-arms it.
+///
+/// Fail-on-revert / mutation: delete `self.last_bind_failures.clear()` from
+/// `stop_inner` and this reds — slot 1 comes back carrying the retired
+/// generation's bind error.
+#[test]
+fn a_legitimate_teardown_does_not_inherit_the_bind_failure_cause_8558() {
+    let mut coordinator = Coordinator::new();
+    let mut bindings = wedge8388_three_worker_bindings();
+    coordinator.force_worker_bind_incomplete = 1;
+    coordinator.force_worker_healthy_stub = true;
+
+    let snap = mandatory_ok_snapshot(5);
+    let _ = coordinator.reconcile(Some(&snap), &mut bindings, 64);
+    assert!(
+        bindings[0]
+            .last_error
+            .to_lowercase()
+            .contains("resource busy"),
+        "precondition: the fail-closed reconcile recorded a cause"
+    );
+
+    // The disarm path: `reconcile_status_bindings` calls `afxdp.stop()` when
+    // forwarding is not armed, then refreshes the bindings.
+    coordinator.stop();
+    coordinator.refresh_bindings(&mut bindings);
+
+    for binding in &bindings {
+        assert!(
+            binding.last_error.is_empty(),
+            "slot {} inherited the retired generation's bind error {:?} after a \
+             deliberate teardown",
+            binding.slot,
+            binding.last_error
+        );
+    }
+    assert!(
+        coordinator.last_bind_failures.is_empty(),
+        "the recorded causes must not outlive the worker set they describe"
+    );
+}
+
 /// #6242 — teardown atomicity / no double-clear. `stop_inner` drops each worker
 /// record's FOUR owners (handle + panic + exception ring + last-resolution)
 /// EXACTLY ONCE via the teardown's record publish (#7209: `clear_records`,

@@ -10,14 +10,28 @@ import (
 // #7497 blocker 5.
 //
 // `hasBusyBindingsWedgeLocked` required `bound == 0 && ready == 0` — every
-// binding down. That was reasonable when the planner bound `min(rx)` queues
-// across all candidates: the binding set was small and a bind failure
-// plausibly hit all of it at once. With `Σ min(rx, 16)` bindings the realistic
-// failure is PARTIAL — fifteen bind, one returns EBUSY — so `bound != 0` and
-// auto-rebind recovery never ran at all.
+// binding down. Widening it to "any registered and armed binding is unbound"
+// is right, but not for the reason recorded here originally, and #8388
+// measured the difference.
 //
-// The predicate did not become wrong. The distribution of failures in front of
-// it moved.
+// The original claim was that with `Σ min(rx, 16)` bindings the realistic
+// failure is PARTIAL — fifteen bind, one returns EBUSY. A BIND failure never
+// produces that shape: the helper's #5143 readiness barrier fails the whole
+// reconcile closed and stops every worker, so one EBUSY arrives here as
+// `bound == 0` with every slot wedged (`bind_incomplete_leaves_no_bound_
+// sibling_8388`). The shape that IS partial is a #4952 worker-thread SPAWN
+// failure at worker K, which leaves workers `0..K-1` live and bound
+// (`spawn_failure_does_leave_bound_siblings_8388`). That is the case the old
+// predicate could not see, and the reason to keep the widened one.
+//
+// NOTE ON THE FIXTURES BELOW. Every cell in this file hands the predicate a
+// `BindingStatus` it built itself, with `LastError` already populated. That is
+// fine for what they assert — the predicate's own logic — but it is why they
+// stayed green through #8558, where the real sequence ERASED `LastError`
+// before the predicate ever saw it and recovery could not fire at all. A cell
+// over this predicate cannot see that class; the ones that can are in
+// `wedge_cause_recovery_8558_test.go` (manager -> control socket) and in
+// `userspace-dp`'s `afxdp::coordinator::tests` (teardown -> refresh -> refresh).
 
 func wedgeManager7497(bindings []BindingStatus) *Manager {
 	return &Manager{

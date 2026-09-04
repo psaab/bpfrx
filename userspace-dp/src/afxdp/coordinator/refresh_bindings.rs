@@ -16,6 +16,20 @@
 //! lives in this file as a thin dispatcher and calls
 //! `refresh_cos_owner_worker_map_from_binding_statuses` at the
 //! tail, preserving the pre-#1328 contract.
+//!
+//! #8558 adds ONE exception to the unbound-slot branch: after
+//! `zero_unbound_slot` has zeroed the slot, the dispatcher restores
+//! `last_error` from `Coordinator::last_bind_failures` if the last
+//! fail-closed bring-up recorded a TERMINAL bind cause for that slot.
+//! Without it the `"Device or resource busy"` a bind returned was
+//! erased before any status left the helper — and since
+//! `hasBusyBindingsWedgeLocked`'s `busyErr` term is a substring match
+//! on exactly that field, auto-rebind recovery could never fire for
+//! the fault it exists for. The restore lives HERE, in the dispatcher,
+//! rather than inside `zero_unbound_slot`, because this function runs
+//! on EVERY control response: a cause restored anywhere else is erased
+//! by the next ~1 Hz status poll, well inside the 5s dwell the Go
+//! predicate requires before it acts.
 // Use the coordinator's afxdp scope (super::* from coordinator
 // pulls in all afxdp items; we re-use the same pattern here).
 use super::*;
@@ -29,6 +43,28 @@ impl Coordinator {
                 copy_live_snapshot(binding, snap);
             } else {
                 zero_unbound_slot(binding);
+                // #8558: re-publish the TERMINAL bind-failure cause for this
+                // slot, if the last fail-closed bring-up recorded one.
+                //
+                // `zero_unbound_slot` ends with `last_error.clear()`, which is
+                // right for a slot that is unbound because forwarding is
+                // disarmed or the config was cleared — and destructive for the
+                // one case where the cause is the whole point. This runs on
+                // EVERY control response, so restoring the cause anywhere else
+                // would be erased within one ~1 Hz status poll, well inside the
+                // 5s dwell the Go wedge predicate requires before it acts.
+                //
+                // Restoring AFTER the zero-out rather than teaching
+                // `zero_unbound_slot` to skip the field keeps that helper's
+                // contract intact ("this slot has no worker: zero its runtime")
+                // and makes the exception explicit at the one call site that
+                // has the map. `clear()` + `push_str` rather than an owned
+                // clone so the existing `String` allocation is reused, matching
+                // the rest of the refresh.
+                if let Some(reason) = self.last_bind_failures.get(&binding.slot) {
+                    binding.last_error.clear();
+                    binding.last_error.push_str(reason);
+                }
             }
         }
         self.refresh_cos_owner_worker_map_from_binding_statuses(bindings);
