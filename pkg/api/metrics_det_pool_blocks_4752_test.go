@@ -9,6 +9,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
 // #4752: deterministic-CGNAT pools have no port-utilization observability —
@@ -179,7 +180,7 @@ func TestCollectNATPoolMetricsDeterministicBlocks(t *testing.T) {
 
 	ch := make(chan prometheus.Metric)
 	go func() {
-		c.collectNATPoolMetrics(ch, dp)
+		c.collectNATPoolMetrics(ch, dp, &dpuserspace.ProcessStatus{})
 		close(ch)
 	}()
 

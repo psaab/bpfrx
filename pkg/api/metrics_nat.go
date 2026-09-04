@@ -8,9 +8,10 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
-func (c *xpfCollector) collectNATPoolMetrics(ch chan<- prometheus.Metric, dp apiRuntimeDataPlane) {
+func (c *xpfCollector) collectNATPoolMetrics(ch chan<- prometheus.Metric, dp apiRuntimeDataPlane, userspaceStatus *dpuserspace.ProcessStatus) {
 	cfg := c.srv.store.ActiveConfig()
 	if cfg == nil {
 		return
@@ -25,6 +26,22 @@ func (c *xpfCollector) collectNATPoolMetrics(ch chan<- prometheus.Metric, dp api
 	// contract break — the alert reads capacity for something that can allocate
 	// nothing. Capacity now comes from the compiler's verdict.
 	overBudget := config.SourceNATAggregateOverBudgetPools(cfg)
+	// #5317: the helper status is fetched ONCE per scrape and shared. Calling
+	// runtimeSourceNATPools() here would issue a SECOND control-socket round
+	// trip -- which is exactly what #5317 removed, and what
+	// TestMetricsCollectFetchesUserspaceStatusOncePerScrape caught when an
+	// earlier revision of this change did it.
+	//
+	// #5046 contract, preserved: a nil status is a failed or absent round trip,
+	// not idle usage. Bump the shared scrape-error counter and emit no
+	// used-ports sample, rather than degrading every pool to a healthy-looking
+	// zero.
+	var poolOccupancy map[string]dpuserspace.SourceNATPoolStatus
+	if userspaceStatus == nil {
+		c.counterReadErrors.Add(1)
+	} else {
+		poolOccupancy = dpuserspace.SourceNATPoolOccupancy(*userspaceStatus)
+	}
 	for name, pool := range cfg.Security.NAT.SourcePools {
 		portLow, portHigh := pool.PortLow, pool.PortHigh
 		if portLow == 0 {
@@ -51,19 +68,20 @@ func (c *xpfCollector) collectNATPoolMetrics(ch chan<- prometheus.Metric, dp api
 		// The reason was already computed for the capacity gauge above and
 		// DISCARDED into `_`. Binding it is the whole fix: one verdict, both
 		// samples, no second call that could disagree with the first.
-		if id, ok := cr.PoolIDs[name]; ok && unusable == "" {
-			cnt, err := dp.ReadNATPortCounter(uint32(id))
-			if err != nil {
-				// #5046: a port-counter read failure must not silently emit a
-				// healthy sample nor vanish without a trace. Omit the used-ports
-				// sample (never a fake 0) AND bump the shared scrape-error
-				// counter so monitoring can see the read failed — the same
-				// #3345/#3462 contract the zone/policy/filter collectors honor.
-				c.counterReadErrors.Add(1)
-			} else {
-				ch <- prometheus.MustNewConstMetric(c.natPoolUsedPorts, prometheus.GaugeValue,
-					float64(cnt), name)
-			}
+		// #8606: the sample comes from the helper's live occupancy, not from
+		// the legacy `nat_port_counters` map -- which is seeded with
+		// `rand.Uint64()` and has had no writer since #1476 deleted the eBPF
+		// pipeline, so this gauge was publishing a random number as used
+		// ports. As the numerator of every pool-utilisation alert, that is the
+		// worst place in the product for a fabricated figure.
+		//
+		// With no helper entry the sample is OMITTED, which is the same
+		// judgement the paragraph above reaches for a disarmed pool: a missing
+		// series says "not installed", a 0 says "measured, and nothing is
+		// used", and monitoring cannot tell the second from health.
+		if rp, ok := poolOccupancy[name]; ok && unusable == "" {
+			ch <- prometheus.MustNewConstMetric(c.natPoolUsedPorts, prometheus.GaugeValue,
+				float64(rp.UsedPorts), name)
 		}
 
 		if pool.Deterministic != nil {

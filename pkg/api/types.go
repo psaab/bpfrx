@@ -616,10 +616,18 @@ type TextResponse struct {
 
 // NATPoolStatsInfo holds NAT pool statistics.
 type NATPoolStatsInfo struct {
-	Name           string `json:"name"`
-	Address        string `json:"address"`
-	TotalPorts     int    `json:"total_ports"`
-	UsedPorts      int    `json:"used_ports"`
+	Name       string `json:"name"`
+	Address    string `json:"address"`
+	TotalPorts int    `json:"total_ports"`
+	UsedPorts  int    `json:"used_ports"`
+	// #8606: false means the dataplane helper reported no occupancy for this
+	// pool, so UsedPorts/AvailablePorts/Utilization are UNMEASURED rather than
+	// measured-as-idle. Occupancy used to fall back to the legacy
+	// `nat_port_counters` map, which is a rand.Uint64() seed with no writer
+	// since #1476 -- so the fallback reported a random number as a
+	// measurement. Reporting nothing is the honest form; this flag is how a
+	// consumer tells the two apart.
+	UsedPortsKnown bool   `json:"used_ports_known"`
 	AvailablePorts int    `json:"available_ports"`
 	Utilization    string `json:"utilization"`
 	IsInterface    bool   `json:"is_interface,omitempty"`

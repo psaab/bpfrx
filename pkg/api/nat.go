@@ -47,20 +47,11 @@ func (s *Server) runtimeSourceNATPools() (map[string]dpuserspace.SourceNATPoolSt
 	if err != nil {
 		return nil, err
 	}
-	if len(status.SourceNATPools) == 0 {
-		return nil, nil
-	}
-	pools := make(map[string]dpuserspace.SourceNATPoolStatus, len(status.SourceNATPools))
-	for _, p := range status.SourceNATPools {
-		if p.PoolName == "" {
-			continue
-		}
-		if _, seen := pools[p.PoolName]; seen {
-			continue
-		}
-		pools[p.PoolName] = p
-	}
-	return pools, nil
+	// #8606: single-sourced. The dedup contract (one entry per pool name,
+	// never summed -- rules sharing a pool share one allocator and report
+	// identical UsedPorts) now lives with the type, so the four surfaces that
+	// report occupancy cannot drift apart on it.
+	return dpuserspace.SourceNATPoolOccupancy(status), nil
 }
 
 // appliedNATView projects the userspace manager's last-applied NAT snapshot
@@ -294,6 +285,7 @@ func (s *Server) natPoolStatsHandler(w http.ResponseWriter, r *http.Request) {
 		// singular `address` field.
 		addrCount, poolDisarm := config.SourceNATPoolReportableAddresses(pool, name, overBudgetPools)
 		used := 0
+		usedKnown := false
 
 		if rp, ok := runtime[name]; ok {
 			// Runtime SSOT: the helper's applied address count, port window,
@@ -308,21 +300,15 @@ func (s *Server) natPoolStatsHandler(w http.ResponseWriter, r *http.Request) {
 				portHigh = int(rp.PortHigh)
 			}
 			used = int(rp.UsedPorts)
-		} else if cr != nil {
-			// No runtime entry (helper not running / pre-first-apply): fall
-			// back to the legacy port counter so the surface is not blank.
-			if id, ok := cr.PoolIDs[name]; ok {
-				cnt, err := s.dp.ReadNATPortCounter(uint32(id))
-				if err != nil {
-					// A counter read FAILURE is not idle usage: surface it as
-					// unavailable rather than reporting a healthy 0 (#5046).
-					writeError(w, http.StatusInternalServerError,
-						"NAT pool port counter read failed: "+err.Error())
-					return
-				}
-				used = int(cnt)
-			}
+			usedKnown = true
 		}
+		// #8606: there is deliberately NO legacy-counter fallback here any
+		// more. It existed so the surface would not be blank when the helper
+		// had no entry, but `nat_port_counters` is seeded with `rand.Uint64()`
+		// and has had no writer since #1476 deleted the eBPF pipeline, so the
+		// fallback filled the blank with a RANDOM number. A fallback is worth
+		// having only when its value is true; this one reported noise as a
+		// measurement, which is strictly worse than reporting nothing.
 
 		// #6553: one shared formula across all four surfaces (this guard used
 		// to exist only here).
@@ -332,9 +318,18 @@ func (s *Server) natPoolStatsHandler(w http.ResponseWriter, r *http.Request) {
 		if avail < 0 {
 			avail = 0
 		}
-		util := "0.0%"
-		if totalPorts > 0 {
-			util = fmt.Sprintf("%.1f%%", float64(used)/float64(totalPorts)*100)
+		// #8606: "unknown" is a third state. With the legacy random-seed
+		// fallback gone, a pool the helper is not reporting has NO occupancy
+		// measurement, and rendering "0 used / 0.0%" would be a fabricated
+		// healthy reading -- the same fake zero #7473 removed elsewhere on
+		// this object. `used_ports_known` false marks it; the numeric fields
+		// stay zero-valued so existing consumers keep their shape.
+		util := "unknown"
+		if usedKnown {
+			util = "0.0%"
+			if totalPorts > 0 {
+				util = fmt.Sprintf("%.1f%%", float64(used)/float64(totalPorts)*100)
+			}
 		}
 
 		// #7473: the reason was already computed above for the capacity
@@ -347,6 +342,7 @@ func (s *Server) natPoolStatsHandler(w http.ResponseWriter, r *http.Request) {
 			Address:        strings.Join(pool.Addresses, ","),
 			TotalPorts:     totalPorts,
 			UsedPorts:      used,
+			UsedPortsKnown: usedKnown,
 			AvailablePorts: avail,
 			Utilization:    util,
 		}

@@ -20,6 +20,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/dataplane"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 )
 
@@ -33,8 +34,14 @@ type natPortCtrErrGRPCDP struct {
 
 func (d *natPortCtrErrGRPCDP) IsLoaded() bool                          { return true }
 func (d *natPortCtrErrGRPCDP) LastApplyResult() *dataplane.ApplyResult { return d.result.Clone() }
-func (d *natPortCtrErrGRPCDP) ReadNATPortCounter(uint32) (uint64, error) {
-	return 0, errors.New("nat port counter bridge degraded")
+
+// #8606: the RPC's occupancy source moved from the legacy `nat_port_counters`
+// map (a rand.Uint64() seed with no writer since #1476) to the helper's live
+// status, so the failure this fixture injects is a STATUS read failure. The
+// contract under test is unchanged -- a failed read must fail the RPC as
+// unavailable rather than return a healthy zero-usage pool (#5046, #3345).
+func (d *natPortCtrErrGRPCDP) Status() (dpuserspace.ProcessStatus, error) {
+	return dpuserspace.ProcessStatus{}, errors.New("nat status bridge degraded")
 }
 
 // Telemetry routes reads through THIS mock (not the embedded Manager's promoted
@@ -81,7 +88,7 @@ set security nat source rule-set rs rule r1 then source-nat pool p1`); err != ni
 	return store
 }
 
-func TestGetNATPoolStatsFailsOnPortCounterReadError(t *testing.T) {
+func TestGetNATPoolStatsFailsOnRuntimeStatusReadError(t *testing.T) {
 	s := &Server{
 		store: newNATPoolStatsGRPCStore(t),
 		dp: &natPortCtrErrGRPCDP{
@@ -92,7 +99,7 @@ func TestGetNATPoolStatsFailsOnPortCounterReadError(t *testing.T) {
 
 	_, err := s.GetNATPoolStats(context.Background(), &pb.GetNATPoolStatsRequest{})
 	if err == nil {
-		t.Fatal("GetNATPoolStats returned nil error on port counter read failure; want codes.Internal")
+		t.Fatal("GetNATPoolStats returned nil error on runtime status read failure; want codes.Internal")
 	}
 	if status.Code(err) != codes.Internal {
 		t.Fatalf("GetNATPoolStats error code = %v, want Internal; err: %v", status.Code(err), err)
