@@ -11,9 +11,9 @@
 
 use super::super::ServerState;
 use crate::ControlResponse;
-use crate::afxdp::PoolIdleLease;
+use crate::afxdp::{PoolDisplayLease, PoolIdleLease};
 use crate::nat::IdleLeaseRecord;
-use crate::protocol::IdleLeaseWire;
+use crate::protocol::{DisplayLeaseWire, IdleLeaseWire};
 use std::net::IpAddr;
 
 fn to_wire(rec: &PoolIdleLease) -> IdleLeaseWire {
@@ -211,4 +211,38 @@ mod tests {
             assert!(from_wire(&w).is_none(), "{label} must be refused");
         }
     }
+}
+
+/// #8615: the DISPLAY export. One-way by construction — there is no
+/// `from_wire` for this type and no import verb that accepts it, because the
+/// record carries `active_flows` and design note 1 forbids that on anything a
+/// peer can install.
+fn to_display_wire(rec: &PoolDisplayLease) -> DisplayLeaseWire {
+    let (remote_ip, remote_port) = match rec.lease.remote {
+        Some((ip, port)) => (ip.to_string(), port),
+        None => (String::new(), 0),
+    };
+    DisplayLeaseWire {
+        pool_name: rec.pool_name.clone(),
+        protocol: rec.lease.protocol,
+        src_ip: rec.lease.src_ip.to_string(),
+        src_port: rec.lease.src_port,
+        remote_ip,
+        remote_port,
+        translated_ip: rec.lease.translated_ip.to_string(),
+        translated_port: rec.lease.translated_port,
+        address_only: rec.lease.address_only,
+        remaining_ns: rec.lease.remaining_ns,
+        timeout_ns: rec.lease.timeout_ns,
+        active_flows: rec.lease.active_flows,
+    }
+}
+
+pub(super) fn export_display(guard: &mut ServerState, response: &mut ControlResponse) {
+    response.display_leases = guard
+        .afxdp
+        .export_display_persistent_leases_now()
+        .iter()
+        .map(to_display_wire)
+        .collect();
 }
