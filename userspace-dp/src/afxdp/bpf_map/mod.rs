@@ -613,6 +613,68 @@ pub(super) fn delete_bpf_conntrack_entry(
 /// admitting rule was deleted re-resolves to the unattributed default-policy
 /// sentinel; an unbound (non-policy / peer-synced) session keeps its frozen id.
 /// See `PolicyState::reresolve_session_policy_id`.
+/// #7919: what the BPF conntrack row's four counter fields should carry after
+/// this walking session entry is mirrored onto it.
+///
+/// THE DEFECT THIS EXISTS FOR. A local transit install is fanned out to EVERY
+/// worker (`replicate_session_upsert`; `handle_upsert_synced`'s own doc says
+/// "The synced entry is fanned out to every worker"), and the replication types
+/// carry NO COUNTERS FIELD AT ALL — neither `SyncedSessionEntry`
+/// (`afxdp/worker/mod.rs`) nor `SessionInstall` (`session/ctx.rs`). A worker
+/// that does not receive the flow's packets therefore holds a copy created at
+/// zero that can never advance: only `account_packet` moves counters, and it
+/// runs where the packets land.
+///
+/// Every worker then refreshes its OWN table into the SAME row — the walk
+/// applies no origin filter, the refresh skips only `is_reverse`, and publish
+/// and refresh build the key with the same `bpf_session_key_v4`. With six
+/// combined RX queues on the reference cluster, five writers out of six
+/// published zero over the owner's live volume, which is why
+/// `show security flow session` reported `Pkts: 0, Bytes: 0` for a flow moving
+/// 90 Mbit/s.
+///
+/// WHY THE RULE IS "HAS NOTHING TO CONTRIBUTE" RATHER THAN AN ORIGIN TEST.
+/// Every predicate over `SessionOrigin` gets this wrong somewhere:
+///
+///   - skipping `is_peer_synced()` entries ENTIRELY would also stop refreshing
+///     `last_seen`, which drives idle/expiry — on a STANDBY every entry is
+///     `SyncImport`, so that expires synced sessions early. `last_seen` and
+///     `policy_id` are still refreshed unconditionally; only these four fields
+///     are gated.
+///   - excluding `is_peer_synced()` from the COUNTER write is wrong too: it
+///     covers `SharedMaterialize`, which is precisely the origin a worker takes
+///     when it RECEIVES traffic for a shared session
+///     (`materialized_shared_hit_origin`). Excluding it would freeze the
+///     counters for post-failover traffic specifically — a regression no test
+///     written before a failover can see.
+///
+/// Counters are monotonic per session (`SessionCounters::account` only
+/// `saturating_add`s) and `publish_bpf_conntrack_entry` re-zeroes the row at
+/// install with `BPF_ANY`, so "an all-zero entry does not overwrite the row" is
+/// origin-agnostic, needs no new wire or table state, and stays correct across
+/// promotion and materialization.
+///
+/// KNOWN LIMIT, stated so it is not mistaken for coverage: if per-session
+/// accounting ever broke outright, every entry would be all-zero and the row
+/// would keep its publish-time zeros — the same symptom as #7919 with a
+/// different cause. This gate does not make that case worse and does not detect
+/// it.
+#[inline]
+pub(super) fn mirrored_counters(
+    existing: (u64, u64, u64, u64),
+    live: &crate::session::SessionCounters,
+) -> (u64, u64, u64, u64) {
+    if live.fwd_packets == 0 && live.rev_packets == 0 {
+        return existing;
+    }
+    (
+        live.fwd_packets,
+        live.fwd_bytes,
+        live.rev_packets,
+        live.rev_bytes,
+    )
+}
+
 pub(super) fn refresh_bpf_conntrack_last_seen(
     conntrack_v4_fd: c_int,
     conntrack_v6_fd: c_int,
@@ -659,10 +721,21 @@ pub(super) fn refresh_bpf_conntrack_last_seen(
                     value.policy_id = reresolved_policy_id;
                     // #2501: surface live per-session volume so `show security
                     // flow session` reports real byte/packet counts.
-                    value.fwd_packets = counters.fwd_packets;
-                    value.fwd_bytes = counters.fwd_bytes;
-                    value.rev_packets = counters.rev_packets;
-                    value.rev_bytes = counters.rev_bytes;
+                    // #7919: an all-zero entry is a SIBLING WORKER's replica of
+                    // a live session and must not overwrite the owner's volume.
+                    let (fp, fb, rp, rb) = mirrored_counters(
+                        (
+                            value.fwd_packets,
+                            value.fwd_bytes,
+                            value.rev_packets,
+                            value.rev_bytes,
+                        ),
+                        &counters,
+                    );
+                    value.fwd_packets = fp;
+                    value.fwd_bytes = fb;
+                    value.rev_packets = rp;
+                    value.rev_bytes = rb;
                     let _ = unsafe {
                         libbpf_sys::bpf_map_update_elem(
                             conntrack_v4_fd,
@@ -690,10 +763,21 @@ pub(super) fn refresh_bpf_conntrack_last_seen(
                     // (see v4 arm).
                     value.policy_id = reresolved_policy_id;
                     // #2501: surface live per-session volume (see v4 arm).
-                    value.fwd_packets = counters.fwd_packets;
-                    value.fwd_bytes = counters.fwd_bytes;
-                    value.rev_packets = counters.rev_packets;
-                    value.rev_bytes = counters.rev_bytes;
+                    // #7919: an all-zero entry is a SIBLING WORKER's replica of
+                    // a live session and must not overwrite the owner's volume.
+                    let (fp, fb, rp, rb) = mirrored_counters(
+                        (
+                            value.fwd_packets,
+                            value.fwd_bytes,
+                            value.rev_packets,
+                            value.rev_bytes,
+                        ),
+                        &counters,
+                    );
+                    value.fwd_packets = fp;
+                    value.fwd_bytes = fb;
+                    value.rev_packets = rp;
+                    value.rev_bytes = rb;
                     let _ = unsafe {
                         libbpf_sys::bpf_map_update_elem(
                             conntrack_v6_fd,
