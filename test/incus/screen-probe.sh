@@ -50,6 +50,8 @@ cd "$(dirname "$0")"
 source ./screen-probe-lib.sh
 # shellcheck source=cluster-env.sh
 source ./cluster-env.sh
+# shellcheck source=cos-apply-lib.sh
+source ./cos-apply-lib.sh
 
 SUBJECT_CMD="${1:?usage: screen-probe.sh <subject-send-cmd> <witness-send-cmd>}"
 WITNESS_CMD="${2:?usage: screen-probe.sh <subject-send-cmd> <witness-send-cmd>}"
@@ -62,26 +64,60 @@ metrics() {
 		| awk -v m="$1" '$1 == m { print $2 }' | head -1
 }
 
+# arm commits the screen profile and VERIFIES the commit from the CLI
+# TRANSCRIPT, not from the exit status.
+#
+# #6440: the piped-stdin CLI is a REPL. It prints "error: ..." for a failed
+# command and still exits 0, so `if ! incus exec ... <<EOF` cannot fire. The
+# first version of this script gated on the exit status, which meant a failed
+# arm set `armed_state="armed"` and the probe then measured an UNARMED box
+# while reporting a verdict — trap 1 wearing this script's own clothes, since
+# trap 1 is precisely "the screen stage short-circuits and the run is green for
+# reasons unrelated to the change".
+#
+# Caught by `TestEveryConfigCommittingSmokeUsesTheMarkerGate_6936`, which scans
+# every config-committing smoke script for this gate. The guard lives in
+# cmd/cli and the script is shell, which is exactly why it was missed: a guard
+# can live in a package the change never touched.
 arm() {
 	printf 'arming screen profile %s on %s\n' "$PROFILE" "$FW0" >&2
-	incus exec "$FW0" -- /usr/local/bin/cli <<-EOF
+	local transcript
+	transcript="$(mktemp)"
+	incus exec "$FW0" -- /usr/local/bin/cli >"$transcript" 2>&1 <<-EOF || true
 	configure
 	set security screen ids-option $PROFILE ip tear-drop
 	set security zones security-zone lan screen $PROFILE
 	commit
 	exit
 	EOF
+	if ! cos_require_markers "screen-probe arm" "$transcript" \
+		"$COS_MARKER_COMMIT"; then
+		rm -f "$transcript"
+		return 1
+	fi
+	rm -f "$transcript"
 }
 
+# disarm is best-effort by design -- it runs from an EXIT trap, including after
+# a failure -- but it still verifies the transcript, because a disarm that
+# silently failed leaves the SHARED cluster armed for every other lane. The
+# verdict goes to the cleanup check at the end rather than aborting here.
 disarm() {
 	printf 'disarming screen profile %s\n' "$PROFILE" >&2
-	incus exec "$FW0" -- /usr/local/bin/cli <<-EOF || true
+	local transcript
+	transcript="$(mktemp)"
+	incus exec "$FW0" -- /usr/local/bin/cli >"$transcript" 2>&1 <<-EOF || true
 	configure
 	delete security zones security-zone lan screen
 	delete security screen ids-option $PROFILE
 	commit
 	exit
 	EOF
+	if ! cos_require_markers "screen-probe disarm" "$transcript" \
+		"$COS_MARKER_COMMIT"; then
+		printf 'screen-probe: DISARM did not commit — the shared cluster may still be armed\n' >&2
+	fi
+	rm -f "$transcript"
 }
 
 count_profile_on() {
