@@ -3,6 +3,7 @@ package configstore
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -173,7 +174,17 @@ func (s *Store) recoverPendingConfirmLocked() error {
 	// the stale record still converges to deletion. A legacy record (empty
 	// GuardedHash, written before #5835) skips this check and recovers exactly
 	// as #4577 so the cross-upgrade auto-rollback hatch is preserved.
-	if rec.GuardedHash != "" && rec.GuardedHash != journalConfigHash(s.active) {
+	// #8564: the CANONICAL basis, paired with the arm site. Note this end is
+	// IDEMPOTENT today and a mutation of it alone escapes the suite: `s.active`
+	// here was decoded from disk by `Load` immediately above, so it has already
+	// been round-tripped and canonicalizing it again changes nothing. It is
+	// written anyway so the two ends name the SAME function — swapping this back
+	// to `journalConfigHash` encodes the unwritten assumption "the tree here is
+	// always disk-derived", which a future recovery path that seeds `s.active`
+	// from memory would silently falsify. The arm site is the one the #8564
+	// cells bind; do not "simplify" this one away on the grounds that it is
+	// provably a no-op.
+	if rec.GuardedHash != "" && rec.GuardedHash != guardedConfigHash(s.active) {
 		slog.Warn("ignoring a stale pending commit-confirmed record on boot: it guards a config "+
 			"that is no longer active (a later commit/confirm superseded it); not resurrecting its "+
 			"rollback", "issue", "#5835")
@@ -386,6 +397,53 @@ func journalConfigHash(tree *config.ConfigTree) string {
 	}
 	sum := sha256.Sum256([]byte(tree.Format()))
 	return hex.EncodeToString(sum[:])
+}
+
+// guardedConfigHash returns the hash used to bind a pending commit-confirmed
+// record to the config it guards (`confirmRecord.GuardedHash`, #5835), over the
+// tree's CANONICAL text: the text it has after ONE JSON round-trip (#8564).
+//
+// The two ends of that binding never saw the same tree. It is computed at ARM
+// time over the IN-MEMORY promoted tree and re-computed at BOOT over the tree
+// DECODED FROM DISK, so any value the JSON encoding normalizes makes the two
+// hashes differ and recovery classifies a LIVE record as stale — dropping it,
+// leaving the UNCONFIRMED config standing with no rollback timer, and logging
+// that "a later commit/confirm superseded it" when nothing did.
+//
+// One such value is reachable from ordinary config: `hasControlChars` rejects
+// only C0/DEL, so a raw invalid-UTF-8 byte in a free-text leaf commits cleanly,
+// and `json.MarshalIndent` (the DB persistence format) coerces it to U+FFFD.
+//
+// Canonicalizing makes the two bases equal BY CONSTRUCTION rather than by the
+// absence of any normalizing value: the round trip is idempotent, so the
+// arm-time hash of the in-memory tree already equals the boot-time hash of the
+// tree that comes back. For every config the encoding does NOT normalize —
+// which is every config that works today — this is byte-identical to
+// `journalConfigHash`, so records written by an older build still match and no
+// #1917-style versioned basis is needed. The journal's own `ConfigHash` keeps
+// the plain basis: it records what was committed, not what will be read back.
+func guardedConfigHash(tree *config.ConfigTree) string {
+	if tree == nil {
+		return ""
+	}
+	return journalConfigHash(canonicalizeTree(tree))
+}
+
+// canonicalizeTree returns tree as it will be after a persist/load round trip:
+// marshalled and decoded exactly as `writeTreeMarked`/`readTreeMeta` do. On a
+// marshal/decode failure it returns tree unchanged, which degrades to the
+// pre-#8564 basis rather than to an empty tree — a wrong-but-stable hash
+// stale-drops one record, an empty tree would match every config.
+func canonicalizeTree(tree *config.ConfigTree) *config.ConfigTree {
+	data, err := json.Marshal(tree)
+	if err != nil {
+		return tree
+	}
+	var round config.ConfigTree
+	if err := json.Unmarshal(data, &round); err != nil {
+		return tree
+	}
+	return &round
 }
 
 // ConfigPersistDegraded reports whether the running active config

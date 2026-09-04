@@ -629,7 +629,7 @@ func (s *Store) writeConfirmState(prevTree *config.ConfigTree, deadline time.Tim
 		// boot recovery a mismatch means a later commit/confirm advanced the
 		// active config while this record's durable removal had failed — the
 		// record is then stale and must not resurrect a rollback.
-		GuardedHash: journalConfigHash(s.active),
+		GuardedHash: guardedConfigHash(s.active),
 	}
 	if err := s.db.WriteConfirm(rec); err != nil {
 		slog.Warn("failed to persist commit-confirmed state; auto-rollback will not "+
