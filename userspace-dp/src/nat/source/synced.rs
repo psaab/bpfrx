@@ -514,13 +514,22 @@ fn reserve_synced_on_first_pool_owner<'a>(
         // untouched and tries the next, matching the port-bearing arm's per-rule
         // fall-through and the config-drift skip.
         let Some(rewrite_src_port) = rewrite_src_port else {
-            let in_pool = match rewrite_src {
-                IpAddr::V4(v4) => rule.pool_addresses_v4.iter().any(|a| *a == v4),
-                IpAddr::V6(v6) => rule.pool_addresses_v6.iter().any(|a| *a == v6),
+            // #8132: `position`, not `any` — the absolute pool index (v6
+            // folded after v4, matching `address_index`) is what the lease's
+            // idle-expiry index is keyed on. `is_some()` is the same candidacy
+            // predicate `any` gave, so the pool-membership decision below is
+            // unchanged.
+            let addr_index = match rewrite_src {
+                IpAddr::V4(v4) => rule.pool_addresses_v4.iter().position(|a| *a == v4),
+                IpAddr::V6(v6) => rule
+                    .pool_addresses_v6
+                    .iter()
+                    .position(|a| *a == v6)
+                    .map(|i| rule.pool_addresses_v4.len() + i),
             };
-            if !in_pool {
+            let Some(addr_index) = addr_index else {
                 continue;
-            }
+            };
             saw_candidate = true;
             // #7076: a rule carrying a `pool_failure` OWNS the translated
             // address on paper but has no allocator a packet path will ever
@@ -548,10 +557,35 @@ fn reserve_synced_on_first_pool_owner<'a>(
                 }
                 continue;
             }
-            if let Ok(translated) =
-                rule.pool_allocator
-                    .reserve_address_only(flow, rewrite_src, holder)
-            {
+            // #8132: hand the allocator this rule's persistence identity when
+            // the rule runs `persistent-nat`, so the reservation JOINS the
+            // source's lease (creating it on the first session) instead of
+            // minting a bare reverse-identity token and no lease. Without this
+            // the standby holds zero leases for every `port no-translation`
+            // persistent client, and a failover moves the client's public
+            // ADDRESS — which under an address-only rule is the entire property
+            // the lease pins, since the client keeps its own source port on the
+            // wire and there is no translated port to preserve.
+            //
+            // Derived through the SAME `persistent_source_key` helper the local
+            // path and #7360's port-bearing arm call, from the same `flow` the
+            // rule match used, so the standby's lease is keyed identically to
+            // the active's — including the `permit` shape, which decides
+            // whether the remote endpoint is folded in (#2823).
+            let persistent = rule.persistent_nat.then(|| {
+                (
+                    flow.persistent_source_key(rule.persistent_nat_permit),
+                    rule.persistent_nat_timeout_ns,
+                )
+            });
+            if let Ok(translated) = rule.pool_allocator.reserve_address_only_maybe_persistent(
+                flow,
+                rewrite_src,
+                addr_index,
+                now_ns,
+                holder,
+                persistent,
+            ) {
                 // #8115 R2: the identity the ACTIVE node chose may be one a
                 // LOCAL flow already owns in a PEER pool. `reserve_address_only`
                 // checks only THIS allocator's `address_only_owners`, so the
@@ -649,16 +683,13 @@ fn reserve_synced_on_first_pool_owner<'a>(
         // `permit` shape, which decides whether the remote endpoint is folded
         // in (#2823).
         //
-        // PORT-BEARING ARM ONLY. The address-only arm above (`port
-        // no-translation` / a port-less protocol) takes the #6041 lease path,
-        // whose synced form mints the reverse-identity token and no lease. It
-        // needs a third variant — mint the token AND join the lease at the
-        // address the WIRE named, rather than choosing one the way
-        // `reserve_address_only_persistent` does — so it is tracked as #8132
-        // rather than bolted on here. Its session-drop half does not exist:
-        // an address-only allocation holds no port bit, and its
-        // `AddressOnlyReverseKey` folds in the remote, so two flows from one
-        // client to different remotes never collide.
+        // PORT-BEARING ARM. The address-only arm above (`port no-translation`
+        // / a port-less protocol) takes the #6041 lease path and needed its own
+        // variant — mint the token AND join the lease at the address the WIRE
+        // named, rather than choosing one the way
+        // `reserve_address_only_persistent` does. That landed as #8132; the two
+        // arms now build `persistent` identically and differ only in which
+        // reserve they hand it to.
         let persistent = rule
             .persistent_nat
             .then(|| (flow.persistent_source_key(rule.persistent_nat_permit), rule.persistent_nat_timeout_ns));

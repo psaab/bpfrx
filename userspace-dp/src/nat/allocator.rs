@@ -2158,7 +2158,6 @@ impl PortAllocator {
         true
     }
 
-
     /// #6528: unlink ONE flow's `live_by_flow` record, applying the teardown its
     /// allocation MODE requires. This is the half of a teardown that is
     /// IDENTICAL across all THREE paths that retire a record — `release_flow`,
@@ -2956,6 +2955,27 @@ impl PortAllocator {
                 }
                 let was_idle = lease.active_flows == 0;
                 if let Some(lease) = live.persistent_by_source.get_mut(&persistent_key) {
+                    // #8132: the 0 -> 1 edge re-arms the ACTIVATION-ROLLBACK
+                    // bookkeeping, as the local reuse path does. Without it
+                    // `rollback_flow` sees a lease that has never seen a
+                    // completion and records no previous state, concludes the
+                    // activation CREATED it, DELETES it — and here, on the
+                    // port-bearing arm, FREES the pool port the lease was
+                    // holding.
+                    //
+                    // The shape that reaches it is an idle lease installed by
+                    // #8121's `import_idle_lease`
+                    // (`activation_saw_completion: false`,
+                    // `activation_had_previous_lease: false`). An idle lease
+                    // that got there the ordinary way carries
+                    // `activation_saw_completion == true` and survives, which is
+                    // why this went unnoticed when #7360 landed: the
+                    // interaction needs BOTH changes present.
+                    if was_idle {
+                        lease.activation_saw_completion = false;
+                        lease.activation_previous_expires_at_ns = lease.expires_at_ns;
+                        lease.activation_had_previous_lease = true;
+                    }
                     lease.active_flows = lease.active_flows.saturating_add(1);
                 }
                 // An ACTIVE lease must not sit in the idle-expiry index — the
@@ -3078,6 +3098,49 @@ impl PortAllocator {
         translated_ip: IpAddr,
         holder: NatHolder,
     ) -> Result<TranslatedTuple, super::source::SourceNatFailureReason> {
+        self.reserve_address_only_maybe_persistent(flow, translated_ip, 0, 0, holder, None)
+    }
+
+    /// #8132: the ADDRESS-ONLY twin of [`reserve_flow_maybe_persistent`] — mint
+    /// the reverse-identity token AND join (or create) the source's persistent
+    /// lease AT THE ADDRESS THE WIRE NAMED.
+    ///
+    /// Why this is a third variant rather than a call-site swap to
+    /// [`reserve_address_only_persistent`]: that function CHOOSES the pool
+    /// address, via `address_index` over the family. A synced reservation must
+    /// not choose. The active node already did, and the standby's only job is
+    /// to honour that choice — recomputing it lands on a different address in
+    /// exactly the configuration this issue is about (`address-persistent`
+    /// OFF, where the choice is round-robin over live occupancy rather than a
+    /// pure function of the source), so the client's public address would move
+    /// across the failover the lease exists to survive.
+    ///
+    /// The session-DROP half of #7360 has no counterpart here: an address-only
+    /// allocation claims no pool port, so a client's 2nd..Nth sessions never
+    /// compete for a bit their own lease holds, and the
+    /// `AddressOnlyReverseKey` folds in the remote endpoint, so two flows from
+    /// one client to different servers never collide.
+    pub(super) fn reserve_address_only_maybe_persistent(
+        &self,
+        flow: SourceNatFlowKey,
+        translated_ip: IpAddr,
+        // The absolute pool index of `translated_ip`, folded v4-then-v6 the way
+        // `address_index` folds it. Consulted ONLY for a persistent lease,
+        // whose idle expiry is indexed per pool address. An address-only record
+        // claims no port bit (`unlink_live_allocation_locked` skips the free on
+        // `address_only`), so it is inert for the non-persistent form, which is
+        // why the plain `reserve_address_only` above can pass 0 as it always
+        // has.
+        addr_index: usize,
+        now_ns: u64,
+        holder: NatHolder,
+        // #8132: `Some((key, timeout_ns))` when the rule this reservation
+        // matched runs `persistent-nat`, mirroring #7360's parameter on the
+        // port-bearing arm. The standby cannot learn a lease any other way — a
+        // lease is a property of the SOURCE and session sync carries sessions —
+        // so it is reconstructed here, from imports that actually succeeded.
+        persistent: Option<(PersistentSourceKey, u64)>,
+    ) -> Result<TranslatedTuple, super::source::SourceNatFailureReason> {
         let translated = TranslatedTuple {
             ip: translated_ip,
             // Port-bearing protocols preserve their source port; a port-less
@@ -3120,15 +3183,119 @@ impl PortAllocator {
             self.shared.exhaustion_total.fetch_add(1, Ordering::Relaxed);
             return Err(super::source::SourceNatFailureReason::AllocatorExhausted);
         }
+        // #8132: resolve the lease BEFORE inserting the token, so a refused
+        // flow leaves BOTH the lease and the reverse-identity map untouched —
+        // the ordering `reserve_address_only_persistent` documents for the same
+        // reason on the local path.
+        //
+        // `addr_index` is bounds-checked here rather than trusted: it indexes
+        // `lease_expirations_by_addr`, whose accessors are `get_mut`, so an
+        // out-of-range value would silently skip the per-address index and
+        // leave it disagreeing with the global `lease_expirations` — a lease
+        // the per-address GC sweep can never reap. Mirrors the
+        // `addr_index >= occupancy.len()` guard on the port-bearing arm.
+        let mut idle_lease_to_deindex: Option<(usize, u64)> = None;
+        if let Some((persistent_key, _)) = persistent {
+            if addr_index >= live.lease_expirations_by_addr.len() {
+                return Err(super::source::SourceNatFailureReason::AllocatorExhausted);
+            }
+            if let Some(lease) = live.persistent_by_source.get(&persistent_key).copied() {
+                // A lease naming a DIFFERENT address than the wire does is
+                // config drift or a stale import. Refuse rather than retarget —
+                // the same posture #7360 takes on the port-bearing arm, and the
+                // caller falls through to the next rule. Deliberately NOT
+                // counted as exhaustion: nothing is full. (The caller discards
+                // the reason; the `Err` itself is the signal.)
+                if lease.translated != translated || lease.addr_index != addr_index {
+                    return Err(super::source::SourceNatFailureReason::AllocatorExhausted);
+                }
+                if lease.active_flows == 0 {
+                    idle_lease_to_deindex = Some((lease.addr_index, lease.expires_at_ns));
+                }
+            }
+        }
         live.address_only_owners.insert(rkey, flow);
+        // #8132: join the source's lease, or mint it on the first session for
+        // that source. `active_flows` starts at 1 and is DERIVED from imports
+        // that actually succeeded, never carried from the peer — the standby
+        // installs a strict subset of what the active sends, and a refcount
+        // that never reaches zero is never idle, so a credited-but-absent flow
+        // would strand the lease outside every GC path.
+        //
+        // `expires_at_ns` comes from the LOCAL clock: the peer's value derives
+        // from CLOCK_MONOTONIC and is meaningless across nodes. That is sound
+        // rather than approximate, because the reuse predicate is
+        // `active_flows > 0 || expires_at_ns > now_ns` — while any flow is
+        // active the expiry is never consulted, and
+        // `complete_persistent_lease_locked` re-arms it from the local clock
+        // the moment the last flow releases.
+        let persistent_key = persistent.map(|(persistent_key, timeout_ns)| {
+            match live.persistent_by_source.get_mut(&persistent_key) {
+                Some(lease) => {
+                    // The 0 -> 1 active-flow edge re-arms the
+                    // ACTIVATION-ROLLBACK bookkeeping, exactly as the local
+                    // reuse path does. Without it `rollback_flow` reads a lease
+                    // that has never seen a completion and has no recorded
+                    // previous state, concludes the activation CREATED it, and
+                    // DELETES it.
+                    //
+                    // Measured, not reasoned: an idle lease installed by
+                    // #8121's `import_idle_lease` is exactly that shape
+                    // (`activation_saw_completion: false`,
+                    // `activation_had_previous_lease: false`, `active_flows:
+                    // 0`). Join a synced flow to it and roll that flow back —
+                    // which is the #8115 peer-conflict path, not a hypothetical
+                    // — and the imported lease is gone. An idle lease that got
+                    // there the ordinary way (its flows completed) carries
+                    // `activation_saw_completion == true` and survives, which
+                    // is why nothing noticed.
+                    if idle_lease_to_deindex.is_some() {
+                        lease.activation_saw_completion = false;
+                        lease.activation_previous_expires_at_ns = lease.expires_at_ns;
+                        lease.activation_had_previous_lease = true;
+                    }
+                    lease.active_flows = lease.active_flows.saturating_add(1);
+                }
+                None => {
+                    live.persistent_by_source.insert(
+                        persistent_key,
+                        PersistentLease {
+                            translated,
+                            addr_index,
+                            expires_at_ns: now_ns.saturating_add(timeout_ns.max(NS_PER_SEC)),
+                            timeout_ns,
+                            active_flows: 1,
+                            completed_flows: 0,
+                            activation_saw_completion: false,
+                            activation_previous_expires_at_ns: 0,
+                            activation_had_previous_lease: false,
+                            // The lease pins an ADDRESS and holds no port bit.
+                            // Its teardown must not free one, and
+                            // `gc_expired_locked` reads this flag to decide.
+                            address_only: true,
+                        },
+                    );
+                }
+            }
+            // An ACTIVE lease must not sit in the idle-expiry index — the
+            // invariant `assert_persistent_expiry_indexes_consistent` states
+            // it, and both the local reuse path and #7360's synced twin
+            // maintain it exactly this way.
+            if let Some((idx, expires_at_ns)) = idle_lease_to_deindex {
+                Self::remove_lease_expiration_locked(&mut live, idx, expires_at_ns, persistent_key);
+            }
+            persistent_key
+        });
         live.live_by_flow.insert(
             flow,
             LiveAllocation {
                 translated,
-                persistent_key: None,
-                // No pool-port bit is claimed for an address-only token, so the
-                // occupancy address index is irrelevant to its release.
-                addr_index: 0,
+                persistent_key,
+                // Inert for the release of an address-only record, which frees
+                // no port bit — but it is what the LOCAL
+                // `reserve_address_only_persistent` stores, and the standby's
+                // allocator state has to be readable as the same thing.
+                addr_index,
                 deterministic: false,
                 address_only: true,
                 // #6211 F2: the first holder of this synced address-only token.

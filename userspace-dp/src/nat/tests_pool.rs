@@ -9298,6 +9298,648 @@ fn a_synced_import_conflicting_with_an_existing_lease_is_refused_7360() {
     assert_eq!(statuses[0].persistent_leases, 1, "the lease is unchanged");
     assert_persistent_expiry_indexes_consistent(&standby[0]);
 }
+// --- #8132: the ADDRESS-ONLY twin of #7360's lease reconstruction -----------
+//
+// #7360 rebuilds the lease for a PORT-TRANSLATING persistent client. This is
+// the `port no-translation` path, which reaches a different reserve function
+// and was not covered there: `reserve_address_only` minted the #5269
+// reverse-identity token and nothing else, so the standby held zero leases.
+//
+// THE ASSERTION AXIS INVERTS. Under `port no-translation` the client keeps its
+// own source port on the wire, so there is no translated PORT to lose — what
+// the lease pins is the ADDRESS, and the address is what moves across a
+// failover. #7360's cells call the address "the axis that survives for free";
+// here it is the entire property.
+//
+// So the fixture must be a MULTI-ADDRESS pool with `address-persistent` OFF and
+// interleaved decoys. With one pool address, or with `address-persistent` on
+// (where `sticky_pool_index` is a pure function of `(src_ip, pool_len)` and the
+// standby recomputes the same slot), the assertion passes by construction and
+// measures nothing.
+
+/// The 4-address `port no-translation` persistent pool both nodes run.
+///
+/// `address_persistent` is a parameter only so the "this measures nothing"
+/// claim above can itself be tested (`the_same_cell_passes_under_address_persistent_8132`)
+/// rather than asserted.
+fn ha_address_only_rules_8132(address_persistent: bool) -> Vec<SourceNatRule> {
+    let mut snap = persistent_pool_snapshot(
+        300,
+        40000,
+        40010,
+        vec!["203.0.113.2", "203.0.113.3", "203.0.113.4", "203.0.113.5"],
+        address_persistent,
+    );
+    snap.pool_no_translation = true;
+    parse_source_nat_rules(&[snap])
+}
+
+/// THE POSITIVE CONTROL FOR THE FIXTURE ITSELF, and it is not optional here.
+///
+/// Every cell below would pass on the PORT-BEARING arm — #7360 already fixed
+/// that one. If `pool_no_translation` ever stopped reaching the address-only
+/// path, this whole section would go green while measuring #7360's repair
+/// instead of this one, and nothing else in it could tell.
+///
+/// `rewrite_src_port: None` IS the discriminator: it is what
+/// `reserve_synced_on_first_pool_owner` branches on to take the address-only
+/// arm.
+fn expect_address_only_decision(lookup: SourceNatLookup) -> NatDecision {
+    let decision = expect_snat_decision(lookup);
+    assert!(
+        decision.rewrite_src_port.is_none(),
+        "fixture: this cell must reach the ADDRESS-ONLY arm, which is selected by \
+         a MISSING translated port. A port here means the rule is port-translating \
+         and the cell is re-measuring #7360. Got {:?}",
+        decision.rewrite_src_port
+    );
+    decision
+}
+
+/// Import one address-only session onto the standby through the REAL
+/// synced-reserve path — the same call `handle_upsert_synced` makes.
+fn import_synced_address_only_8132(
+    standby: &[SourceNatRule],
+    src_port: u16,
+    dst_ip: &str,
+    dst_port: u16,
+    active: &NatDecision,
+    now_ns: u64,
+) {
+    reserve_synced_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        standby,
+        &session_key(src_port, dst_ip, dst_port),
+        NatDecision {
+            rewrite_src: active.rewrite_src,
+            rewrite_src_port: active.rewrite_src_port,
+            ..NatDecision::default()
+        },
+        false,
+        None,
+        now_ns,
+    );
+}
+
+/// Other clients admitted on the standby before our client comes back, so a
+/// round-robin chooser has moved on. Without these a 4-address pool can hand
+/// out the original slot by construction.
+fn decoy_flows_8132(standby: &[SourceNatRule], now_ns: u64) {
+    for p in [21000u16, 21001, 21002, 21003, 21004] {
+        let _ = tuple_snat_lookup_from_src(standby, "10.0.1.200", p, "9.9.9.9", 53, now_ns);
+    }
+}
+
+/// FAIL-ON-REVERT: the standby holds no lease at all before this change.
+/// `persistent_leases` is the defect stated as a number.
+#[test]
+fn standby_rebuilds_an_address_only_lease_from_synced_sessions_8132() {
+    let active = ha_address_only_rules_8132(false);
+    let first = expect_address_only_decision(tuple_snat_lookup(&active, 12345, "8.8.8.8", 53, 1));
+    assert_eq!(
+        source_nat_pool_statuses(&active)[0].persistent_leases,
+        1,
+        "fixture: the ACTIVE must hold a lease, or the standby has nothing to rebuild"
+    );
+
+    let standby = ha_address_only_rules_8132(false);
+    import_synced_address_only_8132(&standby, 12345, "8.8.8.8", 53, &first, 1);
+
+    let status = &source_nat_pool_statuses(&standby)[0];
+    assert_eq!(
+        status.persistent_leases, 1,
+        "the standby must reconstruct the persistence binding from the session it \
+         imported. 0 means a failover hands this client a different public ADDRESS, \
+         which under `port no-translation` is the whole of what persistent-NAT \
+         promises (#8132)"
+    );
+    assert_eq!(
+        status.live_flows, 1,
+        "the imported session must still hold its own reverse-identity token"
+    );
+    assert_persistent_expiry_indexes_consistent_address_only_8132(&standby[0]);
+}
+
+/// THE ACCEPTANCE PROPERTY, and the one the issue measured:
+///
+/// ```text
+/// ACTIVE   addr=203.0.113.2  persistent_leases=1
+/// STANDBY  after import      persistent_leases=0
+/// STANDBY  new flow          addr=203.0.113.4   SAME=false
+/// ```
+#[test]
+fn an_address_only_client_keeps_its_public_address_after_failover_8132() {
+    let active = ha_address_only_rules_8132(false);
+    let before = expect_address_only_decision(tuple_snat_lookup(&active, 12345, "8.8.8.8", 53, 1));
+
+    let standby = ha_address_only_rules_8132(false);
+    import_synced_address_only_8132(&standby, 12345, "8.8.8.8", 53, &before, 1);
+    decoy_flows_8132(&standby, 2);
+
+    // Promoted. The client returns, to a DIFFERENT remote as it would.
+    let after = expect_address_only_decision(tuple_snat_lookup(&standby, 12345, "1.1.1.1", 443, 3));
+    assert_eq!(
+        after.rewrite_src, before.rewrite_src,
+        "the client's public ADDRESS must survive the failover. There is no \
+         translated port on this path to fall back on — the address is the \
+         binding, and a changed address is a changed identity to every server \
+         the client is talking to"
+    );
+}
+
+/// THE CONTROL FOR THE FIXTURE'S OTHER HALF: the same cell under
+/// `address-persistent`, where `sticky_pool_index` is a pure function of
+/// `(src_ip, pool_len)` and both nodes recompute the same slot.
+///
+/// It passes on the UNFIXED code, which is the point. Without this, "we used a
+/// multi-address pool with address-persistent off" is a claim about the fixture
+/// rather than a measured property of it — and a later edit flipping that flag
+/// would silently turn the cell above into a no-op.
+#[test]
+fn the_address_assertion_is_vacuous_under_address_persistent_8132() {
+    let active = ha_address_only_rules_8132(true);
+    let before = expect_address_only_decision(tuple_snat_lookup(&active, 12345, "8.8.8.8", 53, 1));
+
+    // A standby that imported NOTHING for this client — the pre-#8132 state,
+    // exactly. The five decoys DO each mint a lease (persistent NAT binds an
+    // internal transport address, so five source ports are five keys); naming
+    // that number is what makes the absence of a SIXTH the assertion. A lease
+    // for our client would put it at 6.
+    let standby = ha_address_only_rules_8132(true);
+    decoy_flows_8132(&standby, 2);
+    assert_eq!(
+        source_nat_pool_statuses(&standby)[0].persistent_leases,
+        5,
+        "fixture: exactly the five decoys' leases and nothing for our client, so \
+         anything the two nodes agree on below comes from the hash and not from \
+         persistence"
+    );
+
+    let after = expect_address_only_decision(tuple_snat_lookup(&standby, 12345, "1.1.1.1", 443, 3));
+    assert_eq!(
+        after.rewrite_src, before.rewrite_src,
+        "with `address-persistent` ON the two nodes agree WITHOUT any lease, so an \
+         address assertion under that flag measures the hash. This is why the cell \
+         above turns it off"
+    );
+}
+
+/// The refcount SYMMETRY. A lease whose `active_flows` never reaches zero is
+/// never idle, so it never enters `lease_expirations` and no GC path can
+/// reclaim it — an address pinned forever for a client that left.
+///
+/// FAIL-ON-REVERT: mint the lease without joining it to the flow (drop the
+/// `persistent_key` from the `LiveAllocation`) and the release cannot find the
+/// lease to decrement, so it sits at `active_flows = 2` forever with no flow
+/// alive.
+///
+/// That mutation ESCAPED the first version of this cell, and the escape is the
+/// interesting part: `persistent_leases` is 1 and `live_flows` is 0 either way,
+/// and the expiry-index invariant is SATISFIED by the leak — a lease with a
+/// bogus refcount looks ACTIVE, and an active lease is correctly absent from
+/// the idle index. Consistency between the two indexes cannot see a lease that
+/// lies about being in use, so the refcount has to be read directly.
+#[test]
+fn releasing_every_synced_address_only_flow_makes_the_lease_idle_8132() {
+    let active = ha_address_only_rules_8132(false);
+    let a1 = expect_address_only_decision(tuple_snat_lookup(&active, 12345, "8.8.8.8", 53, 1));
+    let a2 = expect_address_only_decision(tuple_snat_lookup(&active, 12345, "1.1.1.1", 443, 2));
+    assert_eq!(
+        a1.rewrite_src, a2.rewrite_src,
+        "fixture: both sessions must share ONE lease on the active, or the standby \
+         is not being asked to join anything"
+    );
+
+    let standby = ha_address_only_rules_8132(false);
+    import_synced_address_only_8132(&standby, 12345, "8.8.8.8", 53, &a1, 1);
+    import_synced_address_only_8132(&standby, 12345, "1.1.1.1", 443, &a2, 2);
+    let statuses = source_nat_pool_statuses(&standby);
+    assert_eq!(
+        statuses[0].live_flows, 2,
+        "both sessions must have imported"
+    );
+    assert_eq!(
+        statuses[0].persistent_leases, 1,
+        "the two sessions share ONE lease, not two"
+    );
+
+    for (dst, dport, decision) in [("8.8.8.8", 53u16, &a1), ("1.1.1.1", 443u16, &a2)] {
+        release_source_nat_allocation(
+            &InterfaceNatAllocators::default(),
+            &standby,
+            &session_key(12345, dst, dport),
+            NatDecision {
+                rewrite_src: decision.rewrite_src,
+                rewrite_src_port: decision.rewrite_src_port,
+                ..NatDecision::default()
+            },
+            false,
+            3,
+        );
+    }
+
+    let statuses = source_nat_pool_statuses(&standby);
+    assert_eq!(
+        statuses[0].live_flows, 0,
+        "both synced flows must have released"
+    );
+    assert_eq!(
+        statuses[0].persistent_leases, 1,
+        "the lease outlives its flows for the persistence timeout"
+    );
+    {
+        let live = standby[0].pool_allocator.debug_live();
+        let lease = live
+            .persistent_by_source
+            .values()
+            .next()
+            .copied()
+            .expect("the one lease");
+        assert_eq!(
+            lease.active_flows, 0,
+            "the lease must have DROPPED both refcounts. A lease whose count never \
+             reaches zero is never idle, so it never enters `lease_expirations` and \
+             no GC path can reclaim it — a public address pinned forever for a \
+             client that left"
+        );
+        assert_eq!(
+            live.lease_expirations.len(),
+            1,
+            "an idle lease must be in the expiry index, which is what makes it \
+             reclaimable"
+        );
+    }
+    assert_persistent_expiry_indexes_consistent_address_only_8132(&standby[0]);
+}
+
+/// A synced flow joining an IDLE lease must take it OUT of the idle-expiry
+/// index. Reached the ordinary way: the client pauses (its flows release, the
+/// lease goes idle and is indexed), then resumes.
+///
+/// What it costs if wrong: a lease in the idle index while it has a LIVE flow
+/// is GC-eligible, so the reaper can reclaim the binding the flow is still
+/// forwarding through.
+#[test]
+fn a_synced_address_only_flow_rejoining_an_idle_lease_leaves_the_expiry_index_8132() {
+    let active = ha_address_only_rules_8132(false);
+    let first = expect_address_only_decision(tuple_snat_lookup(&active, 12345, "8.8.8.8", 53, 1));
+
+    let standby = ha_address_only_rules_8132(false);
+    import_synced_address_only_8132(&standby, 12345, "8.8.8.8", 53, &first, 1);
+    release_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &standby,
+        &session_key(12345, "8.8.8.8", 53),
+        NatDecision {
+            rewrite_src: first.rewrite_src,
+            rewrite_src_port: first.rewrite_src_port,
+            ..NatDecision::default()
+        },
+        false,
+        2,
+    );
+    {
+        let live = standby[0].pool_allocator.debug_live();
+        assert_eq!(
+            live.lease_expirations.len(),
+            1,
+            "fixture: the lease must be IDLE and indexed here, or the cell never \
+             reaches the branch it exists to bind"
+        );
+    }
+
+    let resumed =
+        expect_address_only_decision(tuple_snat_lookup(&active, 12345, "1.1.1.1", 443, 3));
+    import_synced_address_only_8132(&standby, 12345, "1.1.1.1", 443, &resumed, 3);
+
+    let live = standby[0].pool_allocator.debug_live();
+    assert!(
+        live.lease_expirations.is_empty(),
+        "a lease with a live flow must NOT sit in the idle-expiry index — the GC \
+         reaps from that index. Present: {:?}",
+        live.lease_expirations
+    );
+    drop(live);
+    assert_persistent_expiry_indexes_consistent_address_only_8132(&standby[0]);
+}
+
+/// The drift REFUSAL. A lease already naming a DIFFERENT address than the wire
+/// does is config drift or a stale import; the reservation is refused rather
+/// than retargeted, the same "never steal" posture as the occupancy CAS.
+///
+/// FAIL-ON-REVERT: delete the drift check and the second import succeeds, so
+/// `live_flows` reaches 2 and one lease claims to pin an address that one of
+/// its own flows is not using.
+#[test]
+fn a_synced_address_only_import_conflicting_with_an_existing_lease_is_refused_8132() {
+    let active = ha_address_only_rules_8132(false);
+    let first = expect_address_only_decision(tuple_snat_lookup(&active, 12345, "8.8.8.8", 53, 1));
+
+    let standby = ha_address_only_rules_8132(false);
+    import_synced_address_only_8132(&standby, 12345, "8.8.8.8", 53, &first, 1);
+
+    // A second session for the SAME source (`permit-any-remote-host`, so one
+    // key) arrives naming a DIFFERENT pool address than the lease holds.
+    let drifted = pool_address_other_than_8132(&first.rewrite_src.expect("address-only decision"));
+    import_synced_address_only_8132(
+        &standby,
+        12345,
+        "1.1.1.1",
+        443,
+        &NatDecision {
+            rewrite_src: Some(drifted),
+            rewrite_src_port: None,
+            ..NatDecision::default()
+        },
+        2,
+    );
+
+    let statuses = source_nat_pool_statuses(&standby);
+    assert_eq!(
+        statuses[0].live_flows, 1,
+        "the drifting import must be REFUSED, not retargeted: accepting it puts two \
+         of one source's flows on two different public addresses while the lease \
+         claims to pin one"
+    );
+    assert_eq!(statuses[0].persistent_leases, 1, "the lease is unchanged");
+    assert_persistent_expiry_indexes_consistent_address_only_8132(&standby[0]);
+}
+
+// --- #8132: a rolled-back activation must not DESTROY the lease it joined ----
+//
+// Found while writing the join above, measured rather than reasoned, and it
+// needs BOTH #7360/#8132 and #8121 present — which is why it went unnoticed
+// when each landed on its own.
+//
+// `rollback_flow` decides whether an activation CREATED the lease by asking two
+// recorded facts: has this lease ever seen a flow complete
+// (`activation_saw_completion`), and did the activation record a previous state
+// to restore (`activation_had_previous_lease`). Both false means "this lease
+// did not exist before this flow", so rollback deletes it — and on the
+// port-bearing arm frees the pool port with it.
+//
+// The LOCAL reuse path sets those fields on the 0 -> 1 active-flow edge. Both
+// SYNCED joins omitted it. For a lease that went idle the ORDINARY way that is
+// harmless: its flows completed, so `activation_saw_completion` is already
+// true. #8121's `import_idle_lease` installs a lease that has completed
+// NOTHING, and that is the shape where the omission bites.
+//
+// Both cells below are FAIL-ON-REVERT: drop the three-line bookkeeping in
+// either join and the imported lease is gone after the rollback.
+
+/// Build an idle lease on one node, export it, and install it on another
+/// through #8121's real import — the only producer of a lease that has
+/// completed nothing.
+fn import_an_idle_lease_8132(
+    active: &[SourceNatRule],
+    standby: &[SourceNatRule],
+    decision: &NatDecision,
+    pool: &[&str],
+) {
+    release_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        active,
+        &session_key(12345, "8.8.8.8", 53),
+        NatDecision {
+            rewrite_src: decision.rewrite_src,
+            rewrite_src_port: decision.rewrite_src_port,
+            ..NatDecision::default()
+        },
+        false,
+        2,
+    );
+    let exported = active[0].pool_allocator.export_idle_leases(3);
+    assert_eq!(
+        exported.len(),
+        1,
+        "fixture: the active must hold exactly one IDLE lease to export"
+    );
+    let addresses: Vec<IpAddr> = pool
+        .iter()
+        .map(|a| a.parse().expect("pool address"))
+        .collect();
+    assert_eq!(
+        standby[0]
+            .pool_allocator
+            .import_idle_lease(&exported[0], &addresses, 3),
+        IdleLeaseImport::Installed,
+        "fixture: the idle lease must actually install, or the cell measures nothing"
+    );
+}
+
+/// Assert the lease survived the rollback AND was restored to the state it was
+/// in before the activation: idle, and back in the expiry index that makes it
+/// reclaimable.
+///
+/// Surviving is not enough on its own. A lease left ACTIVE by a rolled-back
+/// flow never becomes idle again, so it never enters the expiry index and no GC
+/// path reclaims it — a public identity pinned forever, which is the same end
+/// state the deletion was hiding, reached from the other side.
+fn assert_idle_lease_restored_8132(rule: &SourceNatRule, expected_expiry: u64) {
+    let live = rule.pool_allocator.debug_live();
+    assert_eq!(
+        live.persistent_by_source.len(),
+        1,
+        "the imported idle lease must SURVIVE a rolled-back activation. Deleting it \
+         discards state the peer sent and, on the port-bearing arm, frees the pool \
+         port the lease was holding"
+    );
+    let lease = *live
+        .persistent_by_source
+        .values()
+        .next()
+        .expect("the one lease");
+    assert_eq!(
+        lease.active_flows, 0,
+        "the rolled-back flow must have given its refcount back"
+    );
+    assert_eq!(
+        lease.expires_at_ns, expected_expiry,
+        "the lease's expiry must be RESTORED to what it was before the activation, \
+         not re-armed from the local clock — a rolled-back flow never ran, so it has \
+         no claim to extend the window"
+    );
+    assert_eq!(
+        live.lease_expirations.len(),
+        1,
+        "an idle lease must be back in the expiry index, or nothing can reclaim it"
+    );
+}
+
+/// The ADDRESS-ONLY arm (#8132's own join).
+#[test]
+fn a_rolled_back_address_only_flow_leaves_an_imported_idle_lease_intact_8132() {
+    let active = ha_address_only_rules_8132(false);
+    let first = expect_address_only_decision(tuple_snat_lookup(&active, 12345, "8.8.8.8", 53, 1));
+
+    let standby = ha_address_only_rules_8132(false);
+    let pool = ["203.0.113.2", "203.0.113.3", "203.0.113.4", "203.0.113.5"];
+    import_an_idle_lease_8132(&active, &standby, &first, &pool);
+    let expiry_before = standby[0]
+        .pool_allocator
+        .debug_live()
+        .persistent_by_source
+        .values()
+        .next()
+        .expect("the imported lease")
+        .expires_at_ns;
+
+    // A synced flow for the same source joins the idle lease...
+    import_synced_address_only_8132(&standby, 12345, "1.1.1.1", 443, &first, 4);
+    assert_eq!(
+        source_nat_pool_statuses(&standby)[0].live_flows,
+        1,
+        "fixture: the flow must have joined, or there is no activation to roll back"
+    );
+
+    // ...and the coordinator then finds a PEER owns the identity (#8115) and
+    // withdraws it. That is a rollback, not a release: the flow never shipped.
+    standby[0].pool_allocator.rollback_flow(
+        flow_key_8132("1.1.1.1", 443),
+        TranslatedTuple {
+            ip: first.rewrite_src.expect("address-only decision"),
+            port: 12345,
+        },
+        5,
+        NatHolder::Untracked,
+    );
+
+    assert_idle_lease_restored_8132(&standby[0], expiry_before);
+    assert_persistent_expiry_indexes_consistent_address_only_8132(&standby[0]);
+}
+
+/// The PORT-BEARING arm (#7360's join), which has the identical omission and
+/// one extra consequence: `rollback_flow`'s delete branch also FREES the pool
+/// port, so the standby hands that port to another client while the peer still
+/// believes the lease holds it.
+#[test]
+fn a_rolled_back_pat_flow_leaves_an_imported_idle_lease_intact_8132() {
+    let active = ha_persistent_rules_7360(false);
+    let first = expect_snat_decision(tuple_snat_lookup(&active, 12345, "8.8.8.8", 53, 1));
+
+    let standby = ha_persistent_rules_7360(false);
+    let pool = [
+        "203.0.113.10",
+        "203.0.113.11",
+        "203.0.113.12",
+        "203.0.113.13",
+    ];
+    import_an_idle_lease_8132(&active, &standby, &first, &pool);
+    let expiry_before = standby[0]
+        .pool_allocator
+        .debug_live()
+        .persistent_by_source
+        .values()
+        .next()
+        .expect("the imported lease")
+        .expires_at_ns;
+
+    import_synced_7360(&standby, 12345, "1.1.1.1", 443, &first, 4);
+    assert_eq!(
+        source_nat_pool_statuses(&standby)[0].live_flows,
+        1,
+        "fixture: the flow must have joined, or there is no activation to roll back"
+    );
+
+    let translated = TranslatedTuple {
+        ip: first.rewrite_src.expect("pool decision"),
+        port: first.rewrite_src_port.expect("port-bearing decision"),
+    };
+    standby[0].pool_allocator.rollback_flow(
+        flow_key_8132("1.1.1.1", 443),
+        translated,
+        5,
+        NatHolder::Untracked,
+    );
+
+    assert_idle_lease_restored_8132(&standby[0], expiry_before);
+    let lease_addr_index = standby[0]
+        .pool_allocator
+        .debug_live()
+        .persistent_by_source
+        .values()
+        .next()
+        .expect("the surviving lease")
+        .addr_index;
+    assert!(
+        standby[0]
+            .pool_allocator
+            .debug_is_port_occupied(lease_addr_index, translated.port),
+        "the surviving lease must still OWN its pool port. The delete branch frees \
+         it, which is how a deleted lease becomes a port handed to two clients while \
+         the peer still believes the lease holds it"
+    );
+    assert_persistent_expiry_indexes_consistent(&standby[0]);
+}
+
+/// The flow key a synced import for our client installs, as `rollback_flow`
+/// addresses it.
+fn flow_key_8132(dst_ip: &str, dst_port: u16) -> SourceNatFlowKey {
+    SourceNatFlowKey {
+        protocol: 6,
+        src_ip: "10.0.1.100".parse().expect("src"),
+        dst_ip: dst_ip.parse().expect("dst"),
+        src_port: 12345,
+        dst_port,
+    }
+}
+
+/// Any pool address that is not `held`.
+fn pool_address_other_than_8132(held: &IpAddr) -> IpAddr {
+    ["203.0.113.2", "203.0.113.3", "203.0.113.4", "203.0.113.5"]
+        .iter()
+        .map(|a| a.parse::<IpAddr>().expect("pool address"))
+        .find(|a| a != held)
+        .expect("a 4-address pool has another address")
+}
+
+/// The expiry-index invariant, for ADDRESS-ONLY leases.
+///
+/// `assert_persistent_expiry_indexes_consistent` cannot be reused: it asserts
+/// `debug_is_port_occupied(lease.addr_index, lease.translated.port)`, and an
+/// address-only lease claims NO port bit. That assertion is correct for the PAT
+/// leases it was written for and would fire on every lease here, so this is the
+/// same invariant with the port clause dropped — the two index structures agree,
+/// and membership is exactly the idle leases.
+fn assert_persistent_expiry_indexes_consistent_address_only_8132(rule: &SourceNatRule) {
+    let live = rule.pool_allocator.debug_live();
+    let mut expected_global = BTreeSet::new();
+    let mut expected_by_addr = vec![BTreeSet::new(); live.lease_expirations_by_addr.len()];
+
+    for (key, lease) in &live.persistent_by_source {
+        assert!(
+            lease.address_only,
+            "fixture: every lease on this rule must be address-only"
+        );
+        assert!(
+            lease.addr_index < expected_by_addr.len(),
+            "persistent lease addr index {} out of range {}",
+            lease.addr_index,
+            expected_by_addr.len()
+        );
+        assert_eq!(
+            pool_ip_for_addr_index(rule, lease.addr_index),
+            Some(lease.translated.ip),
+            "the lease's addr_index must name the address it pins — the idle-expiry \
+             index is keyed on it, so a wrong index files the lease under another \
+             address and the per-address sweep never reaps it"
+        );
+        if lease.active_flows == 0 {
+            let entry = (lease.expires_at_ns, *key);
+            expected_global.insert(entry);
+            expected_by_addr[lease.addr_index].insert(entry);
+        }
+    }
+
+    assert_eq!(
+        live.lease_expirations, expected_global,
+        "the global idle-expiry index must hold exactly the idle leases"
+    );
+    assert_eq!(
+        live.lease_expirations_by_addr, expected_by_addr,
+        "the per-address idle-expiry index must agree with the global one"
+    );
+}
 
 // ---------------------------------------------------------------------------
 // #7560: a partial-overlap pool change DROPS every persistent-NAT lease —
@@ -9759,3 +10401,4 @@ fn pool_snat_occupancy_counter_agrees_with_bitmap_7174_m13() {
         alloc.debug_occupied_count()
     );
 }
+
