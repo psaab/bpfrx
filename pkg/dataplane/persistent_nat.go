@@ -152,6 +152,44 @@ func (t *PersistentNATTable) GC() int {
 	return removed
 }
 
+// ReplaceAll makes the table a SNAPSHOT of bindings, atomically (#8607).
+//
+// WHY A REPLACE AND NOT A LOOP OF Save. Under the userspace dataplane this
+// table is not an accumulator that ages out — it is a copy of state the Rust
+// helper owns, and the helper is authoritative for both existence AND expiry.
+// Two things follow:
+//
+//   - Save would be wrong on the way in: it treats a repeat as a refresh and
+//     stamps LastSeen = time.Now(), which would reset every binding's remaining
+//     lifetime to the full timeout on every refresh and make the SHOW column
+//     count down from a value it never had.
+//   - GC would be wrong on the way out, and is unreachable anyway: it is called
+//     from the conntrack sweep, which daemon_run.go disables outright on this
+//     path (`gc.SkipSweep = func() bool { return true }`). A binding the helper
+//     has released must disappear because it is ABSENT from the next snapshot,
+//     not because a local timer expired it.
+//
+// Atomic because a renderer holds no lock across All(): a Clear followed by a
+// loop of Save has a window in which the table is empty or half-filled, and the
+// symptom of that window is the exact "No persistent NAT bindings" line #8607 is
+// about — reintroduced as a rare flake instead of a permanent state.
+//
+// A nil or empty slice empties the table, deliberately: "the helper has no
+// bindings" is an answer, and the caller is responsible for not calling this
+// when it could not ASK (see the daemon refresher, which skips on error).
+func (t *PersistentNATTable) ReplaceAll(bindings []*PersistentNATBinding) {
+	next := make(map[persistentNATKey]*PersistentNATBinding, len(bindings))
+	for _, b := range bindings {
+		if b == nil {
+			continue
+		}
+		next[persistentNATKey{SrcIP: b.SrcIP, SrcPort: b.SrcPort, Pool: b.PoolName}] = b
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.bindings = next
+}
+
 // Clear removes all bindings.
 func (t *PersistentNATTable) Clear() {
 	t.mu.Lock()
