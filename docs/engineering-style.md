@@ -1496,6 +1496,31 @@ they repeatedly bite:
   PASSed and `git diff --exit-code pkg/dataplane/userspace_xdp_bpfel.o`
   is clean after a pinned re-run. Recovery from a bad artifact:
   `git checkout -- pkg/dataplane/userspace_xdp_bpfel.o && make build`.
+- **The shim has TWO budgets, and BPF's five-argument call limit is a
+  design constraint on both (#8249).** Processed instructions are the one
+  every gate here measures; the other is **512 bytes of stack COMBINED
+  across a call path**, pinned by
+  `pkg/dataplane/shim_stack_margin_8249_test.go`. The lever for the stack
+  budget is usually OUTLINING work out of the entry program rather than the
+  scratch maps CLAUDE.md suggests — check what the frame is made of first,
+  because the shim's was over half register spills with no large named
+  object to move.
+
+  Outlining runs into the limit immediately: **a bpf-to-bpf call takes at
+  most FIVE arguments**, and the useful helper almost always wants six. It
+  has been rediscovered three times. **Do not pack two values into a wider
+  word to get under it** — #5173 exists because nothing rejects a REDUCTION
+  of the interface coordinate by type, and a pack/unpack pair is a new site
+  for exactly that. Move a cheap scalar out of the call instead (#8625
+  stores `pkt_len` after the call rather than passing it, so both
+  coordinates still travel as bare u32s).
+
+  And **sharing duplicated code between subprograms is not generically
+  profitable here.** Sharing an inner map lookup between the two GRE
+  classifiers saved 23,181 instructions; sharing the port-parse beside it
+  the same way COST 6,652, because passing a `&mut` to a stack struct
+  through the call verifies worse than the duplicated inline code. Measure
+  each one — the sign is not predictable from the shape.
 - **Before claiming a CoS admission-path PR moves a metric, read the
   counters.** `show class-of-service interface` surfaces `flow_share`,
   `buffer`, and `ecn_marked` drop counts per queue since #724. See

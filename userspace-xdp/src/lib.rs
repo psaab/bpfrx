@@ -988,6 +988,15 @@ fn write_userspace_meta(
     }
 }
 
+/// #8249: the inner-session lookup, shared by the v4 and v6 GRE classifiers.
+///
+/// Both built an identical 40-byte `UserspaceSessionKey` and read the SAME map
+/// inline, so the verifier explored the key construction and the map read twice.
+#[inline(never)]
+fn session_action_for_key(key: &UserspaceSessionKey) -> u8 {
+    unsafe { USERSPACE_SESSIONS.get(key).copied() }.unwrap_or(0)
+}
+
 fn classify_native_gre_inner(data: usize, data_end: usize, outer: &ParsedPacket) -> u8 {
     let gre_offset = outer.l4_offset as usize;
     let Some(gre) = (unsafe { read_bytes(data, data_end, gre_offset, 4) }) else {
@@ -1041,7 +1050,6 @@ fn classify_native_gre_inner_ipv4(data: usize, data_end: usize, l3_offset: usize
     let Some(l4_offset) = l3_offset.checked_add(ihl) else {
         return 0;
     };
-    let mut icmp_type = 0u8;
     match protocol {
         PROTO_TCP => {
             let Some(tcp) = (unsafe { read_bytes(data, data_end, l4_offset, 14) }) else {
@@ -1062,11 +1070,10 @@ fn classify_native_gre_inner_ipv4(data: usize, data_end: usize, l3_offset: usize
                 return 0;
             };
             key.src_port = u16::from_be_bytes([icmp[4], icmp[5]]);
-            icmp_type = icmp[0];
         }
         _ => {}
     }
-    let action = unsafe { USERSPACE_SESSIONS.get(&key).copied() }.unwrap_or(0);
+    let action = session_action_for_key(&key);
     if action != 0 {
         return action;
     }
@@ -1086,12 +1093,6 @@ fn classify_native_gre_inner_ipv4(data: usize, data_end: usize, l3_offset: usize
     // tunnel-local/control-plane address, passing the outer GRE packet to the
     // kernel no longer works once the kernel GRE device has been replaced by a
     // logical anchor. Keep these packets on the userspace dataplane instead.
-    if protocol == PROTO_ICMP
-        && icmp_type == 8
-        && unsafe { USERSPACE_INTERFACE_NAT_V4.get(&dst_v4) }.is_some()
-    {
-        return USERSPACE_SESSION_ACTION_REDIRECT;
-    }
     if unsafe { USERSPACE_INTERFACE_NAT_V4.get(&dst_v4) }.is_some() {
         return USERSPACE_SESSION_ACTION_REDIRECT;
     }
@@ -1188,7 +1189,6 @@ fn classify_native_gre_inner_ipv6(data: usize, data_end: usize, l3_offset: usize
     let Some(l4_offset) = l3_offset.checked_add(40) else {
         return 0;
     };
-    let mut icmp_type = 0u8;
     match protocol {
         PROTO_TCP => {
             let Some(tcp) = (unsafe { read_bytes(data, data_end, l4_offset, 14) }) else {
@@ -1209,11 +1209,10 @@ fn classify_native_gre_inner_ipv6(data: usize, data_end: usize, l3_offset: usize
                 return 0;
             };
             key.src_port = u16::from_be_bytes([icmp[4], icmp[5]]);
-            icmp_type = icmp[0];
         }
         _ => {}
     }
-    let action = unsafe { USERSPACE_SESSIONS.get(&key).copied() }.unwrap_or(0);
+    let action = session_action_for_key(&key);
     if action != 0 {
         return action;
     }
@@ -1229,12 +1228,6 @@ fn classify_native_gre_inner_ipv6(data: usize, data_end: usize, l3_offset: usize
         key.dst_port
     };
     if dnat_lookup_v6(protocol, &key.dst_addr, dnat_port).is_some() {
-        return USERSPACE_SESSION_ACTION_REDIRECT;
-    }
-    if protocol == PROTO_ICMPV6
-        && icmp_type == 128
-        && unsafe { USERSPACE_INTERFACE_NAT_V6.get(&dst_key) }.is_some()
-    {
         return USERSPACE_SESSION_ACTION_REDIRECT;
     }
     if unsafe { USERSPACE_INTERFACE_NAT_V6.get(&dst_key) }.is_some() {
