@@ -4697,6 +4697,125 @@ mod routing_domain_delete_7160 {
         }))
     }
 
+    /// #8636: two tenants holding the SAME 5-tuple in DIFFERENT routing
+    /// instances — the normal case, since routing instances exist to carry
+    /// overlapping address space.
+    fn state_holding_the_same_tuple_in(domains: &[u32]) -> Arc<Mutex<ServerState>> {
+        let mut afxdp = afxdp::Coordinator::new();
+        for (idx, rd) in domains.iter().enumerate() {
+            afxdp.seed_routing_domain_for_test(24 + idx as i32, *rd);
+        }
+        for rd in domains {
+            let entry = crate::server::helpers::build_synced_session_entry(
+                &upsert_request(),
+                afxdp.zone_name_to_id_ref(),
+                *rd,
+            )
+            .expect("build the synced entry");
+            afxdp.upsert_synced_session(entry);
+        }
+        // TWO map entries per session: the forward key and its reverse
+        // companion (the dual-entry design). Asserting the doubled count rather
+        // than relaxing to `> 0` keeps the setup check able to notice a domain
+        // that silently failed to install.
+        assert_eq!(
+            afxdp.synced_session_entry_count_for_test(),
+            domains.len() * 2,
+            "setup: each domain must hold its own forward+reverse copy of the \
+             tuple, or the ambiguity this cell is about does not exist"
+        );
+        Arc::new(Mutex::new(ServerState {
+            status: ProcessStatus::default(),
+            snapshot: None,
+            afxdp,
+            state_writer: Arc::new(StateWriter::new()),
+        }))
+    }
+
+    /// #8636 THE ANTI-OVER-REFUSE CONTROL, and it is the cell that decides
+    /// whether the change is safe rather than merely careful.
+    ///
+    /// Refusing is the NEW behaviour, so the risk is that it fires on ordinary
+    /// deletes and turns every policy invalidation into a session leak. When
+    /// exactly one routing instance holds the tuple, the bare 5-tuple names it
+    /// unambiguously and it must still be deleted — and deleted through the
+    /// SCOPED key, which is strictly better than the old fan-out because it
+    /// touches no other domain.
+    ///
+    /// Without this cell, "always refuse" passes the ambiguity cell below.
+    #[test]
+    fn an_unambiguous_bare_tuple_delete_still_removes_the_session_8636() {
+        let state = state_holding_a_session_in(DOMAIN);
+        // forward + reverse companion
+        assert_eq!(synced_key_count(&state), 2, "setup");
+
+        let response = run_request(state.clone(), bare_five_tuple_delete());
+        assert!(
+            response.ok,
+            "a delete naming exactly one routing instance must succeed; got {:?}",
+            response.error
+        );
+        assert_eq!(
+            synced_key_count(&state),
+            0,
+            "the session lives in exactly ONE routing instance, so the bare \
+             5-tuple names it unambiguously and it must still be removed — the \
+             #7160 guarantee that a clear the operator was told succeeded \
+             actually revoked the session"
+        );
+    }
+
+    /// #8636 THE FEATURE. The same 5-tuple live in two routing instances is
+    /// two tenants, and nothing in a bare-5-tuple delete says which one is
+    /// meant. Deleting in every domain — what this replaces — tore down the
+    /// other tenant's live session.
+    ///
+    /// FAIL-ON-REVERT: restore the `for rd in view.routing_domains()` delete
+    /// loop and both sessions disappear, reddening the count assertion.
+    #[test]
+    fn an_ambiguous_bare_tuple_delete_is_refused_and_touches_nothing_8636() {
+        let state = state_holding_the_same_tuple_in(&[100_007, 100_008]);
+        // two tenants x (forward + reverse companion)
+        assert_eq!(synced_key_count(&state), 4, "setup");
+
+        let response = run_request(state.clone(), bare_five_tuple_delete());
+        assert!(
+            !response.ok,
+            "a delete whose 5-tuple matches live sessions in TWO routing \
+             instances cannot be resolved from the request, and guessing tears \
+             down another tenant's session"
+        );
+        assert!(
+            response.error.contains("ambiguous-routing-domain"),
+            "the refusal needs its own stable token so an operator can tell a \
+             cross-tenant guard firing from an import problem or a transport \
+             failure; got {:?}",
+            response.error
+        );
+        assert_eq!(
+            synced_key_count(&state),
+            4,
+            "a refused delete must touch NEITHER tenant. Removing even the \
+             'right' one on a guess is the defect — the request does not say \
+             which is right"
+        );
+    }
+
+    /// #8636: a tuple in NO routing instance is unchanged — the exact delete
+    /// above it was the whole job. Guards against the probe loop turning a
+    /// plain miss into a refusal.
+    #[test]
+    fn a_bare_tuple_delete_matching_no_instance_still_succeeds_8636() {
+        let state = state_holding_a_session_in(0);
+        let response = run_request(state.clone(), bare_five_tuple_delete());
+        assert!(
+            response.ok,
+            "no routing-instance copy exists, so there is nothing to \
+             disambiguate and nothing to refuse; got {:?}",
+            response.error
+        );
+    }
+
     fn synced_key_count(state: &Arc<Mutex<ServerState>>) -> usize {
         state
             .lock()
