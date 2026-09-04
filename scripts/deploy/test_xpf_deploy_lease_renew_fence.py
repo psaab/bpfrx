@@ -471,7 +471,11 @@ def _image_args():
         manifest="xpf-2.0.0-newimage.manifest",
         sha256sums=None, sig=None, pubkey=None,
         lease_ttl=1800, drain_deadline=120, boot_deadline=40,
-        allow_session_drop=False)
+        allow_session_drop=False,
+        # #7559: this suite drives the lease fence, and the ssh backend does
+        # not request the daemon hold, so the roll behaves exactly as it did
+        # before the hold existed.
+        require_daemon_hold=False)
 
 
 class ImageRollFenceAbortTests(unittest.TestCase):

@@ -1280,6 +1280,47 @@ dedup — forward keys first, then not-yet-seen reverse keys in first-seen
 order — only the membership data structure changed. `ha_tests.rs` pins the
 order/dedup contract and a large-N (N=M=200k) linear-time guard.
 
+## The reverse-prewarm index removes by KEY, never by a recomputed bucket (#7209)
+
+`reverse_prewarm_sessions` is the one owner-RG index whose buckets are not
+all carried on the entry. `reverse_prewarm_owner_rg_candidates` files a
+synced session under two RGs: the one its own `metadata.owner_rg_id` names
+(carried, so it cannot drift) and the one that owns the egress interface a
+reply to `key.src_ip` would leave by — read out of the FIB, and therefore a
+property of *when* the question is asked. Its three siblings
+(`sessions`, `nat_sessions`, `forward_wire_sessions`) are maintained from
+`metadata.owner_rg_id` alone and are symmetric by construction.
+
+`refresh_reverse_prewarm_owner_rg_indexes` used to recompute the PREVIOUS
+entry's candidate set against the CURRENT forwarding in order to decide what
+to un-file. That is only the set the key was actually filed under while
+nothing has moved the route, and an entry's lifetime spans arbitrarily many
+commits. Re-home an interface between redundancy groups while a synced
+session is live and the recomputed set names a bucket the key is not in,
+while the bucket it *is* in is never named again by anything: the session is
+gone, so no later transition carries it, and the index is only READ — never
+rebuilt — by `prewarm_reverse_synced_sessions_for_owner_rgs`. The key is
+stranded for the life of the process, and every RG activation walks a set
+that only grows. That is the same failover critical path the #4069 dedup
+above exists to keep cheap.
+
+The removal therefore drops the key from EVERY bucket (`retain`, pruning any
+bucket it empties) instead of from a recomputed guess. Identical whenever
+the FIB did not move, correct when it did, allocation-free, and the walk is
+over the RGs that currently hold synced sessions — single digits on a real
+chassis cluster.
+
+This also matters for the *next* step of #7209. Taking `sync_session` off
+the snapshot-wide `ServerState` mutex lets a reconcile empty
+`Coordinator.forwarding` UNDERNEATH an import, which turns the divergent
+case from "a route moved between two commits" into the common one. Making
+the asymmetry structurally impossible is a prerequisite for that change
+rather than a consequence of it. `ha_tests.rs` pins three properties: the
+stranded key after a route move (the leak), that a delete does not evict a
+neighbouring session's key (the opposite failure, which is worse — a session
+missing from this index is one the newly-primary node does not pre-resolve),
+and that a REPLACE after a route move re-files rather than accumulates.
+
 ## Hot-path constants
 
 - `RX_BATCH_SIZE = 64`

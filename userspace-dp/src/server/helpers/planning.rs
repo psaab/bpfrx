@@ -378,19 +378,29 @@ pub(crate) fn userspace_unbindable_netdev(iface: &InterfaceSnapshot) -> bool {
     //
     // WHY, in the order the reasons can actually be established (#6691 round 8).
     //
-    // 1. IT COLLAPSES THE WHOLE BOX TO ONE QUEUE. This is the load-bearing
-    //    reason and it is provable right here. An xfrm interface has exactly
-    //    ONE RX queue — `ip -d link` reports `numrxqueues 1` and
-    //    `/sys/class/net/<if>/queues` holds a single `rx-0`, which is what both
-    //    `rx_queue_count` (below) and the Go `userspaceRXQueueCount` read — and
-    //    `replan_bindings_from_candidates` takes the GLOBAL MINIMUM queue count
-    //    across every candidate. So one zoned xfrmi drags every physical
-    //    interface on the box down to one queue and one worker: the #3091
-    //    ~6 Gbps single-worker regression, arriving through a different door
-    //    than the VLAN child that #3091 named.
-    //    `secure_tunnel_would_collapse_the_global_queue_count` (main_tests.rs)
-    //    is the fail-on-revert guard, and it asserts the QUEUE COUNT rather
-    //    than plan identity so the reason is visible in the failure.
+    // 1. IT BINDS A NETDEV THE DATAPLANE CANNOT TRANSMIT INTO. An xfrm
+    //    interface has exactly ONE RX queue — `ip -d link` reports
+    //    `numrxqueues 1` and `/sys/class/net/<if>/queues` holds a single
+    //    `rx-0`, which is what both `rx_queue_count` (below) and the Go
+    //    `userspaceRXQueueCount` read. Admitting it mints a binding on a
+    //    netdev that has no egress path back from this dataplane, and costs a
+    //    slot against MAX_BINDING_SLOTS.
+    //
+    //    BEFORE #7497 the harm was GLOBAL, and that is worth recording because
+    //    every cite of this exclusion used to lead with it:
+    //    `replan_bindings_from_candidates` took the MINIMUM queue count across
+    //    every candidate, so one zoned xfrmi dragged every physical interface
+    //    on the box down to one queue and one worker — the #3091 ~6 Gbps
+    //    single-worker regression through a different door than the VLAN child
+    //    #3091 named. Per-interface counts removed that amplification: the
+    //    tunnel now costs ONE binding, and no other interface's queue count
+    //    moves. `secure_tunnel_would_collapse_the_global_queue_count` asserted
+    //    the collapse and was retired with the change — the assertion had
+    //    become true with the exclusion deleted, so it guarded nothing. The
+    //    fail-on-revert guards are now the two plan-IDENTITY tests
+    //    (`secure_tunnel_adds_nothing_to_the_binding_plan`,
+    //    `binding_candidate_excludes_secure_tunnel`), both measured to fail
+    //    when this predicate stops refusing.
     //
     // 2. And it cannot be half-admitted. Keeping the xfrmi in the shim's
     //    ingress-adjudication map while withholding its binding is precisely
@@ -892,7 +902,8 @@ pub(crate) fn replan_bindings_from_candidates(
         return Vec::new();
     }
 
-    // #7497: `slot` is minted DENSELY below — a plain counter over
+    // #7497: `slot` is minted DENSELY below — a plain counter over the bindings
+    // that actually exist, i.e. `Σ min(rx_i, 16)` and NOT the product
     // `queue_count * interfaces.len()` — and indexes `userspace_heartbeat` and
     // `userspace_xsk_map`, which hold MAX_BINDING_SLOTS entries. Refuse a plan
     // that would mint a slot those maps cannot address.
@@ -902,13 +913,16 @@ pub(crate) fn replan_bindings_from_candidates(
     // operand can be large on a box whose product is safe, so bounding one
     // would refuse a configuration that binds cleanly.
     //
-    // Refusing the WHOLE plan is deliberate and matches the sibling. Note the
-    // minting order below is queue-MAJOR (`for queue_id { for iface {`), so
-    // `slot == queue_id * interfaces.len() + iface_index`. Truncating at the
-    // capacity would therefore not sacrifice some identifiable interface — it
-    // would strand the HIGHEST queue ids across EVERY interface at once, which
-    // is also why this refusal names counts rather than a culprit interface:
-    // there isn't one.
+    // Refusing the WHOLE plan is deliberate and matches the sibling. The
+    // minting order below is queue-MAJOR (`for queue_id { for iface {`) WITH a
+    // per-row skip, so a row holds only the interfaces that have that queue and
+    // `slot` is dense over a RAGGED set — it is NOT
+    // `queue_id * interfaces.len() + iface_index`, which was the formula while
+    // every interface contributed the same count. Truncating at the capacity
+    // would therefore not sacrifice some identifiable interface — it would
+    // strand the HIGHEST queue ids across every interface that reaches them,
+    // which is also why this refusal names counts rather than a culprit
+    // interface: there isn't one.
     //
     // And capping to the first MAX_BINDING_SLOTS bindings would leave those
     // queues unbound, and an unbound queue does not degrade throughput — the shim takes
