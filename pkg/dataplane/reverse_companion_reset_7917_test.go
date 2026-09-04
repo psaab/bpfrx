@@ -36,11 +36,34 @@ var companionResetFields = map[string]bool{
 	"FibVlanID":  true,
 	"FibDmac":    true,
 	"FibSmac":    true,
-	"FibGen":     true,
 	// Forward ingress — unobserved for the reply, in all three spellings.
 	"IngressIfindex":   true,
 	"IngressVlanID":    true,
 	"IngressIfaceFold": true,
+}
+
+// conditionallyUnobservedCompanionFields mirrors
+// `conditionallyNodeLocalSessionFields` (#8612): fields the reset clears only
+// while a LogFlags bit is CLEAR, and must leave untouched while it is SET.
+//
+// `FibGen` moved here from the list above in #8597 K74, and the move is the
+// interesting part of that row. #8612 established that under
+// LogFlagUserspaceTunnelEndpoint the field is not a FIB generation at all but a
+// `config.StableTunnelEndpointID` — an FNV-1a fold of the interface NAME that
+// pkg/config/tunnelid.go documents as crossing the cluster in this exact field,
+// identical on both nodes by construction. A name-derived identity is not an
+// OBSERVATION, so "the reverse direction has not observed this yet" does not
+// reach it.
+//
+// #8612 corrected `ScrubNodeLocal` and did NOT correct this reset, because
+// since #8015 the reset had no callers and nothing could make the staleness
+// observable. K74 added the first callers back, at the two `PutClusterSynced*`
+// explicit-reverse sites — and FibGen, unlike IngressIfaceFold, IS carried in
+// the on-map ABI (`bpf_session_value.go`), so wiring the reset as the finding
+// literally prescribed would have zeroed a live tunnel endpoint id on every
+// peer-installed reverse companion of a tunnelled session.
+var conditionallyUnobservedCompanionFields = map[string]uint64{
+	"FibGen": uint64(LogFlagUserspaceTunnelEndpoint),
 }
 
 func assertCompanionCensus(t *testing.T, before, after reflect.Value) {
@@ -51,6 +74,12 @@ func assertCompanionCensus(t *testing.T, before, after reflect.Value) {
 			"not run, and the two directional checks below would both pass vacuously")
 	}
 	for name := range companionResetFields {
+		if _, conditional := conditionallyUnobservedCompanionFields[name]; conditional {
+			t.Errorf("%s is declared BOTH unconditionally and conditionally "+
+				"unobserved; the two lists must not overlap or the directional "+
+				"checks below contradict each other (#8597 K74)", name)
+			continue
+		}
 		if !reset[name] {
 			t.Errorf("%s records something the REVERSE direction has not observed, "+
 				"but the companion inherited it from the forward session. That is a "+
@@ -59,6 +88,12 @@ func assertCompanionCensus(t *testing.T, before, after reflect.Value) {
 		}
 	}
 	for name := range reset {
+		if _, conditional := conditionallyUnobservedCompanionFields[name]; conditional {
+			// Judged by the flag-state cells below, not here: in this fixture
+			// the bit may be either way, so neither "cleared" nor "survived"
+			// is a violation on its own.
+			continue
+		}
 		if !companionResetFields[name] {
 			t.Errorf("the companion reset clears %s, which is not declared unobserved. "+
 				"Either it is and this list is stale, or the reset is destroying a "+
@@ -132,4 +167,101 @@ func TestCompanionResetAndNodeLocalScrubAreDifferentRules7917(t *testing.T) {
 			"above proves nothing about them being confusable — re-read whether " +
 			"either list is still describing what this test thinks it describes")
 	}
+
+	// #8597 K74. The two rules now AGREE about FibGen, and that agreement is
+	// not a collapse of the divergence above — they still part company on
+	// IngressIfaceFold, which is the field the divergence was always about.
+	// They agree here because #8612's argument is about what the VALUE IS (a
+	// name-derived identity, not a measurement), which is upstream of both
+	// questions: a value that is not an observation is neither node-local nor
+	// unobserved. If a future change makes one of them conditional on a
+	// different bit than the other, that is a real divergence and this fires.
+	if !reflect.DeepEqual(conditionallyUnobservedCompanionFields, conditionallyNodeLocalSessionFields) {
+		t.Errorf("the conditional lists disagree:\ncompanion=%v\nscrub=%v\n"+
+			"Both encode #8612's single fact — LogFlagUserspaceTunnelEndpoint says "+
+			"FibGen holds a cluster-stable tunnel endpoint id rather than a "+
+			"node-local FIB generation. One list learning a bit the other has not "+
+			"is how this went wrong the first time (#8597 K74)",
+			conditionallyUnobservedCompanionFields, conditionallyNodeLocalSessionFields)
+	}
+}
+
+// The arm the K74 correction is FOR, asserted in field terms rather than only
+// through the reflective census — the same shape as
+// TestScrubPreservesTheTunnelEndpointIdentity8612 one file over.
+func TestCompanionResetPreservesTheTunnelEndpointIdentity_8597(t *testing.T) {
+	t.Run("v4", func(t *testing.T) {
+		var val SessionValue
+		fillNonZero(t, reflect.ValueOf(&val).Elem())
+		val.LogFlags |= LogFlagUserspaceTunnelEndpoint
+		wantGen, wantFlags := val.FibGen, val.LogFlags
+		if wantGen == 0 {
+			t.Fatal("fixture must seed a non-zero FibGen or this cell is vacuous")
+		}
+		val.ResetUnobservedForReverseCompanion()
+		if val.FibGen != wantGen {
+			t.Errorf("the companion reset cleared the tunnel endpoint id to %#x, want "+
+				"%#x preserved. Under LogFlagUserspaceTunnelEndpoint the field is a "+
+				"StableTunnelEndpointID folded from the interface NAME, identical on "+
+				"both nodes and in both directions — config, not an observation the "+
+				"reply direction is missing (#8612 via #8597 K74)", val.FibGen, wantGen)
+		}
+		if val.LogFlags != wantFlags {
+			t.Errorf("LogFlags changed to %#x, want %#x — the reset must not edit the "+
+				"flag that describes a value it preserved (#8612)", val.LogFlags, wantFlags)
+		}
+		// The unconditional half must still happen, or "preserved" would just
+		// mean the reset did nothing.
+		if val.FibIfindex != 0 || val.IngressIfaceFold != 0 {
+			t.Errorf("FibIfindex=%d IngressIfaceFold=%d — both must still be cleared; "+
+				"a cell that only checks the preserved field passes a reset that was "+
+				"deleted outright (#7917)", val.FibIfindex, val.IngressIfaceFold)
+		}
+	})
+	t.Run("v6", func(t *testing.T) {
+		var val SessionValueV6
+		fillNonZero(t, reflect.ValueOf(&val).Elem())
+		val.LogFlags |= LogFlagUserspaceTunnelEndpoint
+		wantGen := val.FibGen
+		val.ResetUnobservedForReverseCompanion()
+		if val.FibGen != wantGen {
+			t.Errorf("v6 companion reset cleared the tunnel endpoint id to %#x, want "+
+				"%#x (#8597 K74)", val.FibGen, wantGen)
+		}
+		if val.FibIfindex != 0 || val.IngressIfaceFold != 0 {
+			t.Errorf("v6: FibIfindex=%d IngressIfaceFold=%d must still be cleared",
+				val.FibIfindex, val.IngressIfaceFold)
+		}
+	})
+}
+
+// The other arm. Without this, the reset could stop clearing FibGen ALTOGETHER
+// and the suite would stay green — a companion would then carry the forward
+// direction's FIB generation, which is the #7917 defect the conditional was
+// carved out of, not a fix to it.
+func TestCompanionResetZeroesFibGenWhenTheTunnelBitIsClear_8597(t *testing.T) {
+	t.Run("v4", func(t *testing.T) {
+		var val SessionValue
+		fillNonZero(t, reflect.ValueOf(&val).Elem())
+		val.LogFlags &^= LogFlagUserspaceTunnelEndpoint
+		if val.FibGen == 0 {
+			t.Fatal("fixture must seed a non-zero FibGen or this cell is vacuous")
+		}
+		val.ResetUnobservedForReverseCompanion()
+		if val.FibGen != 0 {
+			t.Errorf("FibGen survived as %#x with the tunnel bit CLEAR — in that "+
+				"state it is the forward direction's FIB generation, which the reply "+
+				"has not resolved (#7917)", val.FibGen)
+		}
+	})
+	t.Run("v6", func(t *testing.T) {
+		var val SessionValueV6
+		fillNonZero(t, reflect.ValueOf(&val).Elem())
+		val.LogFlags &^= LogFlagUserspaceTunnelEndpoint
+		val.ResetUnobservedForReverseCompanion()
+		if val.FibGen != 0 {
+			t.Errorf("v6 FibGen survived as %#x with the tunnel bit CLEAR (#7917)",
+				val.FibGen)
+		}
+	})
 }

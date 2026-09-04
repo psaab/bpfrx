@@ -3,6 +3,7 @@ package dataplane
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net/netip"
 	"time"
 
@@ -281,6 +282,17 @@ func (s dataPlaneSessionStore) PutClusterSyncedV4(key SessionKey, val SessionVal
 		revVal.ReverseKey = key
 		revVal.IngressZone = val.EgressZone
 		revVal.EgressZone = val.IngressZone
+		// #8597 K74. The companion inherits the FORWARD row's observations
+		// unless they are cleared, and the rule for which ones is single-sourced
+		// in session_reverse_companion.go — the same discipline #7097 imposed on
+		// the node-local list after four sites kept their own copies and all
+		// four went quietly incomplete in one change.
+		//
+		// The fallback below applies only ScrubNodeLocal, which deliberately
+		// PRESERVES IngressIfaceFold (it is cluster-stable by design), so
+		// without this the companion carried the forward direction's ingress
+		// binding — a confident value on a binding the reply has not made.
+		revVal.ResetUnobservedForReverseCompanion()
 		if err := s.putClusterSyncedV4Raw(val.ReverseKey, revVal); err != nil {
 			return errors.Join(err, s.rollbackV4(written))
 		}
@@ -337,6 +349,17 @@ func (s dataPlaneSessionStore) PutClusterSyncedV6(key SessionKeyV6, val SessionV
 		revVal.ReverseKey = key
 		revVal.IngressZone = val.EgressZone
 		revVal.EgressZone = val.IngressZone
+		// #8597 K74. The companion inherits the FORWARD row's observations
+		// unless they are cleared, and the rule for which ones is single-sourced
+		// in session_reverse_companion.go — the same discipline #7097 imposed on
+		// the node-local list after four sites kept their own copies and all
+		// four went quietly incomplete in one change.
+		//
+		// The fallback below applies only ScrubNodeLocal, which deliberately
+		// PRESERVES IngressIfaceFold (it is cluster-stable by design), so
+		// without this the companion carried the forward direction's ingress
+		// binding — a confident value on a binding the reply has not made.
+		revVal.ResetUnobservedForReverseCompanion()
 		if err := s.putClusterSyncedV6Raw(val.ReverseKey, revVal); err != nil {
 			return errors.Join(err, s.rollbackV6(written))
 		}
@@ -621,6 +644,28 @@ func (s dataPlaneSessionStore) ReconcileClusterBulk(input ClusterBulkReconcileIn
 		reason = DeleteReasonClusterStale
 	}
 
+	// #8597 K73. errs is declared BEFORE the first sweep, not between them.
+	//
+	// The V4 enumerate error used to `return result, err`, which skipped the V4
+	// delete phase AND the entire V6 sweep — so V6 stale rows were neither
+	// counted nor deleted, and the caller could not tell "V6 clean" from "V6
+	// never looked at" because StaleV6 is 0 either way. The two families are
+	// independent map dumps; a failure to enumerate one says nothing about the
+	// other.
+	//
+	// A partial staleV4 is still SAFE to act on. Every entry in it was
+	// classified by the same predicate as in a complete sweep — not in the
+	// received set, not in a synced zone — so the set is a subset of the true
+	// stale set, never a superset. Deleting a subset is progress; the next bulk
+	// reconcile finds the rest. (DeleteBatchKnownV4 no-ops on an empty slice, so
+	// a failure on the very first entry costs nothing either.)
+	//
+	// The errors are wrapped with the family so the caller's single joined error
+	// says WHICH sweep was partial. Without that the operator sees a warning
+	// beside a complete-looking stale_v4/stale_v6 pair and cannot tell which
+	// number to distrust.
+	var errs []error
+
 	var staleV4 []SessionEntryV4
 	if err := s.ForEachV4(func(key SessionKey, val SessionValue) bool {
 		if val.IsReverse != 0 {
@@ -634,11 +679,10 @@ func (s dataPlaneSessionStore) ReconcileClusterBulk(input ClusterBulkReconcileIn
 		}
 		return true
 	}); err != nil {
-		return result, err
+		errs = append(errs, fmt.Errorf("enumerate v4 sessions: %w", err))
 	}
 	result.StaleV4 = len(staleV4)
 
-	var errs []error
 	deletedV4, err := s.DeleteBatchKnownV4(staleV4, reason)
 	result.DeletedV4 = deletedV4
 	if err != nil {
@@ -658,7 +702,7 @@ func (s dataPlaneSessionStore) ReconcileClusterBulk(input ClusterBulkReconcileIn
 		}
 		return true
 	}); err != nil {
-		return result, errors.Join(append(errs, err)...)
+		errs = append(errs, fmt.Errorf("enumerate v6 sessions: %w", err))
 	}
 	result.StaleV6 = len(staleV6)
 
