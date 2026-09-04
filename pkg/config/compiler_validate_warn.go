@@ -738,7 +738,12 @@ func ValidateConfig(cfg *Config) []string {
 					"a synced session arrives at the peer with a zero discriminator, so per-tunnel "+
 					"identity does NOT survive a failover and the tunnels alias on the standby. "+
 					"Do not rely on per-tunnel policy/NAT/counter/timeout separation across an HA "+
-					"event (#7188)")
+					"event (#7188). The same now applies to PPTP: a GRE version-1 data packet is "+
+					"keyed on the call association this node learned from the TCP/1723 control "+
+					"channel (#7699), so two simultaneous calls between the same endpoints no "+
+					"longer alias locally — but a call already up before this node started, or "+
+					"one whose Outgoing-Call-Reply it did not see, has no association and stays "+
+					"unkeyed, and the association is not carried across a failover either")
 		}
 	}
 

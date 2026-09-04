@@ -438,7 +438,35 @@ so the three cannot drift into describing the same ALG differently.
 | **SCCP ALG** | `security alg sccp ...` | VoIP: Skinny Client Control Protocol (Cisco) session tracking | Low | Missing |
 | **MSRPC ALG** | `security alg msrpc ...` | Microsoft RPC dynamic port tracking (Active Directory, Exchange) | Medium | Missing |
 | **SunRPC ALG** | `security alg sunrpc ...` | Sun/ONC RPC dynamic port tracking (NFS, NIS) | Low | Missing |
-| **PPTP ALG** | `security alg pptp ...` | Point-to-Point Tunneling Protocol GRE call tracking | Low | Missing |
+| **PPTP ALG** | `security alg pptp ...` | Point-to-Point Tunneling Protocol GRE call tracking | Low | Partial — see below |
+
+**PPTP (#7699), stated precisely because "Missing" is no longer accurate and
+"Done" would be a claim the box cannot honour.**
+
+What EXISTS: the TCP/1723 control-channel parser (Outgoing-Call-Reply), the
+per-call association table with a locally derived direction-symmetric handle,
+cross-worker publication of a learned call, an idle expiry that does not depend
+on seeing a teardown, and — as of the data-channel resolve — a GRE version-1
+data packet resolving its call id to that handle, so two simultaneous calls
+between one endpoint pair no longer alias into one session.
+
+What does NOT exist, and why each is listed rather than fixed:
+
+* **The `security alg pptp` knob itself.** There is no `pptp` `alg_type`
+  alongside none/FTP/SIP/DNS. The config leaf in the first column is still
+  unimplemented, which is why this row is not "Done": an operator can configure
+  nothing here, and the separation above happens on its own under
+  `gre-performance-acceleration`.
+* **Control-channel CLOSE observation.** Nothing recognises the FIN/RST that
+  would forget a call's associations, so the idle timeout is the only
+  association lifetime that runs on a live box. Bounded, but later than a
+  teardown would be.
+* **Association survival across a failover.** HA session sync carries no tunnel
+  discriminator at all (the #7188 limitation the commit advisory names), so a
+  synced PPTP session arrives at the peer with a zero discriminator and its
+  calls alias on the standby exactly as they did before this work.
+* **NAT traversal.** Call-id rewriting for PPTP through NAT is out of scope and
+  was never in it.
 | **RTSP ALG** | `security alg rtsp ...` | Real-Time Streaming Protocol media pinhole management | Low | Missing |
 | **RSH ALG** | `security alg rsh ...` | Remote Shell protocol dynamic port tracking | Low | Missing |
 | **IKE-ESP NAT** | `security alg ike-esp-nat enable` | IKE/ESP NAT traversal assistance (non-standard NAT-T) | Low | Missing |
@@ -1431,7 +1459,12 @@ drift) closed in `fix/2008-quickwins-batch1`:
   GRE/PPTP tunnels between the SAME outer endpoints share one session and its
   policy/NAT/counter/timeout state. The dataplane feature — an RFC 2890 tunnel
   discriminator in `SessionKey` — is #7188, which retires both the advisory and
-  the qualifier when it lands.
+  the qualifier when it lands. **#7188 landed** and rewrote the advisory to
+  "PARTIALLY in force": keyed locally, not across a failover. **#7699's
+  data-channel resolve extends that to PPTP**, whose version-1 packets are keyed
+  on the call association learned from the TCP/1723 control channel rather than
+  on an RFC 2890 Key — so the sentence above is now historical for both
+  protocols, with the failover half still true for both.
 - **M9 `security flow tcp-session no-sequence-check`** — DONE (typed). Added
   the schema child (`pkg/config/schema_security.go`), the
   `TCPSessionConfig.NoSequenceCheck` field (`pkg/config/types_security.go`),

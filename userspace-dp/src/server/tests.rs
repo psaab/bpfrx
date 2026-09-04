@@ -4935,6 +4935,11 @@ mod routing_domain_delete_7160 {
 const PPTP_DRAIN_NEEDLE: &str = "crate::afxdp::worker_queue::drain_pptp_control_inbox(";
 const PPTP_EXPIRY_NEEDLE: &str =
     "let expired_entries = sessions.expire_stale_entries_ha(loop_now_ns";
+/// #7699: the DATA-channel resolve's call site. Same module-level treatment and
+/// the same reason: the guard and its over-reach control must search for one
+/// string, not two copies of it.
+const PPTP_RESOLVE_NEEDLE: &str =
+    "flow = crate::afxdp::gre_discriminator::pptp_data_session_flow(";
 
 /// Find the 0-based line whose trimmed start IS `needle` — a real statement,
 /// not a mention. Shared by the guard and its control for the same reason the
@@ -5064,6 +5069,85 @@ fn worker_loop_drains_the_pptp_control_inbox_7699() {
          packet rate, so a call-site gate is one edit from per-poll work — the \
          defect #8399 shipped — and it is invisible to the frequency cell, \
          which calls the drain directly (#7699)"
+    );
+}
+
+/// #7699: the DATA-channel resolve must be CALLED from the descriptor loop.
+///
+/// The sibling guard above exists because deleting the drain call survived the
+/// entire suite — every cell called the drain directly, so none could see the
+/// worker loop stop calling it. This resolve is in exactly that position: its
+/// parser and table cells drive `pptp_data_session_flow` by name, and all of
+/// them stay green with the production call deleted, while a live box resolves
+/// nothing and every PPTP data packet stays flowless and aliasing.
+///
+/// Anchored to the flow-parsing stage rather than to a line number: the resolve
+/// is only correct AFTER `stage_parse_flow_and_learn`, because it is gated on
+/// that stage having produced no flow. Ordering the other way round would make
+/// it unreachable for every packet, which is a silent no-op rather than a
+/// failure.
+#[test]
+fn descriptor_loop_resolves_the_pptp_data_channel_7699() {
+    let src = include_str!("../afxdp/poll_descriptor/mod.rs");
+
+    let stage_at = pptp_drain_line(src, "let mut flow = stage_parse_flow_and_learn(")
+        .unwrap_or_else(|| {
+            panic!(
+                "the descriptor loop's flow-parsing stage is gone — this guard's \
+                 ordering claim is anchored to a line that no longer exists (#7699)"
+            )
+        });
+    let resolve_at = pptp_drain_line(src, PPTP_RESOLVE_NEEDLE).unwrap_or_else(|| {
+        panic!(
+            "the descriptor loop does not call pptp_data_session_flow: a GRE \
+             version-1 data packet never consults the association table, so two \
+             simultaneous PPTP calls between one endpoint pair still alias onto \
+             one session — while the parser, table and resolve cells all stay \
+             green (#7699)"
+        )
+    });
+    assert!(
+        resolve_at > stage_at,
+        "the PPTP data resolve (line {resolve_at}) runs BEFORE the flow-parsing \
+         stage (line {stage_at}). It is gated on that stage having produced no \
+         flow, so ordering it first makes it unreachable for every packet — a \
+         silent no-op, not a failure (#7699)"
+    );
+}
+
+/// OVER-REACH CONTROL for the guard above, on the same matcher and the same
+/// needle for the same reason its sibling states: a control that retypes the
+/// needle stops controlling the guard the first time one of them is edited.
+#[test]
+fn pptp_resolve_guard_does_not_accept_a_mention_7699() {
+    const COMMENTED_OUT: &str =
+        "        // flow = crate::afxdp::gre_discriminator::pptp_data_session_flow(\n";
+    const PROSE: &str =
+        "        // the resolve rides flow = crate::afxdp::gre_discriminator::pptp_data_session_flow( here\n";
+    const REAL: &str =
+        "        flow = crate::afxdp::gre_discriminator::pptp_data_session_flow(\n            packet_frame,\n";
+
+    assert!(
+        pptp_drain_line(COMMENTED_OUT, PPTP_RESOLVE_NEEDLE).is_none(),
+        "the guard accepts a COMMENTED-OUT resolve, so deleting the call by \
+         commenting it out would report the data channel as wired (#7699)"
+    );
+    assert!(
+        pptp_drain_line(PROSE, PPTP_RESOLVE_NEEDLE).is_none(),
+        "the guard accepts a PROSE mention, so a comment naming the function \
+         would report the data channel as wired (#7699)"
+    );
+    assert!(
+        pptp_drain_line(REAL, PPTP_RESOLVE_NEEDLE).is_some(),
+        "the guard does not match a body that plainly contains the real call — \
+         it is searching for something unreachable and would pass nothing, \
+         ever (#7699)"
+    );
+    assert!(
+        pptp_drain_line(REAL, PPTP_DRAIN_NEEDLE).is_none(),
+        "the resolve needle and the drain needle are not distinct, so one \
+         guard's body satisfies the other's and neither binds what it names \
+         (#7699)"
     );
 }
 
