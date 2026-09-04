@@ -682,7 +682,16 @@ func (f *sessionFilter) matchV6(key dataplane.SessionKeyV6, val dataplane.Sessio
 
 // fetchPeerSessions fetches sessions from the cluster peer if requested.
 func (s *Server) fetchPeerSessions(ctx context.Context, req *pb.GetSessionsRequest, resp *pb.GetSessionsResponse) {
+	// #8308: every arm below now RECORDS its outcome. Until the response
+	// carried these fields there was nowhere to put one, which is why the
+	// session-LIST surface reported no peer outcome at all — the discarded
+	// error was downstream of a gap in the message, not the cause of it.
+	//
+	// The classification matches the summary surfaces exactly
+	// (peerAbsentStatus, peerFetchErrorStatus), because a list and a summary
+	// disagreeing about the same peer fetch would always be a bug.
 	if !req.GetIncludePeer() || s.cluster == nil || !s.cluster.PeerAlive() {
+		resp.PeerStatus = s.peerAbsentStatus()
 		return
 	}
 	// When paginating via page_token, suppress peer results — the caller
@@ -690,11 +699,17 @@ func (s *Server) fetchPeerSessions(ctx context.Context, req *pb.GetSessionsReque
 	// producing misleading mixed-page responses. Peer sessions should
 	// only be fetched on the first page (no token).
 	if req.GetPageToken() != "" {
+		// NOT_APPLICABLE, not UNREACHABLE: nothing was attempted and nothing
+		// failed. This is the one arm where the request itself, rather than
+		// the cluster, is why there is no peer data.
+		resp.PeerStatus = pb.PeerFetchStatus_PEER_FETCH_STATUS_NOT_APPLICABLE
 		return
 	}
 	conn, err := s.dialPeer()
 	if err != nil {
 		slog.Warn("failed to dial peer for sessions", "err", err)
+		resp.PeerStatus = peerFetchErrorStatus(err)
+		resp.PeerError = err.Error()
 		return
 	}
 	defer conn.Close()
@@ -724,6 +739,8 @@ func (s *Server) fetchPeerSessions(ctx context.Context, req *pb.GetSessionsReque
 	peerResp, err := client.GetSessions(peerCtx, peerReq)
 	if err != nil {
 		slog.Warn("failed to fetch peer sessions", "err", err)
+		resp.PeerStatus = peerFetchErrorStatus(err)
+		resp.PeerError = err.Error()
 	} else {
 		// #6851/#4626: the peer resolved these policy NAMES itself, so a peer
 		// running a pre-#4626 build sent the name of ITS first configured
@@ -752,6 +769,7 @@ func (s *Server) fetchPeerSessions(ctx context.Context, req *pb.GetSessionsReque
 		// The REMOTE cli binary is not a third case; it sets IncludePeer and
 		// arrives here.
 		attachPeerSessions(resp, peerResp)
+		resp.PeerStatus = pb.PeerFetchStatus_PEER_FETCH_STATUS_OK
 	}
 }
 
