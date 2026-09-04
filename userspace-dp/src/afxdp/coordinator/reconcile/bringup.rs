@@ -613,6 +613,22 @@ fn spawn_workers(
         // compare it against the worker's reported bound set.
         let planned_slots: std::collections::BTreeSet<u32> =
             binding_plans.iter().map(|plan| plan.status.slot).collect();
+        // #8388: the per-slot `BindingLiveState` handles dispatched to this
+        // worker, captured here because `binding_plans` is moved into the
+        // launch plan below. Used ONLY by the `#[cfg(test)]` stub arms, which
+        // publish `set_bound` through them for every slot they REPORT as bound
+        // — the same publish a real `worker_loop` makes from
+        // `BindingWorker::create`. Without it a "healthy" stub is healthy only
+        // in its startup report: `refresh_bindings` reads the (never-published)
+        // live state and every slot comes back `bound = false`, so the
+        // operator- and Go-visible binding surface is IDENTICAL whether the
+        // fail-close stopped the healthy siblings or not, and any cell over
+        // that surface is mutation-insensitive by construction.
+        #[cfg(test)]
+        let stub_lives: BTreeMap<u32, Arc<BindingLiveState>> = binding_plans
+            .iter()
+            .map(|plan| (plan.status.slot, plan.live.clone()))
+            .collect();
         let stop = Arc::new(AtomicBool::new(false));
         let heartbeat = Arc::new(AtomicU64::new(monotonic_nanos()));
         let session_export_ack = Arc::new(AtomicU64::new(0));
@@ -745,6 +761,17 @@ fn spawn_workers(
             // is short by one — either way bound != planned -> barrier fails
             // closed.
             let incomplete_bound: Vec<u32> = planned_slots.iter().copied().skip(1).collect();
+            // #8388: publish the bound live state for the slots this stub
+            // reports bound. Synchronous (before the spawn) rather than inside
+            // the stub body so the surface is race-free: the `SpawnFailed` arm
+            // returns without ever reaching the readiness barrier, so a
+            // stub-thread publish would not be ordered against the reconcile's
+            // closing `refresh_bindings`.
+            for slot in &incomplete_bound {
+                if let Some(live) = stub_lives.get(slot) {
+                    live.set_bound(-1);
+                }
+            }
             // #6245: the omitted slot is the SMALLEST planned slot (`skip(1)`
             // drops the first of the sorted BTreeSet). Report it as an EXPLICIT
             // per-slot failure so the barrier surfaces the cause, exercising the
@@ -814,6 +841,16 @@ fn spawn_workers(
             }
             drop(body);
             let full_bound: Vec<u32> = planned_slots.iter().copied().collect();
+            // #8388: see the sibling publish in the bind-incomplete arm. A
+            // HEALTHY stub reports its full planned set, so it publishes bound
+            // live state for all of it — that is what makes "the fail-close
+            // stopped the healthy siblings too" observable on the binding
+            // surface instead of only in `workers.records`.
+            for slot in &full_bound {
+                if let Some(live) = stub_lives.get(slot) {
+                    live.set_bound(-1);
+                }
+            }
             let stub_stop = stop.clone();
             let stub_heartbeat = heartbeat.clone();
             let stub_tx = startup_report_tx.clone();
