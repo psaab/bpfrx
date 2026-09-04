@@ -67,7 +67,27 @@ func compileIKE(node *Node, sec *SecurityConfig) error {
 
 	// IKE policies (Phase 1 mode + PSK + proposal ref)
 	for _, inst := range namedInstances(node.FindChildren("policy")) {
-		pol := &IKEPolicy{Name: inst.name}
+		// #8436: FIND-OR-CREATE, not construct-and-overwrite.
+		//
+		// A fresh struct per block plus `IKEPolicies[name] = pol` below is
+		// last-wins-with-a-whole-wipe: two `policy P { ... }` blocks in a
+		// hierarchical config file silently discard everything the first one
+		// carried — mode, PSK, proposals. The #8436 census classifies this site
+		// as SILENT, meaning configuration the operator authored is lost with
+		// no commit error.
+		//
+		// Find-or-create is the disposition the census names as the correct one
+		// (it is what dhcp-relay already does), and it makes the hierarchical
+		// spelling agree with the flat-set spelling, which merges. That
+		// agreement is the conservation property #8436 asks to be bound rather
+		// than another per-container registry row.
+		//
+		// Reachable only through a hierarchical config file, `load merge` or
+		// `load override` — flat `set` merges correctly today.
+		pol := sec.IPsec.IKEPolicies[inst.name]
+		if pol == nil {
+			pol = &IKEPolicy{Name: inst.name}
+		}
 		for _, p := range inst.node.Children {
 			v := nodeVal(p)
 			switch p.Name() {
@@ -445,7 +465,14 @@ func compileIPsec(node *Node, sec *SecurityConfig) error {
 
 	// VPN tunnels
 	for _, inst := range namedInstances(node.FindChildren("vpn")) {
-		vpn := &IPsecVPN{Name: inst.name}
+		// #8436: find-or-create, same reasoning as `security ike policy` above.
+		// The census classifies this site as SILENT — two `vpn V { ... }` blocks
+		// in a hierarchical config file discard everything the first carried,
+		// with no commit error.
+		vpn := sec.IPsec.VPNs[inst.name]
+		if vpn == nil {
+			vpn = &IPsecVPN{Name: inst.name}
+		}
 		for _, p := range inst.node.Children {
 			v := nodeVal(p)
 			switch p.Name() {

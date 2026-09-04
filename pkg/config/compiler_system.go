@@ -176,7 +176,27 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 			// coarse permission model. Compiled BEFORE users so the class set
 			// is complete regardless of stanza order.
 			for _, classInst := range namedInstances(child.FindChildren("class")) {
-				lc := &LoginClass{Name: classInst.name}
+				// #8436: find-or-create. `Login.Classes` is a SLICE, so before
+				// this a duplicate `class C { ... }` appended a SECOND entry
+				// with the same name — the "append both" disposition. Whichever
+				// consumer reads the slice first wins, and the other block's
+				// permissions are silently unreachable.
+				//
+				// Merging into the existing entry makes the hierarchical
+				// spelling agree with the flat-set one, which is the #8436
+				// conservation property. `mapJunosPermissions` below then runs
+				// over the MERGED permission set rather than one block's half.
+				var lc *LoginClass
+				for _, existing := range sys.Login.Classes {
+					if existing != nil && existing.Name == classInst.name {
+						lc = existing
+						break
+					}
+				}
+				if lc == nil {
+					lc = &LoginClass{Name: classInst.name}
+					sys.Login.Classes = append(sys.Login.Classes, lc)
+				}
 				for _, prop := range classInst.node.Children {
 					// #5831: record RESTRICTIVE leaf PRESENCE from the
 					// classification table (compiler_login_deny.go), NOT from
@@ -223,7 +243,6 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 					}
 				}
 				lc.MappedPermissions, _ = mapJunosPermissions(lc.Permissions)
-				sys.Login.Classes = append(sys.Login.Classes, lc)
 			}
 			// #6992: a user NAME authored in two blocks folds into ONE entry.
 			//
