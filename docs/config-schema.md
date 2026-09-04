@@ -913,6 +913,49 @@ part worth keeping:
 is already rejected by the existing typed-leaf trailing-token gate. The gap this
 closes is specifically **untyped** and **`multi`** leaves.
 
+### Too FEW tokens, the other half of the same arity question (#8597)
+
+Every gate above is about a token too MANY. A token too FEW was accepted
+everywhere:
+
+```
+set routing-options rib inet6.0 static route 2001:db8::/64 next-hop fe80::1 interface
+  -> commits clean, compiles to Interface: "" — an UNSCOPED IPv6 link-local
+     next-hop, the one route an operator can least afford to mis-scope
+set system host-name
+  -> commits clean, the system carries no host-name
+set interfaces ge-0/0/0 unit 0 family inet address
+set security policies from-zone trust to-zone untrust policy p match source-address
+  -> the same
+```
+
+`validateScalarValueLeaf` has rejected a trailing token since #3332 with the
+reasoning *"the extra token would be silently dropped"*. A missing token is
+silently dropped in exactly the same sense, so that check now runs in both
+directions.
+
+The walker path needed its own half, and this is where the shape is
+interesting: `walkSchemaNode` computes `missingArgs := declaredKeyTokens -
+consumed` and, when positive, delegates to `walkInstanceChildren` — the
+dual-AST path, where a hierarchical spelling supplies the missing name/arg
+levels as nested AST children. **With zero children it iterates nothing and
+returns nil**, so a valueless statement fell out of the gate through the branch
+written to handle a different shape.
+
+**The discriminator is the AST node having no children**, not the schema node
+being a leaf. A container legitimately takes its missing name level from nested
+children (`class-of-service { schedulers { be { transmit-rate 1g; } } }`), and
+so does a leaf with modifier children (`address 10.0.0.1/24 { primary; }`).
+With zero children there is nowhere left for the value to come from, whichever
+it is. Rejecting on `missingArgs` alone condemns the dual-AST shape —
+`TestValuelessLeafGateIsScopedToLEAVES_8597` is the control that fails on it.
+
+**Both halves were measured before landing, not after.** The sibling finding in
+the same review (#8662) prescribed a gate of this family that rejects the
+project's own shipped HA cluster config; the difference is that this one was
+run against `pkg/config`, `pkg/configstore`, `pkg/cli` and `pkg/daemon` first,
+with zero failures, and carries its own list of spellings it must NOT reject.
+
 **Testing it binds the WIDENING, not the parse.** A cell asserting the
 route-filter prefix and match-type survived stays GREEN on the defective input —
 both *are* intact. What is lost is the `protocol` dimension. The cell asserts

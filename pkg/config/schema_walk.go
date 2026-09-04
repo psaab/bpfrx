@@ -656,6 +656,30 @@ func walkSchemaNode(node *Node, parent *schemaNode, path []string, vc *walkConte
 	}
 
 	missingArgs := declaredKeyTokens - consumed
+	if missingArgs > 0 && !childSchema.compoundKey && len(node.Children) == 0 {
+		// #8597 (muse-004 K15): a LEAF that declares an argument, carries no
+		// value token, and has no AST children has nowhere left for the value
+		// to come from. The branch below exists for the dual-AST shape, where
+		// the missing name/arg levels arrive as nested children; with zero
+		// children it iterates nothing and returns nil, so a valueless leaf
+		// walked out of the gate entirely.
+		//
+		// Measured at HEAD, `next-hop fe80::1 interface` (no interface name)
+		// committed clean and compiled to Interface = "" — an UNSCOPED
+		// link-local gateway, which is the one route an operator can least
+		// afford to mis-scope.
+		//
+		// The discriminator is the AST node having NO CHILDREN, not the schema
+		// node being a leaf. A container legitimately takes its missing name
+		// level from nested children — that is what the branch below is for —
+		// and a leaf with modifier children (`family inet address <p> {
+		// primary; }`) is the same shape. With zero children there is nowhere
+		// left for the value to come from, whichever it is.
+		return fmt.Errorf("%s: `%s` declares a value and none was given — the compiler "+
+			"drops a valueless statement, so this commits clean and the configuration "+
+			"silently does not carry it",
+			strings.Join(newPath, " "), keyword)
+	}
 	if missingArgs > 0 && !childSchema.compoundKey {
 		// The already-consumed identity tokens are Keys[1:consumed]; the
 		// name levels peeled below supply args starting at 0-based index
@@ -801,6 +825,18 @@ func validateScalarValueLeaf(node *Node, leafSchema *schemaNode, parentPath []st
 	leafName := node.Keys[0]
 	leafPath := append(append([]string(nil), parentPath...), leafName)
 	allowed := 1 + leafSchema.args
+	// #8597 (muse-004 K15): the TOO-FEW half. This validator has rejected a
+	// trailing token since #3332 with the reasoning "the extra token would be
+	// silently dropped" — and a MISSING token is silently dropped in exactly
+	// the same sense: `set system host-name` with no name commits clean and
+	// the system carries no host-name. One arity check, both directions.
+	if len(node.Keys) < allowed && len(node.Children) == 0 {
+		return typedLeafErrorf(leafPath,
+			"`%s` declares a value and none was given (this leaf takes %d value token(s)); "+
+				"the compiler drops a valueless statement, so this commits clean and the "+
+				"configuration silently does not carry it",
+			leafName, leafSchema.args)
+	}
 	if len(node.Keys) > allowed {
 		return typedLeafErrorf(leafPath,
 			"unexpected trailing token %q (this leaf takes %d value token(s); the extra token would be silently dropped)",
