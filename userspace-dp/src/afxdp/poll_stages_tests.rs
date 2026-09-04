@@ -270,7 +270,9 @@ fn session_miss_ack_stage_invokes_syn_cookie_runtime_validation() {
             burst: 0,
         },
     );
+    let __pptp_control_7699 = std::sync::Arc::new(crate::session::pptp_control::PptpControlInbox::default());
     let worker_ctx = WorkerContext {
+        pptp_control: &__pptp_control_7699,
         ident: &ident,
         binding_lookup: &binding_lookup,
         mirror_targets: &mirror_targets,
@@ -506,7 +508,9 @@ fn unresolved_screen_profile_zone_continues_to_policy_5806() {
             burst: 0,
         },
     );
+    let __pptp_control_7699 = std::sync::Arc::new(crate::session::pptp_control::PptpControlInbox::default());
     let worker_ctx = WorkerContext {
+        pptp_control: &__pptp_control_7699,
         ident: &ident,
         binding_lookup: &binding_lookup,
         forwarding: &forwarding,
@@ -700,7 +704,9 @@ fn priority_tagged_vlan0_screen_stage_parses_l3_at_offset_18() {
             burst: 0,
         },
     );
+    let __pptp_control_7699 = std::sync::Arc::new(crate::session::pptp_control::PptpControlInbox::default());
     let worker_ctx = WorkerContext {
+        pptp_control: &__pptp_control_7699,
         ident: &ident,
         binding_lookup: &binding_lookup,
         mirror_targets: &mirror_targets,
@@ -906,7 +912,11 @@ fn neighbor_learn_ctx(
     let peer_worker_commands = Box::leak(Box::new(Vec::new()));
     let dnat_fds = Box::leak(Box::new(DnatTableFds::default()));
     let rg_epochs = Box::leak(Box::new(std::array::from_fn(|_| AtomicU32::new(0))));
+    let __pptp_control_7699 = Box::leak(Box::new(std::sync::Arc::new(
+        crate::session::pptp_control::PptpControlInbox::default(),
+    )));
     let ctx = Box::leak(Box::new(WorkerContext {
+        pptp_control: __pptp_control_7699,
         ident,
         binding_lookup,
         mirror_targets,
@@ -1951,7 +1961,9 @@ fn screen_zone_lookup_uses_logical_ingress_ifindex_3022() {
             burst: 0,
         },
     );
+    let __pptp_control_7699 = std::sync::Arc::new(crate::session::pptp_control::PptpControlInbox::default());
     let worker_ctx = WorkerContext {
+        pptp_control: &__pptp_control_7699,
         ident: &ident,
         binding_lookup: &binding_lookup,
         mirror_targets: &mirror_targets,
@@ -2198,7 +2210,9 @@ fn run_stage_screen_capture_in(
             burst: 0,
         },
     );
+    let __pptp_control_7699 = std::sync::Arc::new(crate::session::pptp_control::PptpControlInbox::default());
     let worker_ctx = WorkerContext {
+        pptp_control: &__pptp_control_7699,
         ident: &ident,
         binding_lookup: &binding_lookup,
         mirror_targets: &mirror_targets,
@@ -2892,7 +2906,9 @@ fn stage_ipsec_passthrough_exempts_all_classes_3616() {
             burst: 0,
         },
     );
+    let __pptp_control_7699 = std::sync::Arc::new(crate::session::pptp_control::PptpControlInbox::default());
     let worker_ctx = WorkerContext {
+        pptp_control: &__pptp_control_7699,
         ident: &ident,
         binding_lookup: &binding_lookup,
         mirror_targets: &mirror_targets,
@@ -3174,7 +3190,9 @@ fn stage_ipsec_passthrough_gates_new_ike_4323() {
             burst: 0,
         },
     );
+    let __pptp_control_7699 = std::sync::Arc::new(crate::session::pptp_control::PptpControlInbox::default());
     let worker_ctx = WorkerContext {
+        pptp_control: &__pptp_control_7699,
         ident: &ident,
         binding_lookup: &binding_lookup,
         mirror_targets: &mirror_targets,
@@ -3392,7 +3410,9 @@ fn stage_ipsec_passthrough_gates_forged_responder_spi_6471() {
             burst: 0,
         },
     );
+    let __pptp_control_7699 = std::sync::Arc::new(crate::session::pptp_control::PptpControlInbox::default());
     let worker_ctx = WorkerContext {
+        pptp_control: &__pptp_control_7699,
         ident: &ident,
         binding_lookup: &binding_lookup,
         mirror_targets: &mirror_targets,
@@ -3612,7 +3632,9 @@ fn run_stage11(
             burst: 0,
         },
     );
+    let __pptp_control_7699 = std::sync::Arc::new(crate::session::pptp_control::PptpControlInbox::default());
     let worker_ctx = WorkerContext {
+        pptp_control: &__pptp_control_7699,
         ident: &ident,
         binding_lookup: &binding_lookup,
         mirror_targets: &mirror_targets,
@@ -3887,4 +3909,339 @@ fn flowless_legitimate_ihl5_fragment_is_not_dropped_8298() {
          fail-closed floor rejects IHL < 5 only; if this reds, the floor is \
          over-rejecting real fragments (#8298)"
     );
+}
+
+/// #7699: the PACKET-PATH DISPATCH — the production join.
+///
+/// # Why this module exists and what was missing without it
+///
+/// Every #7699 cell before this one tested ONE hop. The parser cells build a
+/// segment and assert a parse; the table cells install a `PptpCall` and assert
+/// a resolve; the broadcast cells push a `WorkerCommand` and assert it lands.
+/// All of them stayed green against a build in which **nothing in the running
+/// dataplane called the parser at all** — each end worked and nothing joined
+/// them. `session_glue/tests.rs`'s stage-2 end-to-end cell says so in its own
+/// doc, and an earlier version of that comment named a falsifying mutation
+/// ("delete the call from the publish path") that could not be performed
+/// because there was no publish path to delete it from.
+///
+/// This module is the first point in the series where that mutation exists, so
+/// it is RUN rather than described. It binds **two** properties, because only
+/// the first is visible in what the association table ends up containing —
+/// which is exactly how #8399's placement defect survived a sound wiring
+/// mutation AND a sound function mutation:
+///
+///   - **connection**: deleting the `capture_pptp_control_segment` call from
+///     `stage_parse_flow_and_learn` reds
+///     `the_stage_captures_a_control_segment_and_the_drain_learns_it_7699`;
+///   - **frequency**: the drain runs once per `CONTROL_DRAIN_INTERVAL_NS`, not
+///     once per poll — `the_control_drain_runs_once_per_interval_not_per_call_7699`.
+#[cfg(test)]
+mod pptp_dispatch_join_tests_7699 {
+    use super::*;
+    use crate::session::pptp_control::{
+        fixtures_7699::outgoing_call_reply, PptpControlInbox, CONTROL_DRAIN_INTERVAL_NS,
+        PENDING_CONTROL_CAPACITY, PPTP_CONTROL_PORT,
+    };
+
+    const PAC: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 7);
+    const PNS: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 9);
+    const PAC_CALL_ID: u16 = 0xAAAA;
+    const PNS_CALL_ID: u16 = 0xBBBB;
+    const EPHEMERAL: u16 = 49152;
+    const T0: u64 = 1_000_000_000_000;
+
+    /// An IPv4 TCP segment carrying `payload`, with the IP total length and
+    /// both checksums recomputed for the longer frame.
+    fn tcp_v4_frame_with_payload(
+        src: Ipv4Addr,
+        dst: Ipv4Addr,
+        src_port: u16,
+        dst_port: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        // PSH|ACK: a data-bearing segment, which is what a control message is.
+        let mut frame = tcp_v4_frame(src, dst, src_port, dst_port, 0x18, 1, 1);
+        frame.extend_from_slice(payload);
+        let total = (20 + 20 + payload.len()) as u16;
+        frame[16..18].copy_from_slice(&total.to_be_bytes());
+        frame[24..26].copy_from_slice(&[0, 0]);
+        let ip_csum = checksum16(&frame[14..34]);
+        frame[24..26].copy_from_slice(&ip_csum.to_be_bytes());
+        recompute_l4_checksum_ipv4(&mut frame[14..], 20, PROTO_TCP, false)
+            .expect("tcp checksum");
+        frame
+    }
+
+    /// The Outgoing-Call-Reply as it travels on the wire: from the PAC (which
+    /// LISTENS on 1723) back to the PNS. So the control port is the SOURCE
+    /// port, which is the direction a dst-port-only test would miss — and this
+    /// is the only message carrying both halves of the pair.
+    fn call_reply_frame() -> Vec<u8> {
+        tcp_v4_frame_with_payload(
+            PAC,
+            PNS,
+            PPTP_CONTROL_PORT,
+            EPHEMERAL,
+            &outgoing_call_reply(PAC_CALL_ID, PNS_CALL_ID, 1),
+        )
+    }
+
+    fn stage_ctx() -> &'static WorkerContext<'static> {
+        let forwarding: &'static ForwardingState = Box::leak(Box::new(build_forwarding_state(
+            &super::super::test_fixtures::nat_snapshot(),
+        )));
+        neighbor_learn_ctx(forwarding).0
+    }
+
+    /// Run the REAL stage over `frame`. `learn_from_live_frame: false` is
+    /// deliberate twice over: it keeps the neighbor-learn side (which would
+    /// dereference the UMEM) out of the way, AND it binds the decision that the
+    /// capture is NOT gated on that flag — adding `learn_from_live_frame &&` to
+    /// the capture condition reds every cell in this module.
+    fn run_stage(ctx: &WorkerContext<'_>, frame: &[u8]) {
+        let area = MmapArea::new(4096).expect("mmap");
+        let desc = crate::xsk_ffi::XdpDesc {
+            addr: 0,
+            len: frame.len() as u32,
+            options: 0,
+        };
+        let mut last_learned = None;
+        stage_parse_flow_and_learn(
+            &area,
+            desc,
+            frame,
+            tcp_v4_meta(frame, 0x18),
+            false,
+            &mut last_learned,
+            ctx,
+        );
+    }
+
+    fn peer_queues(n: usize) -> Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> {
+        (0..n)
+            .map(|_| Arc::new(Mutex::new(VecDeque::new())))
+            .collect()
+    }
+
+    /// THE PRODUCTION JOIN: wire bytes -> the real stage -> the inbox -> the
+    /// real drain -> an association a data packet in EITHER direction resolves
+    /// against, AND the sibling workers told about it.
+    ///
+    /// RED ON REVERT: delete the `capture_pptp_control_segment(..)` call from
+    /// `stage_parse_flow_and_learn` and this fails at the first assert — the
+    /// inbox stays empty, so nothing is parsed, installed or broadcast. That
+    /// mutation was not available anywhere in #7699 before this change.
+    #[test]
+    fn the_stage_captures_a_control_segment_and_the_drain_learns_it_7699() {
+        let ctx = stage_ctx();
+        let inbox: &PptpControlInbox = ctx.pptp_control;
+        let frame = call_reply_frame();
+
+        run_stage(ctx, &frame);
+        assert_eq!(
+            inbox.pending_len(),
+            1,
+            "the stage did not copy the TCP/1723 segment into the inbox — the \
+             hot-path push is the join, and without it every other #7699 cell \
+             still passes while the dataplane learns nothing"
+        );
+
+        let mut sessions = crate::session::SessionTable::new();
+        let queues = peer_queues(2);
+        let learned = crate::afxdp::worker_queue::drain_pptp_control_inbox(
+            inbox,
+            &mut sessions,
+            &queues,
+            T0,
+        );
+        assert_eq!(learned, 1, "the drain did not learn the association");
+
+        // Both directions resolve to ONE handle: a packet TO the PAC carries
+        // the PAC's call id, a packet TO the PNS carries the PNS's.
+        let to_pac = sessions.pptp().resolve(IpAddr::V4(PAC), PAC_CALL_ID);
+        let to_pns = sessions.pptp().resolve(IpAddr::V4(PNS), PNS_CALL_ID);
+        assert!(to_pac.is_some(), "no association for the PAC direction");
+        assert_eq!(
+            to_pac, to_pns,
+            "the two directions of one call must resolve to the SAME handle — \
+             that is the whole point of learning the pair from the control \
+             channel (RFC 2637 §4.1 call ids are per-direction)"
+        );
+
+        // And the siblings were told: the control channel and the GRE data
+        // channel are not co-located, so a local-only install teaches the wrong
+        // worker.
+        for (i, q) in queues.iter().enumerate() {
+            let pending = q.lock().expect("queue");
+            assert!(
+                pending
+                    .iter()
+                    .any(|c| matches!(c, WorkerCommand::InstallPptpCall { .. })),
+                "worker {i} was never told about the association"
+            );
+        }
+    }
+
+    /// FREQUENCY, at the production site. The drain is CALLED every poll
+    /// iteration; it must RUN once per interval.
+    ///
+    /// Three steps, because the third is what makes the second mean anything —
+    /// an implementation that never drains at all also does nothing in step 2.
+    ///
+    /// RED ON REVERT: remove the `CONTROL_DRAIN_INTERVAL_NS` gate from
+    /// `PptpControlInbox::take_pending` and step 2 learns its segment
+    /// immediately. Nothing about the end state distinguishes the two — which
+    /// is precisely how #8399's expiry ran at poll frequency for a whole
+    /// release with sound wiring and sound function cells.
+    #[test]
+    fn the_control_drain_runs_once_per_interval_not_per_call_7699() {
+        let ctx = stage_ctx();
+        let inbox: &PptpControlInbox = ctx.pptp_control;
+        let mut sessions = crate::session::SessionTable::new();
+        let queues = peer_queues(1);
+
+        run_stage(ctx, &call_reply_frame());
+        assert_eq!(
+            crate::afxdp::worker_queue::drain_pptp_control_inbox(
+                inbox,
+                &mut sessions,
+                &queues,
+                T0
+            ),
+            1,
+            "the first drain must learn"
+        );
+
+        // A second call comes up while we are inside the interval.
+        let second = tcp_v4_frame_with_payload(
+            PAC,
+            PNS,
+            PPTP_CONTROL_PORT,
+            EPHEMERAL,
+            &outgoing_call_reply(0xCCCC, 0xDDDD, 1),
+        );
+        run_stage(ctx, &second);
+        assert_eq!(
+            crate::afxdp::worker_queue::drain_pptp_control_inbox(
+                inbox,
+                &mut sessions,
+                &queues,
+                T0 + CONTROL_DRAIN_INTERVAL_NS - 1
+            ),
+            0,
+            "the drain ran INSIDE its interval; it is called from the poll \
+             loop, which runs at packet rate, so this is per-packet work"
+        );
+        assert_eq!(inbox.pending_len(), 1, "the segment must still be buffered");
+        assert_eq!(
+            sessions.pptp().resolve(IpAddr::V4(PAC), 0xCCCC),
+            None,
+            "the second association must not be learned yet"
+        );
+
+        // Past the interval it drains — proving step 2 was the gate and not a
+        // drain that never fires.
+        assert_eq!(
+            crate::afxdp::worker_queue::drain_pptp_control_inbox(
+                inbox,
+                &mut sessions,
+                &queues,
+                T0 + CONTROL_DRAIN_INTERVAL_NS
+            ),
+            1,
+            "the drain never fires at all"
+        );
+        assert!(sessions.pptp().resolve(IpAddr::V4(PAC), 0xCCCC).is_some());
+    }
+
+    /// ACCEPT-SIDE CONTROL for the recognition test: an ordinary TCP flow on a
+    /// nearby port is NOT captured. A capture that fired on everything would
+    /// satisfy the join cell above while filling the inbox from the data path.
+    #[test]
+    fn an_ordinary_tcp_segment_is_not_captured_7699() {
+        let ctx = stage_ctx();
+        let inbox: &PptpControlInbox = ctx.pptp_control;
+        // 1722 and 1724 bracket the control port, so an off-by-one in the
+        // comparison is caught rather than a wholly unrelated port passing.
+        for port in [1722u16, 1724, 443] {
+            let frame = tcp_v4_frame_with_payload(PAC, PNS, port, EPHEMERAL, &[0u8; 32]);
+            run_stage(ctx, &frame);
+        }
+        assert_eq!(
+            inbox.pending_len(),
+            0,
+            "a non-control TCP segment was copied into the control inbox"
+        );
+    }
+
+    /// A payload-less segment (a bare ACK) is not buffered: it cannot be a
+    /// control message, and buffering it spends a capacity slot a real message
+    /// then loses.
+    #[test]
+    fn a_payloadless_segment_is_not_buffered_7699() {
+        let ctx = stage_ctx();
+        let inbox: &PptpControlInbox = ctx.pptp_control;
+        let frame = tcp_v4_frame(PAC, PNS, PPTP_CONTROL_PORT, EPHEMERAL, 0x10, 1, 1);
+        run_stage(ctx, &frame);
+        assert_eq!(inbox.pending_len(), 0, "a bare ACK was buffered");
+    }
+
+    /// A segment whose control message does not name a CONNECTED call teaches
+    /// nothing — and, critically, the drain still consumes it rather than
+    /// leaving it to be re-parsed forever.
+    #[test]
+    fn a_failed_call_is_consumed_and_teaches_nothing_7699() {
+        let ctx = stage_ctx();
+        let inbox: &PptpControlInbox = ctx.pptp_control;
+        let frame = tcp_v4_frame_with_payload(
+            PAC,
+            PNS,
+            PPTP_CONTROL_PORT,
+            EPHEMERAL,
+            // Result Code 2 — the call did NOT come up.
+            &outgoing_call_reply(PAC_CALL_ID, PNS_CALL_ID, 2),
+        );
+        run_stage(ctx, &frame);
+        assert_eq!(inbox.pending_len(), 1, "precondition: it was captured");
+
+        let mut sessions = crate::session::SessionTable::new();
+        let queues = peer_queues(1);
+        assert_eq!(
+            crate::afxdp::worker_queue::drain_pptp_control_inbox(
+                inbox,
+                &mut sessions,
+                &queues,
+                T0
+            ),
+            0,
+            "a failed call must not become an association"
+        );
+        assert_eq!(inbox.pending_len(), 0, "the segment was left in the inbox");
+        assert_eq!(sessions.pptp().len(), 0);
+    }
+
+    /// A FULL inbox drops and counts; it never stalls the data path. The
+    /// consequence is the unassociated path — the same designed degradation as
+    /// a data packet arriving before its control exchange.
+    #[test]
+    fn a_full_control_inbox_drops_and_counts_7699() {
+        let ctx = stage_ctx();
+        let inbox: &PptpControlInbox = ctx.pptp_control;
+        let frame = call_reply_frame();
+        for _ in 0..PENDING_CONTROL_CAPACITY {
+            run_stage(ctx, &frame);
+        }
+        assert_eq!(inbox.pending_len(), PENDING_CONTROL_CAPACITY);
+        assert_eq!(inbox.dropped_count(), 0, "nothing dropped while it fit");
+
+        run_stage(ctx, &frame);
+        assert_eq!(
+            inbox.pending_len(),
+            PENDING_CONTROL_CAPACITY,
+            "the inbox grew past its capacity — the data path can now be made \
+             to allocate without bound by a control-port flood"
+        );
+        assert_eq!(inbox.dropped_count(), 1, "the drop was not counted");
+    }
 }
