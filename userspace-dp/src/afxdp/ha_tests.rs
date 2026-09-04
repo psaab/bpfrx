@@ -254,7 +254,7 @@ fn test_worker_handle(commands: Arc<Mutex<VecDeque<WorkerCommand>>>) -> WorkerHa
 #[test]
 fn update_ha_state_prewarms_split_rg_reverse_sessions_on_activation() {
     let mut coordinator = Coordinator::new();
-    coordinator.forwarding = test_forwarding_state_split_rgs();
+    coordinator.set_forwarding_for_test(test_forwarding_state_split_rgs());
     let worker_commands = Arc::new(Mutex::new(VecDeque::new()));
     coordinator.workers.register(
         0,
@@ -357,7 +357,7 @@ fn update_ha_state_demotion_recovers_from_poisoned_worker_command_mutex() {
     // Poison one of three worker command mutexes and assert the SAME
     // call still completes ALL propagation and returns Ok.
     let mut coordinator = Coordinator::new();
-    coordinator.forwarding = test_forwarding_state_with_fabric();
+    coordinator.set_forwarding_for_test(test_forwarding_state_with_fabric());
     let worker_queues: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = (0..3u32)
         .map(|_| Arc::new(Mutex::new(VecDeque::new())))
         .collect();
@@ -489,7 +489,7 @@ fn prewarm_recovers_from_poisoned_shared_session_mutex() {
     // runs prewarm, and asserts the reverse companion is still
     // synthesized + published (with the old code it would be absent).
     let mut coordinator = Coordinator::new();
-    coordinator.forwarding = test_forwarding_state_split_rgs();
+    coordinator.set_forwarding_for_test(test_forwarding_state_split_rgs());
     let worker_commands = Arc::new(Mutex::new(VecDeque::new()));
 
     let entry = SyncedSessionEntry {
@@ -732,7 +732,8 @@ fn refusal_counters_are_per_coordinator_not_process_global() {
     );
 
     // Entry cap = 2 (logical override 1, doubled for the synthesized reverse).
-    busy.synced_import_cap_override = 1;
+    busy.synced_import_cap_override
+        .store(1, std::sync::atomic::Ordering::Relaxed);
     let commands = Arc::new(Mutex::new(VecDeque::new()));
     busy.workers.register(
         0,
@@ -893,7 +894,9 @@ fn upsert_synced_session_rejects_over_ceiling_import_and_does_not_fan_out() {
     // sessions. In production the logical ceiling is
     // `worker_count * DEFAULT_MAX_SESSIONS` and the entry cap is 2× that.
     const LOGICAL_CEILING: u16 = 3;
-    coordinator.synced_import_cap_override = LOGICAL_CEILING as usize;
+    coordinator
+        .synced_import_cap_override
+        .store(LOGICAL_CEILING as usize, std::sync::atomic::Ordering::Relaxed);
     let commands = Arc::new(Mutex::new(VecDeque::new()));
     coordinator.workers.register(
         0,
@@ -1012,7 +1015,9 @@ fn upsert_synced_session_rejects_over_ceiling_import_and_does_not_fan_out() {
 fn over_ceiling_import_rejected_on_poisoned_shared_mutex() {
     let mut coordinator = Coordinator::new();
     const LOGICAL_CEILING: u16 = 3;
-    coordinator.synced_import_cap_override = LOGICAL_CEILING as usize;
+    coordinator
+        .synced_import_cap_override
+        .store(LOGICAL_CEILING as usize, std::sync::atomic::Ordering::Relaxed);
     let commands = Arc::new(Mutex::new(VecDeque::new()));
     coordinator.workers.register(
         0,
@@ -1087,7 +1092,10 @@ fn over_ceiling_import_rejected_on_poisoned_shared_mutex() {
 fn synced_import_cap_production_formula_is_twice_the_logical_ceiling() {
     let mut coordinator = Coordinator::new();
     assert_eq!(
-        coordinator.synced_import_cap_override, 0,
+        coordinator
+            .synced_import_cap_override
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
         "this test must exercise the PRODUCTION formula — a nonzero override \
          short-circuits `synced_import_cap` before it is reached"
     );
@@ -1654,7 +1662,7 @@ fn kick_owner_rg_export_enqueues_command_then_wait_completes_on_ack() {
 /// purge finds it and `delete_synced_session` can remove it.
 fn coordinator_with_tunnel_session(tunnel_endpoint_id: u16) -> (Coordinator, SessionKey) {
     let mut coordinator = Coordinator::new();
-    coordinator.forwarding = ForwardingState::default();
+    coordinator.set_forwarding_for_test(ForwardingState::default());
     let mut decision = test_decision();
     decision.resolution.tunnel_endpoint_id = tunnel_endpoint_id;
     let key = test_key();
@@ -2236,7 +2244,7 @@ fn synced_import_zone_unresolved_counts_only_real_degradation_7209() {
     forwarding
         .zone_id_to_name
         .insert(TEST_WAN_ZONE_ID, "wan".to_string());
-    resolved.forwarding = forwarding;
+    resolved.set_forwarding_for_test(forwarding);
     assert!(
         crate::afxdp::session_glue::synced_source_nat_zone_pair(
             &resolved.forwarding,
@@ -2324,7 +2332,7 @@ fn reserve6600_entry(src_port: u16, pool_port: u16) -> SyncedSessionEntry {
 #[test]
 fn upsert_synced_session_refuses_import_whose_nat_port_is_locally_owned_6600() {
     let mut coordinator = Coordinator::new();
-    coordinator.forwarding = reserve6600_forwarding();
+    coordinator.set_forwarding_for_test(reserve6600_forwarding());
     let commands = Arc::new(Mutex::new(VecDeque::new()));
     coordinator.workers.register(
         0,
@@ -2418,7 +2426,7 @@ fn upsert_synced_session_refuses_import_whose_nat_port_is_locally_owned_6600() {
 #[test]
 fn upsert_synced_session_skips_pre_publish_reserve_with_no_workers_6600() {
     let mut coordinator = Coordinator::new();
-    coordinator.forwarding = reserve6600_forwarding();
+    coordinator.set_forwarding_for_test(reserve6600_forwarding());
 
     let entry = reserve6600_entry(40003, 50002);
     let key = entry.key.clone();
@@ -2477,7 +2485,7 @@ fn upsert_synced_session_skips_pre_publish_reserve_with_no_workers_6600() {
 #[test]
 fn upsert_synced_session_rolls_back_source_nat_when_nat64_refuses_6600() {
     let mut coordinator = Coordinator::new();
-    coordinator.forwarding = reserve6600_forwarding();
+    coordinator.set_forwarding_for_test(reserve6600_forwarding());
     coordinator.forwarding.nat64 = crate::nat64::Nat64State::from_snapshots(&[
         crate::NAT64RuleSnapshot {
             name: "nat64-wkp".to_string(),
@@ -2715,7 +2723,7 @@ fn coordinator_pre_publish_reserve_uses_the_workers_zone_pair_6600() {
     forwarding
         .zone_id_to_name
         .insert(TEST_WAN_ZONE_ID, "wan".to_string());
-    coordinator.forwarding = forwarding;
+    coordinator.set_forwarding_for_test(forwarding);
     let commands = Arc::new(Mutex::new(VecDeque::new()));
     coordinator.workers.register(
         0,
@@ -2824,7 +2832,9 @@ fn upsert_synced_session_reports_stale_generation_refusal_6785() {
 fn upsert_synced_session_reports_capacity_refusal_6785() {
     let mut coordinator = Coordinator::new();
     const LOGICAL_CEILING: u16 = 2;
-    coordinator.synced_import_cap_override = LOGICAL_CEILING as usize;
+    coordinator
+        .synced_import_cap_override
+        .store(LOGICAL_CEILING as usize, std::sync::atomic::Ordering::Relaxed);
     let commands = Arc::new(Mutex::new(VecDeque::new()));
     coordinator.workers.register(
         0,
@@ -2941,7 +2951,7 @@ fn f1_overlapping_forwarding() -> ForwardingState {
 #[test]
 fn a_pass1_refused_import_is_counted_and_not_published_6979_f1() {
     let mut coordinator = Coordinator::new();
-    coordinator.forwarding = f1_overlapping_forwarding();
+    coordinator.set_forwarding_for_test(f1_overlapping_forwarding());
     let commands = Arc::new(Mutex::new(VecDeque::new()));
     coordinator.workers.register(
         0,
@@ -3371,7 +3381,7 @@ fn a_deleted_synced_session_leaves_no_reverse_prewarm_key_after_a_route_moves_72
     // AT INSERT: ifindex 6 (the reply path to 10.0.61.102) belongs to RG 2,
     // while the entry's own metadata names RG 1 — two distinct buckets, which
     // is what makes the asymmetry observable at all.
-    coordinator.forwarding = test_forwarding_state_split_rgs();
+    coordinator.set_forwarding_for_test(test_forwarding_state_split_rgs());
     let entry = SyncedSessionEntry {
         key: test_key(),
         decision: test_decision(),
@@ -3407,7 +3417,7 @@ fn a_deleted_synced_session_leaves_no_reverse_prewarm_key_after_a_route_moves_72
 
     // A commit re-homes ifindex 6 from RG 2 to RG 1. Ordinary operator work;
     // the synced session is untouched and still live.
-    coordinator.forwarding = test_forwarding_state_with_fabric();
+    coordinator.set_forwarding_for_test(test_forwarding_state_with_fabric());
 
     coordinator.delete_synced_session(entry.key.clone());
 
@@ -3459,7 +3469,7 @@ fn a_deleted_synced_session_leaves_no_reverse_prewarm_key_after_a_route_moves_72
 #[test]
 fn deleting_one_synced_session_leaves_its_neighbours_in_the_reverse_prewarm_index_7209() {
     let mut coordinator = Coordinator::new();
-    coordinator.forwarding = test_forwarding_state_split_rgs();
+    coordinator.set_forwarding_for_test(test_forwarding_state_split_rgs());
 
     let doomed = SyncedSessionEntry {
         key: test_key(),
@@ -3555,7 +3565,7 @@ fn deleting_one_synced_session_leaves_its_neighbours_in_the_reverse_prewarm_inde
 #[test]
 fn a_route_move_adds_the_new_prewarm_filing_and_delete_clears_all_of_them_7209() {
     let mut coordinator = Coordinator::new();
-    coordinator.forwarding = test_forwarding_state_split_rgs();
+    coordinator.set_forwarding_for_test(test_forwarding_state_split_rgs());
     let entry = SyncedSessionEntry {
         key: test_key(),
         decision: test_decision(),
@@ -3578,7 +3588,7 @@ fn a_route_move_adds_the_new_prewarm_filing_and_delete_clears_all_of_them_7209()
     // ifindex 6 is genuinely RE-HOMED from RG 2 to RG 1 — the FIB can answer,
     // it just answers differently. Distinct from the blind-FIB case, and the
     // distinction is the whole reason both cells exist.
-    coordinator.forwarding = test_forwarding_state_with_fabric();
+    coordinator.set_forwarding_for_test(test_forwarding_state_with_fabric());
     assert_eq!(
         coordinator.upsert_synced_session(entry.clone()),
         SyncedImportOutcome::Applied,
@@ -3640,7 +3650,7 @@ fn a_removal_outside_the_delete_verb_still_unfiles_the_prewarm_key_7209() {
         ("B: promoted before removal", SessionOrigin::SharedPromote),
     ] {
         let mut coordinator = Coordinator::new();
-        coordinator.forwarding = test_forwarding_state_split_rgs();
+        coordinator.set_forwarding_for_test(test_forwarding_state_split_rgs());
         let entry = SyncedSessionEntry {
             key: test_key(),
             decision: test_decision(),
@@ -3717,7 +3727,7 @@ fn a_removal_outside_the_delete_verb_still_unfiles_the_prewarm_key_7209() {
 #[test]
 fn a_promoted_then_deleted_synced_session_leaves_no_prewarm_key_7209() {
     let mut coordinator = Coordinator::new();
-    coordinator.forwarding = test_forwarding_state_split_rgs();
+    coordinator.set_forwarding_for_test(test_forwarding_state_split_rgs());
     let entry = SyncedSessionEntry {
         key: test_key(),
         decision: test_decision(),
@@ -3810,7 +3820,7 @@ fn filed_under_7209(coordinator: &Coordinator, key: &SessionKey) -> Vec<i32> {
 #[test]
 fn a_refresh_never_drops_a_prewarm_filing_the_current_fib_cannot_rederive_7209() {
     let mut coordinator = Coordinator::new();
-    coordinator.forwarding = test_forwarding_state_split_rgs();
+    coordinator.set_forwarding_for_test(test_forwarding_state_split_rgs());
     let entry = SyncedSessionEntry {
         key: test_key(),
         decision: test_decision(),
@@ -3955,7 +3965,7 @@ fn an_import_under_an_emptied_forwarding_table_publishes_a_dead_reverse_companio
 
     // CONTROL: a populated table resolves the companion's reply path.
     let mut healthy = Coordinator::new();
-    healthy.forwarding = test_forwarding_state_split_rgs();
+    healthy.set_forwarding_for_test(test_forwarding_state_split_rgs());
     // HA state BEFORE the import, and it is load-bearing rather than setup:
     // `owner_rg_for_resolution` only names an RG for a resolution the node can
     // actually forward. With no RG locally active the reply path resolves to
@@ -4008,7 +4018,7 @@ fn an_import_under_an_emptied_forwarding_table_publishes_a_dead_reverse_companio
     // THE WINDOW: exactly what `stop_inner(false)` leaves behind, which is the
     // state a released lock would expose during the 500 ms mlx5 quiesce.
     let mut torn_down = Coordinator::new();
-    torn_down.forwarding = ForwardingState::default();
+    torn_down.set_forwarding_for_test(ForwardingState::default());
     assert_eq!(
         torn_down.upsert_synced_session(entry.clone()),
         SyncedImportOutcome::Applied,
@@ -4071,7 +4081,7 @@ fn an_import_under_an_emptied_forwarding_table_publishes_a_dead_reverse_companio
 fn the_reconcile_replay_rederives_a_dead_reverse_companion_7209() {
     let mut coordinator = Coordinator::new();
     // The window: torn-down forwarding, exactly as `stop_inner(false)` leaves.
-    coordinator.forwarding = ForwardingState::default();
+    coordinator.set_forwarding_for_test(ForwardingState::default());
     // HA state goes in FIRST, and the ordering is load-bearing rather than
     // setup. `update_ha_state` runs `prewarm_reverse_synced_sessions_for_owner_
     // rgs` on an RG ACTIVATION, which re-synthesizes every companion — so
@@ -4126,7 +4136,7 @@ fn the_reconcile_replay_rederives_a_dead_reverse_companion_7209() {
     // The reconcile now completes: `apply_snapshot` installs the new table
     // BEFORE `bring_up_workers` reaches the replay, which is what makes the
     // replay a repair point at all.
-    coordinator.forwarding = test_forwarding_state_split_rgs();
+    coordinator.set_forwarding_for_test(test_forwarding_state_split_rgs());
     let replay_entries = coordinator.snapshot_shared_session_entries();
     assert!(
         replay_entries.iter().any(|e| e.key == reverse_key),
@@ -4240,7 +4250,7 @@ fn the_reconcile_replay_rederives_a_dead_reverse_companion_7209() {
 #[test]
 fn stop_inner_empties_the_forwarding_table_that_a_released_lock_would_expose_7209() {
     let mut coordinator = Coordinator::new();
-    coordinator.forwarding = test_forwarding_state_split_rgs();
+    coordinator.set_forwarding_for_test(test_forwarding_state_split_rgs());
     assert!(
         !coordinator.forwarding.egress.is_empty(),
         "fixture starts with an EMPTY table, so it cannot show that stop_inner \
@@ -4362,8 +4372,7 @@ fn purge8138_port_held(
 #[test]
 fn tunnel_remap_purge_releases_untracked_reservation_on_refresh_8138() {
     let mut coordinator = Coordinator::new();
-    coordinator.forwarding =
-        crate::afxdp::forwarding_build::build_forwarding_state(&purge8138_snapshot(true));
+    coordinator.set_forwarding_for_test(crate::afxdp::forwarding_build::build_forwarding_state(&purge8138_snapshot(true)));
     coordinator.validation.snapshot_installed = true;
     assert!(
         coordinator.forwarding.tunnel_endpoints.contains_key(&7),
@@ -4432,8 +4441,7 @@ fn tunnel_remap_purge_releases_untracked_reservation_on_refresh_8138() {
 #[test]
 fn purge_release_against_defaulted_forwarding_frees_nothing_and_counts_nothing_8138() {
     let mut coordinator = Coordinator::new();
-    coordinator.forwarding =
-        crate::afxdp::forwarding_build::build_forwarding_state(&purge8138_snapshot(true));
+    coordinator.set_forwarding_for_test(crate::afxdp::forwarding_build::build_forwarding_state(&purge8138_snapshot(true)));
     register_test_worker_7209(&mut coordinator);
 
     let allocs = std::sync::Arc::clone(&coordinator.forwarding.iface_nat_allocators);
@@ -4468,8 +4476,7 @@ fn purge_release_against_defaulted_forwarding_frees_nothing_and_counts_nothing_8
 #[test]
 fn purge_of_a_session_without_snat_counts_no_release_8138() {
     let mut coordinator = Coordinator::new();
-    coordinator.forwarding =
-        crate::afxdp::forwarding_build::build_forwarding_state(&purge8138_snapshot(true));
+    coordinator.set_forwarding_for_test(crate::afxdp::forwarding_build::build_forwarding_state(&purge8138_snapshot(true)));
     register_test_worker_7209(&mut coordinator);
 
     // Same session shape, but no source-NAT rewrite: nothing was ever reserved.
@@ -4564,7 +4571,7 @@ fn both_purge_call_sites_release_against_new_forwarding_8138() {
 #[test]
 fn upsert_synced_session_refuses_standalone_reverse_8015() {
     let mut coordinator = Coordinator::new();
-    coordinator.forwarding = test_forwarding_state_with_fabric();
+    coordinator.set_forwarding_for_test(test_forwarding_state_with_fabric());
     let commands = Arc::new(Mutex::new(VecDeque::new()));
     coordinator.workers.register(
         0,
@@ -4686,9 +4693,11 @@ fn upsert_synced_session_refuses_standalone_reverse_8015() {
 #[test]
 fn cap_rejected_forward_leaves_no_orphan_reverse_8015() {
     let mut coordinator = Coordinator::new();
-    coordinator.forwarding = test_forwarding_state_with_fabric();
+    coordinator.set_forwarding_for_test(test_forwarding_state_with_fabric());
     const LOGICAL_CEILING: u16 = 1;
-    coordinator.synced_import_cap_override = LOGICAL_CEILING as usize;
+    coordinator
+        .synced_import_cap_override
+        .store(LOGICAL_CEILING as usize, std::sync::atomic::Ordering::Relaxed);
     let commands = Arc::new(Mutex::new(VecDeque::new()));
     coordinator.workers.register(
         0,

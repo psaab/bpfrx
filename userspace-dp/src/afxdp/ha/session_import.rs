@@ -96,7 +96,19 @@ impl SyncedImportOutcome {
     }
 }
 
-impl crate::afxdp::Coordinator {
+// #7209: this whole block moved from `impl Coordinator` to the SESSION DOMAIN
+// handle. Nothing in it needed the coordinator — the reference set is exactly
+// `sessions`, `forwarding`, `bpf_maps`, `workers`, `ha.rg_runtime` and
+// `dynamic_neighbors_ref`, every one of which is already shared state — and the
+// type system had already proved the subgraph `&self`-only, since
+// `upsert_synced_session(&self)` compiled.
+//
+// The one substantive change is the FORWARDING source: these reads were
+// `Coordinator::forwarding`, the owned field, and are now the PUBLISHED
+// `RuntimeView` — the same state the packet workers hold. See
+// `session_domain.rs` for why that is the more correct source rather than a
+// concession, and why the two cannot diverge in production.
+impl crate::afxdp::ha::SessionDomain {
     /// #5674: this appliance's aggregate synced-session ENTRY ceiling. The
     /// LOGICAL ceiling is `worker_count * DEFAULT_MAX_SESSIONS` (each worker
     /// table caps locally-created sessions at `DEFAULT_MAX_SESSIONS`), but the
@@ -141,16 +153,24 @@ impl crate::afxdp::Coordinator {
     /// register N workers and would have stayed green with the live path
     /// reading anything at all. Keeping the map as the parameter keeps the
     /// sourcing inside the one function those assertions drive.
-    pub(super) fn synced_import_cap_for(
+    pub(in crate::afxdp) fn synced_import_cap_for(
         &self,
         records: &std::collections::BTreeMap<u32, std::sync::Arc<crate::afxdp::coordinator::WorkerRuntimeRecord>>,
     ) -> usize {
         #[cfg(test)]
-        if self.synced_import_cap_override != 0 {
-            // The override expresses a LOGICAL session ceiling; double it to the
-            // ENTRY cap (fwd + synthesized reverse per logical session), matching
-            // the production formula below so tests exercise the real arithmetic.
-            return self.synced_import_cap_override.saturating_mul(2);
+        {
+            // #7209: the override is read through the SHARED cell, so a test
+            // that sets it on the `Coordinator` reaches this handle.
+            let override_cap = self
+                .synced_import_cap_override
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if override_cap != 0 {
+                // The override expresses a LOGICAL session ceiling; double it to
+                // the ENTRY cap (fwd + synthesized reverse per logical session),
+                // matching the production formula below so tests exercise the
+                // real arithmetic.
+                return override_cap.saturating_mul(2);
+            }
         }
         records
             .len()
@@ -175,8 +195,15 @@ impl crate::afxdp::Coordinator {
 
     fn reserve_synced_translation(&self, entry: &SyncedSessionEntry) -> bool {
         let now_ns = monotonic_nanos();
+        // #7209: ONE load of the published view, bound for the whole call. Two
+        // loads inside one import can straddle a publish and resolve the
+        // session's zones against one generation and its NAT against another —
+        // the pairing defect #6592 closed, reintroduced at a different layer.
+        let view = self.runtime_view();
+        let forwarding = view.forwarding();
+
         let zones = crate::afxdp::session_glue::synced_source_nat_zone_pair(
-            &self.forwarding,
+            forwarding,
             &entry.metadata,
         );
         // #7209: count the degraded path. Bumped HERE, on the coordinator's
@@ -204,8 +231,8 @@ impl crate::afxdp::Coordinator {
                 .fetch_add(1, Ordering::Relaxed);
         }
         if !crate::nat::reserve_synced_source_nat_allocation_untracked(
-            &self.forwarding.iface_nat_allocators,
-            &self.forwarding.source_nat_rules,
+            &forwarding.iface_nat_allocators,
+            &forwarding.source_nat_rules,
             &entry.key,
             entry.decision.nat,
             entry.metadata.is_reverse,
@@ -215,15 +242,15 @@ impl crate::afxdp::Coordinator {
             return false;
         }
         if !crate::nat64::reserve_synced_nat64_allocation(
-            &self.forwarding.nat64,
+            &forwarding.nat64,
             &entry.key,
             entry.decision.nat,
             entry.metadata.is_reverse,
             now_ns,
         ) {
             crate::nat::release_source_nat_allocation(
-                &self.forwarding.iface_nat_allocators,
-                &self.forwarding.source_nat_rules,
+                &forwarding.iface_nat_allocators,
+                &forwarding.source_nat_rules,
                 &entry.key,
                 entry.decision.nat,
                 entry.metadata.is_reverse,
@@ -328,6 +355,13 @@ impl crate::afxdp::Coordinator {
         if entry.metadata.is_reverse {
             return SyncedImportOutcome::RejectedStandaloneReverse;
         }
+        // #7209: ONE load of the published view, bound for the whole call. Two
+        // loads inside one import can straddle a publish and resolve the
+        // session's zones against one generation and its NAT against another —
+        // the pairing defect #6592 closed, reintroduced at a different layer.
+        let view = self.runtime_view();
+        let forwarding = view.forwarding();
+
         // #7209: ONE snapshot of the worker set for this whole import.
         //
         // Three decisions below ask about the workers — the admission cap, the
@@ -344,9 +378,9 @@ impl crate::afxdp::Coordinator {
         // Pinning the snapshot here makes the import internally consistent
         // whatever the reconcile does, which is the property the mutex was
         // providing incidentally.
-        let worker_records = self.workers.records_snapshot();
+        let worker_records = Arc::clone(&self.workers.load());
         let now_secs = monotonic_nanos() / 1_000_000_000;
-        let ha_state = self.ha.rg_runtime.load();
+        let ha_state = self.rg_runtime.load();
         // #5154: read the stored entry AND the map length under ONE RECOVERED
         // critical section. Both reads feed a REFUSAL decision (the #2170
         // generation guard and the #5674 admission bound), and every write
@@ -458,9 +492,9 @@ impl crate::afxdp::Coordinator {
         }
         let reverse_entry = if !entry.metadata.is_reverse {
             synthesized_synced_reverse_entry(
-                &self.forwarding,
+                forwarding,
                 ha_state.as_ref(),
-                self.dynamic_neighbors_ref(),
+                &self.dynamic_neighbors,
                 &entry,
                 now_secs,
             )
@@ -570,8 +604,8 @@ impl crate::afxdp::Coordinator {
         }
         refresh_reverse_prewarm_owner_rg_indexes(
             &self.sessions.owner_rg_indexes.reverse_prewarm_sessions,
-            &self.forwarding,
-            self.dynamic_neighbors_ref(),
+            forwarding,
+            &self.dynamic_neighbors,
             previous_entry.as_ref(),
             Some(&entry),
         );
@@ -633,6 +667,13 @@ impl crate::afxdp::Coordinator {
     /// generation-aware deletes. A delete_gen of 0, or a stored generation of
     /// 0, falls back to unconditional delete (rolling-upgrade safe).
     pub fn delete_synced_session_gen(&self, key: SessionKey, delete_gen: u64) {
+        // #7209: ONE load of the published view, bound for the whole call. Two
+        // loads inside one import can straddle a publish and resolve the
+        // session's zones against one generation and its NAT against another —
+        // the pairing defect #6592 closed, reintroduced at a different layer.
+        let view = self.runtime_view();
+        let forwarding = view.forwarding();
+
         // #5154: RECOVER the poison on this read (same policy as the write
         // below, which reaches the map through `remove_shared_session` ->
         // `lock_shared_recover`). With `.lock().ok()` a poisoned mutex read as
@@ -700,8 +741,8 @@ impl crate::afxdp::Coordinator {
         );
         refresh_reverse_prewarm_owner_rg_indexes(
             &self.sessions.owner_rg_indexes.reverse_prewarm_sessions,
-            &self.forwarding,
-            self.dynamic_neighbors_ref(),
+            forwarding,
+            &self.dynamic_neighbors,
             removed_entry.as_ref(),
             None,
         );
@@ -751,7 +792,7 @@ impl crate::afxdp::Coordinator {
         // process-wide session-map delete already ran above, so the NAT
         // reservation is the part with no other owner. The wider signal is
         // `WORKER_COMMAND_QUEUE_DROPS`.
-        for (worker_id, rec) in self.workers.records().iter() {
+        for (worker_id, rec) in self.workers.load().iter() {
             // #1790/#1807: recover-and-push instead of silently skipping a
             // poisoned queue (same policy as update_ha_state).
             let mut pending = worker_queue::lock_recover(&rec.handle.commands);
@@ -794,12 +835,18 @@ impl crate::afxdp::Coordinator {
         key: &SessionKey,
         worker_id: u32,
     ) {
+        // #7209: ONE load of the published view, bound for the whole call. Two
+        // loads inside one import can straddle a publish and resolve the
+        // session's zones against one generation and its NAT against another —
+        // the pairing defect #6592 closed, reintroduced at a different layer.
+        let view = self.runtime_view();
+        let forwarding = view.forwarding();
         self.sessions
             .delete_dropped_released
             .fetch_add(1, Ordering::Relaxed);
         crate::nat::release_source_nat_allocation_for_worker(
-            &self.forwarding.iface_nat_allocators,
-            &self.forwarding.source_nat_rules,
+            &forwarding.iface_nat_allocators,
+            &forwarding.source_nat_rules,
             key,
             entry.decision.nat,
             entry.metadata.is_reverse,

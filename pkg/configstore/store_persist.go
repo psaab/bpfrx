@@ -485,12 +485,30 @@ func (s *Store) persistRetryLoop(backoff, maxBackoff time.Duration) {
 			}
 		}
 
-		if s.confirmRemoveDegraded {
+		if s.confirmRemoveDegraded && s.confirmRemovalSupersededLocked() {
+			// #7675: a NEWER `commit confirmed` durably replaced the record this
+			// debt was taken for. WriteConfirm is temp+fsync+rename+dir-fsync, so
+			// the record we owed a removal for is already gone and the debt is
+			// satisfied. Re-driving DeleteConfirm here would delete the LIVE
+			// window's crash-recovery file — measured deterministic on master:
+			// the in-memory timer stays armed so nothing looks wrong, and a
+			// restart before the new deadline then leaves the UNCONFIRMED config
+			// standing with no rollback (#4577).
+			s.confirmRemoveDegraded = false
+			s.confirmRemoveDebtID = ""
+			s.journalLog(&JournalEntry{
+				Action: "confirm_remove_superseded",
+				Detail: "pending commit-confirmed removal debt cleared: a newer armed window durably replaced the record",
+			})
+			slog.Info("pending commit-confirmed removal debt cleared: a newer armed window "+
+				"durably replaced the record it was owed for", "issue", "#7675")
+		} else if s.confirmRemoveDegraded {
 			// #5835: re-drive the stale confirm.json removal. DeleteConfirm
 			// reaches the #4864 dir fsync even when the file is already absent,
 			// so an "unlink succeeded, dir-sync owed" state converges here.
 			if err := s.removeConfirmState(); err == nil {
 				s.confirmRemoveDegraded = false
+				s.confirmRemoveDebtID = ""
 				s.journalLog(&JournalEntry{
 					Action: "confirm_remove_recovered",
 					Detail: "stale pending commit-confirmed record removed after earlier failure",

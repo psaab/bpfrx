@@ -114,7 +114,7 @@ impl crate::afxdp::Coordinator {
             }
         }
         for key in &keys {
-            self.delete_synced_session(key.clone());
+            self.session_domain.delete_synced_session(key.clone());
         }
         // #8138: release the coordinator's import-time reservation.
         //

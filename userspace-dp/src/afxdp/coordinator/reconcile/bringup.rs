@@ -468,10 +468,13 @@ fn publish_runtime(
 /// `filter_replayed_synced_sessions` predicate the snapshot phase used, not a
 /// paraphrase, so the two cannot disagree about what a purged tunnel is.
 ///
-/// NOT REACHABLE TODAY: the snapshot-wide `ServerState` mutex excludes
-/// `sync_session` for the whole reconcile, so nothing can arrive in the window
-/// this closes. #7209 is what makes it reachable, and this is its prerequisite
-/// — landing it afterwards would mean shipping the race first.
+/// REACHABLE AS OF #7209. This was written as a prerequisite, with the note
+/// that the snapshot-wide `ServerState` mutex excluded `sync_session` for the
+/// whole reconcile so nothing could arrive in the window it closes — landing it
+/// afterwards would have meant shipping the race first. #7209 has since taken
+/// `sync_session` off that mutex, so an import CAN now land mid-reconcile and
+/// this read is what includes it. The ordering held: the guard was in place
+/// before the race it guards became possible.
 /// Visibility is `pub(in crate::afxdp)` for the #8157 test in `ha_tests.rs`,
 /// which reuses that module's synced-session fixtures rather than duplicating
 /// them here — a duplicated fixture is a fixture that drifts.

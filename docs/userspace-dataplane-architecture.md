@@ -443,6 +443,85 @@ drops the representative packet, and the #1651 protection is untouched
 everywhere else (a hop pins ≤1 `pending_neigh` entry post-#1771 §2.2, so the
 cache was buying nothing here).
 
+### The `bind-interface`-only secure tunnel, and why it needed a row (#7949)
+
+The block above assumes a LAN→tunnel packet *reaches* an egress that names the
+xfrmi. For one blessed config shape it did not.
+
+#4515 accepts a secure tunnel named ONLY through `bind-interface`, with no
+`set interfaces` stanza at all:
+
+```
+set security ipsec vpn v bind-interface st0.0
+set security zones security-zone vpn interfaces st0.0
+```
+
+`buildInterfaceSnapshotsFrom` iterates `cfg.Interfaces.Interfaces` — the config
+map this shape is absent from by definition — so the snapshot carried **no row**
+for the tunnel. `populate_interfaces` (`forwarding_build/interfaces.rs`)
+populates `name_to_ifindex` / `linux_to_ifindex` only for rows with
+`ifindex > 0`, so `resolve_ifindex` missed on both maps, the interface-only next
+hop `@st0.0` collapsed to ifindex 0, and the lookup returned **`NoRoute`**.
+`NoRoute` is slow-path eligible, so on a `default-policy permit-all` box the
+frame was reinjected and the **kernel** forwarded it: no session, no NAT, no
+screen, no egress zone policy. #7480's `noroute_policy_denial` closes this on a
+deny-all default — it evaluates with to-zone 0, which falls through to the
+default action — but not on permit-all. The zone assignment committed cleanly
+and read as enforced throughout.
+
+**The same tunnel written WITH a stanza (Shape A) already produced the row**, and
+has since #5619, which recorded the identical transition for the other naming
+bug in this area (`bind-interface st0.0 : NoRoute before -> MissingNeighbor
+after`). So the fix is a **convergence of two spellings onto one behaviour**, not
+a new dataplane state: `appendBindInterfaceOnlySecureTunnelRows`
+(`pkg/dataplane/userspace/secure_tunnel_bind_only_7949.go`) appends a row that is
+field-identical to Shape A's, and
+`TestBindOnlyTunnelRowMatchesTheStanzaSpelling7949` asserts that agreement rather
+than pinning either side to a literal. That is what settles the per-consumer
+question #7949 asks: every consumer's disposition toward a zoned secure-tunnel
+row is already shipped, reviewed behaviour, so the decision is "the two spellings
+of one tunnel behave the same" rather than five independent judgements.
+
+Four properties are load-bearing and each is pinned:
+
+- **The row exists only alongside an authored zone.** The synthesis iterates
+  `authoredZoneRefs`, so a tunnel the operator never zoned keeps today's
+  behaviour exactly. An unzoned row would buy nothing — egress zone 0 skips
+  every rule tier, including `from-zone any to-zone any`, and falls through to
+  the default action, which is where the `NoRoute` path already lands — while
+  still moving the flow off the kernel path.
+- **`SecureTunnel` is derived, never defaulted.** A row appended outside the
+  builder loop defaults both `Tunnel` and `SecureTunnel` to `false` and escapes
+  BOTH `netdevExclusionClasses` entries (`Tunnel` is stanza-derived, so it is
+  false for this shape either way). The flag comes from `snapshotSecureTunnel`
+  with the ref that names the row, and is true by construction: the same oracle
+  (`SecureTunnelNetdevForRef`) both admits the row and sets the flag.
+- **One row per device.** Both `st0` and `st0.0` can be authored as zone
+  references for one tunnel, and under `bind-interface st0` both resolve to the
+  netdev `st0`. Two rows on one ifindex is an egress-zone claim CONFLICT in the
+  helper, which is sticky and unzones the egress for the whole ifindex.
+- **`out` and `idents` grow together.** `stampEgressZones` returns early unless
+  the two slices are the same length, so appending a row without its
+  `egressRowIdentity` would silently disable the #6722 egress decision for the
+  entire snapshot — not just for the new row.
+
+An if_id COLLISION produces no row: `SecureTunnelNetdevForRef` refuses to name a
+device because `pkg/routing/xfrm.go` creates neither, and gating on that resolver
+inherits the fail-closed answer rather than re-deriving it.
+
+**A stale claim this corrects.** #7949's R1 says a row with no zone "denies under
+every policy measured, including a `from-zone any to-zone any permit` wildcard —
+the tunnel goes dark", and treats that as an outage risk requiring the zone to be
+authored in the same change. The first half is right — `policy.rs` gates every
+rule tier, both-any included, behind `from_id != 0 && to_id != 0`. The conclusion
+is not: only a zero INGRESS zone is hard-denied (#6682), while a zero EGRESS zone
+falls through to `state.default_action`, and that block says why in as many words
+— *"#6713: an xfrmi tunnel egress resolved to 0 … denying on `to_id` would risk
+black-holing a correctly-configured path"*. The measurement behind R1 was taken
+with the box's default action held fixed at deny; "goes dark" is a property of
+that default, not of zone 0. The zone gate is kept anyway, as a scope decision
+rather than an outage guard.
+
 `pending_neigh_admission` returns one of three outcomes, each counted
 separately so an operator can tell normal cold-start coalescing from an
 exhaustion/attack mode (`record_pending_neigh_admission_drop`,

@@ -51,13 +51,32 @@ fn new_state(status: ProcessStatus) -> Arc<Mutex<ServerState>> {
 /// dispatcher over a socketpair, exactly as the daemon's accept loop
 /// does. Returns the decoded `ControlResponse`.
 fn run_request(state: Arc<Mutex<ServerState>>, request: ControlRequest) -> ControlResponse {
+    // #7209: derived here, with nothing else holding the mutex — the same shape
+    // as production, where `lifecycle.rs` clones ONE handle at startup and hands
+    // it to both socket loops. A caller that is deliberately holding the lock
+    // must use `run_request_with_domain` and take its handle first, or the
+    // derivation itself becomes the thing that blocks and the cell measures the
+    // harness rather than the dispatcher.
+    let session_domain = state.lock().expect("state").afxdp.session_domain().clone();
+    run_request_with_domain(state, request, session_domain)
+}
+
+/// `run_request` with the session-domain handle supplied by the caller, for a
+/// cell that holds the `ServerState` mutex across the request (#7209).
+fn run_request_with_domain(
+    state: Arc<Mutex<ServerState>>,
+    request: ControlRequest,
+    session_domain: crate::afxdp::SessionDomain,
+) -> ControlResponse {
     let state_file = unique_state_file(&request.request_type);
     let (mut client, server) =
         std::os::unix::net::UnixStream::pair().expect("control socket pair");
     let running = Arc::new(AtomicBool::new(true));
     let handle = {
         let state_file = state_file.clone();
-        std::thread::spawn(move || handle_stream(server, &state_file, state, running))
+        std::thread::spawn(move || {
+            handle_stream(server, &state_file, state, running, session_domain)
+        })
     };
 
     serde_json::to_writer(&mut client, &request).expect("write request");
@@ -86,7 +105,10 @@ fn run_request_on_file(
     let running = Arc::new(AtomicBool::new(true));
     let handle = {
         let state_file = state_file.to_string();
-        std::thread::spawn(move || handle_stream(server, &state_file, state, running))
+        {
+            let sd = state.lock().expect("state").afxdp.session_domain().clone();
+            std::thread::spawn(move || handle_stream(server, &state_file, state, running, sd))
+        }
     };
 
     serde_json::to_writer(&mut client, &request).expect("write request");
@@ -124,7 +146,10 @@ fn run_raw(state: Arc<Mutex<ServerState>>, payload: &[u8]) -> Result<(), String>
     let running = Arc::new(AtomicBool::new(true));
     let handle = {
         let state_file = state_file.clone();
-        std::thread::spawn(move || handle_stream(server, &state_file, state, running))
+        {
+            let sd = state.lock().expect("state").afxdp.session_domain().clone();
+            std::thread::spawn(move || handle_stream(server, &state_file, state, running, sd))
+        }
     };
     client.write_all(payload).expect("write raw payload");
     // Drop the write half so the handler sees EOF; an oversize body with
@@ -2559,8 +2584,11 @@ fn sync_session_is_served_during_a_forwarding_settle_wait() {
 /// The request is REJECTED (no payload) and that is irrelevant: what is
 /// asserted is that it was DISPATCHED promptly rather than queued. Asserting on
 /// the response would bind the wrong property.
+/// UN-`#[ignore]`d by the change that satisfies it. It was written before the
+/// fix so the fix had a red to work against; leaving the attribute on would
+/// have left a guard whose stated reason names a condition that no longer
+/// holds, which rots quietly and protects nothing.
 #[test]
-#[ignore = "#7209: reds until sync_session is taken off the snapshot-wide ServerState mutex"]
 fn sync_session_is_served_while_the_state_lock_is_held_7209() {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
@@ -2572,6 +2600,10 @@ fn sync_session_is_served_while_the_state_lock_is_held_7209() {
     const SERVED_WITHIN_MS: u64 = 500;
 
     let state = never_settling_state();
+    // #7209: taken BEFORE the holder acquires, as `lifecycle.rs` takes it before
+    // the daemon serves anything. Deriving it inside the measured request would
+    // block on the holder and time the harness instead of the dispatcher.
+    let session_domain = state.lock().expect("state").afxdp.session_domain().clone();
 
     // A holder standing in for any of the four long operations apply_snapshot
     // performs under the lock. `holding` reports that the lock is actually
@@ -2598,7 +2630,7 @@ fn sync_session_is_served_while_the_state_lock_is_held_7209() {
         .expect("holder never acquired the state lock");
 
     let t0 = Instant::now();
-    let resp = run_request(state.clone(), req("sync_session"));
+    let resp = run_request_with_domain(state.clone(), req("sync_session"), session_domain);
     let elapsed = t0.elapsed();
     let _ = release_tx.send(());
     holder.join().expect("holder thread");
@@ -2646,8 +2678,9 @@ fn sync_session_is_served_while_the_state_lock_is_held_7209() {
 /// Both operations, because #5380 aborts the remainder of a bulk batch on the
 /// first transport failure and a batch carries both verbs; a fix that freed
 /// only one would still drop mirrors.
+/// UN-`#[ignore]`d by the change that satisfies it — the verb body now runs off
+/// the mutex, not merely its dispatch.
 #[test]
-#[ignore = "#7209: reds until the sync_session VERB, not merely its dispatch, is off the snapshot-wide ServerState mutex"]
 fn sync_session_real_payload_is_served_while_the_state_lock_is_held_7209() {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
@@ -2693,6 +2726,8 @@ fn sync_session_real_payload_is_served_while_the_state_lock_is_held_7209() {
         ("delete", delete_request as fn() -> ControlRequest),
     ] {
         let state = never_settling_state();
+        // #7209: taken before the holder acquires, as `lifecycle.rs` does.
+        let session_domain = state.lock().expect("state").afxdp.session_domain().clone();
 
         // Same holder shape as the cell above: `holding` reports that the lock
         // is actually taken, so the measurement cannot start before contention
@@ -2710,7 +2745,7 @@ fn sync_session_real_payload_is_served_while_the_state_lock_is_held_7209() {
             .expect("holder never acquired the state lock");
 
         let t0 = Instant::now();
-        let resp = run_request(state.clone(), build());
+        let resp = run_request_with_domain(state.clone(), build(), session_domain);
         let elapsed = t0.elapsed();
         let _ = release_tx.send(());
         holder.join().expect("holder thread");
@@ -3639,7 +3674,10 @@ fn drain_session_deltas_survive_write_state_failure_5294() {
     let running = Arc::new(AtomicBool::new(true));
     let handle = {
         let bad = bad_state_file.clone();
-        std::thread::spawn(move || handle_stream(server, &bad, state, running))
+        {
+            let sd = state.lock().expect("state").afxdp.session_domain().clone();
+            std::thread::spawn(move || handle_stream(server, &bad, state, running, sd))
+        }
     };
 
     serde_json::to_writer(&mut client, &request).expect("write request");
@@ -4413,7 +4451,8 @@ fn sync_session_upsert_reports_a_semantic_refusal_on_the_wire_6785() {
         .lock()
         .expect("state")
         .afxdp
-        .synced_import_cap_override = 1;
+        .synced_import_cap_override
+        .store(1, std::sync::atomic::Ordering::Relaxed);
 
     // Control on the SAME state: the first import must still answer ok, so this
     // cell cannot pass on a handler that reports a refusal unconditionally.
@@ -5135,4 +5174,129 @@ fn session_counters_refuses_mixed_address_families_7919() {
         "got: {}",
         response.error
     );
+}
+
+// --- #7209: `sync_session` served WHILE `apply_snapshot` holds the mutex -----
+//
+// THIS IS THE ONE THE ISSUE'S SCOPE ITEM 4 ASKS FOR, and nothing covered it.
+// The two existing deadline cells assert a `status` poll, and #5862's pair only
+// covers the binding settle. Neither drives the verb whose starvation is the
+// defect.
+//
+// WHY THE STARVATION COSTS SESSIONS RATHER THAN LATENCY. `apply_snapshot` holds
+// `ServerState` across a 10 s worker-readiness barrier, a 500 ms mlx5 teardown
+// quiesce, worker `join()`s and BPF map-pin opens. Go budgets 3 s for a session
+// round-trip (`sessionSyncRoundtripDeadline`) and #5380 ABORTS the remainder of
+// a bulk batch on the first transport failure — so one blocked import takes up
+// to 255 session mirrors with it, during the failover the path exists to serve.
+//
+// THE ASSERTION IS THE SERVICE, NOT THE ABSENCE OF A STALL. A cell that merely
+// timed the request would pass on a build where the dispatch change never took
+// effect but the lock happened to be free. This one holds the lock for the whole
+// request and asserts the import was ANSWERED and APPLIED anyway.
+
+/// Hold the `ServerState` mutex the way a long `apply_snapshot` does, and
+/// require a `sync_session` to complete anyway.
+///
+/// FAIL-ON-REVERT: route the verb back through `state.lock()` and the request
+/// blocks until this guard drops, so the bounded receive below times out. The
+/// bound is what makes the mutant a KILL rather than a hang — a test whose
+/// subject fails by blocking forever reports nothing at all.
+#[test]
+fn sync_session_import_is_applied_while_the_state_lock_is_held_7209() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let state = new_state(ProcessStatus::default());
+    let session_domain = state
+        .lock()
+        .expect("state")
+        .afxdp
+        .session_domain()
+        .clone();
+
+    let mut request = req("sync_session");
+    // DELIBERATELY NOT setting `suppress_status`, though both daemon senders do.
+    // The property is that this verb never queues behind the mutex — full stop,
+    // not "provided the caller asked for no status". An implementation that
+    // took the lock for a status attach would leave the verb starvable by any
+    // caller that omitted the flag, and this cell would not see it.
+    request.session_sync = Some(SessionSyncRequest {
+        operation: "upsert".to_string(),
+        addr_family: 2,
+        protocol: 6,
+        src_ip: "10.0.0.1".to_string(),
+        dst_ip: "10.0.0.2".to_string(),
+        src_port: 4321,
+        dst_port: 80,
+        egress_ifindex: 7,
+        neighbor_mac: "02:bf:72:01:02:03".to_string(),
+        src_mac: "02:bf:72:0a:0b:0c".to_string(),
+        ..SessionSyncRequest::default()
+    });
+
+    // The barrier `apply_snapshot` would be sitting in. Held for the WHOLE
+    // request, not merely overlapping its start: a guard released early would
+    // let the old locked dispatch pass too.
+    let blocker = state.lock().expect("state");
+
+    let state_file = unique_state_file("sync_session_contention_7209");
+    let (mut client, server) =
+        std::os::unix::net::UnixStream::pair().expect("control socket pair");
+    let running = Arc::new(AtomicBool::new(true));
+    let (tx, rx) = mpsc::channel();
+    let handler = {
+        let state = state.clone();
+        let state_file = state_file.clone();
+        std::thread::spawn(move || {
+            let result = handle_stream(server, &state_file, state, running, session_domain);
+            let _ = tx.send(());
+            result
+        })
+    };
+
+    serde_json::to_writer(&mut client, &request).expect("write request");
+    std::io::Write::write_all(&mut client, b"\n").expect("newline");
+
+    // Well inside Go's 3 s round-trip budget, and generous enough that a loaded
+    // CI box does not flake. The defect is an unbounded wait on a 10 s barrier,
+    // so the gap between pass and fail is not marginal.
+    let started = Instant::now();
+    let served = rx.recv_timeout(Duration::from_secs(2));
+    assert!(
+        served.is_ok(),
+        "a sync_session was NOT served while the ServerState mutex was held. \
+         That is the defect: the HA session socket has its own thread (#452) but \
+         dispatched through the snapshot-wide mutex, so an import arriving during \
+         an apply_snapshot waits on a 10 s barrier against a 3 s deadline — and \
+         #5380 drops the rest of the bulk batch behind it. Waited {:?}",
+        started.elapsed()
+    );
+
+    let response: ControlResponse =
+        serde_json::from_reader(std::io::BufReader::new(client)).expect("read response");
+    assert!(
+        response.ok,
+        "the import must be APPLIED, not merely answered — a handler that \
+         returned early without importing would satisfy the timing assertion \
+         above while losing the session: {}",
+        response.error
+    );
+
+    // And it really did land in the shared session map, read through the SAME
+    // handle the off-lock dispatch used. Asserting on the response alone would
+    // pass for a handler that acked without publishing.
+    assert!(
+        blocker.afxdp.session_domain().synced_entry_count() > 0,
+        "the imported session must be present in the shared synced map while the \
+         mutex is still held, which is what proves the import ran off-lock \
+         rather than after this guard dropped"
+    );
+
+    drop(blocker);
+    handler
+        .join()
+        .expect("handler thread")
+        .expect("handler result");
+    let _ = std::fs::remove_file(&state_file);
 }
