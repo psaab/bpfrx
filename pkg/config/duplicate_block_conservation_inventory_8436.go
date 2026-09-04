@@ -93,7 +93,13 @@ var dupConservationSkipped8436 = []string{
 	// This is the site that motivated pinning the skip set.
 	"services rpm probe xpfname test",
 
-	// ---- "second leaf not observable in the typed config" (15). ----
+	// ---- "second leaf not observable in the typed config" (14). ----
+	//
+	// #8662: was 15. `system login user` left this list when the compact/block
+	// census's value synthesis learned to read the schema's valueHint — its
+	// second leaf became observable, so the skip entry was claiming a blindness
+	// the census no longer has. The two censuses share synthPair, so an
+	// improvement to the instrument moves both.
 	//
 	// The census's own VACUITY guard, and structurally uninteresting for this
 	// property rather than unverified: the merged form compiles identically to a
@@ -110,7 +116,6 @@ var dupConservationSkipped8436 = []string{
 	"routing-options static route xpfname qualified-next-hop",
 	"security ipsec proposal",
 	"security log stream",
-	"system login user",
 	"system services dhcp-local-server group xpfname interface",
 	"system services dhcpv6-local-server group xpfname interface",
 	"system syslog file",
