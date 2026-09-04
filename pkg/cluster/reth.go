@@ -4,6 +4,7 @@ package cluster
 
 import (
 	"fmt"
+	"github.com/psaab/xpf/pkg/config"
 	"log/slog"
 	"net"
 	"sync"
@@ -129,7 +130,11 @@ func (rc *RethController) RethIPs(rethName string) ([]net.IP, error) {
 // shared MAC on two member interfaces in one L2 domain makes the switch see one
 // address on two ports. Operator-facing statement: docs/feature-coverage.md.
 func RethMAC(clusterID, rgID, nodeID int) net.HardwareAddr {
-	return net.HardwareAddr{0x02, 0xbf, 0x72, byte(clusterID), byte(rgID), byte(nodeID)}
+	// #8340 (K18/K105): one construction, in the leaf package the dataplane's
+	// recovery search can also reach. `pkg/cluster` imports `pkg/dataplane`, so
+	// the dependency could only go this way round — which is why the search key
+	// and the thing it searches for had been written twice.
+	return config.RethVirtualMAC(clusterID, rgID, nodeID)
 }
 
 // StableRethLinkLocal returns a deterministic link-local IPv6 address shared
