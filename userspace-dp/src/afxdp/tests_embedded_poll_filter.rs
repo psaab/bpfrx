@@ -490,7 +490,9 @@ fn poll_descriptor_embedded_icmp_reversal_reachable_on_flowless_path_5690() {
             burst: 0,
         },
     );
+    let __pptp_control_7699 = std::sync::Arc::new(crate::session::pptp_control::PptpControlInbox::default());
     let worker_ctx = WorkerContext {
+        pptp_control: &__pptp_control_7699,
         ident: &ident,
         binding_lookup: &binding_lookup,
         mirror_targets: &mirror_targets,
@@ -1774,7 +1776,9 @@ fn poll_descriptor_policy_deny_path_emits_rt_flow_event() {
             burst: 0,
         },
     );
+    let __pptp_control_7699 = std::sync::Arc::new(crate::session::pptp_control::PptpControlInbox::default());
     let worker_ctx = WorkerContext {
+        pptp_control: &__pptp_control_7699,
         ident: &ident,
         binding_lookup: &binding_lookup,
         mirror_targets: &mirror_targets,
@@ -2025,7 +2029,9 @@ fn poll_descriptor_policy_deny_keys_logical_ingress_zone_3021() {
             burst: 0,
         },
     );
+    let __pptp_control_7699 = std::sync::Arc::new(crate::session::pptp_control::PptpControlInbox::default());
     let worker_ctx = WorkerContext {
+        pptp_control: &__pptp_control_7699,
         ident: &ident,
         binding_lookup: &binding_lookup,
         mirror_targets: &mirror_targets,
@@ -2232,7 +2238,9 @@ fn poll_descriptor_input_filter_discard_drops_and_logs() {
             burst: 0,
         },
     );
+    let __pptp_control_7699 = std::sync::Arc::new(crate::session::pptp_control::PptpControlInbox::default());
     let worker_ctx = WorkerContext {
+        pptp_control: &__pptp_control_7699,
         ident: &ident,
         binding_lookup: &binding_lookup,
         mirror_targets: &mirror_targets,
@@ -2407,7 +2415,9 @@ fn poll_descriptor_session_hit_rechecks_dscp_input_filter() {
             burst: 0,
         },
     );
+    let __pptp_control_7699 = std::sync::Arc::new(crate::session::pptp_control::PptpControlInbox::default());
     let worker_ctx = WorkerContext {
+        pptp_control: &__pptp_control_7699,
         ident: &ident,
         binding_lookup: &binding_lookup,
         mirror_targets: &mirror_targets,
@@ -2640,7 +2650,9 @@ fn poll_descriptor_lo0_filter_discard_drops_without_reinject() {
             burst: 0,
         },
     );
+    let __pptp_control_7699 = std::sync::Arc::new(crate::session::pptp_control::PptpControlInbox::default());
     let worker_ctx = WorkerContext {
+        pptp_control: &__pptp_control_7699,
         ident: &ident,
         binding_lookup: &binding_lookup,
         mirror_targets: &mirror_targets,
@@ -2829,7 +2841,9 @@ fn poll_descriptor_lo0_filter_drops_cached_local_delivery_session_hit() {
             burst: 0,
         },
     );
+    let __pptp_control_7699 = std::sync::Arc::new(crate::session::pptp_control::PptpControlInbox::default());
     let worker_ctx = WorkerContext {
+        pptp_control: &__pptp_control_7699,
         ident: &ident,
         binding_lookup: &binding_lookup,
         mirror_targets: &mirror_targets,
@@ -3126,7 +3140,9 @@ fn input_filter_discard_drops_the_embedded_icmp_reversal_7359() {
             burst: 0,
         },
     );
+    let __pptp_control_7699 = std::sync::Arc::new(crate::session::pptp_control::PptpControlInbox::default());
     let worker_ctx = WorkerContext {
+        pptp_control: &__pptp_control_7699,
         ident: &ident,
         binding_lookup: &binding_lookup,
         mirror_targets: &mirror_targets,
@@ -3427,7 +3443,9 @@ fn input_filter_count_term_advances_for_the_embedded_icmp_reversal_7359() {
             burst: 0,
         },
     );
+    let __pptp_control_7699 = std::sync::Arc::new(crate::session::pptp_control::PptpControlInbox::default());
     let worker_ctx = WorkerContext {
+        pptp_control: &__pptp_control_7699,
         ident: &ident,
         binding_lookup: &binding_lookup,
         mirror_targets: &mirror_targets,

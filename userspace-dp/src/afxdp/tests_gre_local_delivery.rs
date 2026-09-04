@@ -707,7 +707,9 @@ fn poll_descriptor_junos_host_deny_drops_local_delivery_session_hit() {
             burst: 0,
         },
     );
+    let __pptp_control_7699 = std::sync::Arc::new(crate::session::pptp_control::PptpControlInbox::default());
     let worker_ctx = WorkerContext {
+        pptp_control: &__pptp_control_7699,
         ident: &ident,
         binding_lookup: &binding_lookup,
         mirror_targets: &mirror_targets,

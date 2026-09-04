@@ -111,6 +111,47 @@ pub(in crate::afxdp) fn extract_tcp_flags_and_window(frame: &[u8]) -> Option<(u8
     Some((flags, window))
 }
 
+/// Offset into `frame` of the first TCP PAYLOAD byte (#7699).
+///
+/// `None` unless the frame really is TCP and its declared data offset fits
+/// inside the bytes present — the length is attacker-controlled, so it is
+/// checked against the slice rather than trusted.
+///
+/// This exists because the payload start is NOT free: recognising a control
+/// channel is two port comparisons on a tuple already parsed, but COPYING the
+/// segment additionally requires locating the payload, which means reading the
+/// TCP data-offset nibble. Stating it accurately matters — "off the hot path"
+/// buys the parse, not the test for whether to parse, and not this read.
+///
+/// The address family is derived from the IP version in the frame rather than
+/// taken as a parameter, matching [`extract_tcp_flags_and_window`] above, so a
+/// caller cannot pass one that disagrees with the packet.
+#[inline]
+pub(in crate::afxdp) fn tcp_payload_offset(frame: &[u8]) -> Option<usize> {
+    let l3 = frame_l3_offset(frame)?;
+    let ip = frame.get(l3..)?;
+    let addr_family = match ip.first()? >> 4 {
+        4 => libc::AF_INET as u8,
+        6 => libc::AF_INET6 as u8,
+        _ => return None,
+    };
+    let (l4_offset, protocol) = packet_rel_l4_offset_and_protocol(ip, addr_family)?;
+    if protocol != PROTO_TCP {
+        return None;
+    }
+    let tcp = ip.get(l4_offset..)?;
+    if tcp.len() < TCP_MIN_HEADER_LEN {
+        return None;
+    }
+    let data_offset = ((tcp[12] >> 4) as usize) * 4;
+    // A data offset below the minimum header is malformed; one past the bytes
+    // present is a truncated or lying packet. Both mean "no payload here".
+    if data_offset < TCP_MIN_HEADER_LEN || tcp.len() < data_offset {
+        return None;
+    }
+    Some(l3 + l4_offset + data_offset)
+}
+
 /// Extract TCP window size from raw frame data.
 /// Returns None if not a TCP frame or if frame is too short.
 ///

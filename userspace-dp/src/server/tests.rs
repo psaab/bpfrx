@@ -4888,3 +4888,142 @@ mod routing_domain_delete_7160 {
         );
     }
 }
+
+/// The needle for the #7699 drain call, and the anchor it must sit after.
+/// Module-level so the guard and its over-reach control search for the SAME
+/// strings — a control that retypes the needle stops controlling the guard the
+/// first time one of them is edited.
+const PPTP_DRAIN_NEEDLE: &str = "crate::afxdp::worker_queue::drain_pptp_control_inbox(";
+const PPTP_EXPIRY_NEEDLE: &str =
+    "let expired_entries = sessions.expire_stale_entries_ha(loop_now_ns";
+
+/// Find the 0-based line whose trimmed start IS `needle` — a real statement,
+/// not a mention. Shared by the guard and its control for the same reason the
+/// needles are.
+fn pptp_drain_line(src: &str, needle: &str) -> Option<usize> {
+    src.lines().position(|l| l.trim_start().starts_with(needle))
+}
+
+/// OVER-REACH CONTROL for `worker_loop_drains_the_pptp_control_inbox_7699`.
+///
+/// A source guard that asserts "the call appears in the periodic region" is
+/// satisfied by a MENTION as easily as by a call, and a deleted call most
+/// plausibly leaves behind exactly that: a comment, or the call itself commented
+/// out. This runs the guard's own matcher over synthetic bodies where the only
+/// occurrence is a mention, and requires NO match — then over a body with the
+/// real statement, and requires one, so the control cannot pass by matching
+/// nothing ever.
+///
+/// This is not decoration. Written as a substring search, the guard DID accept
+/// the commented-out body; the line-wise matcher exists because this control
+/// failed first.
+#[test]
+fn pptp_drain_guard_does_not_accept_a_mention_7699() {
+    const COMMENTED_OUT: &str = "        // crate::afxdp::worker_queue::drain_pptp_control_inbox(\n        //     &pptp_control,\n";
+    const PROSE: &str =
+        "        // the drain rides crate::afxdp::worker_queue::drain_pptp_control_inbox( periodic work\n";
+    const REAL: &str =
+        "        crate::afxdp::worker_queue::drain_pptp_control_inbox(\n            &pptp_control,\n";
+
+    assert!(
+        pptp_drain_line(COMMENTED_OUT, PPTP_DRAIN_NEEDLE).is_none(),
+        "the guard accepts a COMMENTED-OUT drain call, so deleting the call by \
+         commenting it out would report the dispatch as wired (#7699)"
+    );
+    assert!(
+        pptp_drain_line(PROSE, PPTP_DRAIN_NEEDLE).is_none(),
+        "the guard accepts a PROSE mention of the drain, so a comment naming \
+         the function would report the dispatch as wired (#7699)"
+    );
+    assert!(
+        pptp_drain_line(REAL, PPTP_DRAIN_NEEDLE).is_some(),
+        "the guard does not match even a body that plainly contains the real \
+         call — it is searching for something unreachable and would pass \
+         nothing, ever (#7699)"
+    );
+    assert!(
+        pptp_drain_line(REAL, PPTP_EXPIRY_NEEDLE).is_none()
+            && pptp_drain_line(
+                "        let expired_entries = sessions.expire_stale_entries_ha(loop_now_ns, Some(&ha_ctx));\n",
+                PPTP_EXPIRY_NEEDLE
+            )
+            .is_some(),
+        "the two needles are not distinct: one matches the other's body, so the \
+         position assertion could compare a line against itself (#7699)"
+    );
+}
+
+/// #7699: the worker loop must actually CALL the PPTP control drain, and the
+/// interval gate must NOT be written at that call site.
+///
+/// # Why this is a source guard rather than an execution cell
+///
+/// The dispatch is a two-hop join and the hops are bound differently. The PUSH
+/// is bound by execution — `pptp_dispatch_join_tests_7699` drives the real
+/// `stage_parse_flow_and_learn` over real frame bytes, so deleting it reds four
+/// cells. The DRAIN CALL SITE cannot be: `worker_loop` needs live AF_XDP
+/// bindings, and every cell that exercises the drain calls
+/// `drain_pptp_control_inbox` directly — which is exactly why they cannot
+/// notice that the worker loop stopped calling it.
+///
+/// That is not a hypothesis. Deleting the call from `loop_body` was run as a
+/// mutation and **SURVIVED** the whole suite: the parser, the inbox, the drain,
+/// the broadcast and the table all still passed while the running dataplane
+/// learned nothing. The same two-correct-halves-and-no-join shape this whole
+/// change exists to close, reproduced one level up. This guard is the detector.
+///
+/// # The second assertion is the #8399 shape
+///
+/// `CONTROL_DRAIN_INTERVAL_NS` must not appear in the worker loop at all. The
+/// gate lives inside `PptpControlInbox::take_pending` deliberately — the caller
+/// runs at packet rate, so a gate written at the call site is one edit from
+/// per-poll work, which is what #8399 shipped when the association expiry
+/// landed above `expire_stale_entries_ha`'s gc-interval gate. A call-site gate
+/// would also be invisible to the frequency cell, which calls the drain
+/// directly.
+///
+/// That assertion is a PROXY, and a deliberately crude one: naming the interval
+/// constant is the only way to write the gate correctly, so its absence from
+/// this file is evidence no correct call-site gate exists here. A hand-rolled
+/// gate on a bare literal would slip past — a different and much more visible
+/// defect — and the loop's own comment says not to name the constant there, so
+/// the proxy keeps meaning what it says.
+/// The needles are matched LINE-WISE, against a line whose trimmed start IS the
+/// needle. A plain `src.find` would accept a commented-out call — the single
+/// most plausible thing a deleted call leaves behind — and the over-reach
+/// control below is what forced that: written as a substring search, the guard
+/// passed for a body whose only occurrence was `// crate::afxdp::…`.
+#[test]
+fn worker_loop_drains_the_pptp_control_inbox_7699() {
+    let src = include_str!("../afxdp/worker/loop_body/mod.rs");
+
+    let expiry_at = pptp_drain_line(src, PPTP_EXPIRY_NEEDLE).unwrap_or_else(|| {
+        panic!(
+            "the worker loop's session-expiry call is gone — this guard's \
+             position claim is anchored to a line that no longer exists (#7699)"
+        )
+    });
+    let drain_at = pptp_drain_line(src, PPTP_DRAIN_NEEDLE).unwrap_or_else(|| {
+        panic!(
+            "the worker loop does not call drain_pptp_control_inbox: control \
+             segments the data path copies into the inbox are never parsed, so \
+             no PPTP association is ever learned on a live box — while the \
+             parser, inbox, drain, broadcast and table cells all stay green \
+             (#7699)"
+        )
+    });
+    assert!(
+        drain_at > expiry_at,
+        "the PPTP control drain (line {drain_at}) is not in the periodic region \
+         beside the association expiry (line {expiry_at}) it is the counterpart \
+         of (#7699)"
+    );
+    assert!(
+        !src.contains("CONTROL_DRAIN_INTERVAL_NS"),
+        "the drain's interval gate has been written at the CALL SITE. It \
+         belongs inside PptpControlInbox::take_pending: this loop runs at \
+         packet rate, so a call-site gate is one edit from per-poll work — the \
+         defect #8399 shipped — and it is invisible to the frequency cell, \
+         which calls the drain directly (#7699)"
+    );
+}

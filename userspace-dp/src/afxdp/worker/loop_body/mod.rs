@@ -199,6 +199,7 @@ pub(crate) fn worker_loop(
                 owner_rg_indexes: shared_owner_rg_indexes,
             },
         ike_exchanges,
+        pptp_control,
     } = shared;
     let WorkerControlChannels {
         commands,
@@ -1016,6 +1017,27 @@ pub(crate) fn worker_loop(
                     .fetch_add(local_expired, Ordering::Relaxed);
             }
         }
+        // #7699: drain the PPTP control inbox — parse the TCP/1723 segments the
+        // data path copied out, install the associations locally and publish
+        // them to the sibling workers.
+        //
+        // PLACEMENT: adjacent to the association EXPIRY it is the counterpart
+        // of, and on the same clock. This is per-iteration work only in the
+        // sense that the CALL is; `take_pending` holds the drain-interval gate
+        // ITSELF and returns an empty vec otherwise, so the body below runs
+        // once per interval. The gate is deliberately not written here: this
+        // loop runs at packet rate, and a call-site gate is one edit from
+        // becoming per-poll work — which is exactly what #8399 shipped when the
+        // association expiry landed above `expire_stale_entries_ha`'s gate
+        // instead of below it. `worker_loop_drains_the_pptp_control_inbox_7699`
+        // enforces both halves of that, including the absence of the interval
+        // constant from this file — so do not name it here even in a comment.
+        crate::afxdp::worker_queue::drain_pptp_control_inbox(
+            &pptp_control,
+            &mut sessions,
+            &peer_worker_commands,
+            loop_now_ns,
+        );
         // Incrementally refresh last_seen in BPF conntrack entries so Go-side
         // callers of IterateSessions (CLI, gRPC, Prometheus) see accurate
         // session idle times.  Issue #333; budgeted/resumable per #5287.
@@ -1097,6 +1119,7 @@ pub(crate) fn worker_loop(
                 &forwarding,
                 ha_runtime.as_ref(),
                 &dynamic_neighbors,
+                &pptp_control,
                 neighbor_resolver.as_ref(),
                 &shared_sessions,
                 &shared_nat_sessions,

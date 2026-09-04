@@ -262,13 +262,18 @@ impl PptpAssociations {
     /// expired under it; a call whose peer vanished stops refreshing and ages
     /// out without anyone announcing its death.
     ///
-    /// **No production caller yet.** The data path reaches this once the
-    /// packet-path dispatch lands (stage 2's remaining half, #7699). Until
-    /// then the idle clock advances only at install, so an association's life
-    /// is bounded from when it was LEARNED rather than from its last packet —
-    /// the conservative direction (it expires sooner, never later), but not the
-    /// intended semantics, and worth saying so here rather than letting a
-    /// reader infer the refresh already happens.
+    /// **Still no production caller, and the packet-path dispatch did NOT
+    /// change that.** The dispatch (#7699) wires the CONTROL channel — a
+    /// TCP/1723 segment reaches the parser and its association is installed and
+    /// broadcast. What reaches this function is the DATA channel: a GRE
+    /// version-1 packet resolving its call id to a handle, which
+    /// `gre_discriminator` still refuses outright (`TunnelDiscriminator::Pptp(_)
+    /// => return None`). That is a separate join and it is not built.
+    ///
+    /// Consequence, unchanged: the idle clock advances only at install, so an
+    /// association's life is bounded from when it was LEARNED rather than from
+    /// its last packet — the conservative direction (it expires sooner, never
+    /// later), but not the intended semantics.
     pub(crate) fn resolve_and_touch(
         &mut self,
         dst: IpAddr,
@@ -310,11 +315,13 @@ impl PptpAssociations {
     /// reused call id. Intended to fire on FIN/RST or the control session's
     /// own timeout, not waiting for per-call notifies that will never arrive.
     ///
-    /// **No production caller yet**, for the honest reason that nothing yet
-    /// observes a control channel closing — that is the packet-path dispatch,
-    /// stage 2's remaining half (#7699). Until it lands this path is bound by
-    /// its cells and by nothing else, and the idle bound above is the only
-    /// association lifetime that actually runs on a live box.
+    /// **Still no production caller.** The packet-path dispatch (#7699) added
+    /// the control-channel LEARN path; it does not observe a control channel
+    /// CLOSING. Recognising the FIN/RST — or the control session's own timeout —
+    /// and calling this is a distinct piece of stage 3 that is not built, so
+    /// this path is bound by its cells and by nothing else, and the idle bound
+    /// above remains the only association lifetime that actually runs on a live
+    /// box.
     pub(crate) fn forget_control_channel(&mut self, control: ControlChannelId) -> usize {
         let doomed: Vec<u32> = self
             .by_handle
