@@ -176,6 +176,36 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 	// family label is not a safety property, and this is the case that proves
 	// it. TestNormalizerScopeNeverCoversAPartialSite8690 binds it mechanically
 	// so the next widening cannot make the same mistake by inspection.
+	// #8690 family 3: policy-options. Taken PER SITE rather than as a family
+	// sweep, because this is the family where a family sweep is actively
+	// harmful: of its 17 inventory sites, 9 are drop shape "empty" and 8 are
+	// "partial" — and all 8 partials sit under `then`.
+	//
+	//	policy-statement <p> term <t> from community <c>   empty    admitted
+	//	policy-statement <p> term <t> then community <c>   partial  NOT admitted
+	//
+	// The same head, one token apart, on opposite sides of the safety rule.
+	// That pair is the clearest argument in the tree for scoping on
+	// (container, head) rather than on either token alone: a head-only rule
+	// admits both, and a container-only rule on `then` admits all eight
+	// partials. Both mistakes were available and neither is visible by reading.
+	//
+	// Every one of the 9 below was checked individually against the inventory's
+	// drop shape, and TestNormalizerScopeNeverCoversAPartialSite8690 re-checks
+	// the whole set against the LIVE normalizer rather than against my reading
+	// of it.
+	switch containerKeyword + " " + head {
+	case "policy-options community",
+		"policy-options policy-statement",
+		"policy-options prefix-list",
+		"community members",
+		"policy-statement term",
+		"from as-path",
+		"from community",
+		"from prefix-list":
+		return true
+	}
+
 	switch containerKeyword + " " + head {
 	case "zones security-zone",
 		"security-zone screen",
