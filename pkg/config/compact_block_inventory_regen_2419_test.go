@@ -107,8 +107,17 @@ func TestRegenerateCompactBlockInventory2419(t *testing.T) {
 		b.WriteString("# skipped (" + k + "): " + strconv.Itoa(res.skipped[k]) + "\n")
 	}
 	b.WriteString("#\n")
-	for _, s := range res.divergent {
-		b.WriteString(s + "\n")
+	for _, site := range res.divergent {
+		// #8662: site TAB shape. The shape is what the compact spelling
+		// produced — "empty" (the folded value contributed nothing) or
+		// "partial" (something was read, but not what was written). A
+		// normalizer may only truncate a tail whose shape is "empty", because
+		// that is the measurement that no reader consumes it.
+		if shape := res.dropShape[site]; shape != "" {
+			b.WriteString(site + "\t" + shape + "\n")
+			continue
+		}
+		b.WriteString(site + "\n")
 	}
 	if err := os.WriteFile(inventoryPath, []byte(b.String()), 0o644); err != nil {
 		t.Fatal(err)
