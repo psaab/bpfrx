@@ -81,6 +81,41 @@ func (t *PersistentNATTable) RegisterNATIP(ip netip.Addr, poolName string) {
 
 // ClearPoolConfigs removes all pool configuration and IP mappings.
 // Called before recompilation to ensure stale pools are removed.
+//
+// IT DELIBERATELY DOES NOT DROP BINDINGS (#8597 K76), and the reason is #8607.
+//
+// The complaint is real and was measured: after a recompile that removes a
+// pool, that pool's bindings survive here and `show security nat source
+// persistent-nat-table` keeps rendering them under their stale PoolName until
+// they expire. Both fix directions the finding offers — dropping the bindings
+// here, or filtering All()/the renderer against poolConfigs — reintroduce the
+// defect #8607 exists to remove, as a window after EVERY commit rather than a
+// permanent state:
+//
+//   - compileNAT calls this at its TOP and re-registers the surviving pools
+//     later in the same function, under a SEPARATE acquisition of t.mu. A
+//     renderer that takes All()'s RLock in between sees zero pools.
+//   - so a poolConfigs-filtered render answers "No persistent NAT bindings" for
+//     that window, and dropping the bindings outright answers it until the next
+//     refresher tick — up to persistentNatShowRefreshInterval.
+//
+// "No persistent NAT bindings" printed for a pool that is demonstrably
+// translating is the exact false statement #8607 was filed for. Trading a
+// permanent one for an intermittent one is not a fix; an intermittent wrong
+// answer is harder to diagnose than a constant one.
+//
+// What makes the ghost rows self-limiting instead: under the userspace
+// dataplane — the only runtime forwarding path — this table is not an
+// accumulator. daemon_persistent_nat_show_8607.go replaces it wholesale every
+// persistentNatShowRefreshInterval from the helper's own view (ReplaceAll), so
+// a deconfigured pool's rows disappear as soon as the helper stops reporting
+// them, whatever this function does.
+//
+// A future fix that genuinely wants pool-scoped rendering needs the clear and
+// the re-register to be ONE atomic swap of poolConfigs/natIPToPool, so the
+// filtered set is never transiently empty. That is a change to compileNAT's
+// registration protocol, not to this function.
+// TestClearPoolConfigsKeepsBindings_8597 fails if the bindings are dropped here.
 func (t *PersistentNATTable) ClearPoolConfigs() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -122,14 +157,46 @@ func (t *PersistentNATTable) Lookup(srcIP netip.Addr, srcPort uint16, pool strin
 	return b
 }
 
-// Save stores a persistent NAT binding. If a binding with the same source
-// IP, port, and pool already exists, LastSeen is updated to the current time.
+// Save stores a persistent NAT binding, refreshing an existing entry for the
+// same source IP, port and pool IN FULL rather than by timestamp alone.
+//
+// #8597 K77: it used to refresh only LastSeen and discard the rest of the
+// caller's record, so a pool edit that changed the mapping, the timeout or the
+// permit scope did not take effect until the old binding expired. Measured —
+// re-saving 10.0.0.5:1000 with NatIP 198.51.100.9:6000, a 1m timeout and
+// permit any-remote-host left the table rendering 192.0.2.1:5000, 1h,
+// target-host.
+//
+// The key is (SrcIP, SrcPort, Pool), so a re-save under the same key is the
+// SAME binding with new facts about it, never a different one. There is
+// nothing in the discarded record the stored one was more right about: the only
+// caller, preservePersistentNATV4/V6, builds every field fresh from the session
+// being deleted and the pool config it just looked up.
+//
+// WHY THE FIELDS ARE COPIED RATHER THAN THE ENTRY REPLACED. The finding offers
+// both ("overwrite mutable fields alongside LastSeen, or replace the entry"),
+// and the second arm was written first — then TestPersistentNATTable_SaveUpdates
+// LastSeen went red. That cell re-saves with a DELIBERATELY STALE LastSeen and
+// asserts the stored one advanced, which is the documented contract of this
+// method: a re-save is a REFRESH, and the caller does not have to supply the
+// clock for it. Replacing the entry stores the caller's timestamp verbatim and
+// silently drops that. Production passes time.Now() either way, so the change
+// was invisible in effect and visible only to the control — which is the case
+// the control exists for.
+//
+// So LastSeen keeps coming from the clock here, and only the four fields that
+// describe the MAPPING follow the caller. Mutating in place under the write
+// lock keeps the #4811 property: All() copies, so no reader aliases this.
 func (t *PersistentNATTable) Save(b *PersistentNATBinding) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	key := persistentNATKey{SrcIP: b.SrcIP, SrcPort: b.SrcPort, Pool: b.PoolName}
 	if existing, ok := t.bindings[key]; ok {
+		existing.NatIP = b.NatIP
+		existing.NatPort = b.NatPort
+		existing.Timeout = b.Timeout
+		existing.Permit = b.Permit
 		existing.LastSeen = time.Now()
 		return
 	}
