@@ -484,6 +484,7 @@ func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventB
 		// monitoring.
 		SchedulerRepublishFailedFn:       d.SchedulerRepublishFailed,
 		HelperCrashEpisodesFn:            d.helperCrashEpisodes,
+		ForwardingSupportedFn:            d.forwardingSupported,
 		SchedulerRepublishStaleSecondsFn: d.SchedulerRepublishStaleSeconds,
 		// #5669: surface the bounded-age fail-closed escalation so
 		// xpf_scheduler_republish_fail_closed reads 1 once a persistently
@@ -805,4 +806,25 @@ func (d *Daemon) helperCrashEpisodes() int {
 	}
 	_, total := mgr.HelperCrashHistory()
 	return total
+}
+
+// forwardingSupported reports whether the userspace dataplane is forwarding
+// transit, for #8447's xpf_dataplane_forwarding_supported.
+//
+// Returns TRUE when there is no userspace manager. That is the deliberate
+// choice and it is worth stating: this metric answers "has a capability gate
+// disarmed forwarding", and a daemon with no userspace manager has no such
+// gate. Reporting 0 there would fire the alert on every config-only daemon and
+// on every moment before the dataplane is published, which is how a signal
+// gets muted.
+//
+// The metric is omitted entirely when the accessor is not wired (see
+// collectForwardingSupported), so "we cannot see" and "forwarding is live"
+// stay distinguishable at the surface even though both are true here.
+func (d *Daemon) forwardingSupported() bool {
+	mgr := d.persistentNatLeaseManager()
+	if mgr == nil {
+		return true
+	}
+	return mgr.ForwardingSupported()
 }

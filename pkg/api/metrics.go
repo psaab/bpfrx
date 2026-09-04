@@ -262,6 +262,7 @@ type xpfCollector struct {
 	managementListenerDown   *prometheus.Desc
 	managementListenerState  *prometheus.Desc
 	helperCrashEpisodesTotal *prometheus.Desc
+	forwardingSupported      *prometheus.Desc
 
 	// #3780: 0/1 gauge — 1 while the most recent scheduler-driven policy
 	// republish failed and has not yet converged (stale enforcement past
@@ -873,6 +874,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.managementListenerDown
 	ch <- c.managementListenerState
 	ch <- c.helperCrashEpisodesTotal
+	ch <- c.forwardingSupported
 	ch <- c.configPersistDegraded
 	ch <- c.rollbackHistoryDegraded
 	ch <- c.userspacePolicyContentRejected
@@ -1349,6 +1351,7 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	// dataplane is NOT currently loaded, and gating it behind a load check
 	// would blank the counter in exactly that case.
 	c.collectHelperCrashEpisodes(ch)
+	c.collectForwardingSupported(ch)
 
 	// #3780: scheduler republish-failure is a control-plane signal (the
 	// policy scheduler runs even in config-only mode) — emit it BEFORE
@@ -1619,4 +1622,23 @@ func (c *xpfCollector) collectHelperCrashEpisodes(ch chan<- prometheus.Metric) {
 	}
 	ch <- prometheus.MustNewConstMetric(c.helperCrashEpisodesTotal,
 		prometheus.CounterValue, float64(c.srv.helperCrashEpisodesFn()))
+}
+
+// collectForwardingSupported emits #8447's xpf_dataplane_forwarding_supported.
+//
+// Extracted like its #8397 neighbour so the three-way distinction is drivable:
+// forwarding -> 1, disarmed -> 0, and NO SOURCE -> nothing at all. The last is
+// the one that matters: a daemon with no dataplane accessor does not know
+// whether forwarding is live, and emitting 1 there would assert that it is --
+// turning "we cannot see" into "everything is fine", which is the exact reading
+// #8447 is about.
+func (c *xpfCollector) collectForwardingSupported(ch chan<- prometheus.Metric) {
+	if c.srv == nil || c.srv.forwardingSupportedFn == nil {
+		return
+	}
+	v := 0.0
+	if c.srv.forwardingSupportedFn() {
+		v = 1
+	}
+	ch <- prometheus.MustNewConstMetric(c.forwardingSupported, prometheus.GaugeValue, v)
 }

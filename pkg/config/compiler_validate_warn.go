@@ -90,6 +90,11 @@ func ValidateConfig(cfg *Config) []string {
 	// reject.
 	warnings = append(warnings, natPoolAlarmInapplicableWarnings(cfg)...)
 
+	// #8447: persistent-NAT on a clustered node disarms forwarding entirely.
+	// The behaviour is the deliberate #1449 contract; the defect was that it
+	// happened silently, and the operator's first sign was traffic stopping.
+	warnings = append(warnings, persistentNATClusterForwardingWarnings(cfg)...)
+
 	// Note (#1476): the previous "ebpf is deprecated" warning was
 	// removed because `validateDataplaneTypeStrict` now hard-rejects
 	// `dataplane-type ebpf` at commit time with
