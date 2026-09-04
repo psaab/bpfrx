@@ -2421,6 +2421,14 @@ func validateNAT64PrefixStrict(cfg *Config, lenient bool) ([]string, error) {
 		// one rejects — all leading '+' — and rejects none that this one
 		// accepts. The backstop being LAXER is the safe direction; see the note
 		// at that call site before changing either side.
+		//
+		// It is REACHABLE and it fails OPEN. On the lenient path below, emit()
+		// only warns and the loop continues, so `/+96` reaches the dataplane
+		// verbatim and the Rust loader INSTALLS it (measured: prefix_bytes
+		// 00:64:ff:9b:..). The warning emit() attaches says the rule "will not
+		// reach the dataplane until it is corrected" — false for this input.
+		// The control plane then believes a live NAT64 rule is inert. Tracked
+		// as #8667; the fix belongs on this side, not in the Rust parse.
 		mask96 := false
 		if len(parts) == 2 {
 			if m, err := strconv.ParseUint(parts[1], 10, 8); err == nil && m == 96 {
