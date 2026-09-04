@@ -271,7 +271,20 @@ func ReconcileProxyARP(cfg *config.Config, ifaceMap, priorIfaceMap map[string]in
 				slog.Warn("proxy-arp: invalid address", "addr", cidr, "err", err)
 				continue
 			}
-			addr := prefix.Addr()
+			// #8597 (muse-004 K21): UNMAP. A `::ffff:a.b.c.d` literal parses to
+			// a 4-in-6 `netip.Addr` (16 bytes), while the kernel's v4 NeighList
+			// pass below builds its key from `n.IP.To4()` (4 bytes). `netip.Addr`
+			// equality distinguishes the two forms, so the desired key never
+			// matched the existing key and the add loop re-installed the entry on
+			// EVERY reconcile pass — a NeighSet and an error log every 30s,
+			// forever, with the entry never recognised as converged.
+			//
+			// The comment below and `keyFamily` both reason correctly about the
+			// FAMILY of a 4-in-6 literal and are silent about its KEY FORM, which
+			// is why this read as handled. Unmapping at parse makes both axes
+			// agree: a v4-mapped literal is v4 in family AND in key form, and
+			// `Unmap` is a no-op on a genuine v6 address.
+			addr := prefix.Addr().Unmap()
 			// #2197 item 1: install an NTF_PROXY neighbor entry for v6
 			// addresses too (the v6 analogue of `ip -6 neigh add proxy
 			// <addr> dev <if>`). Unlike v4 — where the broad arp_fwd_proxy
