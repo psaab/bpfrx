@@ -56,6 +56,25 @@ import (
 // ESP SPI, which are allocated per-direction. Scrubbing it would put both of a
 // peer's same-endpoint keyed tunnels back on one key, which is the aliasing
 // #7188 exists to remove.
+// partiallyScrubbedSessionFields are fields the scrub modifies WITHOUT zeroing,
+// mapped to the exact bits it is allowed to clear.
+//
+// #8612. `LogFlags` is not node-local as a whole — it carries userspace sync
+// metadata the peer legitimately owns — but one bit of it is:
+// LogFlagUserspaceTunnelEndpoint says "FibGen holds a tunnel endpoint id, not a
+// FIB generation". FibGen IS node-local and is zeroed, so the bit describing it
+// must go with it or the row asserts a value it no longer carries.
+//
+// This map exists because the census below could not otherwise SEE such a
+// change, and saying so is the point: `zeroedFields` detects only a non-zero ->
+// zero transition, so ANY partial mutation of a field was invisible to it. The
+// "and nothing else" guarantee in this file's header was therefore weaker than
+// it read — it held for whole-field zeroing and said nothing about a field the
+// scrub merely edits. `changedFields` below closes that.
+var partiallyScrubbedSessionFields = map[string]uint64{
+	"LogFlags": uint64(LogFlagUserspaceTunnelEndpoint),
+}
+
 var nodeLocalSessionFields = map[string]bool{
 	"FibIfindex":     true,
 	"FibVlanID":      true,
@@ -116,6 +135,23 @@ func zeroedFields(before, after reflect.Value) map[string]bool {
 	return out
 }
 
+// changedFields reports every top-level field that differs between `before` and
+// `after`, whether or not it became zero.
+//
+// This is the strictly stronger companion to zeroedFields: a scrub that clears
+// one BIT of a multi-bit field, or that sets a field to a different non-zero
+// value, is a change the zero-transition test cannot represent.
+func changedFields(before, after reflect.Value) map[string]bool {
+	out := map[string]bool{}
+	for i := 0; i < before.NumField(); i++ {
+		name := before.Type().Field(i).Name
+		if !reflect.DeepEqual(before.Field(i).Interface(), after.Field(i).Interface()) {
+			out[name] = true
+		}
+	}
+	return out
+}
+
 func assertScrubCensus(t *testing.T, before, after reflect.Value) {
 	t.Helper()
 	scrubbed := zeroedFields(before, after)
@@ -136,6 +172,55 @@ func assertScrubCensus(t *testing.T, before, after reflect.Value) {
 			t.Errorf("the scrub zeroes %s, which is NOT declared node-local. Either "+
 				"it is node-local and this list is stale, or the scrub is destroying "+
 				"a field the peer legitimately owns (#7097)", name)
+		}
+	}
+
+	// #8612: the same two directions again, over ANY change rather than only a
+	// zero transition. Without this arm a scrub that edits a field instead of
+	// zeroing it passes both checks above while doing something nobody
+	// declared.
+	changed := changedFields(before, after)
+	for name := range changed {
+		if nodeLocalSessionFields[name] {
+			continue
+		}
+		mask, declared := partiallyScrubbedSessionFields[name]
+		if !declared {
+			t.Errorf("the scrub MODIFIES %s, which is declared neither node-local nor "+
+				"partially scrubbed. A field the scrub edits rather than zeroes is "+
+				"invisible to the zero-transition census above, so it has to be "+
+				"declared here or not touched (#8612)", name)
+			continue
+		}
+		b := before.FieldByName(name)
+		a := after.FieldByName(name)
+		if b.Kind() < reflect.Uint || b.Kind() > reflect.Uint64 {
+			t.Errorf("%s is declared partially scrubbed but is kind %s; the mask "+
+				"comparison below only models unsigned integers (#8612)", name, b.Kind())
+			continue
+		}
+		if got, want := a.Uint(), b.Uint()&^mask; got != want {
+			t.Errorf("the scrub changed %s to %#x, want %#x (%#x with mask %#x "+
+				"cleared). It may clear ONLY the declared bits — the rest of this "+
+				"field is metadata the peer owns (#8612)", name, got, want, b.Uint(), mask)
+		}
+	}
+	for name, mask := range partiallyScrubbedSessionFields {
+		b := before.FieldByName(name)
+		if !b.IsValid() {
+			continue
+		}
+		if b.Uint()&mask == 0 {
+			t.Fatalf("the fixture left %s with none of the mask %#x set, so the "+
+				"partial-scrub assertion is vacuous — fillNonZero must seed those "+
+				"bits (#8612)", name, mask)
+		}
+		if !changed[name] {
+			t.Errorf("%s carries declared node-local bits %#x that SURVIVED the "+
+				"scrub. FibGen is zeroed, so a surviving "+
+				"LogFlagUserspaceTunnelEndpoint asserts a tunnel endpoint the row no "+
+				"longer carries — an invariant a flag-only consumer would trust (#8612)",
+				name, mask)
 		}
 	}
 }
