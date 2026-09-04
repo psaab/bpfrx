@@ -73,6 +73,54 @@ func (m *Manager) UpdateConfig(cfg *config.ClusterConfig) {
 			// third same-id-re-add map-lifecycle gap in this loop after #5990
 			// (ip-monitor ipState/ipDebts/ipThresholdState).
 			delete(m.garpCounts, id)
+			// #8435: the FOURTH same-id-re-add map-lifecycle gap in this loop.
+			//
+			// peerTransferOutOverride is armed between
+			// `commitRequestedPeerFailover` succeeding and
+			// `notePeerTransferCommitted`, bounded by failoverAckTimeout (20s).
+			// A stale override surviving an RG's removal meant a same-id re-add
+			// inside that window SELF-PROMOTED TO PRIMARY -- reproduced at
+			// master, with a control (identical remove+re-add without the
+			// override stays secondary) that makes it a defect rather than an
+			// observation.
+			//
+			// Narrow: a ~20s window per operator `request chassis cluster
+			// failover`, requiring a config commit that removes and re-adds that
+			// RG inside it. A race, not a steady state -- but the outcome is
+			// dual-primary.
+			delete(m.peerTransferOutOverride, id)
+			// #8435, found by the struct-enumerated guard rather than named in
+			// the issue: two more per-RG hold deadlines survived the boundary.
+			//
+			// Both fail SAFE where peerTransferOutOverride fails unsafe -- a
+			// stale hold parks something in SECONDARY, where a stale override
+			// promotes to PRIMARY -- and both self-expire on a timer. That is
+			// why only the override produced a reproduced dual-primary, and it
+			// is not a reason to leave them: they are deadlines protecting a
+			// transition of an RG that no longer exists, and a same-id re-add
+			// inheriting one is held in secondary for a window it never earned.
+			delete(m.peerTransferCommitGraceUntil, id)
+			delete(m.localTransferOutHoldUntil, id)
+			// The rest of the per-RG failover-lifecycle authority. Every one of
+			// these was found by the struct-enumerated guard, not by reading the
+			// loop -- which is the point of enumerating rather than remembering.
+			//
+			// `failoverInProgress` is the sharpest: it exists so "a second
+			// request for the same RG is rejected immediately", so a stale TRUE
+			// on a same-id re-add makes that RG permanently un-failoverable --
+			// a wedge, not a 20 s window like the override.
+			//
+			// Purging `failoverGen` is the SAFE direction and worth stating,
+			// because resetting a generation counter usually is not. The
+			// supersede check is `gen != captured -> abandon`. Deleting the
+			// entry makes a later read return 0, so an operation that captured
+			// a non-zero generation on the OLD incarnation sees a mismatch and
+			// abandons. Keeping the counter would let it match and clobber.
+			delete(m.failoverInProgress, id)
+			delete(m.failoverGen, id)
+			delete(m.peerTransferOutPrevious, id)
+			delete(m.remoteTransferOutLeaseUntil, id)
+			delete(m.remoteTransferOutLeaseReqID, id)
 			delete(m.groups, id)
 		}
 	}
