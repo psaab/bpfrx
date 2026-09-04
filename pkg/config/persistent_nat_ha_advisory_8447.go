@@ -1,38 +1,46 @@
 package config
 
-// #8447: the persistent-NAT / chassis-cluster combination, single-sourced.
+// #8447/#8573: the persistent-NAT-on-a-pool predicate, single-sourced.
 //
-// THE DEFECT THIS EXISTS FOR. Adding `persistent-nat` to a source-NAT pool on a
-// clustered node stops the dataplane forwarding transit entirely — rx drops to
-// 0. That is DELIBERATE and documented (#1449): persistent-NAT leases are
-// helper-local allocator state that is not HA-synchronized, so the dataplane
-// declines to forward rather than forward with semantics it cannot honour.
+// WHAT USED TO BE HERE, and why it is not. #8447 added a commit-time ADVISORY
+// warning that `persistent-nat` on a rule-referenced pool would DISARM
+// FORWARDING on a chassis-cluster member (#1449), because the disarm happened
+// invisibly: the config committed cleanly and transit stopped, so it presented
+// as a link failure and the issue spent five rounds of cluster measurement
+// rediscovering it.
 //
-// The defect is that it happens INVISIBLY. The config commits cleanly, and the
-// only surface is `Forwarding supported: false` inside a `show` nobody runs
-// when the symptom is "the link went down". The issue spent five rounds of
-// cluster measurement rediscovering a contract the daemon already knew.
+// #8573 removed the disarm, having measured on the loss userspace cluster that
+// its stated reason was false — a persistent lease created on the active
+// reaches the standby, survives a failover, and is HONOURED by the new active,
+// which hands the same source identity the same translated identity. The
+// advisory went with it: an advisory in front of a gate that no longer exists
+// is worse than none, and #8573 names "a reworded advisory in front of an
+// unchanged disarm" as the shape that made #8447 take five rounds. Both halves
+// moved together, which is what the single-sourcing below was for.
 //
-// WHY THE PREDICATE MOVED HERE. It lived in
-// `pkg/dataplane/userspace/capabilities.go`, which `pkg/config` cannot import
-// (userspace imports config, not the reverse). The tree's existing habit for
-// this shape is to MIRROR the predicate with a comment saying it mirrors — see
-// `deterministicIPv4Enforced`'s "this mirrors the enforced/deferred split in
-// userspace.deterministicSourceNATFields". A mirror is a drift surface: the
-// advisory and the gate can disagree, and the failure mode is an advisory that
-// stops firing for a config that still disarms forwarding — silence that reads
-// exactly like safety.
+// WHY THE PREDICATE STAYS. It has a SECOND consumer that has nothing to do with
+// the retired gate: `ensurePersistentSourceNATProtocolLocked` refuses to publish
+// a persistent-NAT snapshot to a helper too old to understand it
+// (MinProtocolPersistentSourceNAT). That is a live fail-closed check, so the
+// predicate is load-bearing even with the advisory and the disarm gone.
 //
-// So the capability gate now CALLS this. There is one predicate, and the
-// advisory cannot promise something the dataplane does not do.
+// WHY IT LIVES IN pkg/config. `pkg/dataplane/userspace` imports config, not the
+// reverse, so a predicate both planes need has to be here. The tree's older
+// habit for this shape was to MIRROR it with a comment saying so; a mirror is a
+// drift surface, and the failure mode is one copy silently disagreeing with the
+// other.
 
 // UsesPersistentSourceNATPool reports whether any source-NAT rule targets a
 // pool carrying a `persistent-nat` stanza.
 //
 // Keyed on the RULE, not on the pool table: a pool defined but referenced by no
-// rule translates nothing, so it neither disarms forwarding nor deserves an
-// advisory. That is the same shape the capability gate has always had, and it
-// is why the loop walks rule-sets rather than `SourcePools`.
+// rule translates nothing, so it demands nothing of the helper. That is the
+// same shape the retired capability gate had, it is what the surviving
+// protocol-floor consumer needs, and it is why the loop walks rule-sets rather
+// than `SourcePools`.
+//
+// The file name still says "advisory" for the #8447 breadcrumb; the advisory
+// itself is gone (see the header).
 func UsesPersistentSourceNATPool(cfg *Config) bool {
 	if cfg == nil {
 		return false
@@ -52,34 +60,4 @@ func UsesPersistentSourceNATPool(cfg *Config) bool {
 		}
 	}
 	return false
-}
-
-// persistentNATClusterForwardingWarnings emits the #8447 commit-time advisory.
-//
-// It fires on exactly the condition the capability gate uses — a chassis
-// cluster AND a rule-referenced persistent-NAT pool — so an operator learns at
-// COMMIT that this config stops forwarding, rather than discovering it when
-// traffic stops.
-//
-// It is an ADVISORY, not a rejection, and that is deliberate. The behaviour is
-// the documented #1449 contract, the config is valid, and an operator may be
-// committing it knowingly on a node that is not yet carrying traffic. Rejecting
-// would also make the standalone case — where the same stanza is perfectly
-// fine — impossible to reach through a shared config, since `chassis cluster`
-// and the NAT stanza are committed independently.
-func persistentNATClusterForwardingWarnings(cfg *Config) []string {
-	if cfg == nil || cfg.Chassis.Cluster == nil || !UsesPersistentSourceNATPool(cfg) {
-		return nil
-	}
-	return []string{
-		"security nat source persistent-nat is configured on a pool referenced by a " +
-			"rule, and this node is a chassis-cluster member: the userspace dataplane " +
-			"will DISARM FORWARDING while this config is active (persistent-NAT leases " +
-			"are helper-local and not HA-synchronized, #1449). Transit traffic will " +
-			"stop — the interfaces stay up and the config commits cleanly, so this " +
-			"appears as a connectivity failure rather than a NAT one. Check " +
-			"`show chassis forwarding` for \"Forwarding supported: false\". Remove " +
-			"persistent-nat from the pool, or remove the node from the cluster, to " +
-			"restore forwarding.",
-	}
 }

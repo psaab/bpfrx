@@ -134,8 +134,6 @@ func IsRequiredProtocolGateError(err error) bool {
 	return false
 }
 
-const persistentSourceNATHAUnsupportedReason = "userspace persistent-nat source pool leases are not HA-synchronized"
-
 // recordPolicyContentRejectionLocked tracks the #3261 diagnostic for the
 // just-built snapshot: the reasons (if any) it carries unrepresentable policy
 // content that the helper integrity preflight will reject. It is called at the

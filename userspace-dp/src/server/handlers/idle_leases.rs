@@ -11,10 +11,41 @@
 
 use super::super::ServerState;
 use crate::ControlResponse;
-use crate::afxdp::{PoolDisplayLease, PoolIdleLease};
+use crate::afxdp::{IdleLeaseImportCounts, PoolDisplayLease, PoolIdleLease};
 use crate::nat::IdleLeaseRecord;
 use crate::protocol::{DisplayLeaseWire, IdleLeaseWire};
 use std::net::IpAddr;
+
+/// Whether an idle-lease import batch is worth a journald line.
+///
+/// ONE line per BATCH, never per record: this runs on every peer push, and a
+/// per-record log on a bulk window is exactly the control-socket noise the
+/// logging rules exist to prevent. So the predicate has to choose which
+/// outcomes are worth a line at all, and it is extracted rather than inline
+/// because that choice is the thing worth binding.
+///
+/// `skipped_existing` and `skipped_expired` are deliberately NOT notable. The
+/// first is the ordinary steady state — the standby already rebuilt the lease
+/// from a synced session — and the second is a lease that aged out in flight.
+/// Logging either would put a line on every push.
+///
+/// #8573 ADDED `skipped_unknown_address`. It means the pool exists on this node
+/// but does not contain the translated address the peer allocated from, i.e.
+/// the two nodes disagree about the pool's address list. That is never normal,
+/// and until #8573 it was also never logged: a batch in which EVERY lease was
+/// refused for that reason emitted nothing, so the divergence was invisible.
+/// That mattered less while the #1449 capability gate refused to forward
+/// clustered persistent-NAT configs at all. #8573 removed that gate, on the
+/// measurement that leases DO reach the standby — which makes the cases where
+/// one does not the whole of the residual, and this line the operator's
+/// surface for it.
+fn idle_lease_import_is_notable(counts: &IdleLeaseImportCounts, malformed: u32) -> bool {
+    counts.installed > 0
+        || counts.skipped_port_busy > 0
+        || counts.skipped_unknown_pool > 0
+        || counts.skipped_unknown_address > 0
+        || malformed > 0
+}
 
 fn to_wire(rec: &PoolIdleLease) -> IdleLeaseWire {
     let (remote_ip, remote_port) = match rec.lease.remote {
@@ -95,14 +126,7 @@ pub(super) fn import(
         })
         .collect();
     let counts = guard.afxdp.import_idle_persistent_leases_now(&records);
-    // One line per BATCH, never per record: this runs on every peer push, and a
-    // per-record log on a bulk window is exactly the control-socket noise the
-    // logging rules exist to prevent.
-    if counts.installed > 0
-        || counts.skipped_port_busy > 0
-        || counts.skipped_unknown_pool > 0
-        || malformed > 0
-    {
+    if idle_lease_import_is_notable(&counts, malformed) {
         eprintln!(
             "xpf-dp: idle-lease import installed={} existing={} expired={} unknown_addr={} \
              unknown_pool={} port_busy={} malformed={}",
@@ -136,6 +160,88 @@ mod tests {
             remaining_ns: 5_000_000_000,
             timeout_ns: 300_000_000_000,
         }
+    }
+
+    /// #8573: which import outcomes earn a journald line.
+    ///
+    /// The table carries BOTH directions on purpose. A predicate that is simply
+    /// `true` satisfies every notable row, and one that is `false` satisfies
+    /// every quiet row; only having both can tell them apart.
+    #[test]
+    fn only_actionable_import_outcomes_are_logged_8573() {
+        let zero = IdleLeaseImportCounts::default();
+
+        for (label, counts, malformed) in [
+            (
+                "installed",
+                IdleLeaseImportCounts {
+                    installed: 1,
+                    ..zero
+                },
+                0u32,
+            ),
+            (
+                "unknown address — the nodes disagree about the pool's addresses",
+                IdleLeaseImportCounts {
+                    skipped_unknown_address: 1,
+                    ..zero
+                },
+                0,
+            ),
+            (
+                "unknown pool — the pool is missing here entirely",
+                IdleLeaseImportCounts {
+                    skipped_unknown_pool: 1,
+                    ..zero
+                },
+                0,
+            ),
+            (
+                "port busy — installing would duplicate a translated identity",
+                IdleLeaseImportCounts {
+                    skipped_port_busy: 1,
+                    ..zero
+                },
+                0,
+            ),
+            ("malformed records", zero, 1),
+        ] {
+            assert!(
+                idle_lease_import_is_notable(&counts, malformed),
+                "#8573: a batch whose only outcome is {label} must be logged — it \
+                 is the operator's only surface for a lease that did not reach \
+                 this node, and after #8573 lifted the #1449 gate that is the \
+                 whole of the residual"
+            );
+        }
+
+        for (label, counts) in [
+            (
+                "already present — the steady state, rebuilt from a synced session",
+                IdleLeaseImportCounts {
+                    skipped_existing: 7,
+                    ..zero
+                },
+            ),
+            (
+                "expired in flight",
+                IdleLeaseImportCounts {
+                    skipped_expired: 7,
+                    ..zero
+                },
+            ),
+        ] {
+            assert!(
+                !idle_lease_import_is_notable(&counts, 0),
+                "a batch whose only outcome is {label} must stay QUIET — it \
+                 happens on ordinary pushes, and a line here would be on every one"
+            );
+        }
+
+        assert!(
+            !idle_lease_import_is_notable(&zero, 0),
+            "an empty batch must not log"
+        );
     }
 
     /// Round trip: every field survives, so the wire form is not quietly
