@@ -3379,6 +3379,85 @@ pub(super) fn poll_binding_process_descriptor(
                             {
                                 decision.resolution = redirect;
                             }
+                        } else if should_seed_fabric_punt(
+                            decision.resolution.disposition,
+                            packet_fabric_ingress,
+                            decision.nat,
+                        ) {
+                            // #7770: PUNT SEED. This flow is about to cross the
+                            // fabric because the peer owns its egress RG, and it
+                            // is leaving here UNADJUDICATED — the session-miss
+                            // policy + install block above runs only for
+                            // `ForwardCandidate`. That is what costs the first
+                            // packet of every new flow during a sustained RG
+                            // split: the peer's REPLY comes back over the fabric
+                            // in ~1-3 ms, we still have no session for the flow
+                            // (its HA sync lands ~200 ms later), and `wan -> lan`
+                            // has no permit BY DESIGN, so the reply hits the
+                            // default deny. See `fabric_punt_seed_metadata` for
+                            // the full chain and for why the authorisation has to
+                            // live here rather than in the fabric stamp.
+                            //
+                            // Adjudicate the flow's REAL zone pair — `from_zone_id`
+                            // / `to_zone_id` were resolved at the top of this miss
+                            // arm from the PRE-redirect resolution, so `to_zone_id`
+                            // is still the flow's true egress zone and not the
+                            // fabric parent's — and, on a permit, record a seed so
+                            // the return is a session HIT.
+                            //
+                            // THIS NEVER CHANGES THE PACKET'S DISPOSITION. A deny,
+                            // an unresolvable zone pair, or a full session table
+                            // all leave `decision` exactly as it was and the punt
+                            // proceeds as before, with the peer adjudicating it as
+                            // it does today. The arm adds no drop site; the only
+                            // behaviour it changes is that the RETURN of a flow
+                            // THIS node ingressed and THIS node's policy permitted
+                            // is now admitted by a session instead of denied.
+                            //
+                            // The three conditions of `should_seed_fabric_punt`
+                            // — and in particular why the non-fabric-ingress one
+                            // is the security property of this change rather than
+                            // a defensive nicety — are documented on that
+                            // function, which is a function precisely so they can
+                            // be driven directly.
+                            let owner_rg_id =
+                                owner_rg_for_resolution(worker_ctx.forwarding, decision.resolution);
+                            if let Some(seed_metadata) = fabric_punt_seed_metadata(
+                                worker_ctx.forwarding,
+                                from_zone_id,
+                                to_zone_id,
+                                owner_rg_id,
+                                // The non-fabric gate above makes the frame's own
+                                // ingress identity the TRUE one, so it is read
+                                // straight off the meta rather than through the
+                                // #7096 stamped-identity dance the fabric-ingress
+                                // case needs.
+                                meta.ingress_ifindex,
+                                meta.ingress_vlan_id,
+                                flow.src_ip,
+                                flow.dst_ip,
+                                flow.forward_key.protocol,
+                                flow.forward_key.src_port,
+                                flow.forward_key.dst_port,
+                                policy_packet_icmp(packet_frame, meta),
+                                desc.len as u64,
+                            ) {
+                                install_helper_local_session_on_miss(
+                                    sessions,
+                                    binding.bpf_maps.session_map_fd,
+                                    worker_ctx.shared_sessions,
+                                    worker_ctx.shared_nat_sessions,
+                                    worker_ctx.shared_forward_wire_sessions,
+                                    &worker_ctx.shared_owner_rg_indexes,
+                                    &flow.forward_key,
+                                    decision,
+                                    seed_metadata,
+                                    SessionOrigin::FabricPuntSeed,
+                                    now_ns,
+                                    meta.protocol,
+                                    meta.tcp_flags,
+                                );
+                            }
                         }
                         decision
                     }

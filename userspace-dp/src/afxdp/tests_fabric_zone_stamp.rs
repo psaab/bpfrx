@@ -1106,3 +1106,332 @@ fn fabric_ingress_return_traffic_is_denied_on_the_lan_node_7770() {
         "CONTROL: the permitted direction stopped forwarding"
     );
 }
+
+/// #7770: the LAN-side snapshot with the LAN neighbour, but with the
+/// `lan -> wan` permit narrowed so it no longer matches the probe's source.
+///
+/// The DENY control leg needs this and cannot be written without it. The base
+/// fixture's only policy is `allow-all` (`lan -> wan`, `any`/`any`/`any`), so a
+/// cell built on it varies the punt/return axis while sampling only the
+/// permitted point — mutating the `Permit` check out of
+/// `fabric_punt_seed_metadata` would change nothing and come back green. This
+/// narrows `source_addresses` to a subnet the probe host is not in, so the flow
+/// matches no rule and falls to the `deny` default.
+fn fabric_snapshot_policy_denies_the_lan_host_7770() -> ConfigSnapshot {
+    let mut snapshot = fabric_snapshot_with_lan_neighbor_7770();
+    for policy in &mut snapshot.policies {
+        policy.source_addresses = vec!["10.0.99.0/24".to_string()];
+    }
+    snapshot
+}
+
+/// A binding on the LAN member, for the leg that ingresses LOCALLY rather than
+/// off the fabric. `fabric_binding` is ifindex 21 (`ge-0-0-0`, the fabric
+/// parent); the punt has to arrive somewhere else or it is not a punt.
+fn lan_binding_7770() -> BindingWorker {
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("ge-0-0-1");
+    binding
+}
+
+/// Every session in the table, as `(origin, disposition, ingress_zone,
+/// egress_zone, is_reverse)`.
+fn session_shapes_7770(
+    sessions: &SessionTable,
+) -> Vec<(SessionOrigin, ForwardingDisposition, u16, u16, bool)> {
+    let mut out = Vec::new();
+    sessions.iter_with_origin(|_key, decision, metadata, origin| {
+        out.push((
+            origin,
+            decision.resolution.disposition,
+            metadata.ingress_zone,
+            metadata.egress_zone,
+            metadata.is_reverse,
+        ));
+    });
+    out
+}
+
+/// Drive the `wan -> lan` fabric-ingress RETURN against `sessions` and report
+/// `(policy_denies, forwards_queued)`.
+fn drive_fabric_return_7770(
+    forwarding: &ForwardingState,
+    sessions: &mut SessionTable,
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
+    lan_host: Ipv4Addr,
+    wan_peer: Ipv4Addr,
+) -> (u64, usize) {
+    let mut frame = build_txn_tcp_syn_frame_v4(
+        wan_peer,
+        lan_host,
+        443,
+        12345,
+        TCP_FLAG_SYN | TCP_FLAG_ACK,
+    );
+    stamp_fabric_zone_7770(&mut frame, TEST_WAN_ZONE_ID);
+    let mut meta = txn_meta_v4(21, TCP_FLAG_SYN | TCP_FLAG_ACK, frame.len() as u16);
+    meta.protocol = PROTO_TCP;
+    let mut binding = fabric_binding();
+    let (_batch, dbg) = txn_run_descriptor(&mut binding, sessions, forwarding, ha_state, &frame, meta);
+    (dbg.policy_deny, binding.scratch.scratch_forwards.len())
+}
+
+/// #7770 fail-on-revert: a flow this node PUNTS across the fabric is
+/// adjudicated on the way past and seeds a local session, so the peer's RETURN
+/// is a session HIT instead of the `wan -> lan` default deny that costs the
+/// first packet of every new flow during a sustained RG split.
+///
+/// Four legs. The first two are the fix; the last two are what stop the first
+/// two from being evidence about something else.
+///
+///   1. PUNT — a LAN-ingress new flow whose egress RG the peer owns is
+///      fabric-redirected AND leaves a `FabricPuntSeed` session stamped with
+///      the flow's REAL zone pair (`lan -> wan`), not the fabric parent's.
+///   2. RETURN — the same 5-tuple coming back off the fabric stamped `wan` is
+///      now FORWARDED with no policy deny.
+///   3. NO-SEED CONTROL — the identical return frame against a table with no
+///      seed is still DENIED. This is the discriminator: the ONLY difference
+///      between legs 2 and 3 is a record this node minted from a packet that
+///      ingressed on its own LAN member, which is what makes the admission
+///      unforgeable from the fabric.
+///   4. DENIED-PUNT CONTROL — with the `lan -> wan` permit narrowed so it does
+///      not match, the punt installs NO seed and the return is denied again.
+///      Without this leg the `Permit` check in `fabric_punt_seed_metadata`
+///      could be deleted and every other assertion here would stay green.
+#[test]
+fn fabric_punt_seed_admits_the_peers_return_7770() {
+    let forwarding = build_forwarding_state(&fabric_snapshot_with_lan_neighbor_7770());
+    let now_secs = monotonic_nanos() / 1_000_000_000;
+    let lan_host = Ipv4Addr::new(10, 0, 61, 102);
+    let wan_peer = Ipv4Addr::new(8, 8, 8, 8);
+    // The #7770 split: LAN RG 2 is LOCAL, WAN RG 1 is the peer's.
+    let ha_state = BTreeMap::from([(2, active_rg(now_secs))]);
+
+    // --- 1. PUNT ---------------------------------------------------------
+    let mut sessions = SessionTable::new();
+    let mut lan_binding = lan_binding_7770();
+    let out_frame = build_txn_tcp_syn_frame_v4(lan_host, wan_peer, 12345, 443, TCP_FLAG_SYN);
+    let out_meta = txn_meta_v4(24, TCP_FLAG_SYN, out_frame.len() as u16);
+    let (_batch, punt_dbg) = txn_run_descriptor(
+        &mut lan_binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &out_frame,
+        out_meta,
+    );
+    assert_eq!(
+        punt_dbg.policy_deny, 0,
+        "the punt must not be denied — the seed is an ADDITION to the punt \
+         path, not a new drop site (#7770)"
+    );
+    assert_eq!(
+        lan_binding.scratch.scratch_forwards.len(),
+        1,
+        "the punted packet must still be queued for the fabric; if it is not, \
+         the legs below are measuring a flow that never left (#7770)"
+    );
+    let shapes = session_shapes_7770(&sessions);
+    assert_eq!(
+        shapes,
+        vec![(
+            SessionOrigin::FabricPuntSeed,
+            ForwardingDisposition::FabricRedirect,
+            TEST_LAN_ZONE_ID,
+            TEST_WAN_ZONE_ID,
+            false,
+        )],
+        "the punt must leave EXACTLY one session: a FabricPuntSeed carrying the \
+         flow's REAL zone pair. The egress zone is the load-bearing half — it \
+         comes from the PRE-redirect resolution, and reading it off the \
+         FabricRedirect resolution instead would name the fabric parent's zone \
+         and adjudicate a pair that does not exist (#7770)"
+    );
+
+    // --- 2. RETURN: now a session HIT ------------------------------------
+    let (denies, forwards) =
+        drive_fabric_return_7770(&forwarding, &mut sessions, &ha_state, lan_host, wan_peer);
+    assert_eq!(
+        denies, 0,
+        "the peer's RETURN was policy-denied even though this node punted the \
+         flow and its own policy permitted it. That deny is the first packet of \
+         every new flow during a sustained RG split (#7770)"
+    );
+    assert_eq!(
+        forwards, 1,
+        "the RETURN was not queued for forwarding to the LAN host"
+    );
+
+    // --- 3. NO-SEED CONTROL: the same frame, no punt -> still denied ------
+    let mut unseeded = SessionTable::new();
+    let (unseeded_denies, unseeded_forwards) =
+        drive_fabric_return_7770(&forwarding, &mut unseeded, &ha_state, lan_host, wan_peer);
+    assert!(
+        unseeded_denies > 0,
+        "an UNSOLICITED fabric-ingress `wan -> lan` frame — one with no punt \
+         seed behind it — must still be denied. If this admits, the fix is not \
+         a session hit but a blanket relaxation of the return direction, which \
+         is the option #7770 rules dead because the fabric stamp is forgeable \
+         during exactly this split (#7770)"
+    );
+    assert_eq!(
+        unseeded_forwards, 0,
+        "an unsolicited fabric-ingress return was queued for forwarding"
+    );
+
+    // --- 4. DENIED-PUNT CONTROL: no permit -> no seed -> still denied -----
+    let deny_forwarding = build_forwarding_state(&fabric_snapshot_policy_denies_the_lan_host_7770());
+    let mut deny_sessions = SessionTable::new();
+    let mut deny_binding = lan_binding_7770();
+    let deny_out = build_txn_tcp_syn_frame_v4(lan_host, wan_peer, 12345, 443, TCP_FLAG_SYN);
+    let deny_meta = txn_meta_v4(24, TCP_FLAG_SYN, deny_out.len() as u16);
+    txn_run_descriptor(
+        &mut deny_binding,
+        &mut deny_sessions,
+        &deny_forwarding,
+        &ha_state,
+        &deny_out,
+        deny_meta,
+    );
+    assert_eq!(
+        session_shapes_7770(&deny_sessions),
+        Vec::new(),
+        "a punt whose flow this node's OWN policy does not permit must seed \
+         nothing. The seed is minted from a permit, not from the act of \
+         punting — that distinction is the whole answer to \"it would be \
+         minting sessions for traffic it never authorised\" (#7770)"
+    );
+    let (deny_denies, deny_forwards) = drive_fabric_return_7770(
+        &deny_forwarding,
+        &mut deny_sessions,
+        &ha_state,
+        lan_host,
+        wan_peer,
+    );
+    assert!(
+        deny_denies > 0,
+        "the return of an UNAUTHORISED punt must still be denied (#7770)"
+    );
+    assert_eq!(deny_forwards, 0, "an unauthorised return was forwarded");
+}
+
+/// #7770: a FABRIC-ingress packet can never mint a punt seed.
+///
+/// This is the property that keeps the admission unforgeable. An attacker on
+/// the shared fabric segment — #6458's accepted residual, live during exactly
+/// the RG split this issue is about — can clone a legitimate punt's stamp
+/// shape, so if a fabric-ingress frame could create the record that authorises
+/// a return, the fix would hand back the bypass it exists to avoid.
+///
+/// The guard is doubled by construction (`finalize_new_flow_ha_resolution`
+/// declines to redirect a fabric-ingress packet back onto the fabric, so the
+/// arm's `FabricRedirect` precondition is unreachable from the fabric anyway),
+/// and it is asserted anyway: a guard whose only proof is that another guard
+/// makes it unreachable is one line of refactoring away from being wrong.
+#[test]
+fn fabric_ingress_never_mints_a_punt_seed_7770() {
+    let forwarding = build_forwarding_state(&fabric_snapshot_with_lan_neighbor_7770());
+    let now_secs = monotonic_nanos() / 1_000_000_000;
+    let lan_host = Ipv4Addr::new(10, 0, 61, 102);
+    let wan_peer = Ipv4Addr::new(8, 8, 8, 8);
+    // WAN RG 1 LOCAL. That is the placement in which a `lan -> wan` punt is
+    // legitimately admitted here — #6458's V2 owner gate honours the stamp only
+    // when the resolution's owner RG is forwarding-active locally, which is
+    // precisely why the peer punted the flow to us — and it is the placement
+    // the existing cells' CONTROL leg uses. Under the mirrored placement the
+    // punt is not admitted at all and the absence below would prove nothing.
+    let ha_state = BTreeMap::from([(1, active_rg(now_secs))]);
+
+    // The peer's legitimate `lan -> wan` punt arriving here. It IS admitted and
+    // DOES install sessions — so this cell is not passing because nothing
+    // happened.
+    // SYN-ACK, matching the CONTROL leg of
+    // `fabric_ingress_return_traffic_is_denied_on_the_lan_node_7770` — that leg
+    // is the measured proof this placement admits and installs, so reproducing
+    // it exactly is what makes the non-empty precondition below reliable.
+    let mut frame = build_txn_tcp_syn_frame_v4(
+        lan_host,
+        wan_peer,
+        12345,
+        443,
+        TCP_FLAG_SYN | TCP_FLAG_ACK,
+    );
+    stamp_fabric_zone_7770(&mut frame, TEST_LAN_ZONE_ID);
+    let meta = txn_meta_v4(21, TCP_FLAG_SYN | TCP_FLAG_ACK, frame.len() as u16);
+    let mut binding = fabric_binding();
+    let mut sessions = SessionTable::new();
+    txn_run_descriptor(&mut binding, &mut sessions, &forwarding, &ha_state, &frame, meta);
+
+    let shapes = session_shapes_7770(&sessions);
+    assert!(
+        !shapes.is_empty(),
+        "the legitimate fabric punt was not admitted at all, so the absence \
+         asserted below is about a broken fixture rather than about the gate"
+    );
+    assert!(
+        !shapes
+            .iter()
+            .any(|(origin, ..)| *origin == SessionOrigin::FabricPuntSeed),
+        "a FABRIC-ingress packet minted a punt seed. Nothing arriving on the \
+         fabric may create the record that authorises a return, or an attacker \
+         on the fabric segment can manufacture their own admission (#7770)"
+    );
+}
+
+/// #7770: each of `should_seed_fabric_punt`'s three conditions, bound.
+///
+/// This cell exists because the conditions could not be bound where they were.
+/// Measured: with the gate inline in the poll-loop arm, deleting
+/// `!fabric_ingress` reds NOTHING in the suite — `finalize_new_flow_ha_resolution`
+/// never hands a fabric-ingress packet a `FabricRedirect` disposition, so the
+/// condition is unreachable through the loop. The end-to-end cells therefore
+/// cannot speak for it, and the property it carries (an attacker on the fabric
+/// segment cannot mint the record that authorises their own return) is the one
+/// that most needs a red when someone removes it.
+///
+/// A table over the three axes, each row differing from the qualifying row in
+/// exactly one, so no row can pass for another row's reason.
+#[test]
+fn should_seed_fabric_punt_binds_each_condition_7770() {
+    let nat_free = NatDecision::default();
+    let translated = NatDecision {
+        rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 7))),
+        ..NatDecision::default()
+    };
+
+    assert!(
+        should_seed_fabric_punt(ForwardingDisposition::FabricRedirect, false, nat_free),
+        "the qualifying shape — a locally ingressed, untranslated flow leaving \
+         across the fabric — must seed, or every row below is vacuous"
+    );
+    assert!(
+        !should_seed_fabric_punt(ForwardingDisposition::FabricRedirect, true, nat_free),
+        "a FABRIC-ingress packet must never mint a punt seed. This is the \
+         condition the end-to-end cells cannot reach: nothing arriving on the \
+         shared fabric segment may create the record that authorises a return, \
+         or #6458's accepted stamp-forgery residual becomes a policy bypass \
+         (#7770)"
+    );
+    assert!(
+        !should_seed_fabric_punt(ForwardingDisposition::FabricRedirect, false, translated),
+        "a flow carrying an INGRESS translation must not seed: the punt sends \
+         the rewritten tuple, so the return would not match the key seeded here \
+         (#7770)"
+    );
+    for disposition in [
+        ForwardingDisposition::ForwardCandidate,
+        ForwardingDisposition::HAInactive,
+        ForwardingDisposition::LocalDelivery,
+        ForwardingDisposition::NoRoute,
+        ForwardingDisposition::MissingNeighbor,
+        ForwardingDisposition::PolicyDenied,
+    ] {
+        assert!(
+            !should_seed_fabric_punt(disposition, false, nat_free),
+            "{disposition:?} must not seed a punt: only a flow actually leaving \
+             across the fabric is unadjudicated on this node, and a seed for \
+             anything else is a session for a flow that was already installed \
+             (ForwardCandidate) or dropped (#7770)"
+        );
+    }
+}
