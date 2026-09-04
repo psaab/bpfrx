@@ -268,6 +268,28 @@ editing cmdtree.
     check has twice shipped blind while the suite stayed green.
 - **HTTP REST** on `127.0.0.1:8080` — health, Prometheus `/metrics`,
   config endpoints, full gRPC parity.
+  - **The two redaction SURFACES must agree, and the agreement is asserted
+    rather than assumed (#8258).** Every operator secret is rendered by two
+    independent routes: the TYPED route (the compiled `*config.Config`
+    JSON/REST/gRPC surface), where a secret field is declared as the `Secret`
+    type and `Secret.MarshalJSON` redacts automatically; and the AST route
+    (`show configuration`, the gRPC config RPCs, the on-box CLI), where
+    `secretIndices` matches keywords in a flattened `[]string` path. The typed
+    route is SELF-MAINTAINING — one type annotation covers a new field — and
+    the AST route is HAND-MAINTAINED, so a fix on the typed side exerts no
+    pressure on the AST side. That asymmetry is why `archive-sites ... password`
+    still rendered in full on the AST surface (#7511) after #7510 had fixed the
+    typed one, and why the same story played out for `feed-server hostname` in
+    the sibling URL pass (#8104).
+    `pkg/config/ast_secret_redaction_census_8258_test.go` closes it with an
+    agreement predicate: **a leaf is secret-bearing iff the typed route declares
+    its field as `Secret`.** The population is enumerated by REFLECTION over the
+    compiled `Config`, so declaring a new `Secret` field enrols it in the census
+    on the next run whether or not anyone remembers the file exists; an
+    unmapped field fails, and each mapped leaf is verified by planting a secret
+    and rendering all four AST formats. The sibling census for URL-shaped leaves
+    (redacted by transform, not replacement) is
+    `pkg/config/ast_url_redaction_census_8104_test.go`.
   - **Listener lifecycle is all-or-nothing (#5058).** `Server.Run` may
     serve both an HTTP and (with `web-management https` + a self-signed
     cert) an HTTPS listener; the two form ONE lifecycle. Run binds both
