@@ -9,20 +9,22 @@
 // starves session installs during bulk sync. A per-event push under BGP churn
 // is a control-plane brownout, not a latency tail.
 //
-// It is NOT extracted FROM ipmon here, deliberately. ipmon's Engine entangles
-// the same loop with policy state, next-hop resolution and `publishEnabled` —
-// the HA-standby publication gate. Refactoring an HA-gated engine inside a
-// feature PR would put any regression on the cluster rather than in review, and
-// attribute it to the route listener.
+// It was written as the type ipmon WOULD adopt, because ipmon already
+// implemented this discipline and a second copy in the route listener would
+// have been a divergence with a delay fuse — whichever copy is edited first is
+// right, and nothing tells the other. The extraction was deliberately NOT done
+// inside #7437's feature PR: ipmon's Engine entangles the loop with policy
+// state, next-hop resolution and `publishEnabled` (the HA-standby publication
+// gate), and refactoring an HA-gated engine there would have put any regression
+// on the cluster rather than in review, and attributed it to the route
+// listener.
 //
-// So this is written as the type ipmon WOULD adopt, and its adoption is
-// tracked. Until then two implementations of one discipline exist, which is a
-// real cost and is why the follow-up is filed rather than assumed: untracked
-// duplication is how a time-boxed copy becomes a permanent one.
-//
-// ADOPTION IS TRACKED AS #8354. Until it lands, pkg/ipmon's run loop holds
-// the other implementation of this same discipline — if you edit one, the
-// other is the copy that will not follow.
+// #8354 completed the adoption: ipmon.Engine now drives this loop, so there is
+// ONE implementation. What stayed in ipmon is what is genuinely ipmon's —
+// policy evaluation, next-hop resolution, recovery hold-downs, and the
+// publishEnabled gate. The seam is `OnConverged` / `OnFailed`: an adopter that
+// must act on "the actuator converged AND nothing was marked while it ran"
+// cannot compute that condition, because half of it lives in here.
 package coalesce
 
 import (
@@ -48,6 +50,10 @@ const (
 // hot-loop, because lastActuation advances when the attempt starts, not when
 // it succeeds.
 type Loop struct {
+	// #8354: fired after a CONVERGED / a FAILED actuation respectively. See
+	// OnConverged and OnFailed.
+	onConverged   func()
+	onFailed      func()
 	mu            sync.Mutex
 	dirtySince    time.Time // zero = clean
 	dirtyGen      uint64
@@ -93,6 +99,20 @@ func (l *Loop) SetTimings(debounce, throttle time.Duration) {
 // SetClock injects a clock. Tests use it so a rate assertion is DETERMINISTIC
 // rather than a race against wall time — a coalescing bound asserted with
 // sleeps is the flaky-guard shape this repo keeps finding.
+// SetActuateTimeout bounds a single actuate() call; 0 disables the bound.
+//
+// #8354: exported for an adopter that owns its own timeout knob. ipmon's is
+// operator-visible through the engine, and a test drives it down to observe
+// the bounded-timeout retry -- so the value must reach the loop that applies
+// it, or the bound silently becomes the loop's default.
+//
+// Set before Start.
+func (l *Loop) SetActuateTimeout(d time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.actuateTimeout = d
+}
+
 func (l *Loop) SetClock(now func() time.Time) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -192,10 +212,107 @@ func (l *Loop) Tick(ctx context.Context) {
 	l.actuated++
 	// Clear only when the actuation converged AND nothing was marked while it
 	// ran. Either condition failing leaves the state dirty for the next sweep.
-	if ok && l.dirtyGen == gen {
+	converged := ok && l.dirtyGen == gen
+	if converged {
 		l.dirtySince = time.Time{}
 	}
+	onConverged := l.onConverged
+	onFailed := l.onFailed
 	l.mu.Unlock()
+
+	// #8354: the two hooks exist because an adopter needs to act on exactly the
+	// condition this loop decides, and cannot recompute it.
+	//
+	// `converged` is `ok && dirtyGen unchanged` -- both halves live in here, and
+	// the second is invisible to an actuator, which sees only its own return.
+	// ipmon records its APPLIED overlay under precisely this condition (#3761
+	// H8): "the actuator published exactly what it read" is true only when no
+	// newer change landed mid-actuation. Without the hook an adopter must either
+	// duplicate the generation tracking -- which is the duplication #8354 exists
+	// to remove -- or widen the condition to plain `ok` and record a desired
+	// state as an applied one.
+	//
+	// Called OUTSIDE the lock, like `actuate` itself, so a hook may take the
+	// adopter's own mutex without ordering against this one.
+	if converged {
+		if onConverged != nil {
+			onConverged()
+		}
+		return
+	}
+	if !ok && onFailed != nil {
+		onFailed()
+	}
+}
+
+// NextWake reports how long the loop may sleep before its own state could
+// next permit an actuation: the later of the debounce and throttle deadlines
+// for a pending dirty bit, or `idle` when nothing is pending.
+//
+// #8354: exported because an adopter with its OWN wakeup sources (ipmon has
+// recovery hold-down expiries) must combine them with this one, and the
+// deadlines are computed from `dirtySince`/`lastActuation`/`debounce`/
+// `throttle` -- all of which live in here. Recomputing them outside would be
+// the same duplication, moved.
+//
+// Never returns less than a millisecond for a pending deadline, so a caller
+// cannot spin on a deadline that has just passed.
+func (l *Loop) NextWake(idle time.Duration) time.Duration {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.dirtySince.IsZero() {
+		return idle
+	}
+	now := l.now()
+	debounceAt := l.dirtySince.Add(l.debounce)
+	throttleAt := l.lastActuation.Add(l.throttle)
+	at := debounceAt
+	if throttleAt.After(debounceAt) {
+		at = throttleAt
+	}
+	d := at.Sub(now)
+	if d < time.Millisecond {
+		d = time.Millisecond
+	}
+	if d > idle {
+		return idle
+	}
+	return d
+}
+
+// Dirty reports whether a change is pending actuation. For status surfaces and
+// for an adopter deciding whether to schedule its own wakeup.
+func (l *Loop) Dirty() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return !l.dirtySince.IsZero()
+}
+
+// OnConverged registers a callback fired after an actuation that CONVERGED --
+// the actuator returned true AND no change was marked while it ran.
+//
+// Not "the actuator returned true". The second half is the point: it is what
+// distinguishes "the state I published is the current state" from "the state I
+// published was already stale when I finished", and only this loop knows it.
+//
+// Called outside the loop's lock. Set before Start.
+func (l *Loop) OnConverged(fn func()) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.onConverged = fn
+}
+
+// OnFailed registers a callback fired after an actuation whose actuator
+// returned false. A NON-convergence caused by a concurrent mark (actuator
+// returned true, generation moved) does NOT fire it -- nothing failed there,
+// the work is simply not finished, and counting it as a failure would make a
+// flap storm look like an outage.
+//
+// Called outside the loop's lock. Set before Start.
+func (l *Loop) OnFailed(fn func()) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.onFailed = fn
 }
 
 func (l *Loop) run() {

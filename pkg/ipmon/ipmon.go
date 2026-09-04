@@ -50,6 +50,8 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/rpm"
+
+	"github.com/psaab/xpf/pkg/coalesce"
 )
 
 const (
@@ -165,8 +167,14 @@ type Engine struct {
 	// actuator publishes the config baseline.
 	publishEnabled bool
 
-	dirtySince    time.Time // zero = clean
-	lastActuation time.Time
+	// #8354: the debounce/throttle/dirty-generation discipline lives in
+	// pkg/coalesce, which was written as the type this engine would adopt.
+	// Two implementations of one discipline is a divergence with a delay
+	// fuse: whichever copy is edited first is right, and nothing tells the
+	// other. What stays here is what is genuinely ipmon's -- policy
+	// evaluation, next-hop resolution, recovery hold-downs, and the
+	// publishEnabled HA gate.
+	loop *coalesce.Loop
 	// appliedOverlay is the overlay snapshot from the last CONVERGED
 	// actuation — what is actually live in the FIBs (#3761 H8). It is
 	// updated ONLY when the run loop confirms a consistent actuation
@@ -174,12 +182,6 @@ type Engine struct {
 	// the last good state across a failing/pending actuation instead of
 	// reporting the desired overlay as applied.
 	appliedOverlay []config.RouteOverlayEntry
-	// dirtyGen increments on every marked change (even while already
-	// dirty). The run loop snapshots it before actuating and clears the
-	// dirty bit only when it is unchanged AND the actuation converged —
-	// so a change that lands DURING an actuation (last-writer-wins) is
-	// not lost, and a failed actuation stays dirty for retry (#3757).
-	dirtyGen uint64
 	// actuationFailures counts route-overlay actuations that did not
 	// converge (a hard FRR reload error, a snapshot-publish failure, an
 	// unconfirmed FIB-generation bump, or a bounded-timeout/shutdown
@@ -251,7 +253,7 @@ type Engine struct {
 // autonomous retry (#3757).
 func New(actuate func(ctx context.Context) bool) *Engine {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Engine{
+	e := &Engine{
 		policies:       make(map[string]*policyState),
 		failedTests:    make(map[string]map[string]bool),
 		publishEnabled: true,
@@ -266,6 +268,62 @@ func New(actuate func(ctx context.Context) bool) *Engine {
 		actuateCtx:     ctx,
 		actuateCancel:  cancel,
 	}
+	// #8354: the shared discipline. Constructed HERE rather than in Start
+	// because Apply/HandleTransition can mark the engine dirty before it is
+	// started, and a nil loop would panic on the first mark -- Go compiles a
+	// nil-pointer method call happily, so that is a runtime failure with no
+	// compile-time sign.
+	//
+	// The actuator is wrapped rather than passed through: the engine's
+	// post-actuation bookkeeping (applied overlay, failure counter) is
+	// attached with OnConverged/OnFailed, which fire on the loop's own
+	// convergence condition -- `ok && generation unchanged` -- that an
+	// actuator cannot see.
+	e.loop = coalesce.New(e.actuateForLoop)
+	e.loop.OnConverged(e.recordConvergedActuation)
+	e.loop.OnFailed(e.recordFailedActuation)
+	return e
+}
+
+// actuateForLoop adapts the engine's actuator to the loop. A nil actuator
+// (tests that drive the state machine directly) is a converged no-op, which is
+// the pre-#8354 behaviour.
+func (e *Engine) actuateForLoop(ctx context.Context) bool {
+	e.mu.Lock()
+	actuate := e.actuate
+	e.mu.Unlock()
+	if actuate == nil {
+		return true
+	}
+	// Outside the lock; the actuator reads ActiveOverlay() itself, so it
+	// publishes the freshest state (last-writer-wins under flap storms).
+	return actuate(ctx)
+}
+
+// recordConvergedActuation runs after an actuation that CONVERGED -- the
+// actuator returned true AND no change landed while it ran.
+//
+// #3761 H8: the applied overlay is recorded under exactly that condition,
+// because "the actuator published what it read" is only true when no newer
+// change arrived mid-actuation. Widening this to plain `ok` would record a
+// DESIRED state as an APPLIED one, which is what status and metrics report.
+func (e *Engine) recordConvergedActuation() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.appliedOverlay = e.activeOverlayLocked()
+}
+
+// recordFailedActuation counts a non-convergence caused by the ACTUATOR
+// (a consumer failed, or the bounded timeout / shutdown aborted the wait), so
+// the otherwise-silent self-heal retry is observable (#4423 L).
+//
+// A non-convergence caused by a concurrent re-dirty does NOT reach here:
+// nothing failed, the work is simply not finished, and counting it would make
+// a flap storm look like an outage.
+func (e *Engine) recordFailedActuation() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.actuationFailures++
 }
 
 // SetNextHopResolver injects the interface-typed next-hop resolver
@@ -328,6 +386,20 @@ func (e *Engine) NotifyNextHopChange() {
 // is spawned at most once. A second goroutine would each defer
 // close(e.done) and the second close would panic.
 func (e *Engine) Start() {
+	// #8354: push the engine's timings and clock into the shared loop at
+	// Start. They live on the Engine because tests set them directly before
+	// Start -- keeping that working unchanged is an acceptance condition of
+	// the adoption, since those tests are the guard on the behaviour being
+	// relocated.
+	e.mu.Lock()
+	debounce, throttle, now := e.debounce, e.throttle, e.now
+	actuateTimeout := e.actuateTimeout
+	e.mu.Unlock()
+	e.loop.SetTimings(debounce, throttle)
+	e.loop.SetActuateTimeout(actuateTimeout)
+	if now != nil {
+		e.loop.SetClock(now)
+	}
 	e.mu.Lock()
 	if e.started || e.stopped {
 		e.mu.Unlock()
@@ -800,14 +872,13 @@ func (e *Engine) markDirtyLocked(changed bool) {
 	if !changed {
 		return
 	}
-	// Bump the generation on EVERY change so a change that lands while an
-	// actuation is in flight is visible to the run loop's post-actuate
-	// clear check (#3757 last-writer-wins), not just the first
-	// clean→dirty transition.
-	e.dirtyGen++
-	if e.dirtySince.IsZero() {
-		e.dirtySince = e.now()
-	}
+	// #8354: delegated. Mark() bumps the generation on EVERY change -- so a
+	// change landing while an actuation is in flight is visible to the
+	// post-actuate clear check (#3757 last-writer-wins) rather than only the
+	// first clean->dirty transition -- and starts the debounce window on the
+	// first mark. That is the same contract this function used to implement
+	// itself; it is now implemented once.
+	e.loop.Mark()
 }
 
 func (e *Engine) kickLoop() {
@@ -829,67 +900,15 @@ func (e *Engine) run() {
 		changed := e.evaluateLocked(e.now())
 		e.markDirtyLocked(changed)
 
-		now := e.now()
-		fire := false
-		var actuatingGen uint64
-		if !e.dirtySince.IsZero() &&
-			now.Sub(e.dirtySince) >= e.debounce &&
-			now.Sub(e.lastActuation) >= e.throttle {
-			fire = true
-			// #3757 (M1): snapshot the generation being actuated and
-			// advance lastActuation, but do NOT clear the dirty bit yet —
-			// it is cleared only after the actuator reports a consistent,
-			// converged result (below). Advancing lastActuation paces a
-			// failed actuation's retry to at most one per throttle window
-			// (bounded), never a hot loop.
-			actuatingGen = e.dirtyGen
-			e.lastActuation = now
-		}
 		e.mu.Unlock()
 
-		if fire {
-			// Outside the lock; the actuator reads ActiveOverlay() itself,
-			// so it publishes the freshest state (last-writer-wins under
-			// flap storms). A nil actuator (tests that drive the state
-			// machine directly) is a converged no-op. The actuation runs
-			// under a bounded child of e.actuateCtx so a wedged consumer
-			// cannot hold the loop off its next retry indefinitely while
-			// the daemon is up (#4423 L); Stop still cancels e.actuateCtx
-			// (the parent), so shutdown abort (#3758) is unaffected.
-			ok := true
-			if e.actuate != nil {
-				actCtx := e.actuateCtx
-				var cancel context.CancelFunc
-				if e.actuateTimeout > 0 {
-					actCtx, cancel = context.WithTimeout(e.actuateCtx, e.actuateTimeout)
-				}
-				ok = e.actuate(actCtx)
-				if cancel != nil {
-					cancel()
-				}
-			}
-			e.mu.Lock()
-			if ok && e.dirtyGen == actuatingGen {
-				// Converged, and no newer change arrived while the
-				// actuator ran: clear the dirty bit. A failed actuation
-				// (ok==false) OR a concurrent re-dirty (dirtyGen advanced)
-				// keeps dirtySince set so the next wake re-actuates
-				// autonomously (#3757 M1/H1/H2/H3).
-				e.dirtySince = time.Time{}
-				// The actuator just published this overlay consistently
-				// (dirtyGen unchanged ⇒ the overlay is exactly what it
-				// read via ActiveOverlay); record it as the applied state
-				// so status/metrics report applied, not desired (#3761 H8).
-				e.appliedOverlay = e.activeOverlayLocked()
-			}
-			if !ok {
-				// Non-convergence (a consumer failed, or the bounded
-				// timeout/shutdown aborted the wait): count it so the
-				// otherwise-silent self-heal retry is observable (#4423 L).
-				e.actuationFailures++
-			}
-			e.mu.Unlock()
-		}
+		// #8354: one sweep of the shared discipline. Tick owns the debounce,
+		// the throttle, the pre-actuation `lastActuation` advance that paces a
+		// FAILING actuation to one retry per throttle window, and the
+		// clear-only-when-converged-and-unchanged rule. The actuator, the
+		// applied-overlay record and the failure counter are wired to it in
+		// Start().
+		e.loop.Tick(e.actuateCtx)
 
 		e.mu.Lock()
 		wake := e.nextWakeLocked(e.now())
@@ -928,14 +947,12 @@ func (e *Engine) nextWakeLocked(now time.Time) time.Duration {
 			wake = d
 		}
 	}
-	if !e.dirtySince.IsZero() {
-		debounceAt := e.dirtySince.Add(e.debounce)
-		throttleAt := e.lastActuation.Add(e.throttle)
-		if throttleAt.After(debounceAt) {
-			consider(throttleAt)
-		} else {
-			consider(debounceAt)
-		}
+	// #8354: the debounce/throttle deadline belongs to the shared loop, which
+	// owns the state it is computed from. Recomputing it here would be the same
+	// duplication, moved one function along. The recovery hold-downs below are
+	// ipmon's own wakeup source and stay.
+	if w := e.loop.NextWake(time.Hour); w < wake {
+		wake = w
 	}
 	for _, st := range e.policies {
 		consider(st.pendingRecoveryAt)
