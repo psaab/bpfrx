@@ -74,6 +74,10 @@ mouse_remote_job_start_cmd() {
 mouse_remote_job_kill_cmd() {
     local pidfile
     pidfile="$(mouse_remote_job_pidfile "$1" "$2")"
+    # shellcheck disable=SC2016  # the single quotes are the point: this
+    # printf EMITS a shell snippet that runs on the REMOTE host, so $pid must
+    # reach it unexpanded. Expanding it here would kill whatever pid this
+    # shell happened to have.
     printf 'pid=$(cat %s 2>/dev/null); if [ -n "$pid" ] && grep -qa %s /proc/$pid/cmdline 2>/dev/null; then kill "$pid" 2>/dev/null; fi; rm -f %s; exit 0' \
         "$pidfile" "$3" "$pidfile"
 }
@@ -133,5 +137,12 @@ mouse_elephant_stale_check_cmd() {
 # So the default stays semantic, and the ABORT is what improves: it reports
 # the whole grid, so a one-port gap reads as a one-port gap instead of a dead
 # lab (#8244).
+# shellcheck disable=SC2034  # consumed by test-mouse-latency.sh and
+# test-mouse-latency-matrix.sh, which SOURCE this file, and pinned by
+# cos_port_grid_test.py. shellcheck cannot see across a source boundary,
+# so this is a false positive rather than dead code — the whole point of
+# #8244 was to single-source these two values here.
 MOUSE_DEFAULT_ECHO_PORT=6200
+# shellcheck disable=SC2034  # same: sourced, not dead. A directive covers
+# only the following line, so each assignment needs its own.
 MOUSE_DEFAULT_IPERF_PORT=5202
