@@ -672,6 +672,59 @@ Three specific traps, all of which cost a real attempt:
 verdict, hermetically tested by `make test-screen-probe-lib` so the ordering
 above is asserted rather than remembered.
 
+### A content-scanning guard is never in anyone's diff scope, so everyone runs it
+
+A merge gate is normally scoped to the packages a diff touches: `git diff
+origin/master...HEAD` names the files, and you run those packages' tests. That
+gate is **structurally incapable** of seeing a guard that selects its subjects by
+CONTENT rather than by ownership — a census that walks the whole tree looking for
+a shape.
+
+The failure has a distinctive and expensive signature: **the lane that breaks it
+stays green, and every other lane inherits the red.** The breaking diff does not
+touch the guard's package, so the author's scoped run passes; the guard lives
+elsewhere, so it fires on the next person to merge, who then investigates a
+failure they did not cause.
+
+Three instances in one day, from three lanes, across two guards:
+
+| guard | lives in | broken by a diff touching |
+|---|---|---|
+| `TestTreeIsGofmtClean` | tree-wide | one package's formatting |
+| `TestOperatorPackagesOnlyUseDocumentedLegacyDataplaneImports` | `pkg/dataplane` | a new file in `pkg/cli` |
+| `TestRetirementBoundaryDocsMentionLegacyImportAllowlist` | `pkg/dataplane` | an allowlist entry with no docs row |
+
+**So the merge gate has a step that is deliberately NOT scoped to your diff:**
+
+```
+gofmt -l .                                    # whole tree, not just touched files
+go test ./pkg/dataplane/                      # where the boundary canaries live
+```
+
+Run both regardless of what you changed. They are seconds, and the alternative is
+a red master that blocks every concurrent lane.
+
+**Corollary — when you satisfy a guard by adding to its allowlist, find the guard
+that guards the allowlist.** A registry that exists to record exceptions is
+exactly the kind of thing bound to documentation or to a count elsewhere; the
+obvious one-line fix can be one commit away from a different red. Grep for other
+tests naming the same identifier before landing.
+
+**And distinguish the two kinds of allowlist entry, because only one is
+legitimate:**
+
+- **A new capability gaining an exception is weakening the guard.** The cure for
+  a guard's noise must never be loosening the guard.
+- **A relocation is keeping the guard accurate.** The allowlist is keyed by
+  FILENAME, so splitting code out of an already-allowlisted file trips it while
+  the import boundary is unchanged. Existing entries carry this category
+  explicitly (`#1444 relocated from cli.go`, `#2158 split from
+  cli_show_security.go`, `#5661 pure-motion split`).
+
+An allowlist reason string is a **claim about the import boundary**, not a
+description of the change that moved the code — write it so it stays true after
+that change's rationale is rewritten.
+
 ## Review discipline
 
 ### Reviewing (adversarial by design)
