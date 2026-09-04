@@ -119,3 +119,10 @@ harness = false
 [[bench]]
 name = "runtime_view_refresh"
 harness = false
+
+# #8276: prices the IN-PROCESS half of Option B2 (the kernel -> userspace
+# capture bridge for XFRM plaintext). The kernel half needs hardware; this
+# bounds the userspace handoff so the design argument rests on a number.
+[[bench]]
+name = "b2_capture_bridge"
+harness = false
