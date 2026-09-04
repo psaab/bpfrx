@@ -1001,6 +1001,28 @@ func stablePools(pools []*config.DHCPPool) []*config.DHCPPool {
 // [1, 0xFFFFFFFE].
 const keaSubnetIDMax = 0xFFFFFFFE
 
+// #8597 K53: a COMPILE-TIME assertion that `int` is wide enough to hold
+// keaSubnetIDMax, because stableSubnetID below returns `int` and its modulo can
+// produce any value in [0, keaSubnetIDMax-1].
+//
+// On a 32-bit `int` (GOARCH=386, 32-bit arm) every result above 0x7FFFFFFF —
+// roughly half of all subnets — wraps NEGATIVE, and a negative Kea subnet-id is
+// not a diagnosable error: it is written into the generated Kea config and the
+// daemon rejects or misfiles the subnet, on about half the subnets, chosen by a
+// hash nobody can predict from the config.
+//
+// Today that cannot happen, and the reason is not a check — it is that this
+// tree builds only amd64 and arm64, both LP64. So the arithmetic is correct
+// because of a BUILD-TARGET property that nothing states. This line states it.
+// `int(keaSubnetIDMax)` is a constant conversion: on a 64-bit target it is
+// trivially fine, and on a 32-bit one the compiler refuses with
+// "constant 4294967294 overflows int" — naming the constant, at build time, on
+// the day someone adds the target rather than in the field afterwards.
+//
+// A range check here would be the wrong remedy: it would be dead code on every
+// target we build, which is the dead-guard class #6780 exists to prevent.
+const _ = int(keaSubnetIDMax)
+
 // stableSubnetID derives a DETERMINISTIC Kea subnet-id from the subnet's
 // canonical CIDR identity (#5041). The prior scheme was a positional counter
 // (subnetID := 1; subnetID++) over each node's list of subnets. In an HA

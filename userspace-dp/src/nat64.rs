@@ -737,6 +737,37 @@ impl Nat64State {
             // would otherwise be silently ignored), or a non-/96 length skips
             // the whole rule (#3888) — loudly, so the drop is visible. Mirrors
             // the exact-2-parts `parse_prefix` in nptv6.rs.
+            //
+            // #8597 K62, MEASURED — this check is strict, but it is not
+            // IDENTICAL to the Go gate it backstops, and the difference is
+            // exactly one character. Go validates the same token with
+            // `strconv.ParseUint(parts[1], 10, 8)`
+            // (pkg/config/compiler_validate_strict_nat.go), and Go's ParseUint
+            // permits NO sign, while Rust's integer FromStr permits a leading
+            // '+'. So `64:ff9b::/+96` is REJECTED at a strict commit and
+            // ACCEPTED here.
+            //
+            // Swept exhaustively over all 7240 strings of length <= 3 drawn
+            // from [0-9 + - _ space x X . e E]: 110 tokens differ, every one of
+            // them a leading '+', and there is NO token that Go accepts and
+            // this parse rejects. Rust's accepted language is a strict superset
+            // of Go's, and both agree on the VALUE wherever both accept.
+            //
+            // That direction is the safe one and it should stay that way. The
+            // invariant worth preserving is not "the two grammars are equal"
+            // but "the backstop never rejects what the gate accepted" — a
+            // backstop STRICTER than its gate silently skips a rule that
+            // committed cleanly, turning a cosmetic syntax quirk into lost
+            // NAT64 forwarding. Do NOT "tighten" this to reject '+96': that
+            // trades a harmless, unreachable divergence for the one failure
+            // mode this code exists to prevent.
+            //
+            // Unreachable in supported operation, which is why it is recorded
+            // rather than fixed: reaching it needs a snapshot carrying `/+96`,
+            // and no xpf version can produce one — ParseUint has never accepted
+            // a sign, so the value cannot survive the commit that would persist
+            // it. It would take out-of-band edition of the config DB or a
+            // foreign implementation on the other end of HA sync.
             let parts: Vec<&str> = snap.prefix.split('/').collect();
             if parts.len() != 2 || parts[1].parse::<u8>().ok() != Some(96) {
                 eprintln!(
