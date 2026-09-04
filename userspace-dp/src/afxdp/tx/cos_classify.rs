@@ -1283,9 +1283,41 @@ pub(in crate::afxdp) fn enqueue_local_into_cos(
                 ) {
                     Ok(()) => return Ok(()),
                     Err(CoSPendingTxItem::Prepared(prepared_req)) => {
-                        let req =
+                        // #8597 K41: NEVER panic on the TX path.
+                        //
+                        // `clone_prepared_request_for_cos` returns None only
+                        // when `area.slice(offset, len)` refuses -- a prepared
+                        // descriptor pointing outside the UMEM, i.e. corruption.
+                        // `.expect()` turned that into a worker panic, and a
+                        // panicked TX worker is a fail-closed stall with no
+                        // restart (the supervisor is detection-only), so one
+                        // bad descriptor took down every flow on that worker.
+                        //
+                        // Dropping the packet is strictly better and is what a
+                        // corrupt descriptor deserves: the frame is recycled so
+                        // the UMEM slot is not leaked, and the drop is
+                        // attributed rather than silent.
+                        //
+                        // `tx_errors` is the right counter here and that is
+                        // deliberate, not incidental: the convention at the foot
+                        // of this file reserves it for FAULTS and keeps DESIGNED
+                        // shaping drops off it (`admission_*_drops` /
+                        // `dbg_cos_queue_overflow`). An out-of-bounds descriptor
+                        // is a fault.
+                        let Some(req) =
                             clone_prepared_request_for_cos(binding.umem.area(), &prepared_req)
-                                .expect("prepared CoS fallback clone");
+                        else {
+                            binding
+                                .live
+                                .tx_errors
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            recycle_prepared_immediately_with_shared(
+                                binding,
+                                &prepared_req,
+                                shared_recycles.as_deref_mut(),
+                            );
+                            return Ok(());
+                        };
                         recycle_prepared_immediately_with_shared(
                             binding,
                             &prepared_req,
