@@ -130,8 +130,8 @@ the broken code.
 The walk now descends unconditionally, including to a leaf's nil child map, so
 the next word falls into the not-a-keyword arm. That arm still admits the
 legitimate consumers of a following word — a typed leaf's value, a dynamic
-node, a placeholder — and refuses anything else as `CanonicalUnknown`, which
-callers must fail closed on.
+node, a placeholder, a node that declares `AcceptsArgs` — and refuses anything
+else as `CanonicalUnknown`, which callers must fail closed on.
 
 Over-rejection is the risk to watch when touching this, because a caller MUST
 fail closed on anything other than `CanonicalOK`: refusing too much REFUSES a
@@ -140,6 +140,48 @@ therefore carry control rows for value slots (`ping <host>`,
 `show interfaces <name>`, `monitor traffic interface <name>`) and for genuine
 child descents, and the change was verified differentially against master —
 the only row whose result moved is `show version configuration`.
+
+## `AcceptsArgs` — a node that takes an argument it cannot complete
+
+**#8304 — the over-rejection the section above warns about, in the wild.**
+`show log messages` and every `show configuration <stanza> <deeper>` are served
+by the dispatchers but declared none of the three consumers, so `Canonicalize`
+returned `CanonicalUnknown` and every login class with `allow-commands` /
+`deny-commands` was refused a lawful command.
+
+The repair is in the TREE, not the walk. All three mechanisms are correct and
+load-bearing; those nodes simply declared none of them. `HasDynamic()` was the
+near-fit and it does not fit, because it conflates two different properties:
+
+| property | asked by | `show log <filename>` |
+|---|---|---|
+| offers completions | `CompleteFromTree`, `CompleteFromTreeWithDesc`, `LookupDesc` | no — the set is `/var/log`, not the tree's to enumerate |
+| accepts an argument | `Canonicalize` | **yes** |
+
+Expressing the second through `DynamicFn` means attaching a completer that
+returns nothing, so `Node.AcceptsArgs` states it directly. It consumes
+ARBITRARILY many trailing words and is honoured **only in `Canonicalize`** —
+the completion walkers ask the other question and must not see it. That scope
+is bound by `TestAcceptsArgsIsHonouredOnlyInCanonicalize_8304`, an AST check
+with a `HasDynamic` positive control, so it cannot decay into a comment.
+
+It is OPT-IN AND NEVER A RELAXATION: an unmarked node is exactly as strict as
+before, so it cannot re-open #8289. The mutant that deletes the opt-in and
+admits any trailing word (`if currentNode != nil`) reds the #8289 and #7172
+guards as well as #8304's own controls — that is the cell carrying the weight.
+
+Marked today: `show log`, and the 16 `show configuration` stanza children.
+
+**Do NOT mark a node whose dispatcher refuses the argument.**
+`clear security flow session all` looks like a fourth instance and is not one:
+`parseClearSessionFilter` delegates to `parseSessionFilterMode(args, true)`
+(`pkg/cli/session_filter.go`), whose token switch has no `all` arm — the
+`default:` sets `unknown session filter "all"` — and `hasFilter()` counts
+`parseErr != nil` as its FIRST term, so the error never falls through to a
+clear-all. The command
+is refused by the box, and the tree refusing it is the two agreeing. Marking it
+would assert a command that does not exist — the mirror defect of #8304, and
+the one #8057's canonicalize-to-self check exists to catch.
 
 ## Typed leaves
 
