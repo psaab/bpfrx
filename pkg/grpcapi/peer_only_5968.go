@@ -63,16 +63,37 @@ import (
 // classified the same fetch" would ALWAYS be a bug, so it is single-sourced
 // rather than bound by a test.
 
+// peerFetchErrorStatus classifies a peer-fetch ERROR (#8308).
+//
+// An admission refusal is NOT a partition. This node returns
+// codes.ResourceExhausted when it declines to ask the peer (see the three
+// sites below), which means the peer is reachable and the local budget said
+// no. Reporting that as UNREACHABLE sends an operator debugging a fabric
+// problem after a network fault that does not exist, and #8306 had already
+// fixed the wording on the REST surface — so before this, REST said "busy"
+// while gRPC said "unreachable" about the same event.
+//
+// Single-sourced for the same reason the attachPeer* helpers are: a divergence
+// between how the full path and the peer-only path classify the same fetch
+// would always be a bug.
+func peerFetchErrorStatus(perr error) pb.PeerFetchStatus {
+	if status.Code(perr) == codes.ResourceExhausted {
+		return pb.PeerFetchStatus_PEER_FETCH_STATUS_BUSY
+	}
+	return pb.PeerFetchStatus_PEER_FETCH_STATUS_UNREACHABLE
+}
+
 // attachPeerSessionSummary classifies one peer summary fetch onto resp (#5320
-// semantics, unchanged): a fetch error is UNREACHABLE with the reason attached,
-// a result is OK, and (nil, nil) is either a standalone node (NOT_APPLICABLE)
-// or a clustered node whose peer heartbeat is currently lost (UNREACHABLE — a
+// semantics, plus #8308): a fetch error is UNREACHABLE with the reason
+// attached — or BUSY when it was this node refusing on admission — a result is
+// OK, and (nil, nil) is either a standalone node (NOT_APPLICABLE) or a
+// clustered node whose peer heartbeat is currently lost (UNREACHABLE — a
 // partition, not standalone).
 func (s *Server) attachPeerSessionSummary(resp, peerResp *pb.GetSessionSummaryResponse, perr error) {
 	switch {
 	case perr != nil:
 		slog.Warn("failed to fetch peer session summary", "err", perr)
-		resp.PeerStatus = pb.PeerFetchStatus_PEER_FETCH_STATUS_UNREACHABLE
+		resp.PeerStatus = peerFetchErrorStatus(perr)
 		resp.PeerError = perr.Error()
 	case peerResp != nil:
 		resp.Peer = peerResp
@@ -87,7 +108,7 @@ func (s *Server) attachPeerZonePairSummary(resp, peerResp *pb.GetZonePairSummary
 	switch {
 	case perr != nil:
 		slog.Warn("failed to fetch peer zone-pair summary", "err", perr)
-		resp.PeerStatus = pb.PeerFetchStatus_PEER_FETCH_STATUS_UNREACHABLE
+		resp.PeerStatus = peerFetchErrorStatus(perr)
 		resp.PeerError = perr.Error()
 	case peerResp != nil:
 		resp.Peer = peerResp

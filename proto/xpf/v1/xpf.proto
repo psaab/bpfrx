@@ -464,6 +464,19 @@ message GetSessionsResponse {
   int32 node_id = 5;              // cluster node ID (0, 1, ...)
   GetSessionsResponse peer = 6;   // peer node sessions (nil if standalone)
   string next_page_token = 7;     // opaque cursor for next page; empty = no more data
+  // #8308: the peer-fetch outcome for THIS response, matching the fields
+  // GetSessionSummaryResponse and GetZonePairSummaryResponse have carried
+  // since #5320. Their absence here is why the session-LIST surface reported
+  // no peer outcome at all: the handler's discarded error was downstream of a
+  // gap in the message, not the cause of it.
+  //
+  // New field numbers, so a response from an older server simply omits them
+  // and they decode as UNSPECIFIED / "" -- which is exactly what
+  // UNSPECIFIED already means ("not evaluated / older server"). A reader must
+  // therefore treat UNSPECIFIED as "this server does not report it", never as
+  // an outcome.
+  PeerFetchStatus peer_status = 8;
+  string peer_error = 9;
 }
 message SessionEntry {
   string src_addr = 1;
@@ -1301,4 +1314,15 @@ enum PeerFetchStatus {
   PEER_FETCH_STATUS_NOT_APPLICABLE = 1; // standalone, or include_peer not set
   PEER_FETCH_STATUS_OK = 2;             // peer requested and its data is included
   PEER_FETCH_STATUS_UNREACHABLE = 3;    // peer requested but the fetch failed; peer data omitted
+  // #8308: the peer IS reachable and THIS node declined to ask -- the fetch was
+  // refused on admission (peer_only_5968.go returns codes.ResourceExhausted).
+  // Before this, an admission refusal was classified UNREACHABLE, which sends
+  // an operator debugging a fabric problem after a network fault that does not
+  // exist. ADDED, never a redefinition of UNREACHABLE: in a rolling HA upgrade
+  // the two nodes run different binaries against one wire, so narrowing an
+  // existing member's meaning would silently change what the OLDER binary
+  // reports. An older decoder renders this as the raw integer 4, which is
+  // wrong-looking rather than wrong -- and that is the trade the additive
+  // choice buys.
+  PEER_FETCH_STATUS_BUSY = 4;
 }
