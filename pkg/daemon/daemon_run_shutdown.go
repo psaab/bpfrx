@@ -36,6 +36,13 @@ type controlShutdownBounder interface{ BeginControlShutdown() }
 // the 1690-LOC lifecycle stays reviewable (#4662 Increment 1). Returns runErr
 // unchanged.
 func (d *Daemon) runShutdownSequence(wg *sync.WaitGroup, stop func(), runErr error) error {
+	// #8621: stop answering ARP for source-NAT pool addresses FIRST. A node on
+	// its way down should stop claiming those addresses before the dataplane is
+	// torn out from under them — otherwise an upstream keeps a binding pointing
+	// at this node and sends it pool return traffic it can no longer forward.
+	// Idempotent, and safe when no responder ever started.
+	d.stopProxyARPResponders()
+
 	// #2926: explicitly abort any in-flight commit/remediation apply NOW, at the
 	// very start of the shutdown sequence and BEFORE the explicit subsystem
 	// teardown below (FRR Stop, HA rg_active clear, dp.Teardown). applyCancelCtx

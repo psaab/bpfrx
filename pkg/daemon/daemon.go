@@ -1368,6 +1368,21 @@ type Daemon struct {
 	// responder from a stale config snapshot.
 	proxyARPEnabledMu sync.Mutex
 	proxyARPEnabled   map[string]map[int]struct{}
+
+	// #8621: per-interface ARP responders for source-NAT pool addresses. The
+	// kernel's NTF_PROXY entries and `proxy_arp` sysctl above cannot answer for
+	// a pool address inside its own egress interface's connected subnet — every
+	// arm of arp_process's proxy branch is gated on the route egressing a
+	// DIFFERENT device than the request arrived on. See
+	// pkg/cluster/arp_responder_8621.go.
+	//
+	// Set once at construction and never reassigned, so the field itself needs
+	// no lock; the set has its own mutex. Lock order is
+	// applySem -> arpResponders.mu (syncProxyARPResponders runs inside
+	// reconcileProxyARP, which the commit path calls under applySem), and the
+	// responder goroutines never take arpResponders.mu, so there is no cycle.
+	arpResponders *proxyARPResponders
+
 	// proxyARPUnresolved is the set of CONFIGURED proxy-arp interfaces whose
 	// Linux netdev did not resolve on the most recent reconcile (#7685). The
 	// reconcile already treats these as debt — it carries their prior responder
@@ -1584,6 +1599,7 @@ func New(opts Options) (*Daemon, error) {
 		opts:                       opts,
 		startTime:                  time.Now(),
 		store:                      store,
+		arpResponders:              newProxyARPResponders(),
 		rgStates:                   make(map[int]*rgStateMachine),
 		blackholeRoutes:            make(map[int][]netlink.Route),
 		reconcileNowCh:             make(chan struct{}, 1),

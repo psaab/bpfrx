@@ -191,6 +191,28 @@ func (d *Daemon) reconcileProxyARP(cfg *config.Config) {
 	// property the always-on loop relies on.
 	hasEntries := cfg != nil && len(cfg.Security.NAT.ProxyARP) > 0
 
+	// #8621: keep the userspace ARP responders in step with the config.
+	//
+	// The kernel entries this function installs CANNOT answer for a pool
+	// address inside its own egress interface's connected subnet — every arm of
+	// arp_process's proxy branch is gated on the route egressing a DIFFERENT
+	// device than the request arrived on. Without a responder the configuration
+	// compiles, installs, reports success and answers nothing.
+	//
+	// FIRST, above the early return below. That return fires when there is
+	// nothing configured AND nothing installed, and a responder still running
+	// then would answer for an address this node no longer proxies. Placing the
+	// sync above it means "no config" always reaches "stop everything".
+	//
+	// Driven by the UNFILTERED interface map on purpose. `ifaceMap` further
+	// down is filtered by `proxyARPEntrySuppressed`, which is right for
+	// installing kernel entries and wrong here: a responder started only while
+	// this node owns the group would not EXIST at the moment ownership arrives,
+	// and would not start until the next 30s reassert. Instead one runs for
+	// every configured interface and consults ownership per REQUEST, so a
+	// failover takes effect on the next frame.
+	d.syncProxyARPResponders(cfg, proxyARPResponderTargets(cfg))
+
 	// Snapshot the interfaces a prior commit installed proxy-arp on so the
 	// stateless dataplane reconcile can sweep entries that dropped out of the
 	// config (#4955). Keys are Linux netdev names (ReconcileProxyARP keys its
@@ -267,6 +289,24 @@ func (d *Daemon) reconcileProxyARP(cfg *config.Config) {
 			}
 		}
 	}
+
+}
+
+// proxyARPResponderTargets maps kernel netdev name -> Junos interface ref for
+// every interface with proxy-ARP configured, resolved but NOT ownership
+// filtered. Nil cfg yields an empty set, which stops every responder.
+func proxyARPResponderTargets(cfg *config.Config) map[string]string {
+	want := map[string]string{}
+	if cfg == nil || len(cfg.Security.NAT.ProxyARP) == 0 {
+		return want
+	}
+	byJunos, names, _ := proxyARPIfaceMap(cfg)
+	for junosRef, idx := range byJunos {
+		if n := names[idx]; n != "" {
+			want[n] = junosRef
+		}
+	}
+	return want
 }
 
 // retainUnresolvedProxyResponders carries the PRIOR responder state of every
