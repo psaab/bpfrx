@@ -400,10 +400,16 @@ func (p *nlPlan) pfxAddrMatch(field string, f nlFamily, addrs []string, except b
 	var els []nftables.SetElement
 	if interval {
 		for _, pfx := range pfxs {
-			els = append(els,
-				nftables.SetElement{Key: addrBytes(pfx.Addr(), f)},
-				nftables.SetElement{Key: addrBytes(prefixNext(pfx), f), IntervalEnd: true},
-			)
+			els = append(els, nftables.SetElement{Key: addrBytes(pfx.Addr(), f)})
+			// #8597: a prefix reaching the top of the key space has no
+			// "first address not covered", so it gets NO end element and the
+			// interval runs open to the end of the range. Emitting a wrapped
+			// end put the marker at the BOTTOM of the key space instead — see
+			// prefixNext for the two encodings that produced, and what the
+			// kernel stored for each.
+			if end, ok := prefixNext(pfx); ok {
+				els = append(els, nftables.SetElement{Key: addrBytes(end, f), IntervalEnd: true})
+			}
 		}
 	} else {
 		for _, pfx := range pfxs {
@@ -736,17 +742,34 @@ func prefixMask(bits int, addrLen uint32) []byte {
 	return mask
 }
 
-// prefixNext returns the first address NOT covered by the prefix (the interval
-// end for an anonymous interval set).
-func prefixNext(pfx netip.Prefix) netip.Addr {
+// prefixNext returns the first address NOT covered by the prefix — the interval
+// END for an anonymous interval set — and whether such an address EXISTS.
+//
+// #8597 (muse-004 K06): it does not exist for a prefix whose last address is
+// the top of the key space (0.0.0.0/0, ::/0, 128.0.0.0/1, ...), and this used
+// to fall back to the UNSPECIFIED address, which is the BOTTOM. Measured by
+// installing the set and reading it back from the kernel:
+//
+//	{0.0.0.0/0, 10.0.0.0/8}
+//	  -> 00000000 start, 00000000 END, 0a000000 start, 0b000000 END
+//	     the /0 member is a ZERO-WIDTH interval: a term that must match
+//	     everything matches nothing. Fail-CLOSED.
+//
+//	{128.0.0.0/1, 10.0.0.0/8}
+//	  -> 00000000 END, 0a000000 start, 0b000000 END, 80000000 start
+//	     the wrapped end sorts to the BOTTOM of the key space, an end marker
+//	     with no start before it, while 128.0.0.0 is left open to the top.
+//	     Fail-OPEN at the bottom.
+//
+// Two wrong encodings in opposite directions from one fallback. Returning
+// ok=false lets the caller OMIT the end element, which is the representation
+// for an interval that runs to the top of the range.
+func prefixNext(pfx netip.Prefix) (netip.Addr, bool) {
 	next := lastAddr(pfx).Next()
 	if !next.IsValid() {
-		if pfx.Addr().Is6() {
-			return netip.IPv6Unspecified()
-		}
-		return netip.IPv4Unspecified()
+		return netip.Addr{}, false
 	}
-	return next
+	return next, true
 }
 
 func lastAddr(pfx netip.Prefix) netip.Addr {

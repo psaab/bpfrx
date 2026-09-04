@@ -822,7 +822,29 @@ def _dependent_overlays(golden):
     unknown = []
     try:
         entries = sorted(os.listdir(imgdir))
-    except OSError:
+    except OSError as exc:
+        # #8597 (muse-004 K07): FAIL CLOSED. This used to `return deps, unknown`
+        # with both empty, which the caller reads as "nothing backs onto the
+        # golden" — the guard passes and the sudo fallback overwrites the golden
+        # under live overlays. #5043's HA-pair disk corruption, arrived at
+        # through the guard written to prevent it.
+        #
+        # An unlistable images dir is exactly the state the non-root
+        # `fetch --install-libvirt` flow reaches: this process cannot read the
+        # directory, and then `_atomic_install_golden` succeeds anyway through
+        # `sudo install`. The guard's inputs and the write's privileges are
+        # different, so "I could not look" must not mean "there is nothing
+        # there".
+        #
+        # This contradicted the function's OWN docstring three lines up —
+        # "`unknown` exists because an unprobeable file is not evidence of
+        # safety" — and its sibling `_golden_lock`, which reports its analogous
+        # OSError LOUDLY rather than proceeding silently.
+        #
+        # Reported through the existing `unknown` channel rather than a new die
+        # site: the caller already refuses on any unknown, with an actionable
+        # message, and one refusal path is easier to keep correct than two.
+        unknown.append((imgdir, f"cannot list the images directory: {exc}"))
         return deps, unknown
     for entry in entries:
         if not entry.endswith(".qcow2"):
@@ -925,12 +947,15 @@ def _install_libvirt_golden(srcq, image):
             if unknown:
                 listing = "\n    - ".join(f"{p}: {why}" for p, why in unknown)
                 die(f"refusing to overwrite golden {golden} in place: "
-                    f"{len(unknown)} sibling qcow2 file(s) could not be probed, so "
-                    f"whether they back onto this golden is UNKNOWN — and an "
-                    f"unprobeable overlay is not evidence of safety (#6760). A "
-                    f"running domain's overlay is a common cause: qemu-img can "
-                    f"fail on an image a live VM holds open.\n    - {listing}\n"
-                    f"  Fix by EITHER making each file probeable (stop the domain "
+                    f"{len(unknown)} path(s) could not be probed, so whether they "
+                    f"back onto this golden is UNKNOWN — and an unprobeable "
+                    f"overlay is not evidence of safety (#6760). A running "
+                    f"domain's overlay is a common cause: qemu-img can fail on an "
+                    f"image a live VM holds open. An unlistable images DIRECTORY "
+                    f"is the other (#8597): this process may not be able to read "
+                    f"it while the sudo fallback can still write the golden.\n"
+                    f"    - {listing}\n"
+                    f"  Fix by EITHER making each path probeable (stop the domain "
                     f"holding it, or correct its permissions) and re-running, OR "
                     f"installing under a fresh tag so existing overlays keep their "
                     f"immutable backing (fetch --install-libvirt --alias <new-name>).")
@@ -1601,10 +1626,34 @@ def cmd_fetch(args):
 
     if args.no_import or args.qcow2_only:
         golden = libvirt_golden_path(img_name)
+        # #8597 (muse-004 K08): the printed install must be GATED on the digest,
+        # not merely preceded by a verification that already happened.
+        #
+        # The two importing paths above stage into a private directory
+        # (_verified_private_artifacts, #5817) and re-verify the staged copy, so
+        # "a post-verify swap in --out cannot poison the golden". This path
+        # cannot do that — it hands the operator a command to run LATER, so the
+        # gap between the verify and the install is unbounded and is exactly the
+        # window _verified_private_artifacts' own docstring names: "The public
+        # --out dir may be writable by another local process."
+        #
+        # Printing the expected digest and a verify-then-install one-liner moves
+        # the check to the moment of the write. `sha256sum -c` here is bound to
+        # THIS path and THIS digest on one line, so it is not the cwd-relative
+        # `sha256sum -c` sign.py warns about — the file being hashed is the file
+        # being installed.
+        try:
+            expected_sha = sign.sha256_file(qcow2_pub)
+        except OSError as exc:
+            die(f"cannot hash the verified qcow2 {qcow2_pub} to print its digest: {exc}")
         print(f"==> verified into {out} (not imported). For libvirt/KVM, install "
-              f"it to the golden path deploy reads:\n"
-              f"      sudo install -m 0644 -D {qcow2_pub} {golden}\n"
-              f"   (or re-run fetch with --install-libvirt), then: "
+              f"it to the golden path deploy reads — RE-VERIFY at install time, "
+              f"because {out} stays writable by any local process after this "
+              f"command exits and the golden is not re-checked downstream:\n"
+              f"      echo '{expected_sha}  {qcow2_pub}' | sha256sum -c - && \\\n"
+              f"        sudo install -m 0644 -D {qcow2_pub} {golden}\n"
+              f"   (or re-run fetch with --install-libvirt, which stages the "
+              f"bytes privately and re-verifies them, #5817), then: "
               f"xpf-deploy.py --hypervisor libvirt deploy <appliance.yaml> "
               f"(image: {img_name}). For incus, re-run without "
               f"--qcow2-only/--no-import.")

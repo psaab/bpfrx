@@ -753,21 +753,57 @@ impl Nat64State {
             // this parse rejects. Rust's accepted language is a strict superset
             // of Go's, and both agree on the VALUE wherever both accept.
             //
-            // That direction is the safe one and it should stay that way. The
-            // invariant worth preserving is not "the two grammars are equal"
-            // but "the backstop never rejects what the gate accepted" — a
-            // backstop STRICTER than its gate silently skips a rule that
-            // committed cleanly, turning a cosmetic syntax quirk into lost
-            // NAT64 forwarding. Do NOT "tighten" this to reject '+96': that
-            // trades a harmless, unreachable divergence for the one failure
-            // mode this code exists to prevent.
+            // It is REACHABLE. An earlier revision of this note called it
+            // unreachable, reasoning that no xpf version can persist a `/+96`
+            // because the commit gate rejects it. That is a COMMIT-path
+            // argument, and the commit path does not bound what reaches this
+            // loader — the same mistake #8597 K51 documents one file over.
+            // Measured end to end instead:
             //
-            // Unreachable in supported operation, which is why it is recorded
-            // rather than fixed: reaching it needs a snapshot carrying `/+96`,
-            // and no xpf version can produce one — ParseUint has never accepted
-            // a sign, so the value cannot survive the commit that would persist
-            // it. It would take out-of-band edition of the config DB or a
-            // foreign implementation on the other end of HA sync.
+            //   1. strict commit           -> REJECTED.
+            //   2. Store.Load / SyncApply  -> compiles LENIENTLY; the rule is
+            //      not dropped and not zeroed, so NAT64RuleSnapshot.prefix
+            //      arrives here as "64:ff9b::/+96" verbatim.
+            //   3. this loader             -> INSTALLS it: is_active=true, one
+            //      prefix, prefix_bytes = 00:64:ff:9b:00.. — BYTE-IDENTICAL to
+            //      the state a canonical "64:ff9b::/96" produces. (Packets were
+            //      not driven through it; the claim is that the installed rule
+            //      is the same rule, not a separate datapath observation.)
+            //      Control: "/64" gives is_active=false, 0 prefixes, so the
+            //      loader does reject a bad length — the acceptance of "/+96"
+            //      is attributable to the '+' specifically.
+            //
+            // So a hand-edited or peer-synced config reaches a state where the
+            // dataplane is running a NAT64 rule the control plane rejected at
+            // commit. #8667 fixed the half that was doing active harm: the
+            // lenient path used to WARN that this rule "will not reach the
+            // dataplane until it is corrected" while it was installed, so the
+            // operator was steered away from the config that was running. The
+            // Go side now mirrors this parse and stays silent for exactly the
+            // tokens this parse accepts.
+            //
+            // DO NOT TIGHTEN THIS PARSE UNILATERALLY. Not because tightening is
+            // wrong — an earlier revision of this note claimed that, and the
+            // claim did not survive: it argued a stricter backstop would strand
+            // a cleanly-committed rule, but the commit gate rejects every one of
+            // those 110 tokens, so no such rule exists and the hazard is vacuous
+            // over exactly this set.
+            //
+            // The real reason is that tightening converts a fail-OPEN into a
+            // fail-CLOSED, and which of those is correct here is a genuine
+            // behaviour decision, not a cleanup. Today a leniently-loaded
+            // `/+96` translates with the right prefix. Tightened, it would be
+            // rejected at this loader and NAT64 would be off for that rule-set
+            // — a defensible posture ("the rule you were warned about is not
+            // running") and arguably better than the current one. That choice
+            // belongs to #8667, which weighs it against normalising the token
+            // when the snapshot is built or accepting the spelling at commit.
+            // Making it here in isolation also papers over the live defect,
+            // which is on the Go side of the lenient path.
+            //
+            // Whatever is chosen, the two grammars should be bound by a test
+            // that reds on divergence in EITHER direction; a one-directional
+            // cell lets the next drift through on the other side.
             let parts: Vec<&str> = snap.prefix.split('/').collect();
             if parts.len() != 2 || parts[1].parse::<u8>().ok() != Some(96) {
                 eprintln!(
