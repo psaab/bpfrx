@@ -1188,6 +1188,14 @@ func (m *Manager) recordReconcilePass(err error) {
 	m.reconcileOK.Add(1)
 }
 
+// blockedName is the key of reconcileOnceLocked's Pass-1 -> Pass-2 name block:
+// a forward name is blocked for the FAMILY whose delete failed, never for both
+// (#8597 K50). A struct key makes the family un-forgeable by any name value.
+type blockedName struct {
+	family int
+	fqdn   string
+}
+
 // reconcileOnceLocked is the pure reconcile algorithm (plan §4.5): build
 // the desired DNS state from active leases, diff against owned state, and
 // apply add / move / reassign / expire transitions — each reconciled
@@ -1202,7 +1210,36 @@ func (m *Manager) recordReconcilePass(err error) {
 func (m *Manager) reconcileOnceLocked(ctx context.Context, env *reconcileEnv, leases []Lease, untrusted, disabled map[int]bool) error {
 	blockedIdentity := map[string]struct{}{}
 	blockedAddress := map[string]struct{}{}
-	blockedFQDN := map[string]struct{}{}
+	// blockedFQDN is keyed by (family, name), NOT by name alone (#8597 K50).
+	//
+	// A failed Pass-1 delete leaves a live RR the reconciler believes it has
+	// removed, so Pass 2 must not add a record that would CONFLICT with it.
+	// Identity and address are already family-distinct in practice — a v4
+	// identity is "cid:"/"mac:"-prefixed and a v6 one "duid:"-prefixed (the
+	// no-identity fallback is "addr:"+address), and a v4 address text never
+	// equals a v6 one — but a DUAL-STACK host publishes the SAME FQDN for its
+	// A and its AAAA. Keyed on the bare name, a failed A delete therefore
+	// suppressed that host's unrelated AAAA publish for the whole cycle:
+	//
+	//	seed:   A laptop.example.com -> 10.0.1.5
+	//	cycle:  v4 lease moves to 10.0.1.9; a NEW v6 lease appears
+	//	        the A delete fails -> blockedFQDN["laptop.example.com"]
+	//	        => the AAAA add is skipped, though nothing about the failed
+	//	           A delete can conflict with an AAAA
+	//
+	// The conflict this gate exists for is per RECORD TYPE, and the family
+	// determines the type (A vs AAAA, and the PTR derives from the rdata), so
+	// (family, name) is the axis. Dropping the name gate entirely is NOT the
+	// fix: it is the only one of the three that covers a same-family
+	// REASSIGNMENT — a different client taking over a name at a different
+	// address matches neither the identity nor the address gate, and without
+	// this gate Pass 2 publishes A name->new while A name->old is still live.
+	// Both halves are pinned by cells in ddns_blocked_fqdn_family_8597_test.go.
+	//
+	// A struct key rather than a formatted string: the family cannot then be
+	// forged by a name value, with no encoding argument to maintain (#8597 K49
+	// is the same lesson one function over).
+	blockedFQDN := map[blockedName]struct{}{}
 
 	// gatedScope[scopePrefix] = true marks a scope this node may NOT publish
 	// for (the per-RG HA writer gate is CLOSED for it, #2664). An owned record
@@ -1444,7 +1481,7 @@ func (m *Manager) reconcileOnceLocked(ctx context.Context, env *reconcileEnv, le
 			}
 			blockedIdentity[owned.Identity] = struct{}{}
 			blockedAddress[owned.Address] = struct{}{}
-			blockedFQDN[owned.FQDN] = struct{}{}
+			blockedFQDN[blockedName{family: owned.Family, fqdn: owned.FQDN}] = struct{}{}
 			// leave it in the store so a later reconcile retries the
 			// delete (bounded by the loop cadence; never wedges).
 			continue
@@ -1463,7 +1500,7 @@ func (m *Manager) reconcileOnceLocked(ctx context.Context, env *reconcileEnv, le
 		if _, blocked := blockedAddress[d.ow.Address]; blocked {
 			continue
 		}
-		if _, blocked := blockedFQDN[d.ow.FQDN]; blocked {
+		if _, blocked := blockedFQDN[blockedName{family: d.ow.Family, fqdn: d.ow.FQDN}]; blocked {
 			continue
 		}
 		if err := m.upsertLocked(ctx, env.updaterFor(d.ow.Family), d.rec, d.ow); err != nil {
