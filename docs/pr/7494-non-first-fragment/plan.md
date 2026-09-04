@@ -11,6 +11,78 @@ thing and measured it as a success.
 **Base:** master `3e91d4ae0`. The shim is unchanged from `35399d2b3`, so every
 number here is current for both.
 
+## 0b. RE-MEASURED at `origin/master` — the baseline moved AGAIN, and the
+## stated hypothesis is REFUTED
+
+Every number in §0 and §2 below was measured against an 801,448-instruction
+baseline. **That baseline no longer exists.** The shim has improved by 114,529
+instructions:
+
+| | plan §0 (`3e91d4ae0`) | now |
+|---|---|---|
+| processed insns | 801,448 | **686,919** |
+| headroom vs the 1M cap | 19.86% | **31.31%** |
+| usable slack (vs the 850,000 ceiling) | 48,552 | **163,081** |
+
+`shimverify` now emits a calibration NOTE of its own: the 15% floor admits at
+least one whole structural change (≈87,000 insns, one IPv6 extension-header
+iteration) before it fires, which is not the property the floor claims.
+
+**#8249 says of its matrix "do not re-derive these". That instruction is now
+wrong** — the numbers were true, and the ground under them moved. They were
+re-derived.
+
+### The three consumption shapes, re-measured
+
+All at the new baseline, real kernel verifier, no override.
+
+| shape | result | signature |
+|---|---|---|
+| sentinel at the CALL SITE (`walk.non_first_fragment` -> `PROTO_FRAGMENT_NO_L4`) | **REJECT** 1,000,001 | `total_states 53311 peak_states 3637` |
+| sentinel INSIDE the walk, where flag and protocol are already the same loop-carried state | **REJECT** 1,000,001 | `total_states 53311 peak_states 3637` — **identical** |
+| SKIP `parse_l4` on the fragment arm (removes a call rather than adding a value) | **REJECT** 1,000,001 | `total_states 53221 peak_states 3595` |
+
+Two things follow immediately. **114,529 instructions of new headroom bought
+nothing** — the cost is not additive, so "buy headroom until it fits" is not a
+plan with a known price. And **placement is irrelevant**: moving the
+substitution inside the walk produces a bit-identical verifier signature, which
+kills the intuition that the call site creates a new correlated pair.
+
+### The hypothesis is refuted by two controls
+
+#8249 hypothesises: *"correlating an L4 value with a loop-carried predicate is
+what explodes, while correlating it with a leaf read does not"*, and names the
+isolating experiment — take the v4 shape and derive its bit from a loop instead
+of a fixed-offset read.
+
+Run, in `parse_ipv4`, same value, same consumer, only the derivation changed:
+
+| control | insns | delta | result |
+|---|---|---|---|
+| loop-carried flag, bounded loop, flag set inside an arm | 711,603 | **+24,684** | **PASS** (28.84%) |
+| the same, plus an offset ADVANCING by a packet-derived length, as the walk does | 742,420 | **+55,501** | **PASS** (25.76%) |
+
+The second control has every property the hypothesis names — loop-carried,
+packet-derived, correlated with the protocol `parse_l4` receives — and it costs
++55,501 in the IPv4 parser and passes with 107,580 slack to spare.
+
+**So the mechanism is not loop-carried correlation.** The same structural shape
+is affordable in one parser and unaffordable in the other.
+
+### What that leaves
+
+The constraint is the **IPv6 parse region's state budget**, not the sighting's
+derivation, its placement, or its consumer. That is consistent with the one
+datum in #8249 that never fitted the hypothesis: the row where a new
+`ParsedPacket` field is **never read** also cost ≥198,552. A never-read field
+cannot be correlated with anything; it can only add state to a saturated region.
+
+**This changes the next move.** Restructuring the walk so the sighting is not
+loop-carried — the candidate #8249 proposes — is measured here as fixing a
+problem that does not exist. What has to happen first is a reduction in IPv6
+parse-path state large enough to move a region that three structurally
+different shapes all fail against at the same signature.
+
 ## 0. The premise the issue was filed on has moved
 
 The body's matrix was measured at `9e28d1c25`, **1836 commits** before this
