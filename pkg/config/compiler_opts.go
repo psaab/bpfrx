@@ -2136,6 +2136,13 @@ type compileOpts struct {
 	// two findings stay independently attributable. Same doctrine as
 	// lenientPolicyMissingMatch.
 	lenientPolicyValuelessMatch bool
+	// lenientFirewallValuelessFrom (#8480) downgrades the firewall-filter
+	// valueless-`from` gate from a hard compile error to a cfg.Warnings entry.
+	// Same doctrine as lenientPolicyValuelessMatch one subtree over: an
+	// already-persisted or peer-synced config an older binary silently accepted
+	// must still BOOT (#1960), keeping its pre-existing match-any compilation
+	// with the finding flagged.
+	lenientFirewallValuelessFrom bool
 	// lenientEmptySecurityIdentity (#7525) downgrades the empty-security-
 	// identity gate — an empty zone name, an empty zone-pair from-zone or
 	// to-zone, or an empty policy name — from a hard compile error to a
@@ -2671,6 +2678,7 @@ func lenientCompileOpts() compileOpts {
 		lenientPolicyThenDeny:                  true,
 		lenientPolicyMissingMatch:              true,
 		lenientPolicyValuelessMatch:            true,
+		lenientFirewallValuelessFrom:           true,
 		lenientEmptySecurityIdentity:           true,
 		lenientPolicyCommunityRef:              true,
 		lenientSNMPv3KeyMaterial:               true,

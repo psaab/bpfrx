@@ -469,6 +469,20 @@ func runPreWalkGates(tree *ConfigTree, opts compileOpts) ([]string, error) {
 	// indistinguishable from an intended one. Strict (commit / commit-check):
 	// hard-reject naming the identity. Lenient (load / peer-sync): warn so an
 	// already-persisted config still boots (#1960).
+	// #8480: the same defect one subtree over. A firewall filter term whose
+	// `from` writes a value-bearing leaf with NO OPERAND compiles to the
+	// byte-identical empty match set the omitted form produces, and the matcher
+	// reads empty as match-ANY — so a stateless first-line filter widens. The
+	// policy half has been gated since #6526 and the NAT half since #8430; this
+	// is #8430's unshipped remainder. Runs pre-walk for the same reason they do:
+	// after compileFirewall a valueless leaf and an omitted one are
+	// indistinguishable.
+	firewallValuelessFromWarnings, err := validateFirewallFilterValuelessFromStrict(
+		tree.Children, opts.lenientFirewallValuelessFrom)
+	if err != nil {
+		return nil, err
+	}
+
 	emptyIdentityWarnings, err := validateNonEmptySecurityIdentities(
 		tree.Children, opts.lenientEmptySecurityIdentity)
 	if err != nil {
@@ -626,6 +640,7 @@ func runPreWalkGates(tree *ConfigTree, opts compileOpts) ([]string, error) {
 	warnings = append(warnings, policyThenRejectWarnings...)
 	warnings = append(warnings, policyThenDenyWarnings...)
 	warnings = append(warnings, policyMissingMatchWarnings...)
+	warnings = append(warnings, firewallValuelessFromWarnings...)
 	warnings = append(warnings, emptyIdentityWarnings...)
 	warnings = append(warnings, dnatToScopeWarnings...)
 	warnings = append(warnings, natMixedScopeWarnings...)
