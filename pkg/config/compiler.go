@@ -199,6 +199,16 @@ func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) 
 	// nodes for `show configuration` and ExpandGroups below mutates only our copy.
 	tree = tree.cloneForExpansion()
 
+	// #8662: normalize brace-elided ("compact") statements into their braced
+	// shape BEFORE group expansion and every validator, so nothing downstream
+	// has to know the two spellings exist. Applied at BOTH compile entry
+	// points — this one and the node-aware sibling — because a normalization
+	// present on only one of them would make a cluster peer compile the same
+	// config differently from the node that authored it, which is the class of
+	// asymmetry #8597 K51 was. Scoped to the security-relevant subset for now;
+	// see compact_normalize_8662.go.
+	normalizeCompactStanzas(tree)
+
 	// #1873 R-B: tunnel-endpoint id collision gate. Runs on the
 	// PRE-expansion tree (ExpandGroups removes the groups stanza) so
 	// the check covers the UNION of tunnel names across all groups —
@@ -435,6 +445,16 @@ func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts
 	// returns a fresh, freely-mutable pruned tree in a single deep copy (never
 	// aliases the caller's tree) so ExpandGroupsWithVars below mutates only our copy.
 	tree = tree.cloneForExpansion()
+
+	// #8662: normalize brace-elided ("compact") statements into their braced
+	// shape BEFORE group expansion and every validator, so nothing downstream
+	// has to know the two spellings exist. Applied at BOTH compile entry
+	// points — this one and the node-aware sibling — because a normalization
+	// present on only one of them would make a cluster peer compile the same
+	// config differently from the node that authored it, which is the class of
+	// asymmetry #8597 K51 was. Scoped to the security-relevant subset for now;
+	// see compact_normalize_8662.go.
+	normalizeCompactStanzas(tree)
 
 	// #1873 R-B: union-of-groups tunnel id collision gate — see
 	// compileConfigWithOpts. Pre-expansion on purpose; read-only, safe on the copy.
