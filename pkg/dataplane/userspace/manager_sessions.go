@@ -9,6 +9,7 @@ package userspace
 
 import (
 	"errors"
+	"strings"
 	"fmt"
 	"log/slog"
 
@@ -613,4 +614,70 @@ func (m *Manager) recordSessionPairResult(family string, res sessionPairResult) 
 // the condition is observable without reading the log.
 func (m *Manager) SessionPairOrphanedReverseTotal() uint64 {
 	return m.sessionPairOrphanedReverse.Load()
+}
+
+// ErrSessionCountersUnsupported reports that the running helper does not
+// implement the #7919 `session_counters` verb.
+//
+// THIS IS NOT "ZERO". An older helper answers an unknown verb with
+// `unknown request type <verb>` (server/handlers/mod.rs), and a caller that
+// treated that as an empty result would record "no worker holds this session"
+// — which is one of the two states the query exists to distinguish, and would
+// manufacture exactly the evidence it is meant to gather. In a rolling upgrade
+// the two nodes run different binaries, so this path is reachable in normal
+// operation, not just in test.
+var ErrSessionCountersUnsupported = errors.New("helper does not support the session_counters verb")
+
+// unknownVerbPrefix is the helper's wording for an unimplemented verb. Matching
+// on text is unpleasant and it is the ONLY signal an already-released helper
+// gives — that binary cannot be changed retroactively. The current helper's
+// exact wording is pinned by a test on the Rust side so a reword breaks the
+// build rather than silently turning "unsupported" into a generic error.
+const unknownVerbPrefix = "unknown request type"
+
+// QuerySessionCounters asks the helper what EACH worker's own session table
+// holds for one 5-tuple (#7919).
+//
+// READ-ONLY and DIAGNOSTIC-ONLY. It broadcasts a command to every worker and
+// waits (bounded, helper-side) for their replies, so it must never be issued on
+// a poll: the control socket is shared with the status poll, HA sync, session
+// installs and snapshot sync, and a caller above ~1 Hz starves session installs
+// during bulk sync.
+func (m *Manager) QuerySessionCounters(q SessionCounterQuery) ([]SessionCounterRow, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	resp, err := m.requestDetailedLocked(ControlRequest{
+		Type:                "session_counters",
+		SuppressStatus:      true,
+		SessionCounterQuery: &q,
+	})
+	return sessionCountersFromResponse(resp, err)
+}
+
+// sessionCountersFromResponse turns one control exchange into the caller's
+// answer. EXTRACTED from QuerySessionCounters rather than left inline because
+// the request path has no test seam, and an inline choice cannot be bound by a
+// test — the classification below is the whole contract of this verb on the Go
+// side, and it must be exercisable without a live helper.
+//
+// The distinction it enforces: an UNSUPPORTED verb is an error, never an empty
+// result. Returning `nil, nil` for an old helper would tell the caller that no
+// worker holds the session, which is one of the two states the query exists to
+// separate — the failure would look exactly like a finding.
+func sessionCountersFromResponse(resp ControlResponse, err error) ([]SessionCounterRow, error) {
+	if err != nil {
+		if isUnknownVerbError(err) {
+			return nil, ErrSessionCountersUnsupported
+		}
+		return nil, err
+	}
+	return resp.SessionCounters, nil
+}
+
+// isUnknownVerbError reports whether the helper refused the verb because it does
+// not implement it, as opposed to failing while executing it. The two must not
+// be conflated: the first means "ask a newer helper", the second means the
+// answer is genuinely unavailable and retrying will not help.
+func isUnknownVerbError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), unknownVerbPrefix)
 }

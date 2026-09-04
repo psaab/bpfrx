@@ -874,6 +874,7 @@ pub(crate) fn worker_loop(
             cancelled_keys,
             deleted_synced_keys,
             exported_sequences,
+            session_counter_answers,
             export_owner_rgs,
             shaped_tx_requests,
             vacate_all_shared_exact_slots,
@@ -1305,6 +1306,34 @@ pub(crate) fn worker_loop(
             // re-flooding itself. Clearing it here is unnecessary (drain-as-you-
             // export does not drop), but the chunked loop guarantees no
             // spurious re-arm regardless.
+        }
+        // #7919: publish this tick's per-session counter answers into the
+        // worker's reply slots. Answer fields FIRST, then the sequence with
+        // Release — the reader loads the sequence with Acquire and only then
+        // reads the answers, so the sequence IS the ack and there is no second
+        // completion flag to disagree with it.
+        for answer in &session_counter_answers {
+            runtime_atomics
+                .counter_query_found
+                .store(u64::from(answer.found), Ordering::Relaxed);
+            runtime_atomics
+                .counter_query_replica
+                .store(u64::from(answer.replica), Ordering::Relaxed);
+            runtime_atomics
+                .counter_query_fwd_packets
+                .store(answer.fwd_packets, Ordering::Relaxed);
+            runtime_atomics
+                .counter_query_fwd_bytes
+                .store(answer.fwd_bytes, Ordering::Relaxed);
+            runtime_atomics
+                .counter_query_rev_packets
+                .store(answer.rev_packets, Ordering::Relaxed);
+            runtime_atomics
+                .counter_query_rev_bytes
+                .store(answer.rev_bytes, Ordering::Relaxed);
+            runtime_atomics
+                .counter_query_seq
+                .store(answer.sequence, Ordering::Release);
         }
         if !exported_sequences.is_empty() {
             // #2653 single-shot `ExportOwnerRGSessions` command path. The

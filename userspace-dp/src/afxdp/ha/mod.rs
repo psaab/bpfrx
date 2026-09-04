@@ -8,6 +8,7 @@
 use super::*;
 
 mod state;
+mod counter_query;
 mod export;
 mod session_import;
 // #6785: the typed synced-import outcome and its refusal-token prefix are read
@@ -22,3 +23,5 @@ pub(crate) use self::export::drain_session_deltas_from_live;
 #[cfg(test)]
 #[path = "../ha_tests.rs"]
 mod tests;
+
+pub(crate) use counter_query::{SessionCounterQueryWait, WorkerSessionCounters};
