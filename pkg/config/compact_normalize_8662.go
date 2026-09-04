@@ -204,29 +204,15 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 	// recorded rather than left looking unstarted.
 	switch containerKeyword + " " + head {
 	//
-	// `lacp periodic` is DELIBERATELY NOT admitted, though it is drop shape
-	// "empty" and would otherwise belong here. It is one of the census's two
-	// hand-verified known-true anchors (filedStillOpen), and normalizing it
-	// made TestCompactBlockEquivalenceInventory2419 red with exactly the right
-	// complaint: "an instrument that stops finding known-true sites reports
-	// clean for the same reason a textual sweep does".
-	//
-	// The file's doctrine is that an anchor CHANGES SIDES rather than leaving,
-	// so fixing it is legitimate — but it owes a replacement that is hand
-	// verified by reading the compiler AND sits in a different compiler file
-	// from the surviving anchor (compiler_protocols.go). I checked
-	// `applications application <a> destination-port` as a candidate and it does
-	// not qualify: applicationDirectLeaves walks BOTH AST shapes deliberately
-	// (#6524), so it is not compact-blind in the way this control requires,
-	// whatever the inventory says about it.
-	//
-	// So 14 of the 15 are normalized and this one is left, with the trade
-	// stated: the anchor keeps the whole census falsifiable across 300+ sites,
-	// and the site it holds is an LACP periodic interval. Fixing it is a
-	// follow-up that begins by hand-verifying a replacement anchor, not by
-	// deleting this comment.
+	// `lacp periodic` was withheld in #8721 because it was one of the census's
+	// two hand-verified known-true anchors, and normalizing it blinded the
+	// instrument. It is admitted now: the anchor moved to a PARTIAL site
+	// (`interfaces <if> mtu`), which no scope may ever cover, so the control no
+	// longer depends on leaving a defect unfixed. The withheld site cost one
+	// increment; the structural fix ends the recurrence.
 	case "aggregated-ether-options link-speed",
 		"aggregated-ether-options minimum-links",
+		"lacp periodic",
 		"gigether-options 802.3ad",
 		"gigether-options redundant-parent",
 		"tunnel destination",

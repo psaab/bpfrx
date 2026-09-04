@@ -85,7 +85,6 @@ chassis device-map interface	empty
 chassis device-map unmapped-interface-policy	empty
 event-options policy	empty
 event-options policy xpfarg within	empty
-interfaces xpfname aggregated-ether-options lacp periodic	empty
 interfaces xpfname description	partial
 interfaces xpfname duplex	partial
 interfaces xpfname encapsulation	partial
