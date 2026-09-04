@@ -535,6 +535,15 @@ func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventB
 		// reads 1) while the running active config is not durable on
 		// disk (failed HA sync / auto-rollback persist, retry pending).
 		ConfigPersistDegradedFn: d.store.ConfigPersistDegraded,
+		// #8321 finding 15: the REST /vrrp handler needs the same
+		// per-RG priority source the gRPC surface uses so it can report
+		// RETH VRRP instances on a chassis cluster.
+		VRRPLocalPrioritiesFn: func() map[int]int {
+			if d.cluster == nil {
+				return nil
+			}
+			return d.cluster.LocalPriorities()
+		},
 		// #3441: surface configstore rollback-history-degraded state so
 		// /health reports it (non-fatal) and
 		// xpf_config_rollback_persist_degraded reads 1 while the most
