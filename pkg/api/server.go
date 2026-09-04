@@ -42,6 +42,8 @@ import (
 	"github.com/psaab/xpf/pkg/logging"
 	"github.com/psaab/xpf/pkg/routing"
 	"github.com/psaab/xpf/pkg/vrrp"
+
+	"github.com/psaab/xpf/pkg/sysservices"
 )
 
 // ClusterSessionService is the HA-aware session surface the REST session
@@ -313,6 +315,11 @@ type Config struct {
 	ProxyARPUnresolvedFn     func() bool
 	FabricOverlayMissingFn   func() bool
 	ManagementListenerDownFn func() bool
+	// ManagementListenersFn returns the effective state of BOTH management
+	// listeners (#8195). It is the same sysservices.Listeners snapshot
+	// `show system services` renders, so the metric and the CLI cannot
+	// disagree — deliberately the same source rather than a parallel one.
+	ManagementListenersFn func() sysservices.Listeners
 	// SchedulerRepublishFailedFn reports whether the most recent
 	// scheduler-driven policy republish failed and has not yet converged
 	// (#3780). A scheduler window transition republishes enforcement; a
@@ -496,6 +503,7 @@ type Server struct {
 	proxyARPUnresolvedFn                 func() bool
 	fabricOverlayMissingFn               func() bool
 	managementListenerDownFn             func() bool
+	managementListenersFn                func() sysservices.Listeners
 	schedulerRepublishFailedFn           func() bool
 	schedulerRepublishStaleSecondsFn     func() float64
 	schedulerRepublishFailClosedFn       func() bool
@@ -612,6 +620,7 @@ func NewServer(cfg Config) *Server {
 		proxyARPUnresolvedFn:                 cfg.ProxyARPUnresolvedFn,
 		fabricOverlayMissingFn:               cfg.FabricOverlayMissingFn,
 		managementListenerDownFn:             cfg.ManagementListenerDownFn,
+		managementListenersFn:                cfg.ManagementListenersFn,
 		schedulerRepublishFailedFn:           cfg.SchedulerRepublishFailedFn,
 		schedulerRepublishStaleSecondsFn:     cfg.SchedulerRepublishStaleSecondsFn,
 		schedulerRepublishFailClosedFn:       cfg.SchedulerRepublishFailClosedFn,

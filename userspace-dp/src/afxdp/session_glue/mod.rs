@@ -264,6 +264,12 @@ pub(super) struct WorkerCommandResults {
     /// DeleteSynced paths all funnel through this command).
     pub deleted_synced_keys: Vec<SessionKey>,
     pub exported_sequences: Vec<u64>,
+    /// #7919: answers to `QuerySessionCounters` processed this tick. The
+    /// command handler reads the table (it has `sessions` in scope); the WORKER
+    /// LOOP publishes into the per-worker reply atomics, because that is where
+    /// `runtime_atomics` lives. Same split as the export: decide here, publish
+    /// where the handles are.
+    pub session_counter_answers: Vec<SessionCounterAnswer>,
     /// #2653: the union of owner RGs requested by every
     /// `ExportOwnerRGSessions` command processed this tick. The command
     /// handler NO LONGER emits the open deltas itself — doing so pushed the
@@ -306,6 +312,7 @@ impl WorkerCommandResults {
             cancelled_keys: Vec::new(),
             deleted_synced_keys: Vec::new(),
             exported_sequences: Vec::new(),
+            session_counter_answers: Vec::new(),
             export_owner_rgs: Vec::new(),
             shaped_tx_requests: Vec::new(),
             vacate_all_shared_exact_slots: false,
@@ -772,6 +779,7 @@ pub(super) fn apply_worker_commands(
     let mut cancelled_keys_seen: rustc_hash::FxHashSet<SessionKey> =
         rustc_hash::FxHashSet::default();
     let mut exported_sequences = Vec::new();
+    let mut session_counter_answers: Vec<SessionCounterAnswer> = Vec::new();
     let mut export_owner_rgs: Vec<i32> = Vec::new();
     let mut shaped_tx_requests = Vec::new();
     let mut vacate_all_shared_exact_slots = false;
@@ -813,6 +821,33 @@ pub(super) fn apply_worker_commands(
                     sequence,
                     owner_rgs,
                 );
+            }
+            WorkerCommand::QuerySessionCounters { sequence, key } => {
+                // READ-ONLY. `counters_with_replica_flag` looks the key up
+                // without touching the table; nothing here installs, refreshes
+                // or expires anything. A diagnostic that perturbed the state it
+                // reports would be worse than no diagnostic.
+                let answer = match sessions.counters_with_replica_flag(&key) {
+                    Some((counters, replica)) => SessionCounterAnswer {
+                        sequence,
+                        found: true,
+                        replica,
+                        fwd_packets: counters.fwd_packets,
+                        fwd_bytes: counters.fwd_bytes,
+                        rev_packets: counters.rev_packets,
+                        rev_bytes: counters.rev_bytes,
+                    },
+                    None => SessionCounterAnswer {
+                        sequence,
+                        found: false,
+                        replica: false,
+                        fwd_packets: 0,
+                        fwd_bytes: 0,
+                        rev_packets: 0,
+                        rev_bytes: 0,
+                    },
+                };
+                session_counter_answers.push(answer);
             }
             WorkerCommand::UpsertSynced(entry) => {
                 commands::handle_upsert_synced(
@@ -924,6 +959,7 @@ pub(super) fn apply_worker_commands(
         cancelled_keys,
         deleted_synced_keys,
         exported_sequences,
+        session_counter_answers,
         export_owner_rgs,
         shaped_tx_requests,
         vacate_all_shared_exact_slots,
@@ -1621,3 +1657,24 @@ mod newflow_contention_tests;
 // pair through the SAME helper the worker-side upsert uses, so the two cannot
 // land on different allocators.
 pub(in crate::afxdp) use commands::upsert_synced::synced_source_nat_zone_pair;
+
+/// #7919: one worker's answer to a `QuerySessionCounters` request.
+///
+/// `found` is carried separately from the counters because "I hold this session
+/// and it has no traffic" and "I do not hold this session" are different facts,
+/// and the query exists to tell them apart. A single zeroed row would collapse
+/// them and answer neither.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SessionCounterAnswer {
+    pub sequence: u64,
+    pub found: bool,
+    /// True when the held entry is a peer-synced/replica origin. A replica
+    /// reporting VOLUME would falsify the premise the investigation rests on —
+    /// that replicas are created at zero and cannot advance — so the answer
+    /// carries what it would take to notice that.
+    pub replica: bool,
+    pub fwd_packets: u64,
+    pub fwd_bytes: u64,
+    pub rev_packets: u64,
+    pub rev_bytes: u64,
+}
