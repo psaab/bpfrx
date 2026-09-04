@@ -1280,46 +1280,80 @@ dedup — forward keys first, then not-yet-seen reverse keys in first-seen
 order — only the membership data structure changed. `ha_tests.rs` pins the
 order/dedup contract and a large-N (N=M=200k) linear-time guard.
 
-## The reverse-prewarm index removes by KEY, never by a recomputed bucket (#7209)
+## The reverse-prewarm index is add-only while live, un-filed at removal (#7209)
 
-`reverse_prewarm_sessions` is the one owner-RG index whose buckets are not
-all carried on the entry. `reverse_prewarm_owner_rg_candidates` files a
-synced session under two RGs: the one its own `metadata.owner_rg_id` names
-(carried, so it cannot drift) and the one that owns the egress interface a
-reply to `key.src_ip` would leave by — read out of the FIB, and therefore a
-property of *when* the question is asked. Its three siblings
-(`sessions`, `nat_sessions`, `forward_wire_sessions`) are maintained from
-`metadata.owner_rg_id` alone and are symmetric by construction.
+`reverse_prewarm_sessions` is the one owner-RG index whose buckets are not all
+carried on the entry. `reverse_prewarm_owner_rg_candidates` files a peer-synced
+session under two RGs: the one its own `metadata.owner_rg_id` names — carried,
+so it cannot drift — and the one that owns the egress interface a reply to
+`key.src_ip` would leave by, which is **read out of the FIB** and is therefore a
+property of *when* the question is asked. Its three siblings (`sessions`,
+`nat_sessions`, `forward_wire_sessions`) take their bucket from
+`metadata.owner_rg_id` alone, on both the publish and the remove half, so on the
+RG axis they are symmetric by construction. (Their *key* is not carried either —
+it is derived from `entry.decision.nat` — so a replace that changes the NAT
+decision can strand an alias. Different axis, not addressed here.)
 
-`refresh_reverse_prewarm_owner_rg_indexes` used to recompute the PREVIOUS
-entry's candidate set against the CURRENT forwarding in order to decide what
-to un-file. That is only the set the key was actually filed under while
-nothing has moved the route, and an entry's lifetime spans arbitrarily many
-commits. Re-home an interface between redundancy groups while a synced
-session is live and the recomputed set names a bucket the key is not in,
-while the bucket it *is* in is never named again by anything: the session is
-gone, so no later transition carries it, and the index is only READ — never
-rebuilt — by `prewarm_reverse_synced_sessions_for_owner_rgs`. The key is
-stranded for the life of the process, and every RG activation walks a set
-that only grows. That is the same failover critical path the #4069 dedup
-above exists to keep cheap.
+**The two directions are not symmetric, and that is the whole design.**
+`prewarm_reverse_synced_sessions_for_owner_rgs` re-derives each candidate's
+reverse companion under live tables and re-checks `owner_rg_set.contains(..)`
+before keeping anything, so an EXTRA bucket costs one discarded re-synthesis. A
+MISSING bucket is never checked at all — the key does not enter the candidate
+set, so the session is simply not pre-resolved when that RG activates. Over-
+filing degrades a scan; under-filing drops reply traffic at a failover.
 
-The removal therefore drops the key from EVERY bucket (`retain`, pruning any
-bucket it empties) instead of from a recomputed guess. Identical whenever
-the FIB did not move, correct when it did, allocation-free, and the walk is
-over the RGs that currently hold synced sessions — single digits on a real
-chassis cluster.
+So: **add-only across a live entry's transitions, and un-file exactly once, at
+removal.** A refresh can only ever name the buckets the FIB can resolve *right
+now*, which is a strict subset of the truth whenever the FIB is momentarily
+blind to the reply path — a RETH member down with the route not yet re-homed, or
+`stop_inner` having emptied `forwarding` between a failed reconcile and its
+retry. Nothing may be removed on that basis. The un-file needs no `forwarding`
+at all, which is what lets it live in `remove_shared_session`, the choke point
+every removal goes through — including `purge_translated_synced_hit` and the
+LocalDelivery replacement after `take_synced_local`, neither of which calls the
+refresh at all.
 
-This also matters for the *next* step of #7209. Taking `sync_session` off
-the snapshot-wide `ServerState` mutex lets a reconcile empty
-`Coordinator.forwarding` UNDERNEATH an import, which turns the divergent
-case from "a route moved between two commits" into the common one. Making
-the asymmetry structurally impossible is a prerequisite for that change
-rather than a consequence of it. `ha_tests.rs` pins three properties: the
-stranded key after a route move (the leak), that a delete does not evict a
-neighbouring session's key (the opposite failure, which is worse — a session
-missing from this index is one the newly-primary node does not pre-resolve),
-and that a REPLACE after a route move re-files rather than accumulates.
+### This is the second attempt; the first one shipped
+
+Recorded because both failure modes are instructive and the second was
+introduced by the fix for the first.
+
+1. **Originally** the removal half recomputed the PREVIOUS entry's candidate set
+   against the CURRENT forwarding. Move a route between RGs while a synced
+   session is live and the recomputed set names a bucket the key is not in,
+   while the bucket it *is* in is never named again — the index is only READ,
+   never rebuilt. Permanent strand, unbounded in the number of such sessions, on
+   the path #4069 rewrote from O(N·M) to O(N+M) because its *size* measurably
+   slowed a newly-primary node.
+2. **PR #8479** fixed that by making every refresh un-file from EVERY bucket and
+   re-file `candidates(next)`. That removes the strand and introduces its
+   inverse: a refresh landing in a blind-FIB window narrows the filing, and
+   nothing restores it. Two independent hostile reviews found it by different
+   routes. Its own commit message had already named under-filing as "far worse
+   than the leak it replaces" — the accept-side cell it shipped covered
+   *neighbour* eviction and not *self* eviction, so the guard was aimed one
+   step away from the harm the author had correctly identified.
+3. **Now**: split the two. Add-only while live (so nothing un-re-derivable is
+   ever dropped), authoritative un-file at removal (so the residue a route move
+   leaves is bounded by the entry's lifetime rather than the process's).
+
+The cells in `ha_tests.rs` pin both directions plus the paths that reach the
+un-file without the delete verb: a deleted session strands nothing after a route
+move; a delete does not evict a neighbouring session's key; a refresh under a
+blind FIB does not drop a filing it cannot re-derive; a route move ADDS the new
+bucket and the delete clears every accumulated one; and `remove_shared_session`
+un-files regardless of the stored entry's origin — the leg that matters, because
+the delete verb un-files too and masks the mechanism without it.
+
+### Cost, stated rather than asserted
+
+`HashMap::retain` is O(**capacity**), not O(len), and pruning does not shrink the
+allocation's high-water capacity. Capacity is bounded by the number of distinct
+owner-RG ids ever filed — single digits on a real chassis cluster, but the helper
+does not enforce that: `metadata.owner_rg_id` arrives from the peer as a raw
+`i32` and every positive value is filed. Bounding it at the import boundary is
+worth doing and is not done today. The walk runs once per authoritative removal
+(never per refresh) on the control thread, and allocates nothing.
 
 ## Hot-path constants
 
