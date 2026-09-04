@@ -524,6 +524,7 @@ test-mutate-lib:
 test-cluster-lock-lib:
 	bash ./test/incus/with-cluster-selftest.sh
 	bash ./test/incus/cluster-cell-selftest.sh
+	bash ./test/incus/cluster-build-identity-selftest.sh
 
 # Self-test the #8040 target-service preflight. Every per-class harness
 # (mouse-latency, fairness, CoS best-effort contention) needs live listeners

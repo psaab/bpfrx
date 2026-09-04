@@ -34,6 +34,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=cluster-lock.sh
 source "${SCRIPT_DIR}/cluster-lock.sh"
+# Build identity: the lock says who may touch the cluster, not what is
+# running on it. See cluster-build-identity.sh for why that gap matters.
+# shellcheck source=cluster-build-identity.sh
+source "${SCRIPT_DIR}/cluster-build-identity.sh"
 
 usage() {
 	echo "Usage: $0 \"<purpose>\" -- <cmd> [args...]" >&2
@@ -147,6 +151,20 @@ trap 'rm -f "$XPF_CLUSTER_OWNER" 2>/dev/null || true' EXIT
 
 export XPF_CLUSTER_LOCK_HELD="${XPF_CLUSTER_LOCK}:$$"
 
+# Record WHICH BUILD this cell is about to measure, and export the path so
+# a long cell can re-assert it before each sample rather than only at the
+# boundaries — the originating incident took both of its measurements
+# inside ONE cell, so boundary-only checking would not have caught it.
+XPF_CLUSTER_BUILD_BASELINE="$(mktemp "${TMPDIR:-/tmp}/xpf-cluster-build.XXXXXX")"
+export XPF_CLUSTER_BUILD_BASELINE
+xpf_cluster_build_record "$XPF_CLUSTER_BUILD_BASELINE"
+# SUPERSEDES the owner-only trap installed above (bash replaces, not
+# stacks). The earlier one is deliberately left in place rather than
+# merged: it covers the window between owner-file publication and this
+# line, where the baseline file does not exist yet and an exit must still
+# clean up the owner file.
+trap 'rm -f "$XPF_CLUSTER_OWNER" "$XPF_CLUSTER_BUILD_BASELINE" 2>/dev/null || true' EXIT
+
 echo "[with-cluster $(date +%H:%M:%S)] lock acquired (pid $$, purpose: ${PURPOSE})" >&2
 
 # Run the cell with the lock fd closed: children never inherit fd 9,
@@ -156,4 +174,12 @@ echo "[with-cluster $(date +%H:%M:%S)] lock acquired (pid $$, purpose: ${PURPOSE
 # running as a child (Codex code-r1 F1).
 rc=0
 env -- "$@" 9>&- || rc=$?
+# Report a build that changed under the cell. Advisory by default (a cell
+# that deploys on purpose re-baselines; an unwired path that legitimately
+# replaces the binary must not break a working target for a diagnostic),
+# fatal under XPF_CLUSTER_BUILD_STRICT=1. A cell that already failed keeps
+# its own exit status — the build report never masks the real error.
+if ! xpf_cluster_build_report "cell" && [[ "$rc" -eq 0 ]]; then
+	rc=71  # EX_OSERR — the run completed, but its subject changed
+fi
 exit "$rc"
