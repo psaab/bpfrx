@@ -3343,3 +3343,244 @@ fn a_held_bpf_map_set_stays_open_across_teardown_7209() {
          published set is leaking descriptors rather than deferring their close"
     );
 }
+
+/// #7209: a synced session's key must leave the reverse-prewarm index when the
+/// session is deleted, even if the forwarding table changed while it was live.
+///
+/// THE HARM, not the shape. `reverse_prewarm_owner_rg_candidates` derives one
+/// of an entry's two index buckets from the FIB — the RG that owns the egress
+/// interface a reply to `key.src_ip` would leave by. The insert files the key
+/// under the buckets computed against the forwarding live AT INSERT; the remove
+/// recomputes them against the forwarding live AT REMOVE. Those are the same
+/// set only while nothing moved the route, which the snapshot-wide `ServerState`
+/// mutex made true incidentally for a single import — and never made true
+/// across an entry's LIFETIME, because a commit that re-homes an interface sits
+/// between the two.
+///
+/// So a route that moves between RGs strands the key in the bucket it was filed
+/// under. Nothing ever removes it: the session is gone, so no later remove
+/// carries it, and the bucket is only read — never rebuilt — by
+/// `prewarm_reverse_synced_sessions_for_owner_rgs` on RG ACTIVATION, which is
+/// the failover critical path (#4069 rewrote its key merge from O(N*M) to
+/// O(N+M) precisely because its size measurably slowed a newly-primary node).
+/// The leak is unbounded in the number of such sessions and permanent for the
+/// life of the process.
+#[test]
+fn a_deleted_synced_session_leaves_no_reverse_prewarm_key_after_a_route_moves_7209() {
+    let mut coordinator = Coordinator::new();
+    // AT INSERT: ifindex 6 (the reply path to 10.0.61.102) belongs to RG 2,
+    // while the entry's own metadata names RG 1 — two distinct buckets, which
+    // is what makes the asymmetry observable at all.
+    coordinator.forwarding = test_forwarding_state_split_rgs();
+    let entry = SyncedSessionEntry {
+        key: test_key(),
+        decision: test_decision(),
+        metadata: test_metadata(),
+        origin: SessionOrigin::SyncImport,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+        generation: 0,
+        session_id: 0,
+    };
+    assert_eq!(
+        coordinator.upsert_synced_session(entry.clone()),
+        SyncedImportOutcome::Applied,
+        "the fixture must actually import, or nothing below is under test"
+    );
+    {
+        let index = coordinator
+            .sessions
+            .owner_rg_indexes
+            .reverse_prewarm_sessions
+            .lock()
+            .expect("prewarm index");
+        assert!(
+            index.get(&1).is_some_and(|keys| keys.contains(&entry.key)),
+            "fixture no longer files the key under its metadata RG"
+        );
+        assert!(
+            index.get(&2).is_some_and(|keys| keys.contains(&entry.key)),
+            "fixture no longer files the key under the FIB-derived RG — without \
+             that second bucket this cell cannot see the asymmetry it exists for"
+        );
+    }
+
+    // A commit re-homes ifindex 6 from RG 2 to RG 1. Ordinary operator work;
+    // the synced session is untouched and still live.
+    coordinator.forwarding = test_forwarding_state_with_fabric();
+
+    coordinator.delete_synced_session(entry.key.clone());
+
+    assert!(
+        coordinator
+            .sessions
+            .synced
+            .lock()
+            .expect("synced")
+            .get(&entry.key)
+            .is_none(),
+        "the delete did not remove the session itself; the index assertion \
+         below would then be measuring the wrong thing"
+    );
+    let index = coordinator
+        .sessions
+        .owner_rg_indexes
+        .reverse_prewarm_sessions
+        .lock()
+        .expect("prewarm index");
+    let stranded: Vec<i32> = index
+        .iter()
+        .filter(|(_, keys)| keys.contains(&entry.key))
+        .map(|(rg, _)| *rg)
+        .collect();
+    assert!(
+        stranded.is_empty(),
+        "a DELETED synced session is still indexed for reverse prewarm under \
+         RG(s) {stranded:?}. The remove recomputed the entry's buckets against \
+         the CURRENT forwarding, so the bucket it was INSERTED under is never \
+         cleared once a route moves between RGs. Every RG activation then walks \
+         a key set that only grows, on the failover critical path (#7209)"
+    );
+}
+
+/// #7209: the accept side of the cell above — clearing one key's buckets must
+/// not evict anyone else's.
+///
+/// The removal now walks EVERY owner-RG bucket instead of a recomputed pair, so
+/// the failure this guards is the mirror image of the leak: a bucket sweep that
+/// takes the whole set with it. That direction is far worse than the leak it
+/// replaces — a session missing from the reverse-prewarm index is a session the
+/// newly-primary node does not pre-resolve at RG activation, i.e. dropped reply
+/// traffic at exactly the failover the index exists to serve, whereas a
+/// stranded key only costs memory and scan time.
+///
+/// Without this cell a mutant that empties the index on every delete passes the
+/// leak cell perfectly.
+#[test]
+fn deleting_one_synced_session_leaves_its_neighbours_in_the_reverse_prewarm_index_7209() {
+    let mut coordinator = Coordinator::new();
+    coordinator.forwarding = test_forwarding_state_split_rgs();
+
+    let doomed = SyncedSessionEntry {
+        key: test_key(),
+        decision: test_decision(),
+        metadata: test_metadata(),
+        origin: SessionOrigin::SyncImport,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+        generation: 0,
+        session_id: 0,
+    };
+    // Same source, different port: a distinct key that lands in the SAME two
+    // buckets, which is the only arrangement in which an over-broad sweep is
+    // observable at all.
+    let mut survivor = doomed.clone();
+    survivor.key.src_port = doomed.key.src_port.wrapping_add(1);
+    assert_ne!(doomed.key, survivor.key);
+
+    assert_eq!(
+        coordinator.upsert_synced_session(doomed.clone()),
+        SyncedImportOutcome::Applied
+    );
+    assert_eq!(
+        coordinator.upsert_synced_session(survivor.clone()),
+        SyncedImportOutcome::Applied
+    );
+    for rg in [1, 2] {
+        assert!(
+            coordinator
+                .sessions
+                .owner_rg_indexes
+                .reverse_prewarm_sessions
+                .lock()
+                .expect("prewarm index")
+                .get(&rg)
+                .is_some_and(|keys| keys.contains(&survivor.key)),
+            "fixture no longer files BOTH sessions under RG {rg}; an over-broad \
+             sweep would then be invisible here"
+        );
+    }
+
+    coordinator.delete_synced_session(doomed.key.clone());
+
+    let index = coordinator
+        .sessions
+        .owner_rg_indexes
+        .reverse_prewarm_sessions
+        .lock()
+        .expect("prewarm index");
+    for rg in [1, 2] {
+        assert!(
+            index
+                .get(&rg)
+                .is_some_and(|keys| keys.contains(&survivor.key)),
+            "deleting one synced session removed a DIFFERENT live session's key \
+             from RG {rg}'s reverse-prewarm bucket. That session is then not \
+             pre-resolved when the RG activates, so its reply traffic drops at \
+             the failover the index exists to serve (#7209)"
+        );
+        assert!(
+            !index.get(&rg).is_some_and(|keys| keys.contains(&doomed.key)),
+            "the deleted session is still in RG {rg}'s bucket"
+        );
+    }
+}
+
+/// #7209: the LIVE-session variant of the same asymmetry — a replace after the
+/// route moved must not leave the key filed under the RG it no longer belongs
+/// to.
+///
+/// `upsert_synced_session` refreshes a re-imported key with
+/// `(Some(previous), Some(next))`, and a peer refreshes its synced sessions
+/// continuously. Under the recomputed-removal shape both halves were evaluated
+/// against the CURRENT forwarding, so the replace removed and re-inserted the
+/// same set and the bucket the key was ORIGINALLY filed under simply survived.
+/// The session is still live here, so this is not the permanent leak — it is
+/// the entry appearing under an RG whose activation must then re-derive and
+/// discard it, on the failover critical path, once per moved route per session.
+#[test]
+fn a_replaced_synced_session_is_refiled_not_accumulated_after_a_route_moves_7209() {
+    let mut coordinator = Coordinator::new();
+    coordinator.forwarding = test_forwarding_state_split_rgs();
+    let entry = SyncedSessionEntry {
+        key: test_key(),
+        decision: test_decision(),
+        metadata: test_metadata(),
+        origin: SessionOrigin::SyncImport,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+        generation: 0,
+        session_id: 0,
+    };
+    assert_eq!(
+        coordinator.upsert_synced_session(entry.clone()),
+        SyncedImportOutcome::Applied
+    );
+
+    // ifindex 6 moves from RG 2 back to RG 1, so the FIB-derived bucket
+    // collapses onto the metadata one and RG 2 must be left with nothing.
+    coordinator.forwarding = test_forwarding_state_with_fabric();
+    assert_eq!(
+        coordinator.upsert_synced_session(entry.clone()),
+        SyncedImportOutcome::Applied,
+        "the replace must be ADMITTED, or the refile below never runs"
+    );
+
+    let index = coordinator
+        .sessions
+        .owner_rg_indexes
+        .reverse_prewarm_sessions
+        .lock()
+        .expect("prewarm index");
+    assert!(
+        index.get(&1).is_some_and(|keys| keys.contains(&entry.key)),
+        "the replace dropped the key from the RG it DOES belong to"
+    );
+    assert!(
+        !index.get(&2).is_some_and(|keys| keys.contains(&entry.key)),
+        "a re-imported synced session is still filed under RG 2, the RG that \
+         owned its reply path before the route moved. The replace recomputed \
+         both halves against the CURRENT forwarding, so it removed and \
+         re-inserted the same set and never touched the original bucket (#7209)"
+    );
+}

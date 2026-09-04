@@ -1233,6 +1233,41 @@ pub(super) fn owner_rg_session_keys_serialized(
     owner_rg_session_keys(index, owner_rgs)
 }
 
+/// Maintain the reverse-prewarm owner-RG index across one entry transition:
+/// `(Some, None)` is a delete, `(None, Some)` an insert, `(Some, Some)` a
+/// replace of the same key.
+///
+/// #7209: THE REMOVAL HALF IS DELIBERATELY NOT DERIVED FROM `forwarding`.
+///
+/// An entry's buckets are `reverse_prewarm_owner_rg_candidates`: the RG named
+/// by its own metadata (which travels with the entry, so it cannot drift) and
+/// the RG that owns the egress interface a reply to `key.src_ip` would leave
+/// by — which is read out of the FIB, and therefore is a property of WHEN the
+/// question is asked. Recomputing that set to decide what to REMOVE assumes the
+/// FIB has not moved since the key was filed, and an entry's lifetime spans
+/// arbitrarily many commits. Re-home an interface between RGs while a synced
+/// session is live and the recomputed set names a bucket the key is not in,
+/// while the bucket it IS in is never named again by anything:
+///
+///   * the session is gone, so no later transition carries it, and
+///   * the index is only READ — never rebuilt — by
+///     `prewarm_reverse_synced_sessions_for_owner_rgs`.
+///
+/// The key is then stranded for the life of the process, and every RG
+/// activation walks a set that only grows. That is on the failover critical
+/// path: #4069 rewrote this index's key merge from O(N*M) to O(N+M) because its
+/// SIZE measurably slowed how quickly a newly-primary node fully forwarded.
+///
+/// So the removal drops the key from EVERY bucket rather than from a
+/// recomputed guess. The result is identical whenever the FIB did not move
+/// (the recomputed set was then exactly the filed set) and correct when it
+/// did, which makes the asymmetry structurally impossible instead of merely
+/// unreachable — the shape this has to be in before `sync_session` can run off
+/// the snapshot-wide `ServerState` mutex, where a reconcile can empty
+/// `forwarding` UNDER an import and make the divergent case the common one.
+///
+/// The walk is over the RGs that currently hold synced sessions — single
+/// digits on a real chassis cluster — and allocates nothing.
 pub(super) fn refresh_reverse_prewarm_owner_rg_indexes(
     index: &Arc<Mutex<OwnerRgSessionIndex>>,
     forwarding: &ForwardingState,
@@ -1240,17 +1275,13 @@ pub(super) fn refresh_reverse_prewarm_owner_rg_indexes(
     previous_entry: Option<&SyncedSessionEntry>,
     next_entry: Option<&SyncedSessionEntry>,
 ) {
-    let previous_owner_rgs = previous_entry
-        .map(|entry| reverse_prewarm_owner_rg_candidates(forwarding, dynamic_neighbors, entry));
     let next_owner_rgs = next_entry
         .map(|entry| reverse_prewarm_owner_rg_candidates(forwarding, dynamic_neighbors, entry));
     // #2402: recover poison so reverse-prewarm index maintenance is not
     // skipped after a prior worker panic.
     let mut index = lock_shared_recover(index);
     if let Some(previous_entry) = previous_entry {
-        for owner_rg_id in previous_owner_rgs.unwrap_or_default() {
-            remove_owner_rg_index_entry_locked(&mut index, owner_rg_id, &previous_entry.key);
-        }
+        remove_owner_rg_index_key_from_every_bucket_locked(&mut index, &previous_entry.key);
     }
     if let Some(next_entry) = next_entry {
         for owner_rg_id in next_owner_rgs.unwrap_or_default() {
@@ -1260,6 +1291,23 @@ pub(super) fn refresh_reverse_prewarm_owner_rg_indexes(
                 .insert(next_entry.key.clone());
         }
     }
+}
+
+/// #7209: drop `key` from every owner-RG bucket, pruning buckets it emptied.
+///
+/// The `retain` predicate also drops buckets that were ALREADY empty. That is
+/// not a behaviour change: `remove_owner_rg_index_entry_locked` has always
+/// pruned on emptying, so an empty bucket is unreachable state, and
+/// `owner_rg_session_keys` reads through `get`, for which an empty set and an
+/// absent one are indistinguishable.
+fn remove_owner_rg_index_key_from_every_bucket_locked(
+    index: &mut OwnerRgSessionIndex,
+    key: &SessionKey,
+) {
+    index.retain(|_, keys| {
+        keys.remove(key);
+        !keys.is_empty()
+    });
 }
 
 fn reverse_prewarm_owner_rg_candidates(
