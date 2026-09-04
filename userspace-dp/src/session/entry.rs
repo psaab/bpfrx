@@ -391,6 +391,19 @@ pub(crate) enum SessionOrigin {
     ReverseFlow,
     LocalMiss,
     MissingNeighborSeed,
+    /// #7770: a PUNT SEED. This node is about to redirect a new flow across
+    /// the fabric because the peer owns its egress RG, and it has adjudicated
+    /// the flow against its OWN zone policy on the way past. The seed exists so
+    /// the peer's RETURN — which arrives fabric-ingress in the reply direction,
+    /// where policy can never permit it by design — is a session HIT instead of
+    /// a `wan -> lan` default deny.
+    ///
+    /// Transient-local like `MissingNeighborSeed`: never HA-exported, never
+    /// Open-delta'd. The AUTHORITATIVE session for the flow is the one the peer
+    /// creates when it evaluates the punted packet; this is a local record of
+    /// "I punted this and my own policy permitted it", and two nodes both
+    /// claiming authority for one flow is what #518/#5007 exist to prevent.
+    FabricPuntSeed,
     SyncImport,
     SharedMaterialize,
     SharedPromote,
@@ -405,6 +418,7 @@ impl SessionOrigin {
             Self::ReverseFlow => "reverse_flow",
             Self::LocalMiss => "local_miss",
             Self::MissingNeighborSeed => "missing_neighbor_seed",
+            Self::FabricPuntSeed => "fabric_punt_seed",
             Self::SyncImport => "sync_import",
             Self::SharedMaterialize => "shared_materialize",
             Self::SharedPromote => "shared_promote",
@@ -442,8 +456,15 @@ impl SessionOrigin {
         }
     }
 
+    /// Transient LOCAL seeds: installed by this node's own cold path, never
+    /// exported to the peer and never Open-delta'd (`install.rs`'s `counted`
+    /// gate, `forward_export_candidates_for_owner_rgs`). #7770 adds
+    /// `FabricPuntSeed` for the same reason `MissingNeighborSeed` is here: the
+    /// entry is a local artefact of a decision this node made, not a claim of
+    /// authority over the flow, and syncing it would put a NAT-free duplicate
+    /// of the peer's authoritative session on the wire.
     pub(crate) fn is_transient_local_seed(self) -> bool {
-        matches!(self, Self::MissingNeighborSeed)
+        matches!(self, Self::MissingNeighborSeed | Self::FabricPuntSeed)
     }
 }
 
