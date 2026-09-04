@@ -204,6 +204,7 @@ pub(super) fn poll_binding(
             recent_exceptions,
             last_resolution,
             peer_worker_commands,
+            worker_commands_by_id,
             dnat_fds,
             rg_epochs,
             cold_path_sample_mask,

@@ -3,6 +3,7 @@ package configstore
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -156,11 +157,52 @@ func (s *Store) recoverPendingConfirmLocked() error {
 	}
 	rec, err := s.db.ReadConfirm()
 	if err != nil {
-		slog.Warn("failed to read persisted commit-confirmed state; cannot restore the "+
-			"pending auto-rollback window", "err", err, "issue", "#4577")
+		// #8566: this used to be a bare WARN + `return nil`, so `Load` reported
+		// success and the box came up with the rollback window silently gone —
+		// no timer, no debt, and `ConfigPersistDegraded()` false, so /health
+		// returned 200. Every OTHER way the store ends a boot unsafe raises
+		// degraded health; this one did not, so nothing alerted on it.
+		//
+		// `Load` still succeeds: refusing to boot on an unreadable TRANSIENT
+		// recovery file would turn a corrupt 200-byte file into an outage,
+		// which is the #1960 no-brick posture. The state is made VISIBLE
+		// instead, and the record is left in place — a decrypt failure can be a
+		// transient master-key problem and the window may be readable on a
+		// later boot.
+		//
+		// Deliberately NOT added here: a bounded in-`Load` retry split by error
+		// class. That is a startup-latency and taxonomy change with its own
+		// design (the #7675 seed's TRANSIENT/PERMANENT split) and belongs in its
+		// own review, not folded into making the state legible.
+		slog.Error("failed to read persisted commit-confirmed state; the pending auto-rollback "+
+			"window is LOST for this process and the unconfirmed config now stands with no "+
+			"timer — configuration persistence is degraded until a commit or confirm clears it",
+			"err", err, "issue", "#8566")
+		s.confirmRecoveryReadFailed = true
+		s.journalLog(&JournalEntry{
+			Action: "confirm_recovery_read_error",
+			Detail: fmt.Sprintf("pending commit-confirmed record unreadable on boot; auto-rollback window lost: %v", err),
+		})
 		return nil
 	}
 	if rec == nil {
+		return nil
+	}
+	// #8565: a RESOLUTION TOMBSTONE. The window was confirmed, superseded or
+	// rolled back and only the durable deletion was still owed, so there is
+	// nothing to re-arm and nothing to revert to — finish the deletion and move
+	// on. #5835's staleness check below cannot substitute for this: it fires
+	// only when the resolution CHANGED the active config, and a confirmation
+	// changes nothing (`ConfirmCommit` / `ConfirmPendingOnDemotion` replace no
+	// tree), so the hash still matches and the record would be treated as live.
+	// `ConfirmPendingOnDemotion` returns a bool and has no channel to warn
+	// anyone on, so the operator's confirmation would be reverted here with no
+	// diagnostic anywhere.
+	if rec.Resolved {
+		slog.Warn("ignoring a RESOLVED pending commit-confirmed record on boot: its window was "+
+			"already confirmed or superseded and only the durable removal was owed; not "+
+			"resurrecting its rollback", "issue", "#8565")
+		s.resolveConfirmRemovalLocked("resolved_tombstone_recovery")
 		return nil
 	}
 	// #5835: a stale record must not resurrect a rollback of an unrelated,
@@ -173,7 +215,17 @@ func (s *Store) recoverPendingConfirmLocked() error {
 	// the stale record still converges to deletion. A legacy record (empty
 	// GuardedHash, written before #5835) skips this check and recovers exactly
 	// as #4577 so the cross-upgrade auto-rollback hatch is preserved.
-	if rec.GuardedHash != "" && rec.GuardedHash != journalConfigHash(s.active) {
+	// #8564: the CANONICAL basis, paired with the arm site. Note this end is
+	// IDEMPOTENT today and a mutation of it alone escapes the suite: `s.active`
+	// here was decoded from disk by `Load` immediately above, so it has already
+	// been round-tripped and canonicalizing it again changes nothing. It is
+	// written anyway so the two ends name the SAME function — swapping this back
+	// to `journalConfigHash` encodes the unwritten assumption "the tree here is
+	// always disk-derived", which a future recovery path that seeds `s.active`
+	// from memory would silently falsify. The arm site is the one the #8564
+	// cells bind; do not "simplify" this one away on the grounds that it is
+	// provably a no-op.
+	if rec.GuardedHash != "" && rec.GuardedHash != guardedConfigHash(s.active) {
 		slog.Warn("ignoring a stale pending commit-confirmed record on boot: it guards a config "+
 			"that is no longer active (a later commit/confirm superseded it); not resurrecting its "+
 			"rollback", "issue", "#5835")
@@ -388,17 +440,78 @@ func journalConfigHash(tree *config.ConfigTree) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// guardedConfigHash returns the hash used to bind a pending commit-confirmed
+// record to the config it guards (`confirmRecord.GuardedHash`, #5835), over the
+// tree's CANONICAL text: the text it has after ONE JSON round-trip (#8564).
+//
+// The two ends of that binding never saw the same tree. It is computed at ARM
+// time over the IN-MEMORY promoted tree and re-computed at BOOT over the tree
+// DECODED FROM DISK, so any value the JSON encoding normalizes makes the two
+// hashes differ and recovery classifies a LIVE record as stale — dropping it,
+// leaving the UNCONFIRMED config standing with no rollback timer, and logging
+// that "a later commit/confirm superseded it" when nothing did.
+//
+// One such value is reachable from ordinary config: `hasControlChars` rejects
+// only C0/DEL, so a raw invalid-UTF-8 byte in a free-text leaf commits cleanly,
+// and `json.MarshalIndent` (the DB persistence format) coerces it to U+FFFD.
+//
+// Canonicalizing makes the two bases equal BY CONSTRUCTION rather than by the
+// absence of any normalizing value: the round trip is idempotent, so the
+// arm-time hash of the in-memory tree already equals the boot-time hash of the
+// tree that comes back. For every config the encoding does NOT normalize —
+// which is every config that works today — this is byte-identical to
+// `journalConfigHash`, so records written by an older build still match and no
+// #1917-style versioned basis is needed. The journal's own `ConfigHash` keeps
+// the plain basis: it records what was committed, not what will be read back.
+func guardedConfigHash(tree *config.ConfigTree) string {
+	if tree == nil {
+		return ""
+	}
+	return journalConfigHash(canonicalizeTree(tree))
+}
+
+// canonicalizeTree returns tree as it will be after a persist/load round trip:
+// marshalled and decoded exactly as `writeTreeMarked`/`readTreeMeta` do. On a
+// marshal/decode failure it returns tree unchanged, which degrades to the
+// pre-#8564 basis rather than to an empty tree — a wrong-but-stable hash
+// stale-drops one record, an empty tree would match every config.
+func canonicalizeTree(tree *config.ConfigTree) *config.ConfigTree {
+	data, err := json.Marshal(tree)
+	if err != nil {
+		return tree
+	}
+	var round config.ConfigTree
+	if err := json.Unmarshal(data, &round); err != nil {
+		return tree
+	}
+	return &round
+}
+
 // ConfigPersistDegraded reports whether the running active config
 // failed to persist to disk on an Option-B path (SyncApply /
 // performAutoRollback) and the background retry has not yet succeeded
 // (#1799), OR a resolved commit-confirmed window's confirm.json removal is not
-// yet durable (#5835). While true, a daemon restart would load a STALE config
-// or resurrect a resolved rollback; /health returns 503 and
-// xpf_daemon_config_persist_degraded reads 1.
+// yet durable (#5835), OR boot recovery could not READ confirm.json and the
+// pending rollback window was lost (#8566). While true, a daemon restart would
+// load a STALE config or resurrect a resolved rollback — or, for #8566, an
+// UNCONFIRMED config is already standing with no rollback; /health returns 503
+// and xpf_daemon_config_persist_degraded reads 1.
 func (s *Store) ConfigPersistDegraded() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.persistDegraded || s.confirmRemoveDegraded
+	return s.persistDegraded || s.confirmRemoveDegraded || s.confirmRecoveryReadFailed
+}
+
+// ConfirmRecoveryReadFailed reports specifically whether boot recovery could not
+// read confirm.json and therefore lost the pending commit-confirmed rollback
+// window (#8566). A strict subset of ConfigPersistDegraded, exposed separately
+// so a caller can distinguish "the window is gone" from a write-side debt that
+// the background retry will heal on its own — this one will not: it clears only
+// when a later arm or removal of a confirm record succeeds.
+func (s *Store) ConfirmRecoveryReadFailed() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.confirmRecoveryReadFailed
 }
 
 // ConfirmRemovalDegraded reports specifically whether a RESOLVED

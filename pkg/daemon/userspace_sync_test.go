@@ -757,15 +757,42 @@ func TestShouldSyncUserspaceDeltaSkipsLocalDelivery(t *testing.T) {
 	}
 }
 
-func TestShouldSyncUserspaceDeltaSkipsMissingNeighborSeed(t *testing.T) {
+// EVERY transient-local-seed origin must stay out of session sync, and the
+// control leg is what makes that mean something.
+//
+// The helper suppresses these at install, so a green here proves only that the
+// belt matches the suspenders — which is the point: #6599 measured that a
+// FabricRedirect-disposition Open delta reaching the peer overwrites the
+// owner's authoritative session family under latest-generation-wins, and a
+// #7770 punt seed has that disposition and is NAT-free. The list is driven
+// rather than spelled out per-origin so a member added to
+// `transientLocalSeedOrigins` without a test cannot slip through.
+//
+// The non-seed control leg is load-bearing: without it a filter that refused
+// EVERY delta would satisfy every assertion above it.
+func TestShouldSyncUserspaceDeltaSkipsTransientLocalSeeds(t *testing.T) {
 	d := &Daemon{
 		sessionSync: &cluster.SessionSync{
 			IsPrimaryFn:      func() bool { return true },
 			IsPrimaryForRGFn: func(rgID int) bool { return true },
 		},
 	}
-	if d.shouldSyncUserspaceDelta(d.sessionSync, dpuserspace.SessionDeltaInfo{Origin: "missing_neighbor_seed"}, 1) {
-		t.Fatal("expected transient missing-neighbor seed deltas to stay out of session sync")
+	if len(transientLocalSeedOrigins) == 0 {
+		t.Fatal("transientLocalSeedOrigins is empty, so this test asserts nothing")
+	}
+	for _, origin := range transientLocalSeedOrigins {
+		if d.shouldSyncUserspaceDelta(d.sessionSync, dpuserspace.SessionDeltaInfo{Origin: origin}, 1) {
+			t.Errorf("transient local seed origin %q was queued for session sync; "+
+				"the authoritative session for such a flow lives on the OTHER node, "+
+				"and a FabricRedirect-disposition Open delta overwrites it there "+
+				"under latest-generation-wins (#6599/#7770)", origin)
+		}
+	}
+	// Control: an ORDINARY local forward session must still sync, or the loop
+	// above is measuring a filter that refuses everything.
+	if !d.shouldSyncUserspaceDelta(d.sessionSync, dpuserspace.SessionDeltaInfo{Origin: "forward_flow"}, 1) {
+		t.Fatal("an ordinary forward_flow delta was filtered — the seed filter is " +
+			"refusing traffic it must pass, so the assertions above are not about seeds")
 	}
 }
 

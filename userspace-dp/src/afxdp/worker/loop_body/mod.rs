@@ -360,6 +360,7 @@ pub(crate) fn worker_loop(
                         &shared_owner_rg_indexes,
                         &recent_session_deltas,
                         &peer_worker_commands,
+                        &worker_commands_by_id,
                         &event_stream,
                         forwarding.as_ref(),
                         &mut worker_lossless_wedged,
@@ -387,6 +388,7 @@ pub(crate) fn worker_loop(
                         &shared_owner_rg_indexes,
                         &recent_session_deltas,
                         &peer_worker_commands,
+                        &worker_commands_by_id,
                         &event_stream,
                         forwarding.as_ref(),
                         &mut worker_lossless_wedged,
@@ -725,6 +727,7 @@ pub(crate) fn worker_loop(
                 &shared_forward_wire_sessions,
                 &shared_owner_rg_indexes,
                 &peer_worker_commands,
+                &worker_commands_by_id,
                 &forwarding,
                 purge_input_dscp_v4,
                 purge_input_dscp_v6,
@@ -1808,6 +1811,13 @@ fn count_local_session_expiries(
             | SessionOrigin::ReverseFlow
             | SessionOrigin::LocalMiss
             | SessionOrigin::MissingNeighborSeed => true,
+            // #7770: a fabric PUNT SEED is installed without bumping
+            // `session_creates` — the punting node deliberately keeps its
+            // operator-visible create accounting unchanged, because the
+            // AUTHORITATIVE session for a punted flow is the peer's. Its expiry
+            // must therefore not be counted either, or `session_creates -
+            // session_expires` wraps.
+            SessionOrigin::FabricPuntSeed => false,
             // Synced-derived, never create-counted: must NOT be expire-counted.
             SessionOrigin::SyncImport
             | SessionOrigin::SharedMaterialize

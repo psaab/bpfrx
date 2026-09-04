@@ -22,6 +22,43 @@ type userspaceEventStreamProvider interface {
 }
 
 // shouldSyncUserspaceDelta decides whether a userspace session delta should be
+// transientLocalSeedOrigins mirrors the helper's
+// `SessionOrigin::is_transient_local_seed` (userspace-dp/src/session/entry.rs).
+// A seed is a LOCAL artefact of a decision one node made — it is not a claim of
+// authority over the flow, and the authoritative session lives on the other
+// node.
+//
+// The helper already suppresses the Open delta for these origins at install
+// (`install.rs`'s `counted` gate), so nothing here should ever see one. This
+// filter is the belt to that suspenders, and the reason it is worth having is
+// recorded directly below in the fabric-redirect branch: #6599 measured what a
+// FabricRedirect-disposition Open delta does when it reaches the peer, which is
+// to overwrite the owner's authoritative session family under
+// latest-generation-wins. A #7770 punt seed has exactly that disposition and is
+// NAT-free by construction, so a regression in the helper's suppression would
+// land the worst shape of that class on the wire. Filtering by origin costs one
+// string compare and removes the whole class from this path's reach.
+//
+// It is a LIST rather than two `EqualFold` calls so the pair cannot drift apart
+// as the helper's set grows; `TestShouldSyncUserspaceDeltaSkipsTransientLocalSeeds`
+// pins every member and carries a non-seed control.
+var transientLocalSeedOrigins = []string{
+	"missing_neighbor_seed",
+	// #7770: the punting node's record of "I redirected this flow across the
+	// fabric and my own policy permitted it", which exists so the peer's RETURN
+	// is a session hit instead of a `wan -> lan` default deny.
+	"fabric_punt_seed",
+}
+
+func isTransientLocalSeedOrigin(origin string) bool {
+	for _, seed := range transientLocalSeedOrigins {
+		if strings.EqualFold(origin, seed) {
+			return true
+		}
+	}
+	return false
+}
+
 // synced to the peer. ss is the caller's captured session-sync object (#4958):
 // the per-delta hot path takes the snapshot once in queueUserspaceSessionDeltas
 // rather than re-reading the shared field under lock for every delta.
@@ -42,8 +79,9 @@ func (d *Daemon) shouldSyncUserspaceDelta(ss *cluster.SessionSync, delta dpusers
 		slog.Debug("userspace delta: filtered (local_delivery)", "src", delta.SrcIP, "dst", delta.DstIP)
 		return false
 	}
-	if strings.EqualFold(delta.Origin, "missing_neighbor_seed") {
-		slog.Debug("userspace delta: filtered (missing_neighbor_seed)", "src", delta.SrcIP, "dst", delta.DstIP)
+	if isTransientLocalSeedOrigin(delta.Origin) {
+		slog.Debug("userspace delta: filtered (transient local seed)",
+			"origin", delta.Origin, "src", delta.SrcIP, "dst", delta.DstIP)
 		return false
 	}
 	// A fabric redirect means the PEER owns the flow's egress side, so
