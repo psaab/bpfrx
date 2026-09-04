@@ -191,6 +191,28 @@ func (s *Server) sessionsOffset(w http.ResponseWriter, r *http.Request, q *sessi
 		writeError(w, http.StatusBadRequest, "invalid offset: "+r.URL.Query().Get("offset"))
 		return
 	}
+	// #8597 (muse-004 K25): `offset` needs a ceiling, and its sibling `limit`
+	// three lines above has had one all along. Without it the countCap raise
+	// below — which exists so an explicitly requested deep window is not
+	// truncated — is driven by an unbounded query parameter, so `offset` past
+	// sessionCountCap RESTORES the full v4+v6 table walk per page that #5318
+	// exists to prevent. One query string turns the bound off.
+	//
+	// REJECTED rather than clamped, unlike `limit`, and the difference is
+	// deliberate: a clamped limit returns fewer rows than asked for, which a
+	// paging client handles, whereas a clamped offset returns a DIFFERENT PAGE
+	// than asked for — a client walking pages would loop on it forever. Past
+	// this cap the offset path has nothing meaningful to return anyway: it is
+	// documented above as best-effort because the backend iterates helper map
+	// order, and Total is already only a lower bound there. The cursor path
+	// (`page_token`) is the stable deep-pagination surface and the error names
+	// it.
+	if offset > sessionCountCap {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf(
+			"offset %d exceeds the maximum offset-pagination depth (%d); "+
+				"use page_token cursor pagination for deep pages", offset, sessionCountCap))
+		return
+	}
 
 	now := monotonicSeconds()
 	all := make([]SessionEntry, 0)
