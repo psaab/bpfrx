@@ -211,6 +211,29 @@ quit
 EOF
 }
 
+# Which of the three mastership predicates are NOT satisfied, as a
+# human-readable list.
+#
+# #8274: this exists because the AND below has THREE operands and every
+# message about it named only the first. A run whose real fault was an
+# unconfigured peer (so `peer_arp_resolves_to_fw0` could not resolve the
+# VIP's MAC) reported "WG VIP absent on fw0" — while the VIP was plainly
+# present on ge-0-0-1 — and sent the reader to check cluster mastership,
+# which was fine. That cost a full cluster cycle to disbelieve.
+#
+# Note the asymmetry that makes the misdirection easy: `peer_arp_resolves_to_fw0`
+# returns SUCCESS when the peer does not exist at all (it has nothing to ask),
+# so the predicate is silently satisfied on a fresh cluster and only starts
+# failing once a peer exists but is not yet addressed — the state a
+# hand-seeded or half-torn-down peer is in.
+mastership_unmet() {
+    local unmet=""
+    fw0_has_wg_vip || unmet="${unmet} VIP-absent-on-fw0"
+    peer_arp_resolves_to_fw0 || unmet="${unmet} peer-ARP-does-not-resolve-to-fw0"
+    fw0_is_rg0_primary || unmet="${unmet} fw0-not-RG0-primary"
+    printf '%s' "${unmet# }"
+}
+
 ensure_wg_mastership() { # ensure_wg_mastership <label>
     local t
     for t in $(seq 1 12); do
@@ -220,7 +243,7 @@ ensure_wg_mastership() { # ensure_wg_mastership <label>
         fi
         sleep 2
     done
-    warn "$1: WG VIP absent on fw0 — failing ALL redundancy groups back to node0"
+    warn "$1: mastership unmet [$(mastership_unmet)] — failing ALL redundancy groups back to node0"
     # Discover the configured RG ids from cluster status and fail each
     # back. Hardcoding 0/1 missed RG2 live (three RGs on this cluster).
     local rgs rg
@@ -250,6 +273,10 @@ EOF
         fi
         sleep 2
     done
+    # Name the survivors on the way out. The caller's `|| fail` message
+    # cannot know which predicate lost, so it is said HERE, where it is
+    # cheap to ask each one again.
+    warn "$1: mastership STILL unmet after failback [$(mastership_unmet)]"
     return 1
 }
 
@@ -293,7 +320,7 @@ preflight() {
     ish "${FW0}" 'systemctl is-active xpfd' | grep -q active || fail "xpfd not active on fw0"
     ish "${FW1}" 'systemctl is-active xpfd' | grep -q active || fail "xpfd not active on fw1"
     check_build_identity "preflight" || true
-    ensure_wg_mastership "preflight" || fail "WG VIP not on fw0 (even after all-RG failback) — WG sends would EINVAL"
+    ensure_wg_mastership "preflight" || fail "WG mastership not established on fw0 even after all-RG failback (the unmet predicate is named in the warning above) — WG sends would EINVAL"
     # Stale wg0 STANZA from a previous run: the config DB persists
     # across deploys (deploy pushes xpf.conf but the daemon loads the
     # DB first), so a prior run's stanza silently revives the engine at
@@ -574,7 +601,7 @@ configure_p1() {
     log "P1: keys + peer (responder) + xpf commit (initiator, node0-scoped)"
     gen_keys force
     peer_wg_setup ""   # peer responder: no endpoint — must learn from xpf msg1
-    ensure_wg_mastership "p1" || fail "P1: WG VIP not on fw0 (even after all-RG failback)"
+    ensure_wg_mastership "p1" || fail "P1: WG mastership not established on fw0 even after all-RG failback (the unmet predicate is named in the warning above)"
     check_build_identity "p1" || true
     wg_stanza_delete   # remove any stale stanza (fresh-engine belt)
     # S2a removal-leak workaround (#1866): a leaked control thread from

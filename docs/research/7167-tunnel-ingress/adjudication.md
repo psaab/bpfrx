@@ -502,8 +502,9 @@ a 4-byte check (`frame1`, offset reloaded from the stack). The failing site
 was not the new read at all. A `bool` lands in existing padding.
 
 **Cost, stated because it is spent from a shared budget**: verifier headroom
-falls from 31.31% (686,919 insns) to 23.47% (765,284), against a 15.0% floor —
-84,716 insns of slack remain. Runtime cost is approximately nil: the common
+falls from 31.38% (686,201 insns) to 23.20% (768,026), against a 15.0% floor —
+81,974 insns of slack remain. Master's baseline was re-measured in a throwaway
+worktree at its own head rather than carried over from before the merge. Runtime cost is approximately nil: the common
 UDP path now does ONE 9-byte read where it did one 8-byte read, and the
 8-byte fallback runs only for a zero-length payload.
 
