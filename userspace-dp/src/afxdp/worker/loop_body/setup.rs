@@ -311,3 +311,159 @@ pub(super) fn worker_loop_setup(
         recovered_fallbacks,
     }
 }
+
+#[cfg(test)]
+mod worker_setup_harness {
+    use super::*;
+    /// The Send-able observations of one `worker_loop_setup` run.
+    ///
+    /// `WorkerLoopSetup` itself is NOT `Send` — it owns an
+    /// `Rc<WorkerUmemInner>` — so it cannot cross the thread boundary and the
+    /// facts a cell wants have to be reduced inside the closure rather than
+    /// carried out of it.
+    pub(super) struct SetupObservation {
+        pub(super) binding_failures: usize,
+        pub(super) bindings: usize,
+        pub(super) elapsed_ns: u64,
+        pub(super) returned_at_ns: u64,
+    }
+
+    /// Drive the REAL `worker_loop_setup`.
+    ///
+    /// WHY THIS EXISTS. Until now `worker_loop` and `worker_loop_setup` had NO
+    /// test callers anywhere in the tree — they were reachable only from
+    /// `reconcile/bringup.rs`, and the spawn seams that exercise the #5143
+    /// readiness barrier substitute STUB threads rather than the real body. So
+    /// every cell over this code was green BY CONSTRUCTION rather than by
+    /// coverage: a mutation that deleted a load-bearing line from worker setup
+    /// passed the entire suite, because nothing ran it.
+    ///
+    /// Runs on its OWN thread, deliberately. `worker_loop_setup` opens with
+    /// `pin_current_thread(worker_id)`, and pinning a cargo test thread would
+    /// outlive the cell and follow whatever test that thread is reused for.
+    /// Spawning also matches production, where setup always runs on a freshly
+    /// spawned worker.
+    pub(super) fn drive_worker_setup(binding_plans: Vec<BindingPlan>) -> SetupObservation {
+        // DO NOT "simplify" this to an inline call. `worker_loop_setup` opens
+        // with `pin_current_thread(worker_id)`, so calling it on the cargo test
+        // thread PINS that thread — and the pin outlives this cell and follows
+        // the thread into whatever test the runner reuses it for. The symptom
+        // would be an unrelated timing flake, weeks later, in a file with no
+        // connection to this one. Spawning also matches production, where setup
+        // always runs on a freshly spawned worker.
+        std::thread::spawn(move || {
+            let t0 = crate::afxdp::monotonic_nanos();
+            let runtime = RuntimeViewChannel::default();
+            let shared_runtime = runtime.reader();
+            let owner_worker_by_queue = ArcSwap::from_pointee(BTreeMap::new());
+            let owner_live_by_queue = ArcSwap::from_pointee(BTreeMap::new());
+            let root_leases = ArcSwap::from_pointee(BTreeMap::new());
+            let exact_backlogs = ArcSwap::from_pointee(BTreeMap::new());
+            let queue_leases = ArcSwap::from_pointee(BTreeMap::new());
+            let queue_vtime_floors = ArcSwap::from_pointee(BTreeMap::new());
+            let mirror_targets = ArcSwap::from_pointee(MirrorTargetMap::default());
+            let cos_status = ArcSwap::from_pointee(Vec::new());
+            let runtime_atomics = crate::afxdp::worker_runtime::WorkerRuntimeAtomics::new();
+            let cold_path_atomics = crate::afxdp::cold_path_hist::WorkerColdPathAtomics::new();
+            let setup = worker_loop_setup(
+                0,
+                0,
+                binding_plans,
+                &shared_runtime,
+                &owner_worker_by_queue,
+                &owner_live_by_queue,
+                &root_leases,
+                &exact_backlogs,
+                &queue_leases,
+                &queue_vtime_floors,
+                &mirror_targets,
+                crate::PollMode::Interrupt,
+                &cos_status,
+                &runtime_atomics,
+                &cold_path_atomics,
+            );
+            let returned_at_ns = crate::afxdp::monotonic_nanos();
+            SetupObservation {
+                binding_failures: setup.binding_failures.len(),
+                bindings: setup.bindings.len(),
+                elapsed_ns: returned_at_ns - t0,
+                returned_at_ns,
+            }
+        })
+        .join()
+        .expect("worker setup thread")
+    }
+
+    /// One private-UMEM plan with closed (-1) map fds on a nonexistent ifindex,
+    /// so the real bind is ATTEMPTED and fails.
+    pub(super) fn unbindable_plan() -> BindingPlan {
+        BindingPlan {
+            status: BindingStatus {
+                slot: 0,
+                ifindex: 999_000,
+                queue_id: 0,
+                ..BindingStatus::default()
+            },
+            live: Arc::new(BindingLiveState::new()),
+            xsk_map_fd: -1,
+            heartbeat_map_fd: -1,
+            session_map_fd: -1,
+            conntrack_v4_fd: -1,
+            conntrack_v6_fd: -1,
+            ring_entries: 256,
+            bind_strategy: AfXdpBindStrategy::UmemOwnerSocket,
+            poll_mode: crate::PollMode::Interrupt,
+            shared_umem: SharedUmemBindingPlan::private(),
+        }
+    }
+
+    /// THE POSITIVE CONTROL FOR THE HARNESS ITSELF, and the reason this file
+    /// is worth landing on its own.
+    ///
+    /// A harness that ran `worker_loop_setup` but returned before the bind
+    /// partition would look exactly like coverage while testing nothing — which
+    /// is the failure mode the existing stub-thread seams already have. So
+    /// assert something ONLY the real body produces: an explicit per-slot
+    /// `BindingSetupFailure` for a plan whose map fds are all closed.
+    ///
+    /// If this ever goes empty, the harness stopped reaching the bind and every
+    /// future cell built on it is vacuous.
+    #[test]
+    fn the_harness_reaches_the_real_bind_path() {
+        let setup = drive_worker_setup(vec![unbindable_plan()]);
+        assert!(
+            setup.binding_failures > 0,
+            "the harness returned with NO per-slot binding failure for a plan \
+             whose map fds are all -1. The real body records an explicit \
+             BindingSetupFailure for such a slot, so an empty list means setup \
+             returned before the bind partition and this harness is not \
+             reaching the code it claims to"
+        );
+        assert_eq!(
+            setup.bindings, 0,
+            "an unbindable plan produced a live binding, so the fixture is not \
+             exercising the failure path it was built for"
+        );
+    }
+
+    /// The complement: with NOTHING to bind, setup still completes and reports
+    /// neither a binding nor a failure.
+    ///
+    /// Without this the control above cannot distinguish "the bind path ran and
+    /// failed" from "the bind path fails for everything, including nothing" —
+    /// a body that pushed a failure unconditionally would satisfy it.
+    #[test]
+    fn the_harness_reports_no_failure_when_there_is_nothing_to_bind() {
+        let setup = drive_worker_setup(Vec::new());
+        assert_eq!(
+            setup.binding_failures, 0,
+            "setup reported a per-slot binding failure with NO plans to bind, \
+             so the failure list is not attributable to a slot"
+        );
+        assert_eq!(setup.bindings, 0, "no plans must produce no bindings");
+        assert!(
+            setup.returned_at_ns >= setup.elapsed_ns,
+            "monotonic clock sanity"
+        );
+    }
+}
