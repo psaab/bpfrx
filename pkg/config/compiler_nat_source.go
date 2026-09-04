@@ -536,7 +536,32 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 
 	// Parse source NAT pools
 	for _, inst := range namedInstances(node.FindChildren("pool")) {
-		pool := &NATPool{Name: inst.name}
+		// #8436: FIND-OR-CREATE, not construct-and-overwrite.
+		//
+		// Two hierarchical `pool P { ... }` blocks are one pool in Junos, and
+		// the flat-set spelling already merges them. Constructing a fresh
+		// NATPool per block made the LAST block win and silently discarded
+		// everything the first one carried — its addresses, its port range, its
+		// persistent-NAT settings. Silently: there is no commit gate on this
+		// container, so an operator who authored two blocks (hierarchical file,
+		// `load merge`, `load override` — `set` merges correctly) got a pool
+		// that translated through a different address set than the one they
+		// wrote.
+		//
+		// Same shape and same repair as `security ike policy` and
+		// `security ipsec vpn` (#8548), which the #8436 census listed alongside
+		// this one.
+		//
+		// The per-field merge is already correct once the object is shared:
+		// every scalar is assigned inside a `switch prop.Name()` arm, so a
+		// block that does not mention a leaf cannot reset it to a zero value,
+		// and `appendPoolAddresses` appends rather than replaces — so the two
+		// blocks' address sets accumulate, which is the conservation property
+		// this is about.
+		pool, found := sec.NAT.SourcePools[inst.name]
+		if !found || pool == nil {
+			pool = &NATPool{Name: inst.name}
+		}
 
 		for _, prop := range inst.node.Children {
 			switch prop.Name() {
