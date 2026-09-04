@@ -526,6 +526,41 @@ impl FilterRevalidationStamp {
     }
 }
 
+/// #8114 item 2: the three answers [`SessionTable::filter_revalidation_target`]
+/// can give about a wire tuple.
+///
+/// It replaces an `Option<SessionKey>` in which TWO of these collapsed onto
+/// `None`, and that collapse was the defect. `Fresh` means "this entry's static
+/// input-filter verdict was already derived under the live (generation,
+/// ingress) pair" — the answer for every packet but one per session per pair,
+/// and correctly nothing to do. `NoLocalEntry` means "this worker holds no
+/// entry this tuple may safely name": the #2120 transient peer-synced hit that
+/// was served from the shared map without a local install, the reverse-NAT
+/// repair whose install was refused at `max_sessions`, or a stale primary
+/// handle. Those packets have a RESOLVED forwarding decision and are being
+/// forwarded, so reading them as `Fresh` meant a newly added static deny was
+/// never applied to them — fail-open, and for the `max_sessions` population for
+/// as long as the table stays full.
+///
+/// The distinction is worth a type because the two need OPPOSITE handling and
+/// look identical at the call site: `Fresh` must cost nothing, `NoLocalEntry`
+/// must still derive the verdict. The verdict needs the flow and the interface;
+/// only the STAMP and the table teardown need the entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FilterRevalidationTarget {
+    /// The entry exists and already carries a verdict for the live
+    /// `(generation, ingress)` pair. Nothing to derive, nothing to apply.
+    Fresh,
+    /// The entry exists and its verdict is stale. Carries the CANONICAL key —
+    /// the primary-index key, which on the NAT reverse-translated alias path is
+    /// NOT the wire tuple that found it — so a teardown acts on the session
+    /// that was actually judged.
+    Stale(SessionKey),
+    /// No entry this tuple may safely name. Derive the verdict anyway; do not
+    /// stamp and do not tear down.
+    NoLocalEntry,
+}
+
 #[derive(Clone, Debug)]
 struct SessionEntry {
     decision: SessionDecision,
@@ -1343,32 +1378,65 @@ impl SessionTable {
     /// is a freed-and-reused slab slot and yields `None` rather than falling
     /// through to the alias index — where a live alias entry for the same tuple
     /// would resolve a DIFFERENT session, which the caller would then revoke.
-    pub(crate) fn stale_filter_revalidation_key(
+    pub(crate) fn filter_revalidation_target(
         &self,
         key: &SessionKey,
         logical_ingress_ifindex: i32,
-    ) -> Option<SessionKey> {
+    ) -> FilterRevalidationTarget {
         let record = match self.key_to_handle.get(key).copied() {
             Some(handle) => {
-                let record = self.entries.get(handle as usize)?;
+                let Some(record) = self.entries.get(handle as usize) else {
+                    return FilterRevalidationTarget::NoLocalEntry;
+                };
                 if record.key != *key {
                     // Stale primary handle: same guard `lookup_with_origin`
                     // applies. Falling through to the alias index here could
                     // resolve a different live session under this tuple.
-                    return None;
+                    //
+                    // #8114 item 2: this is `NoLocalEntry`, not `Fresh`. The
+                    // caller can still DERIVE the flow's verdict — that needs
+                    // the flow and the interface, not the entry — it simply has
+                    // no entry it may safely stamp or tear down. Reporting it as
+                    // `Fresh` would have been the fail-open this issue is about.
+                    return FilterRevalidationTarget::NoLocalEntry;
                 }
                 record
             }
             None => {
-                let handle = self.resolve_reverse_translated_handle(key)?;
-                self.entries.get(handle as usize)?
+                let Some(handle) = self.resolve_reverse_translated_handle(key) else {
+                    return FilterRevalidationTarget::NoLocalEntry;
+                };
+                let Some(record) = self.entries.get(handle as usize) else {
+                    return FilterRevalidationTarget::NoLocalEntry;
+                };
+                record
             }
         };
         let live = FilterRevalidationStamp::live(
             self.filter_revalidation_gen,
             logical_ingress_ifindex,
         );
-        (record.entry.filter_revalidated != live).then(|| record.key.clone())
+        if record.entry.filter_revalidated == live {
+            FilterRevalidationTarget::Fresh
+        } else {
+            FilterRevalidationTarget::Stale(record.key.clone())
+        }
+    }
+
+    /// #7212 test view: the CANONICAL key the probe resolves, or `None` when it
+    /// does not resolve a stale entry. A view over
+    /// [`SessionTable::filter_revalidation_target`], not a second
+    /// implementation, so it cannot answer differently from production.
+    #[cfg(test)]
+    pub(crate) fn stale_filter_revalidation_key(
+        &self,
+        key: &SessionKey,
+        logical_ingress_ifindex: i32,
+    ) -> Option<SessionKey> {
+        match self.filter_revalidation_target(key, logical_ingress_ifindex) {
+            FilterRevalidationTarget::Stale(canonical) => Some(canonical),
+            FilterRevalidationTarget::Fresh | FilterRevalidationTarget::NoLocalEntry => None,
+        }
     }
 
     /// #7212: record that this direction's static input-filter verdict has been
@@ -1403,8 +1471,10 @@ impl SessionTable {
         key: &SessionKey,
         logical_ingress_ifindex: i32,
     ) -> bool {
-        self.stale_filter_revalidation_key(key, logical_ingress_ifindex)
-            .is_some()
+        matches!(
+            self.filter_revalidation_target(key, logical_ingress_ifindex),
+            FilterRevalidationTarget::Stale(_)
+        )
     }
 
 

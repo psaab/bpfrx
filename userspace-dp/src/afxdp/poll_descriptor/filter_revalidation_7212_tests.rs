@@ -1101,3 +1101,148 @@ fn a_verdict_on_one_interface_does_not_judge_another_7212() {
     assert_eq!(hit.eval.action, crate::filter::FilterAction::Discard);
     assert_eq!(hit.revoked_key.as_ref(), Some(&flow.forward_key));
 }
+
+// ---------------------------------------------------------------------------
+// #8114 item 2 — a RESOLVED decision with no local session entry.
+// ---------------------------------------------------------------------------
+
+/// THE CASE. A packet whose forwarding decision RESOLVED but for which this
+/// worker holds no local entry must still have the ingress interface's static
+/// input filter applied to it.
+///
+/// Two production populations reach this, and neither is hypothetical:
+///
+/// * the #2120 TRANSIENT peer-synced hit — `should_keep_synced_hit_transient`
+///   serves the packet from the shared map on an inactive owner without
+///   installing locally. Bounded: `maybe_promote_synced_session` installs the
+///   entry UNVALIDATED on a later packet.
+/// * the reverse-NAT REPAIR whose install was refused at `max_sessions`
+///   (`ResolvedFlowSessionDecision::install_failed`, threaded to the caller as
+///   `flow_cache_install_failed`), which still returns its synthesized
+///   decision. UNBOUNDED — it lasts as long as the session table is full, which
+///   is precisely when an operator is most likely to be adding a deny.
+///
+/// Before #8114 the probe returned `Option<SessionKey>` and this collapsed onto
+/// the same `None` as "the entry's verdict is already fresh", so the caller —
+/// whose single production call site is `if let Some(..)` with NO else arm —
+/// skipped the block and FORWARDED the packet under a filter that denies it.
+///
+/// What must NOT happen is equally load-bearing and is asserted below: no stamp
+/// and no teardown. `revoked_key` is `None`, because there is no entry this
+/// verdict may name — revoking on a resolved-but-unstored tuple would hand the
+/// caller a key that names nothing, or worse, another session's.
+#[test]
+fn a_sessionless_resolved_decision_still_applies_a_static_deny_8114() {
+    let forwarding =
+        forwarding_with_input_filter(LAN_IFINDEX, false, vec![deny_term("no-5201", "5201")]);
+    let flow = v4_flow(5201);
+
+    // No install: this is the whole point. The table publishes a live
+    // generation, so the ONLY thing that distinguishes this from the
+    // established-session cells above is the absence of the entry.
+    let mut sessions = SessionTable::new();
+    sessions.set_filter_revalidation_gen(7);
+
+    let hit = evaluate_input_filter_on_session_hit(
+        &forwarding,
+        &mut sessions,
+        &flow.forward_key,
+        &frame(),
+        Some(&flow),
+        meta(LAN_IFINDEX as u32, 0, false),
+        Some(TEST_LAN_ZONE_ID),
+    )
+    .expect(
+        "a resolved decision with no local entry must still be judged by the \
+         ingress filter — master forwarded it",
+    );
+    assert_eq!(
+        hit.eval.action,
+        crate::filter::FilterAction::Discard,
+        "the deny must be applied to THIS packet"
+    );
+    assert_eq!(
+        hit.revoked_key, None,
+        "there is no entry to revoke; naming one would hand the caller a key \
+         that names nothing"
+    );
+    assert!(
+        sessions.lookup(&flow.forward_key, 2_000, 0).is_none(),
+        "the sessionless path must not install an entry as a side effect"
+    );
+}
+
+/// THE OVER-REACH CONTROL. Same sessionless shape, filter PERMITS the flow —
+/// no verdict, so the packet forwards. The deny term is present and matches a
+/// SIBLING port on the same interface, so the filter is genuinely one that can
+/// deny; an all-accept filter would make this pass for the wrong reason.
+///
+/// Without this cell the one above is satisfied by "deny every sessionless
+/// packet", which would black-hole the entire #2120 transient window and every
+/// reverse-NAT repair on a full table.
+#[test]
+fn a_sessionless_resolved_decision_is_forwarded_when_permitted_8114() {
+    let forwarding = forwarding_with_input_filter(
+        LAN_IFINDEX,
+        false,
+        vec![deny_term("no-ssh", "22"), accept_term("web", "5201")],
+    );
+    let flow = v4_flow(5201);
+    let mut sessions = SessionTable::new();
+    sessions.set_filter_revalidation_gen(7);
+
+    assert!(
+        evaluate_input_filter_on_session_hit(
+            &forwarding,
+            &mut sessions,
+            &flow.forward_key,
+            &frame(),
+            Some(&flow),
+            meta(LAN_IFINDEX as u32, 0, false),
+            Some(TEST_LAN_ZONE_ID),
+        )
+        .is_none(),
+        "a permitted sessionless packet must forward — no verdict, no counter, \
+         no log"
+    );
+}
+
+/// THE HOT-PATH GUARD, and the reason `Fresh` and `NoLocalEntry` had to become
+/// distinguishable rather than "derive whenever the key does not resolve".
+///
+/// `Fresh` is the answer for every packet but one per session per (generation,
+/// ingress) — i.e. the entire population the feature serves. It must stay a
+/// single hash and a compare. A change that folded the new derivation into the
+/// fresh case would turn every established hit on a filtered interface into a
+/// static filter walk, and nothing else in the suite would notice: the verdict
+/// would be identical.
+///
+/// The fixture puts the filter in DENY on the flow while the stamp is fresh —
+/// unreachable in production (a fresh stamp under this generation means this
+/// filter already accepted it) and exactly the state that separates "re-derive
+/// when stale" from "re-derive when the filter denies".
+#[test]
+fn a_fresh_stamp_is_not_re_derived_by_the_8114_sessionless_arm_8114() {
+    let forwarding =
+        forwarding_with_input_filter(LAN_IFINDEX, false, vec![deny_term("no-5201", "5201")]);
+    let flow = v4_flow(5201);
+    let mut sessions = table_with_session(&flow, 7, Some(LAN_IFINDEX));
+
+    assert!(
+        evaluate_input_filter_on_session_hit(
+            &forwarding,
+            &mut sessions,
+            &flow.forward_key,
+            &frame(),
+            Some(&flow),
+            meta(LAN_IFINDEX as u32, 0, false),
+            Some(TEST_LAN_ZONE_ID),
+        )
+        .is_none(),
+        "a fresh stamp must cost a lookup and a compare, not a filter walk"
+    );
+    assert!(
+        sessions.lookup(&flow.forward_key, 2_000, 0).is_some(),
+        "and the session must be untouched"
+    );
+}
