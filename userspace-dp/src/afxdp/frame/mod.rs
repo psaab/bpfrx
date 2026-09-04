@@ -2084,6 +2084,11 @@ mod tests_mss_inject_inspect;
 #[cfg(test)]
 #[path = "tests_shim_ext_parity.rs"]
 mod tests_shim_ext_parity;
+// #8274: the shim's WireGuard record classification, executed rather than
+// modelled — same reason and same shape as the parity guard above.
+#[cfg(test)]
+#[path = "tests_shim_wg_classify_8274.rs"]
+mod tests_shim_wg_classify_8274;
 
 // #1824: proptest property harness (parse no-panic/bounds, NAT
 // round-trip + descriptor-vs-generic differential, TSO reassembly).

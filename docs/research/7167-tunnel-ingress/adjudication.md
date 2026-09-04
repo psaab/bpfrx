@@ -474,6 +474,60 @@ Acceptance for step 2:
 the IPsec capture measurement (B1's reachability on real hardware), which
 does not depend on steps 2–3.
 
+### 4.1 Step 2 as BUILT (#8274), and two things it corrected
+
+Landed. The classification lives in `userspace-xdp/src/wg_classify.rs`, a
+`core`-only module the shim calls and
+`userspace-dp/src/afxdp/frame/tests_shim_wg_classify_8274.rs`
+`#[path]`-includes and EXECUTES — the `ipv6_ext_walk` shape, adopted for the
+reason that file's own comment gives: five successive source-text models of a
+shim property each leaked, the worst accepting the deletion of a security
+property.
+
+**The type byte is captured in `parse_l4`, not at the steer site**, and that
+was forced by the verifier rather than chosen. Reading it at
+`pkt.payload_offset` inside `wg_steer_to_kernel` was rejected —
+`invalid access to packet, off=0 size=1, R8 offset is outside of the packet` —
+because that offset arrives through a `ParsedPacket` field with a wide
+`var_off`. It was rejected identically with a hand-rolled deref and with the
+shim's own `read_bytes`, and the documented narrowing mask did not fix it
+either. Reading at the same freshly-validated `l4_offset` the mandatory
+8-byte UDP header read already uses does verify, because a 9-byte read there
+is a shape the verifier already accepts.
+
+**`ParsedPacket` carries a `bool`, not the byte**, and that was also forced.
+Widening the struct by a `u16` relocated an UNRELATED packet read into a BPF
+subprogram and the verifier rejected the object at a 1-byte load dominated by
+a 4-byte check (`frame1`, offset reloaded from the stack). The failing site
+was not the new read at all. A `bool` lands in existing padding.
+
+**Cost, stated because it is spent from a shared budget**: verifier headroom
+falls from 31.31% (686,919 insns) to 23.47% (765,284), against a 15.0% floor —
+84,716 insns of slack remain. Runtime cost is approximately nil: the common
+UDP path now does ONE 9-byte read where it did one 8-byte read, and the
+8-byte fallback runs only for a zero-length payload.
+
+**Inertness, argued rather than assumed** (the issue's comment asks for it to
+be measured). For exactly the packet set the WireGuard arm matched, a type-4
+record now falls through to the session-miss path and is matched by the SAME
+`is_local_destination` predicate a few arms down, returning the SAME
+`cpumap_or_pass(ctrl)`. `native_gre` cannot divert it (that gate requires
+`protocol == PROTO_GRE`; a WireGuard record is UDP). `should_fallback_early`
+and the NDP arm end at the kernel too. The ONE divergent outcome is
+`USERSPACE_SESSION_ACTION_REDIRECT`, and nothing installs a session on the
+outer 5-tuple: the outer UDP header is synthesized at frame-build time by
+`wg_encap_frame` under the INNER flow's session, and the inbound direction
+still reaches the kernel without the worker adjudicating it. The live
+`wg-interop.sh` smoke is what measures the conclusion.
+
+**What a host test CANNOT bind here, said plainly.** The cells execute the
+classification module and four mutations kill them selectively, but nothing a
+host test can express binds the shim's CALL SITE: if `wg_steer_to_kernel`
+stopped calling `wg_classify`, every cell would stay green. The shim is not
+executable off-target, and emitting a fact about the constant would be a claim
+written into inert code rather than a binding. The live-NIC smoke is the only
+thing that binds the wiring, which is why step 2 owes one.
+
 
 ---
 

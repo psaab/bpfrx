@@ -67,6 +67,7 @@ const USERSPACE_CTRL_FLAG_STRICT: u32 = 8;
 const USERSPACE_CTRL_FLAG_WG_RX: u32 = 16;
 mod binding_index;
 mod ipv6_ext_walk;
+mod wg_classify;
 use binding_index::{
     BINDING_QUEUES_PER_IFACE, BINDING_SLOT_MAP_MAX_ENTRIES, RawRxQueue, binding_slot,
 };
@@ -74,6 +75,7 @@ use ipv6_ext_walk::{
     EH_CLASS_TERMINAL, FragHdr, MAX_EXT_HDRS, PROTO_FRAGMENT_NO_L4, eh_class, eh_class_table,
     read_bytes,
 };
+use wg_classify::{wg_record_is_transport_data, wg_steer_to_kernel_on_port_match};
 // MAX_INTERFACES is threaded in from bpf/headers/xpf_common.h via the
 // pkg/dataplane/build-userspace-xdp.sh wrapper, which does
 // `export MAX_INTERFACES=$(awk ... xpf_common.h)` before `cargo build`.
@@ -1318,6 +1320,14 @@ fn cpumap_or_pass(ctrl: &UserspaceCtrl) -> u32 {
 
 #[derive(Clone, Copy)]
 struct ParsedPacket {
+    // #8274: is this UDP datagram's first payload byte the WireGuard
+    // TRANSPORT-DATA message type? Classified in `parse_l4`, where the offset
+    // is still a freshly-validated local. A `bool` and not the byte: widening
+    // this struct by a `u16` relocated an unrelated packet read into a BPF
+    // subprogram and the verifier rejected the object (see `wg_classify`).
+    // False for a datagram with no readable payload byte and for every non-UDP
+    // protocol.
+    udp_wg_transport_data: bool,
     vlan_id: u16,
     vlan_pcp: u8,
     vlan_present: bool,
@@ -1403,7 +1413,7 @@ fn parse_ipv4(
     };
     let tos = iph[1];
     let l4_offset = l3_offset.checked_add(ihl as u16)?;
-    let (payload_offset, tcp_flags, flow_src_port, flow_dst_port, icmp_type) =
+    let (payload_offset, tcp_flags, flow_src_port, flow_dst_port, icmp_type, udp_wg_transport_data) =
         parse_l4(data, data_end, l4_offset, protocol)?;
     let src_bytes = unsafe { read_bytes(data, data_end, l3_offset as usize + 12, 4) }?;
     let dst_bytes = unsafe { read_bytes(data, data_end, l3_offset as usize + 16, 4) }?;
@@ -1418,6 +1428,7 @@ fn parse_ipv4(
         l3_offset,
         l4_offset,
         payload_offset,
+        udp_wg_transport_data,
         addr_family: AF_INET,
         protocol,
         icmp_type,
@@ -1475,7 +1486,7 @@ fn parse_ipv6(
 
     let flow_lbl0 = ip6[1];
     let dscp = ((version_priority & 0x0f) << 2) | (flow_lbl0 >> 6);
-    let (payload_offset, tcp_flags, flow_src_port, flow_dst_port, icmp_type) =
+    let (payload_offset, tcp_flags, flow_src_port, flow_dst_port, icmp_type, udp_wg_transport_data) =
         parse_l4(data, data_end, offset, protocol)?;
     let mut src_addr = [0u8; 16];
     src_addr.copy_from_slice(unsafe { read_bytes(data, data_end, l3_offset as usize + 8, 16) }?);
@@ -1488,6 +1499,7 @@ fn parse_ipv6(
         l3_offset,
         l4_offset: offset,
         payload_offset,
+        udp_wg_transport_data,
         addr_family: AF_INET6,
         protocol,
         icmp_type,
@@ -1516,10 +1528,29 @@ fn parse_ipv6(
 /// the userspace policy engine.
 fn wg_steer_to_kernel(ctrl: &UserspaceCtrl, pkt: &ParsedPacket) -> bool {
     let wg_port = (ctrl.wg_listen_port & 0xffff) as u16;
-    wg_port != 0
-        && pkt.protocol == PROTO_UDP
-        && pkt.flow_dst_port == wg_port
-        && is_local_destination(pkt)
+    // The cheap tests stay first: the call site's comment is about instruction
+    // path cost, and nothing below runs for a packet that is not UDP to the
+    // configured listen port.
+    if wg_port == 0 || pkt.protocol != PROTO_UDP || pkt.flow_dst_port != wg_port {
+        return false;
+    }
+    // #8274 step 2: types 1/2/3 (handshake, cookie) keep going to the kernel —
+    // the control thread owns the handshake state machine and there is nothing
+    // in them for the dataplane to adjudicate. Type 4 (transport data) does
+    // not, because its plaintext is what the firewall has to adjudicate. The
+    // decision lives in `wg_classify` so a host test can EXECUTE it rather than
+    // model it from source text; see that module for why.
+    //
+    // INERT until step 3 lands the worker decap stage. A type-4 record that is
+    // no longer claimed here falls through to the session-miss path and is
+    // matched by the SAME `is_local_destination` predicate a few arms down,
+    // returning the SAME `cpumap_or_pass(ctrl)`. The only path on which the two
+    // differ is a live userspace session on the OUTER 5-tuple
+    // (`USERSPACE_SESSION_ACTION_REDIRECT`), and nothing installs one: the outer
+    // UDP header is synthesized at frame-build time by `wg_encap_frame` under
+    // the INNER flow's session, and the inbound direction reaches the kernel
+    // without the worker ever adjudicating it.
+    wg_steer_to_kernel_on_port_match(is_local_destination(pkt), pkt.udp_wg_transport_data)
 }
 
 fn should_fallback_early(pkt: &ParsedPacket) -> bool {
@@ -1649,7 +1680,7 @@ fn parse_l4(
     data_end: usize,
     l4_offset: u16,
     protocol: u8,
-) -> Option<(u16, u8, u16, u16, u8)> {
+) -> Option<(u16, u8, u16, u16, u8, bool)> {
     match protocol {
         PROTO_TCP => {
             let bytes = unsafe { read_bytes(data, data_end, l4_offset as usize, 14) }?;
@@ -1664,9 +1695,44 @@ fn parse_l4(
                 u16::from_be_bytes([bytes[0], bytes[1]]),
                 u16::from_be_bytes([bytes[2], bytes[3]]),
                 0,
+                false,
             ))
         }
         PROTO_UDP => {
+            // #8274: the FIRST PAYLOAD BYTE is captured here, not downstream.
+            // For a WireGuard datagram it is the message type, and the shim
+            // needs it to decide whether the record is a handshake (kernel) or
+            // transport data (worker). Reading it at `pkt.payload_offset` in
+            // `wg_steer_to_kernel` was tried and the kernel verifier REJECTED
+            // the object — that offset arrives through a `ParsedPacket` field
+            // with a wide `var_off`, and neither a hand-rolled deref, nor
+            // `read_bytes`, nor the documented narrowing mask made it
+            // trackable. See `wg_classify` for the full record.
+            //
+            // TRY THE 9-BYTE READ FIRST AND RETURN FROM INSIDE IT. Splitting it
+            // into "8-byte header read, then a second 9-byte read whose result
+            // is merged with a constant" was ALSO rejected
+            // (`invalid access to packet, off=0 size=1, r=0`): the two reads
+            // share a base, and after the merge the 1-byte load is dominated by
+            // the EIGHT-byte bound, which does not cover offset 8. This shape
+            // gives each read exactly one dominating check — the "branch merges
+            // lose packet range" hazard CLAUDE.md records, in its packet-read
+            // form.
+            //
+            // The 8-byte fallback below is NOT dead: a zero-length UDP payload
+            // is legal (a WireGuard keepalive is a type-4 record with an empty
+            // payload, but plenty of other UDP has none at all), and it must
+            // still parse and yield its ports.
+            if let Some(b) = unsafe { read_bytes(data, data_end, l4_offset as usize, 9) } {
+                return Some((
+                    l4_offset.checked_add(8)?,
+                    0,
+                    u16::from_be_bytes([b[0], b[1]]),
+                    u16::from_be_bytes([b[2], b[3]]),
+                    0,
+                    wg_record_is_transport_data(Some(b[8])),
+                ));
+            }
             let bytes = unsafe { read_bytes(data, data_end, l4_offset as usize, 8) }?;
             Some((
                 l4_offset.checked_add(8)?,
@@ -1674,6 +1740,7 @@ fn parse_l4(
                 u16::from_be_bytes([bytes[0], bytes[1]]),
                 u16::from_be_bytes([bytes[2], bytes[3]]),
                 0,
+                false,
             ))
         }
         PROTO_ICMP | PROTO_ICMPV6 => {
@@ -1684,9 +1751,10 @@ fn parse_l4(
                 u16::from_be_bytes([bytes[4], bytes[5]]),
                 0,
                 bytes[0],
+                wg_record_is_transport_data(None),
             ))
         }
-        _ => Some((l4_offset, 0, 0, 0, 0)),
+        _ => Some((l4_offset, 0, 0, 0, 0, false)),
     }
 }
 
