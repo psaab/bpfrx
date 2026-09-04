@@ -620,7 +620,7 @@ func TestScrubPreservesTheTunnelEndpointIdentity8612(t *testing.T) {
 				val.FibGen, wantGen)
 		}
 		if val.LogFlags&LogFlagUserspaceTunnelEndpoint == 0 {
-			t.Errorf("the tunnel bit was cleared though its value survives; flag and "+
+			t.Errorf("the tunnel bit was cleared though its value survives; flag and " +
 				"value must agree, and they now agree by KEEPING both (#8612)")
 		}
 		if val.LogFlags != wantFlags {
