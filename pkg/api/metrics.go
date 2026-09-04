@@ -94,6 +94,12 @@ type xpfCollector struct {
 	counterReadErrorsTotal *prometheus.Desc
 	counterReadErrors      atomic.Uint64
 
+	// #8312: per-limiter cumulative admission refusals. The Desc is declared
+	// here and emitted from metrics_admission_refusals_8312.go; the value comes
+	// from the diagcmd limiters themselves, so there is no counter state on the
+	// collector to keep in step.
+	admissionRefusalsTotal *prometheus.Desc
+
 	// Interface counters
 	ifacePacketsTotal *prometheus.Desc
 	ifaceBytesTotal   *prometheus.Desc
@@ -795,6 +801,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.syncookieTotal
 	ch <- c.flowCacheTotal
 	ch <- c.counterReadErrorsTotal
+	c.describeAdmissionRefusals(ch)
 	ch <- c.ifacePacketsTotal
 	ch <- c.ifaceBytesTotal
 	ch <- c.interfaceCounterReadErrorsTotal
@@ -1159,6 +1166,12 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	// value before this change, since nothing after the former emit site
 	// (collectSessionGauges..collectUserspaceStatus) bumps it.
 	defer c.emitCounterReadErrors(ch)
+	// #8312: emitted through the SAME deferred, pre-gate route, and for the
+	// same reason. Admission refusals are a control-plane signal that does not
+	// depend on the dataplane being loaded — and the degraded/unloaded state is
+	// exactly when a scrape is most likely to be refused, so emitting these
+	// after the dataplane gate would hide them in the case they matter most.
+	defer c.emitAdmissionRefusals(ch)
 
 	// #1799: config-persist health is a control-plane signal — emit it
 	// BEFORE the dataplane gate below so the degraded state stays
