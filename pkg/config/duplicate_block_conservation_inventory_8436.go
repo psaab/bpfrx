@@ -29,11 +29,7 @@ package config
 // reading the verdict column: a pinned list nobody reads is a list of defects
 // with a checkmark next to it.
 var dupConservationInventory8436 = []string{
-	// ---- SILENT: no commit gate at all. The candidate list (16). ----
-	"class-of-service interfaces",
-	"class-of-service schedulers",
-	"class-of-service traffic-control-profiles",
-	"protocols isis interface",
+	// ---- SILENT: no commit gate at all. The candidate list. ----
 	"system ntp server",
 	"system services dynamic-dns provider",
 
