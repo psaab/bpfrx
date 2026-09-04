@@ -164,6 +164,23 @@ func (s *Store) recoverPendingConfirmLocked() error {
 	if rec == nil {
 		return nil
 	}
+	// #8565: a RESOLUTION TOMBSTONE. The window was confirmed, superseded or
+	// rolled back and only the durable deletion was still owed, so there is
+	// nothing to re-arm and nothing to revert to — finish the deletion and move
+	// on. #5835's staleness check below cannot substitute for this: it fires
+	// only when the resolution CHANGED the active config, and a confirmation
+	// changes nothing (`ConfirmCommit` / `ConfirmPendingOnDemotion` replace no
+	// tree), so the hash still matches and the record would be treated as live.
+	// `ConfirmPendingOnDemotion` returns a bool and has no channel to warn
+	// anyone on, so the operator's confirmation would be reverted here with no
+	// diagnostic anywhere.
+	if rec.Resolved {
+		slog.Warn("ignoring a RESOLVED pending commit-confirmed record on boot: its window was "+
+			"already confirmed or superseded and only the durable removal was owed; not "+
+			"resurrecting its rollback", "issue", "#8565")
+		s.resolveConfirmRemovalLocked("resolved_tombstone_recovery")
+		return nil
+	}
 	// #5835: a stale record must not resurrect a rollback of an unrelated,
 	// already-confirmed generation. GuardedHash binds the record to the
 	// unconfirmed config it was armed for. The active config was already loaded
