@@ -352,7 +352,16 @@ pub(super) fn flush_session_deltas(
         // step. Skipped when no binding exists; every consumer below is
         // binding-independent and runs regardless.
         if let Some(live) = live {
-            live.push_session_delta(info.clone());
+            // #8593: route on the DELTA, not on a flag the call site chose. A
+            // bulk owner-RG export delta whose push is refused must not arm the
+            // loss-of-sync latch — that latch triggers the export that produced
+            // it. Deciding here means a new drain call site cannot get it wrong,
+            // because it does not choose.
+            if delta.bulk_resync {
+                live.push_session_delta_bulk_export(info.clone());
+            } else {
+                live.push_session_delta(info.clone());
+            }
         }
         // Push to event stream (new path) alongside existing RPC fallback.
         if let Some(es) = event_stream {

@@ -109,6 +109,7 @@ impl crate::afxdp::Coordinator {
                         // deltas (session-sync), NOT the RT_FLOW exporter, and the
                         // SyncedSessionEntry carries no session id. 0 (unknown).
                         session_id: 0,
+                        bulk_resync: false,
                     });
                 }
             }

@@ -7,7 +7,46 @@
 use super::*;
 
 impl BindingLiveState {
+    /// Push an INCREMENTAL session delta into the RPC-fallback buffer. A drop
+    /// arms the loss-of-sync latch, which drives the #2442 owner-RG resync.
     pub(in crate::afxdp) fn push_session_delta(&self, delta: SessionDeltaInfo) {
+        self.push_session_delta_inner(delta, true);
+    }
+
+    /// #8593: push a delta that is ITSELF part of a bulk owner-RG export. A
+    /// drop is counted but does NOT arm the loss-of-sync latch.
+    ///
+    /// The latch exists to trigger the owner-RG resync. A resync delta that
+    /// arms it triggers ANOTHER resync, whose export re-fills the same buffer,
+    /// which arms it again — a feedback loop, and one that outlives the traffic
+    /// that started it. Measured on `loss:xpf-userspace-fw0` (#8593): 125,780
+    /// session creates produced 25.26M deltas of which 23.29M (92%) were
+    /// dropped, and with the generator stopped and `active_flow_count = 0` the
+    /// helper kept generating ~149k deltas/s and dropping ~136k/s for ~90 s,
+    /// ending only as the owned sessions aged out. The signature was decisive:
+    /// 32.68M dropped session-CREATE deltas against 52k dropped closes, from
+    /// 32,768 real creates — re-exported opens, not traffic.
+    ///
+    /// Why not-arming is also the CORRECT answer and not merely the loop-safe
+    /// one: the recovery for a dropped delta is an OPEN-ONLY snapshot of the
+    /// owned set. It cannot restore a dropped CLOSE however many times it runs,
+    /// and every OPEN it could restore is already in the snapshot being shipped.
+    /// Re-running it on its own overflow recovers nothing.
+    ///
+    /// This does NOT suppress a genuinely-new incremental drop, and that is a
+    /// property of WHERE the marker lives rather than of timing: it is set by
+    /// the delta's producer (`SessionTable::emit_open_delta_with_origin`, whose
+    /// only production caller is the worker loop's chunked owner-RG export), so
+    /// an incremental open/close interleaved with the export is unmarked and
+    /// still arms. An earlier revision of this fix passed the flag at the flush
+    /// CALL SITE and had to argue the worker loop's single-threadedness to reach
+    /// the same conclusion; that form is also the one where a future drain site
+    /// passing the wrong flag silently suppresses a real arm.
+    pub(in crate::afxdp) fn push_session_delta_bulk_export(&self, delta: SessionDeltaInfo) {
+        self.push_session_delta_inner(delta, false);
+    }
+
+    fn push_session_delta_inner(&self, delta: SessionDeltaInfo, arm_on_overflow: bool) {
         self.session_delta_generated.fetch_add(1, Ordering::Relaxed);
         match self.pending_session_deltas.lock() {
             Ok(mut pending) => {
@@ -18,7 +57,12 @@ impl BindingLiveState {
                     // stream just went lossy. Latch loss-of-sync so the owning
                     // worker forces a full owner-RG resync (table-truth rescan),
                     // mirroring `SessionTable::push_delta`'s #2442 behavior.
-                    self.delta_loss_pending.store(true, Ordering::Relaxed);
+                    //
+                    // #8593: NOT when the dropped delta is itself part of that
+                    // resync's export — see `push_session_delta_bulk_export`.
+                    if arm_on_overflow {
+                        self.delta_loss_pending.store(true, Ordering::Relaxed);
+                    }
                     return;
                 }
                 pending.push_back(delta);
@@ -44,6 +88,9 @@ impl BindingLiveState {
             }
             Err(_) => {
                 self.session_delta_dropped.fetch_add(1, Ordering::Relaxed);
+                // A POISONED lock is not the #8593 self-arming case: the export
+                // did not cause it and a resync is the right response, so this
+                // arm is unconditional.
                 self.delta_loss_pending.store(true, Ordering::Relaxed);
             }
         }

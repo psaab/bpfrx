@@ -277,6 +277,7 @@ impl SessionTable {
                 // SESSION_CREATE RT_FLOW frame carries the id its eventual
                 // SESSION_CLOSE will.
                 session_id,
+                bulk_resync: false,
             });
         }
         true
@@ -540,6 +541,12 @@ impl SessionTable {
             // #5212: the stable id of the exported entry (0 if absent), so the
             // peer adopts it rather than minting a fresh node-local id.
             session_id,
+            // #8593: the ONLY producer of bulk-export deltas. Its sole production
+            // caller is the worker loop's chunked owner-RG export
+            // (`chunked_drain_as_you_export!`); the other caller is a
+            // `#[cfg(test)]` fixture. A drop of one of these must not arm the
+            // loss-of-sync latch that TRIGGERS that export.
+            bulk_resync: true,
         });
     }
 
@@ -583,6 +590,7 @@ impl SessionTable {
             // sentinel. The dominant idle/age close path (session/expire.rs)
             // carries the real id off the expiring entry.
             session_id: 0,
+            bulk_resync: false,
         });
     }
 
