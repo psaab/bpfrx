@@ -123,6 +123,11 @@ pub(crate) struct WorkerSharedDataplane {
     /// [`WorkerSharedSessions`] so the swap-compatible trio stays the only
     /// same-typed set the wiring test has to pin).
     pub(in crate::afxdp) ike_exchanges: crate::afxdp::forwarding::SharedIkeExchangeTable,
+    /// #7699: the node-shared PPTP control-segment inbox. Not in
+    /// [`WorkerSharedSessions`] — it is not a session map, and the swap-hazard
+    /// trio that bundle exists to pin must stay the only same-typed set there.
+    pub(in crate::afxdp) pptp_control:
+        Arc<crate::session::pptp_control::PptpControlInbox>,
 }
 
 impl WorkerSharedDataplane {
@@ -155,6 +160,7 @@ impl WorkerSharedDataplane {
                 owner_rg_indexes: coord.sessions.owner_rg_indexes.clone(),
             },
             ike_exchanges: coord.ike_exchanges.clone(),
+            pptp_control: coord.pptp_control.clone(),
         }
     }
 }
@@ -356,6 +362,12 @@ mod tests {
         // session map — a same-typed swap with one of the trio above would
         // fail their assertions first).
         assert!(Arc::ptr_eq(&bundle.ike_exchanges, &coord.ike_exchanges));
+        // #7699: the PPTP control inbox. This test's NAME claims every field,
+        // so a new field left unasserted makes the name false — and an inbox
+        // wired to a fresh allocation instead of the coordinator's would leave
+        // each worker filling a buffer nobody drains, with every other #7699
+        // cell still green.
+        assert!(Arc::ptr_eq(&bundle.pptp_control, &coord.pptp_control));
     }
 
     #[test]

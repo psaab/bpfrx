@@ -576,6 +576,16 @@ config carrying *both* families with a command matching an allow in one and a
 deny in the other — a single-family fixture cannot tell a per-family rule from a
 shared one.
 
+**Decision (#7971): won't-do for now**, recorded as a row in
+[`docs/feature-gaps.md`](feature-gaps.md) §22 rather than left implicit. The row
+states the precedence inversion as the reason reuse is unsafe, so the next
+reader does not wire the leaves to the plain family's evaluator. It also records
+the part that is easy to miss: because the absent family is the deny-precedence
+one, xpf has **no** deny-wins restriction family at all, and the plain family's
+allow-over-deny combined with unanchored partial matching (below) lets a wide
+allow silently re-permit a narrow deny. The gap is a safety gap, not only a
+parity gap.
+
 Modeling the four leaves to REJECT them is deliberately not a step toward
 implementing the family: nothing in `schema_login_regexps_7971.go` consumes
 `LoginRegexFamily`, and it must stay that way until the precedence and

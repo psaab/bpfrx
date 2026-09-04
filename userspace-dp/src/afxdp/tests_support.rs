@@ -823,7 +823,9 @@ pub(super) fn run_input_filter_accept_log_poll(
             burst: 0,
         },
     );
+    let __pptp_control_7699 = std::sync::Arc::new(crate::session::pptp_control::PptpControlInbox::default());
     let worker_ctx = WorkerContext {
+        pptp_control: &__pptp_control_7699,
         ident: &ident,
         binding_lookup: &binding_lookup,
         mirror_targets: &mirror_targets,
@@ -1111,7 +1113,9 @@ pub(super) fn txn_run_descriptor_with_neighbors(
     let peer_worker_commands = Vec::new();
     let dnat_fds = DnatTableFds::default();
     let rg_epochs = std::array::from_fn(|_| AtomicU32::new(0));
+    let __pptp_control_7699 = std::sync::Arc::new(crate::session::pptp_control::PptpControlInbox::default());
     let worker_ctx = WorkerContext {
+        pptp_control: &__pptp_control_7699,
         ident: &ident,
         binding_lookup: &binding_lookup,
         mirror_targets: &mirror_targets,
@@ -1219,7 +1223,9 @@ pub(super) fn txn_run_descriptor_with_deliveries(
     let peer_worker_commands = Vec::new();
     let dnat_fds = DnatTableFds::default();
     let rg_epochs = std::array::from_fn(|_| AtomicU32::new(0));
+    let __pptp_control_7699 = std::sync::Arc::new(crate::session::pptp_control::PptpControlInbox::default());
     let worker_ctx = WorkerContext {
+        pptp_control: &__pptp_control_7699,
         ident: &ident,
         binding_lookup: &binding_lookup,
         mirror_targets: &mirror_targets,
@@ -1339,7 +1345,9 @@ pub(super) fn txn_run_descriptor_capturing_events(
             burst: 0,
         },
     );
+    let __pptp_control_7699 = std::sync::Arc::new(crate::session::pptp_control::PptpControlInbox::default());
     let worker_ctx = WorkerContext {
+        pptp_control: &__pptp_control_7699,
         ident: &ident,
         binding_lookup: &binding_lookup,
         mirror_targets: &mirror_targets,

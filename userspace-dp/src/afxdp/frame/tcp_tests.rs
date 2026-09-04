@@ -1177,3 +1177,82 @@ fn syn_cookie_reply_v4_in_range_length_is_exact() {
     let total_len_field = u16::from_be_bytes([out[parsed.l3 + 2], out[parsed.l3 + 3]]);
     assert_eq!(total_len_field, (20 + tcp_len) as u16, "in-range total_length must be exact");
 }
+
+// ── #7699: tcp_payload_offset ────────────────────────────────────────────────
+//
+// The dispatch COPIES a TCP/1723 segment's payload off the hot path, and this
+// is what locates it. Two properties are load-bearing rather than cosmetic:
+// the offset must honour TCP OPTIONS (a fixed +20 silently copies the options
+// as if they were the control message), and the declared data offset is
+// ATTACKER-CONTROLLED, so it must be checked against the bytes present rather
+// than trusted.
+
+/// An Ethernet + IPv4 + TCP frame whose TCP header is `data_offset_dwords`
+/// 32-bit words long, followed by `payload`.
+fn tcp_v4_frame_with_options(data_offset_dwords: u8, payload: &[u8]) -> Vec<u8> {
+    let opt_bytes = (data_offset_dwords as usize) * 4 - 20;
+    let total_len = (IPV4_HDR_LEN + 20 + opt_bytes + payload.len()) as u16;
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&eth_header(0x0800));
+    frame.extend_from_slice(&ipv4_header(total_len, PROTO_TCP));
+    frame.extend_from_slice(&tcp_header_skeleton(0x18, data_offset_dwords));
+    // NOP-fill the option space so the bytes are well-formed rather than zeros
+    // that could be read as End-of-Options.
+    frame.extend(std::iter::repeat(1u8).take(opt_bytes));
+    frame.extend_from_slice(payload);
+    frame
+}
+
+#[test]
+fn tcp_payload_offset_skips_tcp_options_7699() {
+    // 10 dwords = 20 header + 20 option bytes. A fixed +20 implementation
+    // returns 34 here and the "payload" it copies is the OPTIONS.
+    let payload = b"PPTP-CONTROL";
+    let frame = tcp_v4_frame_with_options(10, payload);
+    let off = tcp_payload_offset(&frame).expect("a well-formed TCP frame has a payload offset");
+    assert_eq!(off, ETH_HDR_LEN + IPV4_HDR_LEN + 40);
+    assert_eq!(
+        &frame[off..],
+        payload,
+        "the offset did not skip the TCP options"
+    );
+}
+
+#[test]
+fn tcp_payload_offset_handles_the_no_options_case_7699() {
+    let payload = b"PPTP-CONTROL";
+    let frame = tcp_v4_frame_with_options(5, payload);
+    let off = tcp_payload_offset(&frame).expect("offset");
+    assert_eq!(off, ETH_HDR_LEN + IPV4_HDR_LEN + 20);
+    assert_eq!(&frame[off..], payload);
+}
+
+#[test]
+fn tcp_payload_offset_refuses_a_data_offset_past_the_bytes_present_7699() {
+    // A 5-dword header, then the declared offset is rewritten to 15 dwords (60
+    // bytes) with only 20 + 12 present. Trusting it would slice out of range,
+    // or — worse for a copy — hand back a start past the payload.
+    let mut frame = tcp_v4_frame_with_options(5, b"PPTP-CONTROL");
+    let tcp = ETH_HDR_LEN + IPV4_HDR_LEN;
+    frame[tcp + 12] = 15 << 4;
+    assert_eq!(
+        tcp_payload_offset(&frame),
+        None,
+        "a lying data offset was trusted"
+    );
+}
+
+#[test]
+fn tcp_payload_offset_refuses_a_sub_minimum_data_offset_7699() {
+    let mut frame = tcp_v4_frame_with_options(5, b"PPTP-CONTROL");
+    let tcp = ETH_HDR_LEN + IPV4_HDR_LEN;
+    frame[tcp + 12] = 4 << 4; // 16 bytes — below the 20-byte minimum header
+    assert_eq!(tcp_payload_offset(&frame), None);
+}
+
+#[test]
+fn tcp_payload_offset_refuses_a_non_tcp_frame_7699() {
+    let mut frame = tcp_v4_frame_with_options(5, b"PPTP-CONTROL");
+    frame[ETH_HDR_LEN + 9] = 17; // UDP
+    assert_eq!(tcp_payload_offset(&frame), None);
+}
