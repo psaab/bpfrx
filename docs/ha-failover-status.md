@@ -260,6 +260,36 @@ expected capability gate, not allocator exhaustion. Non-HA persistent pools
 still report live-flow, used-port, persistent-lease, allocation, reuse, and
 exhaustion counters.
 
+**The gate is now announced when it fires (#8447).** Until then it was visible
+only where someone thought to look for it — the commit SUCCEEDS, the reconcile
+that keeps forwarding disarmed short-circuits silently every second, and the
+only surface was a `show` field. What an operator saw was a total connectivity
+outage on a configuration they had just committed cleanly, with nothing in the
+journal naming NAT, the pool or the reconcile. #8447 was investigated across
+five rounds of cluster measurement — counter deltas, arm-order controls,
+log-line censuses — before the cause turned out to be this documented contract.
+`disarmBeforeUnsupportedPublishLocked` now logs at WARN, naming the reasons and
+saying that transit will STOP until the unsupported configuration is removed:
+
+```
+level=WARN msg="userspace dataplane: DISARMING forwarding — the committed
+  configuration is not supported by this dataplane, so transit will STOP until
+  the unsupported configuration is removed"
+  reason=unsupported-config
+  unsupported="userspace persistent-nat source pool leases are not HA-synchronized"
+```
+
+The gate itself is unchanged, deliberately: the boundary is correct, and what
+#8447 found was that it was silent, not that it was wrong. **It remains
+cluster-only** — a standalone node has no peer to synchronize leases with, so
+persistent-NAT there keeps forwarding, and that is pinned by
+`TestStandalonePersistentNATKeepsForwarding8447` so a later widening of the
+condition cannot turn a cluster-only gate into a standalone outage.
+
+Still missing, and worth its own change: there is no Prometheus series for
+`ForwardingSupported` / `ForwardingArmed` / the unsupported reasons, so this
+state is not alertable — only greppable.
+
 A future change that admits HA persistent-NAT must add full lease sync or
 replay, including tuple-conflict handling for live synced sessions and stale
 lease cleanup.
