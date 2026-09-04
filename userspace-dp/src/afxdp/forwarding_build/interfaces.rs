@@ -61,6 +61,96 @@ enum EgressZoneClaim {
     Conflicting,
 }
 
+/// What the LOGICAL UNIT rows on ONE ifindex say about that ifindex's zone
+/// (#7509).
+///
+/// Several configured identities land on one netdev — `snapshotLinuxName`
+/// (`pkg/dataplane/userspace/interfaces.go`) collapses a non-VLAN unit 0 onto
+/// its base, and an interface-level tunnel maps EVERY unit onto the tunnel
+/// device — so an ifindex carries at most one base row but can carry several
+/// unit rows. Of those rows only the UNIT rows are traffic identities: a packet
+/// arriving on `st0` is a packet on `st0.0`, and the base row exists to describe
+/// the interface, not to receive frames.
+///
+/// That is what recovers the AUTHORED-vs-INHERITED fact #6727 said was missing.
+/// A base row's zone can be an inheritance — `InterfaceZoneMap`
+/// (`pkg/config/host_inbound_effective_view.go`) writes `out[base]` for a
+/// unit-suffixed reference, so zoning `st0.1` zones `st0` — and the row itself
+/// cannot say which it is. Its UNIT SIBLINGS on the same ifindex can: the same
+/// map fans a BARE reference DOWN onto every configured unit, so a base whose
+/// zone was authored has unit rows carrying that same zone, while a base whose
+/// zone was inherited from a sibling on ANOTHER ifindex has unit rows that do
+/// not. Provenance is not on the row; it is in the agreement.
+///
+/// `Agreed("")` is a statement, not an absence: every unit row on the ifindex
+/// was left out of every zone, so the ifindex has no zone and no derivation may
+/// give it one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum UnitZoneClaim {
+    /// Every logical-unit row on the ifindex carried this zone name.
+    Agreed(String),
+    /// Unit rows on one ifindex carried DIFFERENT zone names.
+    Disagree,
+}
+
+/// True for a snapshot row that names a LOGICAL UNIT (`st0.0`, `reth1.0`,
+/// `ge-0/0/9.100`) rather than an interface (`st0`, `reth1`, `ge-0/0/9`).
+///
+/// Mirrors the Go builder's `egressRowIdentity.isUnit`, which is set exactly on
+/// the rows emitted from the per-unit loop and named `fmt.Sprintf("%s.%d", ...)`.
+/// A Junos interface name never contains `.` — the separator is `/` — so the
+/// numeric suffix test is a spelling of the same fact rather than a heuristic,
+/// and requiring the suffix to be digits keeps a hypothetical dotted interface
+/// name from being read as a unit.
+fn is_logical_unit_row(name: &str) -> bool {
+    match name.rsplit_once('.') {
+        Some((base, unit)) => {
+            !base.is_empty() && !unit.is_empty() && unit.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
+/// ifindex -> [`UnitZoneClaim`] for every ifindex that carries at least one
+/// logical-unit row. An ifindex absent here carries no unit row at all, and its
+/// zone is decided exactly as it was before #7509 — that absence is what keeps
+/// the #921/#3618 trunk-parent inheritance intact for a parent whose units all
+/// have netdevs of their own.
+fn unit_zone_claims(snapshot: &ConfigSnapshot) -> BTreeMap<i32, UnitZoneClaim> {
+    let mut out: BTreeMap<i32, UnitZoneClaim> = BTreeMap::new();
+    for iface in &snapshot.interfaces {
+        if iface.ifindex <= 0 || !is_logical_unit_row(&iface.name) {
+            continue;
+        }
+        match out.entry(iface.ifindex) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(UnitZoneClaim::Agreed(iface.zone.clone()));
+            }
+            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                if slot.get() != &UnitZoneClaim::Agreed(iface.zone.clone()) {
+                    slot.insert(UnitZoneClaim::Disagree);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Whether the unit rows on `ifindex` admit `zone` as that ifindex's INGRESS
+/// zone (#7509).
+///
+/// `true` when no unit row sits on the ifindex (nothing to contradict, the
+/// pre-#7509 answer stands) or when every unit row on it names exactly `zone`.
+/// `false` when the unit rows agree on a DIFFERENT zone, when they agree on NO
+/// zone, or when they disagree among themselves.
+fn unit_rows_admit(claims: &BTreeMap<i32, UnitZoneClaim>, ifindex: i32, zone: &str) -> bool {
+    match claims.get(&ifindex) {
+        None => true,
+        Some(UnitZoneClaim::Agreed(claimed)) => claimed == zone,
+        Some(UnitZoneClaim::Disagree) => false,
+    }
+}
+
 impl EgressZoneClaim {
     fn merge(&self, egress_zone: &str) -> Self {
         match self {
@@ -110,6 +200,20 @@ pub(super) fn populate_interfaces(
     let mut contested_parent_ifindexes: std::collections::BTreeSet<i32> =
         std::collections::BTreeSet::new();
     let mut contested_parent_zones: std::collections::BTreeMap<
+        i32,
+        std::collections::BTreeSet<u16>,
+    > = std::collections::BTreeMap::new();
+
+    // #7509: what the LOGICAL UNIT rows on each ifindex say about its zone,
+    // computed BEFORE the walk because the Go builder emits an interface's base
+    // row ahead of its unit rows (pinned by
+    // `TestZonedTrunkEmitsUnzonedUnit0OnTheSharedIfindex_6722`), so the base
+    // row's insert has to be able to consult a unit row it has not reached yet.
+    let unit_claims = unit_zone_claims(snapshot);
+    // #7509: ifindexes whose zone a unit row REFUSED, with the zone ids that
+    // were refused. Reported after the walk for the same reason the contest is
+    // — a silent unzoning is a blackhole with no error anywhere on the box.
+    let mut unit_refused_zones: std::collections::BTreeMap<
         i32,
         std::collections::BTreeSet<u16>,
     > = std::collections::BTreeMap::new();
@@ -247,6 +351,21 @@ pub(super) fn populate_interfaces(
             if contested_parent_ifindexes.contains(&iface.ifindex) {
                 // Already contested by an earlier row: stay unzoned. Re-inserting
                 // would make the outcome depend on walk order again.
+            } else if !unit_rows_admit(&unit_claims, iface.ifindex, &iface.zone) {
+                // #7509, the zoned-vs-UNZONED half. A BASE row's zone can be an
+                // inheritance from a unit on ANOTHER ifindex — zoning `st0.1`
+                // zones `st0` — while the unit that actually receives frames on
+                // this ifindex, `st0.0`, was deliberately left in no zone. The
+                // unit rows are the traffic identities, so they decide; the base
+                // row's derived zone does not get to overrule them.
+                //
+                // Nothing is REMOVED here: a row this predicate refuses never
+                // wrote the entry in the first place, because the same predicate
+                // refused every earlier row carrying that zone on this ifindex.
+                unit_refused_zones
+                    .entry(iface.ifindex)
+                    .or_default()
+                    .insert(row_zone_id);
             } else if let Some(existing) = state.ifindex_to_zone_id.get(&iface.ifindex).copied() {
                 if existing != row_zone_id {
                     contested_parent_ifindexes.insert(iface.ifindex);
@@ -332,7 +451,20 @@ pub(super) fn populate_interfaces(
                 // and is now denied. It worked by accident of ordering, its
                 // sibling was being misadjudicated the whole time, and both are
                 // now reported (see the warn! below).
-                if !contested_parent_ifindexes.contains(&iface.parent_ifindex) {
+                if !unit_rows_admit(&unit_claims, iface.parent_ifindex, &iface.zone) {
+                    // #7509: the parent ifindex carries a unit row of its own —
+                    // a non-VLAN unit 0 collapsed onto the base netdev — and
+                    // that unit does not name this zone. Untagged traffic on the
+                    // parent IS that unit's traffic, so a zoned child on its own
+                    // netdev may not zone it. Scoped to parents that carry a
+                    // unit row: a trunk whose units all have netdevs of their
+                    // own still inherits (#921/#3618), which is the case this
+                    // propagation exists to serve.
+                    unit_refused_zones
+                        .entry(iface.parent_ifindex)
+                        .or_default()
+                        .insert(row_zone_id);
+                } else if !contested_parent_ifindexes.contains(&iface.parent_ifindex) {
                     match state.ifindex_to_zone_id.get(&iface.parent_ifindex) {
                         Some(existing) if *existing != row_zone_id => {
                             contested_parent_ifindexes.insert(iface.parent_ifindex);
@@ -556,6 +688,33 @@ pub(super) fn populate_interfaces(
              falls to the default policy in BOTH directions (#7509). The dataplane \
              sees an ifindex, not a unit, so it cannot tell which unit a packet \
              arrived on; give the units distinct netdevs or put them in one zone.",
+            ifindex,
+            ids.join(", ")
+        );
+    }
+
+    // #7509 (zoned-vs-UNZONED): same observability requirement, different
+    // refusal. Here the rows do not disagree with each other — a BASE row
+    // carries a zone it INHERITED from a unit on another ifindex, and the unit
+    // row that actually receives frames on this ifindex names a different zone
+    // or none at all. One line per ifindex per build, naming the zone ids the
+    // unit rows refused, so an operator whose untagged trunk or unit-0 tunnel
+    // traffic starts hitting the default policy can reach the cause without
+    // reading source. The commit-time advisory
+    // (`pkg/config/contested_trunk_zone_advisory_7509.go`) is the one that can
+    // name the INTERFACE; this one is the runtime corroboration.
+    for (ifindex, zones) in &unit_refused_zones {
+        if contested_parent_zones.contains_key(ifindex) {
+            // Already reported above as a contest; do not say it twice.
+            continue;
+        }
+        let ids: Vec<String> = zones.iter().map(|z| z.to_string()).collect();
+        eprintln!(
+            "xpf-userspace-dp: WARNING ifindex {} carries a logical unit the operator \
+             left out of zone ids [{}]: that unit is what receives frames on the \
+             device, so the zone its base interface INHERITED from a sibling unit is \
+             refused and the ifindex is UNZONED (#7509). Traffic arriving on it falls \
+             to the default policy. Zone the unit explicitly if it must forward.",
             ifindex,
             ids.join(", ")
         );

@@ -82,6 +82,106 @@ func contestedTrunkZones(cfg *Config) map[string][]string {
 	return out
 }
 
+// sharedDeviceUnzonedUnits returns, per base interface, the sorted names of the
+// units that SHARE the base's kernel device and are in NO security zone, but
+// only for bases some OTHER unit of which IS zoned (#7509, the zoned-vs-UNZONED
+// half).
+//
+// The dataplane refuses to attribute a zone to a device whose logical unit was
+// left out of every zone, even when the base interface's row carries a zone —
+// because that zone was INHERITED from a sibling unit on another device
+// (`InterfaceZoneMap` fans a unit-suffixed reference UP to the base) and the
+// unit that actually receives frames on the device was never zoned. Traffic
+// arriving there falls to the default policy in both directions.
+//
+// SCOPED TO THE UNITS THAT ACTUALLY COLLAPSE, which is the difference between
+// this and a restatement of the contest above. A unit on its OWN device is
+// adjudicated per unit and is unaffected; warning about it would describe a
+// consequence that does not happen. Two units collapse onto the base device:
+//
+//   - unit 0 with no vlan-id — `snapshotLinuxName`'s non-VLAN unit-0 fold; and
+//   - every unit of an INTERFACE-level tunnel with no per-unit tunnel stanza —
+//     `TunnelNameMap` maps them all onto the tunnel device.
+//
+// Both conditions are read off the config here rather than from the snapshot
+// builder, which lives in a package that imports this one. The pairing is
+// pinned from the other side: the userspace-dp fixtures are measured against
+// the real builders in pkg/dataplane/userspace/zone_unit_provenance_7509_test.go.
+func sharedDeviceUnzonedUnits(cfg *Config) map[string][]string {
+	if cfg == nil || len(cfg.Interfaces.Interfaces) == 0 {
+		return nil
+	}
+	zoneByIface := InterfaceZoneMap(cfg)
+	if len(zoneByIface) == 0 {
+		return nil
+	}
+	var out map[string][]string
+	for name, ifc := range cfg.Interfaces.Interfaces {
+		if ifc == nil || len(ifc.Units) < 2 {
+			// One unit cannot disagree with a sibling, and a base with no units
+			// has nothing that collapses onto it.
+			continue
+		}
+		zoned, unzonedShared := false, []string(nil)
+		for num, unit := range ifc.Units {
+			if unit == nil {
+				continue
+			}
+			unitName := fmt.Sprintf("%s.%d", name, num)
+			if zoneByIface[unitName] != "" {
+				zoned = true
+				continue
+			}
+			sharesDevice := (num == 0 && unit.VlanID == 0) ||
+				(ifc.Tunnel != nil && unit.Tunnel == nil)
+			if sharesDevice {
+				unzonedShared = append(unzonedShared, unitName)
+			}
+		}
+		if !zoned || len(unzonedShared) == 0 {
+			continue
+		}
+		sort.Strings(unzonedShared)
+		if out == nil {
+			out = map[string][]string{}
+		}
+		out[name] = unzonedShared
+	}
+	return out
+}
+
+// appendSharedDeviceUnzonedUnitAdvisoryLocked adds one advisory per base whose
+// device-sharing unit is unzoned while a sibling unit is zoned.
+//
+// A WARNING, never an error, for the same reason as the contest advisory: the
+// configuration is legitimate — leaving a unit out of every zone is a statement
+// the operator is entitled to make, and this describes what the dataplane does
+// with it rather than forbidding it.
+func appendSharedDeviceUnzonedUnitAdvisoryLocked(cfg *Config, opts compileOpts) {
+	if cfg == nil || opts.suppressContestedTrunkZoneAdvisory {
+		return
+	}
+	shared := sharedDeviceUnzonedUnits(cfg)
+	if len(shared) == 0 {
+		return
+	}
+	bases := make([]string, 0, len(shared))
+	for base := range shared {
+		bases = append(bases, base)
+	}
+	sort.Strings(bases)
+	for _, base := range bases {
+		cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
+			"interface %s has unit(s) %s in no security zone sharing one kernel "+
+				"device with %s, whose other units ARE zoned: the dataplane sees the "+
+				"device, not the unit, so it declines to adjudicate that traffic under "+
+				"a sibling unit's zone and leaves it UNZONED — it falls to the default "+
+				"policy in both directions (#7509). Put those units in a zone if their "+
+				"traffic must be forwarded.",
+			base, strings.Join(shared[base], ", "), base))
+	}
+}
+
 // appendContestedTrunkZoneAdvisoryLocked adds one advisory per contested base.
 //
 // A WARNING, never an error. A mixed-zone trunk is a legitimate configuration —

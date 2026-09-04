@@ -1521,6 +1521,138 @@ pub(super) fn reused_ifindex_snapshot_6722() -> ConfigSnapshot {
     })
 }
 
+/// TWO interfaces on one RECYCLED ifindex that AGREE on a zone.
+///
+/// ```text
+/// set interfaces st0 unit 0 family inet address 10.5.5.1/30
+/// set interfaces st1 unit 0 family inet address 10.9.9.1/30
+/// set security zones security-zone vpnb interfaces st0
+/// set security zones security-zone vpnb interfaces st1        # the SAME zone
+/// ```
+///
+/// Identical to `reused_ifindex_snapshot_6722` except that `st1` is in `vpnb`
+/// rather than `vpnc`, and that one change is what makes it the LAST shape in
+/// which the two zone maps still disagree (#7509).
+///
+/// - INGRESS admits `vpnb`: every row on the ifindex names it, so neither the
+///   #8407 same-ifindex contest nor the #7509 unit-row refusal fires.
+/// - EGRESS refuses: `egressIdentitiesCohere`
+///   (`pkg/dataplane/userspace/interfaces.go`) sees TWO identities with
+///   DIFFERENT owners and no reth/member relation between them, so the device
+///   is claimed by two independent interfaces and identifies no single zone
+///   whatever the rows agree on. Agreement between two unrelated claimants is
+///   not authorisation.
+///
+/// That divergence is what `unzoned_interface_with_egress_row_stays_zone_zero_6713`
+/// binds after #7509: the trunk shape it used to use now answers 0 on BOTH
+/// halves, so it could no longer tell "the egress half read the right map" from
+/// "nothing is zoned".
+pub(super) fn reused_ifindex_agreeing_zones_snapshot_7509() -> ConfigSnapshot {
+    let mut snapshot = v5(ConfigSnapshot {
+        zones: tunnel_zones_6722(),
+        interfaces: vec![
+            lan_row_6722(),
+            InterfaceSnapshot {
+                name: "st0".to_string(),
+                zone: "vpnb".to_string(),
+                linux_name: "st0".to_string(),
+                ifindex: SHARED_TUNNEL_IFINDEX_6722,
+                mtu: 1400,
+                unit_count: 1,
+                ..Default::default()
+            },
+            tunnel_unit_row_6722(
+                "st0.0",
+                "vpnb",
+                "st0",
+                SHARED_TUNNEL_IFINDEX_6722,
+                SHARED_TUNNEL_IFINDEX_6722,
+                "10.5.5.1/30",
+            ),
+            InterfaceSnapshot {
+                name: "st1".to_string(),
+                zone: "vpnb".to_string(),
+                linux_name: "st1".to_string(),
+                ifindex: SHARED_TUNNEL_IFINDEX_6722,
+                mtu: 1400,
+                unit_count: 1,
+                ..Default::default()
+            },
+            InterfaceSnapshot {
+                name: "st1.0".to_string(),
+                zone: "vpnb".to_string(),
+                linux_name: "st1".to_string(),
+                ifindex: SHARED_TUNNEL_IFINDEX_6722,
+                mtu: 1400,
+                addresses: vec![InterfaceAddressSnapshot {
+                    family: "inet".to_string(),
+                    address: "10.9.9.1/30".to_string(),
+                    scope: 0,
+                }],
+                ..Default::default()
+            },
+        ],
+        routes: tunnel_routes_6722(),
+        default_policy: "deny".to_string(),
+        policies: tunnel_policies_6722(),
+        ..Default::default()
+    });
+    // OVERRIDE `v5`, which stamps `egress_zone` whenever an ifindex's rows are
+    // UNANIMOUS. That is a fixture convenience, not the Go rule: `stampEgressZones`
+    // refuses this ifindex outright because two INDEPENDENT interfaces claim it
+    // (`egressIdentitiesCohere`), agreement or no agreement. Measured, not assumed
+    // — `TestTwoInterfacesOnOneIfindexAgreeingOnAZoneEgressToNothing_7509`
+    // (pkg/dataplane/userspace/zone_unit_provenance_7509_test.go) compiles this
+    // exact config and pins `EgressZone == ""` on all four rows, with a
+    // single-claimant control so the empty value is not the failure default.
+    //
+    // Leaving `v5`'s stamp in place would make the fixture model a snapshot the
+    // builder never emits, and the cell it backs would then be measuring the
+    // helper rather than the dataplane.
+    for iface in &mut snapshot.interfaces {
+        if iface.ifindex == SHARED_TUNNEL_IFINDEX_6722 {
+            iface.egress_zone.clear();
+        }
+    }
+    snapshot
+}
+
+/// The #7509 REPORTED shape with the REVERSE policy present, so the ingress
+/// half's answer is observable as a permit rather than only as a precondition.
+///
+/// Same config as `sibling_tunnel_units_snapshot_6722` — `st0.1` in `vpnb`,
+/// `st0.0` deliberately in no zone, both on base ifindex 42 — plus:
+///
+/// ```text
+/// set security policies from-zone vpnb to-zone lan policy vpn-to-lan match ... then permit
+/// ```
+///
+/// That one rule is what turns the ingress attribution into a SECURITY
+/// OUTCOME instead of a map reading. A packet arriving on ifindex 42 is a
+/// packet on `st0.0`, which the operator put in no zone; if ingress attributes
+/// it to `st0.1`'s `vpnb`, the operator's `vpnb -> lan` permit — written for
+/// the tunnel unit that terminates an authorised SA — admits it. If ingress
+/// refuses, it falls to the `deny-all` default.
+///
+/// The zoned sibling `st0.1` is on its own ifindex 43 and keeps matching the
+/// same permit, which is this fixture's accept-side control: a gate that
+/// refused everything would satisfy the deny assertion and fail that one.
+pub(super) fn sibling_tunnel_units_reverse_policy_snapshot_7509() -> ConfigSnapshot {
+    let mut snapshot = sibling_tunnel_units_snapshot_6722();
+    snapshot.policies.push(PolicyRuleSnapshot {
+        name: "vpnb-to-lan".to_string(),
+        from_zone: "vpnb".to_string(),
+        to_zone: "lan".to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        application_terms: Vec::new(),
+        action: "permit".to_string(),
+        ..Default::default()
+    });
+    snapshot
+}
+
 // ---------------------------------------------------------------------------
 // #6722 B1/B2: INTERFACE-LEVEL TUNNEL shapes — several units on ONE ifindex
 // that DO get `state.egress` rows.
