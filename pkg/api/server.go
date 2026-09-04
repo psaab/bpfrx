@@ -328,6 +328,14 @@ type Config struct {
 	// Backs the xpf_scheduler_republish_failed gauge (0/1, no labels).
 	// Optional; if nil, the gauge is not emitted.
 	SchedulerRepublishFailedFn func() bool
+
+	// HelperCrashEpisodesFn returns the #8397 count of userspace-dataplane
+	// helper crash episodes this daemon has recovered from, feeding
+	// xpf_dataplane_helper_crash_episodes_total. Wired independently of the
+	// dataplane accessor chain because the metric must stay readable when the
+	// dataplane is NOT loaded -- "has this helper been crashing?" is most worth
+	// answering exactly then. nil disables the metric.
+	HelperCrashEpisodesFn func() int
 	// SchedulerRepublishStaleSecondsFn returns how long the current
 	// scheduler-republish failure streak has gone unconverged, in
 	// seconds (0 when healthy) (#3780). Backs the
@@ -505,6 +513,7 @@ type Server struct {
 	managementListenerDownFn             func() bool
 	managementListenersFn                func() sysservices.Listeners
 	schedulerRepublishFailedFn           func() bool
+	helperCrashEpisodesFn                func() int
 	schedulerRepublishStaleSecondsFn     func() float64
 	schedulerRepublishFailClosedFn       func() bool
 	ipmonStatusFn                        func() []ipmon.PolicyStatus
@@ -622,6 +631,7 @@ func NewServer(cfg Config) *Server {
 		managementListenerDownFn:             cfg.ManagementListenerDownFn,
 		managementListenersFn:                cfg.ManagementListenersFn,
 		schedulerRepublishFailedFn:           cfg.SchedulerRepublishFailedFn,
+		helperCrashEpisodesFn:                cfg.HelperCrashEpisodesFn,
 		schedulerRepublishStaleSecondsFn:     cfg.SchedulerRepublishStaleSecondsFn,
 		schedulerRepublishFailClosedFn:       cfg.SchedulerRepublishFailClosedFn,
 		ipmonStatusFn:                        cfg.IPMonStatusFn,

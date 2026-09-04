@@ -213,6 +213,29 @@ func (c *xpfCollector) initControlPlaneDescriptors() {
 			"is `show system services`, which is reached OVER the gRPC listener.",
 		[]string{"surface", "address", "state"}, nil,
 	)
+	// #8397: helper crash episodes recovered from. A COUNTER, not a gauge, and
+	// that is the whole point: `restartHelperAfterCrash` wipes the crash record
+	// on success, so every gauge-shaped view of crash state reads clean the
+	// moment the helper is healthy again. A helper that crashed four times in
+	// the last hour and is running now presents a spotless surface to every
+	// other signal here.
+	//
+	// A counter is also what crosses a DAEMON restart, which the in-process
+	// history ring deliberately does not: the ring answers "what happened" for
+	// an operator in session, the counter answers "is this recurring" for an
+	// alert over a window. `rate()` on this is the alert; the ring is the
+	// follow-up once the alert fires.
+	c.helperCrashEpisodesTotal = prometheus.NewDesc(
+		"xpf_dataplane_helper_crash_episodes_total",
+		"Total unexpected userspace-dataplane-helper exits this daemon has "+
+			"RECOVERED from (#8397). Monotonic within a daemon lifetime and "+
+			"reset by a daemon restart, like any process-scoped counter. This "+
+			"is the only crash signal that survives a successful restart: the "+
+			"helper crash record is wiped on recovery, so a recurring crasher "+
+			"is invisible to every other field once it is healthy again. "+
+			"Per-episode detail is on `show chassis forwarding`.",
+		nil, nil,
+	)
 	c.schedulerRepublishFailed = prometheus.NewDesc(
 		"xpf_scheduler_republish_failed",
 		"1 while the most recent scheduler-driven policy republish "+
