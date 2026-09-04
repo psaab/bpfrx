@@ -225,28 +225,36 @@ fn cos_scheduler_snapshot_literals_carry_an_update_tail_7689() {
 // per struct and only ever goes DOWN: a struct drifting back toward
 // `CoSSchedulerSnapshot`'s 97% reds immediately, while the existing backlog
 // stays visible and shrinkable. Same shape as #7484's coverage ratchet.
+// #8537 tightened seven of these after fixing a scan defect that counted
+// PATH-QUALIFIED TYPE POSITIONS as struct literals. ConfigSnapshot's ceiling of
+// 15 was 15 miscounts, one for one: the tree contains exactly 15
+// `-> crate::ConfigSnapshot {` return types and, measured, every qualified
+// occurrence in EXPRESSION position already carried `..Default::default()`. So
+// no real literal was lost when the number went to 0 — the ceiling had simply
+// been holding room for a miscount, which is the specific way a ratchet decays
+// into permission.
 const ADDITIVE_WIRE_EXHAUSTIVE_CEILING: &[(&str, usize)] = &[
     ("BindingCountersSnapshot", 2),
-    ("ConfigSnapshot", 15),
+    ("ConfigSnapshot", 0),
     ("DestinationNATRuleSnapshot", 3),
     ("ExceptionStatus", 1),
-    ("FabricSnapshot", 8),
+    ("FabricSnapshot", 7),
     ("FirewallTermSnapshot", 12),
     ("FlowWorkerStatus", 1),
     ("InjectPacketRequest", 1),
-    ("InterfaceSnapshot", 2),
-    ("MapPins", 2),
-    ("NAT64RuleSnapshot", 4),
+    ("InterfaceSnapshot", 0),
+    ("MapPins", 0),
+    ("NAT64RuleSnapshot", 3),
     ("NeighborSnapshot", 26),
     ("PacketResolution", 1),
     ("ProcessStatus", 1),
     ("SessionDeltaInfo", 1),
     ("SlowPathStatus", 1),
-    ("SourceNATRuleSnapshot", 1),
+    ("SourceNATRuleSnapshot", 0),
     ("SourceNatPoolStatus", 1),
     ("StaticNATRuleSnapshot", 34),
     ("ThreeColorPolicerSnapshot", 2),
-    ("ThreeColorPolicerStatus", 2),
+    ("ThreeColorPolicerStatus", 1),
     ("WgTunnelStatus", 2),
     ("WorkerRuntimeStatus", 1),
 ];
@@ -260,7 +268,47 @@ fn exhaustive_literal_count(files: &[std::path::PathBuf], name: &str) -> usize {
     let mut exhaustive = 0usize;
     for path in files {
         let raw = std::fs::read_to_string(path).expect("read source");
-        let src = blank_comments_and_strings(&raw);
+        exhaustive += exhaustive_literal_count_in_source(&raw, name);
+    }
+    exhaustive
+}
+
+/// #8537: walk backwards from `start` over any `ident::` segments and return
+/// the index where the whole PATH begins (`crate::a::Name` -> index of
+/// `crate`). `start` is returned unchanged when the name is not qualified.
+fn path_start(bytes: &[u8], start: usize) -> usize {
+    let mut at = start;
+    loop {
+        if at < 2 || bytes[at - 1] != b':' || bytes[at - 2] != b':' {
+            return at;
+        }
+        let sep = at - 2;
+        let mut i = sep;
+        while i > 0 {
+            let c = bytes[i - 1];
+            if c == b'_' || c.is_ascii_alphanumeric() {
+                i -= 1;
+            } else {
+                break;
+            }
+        }
+        if i == sep {
+            // `::` with no identifier before it (a leading `::Name`). The path
+            // begins at the separator.
+            return sep;
+        }
+        at = i;
+    }
+}
+
+/// The source-level half of the scan, split out (#8537) so both directions can
+/// be tested against a fixture instead of against the tree — a cell that can
+/// only assert "the false positive is gone" would also pass against deleting
+/// the guard.
+fn exhaustive_literal_count_in_source(raw: &str, name: &str) -> usize {
+    let mut exhaustive = 0usize;
+    {
+        let src = blank_comments_and_strings(raw);
         let mut from = 0usize;
         while let Some(hit) = src[from..].find(name) {
             let start = from + hit;
@@ -277,7 +325,20 @@ fn exhaustive_literal_count(files: &[std::path::PathBuf], name: &str) -> usize {
                 continue;
             }
             let brace = from + src[from..].find('{').expect("checked");
-            let pre = src[..start].trim_end();
+            // #8537: the arms below inspect the text immediately BEFORE the
+            // name, so a PATH-QUALIFIED occurrence used to defeat every one of
+            // them: for `-> crate::ConfigSnapshot {` the preceding text ends
+            // with `::`, not `->`, and a RETURN TYPE was counted as an
+            // exhaustive literal. The #8138 branch tripped the ratchet on a
+            // test helper that contained no literal at all.
+            //
+            // Strip the qualifier and apply the same arms to what precedes the
+            // WHOLE path. Skipping every `::`-preceded hit instead would trade
+            // this false positive for a false NEGATIVE: `crate::Name { .. }` in
+            // expression position is a real exhaustive literal and must still
+            // count.
+            let name_start = path_start(src.as_bytes(), start);
+            let pre = src[..name_start].trim_end();
             if pre.ends_with("->")
                 || pre.ends_with("struct")
                 || pre.ends_with("impl")
@@ -306,6 +367,92 @@ fn exhaustive_literal_count(files: &[std::path::PathBuf], name: &str) -> usize {
         }
     }
     exhaustive
+}
+
+/// #8537 both-directions fixture for the literal scan.
+///
+/// The bug this fixes was a FALSE POSITIVE — a path-qualified return type
+/// counted as an exhaustive struct literal. The obvious repair, "skip any hit
+/// preceded by `::`", trades it for a false NEGATIVE, because
+/// `crate::Name { .. }` in EXPRESSION position is a real exhaustive literal.
+/// So every row below pins one side or the other, and the rows are in one cell
+/// deliberately: a fix that satisfies only the false-positive rows would also
+/// satisfy deleting the guard.
+#[test]
+fn literal_scan_distinguishes_qualified_types_from_qualified_literals_8537() {
+    // (source, expected count, why)
+    let cases: &[(&str, usize, &str)] = &[
+        // --- MUST NOT COUNT: type positions, qualified and bare ---
+        ("fn f() -> Wire { Wire::default() }", 0, "bare return type"),
+        (
+            "fn f() -> crate::Wire { crate::Wire::default() }",
+            0,
+            "#8537: PATH-QUALIFIED return type — the regression this fixes",
+        ),
+        (
+            "fn f() -> crate::a::b::Wire { todo!() }",
+            0,
+            "deeply qualified return type",
+        ),
+        ("struct Wire { a: u8 }", 0, "struct definition"),
+        ("impl Wire { fn n() {} }", 0, "bare impl header"),
+        ("impl crate::Wire { fn n() {} }", 0, "qualified impl header"),
+        (
+            "impl Default for crate::Wire { fn default() -> Self { todo!() } }",
+            0,
+            "qualified trait-impl header",
+        ),
+        // --- MUST COUNT: real exhaustive literals, qualified and bare ---
+        ("let w = Wire { a: 1, b: 2 };", 1, "bare exhaustive literal"),
+        (
+            "let w = crate::Wire { a: 1, b: 2 };",
+            1,
+            "#8537 the other direction: a QUALIFIED literal is still a literal",
+        ),
+        (
+            "let w = crate::proto::Wire { a: 1 };",
+            1,
+            "deeply qualified literal",
+        ),
+        // --- MUST NOT COUNT: literals that carry the update tail ---
+        (
+            "let w = Wire { a: 1, ..Default::default() };",
+            0,
+            "bare literal with update tail",
+        ),
+        (
+            "let w = crate::Wire { a: 1, ..Default::default() };",
+            0,
+            "qualified literal with update tail",
+        ),
+        // --- whole-identifier matching must survive the change ---
+        (
+            "let w = MyWire { a: 1 };",
+            0,
+            "a longer identifier ENDING in the name is not the name",
+        ),
+    ];
+
+    for (src, want, why) in cases {
+        let got = exhaustive_literal_count_in_source(src, "Wire");
+        assert_eq!(
+            got, *want,
+            "exhaustive_literal_count_in_source({src:?}) = {got}, want {want} — {why}"
+        );
+    }
+
+    // NON-VACUITY: the scan must be capable of returning both answers, or the
+    // table above could be satisfied by a function that always returns 0.
+    assert_eq!(
+        exhaustive_literal_count_in_source("let w = Wire { a: 1 };", "Wire"),
+        1,
+        "the scan never returns a nonzero count — it cannot be measuring anything"
+    );
+    assert_eq!(
+        exhaustive_literal_count_in_source("fn f() -> crate::Wire { todo!() }", "Wire"),
+        0,
+        "the scan never returns zero — it cannot be excluding anything"
+    );
 }
 
 /// The ratchet: no struct in the additive-wire population may gain exhaustive
