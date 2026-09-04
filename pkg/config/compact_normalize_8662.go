@@ -58,7 +58,73 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 	if head == "authentication-key" {
 		return true
 	}
-	return containerKeyword == "match"
+	if containerKeyword == "match" {
+		return true
+	}
+	// #8690 family 2: the POLICY-ENFORCEMENT surface — security zones and
+	// security policies. 20 sites left the inventory and none entered it, and
+	// every one of the 20 was recorded with drop shape "empty": the
+	// measurement that no reader consumes the tail today, and therefore that
+	// truncating it takes nothing away.
+	//
+	// 20 rather than the 17 zones+policies sites the pairs were chosen for.
+	// Three came along because they share a pair: `security address-book global
+	// address-set <s> {address,address-set}` and `security pre-id-default-policy
+	// then log`. They are the same shape and the same consequence class, so they
+	// are in scope deliberately rather than tolerated — but they are named here
+	// because "the diff is bigger than the families I listed" is exactly the
+	// sentence a reviewer should be able to check.
+	//
+	// `security policies from-zone <a> <b> <c> policy` is NOT covered: its pair
+	// is `from-zone policy`, which is not listed, so the bare policy instance
+	// remains in the inventory. Left out rather than added quietly, so the
+	// inventory diff continues to equal the declared scope.
+	//
+	// The consequential members are not the descriptions:
+	//
+	//	security-zone <z> screen <profile>      the zone's IDS screen binding
+	//	security-zone <z> host-inbound-traffic  what the box itself accepts there
+	//	security-zone <z> interfaces <if> ...   per-interface admission
+	//	policy <p> then log                     session logging for the policy
+	//
+	// A brace-elided `screen` leaves the zone with no screen profile applied,
+	// on a commit that reports success — the same shape as #8689's IS-IS
+	// authentication key, one layer up.
+	//
+	// SCOPED BY (container, head) PAIR RATHER THAN BY CONTAINER KEYWORD, and
+	// the difference is load-bearing. `then` is not specific enough: the
+	// `then log` sites here are shape "empty", but
+	// `policy-options policy-statement <p> term <t> then <action>` is shape
+	// "partial" for eight actions — something DOES consume part of that tail,
+	// so truncating it could remove a value that is currently read. A
+	// containerKeyword == "then" rule would have crossed into them silently.
+	//
+	// That is why the widening rule is per SITE rather than per family: a
+	// family label is not a safety property, and this is the case that proves
+	// it. TestNormalizerScopeNeverCoversAPartialSite8690 binds it mechanically
+	// so the next widening cannot make the same mistake by inspection.
+	switch containerKeyword + " " + head {
+	case "zones security-zone",
+		"security-zone screen",
+		"security-zone description",
+		"security-zone interfaces",
+		"security-zone address-book",
+		"security-zone host-inbound-traffic",
+		"host-inbound-traffic protocols",
+		"host-inbound-traffic system-services",
+		"address-set address",
+		"address-set address-set",
+		"address-book address-set",
+		"policies default-policy-log",
+		"policies from-zone",
+		"policies global",
+		"policy description",
+		"policy then",
+		"then log",
+		"global policy":
+		return true
+	}
+	return false
 }
 
 func normalizeCompactNodes(nodes []*Node, schema *schemaNode) int {
