@@ -34,7 +34,11 @@ use super::*;
 #[allow(clippy::too_many_arguments)]
 pub(super) fn try_translate_nat64_icmp_error(
     desc: XdpDesc,
-    raw_frame: &[u8],
+    // #8271: see the note on `try_reverse_embedded_icmp_error`. This is the
+    // frame this function PARSES — the owned inner frame after native-GRE
+    // decap, matching the inner `meta`. `desc` remains the OUTER descriptor and
+    // is used only for queueing.
+    packet_frame: &[u8],
     meta: UserspaceDpMeta,
     binding_index: usize,
     sessions: &mut SessionTable,
@@ -44,7 +48,7 @@ pub(super) fn try_translate_nat64_icmp_error(
     now_secs: u64,
 ) -> EmbeddedIcmpReversal {
     let Some(nat64_match) = try_nat64_icmp_error_match_from_frame(
-        raw_frame,
+        packet_frame,
         meta,
         sessions,
         worker_ctx.forwarding,
@@ -71,7 +75,7 @@ pub(super) fn try_translate_nat64_icmp_error(
             // the session's synthetic destination (`orig_dst_v6`) — NAT64
             // prefixes here are /96-only (config gate in `from_snapshots`),
             // so the split is exact.
-            let Some(router_v4) = raw_frame.get(l3 + 12..l3 + 16) else {
+            let Some(router_v4) = packet_frame.get(l3 + 12..l3 + 16) else {
                 return EmbeddedIcmpReversal::NotHandled;
             };
             let mut src_v6_octets = [0u8; 16];
@@ -96,7 +100,7 @@ pub(super) fn try_translate_nat64_icmp_error(
                 metadata.ingress_zone,
             );
             let Some(rewritten_frame) = crate::nat64::build_nat64_v4_to_v6_icmp_error_frame(
-                raw_frame,
+                packet_frame,
                 src_v6,
                 orig_src_v6,
                 Some(orig_client_port),
@@ -140,7 +144,7 @@ pub(super) fn try_translate_nat64_icmp_error(
                 metadata.ingress_zone,
             );
             let Some(rewritten_frame) = crate::nat64::build_nat64_v6_to_v4_icmp_error_frame(
-                raw_frame,
+                packet_frame,
                 pool_v4,
                 server_v4,
                 Some(translated_port),

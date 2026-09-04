@@ -3644,3 +3644,434 @@ fn the_7359_fixture_actually_attaches_its_input_filter() {
         forwarding.filter_state.iface_filter_v4_fast.keys().collect::<Vec<_>>()
     );
 }
+
+// ---------------------------------------------------------------------------
+// #8271: two ICMP-error arms paired the DECAPPED inner meta with the
+// UN-DECAPPED outer frame.
+//
+// `poll_binding_process_descriptor` substitutes an owned, decapped inner frame
+// for the raw UMEM frame at `stage_native_gre_decap` and rebinds `meta` to
+// describe that inner packet. The NAT64 ICMP-error arm and the embedded-ICMP
+// reversal arm both CLASSIFIED on `packet_frame` (correctly, at the inner
+// `meta.l4_offset`) and then handed the helper `raw_frame` + `desc` -- the
+// still-encapsulated outer frame -- together with the INNER meta. The helper
+// then parsed outer bytes at inner offsets.
+//
+// This is the #1885/#1902 class. Two OTHER arms of the same function were fixed
+// for exactly this pairing and carry comments saying so; these two were not,
+// and they are reachable on the same input those fixes were about: a
+// GRE-decapped ICMP error.
+//
+// THE FIXTURE USES A VLAN-TAGGED UNDERLAY DELIBERATELY. #1885's experience is
+// that the failure mode is not guessable from the shape: on an UNTAGGED
+// underlay the mis-paired read lands on the outer L3 header, which has a valid
+// version nibble, so the parse can proceed and fail as a miss. The 4-byte
+// dot1q tag is what turns the same defect into a misaligned slice. A fixture
+// built on an untagged underlay would pass under the defect for the wrong
+// reason, which is why the issue asks for the tagged shape by name.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn gre_decapped_embedded_icmp_reversal_reads_the_inner_frame_8271() {
+    let router_ip = Ipv4Addr::new(10, 0, 0, 1);
+    let snat_ip = Ipv4Addr::new(172, 16, 80, 8);
+    let client_ip = Ipv4Addr::new(10, 0, 61, 102);
+    let server_ip = Ipv4Addr::new(1, 1, 1, 1);
+    let snat_port: u16 = 40000;
+    let client_port: u16 = 12345;
+
+    // The SAME ICMP error the #5690 cell drives -- outer router -> snat_ip,
+    // embedded quoted snat_ip:snat_port -> server:80 -- but carried as the GRE
+    // payload rather than presented directly. `build_icmp_te_frame_v4` returns
+    // an Ethernet frame; the GRE payload is the IP packet, so the 14-byte L2
+    // header is stripped.
+    let inner_l2 = build_icmp_te_frame_v4(router_ip, snat_ip, server_ip, snat_port, 80, PROTO_TCP);
+    let inner = inner_l2[14..].to_vec();
+    // vlan 80 = the live reth0.80 shape. See the header note on why tagged.
+    let frame = build_gre_to_self_outer_frame_v4(80, &inner);
+
+    // allow_embedded_icmp gates the poll-path reversal — enable it.
+    let mut snapshot = nat_snapshot();
+    snapshot.flow.allow_embedded_icmp = true;
+    // #8271: and a GRE tunnel terminating on this node, so the outer frame is
+    // DECAPPED before the embedded-ICMP arm classifies. Without this the frame
+    // never reaches `stage_native_gre_decap`, `packet_frame` stays equal to
+    // `raw_frame`, and the cell cannot tell the fixed code from the broken code
+    // -- which is exactly why all 5224 existing cells passed against both.
+    snapshot.interfaces.push(InterfaceSnapshot {
+        name: "gr-0/0/0.0".to_string(),
+        zone: "wan".to_string(),
+        linux_name: "gr-0-0-0".to_string(),
+        ifindex: 77,
+        tunnel: true,
+        addresses: vec![InterfaceAddressSnapshot {
+            family: "inet".to_string(),
+            address: "10.255.0.1/30".to_string(),
+            scope: 0,
+        }],
+        ..Default::default()
+    });
+    snapshot.tunnel_endpoints = vec![crate::protocol::snapshot::TunnelEndpointSnapshot {
+        id: 824,
+        interface: "gr-0/0/0.0".to_string(),
+        linux_name: "gr-0-0-0".to_string(),
+        ifindex: 77,
+        zone: "wan".to_string(),
+        mode: "gre".to_string(),
+        outer_family: "inet".to_string(),
+        source: "172.16.80.8".to_string(),
+        destination: "203.0.113.9".to_string(),
+        transport_table: "inet.0".to_string(),
+        ttl: 64,
+        ..Default::default()
+    }];
+    let forwarding = build_forwarding_state(&snapshot);
+
+    // The error ingresses on the WAN (reth0.80, ifindex 12) since it is
+    // addressed to the SNAT address; the reversal resolves egress toward the
+    // client on the LAN (reth1.0, ifindex 24), so learn the client neighbor.
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 12, 0);
+    binding.interface = Arc::<str>::from("reth0.80");
+
+    let meta_len = std::mem::size_of::<UserspaceDpMeta>();
+    let frame_offset = 128;
+    let meta_offset = frame_offset - meta_len;
+    // The shim-contract meta for the OUTER GRE frame on a TAGGED underlay:
+    // L3 at 18, protocol GRE. `stage_native_gre_decap` rebinds this to describe
+    // the inner packet; the arms under test then run on the rebound meta, which
+    // is the whole point of the issue.
+    let mut meta = gre_to_self_outer_meta(80, frame.len());
+    meta.ingress_ifindex = 12;
+    meta.config_generation = 7;
+    meta.fib_generation = 9;
+    let meta_bytes = unsafe {
+        std::slice::from_raw_parts((&meta as *const UserspaceDpMeta).cast::<u8>(), meta_len)
+    };
+    unsafe {
+        binding
+            .umem
+            .area()
+            .slice_mut_unchecked(meta_offset, meta_len)
+            .expect("meta slice")
+            .copy_from_slice(meta_bytes);
+        binding
+            .umem
+            .area()
+            .slice_mut_unchecked(frame_offset, frame.len())
+            .expect("frame slice")
+            .copy_from_slice(&frame);
+    }
+    binding.xsk.rx.push_for_test(XdpDesc {
+        addr: frame_offset as u64,
+        len: frame.len() as u32,
+        options: 0,
+    });
+
+    let ident = binding.identity();
+    let binding_lookup = WorkerBindingLookup::from_bindings(std::slice::from_ref(&binding));
+    let mirror_targets = MirrorTargetMap::default();
+    let ha_state = BTreeMap::new();
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::default());
+    // Neighbor toward the client on the LAN unit so the reversed error resolves
+    // a tx interface + MAC (egress ifindex 24).
+    learn_dynamic_neighbor(
+        &forwarding,
+        &dynamic_neighbors,
+        24,
+        0,
+        IpAddr::V4(client_ip),
+        [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+    );
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let ike_exchanges = Arc::new(crate::afxdp::forwarding::IkeExchangeTable::new());
+    let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
+    let last_resolution = Arc::new(Mutex::new(None));
+    let peer_worker_commands = Vec::new();
+    let dnat_fds = DnatTableFds::default();
+    let rg_epochs = std::array::from_fn(|_| AtomicU32::new(0));
+    let (event_handle, _event_rx) = crate::event_stream::test_worker_handle(
+        8,
+        crate::event_stream::DataplaneEventRateLimitConfig {
+            events_per_second: 0,
+            burst: 0,
+        },
+    );
+    let __pptp_control_7699 = std::sync::Arc::new(crate::session::pptp_control::PptpControlInbox::default());
+    let worker_ctx = WorkerContext {
+        pptp_control: &__pptp_control_7699,
+        ident: &ident,
+        binding_lookup: &binding_lookup,
+        mirror_targets: &mirror_targets,
+        forwarding: &forwarding,
+        ha_state: &ha_state,
+        dynamic_neighbors: &dynamic_neighbors,
+        neighbor_resolver: None,
+        shared_sessions: &shared_sessions,
+        shared_nat_sessions: &shared_nat_sessions,
+        shared_forward_wire_sessions: &shared_forward_wire_sessions,
+        shared_owner_rg_indexes: &shared_owner_rg_indexes,
+        ike_exchanges: &ike_exchanges,
+        slow_path: None,
+        event_stream: Some(&event_handle),
+        local_tunnel_deliveries: &local_tunnel_deliveries,
+        recent_exceptions: &recent_exceptions,
+        last_resolution: &last_resolution,
+        peer_worker_commands: &peer_worker_commands,
+        dnat_fds: &dnat_fds,
+        rg_epochs: &rg_epochs,
+        cold_path_sample_mask: 0xff,
+    };
+
+    // Install the forward NAT session (client:client_port -> server:80 SNAT'd
+    // to snat_ip:snat_port) so the embedded reversal can recover the client.
+    let mut sessions = SessionTable::new();
+    assert!(sessions.install_with_protocol(
+        SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(client_ip),
+            dst_ip: IpAddr::V4(server_ip),
+            src_port: client_port,
+            dst_port: 80,
+                    discriminator: Default::default(),
+                    routing_domain: 0,
+        },
+        SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 12,
+                tx_ifindex: 12,
+                tunnel_endpoint_id: 0,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 1))),
+                neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
+                src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+                tx_vlan_id: 80,
+            },
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(snat_ip)),
+                rewrite_dst: None,
+                rewrite_src_port: Some(snat_port),
+                rewrite_dst_port: None,
+                nat64: false,
+                nptv6: false,
+            },
+        },
+        SessionMetadata {
+            ingress_zone: TEST_LAN_ZONE_ID,
+            egress_zone: TEST_WAN_ZONE_ID,
+            ingress_ifindex: 0,
+            ingress_vlan_id: 0,
+            owner_rg_id: 0,
+            fabric_ingress: false,
+            is_reverse: false,
+            nat64_reverse: None,
+            log_session_init: false,
+            log_session_close: false,
+            policy_id: 0,
+            inactivity_timeout_ns: None,
+            policy_counter_idx: 0,
+            policy_counter: None,
+        },
+        123_000_000_000,
+        PROTO_TCP,
+        0x18,
+    ));
+    let sessions_before = sessions.len();
+
+    let mut screen = ScreenState::new();
+    let mut batch = BatchCounters::default();
+    let mut dbg = DebugPollCounters::default();
+    let mut telemetry = TelemetryContext {
+        dbg: &mut dbg,
+        counters: &mut batch,
+    };
+    let area_ptr = binding.umem.area() as *const MmapArea;
+
+    poll_binding_process_descriptor(
+        &mut binding,
+        0,
+        area_ptr,
+        1,
+        &mut sessions,
+        &mut screen,
+        ValidationState {
+            snapshot_installed: true,
+            config_generation: 7,
+            fib_generation: 9,
+        },
+        123_000_000_000,
+        123,
+        0,
+        0,
+        -1,
+        -1,
+        &worker_ctx,
+        &mut telemetry,
+    );
+
+    // THE LOAD-BEARING #8271 ASSERTION. Under the defect the helper receives
+    // the outer GRE frame while `meta` describes the inner packet, so the
+    // parse reads GRE/outer-IP bytes at inner offsets, finds no ICMP error it
+    // recognises, and queues nothing. RED on revert: length 0, not 1.
+    assert_eq!(
+        binding.scratch.scratch_forwards.len(),
+        1,
+        "a GRE-DECAPPED embedded-ICMP error must reverse exactly as the \
+         un-encapsulated one does. Queueing nothing means the helper parsed \
+         the un-decapped OUTER frame at the INNER meta's offsets (#8271)."
+    );
+    let fwd = &binding.scratch.scratch_forwards[0];
+    let reversed = match &fwd.frame {
+        PendingForwardFrame::Prebuilt(bytes) => bytes,
+        _ => panic!("embedded-ICMP reversal must queue a PREBUILT reversed frame"),
+    };
+    assert_eq!(
+        reversed[34], 11,
+        "the reversed frame must still be an ICMP Time Exceeded built from the \
+         INNER packet's bytes"
+    );
+    let outer_dst = Ipv4Addr::new(reversed[30], reversed[31], reversed[32], reversed[33]);
+    assert_eq!(
+        outer_dst, client_ip,
+        "outer destination must be restored from the SNAT address to the client"
+    );
+    // Embedded IP at eth(14)+outerIP(20)+ICMP(8)=42; inner src at +12 = 54.
+    let embedded_src = Ipv4Addr::new(reversed[54], reversed[55], reversed[56], reversed[57]);
+    assert_eq!(
+        embedded_src, client_ip,
+        "embedded inner source must be reverse-translated from SNAT addr to client"
+    );
+    // Inner TCP source port at 42+20 = 62 restored to the pre-NAT client port.
+    let embedded_src_port = u16::from_be_bytes([reversed[62], reversed[63]]);
+    assert_eq!(
+        embedded_src_port, client_port,
+        "embedded inner source port must be reverse-translated to the client port"
+    );
+    // #5690: the non-query error must NOT become a session/cache authority.
+    assert!(
+        fwd.flow_key.is_none(),
+        "reversed ICMP error must carry flow_key=None (never seeds a session)"
+    );
+    // Egress resolves toward the client on the LAN unit (ifindex 24).
+    assert_eq!(fwd.target_ifindex, 24, "reversed error egresses toward the client");
+    // The error is stateless: it seeds no new session and is not recycled here.
+    assert_eq!(
+        sessions.len(),
+        sessions_before,
+        "the ICMP error must not seed a new session"
+    );
+    assert!(
+        binding.scratch.scratch_recycle.is_empty(),
+        "a queued prebuilt forward owns the descriptor; no recycle"
+    );
+}
+
+
+/// #8271 arm 1: the NAT64 ICMP-error arm, GRE-decapped.
+///
+/// The sibling of `gre_decapped_embedded_icmp_reversal_reads_the_inner_frame_8271`
+/// for the OTHER arm the issue names. It is a separate cell because it is a
+/// separate defect: reverting arm 1 alone left the whole 5230-cell suite green,
+/// including that sibling. Two arms were broken; one cell proves one arm.
+///
+/// Same construction and the same reason for the tagged underlay -- see the
+/// header note above the embedded-ICMP cell.
+///
+/// Note this arm is UNGATED (`allow_embedded_icmp` is deliberately not set on
+/// the #6472 original either): it needs only a configured NAT64 prefix, so its
+/// reachability is strictly wider than arm 2's.
+#[test]
+fn gre_decapped_nat64_icmp_error_reads_the_inner_frame_8271() {
+    let router_ip = Ipv4Addr::new(172, 16, 80, 1);
+    let mut inner_l2 = build_icmp_te_frame_v4(
+        router_ip,
+        n6472_pool_v4(),
+        n6472_server_v4(),
+        N6472_XLATED_PORT,
+        N6472_SERVER_PORT,
+        PROTO_TCP,
+    );
+    n6472_patch_ptb(&mut inner_l2, 34);
+    // The GRE payload is the IP packet, so drop the 14-byte L2 header.
+    let inner = inner_l2[14..].to_vec();
+    let frame = build_gre_to_self_outer_frame_v4(80, &inner);
+
+    let mut snapshot = nat64_snapshot(lan_to_wan_permit("8.8.8.8/32", "permit-nat64-v4"));
+    // The GRE tunnel that makes `packet_frame` differ from `raw_frame`. Its
+    // source must be the outer destination the fixture frame carries
+    // (172.16.80.8) or `stage_native_gre_decap` never fires and the cell
+    // silently degrades into a duplicate of the #6472 original.
+    snapshot.interfaces.push(InterfaceSnapshot {
+        name: "gr-0/0/0.0".to_string(),
+        zone: "wan".to_string(),
+        linux_name: "gr-0-0-0".to_string(),
+        ifindex: 77,
+        tunnel: true,
+        addresses: vec![InterfaceAddressSnapshot {
+            family: "inet".to_string(),
+            address: "10.255.0.1/30".to_string(),
+            scope: 0,
+        }],
+        ..Default::default()
+    });
+    snapshot.tunnel_endpoints = vec![crate::protocol::snapshot::TunnelEndpointSnapshot {
+        id: 824,
+        interface: "gr-0/0/0.0".to_string(),
+        linux_name: "gr-0-0-0".to_string(),
+        ifindex: 77,
+        zone: "wan".to_string(),
+        mode: "gre".to_string(),
+        outer_family: "inet".to_string(),
+        source: "172.16.80.8".to_string(),
+        destination: "203.0.113.9".to_string(),
+        transport_table: "inet.0".to_string(),
+        ttl: 64,
+        ..Default::default()
+    }];
+    let forwarding = build_forwarding_state(&snapshot);
+
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 12, 0);
+    binding.interface = Arc::<str>::from("reth0.80");
+    let mut sessions = SessionTable::new();
+    n6472_install_sessions(&mut sessions, 123_000_000_000);
+
+    let mut meta = gre_to_self_outer_meta(80, frame.len());
+    meta.ingress_ifindex = 12;
+    meta.config_generation = 7;
+    meta.fib_generation = 9;
+    txn_run_descriptor(&mut binding, &mut sessions, &forwarding, &ha_state, &frame, meta);
+
+    // RED on revert: under the defect the helper parses the un-decapped outer
+    // GRE frame at the inner meta's offsets, recognises no ICMP error, and
+    // queues nothing.
+    assert_eq!(
+        binding.scratch.scratch_forwards.len(),
+        1,
+        "a GRE-DECAPPED NAT64 ICMP error must translate exactly as the \
+         un-encapsulated one does. Queueing nothing means the helper parsed \
+         the un-decapped OUTER frame at the INNER meta's offsets (#8271)."
+    );
+    let fwd = &binding.scratch.scratch_forwards[0];
+    let out = match &fwd.frame {
+        PendingForwardFrame::Prebuilt(bytes) => bytes,
+        _ => panic!("the NAT64 ICMP error translation must queue a PREBUILT frame"),
+    };
+    // The cross-family translation is the payload of the fix: these bytes can
+    // only be right if the INNER packet was the one parsed.
+    assert_eq!(&out[12..14], &[0x86, 0xdd], "translated to IPv6");
+    assert_eq!(out[14 + 6], PROTO_ICMPV6, "next header ICMPv6");
+    let icmp6 = &out[14 + 40..];
+    assert_eq!(icmp6[0], 2, "ICMPv6 Packet Too Big type");
+    let mtu = u32::from_be_bytes([icmp6[4], icmp6[5], icmp6[6], icmp6[7]]);
+    assert_eq!(
+        mtu, 1420,
+        "the PTB MTU is read out of the INNER ICMP error's own bytes, so it is \
+         wrong or absent if the outer frame was parsed"
+    );
+}

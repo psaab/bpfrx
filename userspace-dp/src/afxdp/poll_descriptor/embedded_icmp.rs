@@ -48,9 +48,17 @@ pub(super) enum EmbeddedIcmpReversal {
 /// (both checked by the caller).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn try_reverse_embedded_icmp_error(
-    area: &MmapArea,
     desc: XdpDesc,
-    raw_frame: &[u8],
+    // #8271: the frame this function PARSES. On a native-GRE-decapped packet
+    // this is the owned inner frame, NOT the raw UMEM frame `desc` points at.
+    // `meta` describes the inner packet after `stage_native_gre_decap` rebinds
+    // it, so every read here must be at inner offsets against the inner bytes.
+    // Pairing `meta` with the un-decapped outer frame is the #1885/#1902 class:
+    // two other arms of `poll_binding_process_descriptor` were fixed for it and
+    // these were not. `desc` is still the OUTER descriptor and stays that way —
+    // it is used only to queue/recycle the original UMEM frame, which is
+    // correct.
+    packet_frame: &[u8],
     meta: UserspaceDpMeta,
     binding_index: usize,
     sessions: &mut SessionTable,
@@ -62,9 +70,8 @@ pub(super) fn try_reverse_embedded_icmp_error(
     #[cfg(feature = "debug-log")]
     let icmpv6_trace = meta.protocol == PROTO_ICMPV6
         && ICMPV6_EMBED_LOGGED.fetch_add(1, Ordering::Relaxed) < 32;
-    let Some(icmp_match) = try_embedded_icmp_nat_match(
-        area,
-        desc,
+    let Some(icmp_match) = try_embedded_icmp_nat_match_from_frame(
+        packet_frame,
         meta,
         sessions,
         worker_ctx.forwarding,
@@ -123,13 +130,13 @@ pub(super) fn try_reverse_embedded_icmp_error(
         // #5690 reversal (which would leak the internal source and leave
         // the quote in pre-NAT form).
         libc::AF_INET if icmp_match.outbound_snat => {
-            build_snat_outbound_icmp_error_v4(raw_frame, meta, &icmp_match)
+            build_snat_outbound_icmp_error_v4(packet_frame, meta, &icmp_match)
         }
         libc::AF_INET6 if icmp_match.outbound_snat => {
-            build_snat_outbound_icmp_error_v6(raw_frame, meta, &icmp_match)
+            build_snat_outbound_icmp_error_v6(packet_frame, meta, &icmp_match)
         }
-        libc::AF_INET => build_nat_reversed_icmp_error_v4(raw_frame, meta, &icmp_match),
-        libc::AF_INET6 => build_nat_reversed_icmp_error_v6(raw_frame, meta, &icmp_match),
+        libc::AF_INET => build_nat_reversed_icmp_error_v4(packet_frame, meta, &icmp_match),
+        libc::AF_INET6 => build_nat_reversed_icmp_error_v6(packet_frame, meta, &icmp_match),
         _ => None,
     };
     let Some(rewritten_frame) = rewritten else {

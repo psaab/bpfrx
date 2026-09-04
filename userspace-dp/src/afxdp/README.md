@@ -594,7 +594,8 @@ sync.
     DEAD in production (an ICMP error never has a flow). The flowless `else`
     arm now calls `embedded_icmp::try_reverse_embedded_icmp_error` FIRST (before
     the #3291 L3 enforcement): it matches the quoted inner packet against the
-    forward NAT session (`try_embedded_icmp_nat_match`), reverse-translates the
+    forward NAT session (`try_embedded_icmp_nat_match_from_frame`, #8271 —
+    see below), reverse-translates the
     inner tuple + outer destination back to the pre-NAT client, classifies the
     rebuilt frame's egress CoS/output filter with `flow_key = None` (a
     synthesized L3 reply carries no trustworthy 5-tuple), and queues it as a
@@ -1016,6 +1017,29 @@ sync.
   BPF session map mirror so the CLI / GC see the same sessions.
 - `types/` — shared structs: `BindingPlan`, `BindingStatus`,
   `WorkerRuntimeAtomics`, `SharedCoSQueueLease`, `BatchCounters`, …
+
+    **#8271 — both ICMP-error arms parse the DECAPPED frame.** The NAT64
+    ICMP-error arm and the embedded-ICMP reversal arm each CLASSIFY on
+    `packet_frame` at the inner `meta.l4_offset`, and each used to hand its
+    helper `raw_frame` + `desc` — the still-encapsulated OUTER frame — with the
+    INNER `meta`. On a native-GRE-decapped packet those describe different
+    packets: `stage_native_gre_decap` rebinds `meta` to the inner frame while
+    `desc` still references the un-decapped outer one, so the helper parsed
+    outer bytes at inner offsets. This is the #1885/#1902 class; two sibling
+    arms of `poll_binding_process_descriptor` were fixed for the identical
+    pairing and carry comments saying so, and these two were not. Both helpers
+    now take the frame they PARSE (`packet_frame`) and keep `desc` only for
+    queueing the original UMEM frame, which is what `desc` is for. The
+    `(area, desc)` wrapper `try_embedded_icmp_nat_match` was DELETED rather
+    than left unused — its only behaviour was to pair whatever frame `desc`
+    pointed at with whatever `meta` it was handed, so removing it removes the
+    ability to make the mistake. Guarded by
+    `gre_decapped_embedded_icmp_reversal_reads_the_inner_frame_8271` and
+    `gre_decapped_nat64_icmp_error_reads_the_inner_frame_8271`
+    (`tests_embedded_poll_filter.rs`), both on a VLAN-TAGGED underlay: on an
+    untagged one the mis-paired read lands on a valid version nibble and fails
+    as a miss, so an untagged fixture passes under the defect for the wrong
+    reason.
 
 ## Manager-neighbor replace generation envelope (#5864 → #6034)
 
