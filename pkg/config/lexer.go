@@ -365,9 +365,59 @@ func (l *Lexer) readString(line, col int) Token {
 	return Token{Type: TokenError, Value: "unterminated string", Line: line, Column: col}
 }
 
+// readIdentifier scans one identifier token.
+//
+// #8453: a '[' or ']' reached MID-TOKEN, outside any open bracket list, is a
+// literal character of the value rather than list sugar.
+//
+// isIdentChar excludes both brackets, so before this the scanner stopped at one
+// and Next's skip loop then consumed it as a list delimiter (#2419). For a value
+// whose domain legitimately contains brackets that silently rewrote the value
+// into a different, still-valid one:
+//
+//	as-path ap1 .*65000[0-9]*   ->  stored ".*65000 0-9 *"   (a valid regex that
+//	                                 matches literal "65000 0-9", so the term
+//	                                 never fires; ValidASPathRegex compiles it)
+//	community c1 members a[b]c  ->  ["a","b","c"]            (one member became
+//	                                 three — the route-map now matches a OR b OR c)
+//
+// The quoted spelling was preserved byte-for-byte through the same path, which
+// is what made the diagnosis unambiguous.
+//
+// THE DISCRIMINATOR IS POSITION, NOT SHAPE. A Junos list opener always BEGINS a
+// token — `[ a b c ]` — so a bracket the scanner meets after already consuming a
+// character cannot be one. That is the same principle #5182's
+// tryBracketedEndpointLiteral established for `[<addr>]:port`, narrowed further:
+// that one looks FORWARD from a leading '[' and needs a ':port' suffix to stay
+// unambiguous, while this one never fires on a leading '[' at all.
+//
+// "Never fires on a leading '['" is STRUCTURAL, not a condition checked here.
+// Next's skip loop `continue`s on every '[' / ']' and breaks only on a character
+// that is neither, so by the time this function runs `l.input[l.pos]` cannot be
+// a bracket and the first iteration cannot see one. An earlier draft also tested
+// `l.pos > start` for that; a mutation deleting it survived the whole package
+// suite, because no input can distinguish it. It is gone rather than kept as
+// belt-and-braces: an unfalsifiable condition reads as a guard while binding
+// nothing, and the property it was meant to express is the skip loop's.
+//
+// GATED ON bracketDepth == 0, which is what keeps a genuine list intact. Inside
+// `[ a b ]` the depth is 1, so the closing ']' still terminates `b` and closes
+// the list; a spaceless `[a b]` likewise still yields `a`,`b`. Only a bracket met
+// outside any list changes meaning, and outside a list there is no list for it to
+// belong to.
+//
+// Deliberately NOT fixed here: a LEADING '[' — `as-path ap1 [0-9]+` — is
+// genuinely indistinguishable from a one-element list by any local rule, and
+// still requires quoting. See lexer_mid_token_bracket_8453_test.go.
 func (l *Lexer) readIdentifier(line, col int) Token {
 	start := l.pos
-	for l.pos < len(l.input) && isIdentChar(l.input[l.pos]) {
+	for l.pos < len(l.input) {
+		ch := l.input[l.pos]
+		if !isIdentChar(ch) {
+			if !(l.bracketDepth == 0 && (ch == '[' || ch == ']')) {
+				break
+			}
+		}
 		l.pos++
 		l.column++
 	}

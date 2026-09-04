@@ -113,6 +113,10 @@ test-shim-run:
 	fi; \
 	exit $$status
 
+# #8231: opt-in machine-readable side channel for the Go gate legs. Empty by
+# default, which keeps `make test-go` byte-identical to what it ran before.
+GOTESTJSON ?=
+
 test-go: test-race-dp
 	# go vet gate scoped to pkg/flowexport (#2224): catches the
 	# atomic.Uint64-copy regression class (ExportConfig embeds the live
@@ -121,7 +125,18 @@ test-go: test-race-dp
 	# package (cmd/cli protobuf MessageState copy, pkg/cli unreachable
 	# code); widen to ./... once those are resolved.
 	$(GO) vet ./pkg/flowexport/...
-	$(GO) test ./...
+	# #8231: truncate the side file ONCE per invocation, before the first leg.
+	# The legs below APPEND (test-go has two), so without this a second
+	# `make test-go GOTESTJSON=x` would attribute over the union of both runs —
+	# a stale name from the previous run reads exactly like a current failure.
+	# scripts/mutate.sh truncates per CELL for the same reason.
+	@[ -z "$(GOTESTJSON)" ] || : > "$(GOTESTJSON)"
+	# #8231: GOTESTJSON=<path> additionally APPENDS the `go test -json` event
+	# stream to that file, so the mutation driver can attribute a KILLED verdict
+	# to a NAME without bypassing this target and losing the vet and -race legs
+	# it carries. Unset (the default) execs `go test ./...` unchanged — the
+	# shared gate must not acquire a jq dependency or a new failure mode.
+	bash ./scripts/go-test-json.sh "$(GOTESTJSON)" "$(GO)" ./...
 	# #6626: pkg/refactoraudit MUST run uncached.
 	#
 	# Its hard gate (TestTouchedFileCrossedModularityThreshold) measures the
@@ -144,7 +159,7 @@ test-go: test-race-dp
 	# Deliberately NOT narrowed further with -run: a name predicate silently
 	# stops covering the next tree-reading test added here, which is the
 	# #6743 r2-N3 lesson recorded in this package's own doc.go.
-	$(GO) test -count=1 ./pkg/refactoraudit/
+	bash ./scripts/go-test-json.sh "$(GOTESTJSON)" "$(GO)" -count=1 ./pkg/refactoraudit/
 
 # #2114 scoped race gate: the dataplane-cell publication races
 # (bootstrap-exit clear vs sampler/watcher/confirm-timer readers) and the
@@ -515,6 +530,7 @@ test-deploy-lib:
 # emits no `--- FAIL` line at all), and a full disk (which reds NAMED tests).
 test-mutate-lib:
 	bash ./scripts/mutate-selftest.sh
+	bash ./scripts/go-test-json-selftest.sh
 
 # Self-test the #1875 shared-cluster lock cell (with-cluster.sh contention
 # matrix) and the #4020 destructive-smoke lock preamble (every reboot/

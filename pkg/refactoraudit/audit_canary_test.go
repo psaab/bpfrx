@@ -585,31 +585,59 @@ func TestMakefileRunsAuditPackageUncached(t *testing.T) {
 	}
 	mk := string(b)
 
-	// The invocation must exist AND carry -count=1. Matching the two together
-	// is the point: `go test ./pkg/refactoraudit/` without -count=1 is the
+	// #8231: the property, not one spelling of it.
+	//
+	// This used to pin the literal `$(GO) test -count=1 ./pkg/refactoraudit/`.
+	// That worked until the leg was routed through scripts/go-test-json.sh so
+	// the gate can emit a machine-readable stream, at which point the guard
+	// went red on a change that preserved everything it protects — a literal
+	// encodes which SPELLING is trusted rather than what must be true.
+	//
+	// The property is: inside the test-go target there is a RECIPE line naming
+	// this package, and that same line carries -count=1. Matching the two
+	// TOGETHER is still the point: an invocation without -count=1 is the
 	// cached-pass bug wearing the shape of a fix.
-	want := "$(GO) test -count=1 ./pkg/refactoraudit/"
-	if !strings.Contains(mk, want) {
-		t.Fatalf("#6626: the Makefile must run this package UNCACHED — expected a line "+
-			"containing %q in the test-go target.\n\nWithout it, a real threshold crossing "+
-			"returns \"ok (cached)\" on the path CI and developers actually take, so the "+
-			"modularity gate passes without ever running. Every test in this package stays "+
-			"green in that state, which is exactly why this has to be checked here.", want)
-	}
-
-	// And it must be reachable from test-go, not stranded in some unused target.
+	//
+	// Strictly stronger than the literal it replaces, which could be satisfied
+	// by the string appearing anywhere in the Makefile — including in a comment
+	// or in a target nothing runs.
 	idx := strings.Index(mk, "test-go:")
 	if idx < 0 {
 		t.Fatal("#6626: no test-go target found in the Makefile — this guard is bound to it " +
 			"by name and must be re-pointed if the target is renamed")
 	}
-	rest := mk[idx:]
-	if end := strings.Index(rest, "\n\n"); end > 0 {
-		rest = rest[:end]
+	body := mk[idx:]
+	if e := strings.Index(body, "\n\n"); e > 0 {
+		body = body[:e]
 	}
-	if !strings.Contains(rest, want) {
-		t.Errorf("#6626: the uncached pkg/refactoraudit invocation exists but is NOT inside the "+
-			"test-go target, so `make test-go` — the path CI and developers take — would still "+
-			"serve this package from cache.\n\ntest-go target body:\n%s", rest)
+
+	var found, uncached bool
+	for _, line := range strings.Split(body, "\n") {
+		// Recipe lines only: a comment mentioning the package proves nothing,
+		// and the literal check this replaces could be satisfied by one.
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if !strings.Contains(line, "./pkg/refactoraudit/") {
+			continue
+		}
+		found = true
+		if strings.Contains(line, "-count=1") {
+			uncached = true
+		}
+	}
+
+	if !found {
+		t.Fatalf("#6626: the test-go target has no recipe line naming ./pkg/refactoraudit/.\n\n"+
+			"Without one, a real threshold crossing returns \"ok (cached)\" on the path CI and "+
+			"developers actually take, so the modularity gate passes without ever running. Every "+
+			"test in this package stays green in that state, which is exactly why this has to be "+
+			"checked here.\n\ntest-go target body:\n%s", body)
+	}
+	if !uncached {
+		t.Fatalf("#6626: the test-go target runs ./pkg/refactoraudit/ but WITHOUT -count=1, which "+
+			"is the cached-pass bug wearing the shape of a fix: the invocation exists, the target "+
+			"looks correct, and the gate is served from cache.\n\ntest-go target body:\n%s", body)
 	}
 }
