@@ -468,6 +468,14 @@ func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventB
 		ProxyARPUnresolvedFn:     d.ProxyARPUnresolved,
 		FabricOverlayMissingFn:   d.FabricOverlayMissing,
 		ManagementListenerDownFn: d.ManagementListenerDown,
+		// #8195: the SAME snapshot `show system services` renders, deliberately
+		// — the metric and the CLI must not be able to disagree about a
+		// listener's state. It also carries the gRPC leg, which
+		// ManagementListenerDownFn above cannot: that reads the HTTP listener
+		// only, and the gRPC listener's failure is the one an operator cannot
+		// observe by other means, because `show system services` is reached
+		// OVER it.
+		ManagementListenersFn: d.effectiveListeners,
 		// #3780: surface scheduler republish-failure so
 		// xpf_scheduler_republish_failed reads 1 (and
 		// xpf_scheduler_republish_stale_seconds climbs) while a
