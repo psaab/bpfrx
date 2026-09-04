@@ -211,6 +211,25 @@ impl super::Coordinator {
         crate::afxdp::shared_ops::SHARED_SESSION_PUBLISH_LOCK_CONTENDED.load(Ordering::Relaxed)
     }
 
+    /// #8486: owner-RG index filings declined because the peer-supplied
+    /// `owner_rg_id` was outside the 0..15 range the Go strict validator
+    /// enforces.
+    ///
+    /// Exposed rather than left as an internal counter, because an internal
+    /// counter nothing reads is a claim written into inert code: it would
+    /// record the decline and no operator would ever see one. Nonzero here
+    /// means a peer is sending redundancy-group ids this cluster's own strict
+    /// path would reject — a config skew worth investigating, and the only
+    /// externally visible sign that the bound is doing anything.
+    ///
+    /// Counts ONLY out-of-range ids. The ordinary "no redundancy group" case
+    /// (id 0, which every standalone session carries) is not a decline and is
+    /// not counted; counting it would make this read as an attack on every
+    /// non-clustered box and bury the signal.
+    pub fn owner_rg_filings_declined_total(&self) -> u64 {
+        crate::afxdp::shared_ops::OWNER_RG_FILINGS_DECLINED.load(Ordering::Relaxed)
+    }
+
     pub fn session_replication_upserts_total(&self) -> u64 {
         crate::afxdp::session_glue::SESSION_REPLICATION_UPSERTS.load(Ordering::Relaxed)
     }

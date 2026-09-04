@@ -239,6 +239,7 @@ pub(crate) fn run() -> Result<(), String> {
             session_publish_errors_total: 0,
             // #4800 new-flow-install contention surface.
             shared_session_publishes_total: 0,
+            owner_rg_filings_declined_total: 0,
             shared_session_publish_lock_acquisitions_total: 0,
             shared_session_publish_lock_contended_total: 0,
             session_replication_upserts_total: 0,
