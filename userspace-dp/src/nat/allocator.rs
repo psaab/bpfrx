@@ -226,8 +226,16 @@ pub(crate) struct ReseedOutcome {
     pub(crate) reseeded: usize,
     /// Skipped: the port falls outside the NEW port range (range narrowed).
     pub(crate) skipped_out_of_range: usize,
-    /// Skipped: an address-only (`port no-translation`) token, which holds no
-    /// port bit and is outside the port-reissue defect.
+    /// An address-only (`port no-translation`) token that could NOT be
+    /// carried — the new allocator already owns that reverse identity.
+    ///
+    /// #8597 K11 narrowed this from "deliberately skipped". The old reading was
+    /// true about PORTS (the record holds no bit, so it is outside the
+    /// port-reissue defect) and did not cover what the record DOES hold: the
+    /// `address_only_owners` entry that denies a second flow the same public
+    /// reverse identity. Dropping it downgraded a fail-closed guard on an
+    /// ordinary pool edit, so the pass now carries it and this counts the
+    /// residual refusals.
     pub(crate) skipped_address_only: usize,
     /// `reserve_flow` refused — the tuple is already owned in the new
     /// allocator. Expected to be zero on a freshly built allocator.
@@ -2017,7 +2025,24 @@ impl PortAllocator {
         let mut expired = None;
         let mut remove_expiry = None;
         if let Some(lease) = live.persistent_by_source.get_mut(&key) {
-            if lease.active_flows > 0 || lease.expires_at_ns > now_ns {
+            // #8597 K10: the lease's MODE must agree with this path's, and this
+            // is the port-bearing one. An ADDRESS-ONLY lease owns no occupancy
+            // bit — that is the whole difference between the modes — so reusing
+            // it here would publish a PAT decision `(A, S)` with NO bit held,
+            // and a later flow could then claim `(A, S)` through `claim()`.
+            // Two live flows on one translated identity is the duplicate this
+            // allocator exists to prevent.
+            //
+            // The mode can change under a live lease by ordinary operator
+            // action: `allocator_key()` is built from the pool name, addresses
+            // and range and does NOT include `no_translation`, so flipping that
+            // leaf keeps the SAME allocator and carries the leases across.
+            //
+            // A disagreeing lease falls to the `expired` arm below, which
+            // already receives `lease.address_only` and tears it down
+            // mode-correctly. It is not silently ignored and it is not freed by
+            // the wrong path.
+            if !lease.address_only && (lease.active_flows > 0 || lease.expires_at_ns > now_ns) {
                 let translated = lease.translated;
                 let addr_index = lease.addr_index;
                 if lease.active_flows == 0 {
@@ -2756,7 +2781,52 @@ impl PortAllocator {
                 continue;
             };
             if alloc.address_only {
-                out.skipped_address_only += 1;
+                // #8597 K11: CARRY the reverse-identity token instead of
+                // dropping it.
+                //
+                // The record holds no port bit, which is why the port-reissue
+                // work skipped it — that reasoning is sound and is about PORTS.
+                // What it does not cover is what an address-only record DOES
+                // hold: an `address_only_owners` entry, the #5269 guard that
+                // denies a second flow the same public reverse identity.
+                // Dropping it left the carried session forwarding with that
+                // guard silently gone, so a colliding arrival was ADMITTED
+                // instead of refused as exhaustion — a fail-closed protection
+                // downgraded by an ordinary pool edit.
+                //
+                // Holders are preserved the same way the port-bearing carry
+                // below preserves them: an HA-synced flow is reserved once per
+                // WORKER (#6211 F2), and re-seeding with a single untracked
+                // holder would let the first release drop a token the other
+                // N-1 still forward through.
+                let mut carried_ok = false;
+                if alloc.holders == 0 {
+                    carried_ok = self
+                        .reserve_address_only(flow, alloc.translated.ip, NatHolder::Untracked)
+                        .is_ok();
+                } else {
+                    for worker in 0..MAX_NAT_HOLDER_WORKERS {
+                        if alloc.holders & (1u128 << worker) == 0 {
+                            continue;
+                        }
+                        carried_ok |= self
+                            .reserve_address_only(
+                                flow,
+                                alloc.translated.ip,
+                                NatHolder::Worker(worker),
+                            )
+                            .is_ok();
+                    }
+                }
+                if carried_ok {
+                    out.reseeded += 1;
+                } else {
+                    // Still counted, and the field keeps its place in the
+                    // report — its MEANING narrows from "deliberately skipped"
+                    // to "could not be carried", which is the honest reading
+                    // once carrying is attempted.
+                    out.skipped_address_only += 1;
+                }
                 continue;
             }
             if !self.port_in_range(new_index, alloc.translated.port) {
@@ -3164,11 +3234,35 @@ impl PortAllocator {
         // ADDRESS-ONLY (#5338) token is fanned out, and where an already-holding
         // worker lands on every refresh — so record the holder here, exactly as
         // `reserve_flow` does on its own early return.
-        if let Some(existing) = live.live_by_flow.get_mut(&flow) {
-            existing.holders |= holder.bit();
-            let translated = existing.translated;
-            self.shared.reuses_total.fetch_add(1, Ordering::Relaxed);
-            return Ok(translated);
+        if let Some(existing) = live.live_by_flow.get(&flow).copied() {
+            if existing.translated == translated {
+                if let Some(slot) = live.live_by_flow.get_mut(&flow) {
+                    slot.holders |= holder.bit();
+                }
+                self.shared.reuses_total.fetch_add(1, Ordering::Relaxed);
+                return Ok(existing.translated);
+            }
+            // #8597 K63: the incumbent record names a DIFFERENT reverse identity
+            // than the one this reservation asks for. The port-bearing arm has
+            // retired such an incumbent since #6528; this arm did not, and
+            // returned `existing.translated` without ever comparing it — so the
+            // caller was handed a tuple it did not ask for and never learned.
+            //
+            // On a SYNCED reservation the peer's tuple is authoritative: a
+            // disagreeing local record means this node holds a different public
+            // reverse identity than the peer's session actually uses, so replies
+            // land on the wrong flow or are denied — the same misdelivery class
+            // as the sibling findings in this batch, not a bookkeeping nit.
+            //
+            // Retired through the SAME mode-correct teardown the port-bearing
+            // arm uses. It is already right for this mode:
+            // `unlink_live_allocation_locked` clears the `address_only_owners`
+            // token (without which the OLD public identity stays denied
+            // forever) and skips `free_translated_port`, because an address-only
+            // record owns no occupancy bit — freeing one would clear a live PAT
+            // flow's bit at the offset of this flow's preserved source port.
+            self.unlink_live_allocation_locked(&mut live, &flow, existing);
+            Self::complete_persistent_lease_locked(&mut live, existing, now_ns);
         }
         // Collision: the reverse identity is already owned by a DIFFERENT flow.
         // Two flows sharing one public reverse tuple cannot coexist (their
@@ -3764,7 +3858,13 @@ impl PortAllocator {
         let mut reuse_addr: Option<(IpAddr, usize)> = None;
         let mut expired: Option<(usize, u64)> = None;
         if let Some(lease) = live.persistent_by_source.get(&key).copied() {
-            if lease.active_flows > 0 || lease.expires_at_ns > now_ns {
+            // #8597 K10, the mirror of the port-bearing gate: this is the
+            // ADDRESS-ONLY path, so a PAT lease must not be reused here either.
+            // A PAT lease's port belongs to the lease, and adopting its pinned
+            // address for an address-only flow would leave the two modes'
+            // bookkeeping disagreeing about who owns the identity. Falls to the
+            // expired arm, which tears down mode-correctly.
+            if lease.address_only && (lease.active_flows > 0 || lease.expires_at_ns > now_ns) {
                 reuse_addr = Some((lease.translated.ip, lease.addr_index));
             } else {
                 expired = Some((lease.addr_index, lease.expires_at_ns));
