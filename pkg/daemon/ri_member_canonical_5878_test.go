@@ -23,25 +23,25 @@ func TestRIMemberLinuxNameCanonicalizesUnitAlias5878(t *testing.T) {
 
 	// Tunnel path (tunMap hit): `.01` and `.1` resolve to the SAME per-unit
 	// device via the canonical key.
-	if got := riMemberLinuxName(tunMap, "gr-0/0/0.01"); got != "gr-0-0-0u1" {
+	if got := riMemberLinuxName(nil, tunMap, "gr-0/0/0.01"); got != "gr-0-0-0u1" {
 		t.Errorf("riMemberLinuxName(.01, tunnel) = %q, want gr-0-0-0u1 (canonical .1 device)", got)
 	}
-	if a, b := riMemberLinuxName(tunMap, "gr-0/0/0.01"), riMemberLinuxName(tunMap, "gr-0/0/0.1"); a != b {
+	if a, b := riMemberLinuxName(nil, tunMap, "gr-0/0/0.01"), riMemberLinuxName(nil, tunMap, "gr-0/0/0.1"); a != b {
 		t.Errorf("tunnel path: .01 -> %q, .1 -> %q — must be identical", a, b)
 	}
 
 	// Non-tunnel path (LinuxIfName): `.01` resolves to the canonical
 	// "ge-0-0-0.1", NOT the raw "ge-0-0-0.01".
-	if got := riMemberLinuxName(nil, "ge-0/0/0.01"); got != "ge-0-0-0.1" {
+	if got := riMemberLinuxName(nil, nil, "ge-0/0/0.01"); got != "ge-0-0-0.1" {
 		t.Errorf("riMemberLinuxName(.01, non-tunnel) = %q, want ge-0-0-0.1", got)
 	}
-	if a, b := riMemberLinuxName(nil, "ge-0/0/0.01"), riMemberLinuxName(nil, "ge-0/0/0.1"); a != b {
+	if a, b := riMemberLinuxName(nil, nil, "ge-0/0/0.01"), riMemberLinuxName(nil, nil, "ge-0/0/0.1"); a != b {
 		t.Errorf("non-tunnel path: .01 -> %q, .1 -> %q — must be identical", a, b)
 	}
 
 	// A leading-zero unit 0 alias (`.00`) collapses to the base device, same as
 	// the canonical `.0` unit-0 collapse.
-	if got := riMemberLinuxName(nil, "ge-0/0/1.00"); got != "ge-0-0-1" {
+	if got := riMemberLinuxName(nil, nil, "ge-0/0/1.00"); got != "ge-0-0-1" {
 		t.Errorf("riMemberLinuxName(.00, non-tunnel) = %q, want ge-0-0-1 (unit-0 collapse)", got)
 	}
 
@@ -52,7 +52,7 @@ func TestRIMemberLinuxNameCanonicalizesUnitAlias5878(t *testing.T) {
 		"ge-0/0/1.5": "ge-0-0-1.5", // non-tunnel unit>0 canonical
 	}
 	for in, want := range noRegression {
-		if got := riMemberLinuxName(nil, in); got != want {
+		if got := riMemberLinuxName(nil, nil, in); got != want {
 			t.Errorf("riMemberLinuxName(%q) = %q, want %q (no regression)", in, got, want)
 		}
 	}
