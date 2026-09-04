@@ -12,29 +12,50 @@
 #
 # `xpfarg` / `xpfname` are synthesized instance names.
 #
-# checked: 547
+# NOTES (edit these in compact_block_inventory_regen_2419_test.go, not in the
+# generated file — the generator rewrites the header and would drop them).
 #
 # #6940 raised the checked count 546 -> 547 and added
-# `interfaces xpfname aggregated-ether-options minimum-links`. That site is NOT
-# a new compiler defect — it is a pre-existing compact-blind reader that this
-# census could not SEE until #6940 landed.
+# `interfaces xpfname aggregated-ether-options minimum-links`. That site
+# is NOT a new compiler defect — it is a pre-existing compact-blind reader that
+# this census could not SEE until #6940 landed.
 #
 # Before #6940 the leaf carried no valueType or valueExamples, so the census
 # synthesised the generic pair "xpfaaa"/"xpfbbb"; the compiler parsed both with
-# `x, _ = strconv.Atoi(v)`, whose discarded error made BOTH compile to 0. The
-# value therefore did not change the compiled config, the vacuity guard fired,
-# and the cell was recorded "skipped: leaf value not observable" — measured
-# both ways. Giving the leaf a validator and integer examples made the two
-# probe values observable, and the compact spelling is genuinely blind.
+# `x, _ = strconv.Atoi(v)`, whose discarded error made BOTH compile to 0.
+# The value therefore did not change the compiled config, the vacuity guard
+# fired, and the cell was recorded "skipped: leaf value not observable" —
+# measured both ways. Giving the leaf a validator and integer examples made the
+# two probe values observable, and the compact spelling is genuinely blind.
 #
 # So one defect was masking another: a blind-spot count that RISES after a fix
 # is the fix working. Fixing the compact reader is #2419's job, not #6940's.
 #
-# skipped (leaf value not observable in the typed config): 204
-# skipped (a spelling did not parse or compile): 37
-# skipped (no two distinct synthesizable values): 12
-# skipped (under groups (schema re-host, duplicate coverage)): 642
+# #8662 raised the checked count 547 -> 654 and added 97 sites, removing NONE.
+# The census predicate required the folded token to declare no children, which
+# excluded an entire class SILENTLY — those sites appeared in no skip bucket, so
+# the "the census is a FLOOR" note did not account for them. Declaring children
+# for `?` completion says nothing about whether the compiler reads a folded
+# tail, so the predicate was excluding sites for a reason unrelated to the
+# property being measured. Both of #8662's hand-verified members sat in it;
+# `class-of-service schedulers xpfarg transmit-rate` is now tracked here.
 #
+# STILL NOT COVERED, and deliberately so: a container whose instance is named by
+# a WILDCARD rather than by an arg. `security zones security-zone <z> interfaces <if>`
+# is the verified example — braced it compiles to [ge-0/0/0.0], elided to [],
+# and the elided form walks past the strict gate that rejects the braced one for
+# an undefined interface. This census's site model assumes the instance name is
+# an `args` token, so covering that shape is a model change rather than a
+# predicate relaxation, and it is left to a follow-up rather than bolted on.
+#
+# checked: 654
+#
+# skipped (leaf value not observable in the typed config): 252
+# skipped (a spelling did not parse or compile): 44
+# skipped (no two distinct synthesizable values): 17
+# skipped (under groups (schema re-host, duplicate coverage)): 797
+#
+applications application
 applications application xpfarg alg
 applications application xpfarg description
 applications application xpfarg destination-port
@@ -48,7 +69,9 @@ applications application xpfarg timeout
 applications application-set
 bridge-domains xpfname domain-type
 bridge-domains xpfname routing-interface
+chassis device-map interface
 chassis device-map unmapped-interface-policy
+class-of-service classifiers inet-precedence
 class-of-service interfaces xpfarg classifiers dscp
 class-of-service interfaces xpfarg classifiers ieee-802.1
 class-of-service interfaces xpfarg output-traffic-control-profile
@@ -57,23 +80,44 @@ class-of-service interfaces xpfarg rewrite-rules dscp
 class-of-service interfaces xpfarg rewrite-rules ieee-802.1
 class-of-service interfaces xpfarg scheduler-map
 class-of-service interfaces xpfarg shaping-rate xpfarg burst-size
+class-of-service rewrite-rules exp
+class-of-service rewrite-rules inet-precedence
+class-of-service scheduler-maps
+class-of-service scheduler-maps xpfarg forwarding-class
+class-of-service schedulers
+class-of-service schedulers xpfarg buffer-size
 class-of-service schedulers xpfarg codel-target
 class-of-service schedulers xpfarg equal-flow-target-policy
 class-of-service schedulers xpfarg priority
+class-of-service schedulers xpfarg transmit-rate
+class-of-service traffic-control-profiles
 class-of-service traffic-control-profiles xpfarg delay-buffer-rate
 class-of-service traffic-control-profiles xpfarg guaranteed-rate
 class-of-service traffic-control-profiles xpfarg scheduler-map
 class-of-service traffic-control-profiles xpfarg shaping-rate
+event-options policy
+firewall family inet filter
+firewall family inet filter xpfarg term
+firewall family inet filter xpfarg term xpfarg from flexible-match-range range
+firewall family inet6 filter
+firewall family inet6 filter xpfarg term
+firewall family inet6 filter xpfarg term xpfarg from flexible-match-range range
+firewall policer
 firewall policer xpfarg if-exceeding bandwidth-limit
 firewall policer xpfarg if-exceeding burst-size-limit
 firewall policer xpfarg then loss-priority
+forwarding-options dhcp-relay group
 forwarding-options dhcp-relay server-group
 forwarding-options family inet6 mode
+forwarding-options port-mirroring instance
+forwarding-options sampling instance
+forwarding-options sampling instance xpfarg family inet output flow-server
 forwarding-options sampling instance xpfarg family inet output flow-server xpfarg port
 forwarding-options sampling instance xpfarg family inet output flow-server xpfarg source-address
 forwarding-options sampling instance xpfarg family inet output flow-server xpfarg version-ipfix-template
 forwarding-options sampling instance xpfarg family inet output flow-server xpfarg version9-template
 forwarding-options sampling instance xpfarg family inet output source-address
+forwarding-options sampling instance xpfarg family inet6 output flow-server
 forwarding-options sampling instance xpfarg family inet6 output flow-server xpfarg port
 forwarding-options sampling instance xpfarg family inet6 output flow-server xpfarg source-address
 forwarding-options sampling instance xpfarg family inet6 output flow-server xpfarg version-ipfix-template
@@ -98,12 +142,16 @@ interfaces xpfname tunnel routing-instance destination
 interfaces xpfname tunnel source
 interfaces xpfname tunnel ttl
 interfaces xpfname tunnel wireguard listen-port
+interfaces xpfname tunnel wireguard peer
 interfaces xpfname tunnel wireguard peer xpfarg allowed-ips
 interfaces xpfname tunnel wireguard peer xpfarg endpoint
 interfaces xpfname tunnel wireguard peer xpfarg persistent-keepalive
 interfaces xpfname tunnel wireguard peer xpfarg preshared-key
 interfaces xpfname tunnel wireguard private-key
+policy-options community
 policy-options community xpfarg members
+policy-options policy-statement
+policy-options policy-statement xpfarg term
 policy-options policy-statement xpfarg term xpfarg from as-path
 policy-options policy-statement xpfarg term xpfarg from community
 policy-options policy-statement xpfarg term xpfarg from prefix-list
@@ -119,6 +167,7 @@ policy-options policy-statement xpfarg term xpfarg then origin
 policy-options prefix-list
 protocols bgp cluster-id
 protocols bgp export
+protocols bgp group xpfarg neighbor
 protocols bgp group xpfarg neighbor xpfarg authentication-key
 protocols bgp group xpfarg neighbor xpfarg description
 protocols bgp group xpfarg neighbor xpfarg export
@@ -133,6 +182,7 @@ protocols bgp router-id
 protocols isis authentication-key
 protocols isis authentication-type
 protocols isis export
+protocols isis interface
 protocols isis interface xpfarg authentication-key
 protocols isis interface xpfarg authentication-type
 protocols isis interface xpfarg level
@@ -140,11 +190,17 @@ protocols isis is-type
 protocols isis level
 protocols isis net
 protocols lldp hold-multiplier
+protocols lldp interface
 protocols lldp transmit-interval
+protocols ospf area
+protocols ospf area xpfarg interface
 protocols ospf area xpfarg interface xpfarg authentication md5 xpfarg key
+protocols ospf area xpfarg virtual-link
 protocols ospf area xpfarg virtual-link xpfarg transit-area
 protocols ospf export
 protocols ospf router-id
+protocols ospf3 area
+protocols ospf3 area xpfarg interface
 protocols ospf3 export
 protocols ospf3 router-id
 protocols rip authentication-key
@@ -152,26 +208,40 @@ protocols rip authentication-type
 protocols rip neighbor
 protocols rip passive-interface
 protocols rip redistribute
+protocols router-advertisement interface
 protocols router-advertisement interface xpfarg default-lifetime
 protocols router-advertisement interface xpfarg dns-server-address
 protocols router-advertisement interface xpfarg link-mtu
 protocols router-advertisement interface xpfarg max-advertisement-interval
 protocols router-advertisement interface xpfarg min-advertisement-interval
+protocols router-advertisement interface xpfarg nat-prefix
+protocols router-advertisement interface xpfarg nat64prefix
 protocols router-advertisement interface xpfarg preference
+protocols router-advertisement interface xpfarg prefix
 routing-instances xpfname protocols isis authentication-key
 routing-instances xpfname protocols isis authentication-type
 routing-instances xpfname protocols isis export
+routing-instances xpfname protocols isis interface
 routing-instances xpfname protocols isis interface xpfarg authentication-key
 routing-instances xpfname protocols isis interface xpfarg authentication-type
 routing-instances xpfname protocols isis interface xpfarg level
 routing-instances xpfname protocols isis is-type
 routing-instances xpfname protocols isis level
 routing-instances xpfname protocols isis net
+routing-instances xpfname protocols ospf area
+routing-instances xpfname protocols ospf area xpfarg interface
+routing-instances xpfname protocols ospf area xpfarg virtual-link
 routing-instances xpfname protocols ospf area xpfarg virtual-link xpfarg transit-area
+routing-instances xpfname protocols ospf3 area
+routing-instances xpfname protocols ospf3 area xpfarg interface
 routing-instances xpfname protocols ospf3 export
 routing-instances xpfname protocols ospf3 router-id
+routing-instances xpfname routing-options static route
 routing-options autonomous-system
 routing-options forwarding-table export
+routing-options generate route
+routing-options static route
+schedulers scheduler
 schedulers scheduler xpfarg daily start-time
 schedulers scheduler xpfarg daily stop-time
 schedulers scheduler xpfarg friday start-time
@@ -190,9 +260,13 @@ schedulers scheduler xpfarg tuesday start-time
 schedulers scheduler xpfarg tuesday stop-time
 schedulers scheduler xpfarg wednesday start-time
 schedulers scheduler xpfarg wednesday stop-time
+security address-book global address-set
 security address-book global address-set xpfarg address
 security address-book global address-set xpfarg address-set
+security dynamic-address address-name
 security dynamic-address address-name xpfarg profile feed-name
+security dynamic-address feed-server
+security dynamic-address feed-server xpfarg feed-name
 security dynamic-address feed-server xpfarg feed-name xpfarg path
 security dynamic-address feed-server xpfarg hold-interval
 security dynamic-address feed-server xpfarg hostname
@@ -210,10 +284,12 @@ security flow tcp-session initial-timeout
 security flow tcp-session time-wait-timeout
 security flow traceoptions file
 security flow traceoptions flag
+security flow traceoptions packet-filter
 security flow traceoptions packet-filter xpfarg destination-prefix
 security flow traceoptions packet-filter xpfarg protocol
 security flow traceoptions packet-filter xpfarg source-prefix
 security flow udp-session timeout
+security ike gateway
 security ike gateway xpfarg address
 security ike gateway xpfarg external-interface
 security ike gateway xpfarg ike-policy
@@ -221,14 +297,17 @@ security ike gateway xpfarg local-address
 security ike gateway xpfarg local-certificate
 security ike gateway xpfarg nat-traversal
 security ike gateway xpfarg version
+security ike policy
 security ike policy xpfarg mode
 security ike policy xpfarg proposal-set
 security ike policy xpfarg proposals
+security ike proposal
 security ike proposal xpfarg authentication-algorithm
 security ike proposal xpfarg authentication-method
 security ike proposal xpfarg dh-group
 security ike proposal xpfarg encryption-algorithm
 security ike proposal xpfarg lifetime-seconds
+security ipsec gateway
 security ipsec gateway xpfarg address
 security ipsec gateway xpfarg external-interface
 security ipsec gateway xpfarg ike-policy
@@ -236,14 +315,17 @@ security ipsec gateway xpfarg local-address
 security ipsec gateway xpfarg local-certificate
 security ipsec gateway xpfarg nat-traversal
 security ipsec gateway xpfarg version
+security ipsec policy
 security ipsec policy xpfarg proposal-set
 security ipsec policy xpfarg proposals
+security ipsec proposal
 security ipsec proposal xpfarg authentication-algorithm
 security ipsec proposal xpfarg dh-group
 security ipsec proposal xpfarg encryption-algorithm
 security ipsec proposal xpfarg lifetime-kilobytes
 security ipsec proposal xpfarg lifetime-seconds
 security ipsec proposal xpfarg protocol
+security ipsec vpn
 security ipsec vpn xpfarg bind-interface
 security ipsec vpn xpfarg df-bit
 security ipsec vpn xpfarg establish-tunnels
@@ -253,16 +335,20 @@ security ipsec vpn xpfarg local-address
 security ipsec vpn xpfarg local-identity
 security ipsec vpn xpfarg pre-shared-key
 security ipsec vpn xpfarg remote-identity
+security ipsec vpn xpfarg traffic-selector
 security ipsec vpn xpfarg traffic-selector xpfarg local-ip
 security ipsec vpn xpfarg traffic-selector xpfarg remote-ip
 security ipsec vpn xpfarg vpn-monitor destination-ip
 security ipsec vpn xpfarg vpn-monitor source-interface
 security log format
 security log mode
+security log profile
 security log profile xpfarg stream-name
 security log source-interface
 security log stream xpfarg host
 security nat destination pool
+security nat destination rule-set
+security nat destination rule-set xpfarg rule
 security nat destination rule-set xpfarg rule xpfarg match application
 security nat destination rule-set xpfarg rule xpfarg match destination-address
 security nat destination rule-set xpfarg rule xpfarg match destination-address-name
@@ -270,26 +356,35 @@ security nat destination rule-set xpfarg rule xpfarg match destination-port
 security nat destination rule-set xpfarg rule xpfarg match protocol
 security nat destination rule-set xpfarg rule xpfarg match source-address
 security nat destination rule-set xpfarg rule xpfarg match source-address-name
+security nat nat64 rule-set
 security nat nat64 rule-set xpfarg prefix
 security nat nat64 rule-set xpfarg source-pool
+security nat proxy-arp interface
 security nat proxy-arp interface xpfarg address
+security nat source pool
 security nat source pool xpfarg port-overloading-factor
 security nat source pool xpfarg routing-instance
+security nat source rule-set
+security nat source rule-set xpfarg rule
 security nat source rule-set xpfarg rule xpfarg match application
 security nat source rule-set xpfarg rule xpfarg match destination-address
 security nat source rule-set xpfarg rule xpfarg match destination-address-name
 security nat source rule-set xpfarg rule xpfarg match destination-port
 security nat source rule-set xpfarg rule xpfarg match source-address
 security nat source rule-set xpfarg rule xpfarg match source-address-name
+security nat static rule-set
+security nat static rule-set xpfarg rule
 security nat static rule-set xpfarg rule xpfarg match destination-address
 security nat static rule-set xpfarg rule xpfarg match destination-port
 security nat static rule-set xpfarg rule xpfarg match source-address
 security policies default-policy-log
+security policies from-zone xpfarg xpfarg xpfarg policy
 security policies from-zone xpfarg xpfarg xpfarg policy xpfarg description
 security policies from-zone xpfarg xpfarg xpfarg policy xpfarg match application
 security policies from-zone xpfarg xpfarg xpfarg policy xpfarg match destination-address
 security policies from-zone xpfarg xpfarg xpfarg policy xpfarg match source-address
 security policies from-zone xpfarg xpfarg xpfarg policy xpfarg then log
+security policies global policy
 security policies global policy xpfarg description
 security policies global policy xpfarg match application
 security policies global policy xpfarg match destination-address
@@ -298,8 +393,11 @@ security policies global policy xpfarg match source-address
 security policies global policy xpfarg match to-zone
 security policies global policy xpfarg then log
 security pre-id-default-policy then log
+security screen ids-option
 security screen ids-option xpfarg limit-session destination-ip-based
 security screen ids-option xpfarg limit-session source-ip-based
+security zones security-zone
+security zones security-zone xpfarg address-book address-set
 security zones security-zone xpfarg address-book address-set xpfarg address
 security zones security-zone xpfarg address-book address-set xpfarg address-set
 security zones security-zone xpfarg description
@@ -308,18 +406,25 @@ security zones security-zone xpfarg host-inbound-traffic system-services
 security zones security-zone xpfarg interfaces xpfname host-inbound-traffic protocols
 security zones security-zone xpfarg interfaces xpfname host-inbound-traffic system-services
 security zones security-zone xpfarg screen
+services flow-monitoring version-ipfix template
 services flow-monitoring version-ipfix template xpfarg flow-active-timeout
 services flow-monitoring version-ipfix template xpfarg flow-inactive-timeout
 services flow-monitoring version-ipfix template xpfarg template-refresh-rate seconds
+services flow-monitoring version9 template
 services flow-monitoring version9 template xpfarg flow-active-timeout
 services flow-monitoring version9 template xpfarg flow-inactive-timeout
 services flow-monitoring version9 template xpfarg template-refresh-rate seconds
+services rpm probe
+snmp community
 snmp community xpfarg clients
+snmp trap-group
 snmp trap-group xpfarg categories
 snmp trap-group xpfarg targets
 snmp trap-group xpfarg version
+snmp v3 usm local-engine user
 system archival configuration archive-sites
 system archival configuration transfer-interval
+system backup-router
 system dataplane binary
 system dataplane claim-host-tunables
 system dataplane coalescence adaptive
@@ -337,12 +442,14 @@ system dataplane state-file
 system dataplane workers
 system domain-search
 system license autoupdate url
+system login class
 system login class xpfarg allow-commands
 system login class xpfarg allow-configuration
 system login class xpfarg deny-commands
 system login class xpfarg deny-configuration
 system login class xpfarg idle-timeout
 system login class xpfarg permissions
+system login user
 system login user xpfarg authentication encrypted-password
 system login user xpfarg authentication ssh-dsa
 system login user xpfarg authentication ssh-ed25519
@@ -350,14 +457,24 @@ system login user xpfarg authentication ssh-rsa
 system login user xpfarg class
 system master-password pseudorandom-function
 system name-server
+system ntp server
+system ntp threshold
 system root-authentication encrypted-password
 system root-authentication ssh-dsa
 system root-authentication ssh-ed25519
 system root-authentication ssh-rsa
+system services dhcp-local-server group
+system services dhcp-local-server group xpfarg interface
+system services dhcp-local-server group xpfarg pool
 system services dhcp-local-server group xpfarg pool xpfarg dns-server
+system services dhcp-local-server group xpfarg pool xpfarg static-binding
 system services dhcp-local-server group xpfarg pool xpfarg static-binding xpfarg fixed-address
 system services dhcp-local-server group xpfarg pool xpfarg static-binding xpfarg host-name
+system services dhcpv6-local-server group
+system services dhcpv6-local-server group xpfarg interface
+system services dhcpv6-local-server group xpfarg pool
 system services dhcpv6-local-server group xpfarg pool xpfarg dns-server
+system services dhcpv6-local-server group xpfarg pool xpfarg static-binding
 system services dhcpv6-local-server group xpfarg pool xpfarg static-binding xpfarg fixed-address
 system services dhcpv6-local-server group xpfarg pool xpfarg static-binding xpfarg host-name
 system services ssh client-alive-count-max

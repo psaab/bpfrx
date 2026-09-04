@@ -148,7 +148,31 @@ func collectCompactSites() []compactSite {
 			if ch == nil {
 				continue
 			}
-			if ch.children == nil && ch.wildcard == nil && ch.args == 1 && len(path) >= 1 {
+			// #8662: the `children == nil` clause that used to sit here made
+			// this census blind to an entire class, and blind SILENTLY — those
+			// sites were never enumerated, so they appeared in no skip bucket
+			// and the "the census is a FLOOR" note did not account for them.
+			//
+			// A folded token that declares children is still foldable. Two
+			// shapes hit it, and #8662 verified both by hand:
+			//
+			//	class-of-service { schedulers be transmit-rate 1g; }
+			//	  -> transmit-rate has children exact/percent/remainder,
+			//	     declared (per its own comment) "purely so
+			//	     `set ... transmit-rate ?` surfaces them". Compiled: braced
+			//	     125000000, elided 0.
+			//	security { zones { security-zone trust interfaces ge-0/0/0.0; } }
+			//	  -> `interfaces` is a nested named-instance container.
+			//	     Compiled: braced [ge-0/0/0.0], elided [] — and the elided
+			//	     form walks past the strict gate that rejects the braced one
+			//	     for an undefined interface, so the zone boots with no
+			//	     members on a commit that reported success.
+			//
+			// Declaring children for `?` completion is not a statement about
+			// whether the compiler reads a folded tail, so predicating the
+			// census on it excluded sites for a reason unrelated to the
+			// property being measured.
+			if ch.wildcard == nil && ch.args == 1 && len(path) >= 1 {
 				key := strings.Join(path, "/") + "|" + name
 				if !seen[key] {
 					seen[key] = true
