@@ -146,6 +146,42 @@ This is the package that drives chassis-cluster failover.
 - `vrrp.go` — `Instance` config type plus `CollectInstances` /
   `CollectRethInstances` config extraction.
 
+## The send paths snapshot config under the lock (#8597)
+
+`updateConfig` writes `Priority`, `Preempt`, `PreemptHoldTime`,
+`AdvertiseInterval`, `GARPCount`, `TrackInterface` and `TrackPriorityCost`
+under `vi.mu` on the MANAGER goroutine — the #5087 day-2 path, reached by any
+commit that changes `reth-advertise-interval` or `gratuitous-arp-count`. Every
+reader in `instance_preempt.go`, `track.go`, `manager.go` and
+`instance_timing.go` snapshots under the lock (the #6230/#5718 discipline).
+Four statements on the SEND paths did not, and `go test -race` reports two of
+them at `instance_send.go:46` and `instance_garp.go:154` against
+`instance.go:378-379`:
+
+- `sendAdvert` read `cfg.AdvertiseInterval` in each of its v4 and v6 arms;
+- `sendGARP` read `cfg.GARPCount`;
+- `run()`'s startup log read `cfg.Priority` and `cfg.Preempt`.
+
+`sendAdvert` takes ONE snapshot for both arms — `advertiseIntervalMS()` — not
+one per arm. A read per arm silences the race detector completely and is still
+wrong: a dual-stack instance sends its v4 and v6 adverts from one call, and a
+writer landing between them makes the two families advertise different
+`MaxAdverInt`. The peer derives its master-down interval from that field, so
+the families would disagree about the failover horizon — the flapping shape
+gemini-048 finding 06 describes. `TestOneAdvertCallUsesOneIntervalSnapshot_8597`
+pins it deterministically, driving the write from inside the v4 arm through the
+`sendPacketFn` seam rather than racing for the interleaving.
+
+`advertiseIntervalMS` deliberately returns the RAW milliseconds rather than
+reusing `advertInterval()`: that helper substitutes the 1000 ms default for a
+non-positive value, and folding the default into the wire field would make a
+misconfigured instance advertise a cadence it is not sending at.
+
+`advertIntervalLocked` is NOT one of these sites despite looking like one — it
+is documented as lock-held-by-caller and is reached from `recordMasterAdvert`
+under `vi.mu.Lock`. A census of this class has to read the callers, not the
+call.
+
 ## Configured priority is bounded before it is stored (#8597)
 
 `instance_send.go` puts `uint8(priority)` on the wire while the local

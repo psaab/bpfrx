@@ -615,12 +615,16 @@ func (vi *vrrpInstance) stepBackup(masterDownTimer, advertTimer, preemptHoldTime
 func (vi *vrrpInstance) run() {
 	defer close(vi.stopped)
 
+	// #8597 (muse-004 K20): Interface and GroupID are immutable for an
+	// instance's lifetime (a change rebuilds it), but Priority and Preempt are
+	// mu-guarded and written by updateConfig on the manager goroutine.
+	startPriority, startPreempt := vi.startupLogFields()
 	slog.Info("vrrp: instance starting",
 		"key", vi.key(),
 		"interface", vi.cfg.Interface,
 		"vrid", vi.cfg.GroupID,
-		"priority", vi.cfg.Priority,
-		"preempt", vi.cfg.Preempt)
+		"priority", startPriority,
+		"preempt", startPreempt)
 
 	// Start per-instance receiver goroutine.
 	// AF_PACKET captures at the link layer before generic XDP, ensuring
