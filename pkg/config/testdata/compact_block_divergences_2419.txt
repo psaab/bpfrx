@@ -148,7 +148,6 @@ interfaces xpfname mtu
 interfaces xpfname native-vlan-id
 interfaces xpfname speed
 interfaces xpfname tunnel destination
-interfaces xpfname tunnel key
 interfaces xpfname tunnel mode
 interfaces xpfname tunnel routing-instance destination
 interfaces xpfname tunnel source
@@ -158,8 +157,6 @@ interfaces xpfname tunnel wireguard peer
 interfaces xpfname tunnel wireguard peer xpfarg allowed-ips
 interfaces xpfname tunnel wireguard peer xpfarg endpoint
 interfaces xpfname tunnel wireguard peer xpfarg persistent-keepalive
-interfaces xpfname tunnel wireguard peer xpfarg preshared-key
-interfaces xpfname tunnel wireguard private-key
 policy-options community
 policy-options community xpfarg members
 policy-options policy-statement
@@ -190,10 +187,8 @@ protocols bgp group xpfarg neighbor xpfarg peer-as
 protocols bgp import
 protocols bgp local-as
 protocols bgp router-id
-protocols isis authentication-type
 protocols isis export
 protocols isis interface
-protocols isis interface xpfarg authentication-type
 protocols isis interface xpfarg level
 protocols isis is-type
 protocols isis level
@@ -203,7 +198,6 @@ protocols lldp interface
 protocols lldp transmit-interval
 protocols ospf area
 protocols ospf area xpfarg interface
-protocols ospf area xpfarg interface xpfarg authentication md5 xpfarg key
 protocols ospf area xpfarg virtual-link
 protocols ospf area xpfarg virtual-link xpfarg transit-area
 protocols ospf export
@@ -212,7 +206,6 @@ protocols ospf3 area
 protocols ospf3 area xpfarg interface
 protocols ospf3 export
 protocols ospf3 router-id
-protocols rip authentication-type
 protocols rip neighbor
 protocols rip passive-interface
 protocols rip redistribute
@@ -226,10 +219,8 @@ protocols router-advertisement interface xpfarg nat-prefix
 protocols router-advertisement interface xpfarg nat64prefix
 protocols router-advertisement interface xpfarg preference
 protocols router-advertisement interface xpfarg prefix
-routing-instances xpfname protocols isis authentication-type
 routing-instances xpfname protocols isis export
 routing-instances xpfname protocols isis interface
-routing-instances xpfname protocols isis interface xpfarg authentication-type
 routing-instances xpfname protocols isis interface xpfarg level
 routing-instances xpfname protocols isis is-type
 routing-instances xpfname protocols isis level
@@ -308,8 +299,6 @@ security ike policy xpfarg mode
 security ike policy xpfarg proposal-set
 security ike policy xpfarg proposals
 security ike proposal
-security ike proposal xpfarg authentication-algorithm
-security ike proposal xpfarg authentication-method
 security ike proposal xpfarg dh-group
 security ike proposal xpfarg encryption-algorithm
 security ike proposal xpfarg lifetime-seconds
@@ -325,7 +314,6 @@ security ipsec policy
 security ipsec policy xpfarg proposal-set
 security ipsec policy xpfarg proposals
 security ipsec proposal
-security ipsec proposal xpfarg authentication-algorithm
 security ipsec proposal xpfarg dh-group
 security ipsec proposal xpfarg encryption-algorithm
 security ipsec proposal xpfarg lifetime-kilobytes
@@ -339,7 +327,6 @@ security ipsec vpn xpfarg ike gateway
 security ipsec vpn xpfarg ike ipsec-policy
 security ipsec vpn xpfarg local-address
 security ipsec vpn xpfarg local-identity
-security ipsec vpn xpfarg pre-shared-key
 security ipsec vpn xpfarg remote-identity
 security ipsec vpn xpfarg traffic-selector
 security ipsec vpn xpfarg traffic-selector xpfarg local-ip
@@ -438,14 +425,9 @@ system login user xpfarg authentication ssh-dsa
 system login user xpfarg authentication ssh-ed25519
 system login user xpfarg authentication ssh-rsa
 system login user xpfarg class
-system master-password pseudorandom-function
 system name-server
 system ntp server
 system ntp threshold
-system root-authentication encrypted-password
-system root-authentication ssh-dsa
-system root-authentication ssh-ed25519
-system root-authentication ssh-rsa
 system services dhcp-local-server group
 system services dhcp-local-server group xpfarg interface
 system services dhcp-local-server group xpfarg pool

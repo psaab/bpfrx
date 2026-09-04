@@ -207,7 +207,9 @@ func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) 
 	// config differently from the node that authored it, which is the class of
 	// asymmetry #8597 K51 was. Scoped to the security-relevant subset for now;
 	// see compact_normalize_8662.go.
-	normalizeCompactStanzas(tree)
+	if !opts.skipCompactNormalize {
+		normalizeCompactStanzas(tree)
+	}
 
 	// #1873 R-B: tunnel-endpoint id collision gate. Runs on the
 	// PRE-expansion tree (ExpandGroups removes the groups stanza) so
@@ -454,7 +456,9 @@ func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts
 	// config differently from the node that authored it, which is the class of
 	// asymmetry #8597 K51 was. Scoped to the security-relevant subset for now;
 	// see compact_normalize_8662.go.
-	normalizeCompactStanzas(tree)
+	if !opts.skipCompactNormalize {
+		normalizeCompactStanzas(tree)
+	}
 
 	// #1873 R-B: union-of-groups tunnel id collision gate — see
 	// compileConfigWithOpts. Pre-expansion on purpose; read-only, safe on the copy.
