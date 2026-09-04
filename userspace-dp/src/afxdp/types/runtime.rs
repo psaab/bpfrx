@@ -587,6 +587,20 @@ pub(in crate::afxdp) struct DebugPollCounters {
     /// packet and every later packet of that 5-tuple takes the session-MISS path.
     #[allow(dead_code)]
     pub(in crate::afxdp) filter_revoked_sessions: u64,
+    /// #8356: established sessions revoked because the live ZONE POLICY denies
+    /// the flow — the policy sibling of `filter_revoked_sessions` above. A
+    /// commit that narrows zone policy now tears down live flows it denies, the
+    /// same way #5858/#7212 already does for a narrowed input filter.
+    ///
+    /// Distinct from `policy_deny`, which is a verdict on a NEW flow at the
+    /// session-MISS path. This one counts a flow that was ALREADY established
+    /// under an older generation and did not survive re-derivation under the
+    /// current one. A non-zero value here right after a commit is the expected,
+    /// intended signal — it is what the operator's narrowed policy did.
+    ///
+    /// Counted once per revoked session, not per dropped packet.
+    #[allow(dead_code)]
+    pub(in crate::afxdp) policy_revoked_sessions: u64,
     #[allow(dead_code)]
     pub(in crate::afxdp) ha_inactive: u64,
     #[allow(dead_code)]

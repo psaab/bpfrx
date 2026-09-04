@@ -1,0 +1,224 @@
+//! #8356: re-derive ZONE POLICY on the established-session hit path.
+//!
+//! # The residual this closes
+//!
+//! #7323 closed on option B — accept that a peer-synced imported session
+//! carries the PEER's zone-policy verdict and the receiver never re-asks its
+//! own. Input FILTERS are already re-derived on this path (#7212), so the
+//! residual was precisely: *a flow the receiver's newer zone policy would deny,
+//! whose input filters permit it, surviving as an imported session until it
+//! ends.* This module closes it receiver-locally — no wire field, no
+//! negotiation, no `ProtocolVersion` bump, so it also protects against an OLD
+//! sender during a rolling upgrade.
+//!
+//! Scope is EVERY session, not only peer-synced imports. #5858/#7212 already
+//! tears down a live, locally-admitted session when a commit narrows an input
+//! FILTER; not doing the same when a commit narrows ZONE POLICY is the
+//! asymmetry, not a safe default.
+//!
+//! # THREE things here deliberately do NOT mirror #7212
+//!
+//! **1. FORWARD ONLY.** The filter stamp is per-direction on purpose. This one
+//! must not be. The reverse companion is built with SWAPPED zones
+//! (`afxdp/shared_ops.rs`: `ingress_zone: forward.metadata.egress_zone`,
+//! `egress_zone: forward.metadata.ingress_zone`; `poll_descriptor/mod.rs` does
+//! the same with `to_zone_id`/`from_zone_id`). This is a STATEFUL firewall — a
+//! reply is permitted because the session exists, not because a policy admits
+//! (to_zone -> from_zone). Re-deriving on the reverse entry would evaluate the
+//! reversed pair, find no rule on any ordinary one-way policy set, hit the
+//! default deny, and revoke. Per-direction, that revokes EVERY established
+//! session in the box on the first packet after ANY commit. It would also pass
+//! a test whose fixture uses a symmetric or allow-all policy, which is why the
+//! cell for it uses an asymmetric one.
+//!
+//! **2. GENERATION-ONLY stamp.** `FilterRevalidationStamp` is keyed
+//! `(generation, logical ingress ifindex)` because an input filter is a
+//! per-INTERFACE object. A zone-policy verdict is keyed on the (from, to) zone
+//! PAIR and both come from the ENTRY, never from the interface this packet
+//! arrived on. See `SessionEntry::policy_revalidated_gen`.
+//!
+//! **3. Side-effect freedom is STRUCTURAL, not a flag.** The filter needed
+//! `NonRoutingCountPolicy::Never` because its evaluator counts internally.
+//! `evaluate_policy_result_with_icmp` takes `&PolicyState` and RETURNS a counter
+//! handle (`policy_counter_idx`) for the caller to bump; it cannot count, log or
+//! meter by itself. This module simply never bumps what it is handed.
+//!
+//! # What it does NOT cover, stated so this does not read as more than it is
+//!
+//! `to_id` is derived from the egress interface resolved at install/import
+//! time, read through the LIVE zone ledger. So a commit that moves an interface
+//! BETWEEN ZONES is caught; a commit that changes a ROUTE so the flow would now
+//! leave a DIFFERENT interface is NOT. Catching that needs a fresh routing
+//! evaluation on the established-hit path, which is exactly what #2620 forbids
+//! (that path is the sole counter for its packet precisely because it never
+//! calls the routing evaluator). #8356 does not re-open #2620.
+
+use super::*;
+use crate::policy::evaluate_policy_result_with_icmp;
+use crate::session::{PolicyRevalidationTarget, SessionKey};
+
+/// A zone-policy re-derivation that came back DENY. Carries the CANONICAL key —
+/// the primary-index key, which on the NAT reverse-translated alias path is NOT
+/// the wire tuple that found it — so the teardown acts on the session that was
+/// actually judged.
+pub(super) struct PolicyRevocation {
+    pub(super) canonical_key: SessionKey,
+}
+
+/// Re-derive zone policy for an established-session HIT, at most once per
+/// session per `config_generation`.
+///
+/// Returns `Some` only when the live policy DENIES a flow this node is still
+/// forwarding — the caller revokes. `None` is the answer for every packet but
+/// one per session per generation.
+pub(super) fn revalidate_zone_policy_on_session_hit(
+    forwarding: &ForwardingState,
+    sessions: &mut SessionTable,
+    // The matched entry's WIRE key (`ResolvedFlowSessionDecision::key`).
+    session_key: &SessionKey,
+    metadata: &crate::session::SessionMetadata,
+    decision: crate::session::SessionDecision,
+    flow: Option<&SessionFlow>,
+    meta: UserspaceDpMeta,
+) -> Option<PolicyRevocation> {
+    let flow = flow?;
+    // GATE 1, and it is free: the reverse companion is never independently
+    // policy-adjudicated. See item 1 in the module header — getting this wrong
+    // denies the reply of every permitted flow. `is_reverse` is already on the
+    // metadata the lookup returned, so this costs no lookup at all and excludes
+    // roughly half the established-hit population before anything is hashed.
+    if metadata.is_reverse {
+        return None;
+    }
+    // GATE 1b: DECLINE for ICMP. A zone policy can match on ICMP type/code via
+    // an application term, so an ICMP verdict is a property of the PACKET, not
+    // of the flow — and this derivation is deliberately frame-independent, so it
+    // has no type to offer. Evaluating with no type would fail to match a
+    // type-specific term and manufacture a DENY for a flow the policy permits;
+    // stamping a single packet's type as the flow's verdict would be just as
+    // wrong in the other direction. Declining leaves ICMP exactly where #7323
+    // left it — the residual stays open for ICMP alone — rather than inventing
+    // a verdict this function cannot honestly derive. Same reasoning the static
+    // input-filter walk uses to decline a route-lookup-affecting filter.
+    if matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6) {
+        return None;
+    }
+    // GATE 2: one probe answers both "which entry does this WIRE tuple name"
+    // and "is its policy verdict stale". `Fresh` — the answer for every packet
+    // but one per session per generation — costs a single hash and a compare.
+    //
+    // COST NOTE, because a promise was made about this and then revised: an
+    // earlier design threaded the stamp out of `lookup_with_origin` (which
+    // already holds both the entry and its canonical key and discards the
+    // latter) to make this a bare integer compare with no hash. That is
+    // achievable and would be strictly cheaper, but it widens the session
+    // lookup's return type through `ResolvedSessionLookup` and both
+    // `ResolvedFlowSessionDecision` construction sites — a hot-path refactor
+    // whose benefit is unmeasured. It is unmeasured because this code only runs
+    // on a flow-cache MISS: a generation bump invalidates every flow-cache entry
+    // (`FlowCacheStamp::config_generation`), so the packet that pays here is one
+    // already taking the slow path, and steady-state established traffic never
+    // reaches this function at all. Pay the hash, keep the diff narrow; the
+    // threading is a measured optimisation if a profile ever asks for it.
+    let canonical_key = match sessions.policy_revalidation_target(session_key) {
+        PolicyRevalidationTarget::Fresh => return None,
+        // No entry this tuple may safely name (#2120 transient synced hit, or a
+        // reused slab slot). There is nothing to stamp and nothing to tear down,
+        // and deriving a verdict we could not act on would only risk acting on
+        // the WRONG session. Same answer #7212 gives.
+        PolicyRevalidationTarget::NoLocalEntry => return None,
+        PolicyRevalidationTarget::Stale(k) => k,
+    };
+    zone_policy_deny_on_session_hit(forwarding, sessions, canonical_key, metadata, decision, flow, meta)
+}
+
+/// The cold half. `#[cold] #[inline(never)]` because it runs at most once per
+/// session per config generation: keeping it out of line leaves the caller's
+/// common path a compare, a hash and two branches.
+///
+/// The re-stamp happens on the PERMIT exit ONLY, and that asymmetry is
+/// deliberate and identical in spirit to #7212's.
+///
+/// On PERMIT it is the whole point: the session keeps its entry — including its
+/// NAT translation, since a purged-and-recreated permitted SNAT flow reinstalls
+/// on a DIFFERENT translated port and breaks — and must not re-derive the same
+/// verdict on every later packet of this generation.
+///
+/// On DENY the caller REVOKES, so normally there is no entry left to stamp. A
+/// stamp would matter only if the teardown did NOT take, and in exactly that
+/// case it is a fail-OPEN: the session would read "already judged under the live
+/// generation" and be FORWARDED for the rest of the generation under a policy
+/// that denies it. Unstamped, the next packet re-derives the same DENY and
+/// drops. Same failure, fail-CLOSED instead of fail-OPEN.
+#[cold]
+#[inline(never)]
+fn zone_policy_deny_on_session_hit(
+    forwarding: &ForwardingState,
+    sessions: &mut SessionTable,
+    canonical_key: SessionKey,
+    metadata: &crate::session::SessionMetadata,
+    decision: crate::session::SessionDecision,
+    flow: &SessionFlow,
+    meta: UserspaceDpMeta,
+) -> Option<PolicyRevocation> {
+    let egress_ifindex = decision.resolution.egress_ifindex;
+    let (from_id, to_id) = zone_pair_ids_for_flow_with_override(
+        forwarding,
+        meta.ingress_ifindex as i32,
+        // The from-zone comes from the ENTRY, not from this packet's arrival
+        // interface — the same override the input-filter revalidation is handed
+        // at its call site.
+        Some(metadata.ingress_zone),
+        egress_ifindex,
+    );
+    // DECLINE on an unknown zone. `egress_zone_id` is `unwrap_or(0)` and policy
+    // evaluation refuses to match ANY rule against the 0 sentinel, so the flow
+    // would fall to the default policy — i.e. deny. That is a LOOKUP FAILURE,
+    // not a verdict, and revoking on it would tear down sessions for a missing
+    // ledger entry.
+    //
+    // Reachable, not defensive: `egress_zone_id` reads
+    // `ifindex_unambiguous_zone_id`, which `populate_egress` fills only for
+    // interfaces with a resolvable link-layer address. A MAC-less egress — the
+    // canonical case being an IPsec `xfrmi` secure tunnel, #6722 — is absent
+    // from it and resolves to 0 even though the interface itself is perfectly
+    // routable and correctly zoned by the operator. Bound by
+    // `an_unresolvable_egress_declines_rather_than_denying_8356`, whose fixture
+    // routes through exactly such an interface.
+    //
+    // An `egress_ifindex` of 0 lands here too (it resolves to no zone), so it
+    // needs no separate guard. An earlier revision had one; it was removed after
+    // a mutation showed nothing could red it — the established-hit arm never
+    // sees an unresolved decision, because the poll path re-resolves it and a
+    // flow with no route exits before this point.
+    if to_id == 0 || from_id == 0 {
+        return None;
+    }
+    let result = evaluate_policy_result_with_icmp(
+        &forwarding.policy,
+        from_id,
+        to_id,
+        flow.src_ip,
+        flow.dst_ip,
+        meta.protocol,
+        flow.forward_key.src_port,
+        flow.forward_key.dst_port,
+        // Frame-INDEPENDENT, like #7212's static walk: no ICMP type/code is
+        // supplied. ICMP flows are declined outright above rather than
+        // evaluated with `None` here, because `None` would silently fail to
+        // match a type-specific application term and manufacture a DENY.
+        None,
+        // Byte count is used only by policers/counters, neither of which this
+        // side-effect-free derivation touches.
+        0,
+    );
+    if !matches!(result.action, crate::policy::PolicyAction::Deny) {
+        // Still permitted. Nothing counted, nothing logged, the session and its
+        // NAT translation untouched. Re-stamp so no later packet of this
+        // generation re-derives the same verdict.
+        sessions.mark_policy_revalidated(&canonical_key);
+        return None;
+    }
+    // DENY: deliberately NOT re-stamped — see the header.
+    Some(PolicyRevocation { canonical_key })
+}

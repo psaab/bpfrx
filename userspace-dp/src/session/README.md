@@ -548,11 +548,16 @@ rechecked and the flow forwarded until it idled out (#5858, closed against
 `ValidationState::config_generation` this direction's input-filter verdict was
 last computed under:
 
-* `install` stamps `SessionTable::filter_revalidation_gen`, which
-  `poll_binding_process_descriptor` publishes once per pass from the SAME
-  `ValidationState` the pass classifies packets against — so the stamp a session
-  carries and the generation it is later compared to can never come from
+* `SessionTable::filter_revalidation_gen` is the generation a verdict is judged
+  AGAINST. `poll_binding_process_descriptor` publishes it once per pass from the
+  SAME `ValidationState` the pass classifies packets with, so the stamp a
+  session carries and the generation it is later compared to can never come from
   different publishes.
+* EVERY install stamps `UNVALIDATED`, not that generation — forward, reverse
+  companion and peer-synced import alike (`session/install.rs`, both sites), and
+  `mark_filter_revalidated` is the field's only other writer. (An earlier
+  revision of this line said `install` stamps the live generation. It does not,
+  and never did; corrected in #8356 while adding the policy sibling below.)
 * `upsert_synced` stamps `0`, which is never a live generation. A peer-synced
   session therefore revalidates against THIS node's filter state on the first
   packet it forwards after a promotion — the failover fence, obtained from the
@@ -653,6 +658,89 @@ Regression coverage: `session/filter_revalidation_7212_tests.rs` (stamp
 lifecycle) and `afxdp/poll_descriptor/filter_revalidation_7212_tests.rs`
 (verdict, side-effect freedom, the NAT-alias reverse half, the fragment purity
 case, the DENY-exit fail-closed stamp, and the pinned permitted-SNAT case).
+
+## Zone-policy revalidation stamp (#8356)
+
+The stateless-filter argument above applies unchanged to ZONE POLICY, and until
+#8356 the tree only made it for filters. A commit that narrowed an input FILTER
+tore down the live flows it denied (#5858/#7212); a commit that narrowed ZONE
+POLICY did not. #7323 closed on accepting that as a residual — a flow this
+node's newer policy would deny, whose input filters permit it, surviving as a
+session until it ends — with peer-synced imports the population where it bites
+hardest, since they carry the PEER's verdict and the receiver never re-asked its
+own.
+
+`SessionEntry::policy_revalidated_gen` closes it, receiver-locally: no wire
+field, no negotiation, no `ProtocolVersion` bump, so it also protects against an
+OLD sender during a rolling upgrade. Cadence, side-effect freedom, the
+PERMIT-only re-stamp and the `delete_terminal_filtered_session` revocation are
+all exactly as described for the filter above. The peer-synced fence is the same
+one and comes from the same place: `upsert_synced` stamps `0`, which is never
+live, so an import re-derives against THIS node's policy on the first packet it
+forwards after promotion.
+
+**Scope is EVERY session, not only peer-synced imports.** The narrow scope would
+need a peer-synced marker on the entry, which does not exist; the broad one
+needs nothing new and removes the asymmetry rather than preserving it.
+
+THREE things deliberately do NOT mirror #7212, and the first is the one that
+would take a box down:
+
+* **FORWARD ONLY** (`!metadata.is_reverse`). #7212's stamp is per-DIRECTION and
+  correctly so — a filter is a per-interface object and each direction is judged
+  against the interface its packet arrived on. Copying that here is
+  catastrophic. The reverse companion is built with SWAPPED zones
+  (`afxdp/shared_ops.rs`, `afxdp/poll_descriptor/mod.rs`), and this is a
+  STATEFUL firewall: a reply is permitted because the session exists, not
+  because a policy admits (to_zone -> from_zone). Re-derived per-direction it
+  evaluates the reversed pair, matches nothing on any ordinary one-way policy
+  set, hits the default deny and revokes — so every established session in the
+  box would die on the first packet after ANY commit.
+* **GENERATION-ONLY stamp**, where `FilterRevalidationStamp` is keyed
+  `(generation, logical ingress ifindex)`. A policy verdict is a function of the
+  (from_zone, to_zone) pair, and both come from the ENTRY —
+  `metadata.ingress_zone` and `decision.resolution.egress_ifindex` — never from
+  the interface a given packet arrived on. Keying by ifindex would only make the
+  stamp go spuriously stale and re-walk terms that cannot change verdict.
+* **Side-effect freedom is STRUCTURAL, not a flag.** The filter needs
+  `NonRoutingCountPolicy::Never` because its evaluator counts internally.
+  `evaluate_policy_result_with_icmp` takes `&PolicyState` and RETURNS a counter
+  handle for the caller to bump; it cannot count, log or meter by itself.
+
+Two populations are DECLINED rather than adjudicated, both because the
+derivation cannot honestly produce a verdict for them:
+
+* **ICMP.** A zone policy can match ICMP type/code through an application term,
+  so an ICMP verdict is a property of the PACKET, not of the flow — and this
+  derivation is frame-independent, so it has no type to offer. Evaluating with
+  none would fail to match a type-specific term and manufacture a DENY. The
+  #7323 residual stays open for ICMP alone.
+* **An egress that resolves to no zone.** `egress_zone_id` is `unwrap_or(0)` and
+  policy matches no rule against the 0 sentinel, so the flow would fall to the
+  default policy. That is a lookup failure, not a verdict. Reachable rather than
+  defensive: `ifindex_unambiguous_zone_id` is populated only for interfaces with
+  a resolvable link-layer address, so a MAC-less egress (an IPsec `xfrmi` secure
+  tunnel, #6722) resolves to 0 while being perfectly routable and correctly
+  zoned.
+
+**What this does NOT cover.** `to_id` comes from the egress interface resolved
+at install/import time, read through the LIVE zone ledger. A commit that moves
+an interface BETWEEN ZONES is caught; a commit that changes a ROUTE so the flow
+would now leave a DIFFERENT interface is NOT. Catching that needs a fresh
+routing evaluation on the established-hit path, which is exactly what #2620
+forbids — that path is the sole counter for its packet precisely because it
+never calls the routing evaluator. #8356 does not re-open #2620.
+
+Operator-visible signal: `policy_revoked_sessions`, the sibling of
+`filter_revoked_sessions`. A non-zero value right after a commit is the
+expected, intended reading — it is what the operator's narrowed policy did.
+
+Regression coverage: `session/policy_revalidation_8356_tests.rs` (stamp
+lifecycle, generation-only keying, and the two stamps' mutual independence) and
+`afxdp/tests_policy_revocation_8356.rs` (the verdict and the WIRING, driven
+through the real poll body: revoke-on-narrowed-policy, the still-permitted
+control, the reverse-companion trap against an ASYMMETRIC policy set, and the
+unknown-zone decline).
 
 ## Per-session byte/packet accounting (#2501)
 

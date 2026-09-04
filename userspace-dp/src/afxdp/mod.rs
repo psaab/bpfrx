@@ -563,6 +563,9 @@ mod tests_embedded_poll_filter;
 #[cfg(test)]
 #[path = "tests_filter_revocation_7212.rs"]
 mod tests_filter_revocation_7212;
+#[cfg(test)]
+#[path = "tests_policy_revocation_8356.rs"]
+mod tests_policy_revocation_8356;
 // #7160 (#2387): the routing-domain stamp on the REAL poll path — the WIRING,
 // which no unit-level cell can reach.
 #[cfg(test)]
