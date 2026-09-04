@@ -1004,14 +1004,59 @@ packets now take the normal session-miss path: zone-pair policy under the
 permitted — the standard Junos no-syn-check asymmetric-routing pickup
 (#3152), identical to the packet arriving on the real interface. The
 sync-race sub-window the fast path covered (a peer-punted return packet
-arriving before its synced session installs) reverts to a bounded drop:
-the return direction's resolution on the receiving node is HAInactive
-until the RG converges, and the synced session lands within the 1 s
-incremental sweep, so the loss is confined to the race window — which the
+arriving before its synced session installs) reverts to a drop, which the
 #6478 verifier explicitly prefers over unauthenticated seeding. A genuine
 established flow's return traffic is unaffected: it is a session HIT
 served by `resolve_flow_session_decision` (synced session + #2120 standby
 retention) and never reached the session-less fast path.
+
+### Two corrections to the paragraph above (#7770)
+
+Both were measured against the code path rather than reasoned from it, and
+both changed what the residual is.
+
+**The drop is a POLICY DEFAULT-DENY, not `HAInactive`.** This section used
+to attribute it to "the return direction's resolution on the receiving node
+is HAInactive until the RG converges". It is not. Driving a session-less
+`wan -> lan` fabric-ingress return frame through the real poll loop with the
+LAN RG local and the WAN RG remote emits
+`PolicyDeny action=0 reason=5 ingress_zone=wan egress_zone=lan
+policy_id=4294967295`, with `missing_neigh=0`, zero sessions installed and
+zero forwards queued. `reason=5` is the TRANSIT policy deny and
+`policy_id=4294967295` is the no-match default. The mechanism is that
+`wan -> lan` has no permit **by design** — return traffic is admitted by a
+SESSION, never by policy — so the receiving node is being asked for a
+decision policy alone can never authorise. That matters because the two
+attributions imply different fixes: an `HAInactive` drop resolves itself
+when the RG converges, and a default-deny does not.
+
+**It is not "confined to the race window", because the window does not
+close.** The old wording — "until the RG converges", "the loss is confined
+to the race window" — describes a transient. A LAN/WAN redundancy-group
+SPLIT (RG0+RG1 on one node, the LAN RG on the other) is a legitimate steady
+state reached by two supported `request chassis cluster failover
+redundancy-group N node M` commands, and nothing warns that the groups are
+now split. In that placement the RGs never converge, so every NEW flow
+re-enters the race and pays one packet — measured at 12.5% of an 8-packet
+probe in both address families, unchanged on a fresh probe 45 s later.
+Long-lived TCP absorbs it as one retransmit; short request/response flows
+and UDP (DNS especially) do not.
+
+**Coverage note.** The two RED-on-revert cells listed below drive
+`lan -> wan` — the fixture's only permitted pair — so neither exercises the
+return direction this residual lives in. That direction is now pinned by
+`fabric_ingress_return_traffic_is_denied_on_the_lan_node_7770` in the same
+file, which asserts the deny's zone pair and `policy_id` rather than only
+the absence of a session (an unstamped frame produces byte-identical
+counters). Measured: implementing "skip policy for fabric-ingress packets"
+— the tempting fix, ruled dead because it would upgrade the residual below
+into a full zone-policy bypass — reds that one cell and no other in the
+suite.
+
+The remedy is an open design decision, tracked in #7770: the two standing
+options differ in WHERE the return-path authorisation record lives (get the
+session to the LAN node before the reply, versus have the redirecting node
+keep a punt record), not in implementation detail.
 
 RED-on-revert coverage: `afxdp/tests_fabric_zone_stamp.rs`
 `fabric_ingress_syn_ack_seeds_no_reverse_session_6478` and

@@ -21,6 +21,158 @@
 //! is pathological, but it must land somewhere defined rather than nowhere.
 //!
 //! Also not: call-ID rewriting for NAT, a general ALG framework, or IPv6.
+//!
+//! # The inbox: how a segment gets here from the data path (#7699)
+//!
+//! Parsing does not run on the AF_XDP hot path. The control channel carries a
+//! handful of small messages per call and the data channel does not, and
+//! co-locating them buys nothing anyway because RSS hashes the flow tuple — the
+//! two channels are not reliably on the same worker. So the hot path COPIES a
+//! TCP/1723 segment into [`PptpControlInbox`] and moves on; the worker's
+//! periodic work drains it, parses, installs and broadcasts.
+//!
+//! The precedent is `WorkerContext::dynamic_neighbors`, and it is the same
+//! constraint rather than an analogy: `stage_link_layer_classify`'s doc gives
+//! the rationale as "the caller does not need visibility into the learned
+//! neighbor for the same packet". An association learned from a control segment
+//! is likewise not needed for THAT segment — it is needed for the GRE data
+//! packets that follow.
+
+use std::net::IpAddr;
+use std::sync::Mutex;
+
+/// A TCP/1723 segment copied off the hot path, waiting to be parsed (#7699).
+///
+/// The data path copies and moves on; it never parses. The ports ride along
+/// because the association is bound to the control CHANNEL that taught it
+/// ([`crate::session::pptp::ControlChannelId`]) — an association must not
+/// outlive its control connection, and without the ports there is no channel
+/// to bind it to.
+#[derive(Clone, Debug)]
+pub(crate) struct PendingControlSegment {
+    pub(crate) src: IpAddr,
+    pub(crate) dst: IpAddr,
+    pub(crate) src_port: u16,
+    pub(crate) dst_port: u16,
+    pub(crate) payload: Vec<u8>,
+}
+
+/// How many un-parsed control segments the inbox will hold.
+///
+/// Small on purpose. PPTP control traffic is a handful of small messages per
+/// call, so a backlog past this means something is wrong rather than busy, and
+/// the cost of dropping is bounded and already designed: an unlearned
+/// association routes its call's data packets to the unassociated path —
+/// forwarded and counted — which is the same degradation a control segment
+/// arriving after its data takes.
+pub(crate) const PENDING_CONTROL_CAPACITY: usize = 64;
+
+/// How often the inbox is drained.
+///
+/// Matches `SESSION_GC_INTERVAL_NS`. The drain rides the periodic work the
+/// worker already does rather than adding a thread or a channel, which is the
+/// whole reason this shape was chosen — so an association can land up to one
+/// interval after its control exchange, and the first ~1s of that call's GRE
+/// data forwards unassociated.
+pub(crate) const CONTROL_DRAIN_INTERVAL_NS: u64 = 1_000_000_000;
+
+/// The hand-off from the data path to the periodic control-channel work.
+///
+/// Shared across the workers of a dataplane, like `dynamic_neighbors`, and
+/// written through `&self` for the same reason: the hot-path stage that fills
+/// it has no mutable state of its own to put it in. Sharing is also what makes
+/// ONE drain enough — whichever worker drains installs the association in its
+/// own table and broadcasts it to the rest, so a per-worker inbox would only
+/// buy N duplicate parses of the same segment.
+#[derive(Default)]
+pub(crate) struct PptpControlInbox {
+    inner: Mutex<InboxInner>,
+}
+
+#[derive(Default)]
+struct InboxInner {
+    pending: Vec<PendingControlSegment>,
+    /// When [`PptpControlInbox::take_pending`] last handed the buffer out.
+    last_drain_ns: u64,
+    /// Segments dropped because the buffer was full.
+    ///
+    /// Their calls learn no association and take the unassociated path. Counted
+    /// separately from the table's `unassociated` because the causes differ:
+    /// this one means the drain could not keep up, the other means the data
+    /// simply arrived first.
+    dropped: u64,
+}
+
+impl PptpControlInbox {
+    /// Copy a control segment in from the data path. Never blocks on work,
+    /// never parses.
+    ///
+    /// Returns whether it was accepted. A `false` is a DROP, counted, and its
+    /// consequence is the unassociated path — not a stall and not a retry,
+    /// because the data path must not wait on control-channel work.
+    ///
+    /// **Drop-NEWEST on full**, the policy `docs/engineering-style.md`
+    /// prescribes, and the rationale holds here for its own reason as well as
+    /// the general one: an older buffered segment is closer to being parsed,
+    /// and evicting it to make room would lose an association that was about to
+    /// be learned in favour of one that may not even be a control message.
+    pub(crate) fn push(&self, seg: PendingControlSegment) -> bool {
+        let mut inner = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if inner.pending.len() >= PENDING_CONTROL_CAPACITY {
+            inner.dropped = inner.dropped.saturating_add(1);
+            return false;
+        }
+        inner.pending.push(seg);
+        true
+    }
+
+    /// Hand the buffered segments out for parsing, at most once per
+    /// [`CONTROL_DRAIN_INTERVAL_NS`].
+    ///
+    /// **The interval gate is inside this function, deliberately.** The caller
+    /// is the worker poll loop, which runs at packet rate — a drain that gated
+    /// at the call site would be one edit away from running per-poll, which is
+    /// exactly the defect that shipped in #8399 when the association expiry
+    /// landed on the wrong side of `expire_stale_entries_ha`'s gate. Keeping
+    /// the gate here makes "how often" a property of the function rather than
+    /// of every caller.
+    ///
+    /// Returns an empty vec when gated, so a caller cannot distinguish "nothing
+    /// to do" from "not yet" — which is correct: both mean do nothing.
+    pub(crate) fn take_pending(&self, now_ns: u64) -> Vec<PendingControlSegment> {
+        let mut inner = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if inner.last_drain_ns != 0
+            && now_ns.saturating_sub(inner.last_drain_ns) < CONTROL_DRAIN_INTERVAL_NS
+        {
+            return Vec::new();
+        }
+        inner.last_drain_ns = now_ns;
+        std::mem::take(&mut inner.pending)
+    }
+
+    pub(crate) fn dropped_count(&self) -> u64 {
+        match self.inner.lock() {
+            Ok(g) => g.dropped,
+            Err(poisoned) => poisoned.into_inner().dropped,
+        }
+    }
+
+    pub(crate) fn pending_len(&self) -> usize {
+        match self.inner.lock() {
+            Ok(g) => g.pending.len(),
+            Err(poisoned) => poisoned.into_inner().pending.len(),
+        }
+    }
+}
+
+/// The TCP port RFC 2637 assigns the PPTP control connection.
+pub(crate) const PPTP_CONTROL_PORT: u16 = 1723;
 
 /// RFC 2637 §2.1 control-message header, before any message-specific body.
 ///
@@ -299,5 +451,70 @@ mod tests_7699 {
         let mut other = outgoing_call_reply(1, 2, RESULT_CONNECTED);
         other[8..10].copy_from_slice(&7u16.to_be_bytes()); // Outgoing-Call-Request
         assert_eq!(parse_control_segment(&other), ControlParse::Ignored);
+    }
+}
+
+#[cfg(test)]
+mod inbox_drop_policy_tests_7699 {
+    use super::*;
+
+    fn seg(n: u8) -> PendingControlSegment {
+        PendingControlSegment {
+            src: "198.51.100.7".parse().unwrap(),
+            dst: "203.0.113.9".parse().unwrap(),
+            src_port: PPTP_CONTROL_PORT,
+            dst_port: 49152,
+            payload: vec![n; 8],
+        }
+    }
+
+    /// A full inbox drops the NEWEST segment, not the oldest.
+    ///
+    /// `docs/engineering-style.md` prescribes drop-newest and asks for the
+    /// rationale at the drop site; this is the assertion that the site actually
+    /// implements what it says. It is a CONTENT assertion on purpose: the
+    /// buffer's LENGTH and the dropped COUNT are identical under both policies,
+    /// which is exactly how a drop-oldest mutation survived the first table
+    /// against a cell that checked only those two.
+    ///
+    /// Why the policy matters here rather than being a style tick: an older
+    /// buffered segment is closer to being parsed, so evicting it trades an
+    /// association that was about to be learned for one that may not even be a
+    /// control message.
+    #[test]
+    fn a_full_inbox_drops_the_newest_segment_7699() {
+        let inbox = PptpControlInbox::default();
+        for i in 0..PENDING_CONTROL_CAPACITY {
+            assert!(inbox.push(seg(i as u8)), "segment {i} must fit below capacity");
+        }
+        assert_eq!(inbox.dropped_count(), 0, "nothing dropped while it fit");
+
+        // The overflow segment carries a payload none of the others can have.
+        const OVERFLOW: u8 = 0xFF;
+        assert!(
+            !inbox.push(seg(OVERFLOW)),
+            "the segment past capacity must be REFUSED"
+        );
+        assert_eq!(inbox.dropped_count(), 1);
+
+        let drained = inbox.take_pending(1);
+        assert_eq!(drained.len(), PENDING_CONTROL_CAPACITY);
+        assert!(
+            drained.iter().all(|s| s.payload[0] != OVERFLOW),
+            "the REFUSED segment is in the buffer — push returned false but \
+             queued it anyway"
+        );
+        // Drop-newest keeps the oldest, so the buffer is the first N pushes in
+        // order. Under drop-oldest the head would have been evicted and the
+        // sequence would start at 1.
+        for (i, s) in drained.iter().enumerate() {
+            assert_eq!(
+                s.payload[0], i as u8,
+                "buffer position {i} holds segment {} — the inbox evicted the \
+                 OLDEST segment to make room, but an older segment is closer to \
+                 being parsed; drop-newest is the documented policy",
+                s.payload[0]
+            );
+        }
     }
 }

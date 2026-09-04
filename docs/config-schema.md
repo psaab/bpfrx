@@ -6220,6 +6220,121 @@ AND the value validator). As with the other flips, the reject fires only on the
 strict commit path; `compileTreeLenient` downgrades it to a warning on
 `Store.Load` / `SyncApply`.
 
+**More production flips — the OSPF interface `authentication` subtree (#8443).**
+#8473 closed the IS-IS and RIP half of #8443, where `authentication-type` is a
+real free-form leaf and an unrecognised value downgraded md5 to plaintext. OSPF's
+half is a DIFFERENT GRAMMAR and was left open deliberately: OSPF has no
+`authentication-type` leaf at all, and the algorithm is the CHILD KEYWORD of a
+nested block —
+
+```
+interface ge-0/0/0.0 { authentication { md5 <key-id> { key "s"; } } }
+interface ge-0/0/0.0 { authentication { simple-password "s"; } }
+```
+
+`compiler_protocols.go` assigns `OSPFInterface.AuthType` ONLY from a matched
+`md5` / `simple-password`, so there is no free-form value to type-check and the
+#8473 instrument could not reach it. A keyword matching neither left
+`AuthType == ""` and the renderer emitted nothing, so the adjacency came up
+**UNAUTHENTICATED** while `show configuration` echoed the operator's
+authentication block back at them. Measured before the flip, every row
+committing clean:
+
+| authored | compiled | rendered |
+|---|---|---|
+| `authentication { md5 1 { key "SEKRIT"; } }` | `AuthType="md5"` | correct |
+| `authentication { md5-typo 1 { key "SEKRIT"; } }` | `AuthType=""` | **nothing — UNAUTHENTICATED** |
+| `authentication { md5 1 { keyy "SEKRIT"; } }` | `AuthType="md5" AuthKey=""` | nothing (#8473's empty-key guard) |
+| `authentication-type md5;` | `AuthType=""` | **nothing — UNAUTHENTICATED** |
+
+The failure direction is what makes it a defect rather than an inconvenience:
+the operator believes the adjacency is protected and every surface they can
+check agrees with them.
+
+Two mechanisms close it, because those are two different shapes. The first three
+rows are unmodeled keywords INSIDE a modeled subtree, so `closedWorld: true` on
+the `authentication` node is the right instrument — and because closed-world
+inherits DOWN (`childClosed := closed || childSchema.closedWorld`), the same
+flag also catches the misspelled `key` child of `md5`. The fourth row is a leaf
+that does not exist under OSPF at all, which closing `authentication`'s world
+cannot see; it is modeled in `schema_ospf_authentication_8443.go` SOLELY so it is
+refused, in the shape #7971 established for the login-class `*-regexps` family
+(`ValueEnumOf` + an unconditional validator — `ValueAny` would leave the
+validator uninvoked and reproduce the silent-accept).
+
+**Scope was a decision, not an omission.** Closing the whole OSPF `interface`
+world would also catch the fourth row; it was measured, and the `pkg/config`
+suite stayed green with all eight `protocols … interface` nodes closed. It is
+not done here because it converts EVERY unmodeled protocol leaf from inert to
+refused, which is the #8296 class and a larger decision than #8443's scope.
+`TestOSPFAuthGateDidNotCloseTheInterfaceWorld8443` reds if a later change makes
+that flip incidentally, so it has to be taken deliberately rather than inherited.
+
+Both OSPF schema copies are flipped — `protocols ospf` and
+`routing-instances <name> protocols ospf`. That is the #8258 sibling-surface
+class, and it is load-bearing here: every top-level cell passes against a fix
+applied to one copy only, so the routing-instance copy has its own cells.
+Mutations confirm it — dropping `closedWorld` from the routing-instance copy
+alone, or removing the refused leaf from it alone, each reds exactly one cell,
+and that cell is the dedicated one.
+
+No `#1960` lenient opt is needed and that was verified rather than assumed:
+`compileTreeStrict` backs every operator commit and `CheckText`, while
+`Store.Load` / `SyncApply` go through `compileTreeLenient`, which downgrades any
+`SchemaValidate` violation to a `slog.Warn` and continues (`store.go`). A
+persisted or peer-synced config carrying one of these spellings cannot brick a
+boot. Pinned by `schema_ospf_authentication_8443_test.go`.
+
+**A typed leaf whose constraint is the CONSUMER's grammar — OSPF
+`interface-type` (#8481).** `protocols ospf ... interface <n> interface-type`
+carried an arity and a placeholder but no `valueType` and no `validator`. The
+issue reported the consequence as "commits green and leaves the interface on the
+default broadcast type", i.e. inert. **That premise is wrong, and wrong in the
+dangerous direction.** `compiler_protocols.go` stored the token verbatim into
+`OSPFInterface.NetworkType` and `pkg/frr/protocols_render.go` writes it verbatim
+into the managed section. Measured by rendering the section directly:
+
+| authored | emitted into `frr.conf` |
+|---|---|
+| `interface-type point-to-point` | `ip ospf network point-to-point` |
+| `interface-type p2p` | `ip ospf network p2p` |
+| `interface-type "bogus value"` | `ip ospf network bogus value` |
+| `interface-type ""` | (no line) |
+
+vtysh rejects a network type it does not know, and **one rejected line fails the
+entire managed-section reload** (#1880/#2223) — taking down all dynamic routing,
+not just OSPF. That is the same consequence #8443's empty-key guard was written
+for, three lines below this render site in the same file. The leaf was not
+inert; it was a way to break FRR from a clean commit.
+
+So the constraint this leaf is validated against is **vtysh's grammar**, not
+anything the xpf compiler checks — the compiler checks nothing and passes the
+token through. `OSPFNetworkTypes` (`schema_ospf_interface_type_8481.go`) is that
+set, and `CanonicalOSPFNetworkType` is the single source both the validator and
+the compiler consult, so the accepted set and the rendered set cannot drift. That
+drift is the specific shape #8443 called out: *"a per-leaf allowlist authored
+independently of the renderer's recognised set drifts right back open."*
+
+**The Junos spellings are accepted and translated, which is a deliberate scope
+choice beyond the issue's suggested shape.** `p2p`, `nbma` and `p2mp` are what
+Juniper's documentation tells an operator to write, and xpf's product claim is
+native Junos syntax. Validating against the FRR set alone would convert today's
+broken reload into a hard rejection of valid Junos syntax — better, but still a
+refusal of the exact spelling the product claims to accept. `broadcast` and
+`point-to-point` are spelled the same in both and deliberately have no alias
+entry, so a later reader does not read absence as an oversight.
+
+**The compiler canonicalizes rather than trusting the validator to have run, and
+that is the no-brick half.** `compileTreeLenient` (`Store.Load` / `SyncApply`)
+downgrades every `SchemaValidate` violation to a warning and continues, so a
+config an older binary persisted with `interface-type p2P` reaches the compiler
+UNVALIDATED. Passing it through would emit `ip ospf network p2P` and fail the
+managed-section reload on a boot the operator did not initiate — the gate would
+have converted a commit-time defect into a boot-time outage. An unresolvable
+value is therefore DROPPED on the tolerant path, pinned by
+`TestOSPFInterfaceTypeUnresolvableIsDroppedNotPassedThrough8481`.
+
+
 **More production flips — `security ike proposal` (Phase-1 crypto, #4313).**
 The Phase-1 IKE proposal container (`security ike proposal <name>`) now sets
 `closedWorld:true` (`schema_security.go`) after adding the one missing leaf
@@ -7926,6 +8041,63 @@ reserved for whole-dataplane selection where a rewrite shim
   `TestSchemaValidate_Interfaces_PackedVrrpOneLinerBypassesGate` (schema
   passes, compile rejects) and the
   `compiler_validate_strict_vrrp_priority_5184_test.go` matrix.
+  **#8483 — the same bypass on the two `vrrp-group` TIMER leaves.** The
+  #5184 gate closed `priority`; the identical packed-one-liner hole was
+  still open one leaf over. A census of every validated leaf under
+  `vrrpGroupSchemaNode` — run as one `*ConfigTree` per row handed to both
+  `SchemaValidate` and `CompileConfig`, with a braced control that must
+  REJECT and an in-range packed control that must ACCEPT — found four
+  validated leaves and two uncovered:
+
+  | leaf | schema bound | packed spelling bypasses `SchemaValidate` | compiled-`*Config` backstop before #8483 |
+  |---|---|---|---|
+  | `virtual-address` | `ValueCIDR` | yes | yes — the VIP is separately re-parsed at compile |
+  | `priority` | 1..255 | yes | yes — `validateVRRPGroupPriorityStrict` (#5184) |
+  | `advertise-interval` | 1..40 | yes | **no** |
+  | `preempt hold-time` | 1..3600 | yes | **no** |
+
+  `advertise-interval` is the sharp one and the reason this is a defect
+  rather than an inconsistency. It is SECONDS at the config layer,
+  converted seconds→ms (`pkg/vrrp/vrrp.go`) and then ms→centiseconds
+  (`uint16(cfg.AdvertiseInterval / 10)`, `instance_send.go`) into the
+  VRRPv3 Max Advert Int field, which `pkg/vrrp/packet.go` writes under a
+  12-bit mask (`p.MaxAdvertInt&0x0FFF`). 4095 cs is the largest interval
+  that survives the wire, so 40 s (4000 cs) is the last whole-second
+  value that encodes and 41 s aliases to 4 cs. The aliasing is silent and
+  ASYMMETRIC: the local advert timer uses the un-narrowed value while the
+  peer's master-down calculation uses the narrowed one, so a packed
+  `advertise-interval 256;` advertises as 10.24 s and the two nodes
+  disagree about how long silence must last before a takeover. A negative
+  survives `strconv.Atoi` into the same `uint16` arithmetic.
+  `preempt hold-time` reaches the runtime un-narrowed
+  (`time.Duration(cfg.PreemptHoldTime) * time.Second`), so its check is a
+  CONSISTENCY gate — the packed spelling agreeing with the bound a
+  structured spelling of the same config is already held to — not a
+  wire-safety one. Both are closed by `validateVRRPGroupTimersStrict`
+  (`compiler_validate_strict_vrrp_timers.go`) at the #5184 call site, with
+  the same `#1960` no-brick downgrade on the tolerant load / peer-sync
+  path (`lenientVRRPGroupTimers`).
+
+  Zero is NOT out of range for either field and the gate must exempt it:
+  it is the compiler's "unset" sentinel (`pkg/vrrp` substitutes the 1 s
+  default for `AdvertiseInterval == 0` and treats `PreemptHoldTime <= 0`
+  as preempt-immediately), so a naive mirror of the priority gate would
+  refuse every `vrrp-group` that simply does not configure a timer.
+
+  **Reachability is narrower than "any operator" and worth stating:** the
+  packed spelling is NOT reachable through `set` — `SetPath` normalizes
+  packed tokens into schema-structured children, so every flat-set
+  spelling was already gated. It is reachable through a hierarchical
+  config file (`load merge` / `load override`) and through **HA peer
+  config sync**, which is what makes it more than a typo: a packed
+  one-liner authored once propagates to the peer. It also means a fixture
+  built the usual way — `ParseSetCommand` + `SetPath` — CANNOT see this
+  class of defect, and #8483 was in fact first recorded as FALSE for
+  exactly that reason. Pinned by
+  `compiler_validate_strict_vrrp_timers_8483_test.go`, whose fixture is
+  hierarchical for that reason and whose accept-side controls (in-range
+  packed, the inclusive 40 boundary, and a group with NO timers set) are
+  what distinguish a working gate from one that rejects everything.
   **#4826 — reth-derived VRID range gate:** #4573 only bounded the
   *explicit* `vrrp-group <id>` slot; a RETH interface's VRRP GroupID is
   separately synthesized as `100 + redundancy-group-id`

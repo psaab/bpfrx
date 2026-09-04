@@ -1048,11 +1048,13 @@ match side effects or counters.
 `egress_zone` above are u16 ids resolved by
 `forwarding::zone_pair_ids_for_flow_with_override`. The ingress half reads
 `ForwardingState::ifindex_to_zone_id`; the egress half calls
-`ForwardingState::egress_zone_id`, which prefers the denormalized
-`EgressInterface.zone_id` (one map lookup + a field load on the hot path,
-**including when that field is 0** — see the short-circuit below) and falls back
-to `ForwardingState::ifindex_unambiguous_zone_id` when the interface has **no
-`egress` row at all**.
+`ForwardingState::egress_zone_id`, which is a single read of
+`ForwardingState::ifindex_unambiguous_zone_id`.
+
+*(The `EgressInterface.zone_id` arm this used to prefer went away in #6722
+round 10, once `populate_egress` began sourcing that field from the same ledger:
+both arms then returned the same number for every state. The paragraphs below
+describe why the fallback exists and are unchanged by the collapse.)*
 
 That fallback is load-bearing, not defensive. `forwarding_build::populate_egress`
 builds an `EgressInterface` only for an interface whose link-layer address it can
@@ -1105,30 +1107,95 @@ Scope of the fallback:
   resolves the **0 sentinel** — the pre-#6713 answer, against which no exact,
   wildcard or `junos-global` rule matches, so the default policy decides.
 
-  This deliberately makes the two DIRECTIONS disagree for an ambiguous ifindex:
-  ingress still attributes an arriving packet to `ifindex_to_zone_id`
-  (#921/#3618, unchanged), while egress answers 0. The asymmetry is justified by
-  DIRECTION, not by the ingress surface being unreachable — that is only true in
-  shape 3, where every row is unzoned and the two Go-side derivations that scope
-  ingress both open with `if iface.Zone == "" ||
-  userspaceSkipsIngressInterface(iface)`: `UserspaceBoundLinuxInterfaces`
-  (`interfaces.go:133`, guard at `:164`) and `buildUserspaceIngressIfindexes`
-  (`maps_sync.go:1585`, guard at `:1592`). Together they give the ifindex no
-  AF_XDP bind target at all. In shapes 1 and 2 the base row is zoned, so the ifindex *is* a bind
-  target and ingress really does answer `vpnb` for arriving traffic. What makes
-  the two halves different is that ingress answering wide is pre-existing
-  behaviour this change does not touch, while egress answering wide is a NEW
-  fail-open on the exact interface class #6713 routed through the fallback:
-  a to-zone is what makes a permit match. Whether the ingress half should be
-  narrowed the same way is a separate #921/#3618 question, not settled here.
-  Where the ifindex is UNambiguous — #6713's own shape, `bind-interface st0`
-  with its unit in the same zone — both halves still answer the same zone, so
-  #6713 is untouched.
+  Through #6722 this deliberately made the two DIRECTIONS disagree for an
+  ambiguous ifindex — ingress kept attributing an arriving packet to
+  `ifindex_to_zone_id` while egress answered 0 — and #6727 warned at the time
+  that fixing only the egress half would be worse than leaving both alone. That
+  asymmetry is now CLOSED, in two steps.
 
-  Junos zones logical UNITS, so the remaining gap runs the other way: `st0.0`
-  and `st0.1` cannot be given DIFFERENT zones and both forward. Closing that
-  needs per-unit identity end to end — the snapshot's unit-0 ifindex collapse,
-  both halves of the zone resolver, and the AF_XDP bind keying — and is tracked
+- **Ingress refuses a contested ifindex too (#8407, then #7509).** The ingress
+  half is `ifindex_to_zone_id`, built in
+  `userspace-dp/src/afxdp/forwarding_build/interfaces.rs`. It now declines to
+  attribute a zone in exactly the cases the egress half declines:
+
+  1. **Two zoned rows that DISAGREE about one ifindex (#8407).** Both arms that
+     could guess — the same-ifindex insert (last-wins) and the child→parent
+     propagation (first-wins) — refuse, and the ifindex stays unzoned for the
+     REST of the walk, so a third row carrying the first zone cannot resurrect a
+     guess a second row already contested.
+  2. **A zoned row contradicted by an UNZONED logical UNIT on the same ifindex
+     (#7509)** — shape 1 above, the reported case: `st0.1` in `vpnb`, `st0.0`
+     deliberately in no zone, one base netdev.
+
+  Case 2 needs a fact #6727 and #8407 both recorded as "not on the wire": whether
+  a base row's zone was AUTHORED there or merely INHERITED from a sibling unit.
+  It is on the wire — not on the row that needs it, but on that row's UNIT
+  SIBLINGS. `InterfaceZoneMap` (`pkg/config/host_inbound_effective_view.go`) fans
+  a BARE `security-zone <z> interfaces <ifc>` reference DOWN onto every
+  configured unit and a unit-suffixed one only UP, so an authored base has unit
+  rows carrying its zone and an inherited base does not. The base rows are
+  byte-identical; the unit siblings are not. `UnitZoneClaim` /
+  `unit_rows_admit` in `forwarding_build/interfaces.rs` read exactly that: an
+  ifindex whose logical-unit rows do not unanimously name one nonzero zone takes
+  no zone from a base row and none from a child→parent propagation either.
+
+  **The refusal is scoped to ifindexes that CARRY a unit row**, which is what
+  keeps #921/#3618 intact: a trunk parent whose units all have netdevs of their
+  own has no unit row on its own ifindex, nothing contradicts the inheritance,
+  and untagged traffic on it is still attributed to the unit's zone. That
+  boundary is measured from the Go side in
+  `pkg/dataplane/userspace/zone_unit_provenance_7509_test.go`
+  (`TestTrunkWithNoUnitZeroPutsNoUnitRowOnTheParentIfindex_7509`, with the
+  positive control that declaring unit 0 DOES put a row there).
+
+  **The residual asymmetry, stated because it is the last one.** Ingress and
+  egress now answer the same for every shape above. They still differ for two
+  INTERFACES sharing one recycled ifindex that happen to AGREE on a zone: every
+  row names it so ingress admits it, while `egressIdentitiesCohere`
+  (`pkg/dataplane/userspace/interfaces.go`) refuses because two independent
+  claimants on one device are not an authorisation whatever their rows agree on.
+  That state is what
+  `unzoned_interface_with_egress_row_stays_zone_zero_6713` binds after #7509 —
+  it is the only remaining state in which "which map does the egress half read"
+  is observable.
+
+  **Accepted cost.** Where a unit the operator left out of every zone shares a
+  device with a zoned sibling, that traffic now falls to the default policy in
+  BOTH directions rather than being adjudicated under the sibling's zone. In
+  practice that is untagged traffic on a mixed-zone trunk and unit-0 traffic on
+  an interface-level tunnel. It is Junos parity — `st0.0` and `st0.1` are
+  different units and may be in different zones or none, and a unit in no zone
+  forwards nothing — and it removes a policy BYPASS: the sibling's zone is a
+  policy set the operator wrote for a different interface. It is reported so it is
+  not silent, and the two reports are NOT equally effective — measured, not
+  assumed:
+
+  - the **runtime warning** from `forwarding_build/interfaces.rs` names the
+    ifindex and the refused zone ids, one line per contested ifindex per build.
+    Observed in the journal on `loss:xpf-userspace-fw0` for a second, unzoned
+    unit added to `gr-0/0/0`:
+    `WARNING ifindex 10 carries a logical unit the operator left out of zone
+    ids [52010]`.
+  - the **commit-time advisory** in
+    `pkg/config/contested_trunk_zone_advisory_7509.go` names the interface and
+    the units, and is produced by the real compiler
+    (`TestBothZoneAdvisoriesReachTheRealCompiler7509`). It does NOT currently
+    reach an operator through the remote `cli`: neither `commit` nor
+    `commit check` rendered it on that box. The already-merged #8402 advisory
+    behaves identically there, measured as a control in the same session, so the
+    gap is in the commit RESPONSE path rather than in either advisory, and it is
+    filed as #8484.
+
+  **What would invalidate the rationale (#4308).** Untagged frames have no
+  principled unit attribution today because `native-vlan-id` is accepted-only and
+  unenforced. If #4308 is implemented they acquire a defined unit — the native
+  VLAN — and declining to zone them becomes wrong for that unit specifically,
+  while staying right for every other contested case.
+
+  Junos zones logical UNITS, so a gap still runs the other way: `st0.0` and
+  `st0.1` cannot be given DIFFERENT zones and both forward. Closing that needs
+  per-unit identity end to end — the snapshot's unit-0 ifindex collapse, both
+  halves of the zone resolver, and the AF_XDP bind keying — and is tracked
   separately rather than papered over at this one read. Until then such a pair
   fails closed rather than guessing.
 

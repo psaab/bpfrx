@@ -38,9 +38,20 @@ Last updated: 2026-05-24
 | Multi-Tenancy | 4 | 0 | 0 | 4 |
 | Management & Automation | 12 | 2 | 0 | 14 |
 | Interface Enhancements | 1 | 1 | 0 | 2 |
-| System Enhancements | 5 | 0 | 1 | 6 |
+| System Enhancements | 6 | 0 | 1 | 7 |
 | Miscellaneous | 6 | 0 | 0 | 6 |
-| **TOTAL** | **120** | **19** | **1** | **140** |
+| **TOTAL** | **121** | **19** | **1** | **141** |
+
+> **Count note (#7971).** The System Enhancements row was recounted directly
+> against that section's own rows before being incremented (5 Missing + 1
+> Parse-Only before this change, matching what the table already claimed), so
+> its +1 is verified rather than assumed. The TOTAL row is incremented by the
+> same +1 and **no further**: the 23 category rows already summed to 121 while
+> the TOTAL read 120 before this change, i.e. the table carried a pre-existing
+> off-by-one. That is left as-is rather than silently absorbed, because
+> correcting a global quantifier would mean recounting all 23 sections and a
+> re-count over a population nobody has verified is worse than a known-stale
+> number — it reads as audited.
 
 > The per-section counts and grand total above are a hand-maintained
 > summary and drift by ±1 against a strict machine row-parse of
@@ -935,6 +946,7 @@ xpf has hostname, domain-name, domain-search, timezone, name-servers, NTP, servi
 |---------|-------------------|-------------|----------|--------|
 | **SSH Key Exchange** | `system services ssh key-exchange ...` | Restrict the SSH key-exchange (KEX) algorithms the firewall offers | Medium | Done (H5/#2008 — repeatable leaf rendered to the sshd `KexAlgorithms` drop-in, `pkg/daemon/daemon_system.go`; drop-in lifecycle hardened in #2062 — removing/emptying the ssh stanza removes the `/etc/ssh/sshd_config.d/xpf.conf` drop-in and reloads so sshd reverts to base-image defaults, and a reload failure after a write reverts the drop-in to its prior content/removes it so a bad config never breaks the next sshd restart) |
 | **Syslog File Archive / Rotation** | `system syslog file <name> archive { files <n>; size <bytes>; start-time <t>; transfer-interval <min>; archive-sites <url>; }` | Rotate `/var/log/<name>` at a size threshold, retain N archives, and transfer them off-box on a schedule | Low | Missing — accepted-but-inert with a commit advisory (#7146). The whole block is modeled in `setSchema` and compiled by nothing: #4303 folded `archive` into `compileSystem`'s recognized-modifier skip list, and `applySyslogFiles` writes only an rsyslog drop-in pointing at `/var/log/<name>`. #7146 keeps it unimplemented and makes it LOUD instead of silent — the block is recorded on `SyslogFileConfig` (`ArchiveConfigured` / `ArchiveKnobs`, keywords only) and `ValidateConfig` emits one per-file advisory naming the file and its knobs and stating the logs are NOT archived. Warn, never reject: the stanza commits today and a reject would fail the tolerant load / peer-sync path (#1960). Implementing it needs rotation, size accounting, a transfer schedule, and an `scp` path that would then owe the #4589 leading-dash gate that guards `system archival configuration archive-sites`. See [docs/config-schema.md](config-schema.md) "Syslog file `archive` is accepted-but-inert (#7146)". |
+| **Login-class `*-regexps` restrictions** | `system login class <c> { allow-commands-regexps ...; deny-commands-regexps ...; allow-configuration-regexps ...; deny-configuration-regexps ...; }` | Junos' SECOND command/configuration restriction family, parallel to the `allow-commands`/`deny-commands` pair xpf implements | Medium | **Won't-do for now — REFUSED at commit (#7971, #8491).** Not a syntax variant of the family xpf has: its allow/deny precedence is **INVERTED** (`-regexps`: **deny wins**; plain: allow wins) and each pattern matches the command's **full path** rather than partially. Wiring it to the plain family's evaluator would therefore look like responsible reuse while producing a `deny-commands-regexps` that LOSES to an `allow-commands-regexps` — a privilege escalation. `LoginRegexFamily.IdenticalPatternWinner` (`pkg/config/login_regex.go`, #7172) already holds precedence as per-family DATA for exactly that reason; any implementation must carry its own rule and parameterise the matching subject too, and its test needs a config with BOTH families where one command matches an allow in one and a deny in the other (a single-family fixture cannot tell a per-family rule from a shared one). **Read this before deciding it is only a parity gap:** xpf consequently has NO deny-precedence restriction family at all, and `login_regex.go` documents that the plain family's allow-over-deny combined with unanchored partial matching lets a wide allow silently re-permit a narrow deny. The absent family is the one whose precedence fails safe. Until #7971 the four leaves committed CLEAN and were silently discarded — an access control that accepted a restriction and applied none; #8491 models them solely so they are refused, with a message naming the leaf, the inversion, and the supported alternative. See [docs/system-login.md](system-login.md). |
 | **RADIUS Server Config** | `system radius-server ... port ... secret ...` | RADIUS server definitions for AAA (authentication, authorization, accounting) | Medium | Missing |
 | **TACACS+ Server Config** | `system tacplus-server ... port ... secret ...` | TACACS+ server definitions for per-command authorization | Medium | Missing |
 | **Authentication Order** | `system authentication-order [radius tacplus password]` | Control order of authentication methods for management access | Medium | Missing |

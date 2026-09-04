@@ -8286,22 +8286,23 @@ fn worker_commands_install_and_forget_pptp_associations_7699() {
 /// cell along with two unit cells; swapping `src`/`dst` in
 /// `learn_from_control_segment` reds this one and the attribution cell.
 ///
-/// **It does NOT bind production wiring, because there is none yet.** Nothing
-/// in the running dataplane calls `learn_from_control_segment` or
-/// `broadcast_pptp_install` — the packet-path dispatch that recognises a
-/// TCP/1723 segment and routes it to this parser off the hot path is stage 2's
-/// remaining half, tracked in #7699's body. This cell chains the two at the
-/// TEST level, which is a hand-chained pair, and a hand-chained pair cannot
-/// notice that production never chains them.
+/// **It does NOT bind production wiring**, and it never did: it chains the
+/// parser to the broadcast at the TEST level, which is a hand-chained pair, and
+/// a hand-chained pair cannot notice that production never chains them. When
+/// this was written production did not, and this comment said so.
 ///
-/// That is stated rather than left implicit because the earlier version of this
-/// comment claimed the opposite — it named "delete the call from the publish
-/// path" as the falsifying mutation, and there is no publish path to delete it
-/// from. The claim was unfalsifiable, which is worse than silence: it would be
-/// believed exactly as long as nobody tried it. Written, ironically, in the act
-/// of citing #7685 and #8392 as the two-correct-halves-and-no-join cases —
-/// knowing the failure mode by name did not prevent writing an instance of it.
-/// When the dispatch lands, the production join needs its own cell.
+/// That was stated rather than left implicit because an EARLIER version claimed
+/// the opposite — it named "delete the call from the publish path" as the
+/// falsifying mutation, and there was no publish path to delete it from. The
+/// claim was unfalsifiable, which is worse than silence: it would be believed
+/// exactly as long as nobody tried it.
+///
+/// **The production join now exists** (#7699's packet-path dispatch): the hot
+/// path copies a TCP/1723 segment into `PptpControlInbox` and the worker's
+/// periodic drain parses, installs and broadcasts it. Its own cell —
+/// `afxdp::poll_stages::tests::pptp_dispatch_join_tests_7699::the_stage_captures_a_control_segment_and_the_drain_learns_it_7699`
+/// — runs the REAL stage over real frame bytes, so deleting the push reds it.
+/// This cell stays as the parser/broadcast composition test it always was.
 #[test]
 fn a_control_segment_becomes_a_resolvable_association_7699() {
     use crate::session::pptp_control::{

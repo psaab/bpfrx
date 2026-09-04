@@ -1156,6 +1156,29 @@ pub(super) fn remove_shared_session(
     shared_owner_rg_indexes: &SharedSessionOwnerRgIndexes,
     key: &SessionKey,
 ) {
+    // #7209: un-file this key from the reverse-prewarm index HERE, so that
+    // EVERY removal path is covered rather than only the coordinator's delete
+    // verb. `purge_translated_synced_hit` (session_glue/promote.rs) and the
+    // LocalDelivery replacement after `take_synced_local` (session/lookup.rs)
+    // both remove a peer-synced forward entry through this function and neither
+    // calls `refresh_reverse_prewarm_owner_rg_indexes`. A later coordinator
+    // delete then finds no stored entry and refreshes with `(None, None)`, so
+    // before this the filing survived for the life of the process with no
+    // session behind it — the same unbounded strand #7209 set out to close,
+    // reached by a different door.
+    //
+    // Unconditional, and BEFORE the `remove` below: correctness does not depend
+    // on the entry still being present. A key with no entry must not be filed
+    // either — the activation prewarm looks the key up and skips it, so such a
+    // filing is pure scan cost on the failover critical path.
+    //
+    // Needs no `forwarding`, which is what allows it to live here at all. While
+    // the un-file was derived from the FIB it could only be done where a
+    // `ForwardingState` was in scope, and it could not be authoritative anyway.
+    {
+        let mut index = lock_shared_recover(&shared_owner_rg_indexes.reverse_prewarm_sessions);
+        remove_owner_rg_index_key_from_every_bucket_locked(&mut index, key);
+    }
     // #2402: recover poison so a delete-sync removal is never silently
     // skipped (leaving a stale entry that would mis-route after failover)
     // because a worker panicked under the shared-session lock.
@@ -1237,37 +1260,47 @@ pub(super) fn owner_rg_session_keys_serialized(
 /// `(Some, None)` is a delete, `(None, Some)` an insert, `(Some, Some)` a
 /// replace of the same key.
 ///
-/// #7209: THE REMOVAL HALF IS DELIBERATELY NOT DERIVED FROM `forwarding`.
+/// #7209: THE INDEX IS ADD-ONLY WHILE THE ENTRY IS LIVE. Un-filing happens
+/// exactly once, when the entry is authoritatively REMOVED — and that is done
+/// by `remove_shared_session`, not here, so that every removal path is covered
+/// rather than only the coordinator's delete verb.
 ///
 /// An entry's buckets are `reverse_prewarm_owner_rg_candidates`: the RG named
 /// by its own metadata (which travels with the entry, so it cannot drift) and
 /// the RG that owns the egress interface a reply to `key.src_ip` would leave
-/// by — which is read out of the FIB, and therefore is a property of WHEN the
-/// question is asked. Recomputing that set to decide what to REMOVE assumes the
-/// FIB has not moved since the key was filed, and an entry's lifetime spans
-/// arbitrarily many commits. Re-home an interface between RGs while a synced
-/// session is live and the recomputed set names a bucket the key is not in,
-/// while the bucket it IS in is never named again by anything:
+/// by — read out of the FIB, and therefore a property of WHEN the question is
+/// asked. So a refresh can only ever compute the buckets the FIB can name
+/// *right now*, which is a strict SUBSET of the truth whenever the FIB is
+/// momentarily blind to the reply path: a RETH member down with the route not
+/// yet re-homed, or `stop_inner` having emptied `forwarding` between a failed
+/// reconcile and its retry.
 ///
-///   * the session is gone, so no later transition carries it, and
-///   * the index is only READ — never rebuilt — by
-///     `prewarm_reverse_synced_sessions_for_owner_rgs`.
+/// THE TWO DIRECTIONS ARE NOT SYMMETRIC, which is the whole design.
 ///
-/// The key is then stranded for the life of the process, and every RG
-/// activation walks a set that only grows. That is on the failover critical
-/// path: #4069 rewrote this index's key merge from O(N*M) to O(N+M) because its
-/// SIZE measurably slowed how quickly a newly-primary node fully forwarded.
+///   * An EXTRA bucket costs one re-synthesis that
+///     `prewarm_reverse_synced_sessions_for_owner_rgs` then discards — it
+///     re-derives the reverse companion under live tables and re-checks
+///     `owner_rg_set.contains(..)` before keeping anything. The consumer
+///     absorbs over-filing by construction.
+///   * A MISSING bucket is never checked, because the key never enters the
+///     candidate set at all. The session is simply not pre-resolved when that
+///     RG activates.
 ///
-/// So the removal drops the key from EVERY bucket rather than from a
-/// recomputed guess. The result is identical whenever the FIB did not move
-/// (the recomputed set was then exactly the filed set) and correct when it
-/// did, which makes the asymmetry structurally impossible instead of merely
-/// unreachable — the shape this has to be in before `sync_session` can run off
-/// the snapshot-wide `ServerState` mutex, where a reconcile can empty
-/// `forwarding` UNDER an import and make the divergent case the common one.
+/// So over-filing degrades a scan and under-filing drops reply traffic at a
+/// failover. Anything this function cannot re-derive, it must not remove.
 ///
-/// The walk is over the RGs that currently hold synced sessions — single
-/// digits on a real chassis cluster — and allocates nothing.
+/// HISTORY, because the shape here is the second attempt and the first one
+/// shipped. Originally the removal half recomputed the PREVIOUS entry's
+/// candidate set against the CURRENT forwarding, which stranded a key
+/// permanently whenever a route moved between RGs during the entry's life —
+/// the index is only READ, never rebuilt, by the activation prewarm, so
+/// nothing ever named that bucket again. PR #8479 fixed that by making every
+/// refresh un-file from EVERY bucket and re-file `candidates(next)`, which
+/// removed the strand and introduced the inverse defect above: a refresh
+/// landing in a blind-FIB window narrowed the filing and nothing restored it.
+/// Splitting the two — add-only here, authoritative un-file at removal — is
+/// what gets both, and it is why the un-file no longer needs `forwarding` at
+/// all and could therefore move to the one place every removal goes through.
 pub(super) fn refresh_reverse_prewarm_owner_rg_indexes(
     index: &Arc<Mutex<OwnerRgSessionIndex>>,
     forwarding: &ForwardingState,
@@ -1275,31 +1308,55 @@ pub(super) fn refresh_reverse_prewarm_owner_rg_indexes(
     previous_entry: Option<&SyncedSessionEntry>,
     next_entry: Option<&SyncedSessionEntry>,
 ) {
-    let next_owner_rgs = next_entry
-        .map(|entry| reverse_prewarm_owner_rg_candidates(forwarding, dynamic_neighbors, entry));
-    // #2402: recover poison so reverse-prewarm index maintenance is not
-    // skipped after a prior worker panic.
-    let mut index = lock_shared_recover(index);
-    if let Some(previous_entry) = previous_entry {
-        remove_owner_rg_index_key_from_every_bucket_locked(&mut index, &previous_entry.key);
-    }
-    if let Some(next_entry) = next_entry {
-        for owner_rg_id in next_owner_rgs.unwrap_or_default() {
-            index
-                .entry(owner_rg_id)
-                .or_insert_with(FastSet::default)
-                .insert(next_entry.key.clone());
+    let Some(next_entry) = next_entry else {
+        // A removal. Un-file authoritatively — the entry is gone, so no bucket
+        // it holds can still be wanted, and no FIB lookup is needed to know
+        // that. `remove_shared_session` already does this for every removal
+        // path; keeping it here too makes the coordinator's delete verb
+        // self-contained and the operation is idempotent.
+        if let Some(previous_entry) = previous_entry {
+            // #2402: recover poison so index maintenance is not skipped after
+            // a prior worker panic.
+            let mut index = lock_shared_recover(index);
+            remove_owner_rg_index_key_from_every_bucket_locked(&mut index, &previous_entry.key);
         }
+        return;
+    };
+    // The entry is live: ADD what the FIB can name now, remove nothing.
+    // `previous_entry` is deliberately unused on this arm — its buckets were
+    // filed by an earlier call that could see a FIB this one may not.
+    let next_owner_rgs =
+        reverse_prewarm_owner_rg_candidates(forwarding, dynamic_neighbors, next_entry);
+    let mut index = lock_shared_recover(index);
+    for owner_rg_id in next_owner_rgs {
+        index
+            .entry(owner_rg_id)
+            .or_insert_with(FastSet::default)
+            .insert(next_entry.key.clone());
     }
 }
 
 /// #7209: drop `key` from every owner-RG bucket, pruning buckets it emptied.
+///
+/// Needs no `forwarding`, which is the point: an authoritative un-file must not
+/// depend on a table that may be unable to name the buckets the key is in.
 ///
 /// The `retain` predicate also drops buckets that were ALREADY empty. That is
 /// not a behaviour change: `remove_owner_rg_index_entry_locked` has always
 /// pruned on emptying, so an empty bucket is unreachable state, and
 /// `owner_rg_session_keys` reads through `get`, for which an empty set and an
 /// absent one are indistinguishable.
+///
+/// COST, stated honestly. `HashMap::retain` is O(CAPACITY), not O(len), so this
+/// walks the whole allocation and the pruning does not shrink its high-water
+/// capacity. Capacity is bounded by the number of DISTINCT owner-RG ids ever
+/// filed, which on a real chassis cluster is single digits — but the helper
+/// does not enforce that: `metadata.owner_rg_id` arrives from the peer as a raw
+/// `i32` and every positive value is filed. A peer sending N distinct ids
+/// therefore inflates this walk. That is a bound worth enforcing at the import
+/// boundary rather than assuming here; it is not enforced today. Runs once per
+/// authoritative removal (never per refresh) on the control thread, and
+/// allocates nothing.
 fn remove_owner_rg_index_key_from_every_bucket_locked(
     index: &mut OwnerRgSessionIndex,
     key: &SessionKey,
@@ -1308,6 +1365,17 @@ fn remove_owner_rg_index_key_from_every_bucket_locked(
         keys.remove(key);
         !keys.is_empty()
     });
+}
+
+/// #7209: test-only view of the candidate set, so a cell can assert which
+/// arrangement its fixture is actually in rather than assuming it.
+#[cfg(test)]
+pub(super) fn reverse_prewarm_owner_rg_candidates_for_test(
+    forwarding: &ForwardingState,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
+    entry: &SyncedSessionEntry,
+) -> FastSet<i32> {
+    reverse_prewarm_owner_rg_candidates(forwarding, dynamic_neighbors, entry)
 }
 
 fn reverse_prewarm_owner_rg_candidates(

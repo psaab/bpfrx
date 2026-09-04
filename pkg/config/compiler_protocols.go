@@ -99,7 +99,19 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 					case "no-passive":
 						iface.NoPassive = true
 					case "interface-type":
-						iface.NetworkType = nodeVal(prop)
+						// #8481: canonicalize through the SSOT the schema
+						// validator uses, so the accepted set and the rendered
+						// set cannot drift. On the tolerant load / peer-sync
+						// path the value has NOT been through the validator,
+						// so an unresolvable token is dropped rather than
+						// passed to FRR — a config an older binary persisted
+						// must not be able to break the managed-section
+						// reload on a boot the operator did not initiate.
+						if v := nodeVal(prop); v != "" {
+							if canon, ok := CanonicalOSPFNetworkType(v); ok {
+								iface.NetworkType = canon
+							}
+						}
 					case "cost":
 						if v := nodeVal(prop); v != "" {
 							if n, err := strconv.Atoi(v); err == nil {

@@ -238,7 +238,29 @@ var gateBlindCeiling = map[gateBlindClass]int{
 	// the leaf observable, so it left this class. Tightening rather than
 	// leaving it loose is the point of the ratchet: the slack would otherwise
 	// be room for the next regression to hide in.
-	gateBlindUnreachable: 136,
+	// #7971 raised this 136 -> 140, deliberately, for the four
+	// `system login class <*> {allow,deny}-{commands,configuration}-regexps`
+	// leaves. They are modeled SOLELY so they are refused at commit
+	// (schema_login_regexps_7971.go), so both spellings of each produce the same
+	// rejection and the differential can observe no difference between them.
+	// That is not a gap the differential could close: a leaf whose every value
+	// is refused has no output for a spelling to move. The blindness here is a
+	// property of the leaf's purpose, not slack — and if the `-regexps` family
+	// is ever implemented, these four must LEAVE this class and the ceiling must
+	// come back down by four.
+	// #8443 raised this 140 -> 142, deliberately, for the two
+	// `protocols ospf ... interface <*> authentication-type` leaves (top-level
+	// and the routing-instances copy). Like the #7971 `-regexps` family above,
+	// they are modeled SOLELY so they are refused at commit
+	// (schema_ospf_authentication_8443.go) — OSPF has no such leaf, and leaving
+	// it unmodeled meant it committed clean and left the adjacency
+	// UNAUTHENTICATED. Both spellings of a refused leaf produce the same
+	// rejection, so the differential can observe no difference between them.
+	// Not a gap it could close: a leaf whose every value is refused has no
+	// output for a spelling to move. If OSPF ever gains a real
+	// `authentication-type`, these two must LEAVE this class and the ceiling
+	// must come back down by two.
+	gateBlindUnreachable: 142,
 	// #7132 raised this 175 -> 176 for `system ntp server ... prefer`.
 	//
 	// Raised deliberately, and it is the one kind of raise that is not a

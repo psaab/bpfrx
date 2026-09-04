@@ -522,14 +522,36 @@ allow-commands-regexps / deny-commands-regexps
 allow-configuration-regexps / deny-configuration-regexps
 ```
 
-**xpf does not implement it.** There is no schema leaf, so a `-regexps`
-statement is rejected at commit as an unknown leaf rather than accepted and
-ignored — the safe posture for a control that is not implemented. (Until #7172
-the plain `deny-commands` was refused for the same reason; it is enforced now,
-so only the `-regexps` family is still refused.) An operator following Juniper's documentation and writing
-`set system login class limited deny-commands-regexps "..."` will see the
-commit refused; that is intended, not a bug, and the restriction should be
-expressed with a narrower `permissions` set.
+**xpf does not implement it, and it is REFUSED at commit** — as of #7971, and
+not before. An operator following Juniper's documentation and writing
+`set system login class limited deny-commands-regexps "..."` sees the commit
+refused with a message naming the leaf, the precedence difference, and the
+supported alternative. That is intended, not a bug; express the restriction
+with a narrower `permissions` set or with the plain family.
+
+> **Correction (#7971).** This section previously said the family was refused
+> *because* there was no schema leaf: "There is no schema leaf, so a `-regexps`
+> statement is rejected at commit as an unknown leaf rather than accepted and
+> ignored — the safe posture." **That inference was wrong and the stated posture
+> was the opposite of the behaviour.** `closedWorld` is opt-in per subtree
+> (`pkg/config/schema.go`) and `system login class` does not set it, so
+> `SchemaValidate` leaves an unmodeled keyword to the compiler, which drops it.
+> Measured on the real commit path, with the supported `deny-commands` as the
+> accept-side control:
+>
+> ```
+> deny-commands-regexps "^set system"  -> ACCEPT, nothing retained
+> deny-commands         "^set system"  -> ACCEPT, DenyCommands retained
+> ```
+>
+> Both committed clean; only one did anything. For an access control that is the
+> fail-OPEN direction — the operator authors a restriction, sees success, and is
+> not restricted — and it is strictly worse than the missing feature, which is at
+> least visible. The four leaves are now modeled in `setSchema` **solely so they
+> are rejected** (`pkg/config/schema_login_regexps_7971.go`), with
+> `login_regexps_rejected_7971_test.go` pinning both the refusal and the
+> accept-side control. Absence of a schema leaf does not imply rejection; only
+> `closedWorld` does.
 
 It is called out separately from the unmodelled leaves above because it is not
 merely absent — **it inverts the precedence rule of the family xpf does
@@ -553,6 +575,21 @@ must be **per-family data, not a constant**, and the test that binds it needs a
 config carrying *both* families with a command matching an allow in one and a
 deny in the other — a single-family fixture cannot tell a per-family rule from a
 shared one.
+
+**Decision (#7971): won't-do for now**, recorded as a row in
+[`docs/feature-gaps.md`](feature-gaps.md) §22 rather than left implicit. The row
+states the precedence inversion as the reason reuse is unsafe, so the next
+reader does not wire the leaves to the plain family's evaluator. It also records
+the part that is easy to miss: because the absent family is the deny-precedence
+one, xpf has **no** deny-wins restriction family at all, and the plain family's
+allow-over-deny combined with unanchored partial matching (below) lets a wide
+allow silently re-permit a narrow deny. The gap is a safety gap, not only a
+parity gap.
+
+Modeling the four leaves to REJECT them is deliberately not a step toward
+implementing the family: nothing in `schema_login_regexps_7971.go` consumes
+`LoginRegexFamily`, and it must stay that way until the precedence and
+full-path-matching differences above are both handled in the same change.
 
 `pkg/config/login_regex.go` already records this distinction in its header
 comment for exactly that reason. Note that the file's presence does **not** mean

@@ -1162,16 +1162,32 @@ fn build_live_forward_request_logs_no_zone_for_an_ambiguous_ifindex_6722() {
         live_forward_filter_log_zones_6722(SHARED_TUNNEL_IFINDEX_6722);
 
     assert_eq!(ingress_zone_id, TEST_LAN_ZONE_ID);
+    // #7509 retarget of this cell's non-vacuity guard. It used to read "the map
+    // this site must NOT read carries a nonzero zone for the shared ifindex",
+    // which stopped holding once INGRESS refused the inherited zone too. The
+    // guard it is replaced by is the one that still discriminates: an
+    // UNCONTESTED ifindex in the SAME state resolves a real zone at this same
+    // log site, so "logs 0" cannot pass on a state with no zones in it.
+    assert_eq!(
+        forwarding
+            .ifindex_unambiguous_zone_id
+            .get(&ZONED_TUNNEL_IFINDEX_6722)
+            .copied()
+            .unwrap_or(0),
+        TEST_SIBLING_VPN_ZONE_ID_6722,
+        "control: the sibling ifindex 43 IS unambiguous and resolves `vpnb` in \
+         this same state -- otherwise 'logs 0' would be indistinguishable from an \
+         empty state"
+    );
     assert_eq!(
         forwarding
             .ifindex_to_zone_id
             .get(&SHARED_TUNNEL_IFINDEX_6722)
             .copied()
             .unwrap_or(0),
-        TEST_SIBLING_VPN_ZONE_ID_6722,
-        "precondition: the map this site must NOT read carries a real nonzero \
-         zone for the shared ifindex -- otherwise 'logs 0' would be \
-         indistinguishable from an empty state"
+        0,
+        "and after #7509 the INGRESS map refuses the shared ifindex as well, so \
+         both halves agree that ifindex 42 names no zone"
     );
     assert_eq!(
         egress_zone_id, 0,

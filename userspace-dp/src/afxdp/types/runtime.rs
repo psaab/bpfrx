@@ -643,6 +643,19 @@ pub(in crate::afxdp) struct WorkerContext<'a> {
     pub(in crate::afxdp) forwarding: &'a ForwardingState,
     pub(in crate::afxdp) ha_state: &'a BTreeMap<i32, HAGroupRuntime>,
     pub(in crate::afxdp) dynamic_neighbors: &'a Arc<super::sharded_neighbor::ShardedNeighborMap>,
+    /// #7699: the PPTP control-segment inbox the data path copies a TCP/1723
+    /// segment into.
+    ///
+    /// Carried here for the same reason as `dynamic_neighbors` directly above,
+    /// and under the same constraint: a stage writes it through interior
+    /// mutability, and the caller does not need visibility into what was
+    /// learned for the SAME packet — an association learned from a control
+    /// segment is needed by the GRE data packets that follow it, never by the
+    /// segment itself. The alternative, threading `&mut SessionTable` into a
+    /// hot-path stage, would widen that stage's contract permanently for one
+    /// feature, and could not work anyway: no `&mut sessions` site in the
+    /// worker loop has a packet frame.
+    pub(in crate::afxdp) pptp_control: &'a Arc<crate::session::pptp_control::PptpControlInbox>,
     /// #1769: shared on-demand neighbor resolver. `Some` in production
     /// (spawned at coordinator bring-up); `None` in unit tests that do
     /// not exercise the resolver path. The `MissingNeighbor`

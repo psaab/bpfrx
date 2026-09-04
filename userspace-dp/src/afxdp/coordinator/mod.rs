@@ -279,6 +279,10 @@ pub struct Coordinator {
     /// with every packet worker (via `WorkerSharedDataplane`) and the GRE
     /// local-origin threads (via the tunnel-spawn site).
     pub(in crate::afxdp) ike_exchanges: crate::afxdp::forwarding::SharedIkeExchangeTable,
+    /// #7699: the node-shared PPTP control-segment inbox. Why it is shared and
+    /// not per-worker is on [`crate::session::pptp_control::PptpControlInbox`].
+    pub(in crate::afxdp) pptp_control:
+        std::sync::Arc<crate::session::pptp_control::PptpControlInbox>,
     pub(in crate::afxdp) workers: WorkerManager,
     pub(crate) mirror_targets: Arc<ArcSwap<MirrorTargetMap>>,
     pub(crate) forwarding: ForwardingState,
@@ -439,6 +443,7 @@ impl Coordinator {
             neighbors: NeighborManager::new(),
             sessions: SessionManager::new(),
             ike_exchanges: Arc::new(crate::afxdp::forwarding::IkeExchangeTable::new()),
+            pptp_control: Arc::new(crate::session::pptp_control::PptpControlInbox::default()),
             workers: WorkerManager::new(),
             mirror_targets: Arc::new(ArcSwap::from_pointee(MirrorTargetMap::default())),
             forwarding: ForwardingState::default(),

@@ -384,7 +384,79 @@ pub(super) fn stage_parse_flow_and_learn(
             worker_ctx.dynamic_neighbors,
         );
     }
+    // #7699: copy a PPTP control segment out to the inbox. The test is two
+    // comparisons on a tuple this stage has already parsed; everything past it
+    // — locating the payload, copying it, parsing it — is either cold or off
+    // this path entirely. Deliberately NOT gated on `learn_from_live_frame`:
+    // that flag governs whether the FRAME is a live one to learn a neighbor
+    // from, which is a different question from whether these bytes are a
+    // control message, and gating on it would silently drop the association for
+    // every path that passes it false.
+    if let Some(flow) = flow.as_ref()
+        && is_pptp_control_flow(flow)
+    {
+        capture_pptp_control_segment(packet_frame, flow, worker_ctx.pptp_control);
+    }
     flow
+}
+
+/// Is this flow the PPTP control channel? (#7699)
+///
+/// EITHER direction: the reply that carries both call ids travels from the PAC
+/// back to the PNS, so its SOURCE is 1723. Testing only the destination would
+/// see the request — which names one side and cannot pair a call — and miss the
+/// one message that can.
+#[inline]
+pub(in crate::afxdp) fn is_pptp_control_flow(flow: &SessionFlow) -> bool {
+    flow.forward_key.protocol == crate::ip_proto::PROTO_TCP
+        && (flow.forward_key.dst_port == crate::session::pptp_control::PPTP_CONTROL_PORT
+            || flow.forward_key.src_port == crate::session::pptp_control::PPTP_CONTROL_PORT)
+}
+
+/// Copy a recognised control segment into the inbox. Returns whether it landed.
+///
+/// `#[cold]`: PPTP control traffic is a handful of small messages per call, so
+/// this body has no business in the ingress loop's codegen unit — the same
+/// reasoning as the source-NAT exception recorders.
+///
+/// **It allocates, and that is deliberate rather than overlooked.**
+/// `docs/engineering-style.md` says never allocate per PACKET; this allocates
+/// per CONTROL packet — a TCP flow with 1723 on one side, a handful of small
+/// messages per call — into a queue capped at `PENDING_CONTROL_CAPACITY` with
+/// drop-newest on full, so the total is bounded and a control-port flood cannot
+/// make the data path allocate without limit. Copying rather than borrowing is
+/// what lets the frame be returned to the UMEM immediately; holding a slice
+/// would pin a descriptor across the drain interval.
+///
+/// It does NOT parse. Parsing, installing and broadcasting happen on the
+/// worker's periodic drain, so nothing here waits on control-channel work and
+/// the association is never needed for the segment that taught it.
+#[cold]
+#[inline(never)]
+pub(in crate::afxdp) fn capture_pptp_control_segment(
+    packet_frame: &[u8],
+    flow: &SessionFlow,
+    inbox: &crate::session::pptp_control::PptpControlInbox,
+) -> bool {
+    let Some(offset) = crate::afxdp::frame::tcp_payload_offset(packet_frame) else {
+        return false;
+    };
+    let Some(payload) = packet_frame.get(offset..) else {
+        return false;
+    };
+    // A pure ACK / handshake segment has no payload and cannot be a control
+    // message. Buffering it would spend a capacity slot that a real message
+    // then loses.
+    if payload.is_empty() {
+        return false;
+    }
+    inbox.push(crate::session::pptp_control::PendingControlSegment {
+        src: flow.src_ip,
+        dst: flow.dst_ip,
+        src_port: flow.forward_key.src_port,
+        dst_port: flow.forward_key.dst_port,
+        payload: payload.to_vec(),
+    })
 }
 
 /// Stage 9 — fabric-ingress classification.
