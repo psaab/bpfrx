@@ -138,6 +138,36 @@ func ParseVRRPPacket(data []byte, isIPv6 bool, srcIP, dstIP net.IP) (*VRRPPacket
 	count := int(data[3])
 	maxAdvertInt := binary.BigEndian.Uint16(data[4:6]) & 0x0FFF
 
+	// #8321 finding 18, RECORDED DECISION — do NOT add the RFC 5798 §5.1.1.4
+	// discard rule here without re-reading this.
+	//
+	// The gap is real: this parser validates length, version, type,
+	// count-vs-declared-length and both checksums, but not `count == 0` or
+	// `maxAdvertInt == 0`, so it accepts advertisements the RFC says to
+	// discard. The finding's stated consequence — "inbound malformed packets
+	// can trigger master demotions" — does NOT follow, because the only
+	// consumer that could be harmed already defends itself: `instance_rx.go`
+	// ignores a zero MaxAdvertInt so `masterDownInterval` falls back to the
+	// local interval instead of computing a zero (flapping) timer, and #4548
+	// clamps pathologically-low non-zero values.
+	//
+	// Adding the discard would be a NET RISK, not a hardening. Discarding an
+	// advert is precisely how two nodes both become MASTER: a peer we stop
+	// accepting is a peer we declare down. Two concrete ways a legitimate
+	// sender reaches these values —
+	//   * `maxAdvertInt == 0`: our OWN sender computes
+	//     `uint16(cfg.AdvertiseInterval / 10)` (instance_send.go), and the
+	//     per-interface `advertise-interval` leaf carries no lower bound, so
+	//     an interval below 10 ms emits 0 on the wire;
+	//   * `count == 0`: an implementation that advertises without listing
+	//     addresses is malformed but is still a live master.
+	// In both cases today we keep tracking that peer as master, which is the
+	// safe outcome; discarding would time it out and contend for the VIP.
+	//
+	// So this is a CONFORMANCE gap accepted deliberately, at LOW severity, not
+	// an oversight. If it is ever closed, the change owes an argument about the
+	// dual-master direction, not just an RFC citation.
+
 	addrSize := 4
 	if isIPv6 {
 		addrSize = 16
