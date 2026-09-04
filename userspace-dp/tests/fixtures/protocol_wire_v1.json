@@ -671,6 +671,19 @@
   "ha_state_update_request": {
     "groups": []
   },
+  "idle_lease_wire": {
+    "address_only": true,
+    "pool": "p1",
+    "protocol": 6,
+    "remaining_ns": 123,
+    "remote_ip": "8.8.8.8",
+    "remote_port": 443,
+    "src_ip": "10.0.61.102",
+    "src_port": 40000,
+    "timeout_ns": 300000000000,
+    "translated_ip": "172.16.80.7",
+    "translated_port": 51400
+  },
   "inject_packet_request": {
     "addr_family": 0,
     "config_generation": 0,
