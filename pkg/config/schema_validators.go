@@ -123,6 +123,31 @@ func ValidateIntegerMin(min int64) LeafValidator {
 // validateInteger returns a closure that accepts a bare integer in
 // [min, max] inclusive. min > max disables the range check.
 func ValidateInteger(min, max int64) LeafValidator {
+	// #8358: a reversed range SILENTLY DISABLED the check. The body below
+	// guards its comparison with `min <= max`, so `ValidateInteger(1, 0)` --
+	// the shape a caller reaches for when they mean "at least 1" and mis-order
+	// the arguments -- returned a validator that accepted EVERY integer, and
+	// nothing said so. That is the worst shape a check can have: it fails to a
+	// value indistinguishable from a healthy one, and the leaf reads as
+	// validated in review because a validator is right there.
+	//
+	// Measured before adding this: all 35+ literal call sites and every
+	// named-constant site in the tree are well-ordered, so no caller relies on
+	// the disable, and nothing has ever needed it. `ValidateIntegerMin` is the
+	// "no upper bound" spelling and is documented as such.
+	//
+	// A panic rather than an error, because this is a PROGRAMMING error and not
+	// an operator one. `setSchema` is a package-level var built at init, so a
+	// reversed range fails every test in every package that imports pkg/config,
+	// immediately and unmissably. It cannot reach an operator: it cannot get
+	// past a build.
+	if min > max {
+		panic(fmt.Sprintf(
+			"config: ValidateInteger(%d, %d) has min > max, which would silently "+
+				"accept every integer. Use ValidateIntegerMin(%d) for a lower bound "+
+				"with no ceiling, or order the arguments (min, max).",
+			min, max, min))
+	}
 	return func(raw string, _ *Config) error {
 		if strings.TrimSpace(raw) == "" {
 			return fmt.Errorf("missing value (expected integer)")
@@ -131,6 +156,11 @@ func ValidateInteger(min, max int64) LeafValidator {
 		if err != nil {
 			return fmt.Errorf("not an integer: %q", raw)
 		}
+		// The `min <= max` term is now guaranteed by the constructor guard
+		// above. Kept rather than simplified: it is what made the reversed-range
+		// case silent, and leaving it visible next to the panic documents the
+		// pairing. Deleting it would also make the closure unsafe on its own if
+		// the guard were ever removed.
 		if min <= max && (v < min || v > max) {
 			return fmt.Errorf("integer out of range [%d..%d] (got %d)", min, max, v)
 		}
