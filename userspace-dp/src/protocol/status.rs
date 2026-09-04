@@ -295,6 +295,15 @@ pub(crate) struct ProcessStatus {
     /// for backward compatibility.
     #[serde(rename = "shared_session_publishes_total", default)]
     pub shared_session_publishes_total: u64,
+
+    /// #8486: owner-RG index filings declined because the peer-supplied
+    /// `owner_rg_id` was outside the 0..15 range the Go strict validator
+    /// enforces. Nonzero means a peer is sending redundancy-group ids this
+    /// cluster's own strict path would reject. `default` so an older helper
+    /// that does not send the field decodes as 0 rather than failing the
+    /// whole status parse.
+    #[serde(rename = "owner_rg_filings_declined_total", default)]
+    pub owner_rg_filings_declined_total: u64,
     #[serde(rename = "shared_session_publish_lock_acquisitions_total", default)]
     pub shared_session_publish_lock_acquisitions_total: u64,
     #[serde(rename = "shared_session_publish_lock_contended_total", default)]

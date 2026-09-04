@@ -113,6 +113,7 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     // #4800: new-flow-install contention surface — the publish and
     // replication legs. The NAT-allocator leg rides source_nat_pools.
     state.status.shared_session_publishes_total = state.afxdp.shared_session_publishes_total();
+    state.status.owner_rg_filings_declined_total = state.afxdp.owner_rg_filings_declined_total();
     state.status.shared_session_publish_lock_acquisitions_total =
         state.afxdp.shared_session_publish_lock_acquisitions_total();
     state.status.shared_session_publish_lock_contended_total =

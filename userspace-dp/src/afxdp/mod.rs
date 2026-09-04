@@ -545,6 +545,10 @@ mod tests_icmp_te;
 #[cfg(test)]
 #[path = "tests_icmp_reject_reversal.rs"]
 mod tests_icmp_reject_reversal;
+// #8486: the peer-supplied owner_rg_id filing bound.
+#[cfg(test)]
+#[path = "owner_rg_bound_8486_tests.rs"]
+mod owner_rg_bound_8486_tests;
 #[cfg(test)]
 #[path = "tests_embedded_poll_filter.rs"]
 mod tests_embedded_poll_filter;

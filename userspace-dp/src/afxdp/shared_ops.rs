@@ -12,6 +12,56 @@ use std::sync::{MutexGuard, TryLockError};
 /// mutexes are where new flows queue up.
 pub(crate) static SHARED_SESSION_PUBLISHES: AtomicU64 = AtomicU64::new(0);
 
+/// #8486: the largest `owner_rg_id` this helper will FILE into the owner-RG
+/// indexes.
+///
+/// `metadata.owner_rg_id` arrives from the peer as a raw `i32` and was filed
+/// for every positive value. A peer sending N distinct positive ids created N
+/// buckets in `OwnerRgSessionIndex`, and nothing shrinks that allocation
+/// afterwards. That is mild on its own -- but the authoritative un-file,
+/// `remove_owner_rg_index_key_from_every_bucket_locked`, uses `HashMap::retain`,
+/// which is O(CAPACITY) and visits empty slots, so removing N keys filed under
+/// N distinct ids is Theta(N^2) of outer-capacity work on the session-control
+/// thread.
+///
+/// 15 mirrors the Go strict bound (`compiler_validate_strict_chassis.go` limits
+/// redundancy-group ids to 0..15). The Go side downgrades that to a WARNING on
+/// the tolerant load / peer-sync path (`compiler_uniformgates_cluster_zone.go`),
+/// which is exactly why the helper needs its own: it is the last line and it
+/// did not hold one.
+pub(crate) const MAX_FILEABLE_OWNER_RG_ID: i32 = 15;
+
+/// #8486: owner-RG filings declined because the id was out of range. Nonzero
+/// means a peer is sending ids this cluster's own strict validator would
+/// reject -- worth seeing, and it is deliberately a counter rather than a log
+/// so a burst cannot flood the journal.
+pub(crate) static OWNER_RG_FILINGS_DECLINED: AtomicU64 = AtomicU64::new(0);
+
+/// #8486: whether `owner_rg_id` may be FILED into an owner-RG index.
+///
+/// Deliberately narrower than the predicate the REMOVE path uses, and the
+/// asymmetry is the point: removal stays `> 0` so anything that was ever filed
+/// can always be un-filed, including under a future tightening of this bound.
+/// A symmetric bound would strand entries filed under the old one, turning a
+/// hardening change into a leak.
+///
+/// Declining to FILE rather than refusing the IMPORT is also deliberate. The
+/// tolerant peer-sync path exists because a peer may legitimately be running an
+/// older or looser config, and refusing the session would decline a takeover
+/// this node is otherwise fit for -- trading a bounded memory cost for a
+/// blackhole on failover. The session is kept and remains usable; only the
+/// index entry is skipped.
+pub(crate) fn is_fileable_owner_rg(owner_rg_id: i32) -> bool {
+    if owner_rg_id <= 0 {
+        return false;
+    }
+    if owner_rg_id > MAX_FILEABLE_OWNER_RG_ID {
+        OWNER_RG_FILINGS_DECLINED.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    true
+}
+
 /// #4800: shared-map mutex acquisitions taken by [`publish_shared_session`]
 /// (1 for `shared_sessions`, plus `shared_nat_sessions` and
 /// `shared_forward_wire_sessions` on a forward entry), and the subset that
@@ -1387,7 +1437,9 @@ fn reverse_prewarm_owner_rg_candidates(
     if entry.metadata.is_reverse || !entry.origin.is_peer_synced() {
         return owner_rgs;
     }
-    if entry.metadata.owner_rg_id > 0 {
+    // #8486: PEER-SUPPLIED, so it is bounded here. `reverse_owner_rg_id` below
+    // is derived from THIS node's own forwarding state and needs no bound.
+    if is_fileable_owner_rg(entry.metadata.owner_rg_id) {
         owner_rgs.insert(entry.metadata.owner_rg_id);
     }
     let reverse_resolution = super::interface_nat_local_resolution(forwarding, entry.key.src_ip)
@@ -1416,7 +1468,8 @@ fn update_owner_rg_index(
     {
         remove_owner_rg_index_entry(index, previous_owner_rg, key);
     }
-    if owner_rg_id <= 0 {
+    // #8486: the bound is here, on the FILING, not on the import.
+    if !is_fileable_owner_rg(owner_rg_id) {
         return;
     }
     // #2402: recover poison (owner-RG index maintenance).
