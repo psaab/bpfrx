@@ -240,13 +240,18 @@ func (c *xpfCollector) initControlPlaneDescriptors() {
 	//
 	// A capability gate can set ForwardingSupported=false and disarm every
 	// binding, which takes rx to 0 while the interfaces stay up and the config
-	// commits cleanly. The documented case is persistent-NAT on a chassis
-	// cluster (#1449): leases are helper-local and not HA-synchronized, so the
-	// dataplane declines to forward rather than forward with semantics it
-	// cannot honour. That is deliberate. What was missing is any signal an
-	// ALERT could key on -- the only surface was a line inside a `show` nobody
-	// runs when the symptom is "the link went down", and #8447 spent five
-	// rounds of cluster measurement rediscovering it.
+	// commits cleanly. What was missing is any signal an ALERT could key on --
+	// the only surface was a line inside a `show` nobody runs when the symptom
+	// is "the link went down", and #8447 spent five rounds of cluster
+	// measurement rediscovering it.
+	//
+	// #8573 REMOVED the case this gauge was written around. Persistent-NAT on a
+	// chassis cluster used to disarm on the #1449 reasoning that leases are
+	// helper-local and not HA-synchronized; measured on the loss userspace
+	// cluster, they reach the standby, survive an RG0 failover, and are honoured
+	// after failback, so the disarm is gone. This gauge is unchanged and is
+	// MORE load-bearing for it: the remaining reasons are rarer, so a disarm is
+	// now something an operator is even less likely to be looking for.
 	//
 	// A gauge rather than a state set, because the states are exhaustive and
 	// binary: 1 and 0 are both carried by the one series, so there is no
@@ -261,8 +266,10 @@ func (c *xpfCollector) initControlPlaneDescriptors() {
 			"up and the config committed cleanly and NO transit is being "+
 			"processed -- the failure presents as a connectivity problem rather "+
 			"than a configuration one. The reasons are on "+
-			"`show chassis forwarding` and in the disarm warning; the commonest "+
-			"is persistent-NAT on a chassis-cluster member (#1449).",
+			"`show chassis forwarding` and in the disarm warning; they are "+
+			"unsupported-configuration verdicts such as a color-aware "+
+			"three-color policer or a SYN-cookie screen profile without "+
+			"root-authentication material.",
 		nil, nil,
 	)
 	c.schedulerRepublishFailed = prometheus.NewDesc(

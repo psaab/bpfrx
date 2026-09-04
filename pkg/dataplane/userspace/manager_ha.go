@@ -531,12 +531,18 @@ func (m *Manager) disarmBeforeUnsupportedPublishLocked(snap *ConfigSnapshot) err
 	// decorate an error string on the failure path, so the SUCCESS path — the
 	// one that actually stops traffic — emitted nothing at all.
 	//
-	// The reasons ARE the operator's diagnosis: on a chassis cluster a source
-	// rule pointing at a `persistent-nat` pool sets ForwardingSupported false
-	// (capabilities.go, "leases are not HA-synchronized"), forwarding is
-	// disarmed here before the publish, and desiredForwardingArmedLocked then
-	// keeps it disarmed while the 1 Hz reconcile short-circuits silently. What
-	// the operator sees is a connectivity outage on a commit that succeeded.
+	// The reasons ARE the operator's diagnosis: deriveUserspaceCapabilities
+	// sets ForwardingSupported false for an unsupported configuration (a
+	// color-aware three-color policer, say), forwarding is disarmed here before
+	// the publish, and desiredForwardingArmedLocked then keeps it disarmed while
+	// the 1 Hz reconcile short-circuits silently. What the operator sees is a
+	// connectivity outage on a commit that succeeded.
+	//
+	// #8573 note: the example this paragraph used to give — persistent-NAT on a
+	// chassis cluster, refused because "leases are not HA-synchronized" — is
+	// gone. That premise was measured false on the loss userspace cluster and
+	// the gate was removed, so the specimen was replaced rather than left to rot
+	// into a reason no config can reach.
 	//
 	// WARN, not Info: a transition into not-forwarding is a state change, and
 	// it is one-time per publish rather than per-packet or per-tick, so it

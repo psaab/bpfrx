@@ -149,22 +149,27 @@ func TestFormatStatusSummary(t *testing.T) {
 	}
 }
 
-func TestFormatStatusSummaryShowsPersistentSourceNATHABoundary(t *testing.T) {
-	// Mirrors the unexported persistentSourceNATHAUnsupportedReason constant
-	// in the parent userspace package (manager.go); the formatter only echoes
-	// whatever UnsupportedReasons string the manager supplies.
-	const persistentSourceNATHAUnsupportedReason = "userspace persistent-nat source pool leases are not HA-synchronized"
+func TestFormatStatusSummaryShowsTheForwardingDisarmReason(t *testing.T) {
+	// A SPECIMEN reason, not a pinned constant. This used to inline the
+	// unexported persistentSourceNATHAUnsupportedReason from the parent
+	// userspace package; #8573 deleted that constant along with the gate that
+	// produced it, after measuring its premise ("leases are not
+	// HA-synchronized") false on the loss userspace cluster. The formatter only
+	// echoes whatever UnsupportedReasons string the manager supplies, so any
+	// reason exercises it — and pinning a particular one is what tied this cell
+	// to a gate that then went away.
+	const specimenReason = "userspace three-color policers require color-blind mode and then discard"
 	status := userspace.ProcessStatus{
 		Capabilities: userspace.UserspaceCapabilities{
 			ForwardingSupported: false,
-			UnsupportedReasons:  []string{persistentSourceNATHAUnsupportedReason},
+			UnsupportedReasons:  []string{specimenReason},
 		},
 	}
 
 	out := FormatStatusSummary(status)
 	for _, want := range []string{
 		"Forwarding supported:      false",
-		"Forwarding blocked by:     " + persistentSourceNATHAUnsupportedReason,
+		"Forwarding blocked by:     " + specimenReason,
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("summary missing %q:\n%s", want, out)

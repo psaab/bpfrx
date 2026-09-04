@@ -84,9 +84,43 @@ func deriveUserspaceCapabilities(cfg *config.Config) UserspaceCapabilities {
 	if !userspaceSupportsThreeColorPolicers(cfg) {
 		addReason("userspace three-color policers require color-blind mode and then discard")
 	}
-	if cfg.Chassis.Cluster != nil && userspaceConfigUsesPersistentSourceNAT(cfg) {
-		addReason(persistentSourceNATHAUnsupportedReason)
-	}
+	// #8573: the persistent-NAT / chassis-cluster DISARM IS GONE, and the
+	// sentence it reported — "userspace persistent-nat source pool leases are
+	// not HA-synchronized" — was false when it was removed.
+	//
+	// Every persistent lease an active node holds now reaches a standby by one
+	// of three routes: rebuilt from synced sessions for port-translating leases
+	// (#7360) and address-only ones (#8132), and exported/imported over the
+	// cluster sync for idle leases (#8121). That the three are EXHAUSTIVE is
+	// bound by every_persistent_lease_creation_site_has_a_sync_route_8121
+	// (#8572), which reds if a sixth insert site appears unclassified.
+	//
+	// MEASURED ON THE LOSS USERSPACE CLUSTER before removal, which is the run
+	// #1449 made impossible and #8573 was filed to unblock — the gate disarmed
+	// the forwarding its own verification needed. With the disarm lifted and a
+	// rule-referenced persistent-nat pool committed on both nodes:
+	//
+	//   - both nodes armed (FWDD State Online), pool SNAT translating into the
+	//     configured 30000-30999 window;
+	//   - a lease created on the active appeared on the STANDBY with an
+	//     identical source, translated identity and pool;
+	//   - it survived a manual RG0 failover, present on both nodes after;
+	//   - and — the part that matters — after a failback the new active
+	//     translated the SAME source identity (10.0.61.241:51000) to the SAME
+	//     translated identity (172.16.80.7:30003) that the OTHER node had
+	//     allocated. The imported lease was HONOURED, not merely listed, which
+	//     is the whole of what persistent NAT promises a subscriber.
+	//
+	// THE KNOWN RESIDUAL IS NOT A FORWARDING HAZARD. A lease imported
+	// mid-reconcile, or one whose pool address the standby's config lacks, is
+	// refused by design (#8121) — a correct refusal, and the standby then mints
+	// its own translation rather than forwarding with semantics it cannot
+	// honour. Its operator surface is a per-batch journald line from the helper
+	// naming the refusal class, plus `show security nat source
+	// persistent-nat-table` on each node, which #8607 made non-empty — the
+	// surface the measurement above is built out of and which did not exist
+	// when this gate was written. Disarming the whole dataplane was standing in
+	// for observability that now exists.
 	// Firewall filters are supported in the userspace dataplane. Legacy
 	// single-rate `firewall policer` token buckets are ENFORCED as of #4514:
 	// a `then discard` policer is lowered at compile into the metered

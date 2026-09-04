@@ -304,9 +304,17 @@ fn a_local_lease_is_not_overwritten_by_an_imported_one_8121() {
 //
 // WHY THIS EXISTS. #8121, #7360 and #8132 each cover one route by which an
 // active node's persistent lease reaches a standby, and the three together are
-// claimed to be exhaustive. That claim is what the #1449 capability gate — which
-// disarms forwarding for every HA persistent-NAT config, and whose stated reason
-// is "leases are not HA-synchronized" — would have to be re-decided against.
+// claimed to be exhaustive.
+//
+// #8573 acted on that claim: the #1449 capability gate, which disarmed
+// forwarding for every HA persistent-NAT config on the stated reason that
+// "leases are not HA-synchronized", was REMOVED after the three routes were
+// measured working on the loss userspace cluster (lease visible on the standby
+// with an identical translated identity, surviving an RG0 failover, and honoured
+// after failback). This census is therefore no longer an argument against a
+// gate — it is the thing holding the gate's removal up, and a sixth unclassified
+// insert site now means clustered persistent-NAT is silently forwarding with
+// leases that do not survive a failover.
 //
 // A claim that load-bearing must not live in prose. Defining a population by a
 // mechanism ("things that insert a lease") is a CLAIM that the mechanism is the

@@ -198,7 +198,7 @@ func TestDeriveUserspaceCapabilitiesAllowsHAFabricConfigs(t *testing.T) {
 	}
 }
 
-func TestDeriveUserspaceCapabilitiesRejectsHAPersistentSourceNAT(t *testing.T) {
+func TestDeriveUserspaceCapabilitiesAdmitsHAPersistentSourceNAT8573(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Chassis.Cluster = &config.ClusterConfig{ClusterID: 22}
 	cfg.Security.NAT.SourcePools = map[string]*config.NATPool{
@@ -221,12 +221,30 @@ func TestDeriveUserspaceCapabilitiesRejectsHAPersistentSourceNAT(t *testing.T) {
 		}},
 	}}
 
+	// #8573 INVERTED. This cell used to assert the disarm — ForwardingSupported
+	// false with the "leases are not HA-synchronized" reason. That reason was
+	// measured false on the loss userspace cluster (a lease created on the
+	// active reaches the standby, survives a failover, and is HONOURED by the
+	// new active, which hands the same source identity the same translated
+	// identity), so the disarm was removed and this now guards the OTHER
+	// direction: a clustered persistent-NAT config must FORWARD.
+	//
+	// It is inverted rather than deleted on purpose. Deleting it would leave
+	// nothing to red if the gate were reintroduced — and the gate's cost is a
+	// total transit stop that presents as a link failure, which is what took
+	// #8447 five rounds of cluster measurement to identify.
 	caps := deriveUserspaceCapabilities(cfg)
-	if caps.ForwardingSupported {
-		t.Fatal("ForwardingSupported = true, want false for HA persistent source NAT")
+	if !caps.ForwardingSupported {
+		t.Fatalf("ForwardingSupported = false for a clustered persistent-NAT config, "+
+			"reasons %+v. #8573 removed that disarm after measuring the premise false; "+
+			"re-adding it stops transit entirely while the interfaces stay up and the "+
+			"config commits clean — a connectivity failure with no NAT-shaped symptom",
+			caps.UnsupportedReasons)
 	}
-	if !slices.Contains(caps.UnsupportedReasons, persistentSourceNATHAUnsupportedReason) {
-		t.Fatalf("unsupported reasons = %+v, missing persistent-nat HA reason", caps.UnsupportedReasons)
+	for _, r := range caps.UnsupportedReasons {
+		if strings.Contains(r, "persistent-nat") {
+			t.Errorf("a persistent-NAT unsupported reason is back: %q", r)
+		}
 	}
 }
 
