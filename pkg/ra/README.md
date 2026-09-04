@@ -264,6 +264,37 @@ after HA failover. To make that **structural**, not flag-defended:
   RDNSS until the next RG transition. Scoping supersession per interface fixes
   that while a withdraw NAMING A still supersedes A's restart (both the
   per-interface epoch bump and the `goodbyeWanted` flip fire).
+- **The three RA header timers are bounded before ndp marshals them
+  (#8597).** The typed-leaf schema bounds Router Lifetime, Reachable Time
+  and Retrans Timer to `[0, max]` at strict commit, and that gate is
+  STRICT-only: the tolerant Load / peer-sync ingress downgrades it to a
+  warning per #1960. Measured on the wire before the bound
+  (`ndp.MarshalMessage` of `buildRA`):
+
+  ```
+  DefaultLifetime = -1  ->  Router Lifetime 65535   (~18 hours)
+  ReachableTime   = -1  ->  4294967295 ms           (~49 days)
+  RetransTimer    = -1  ->  4294967295 ms
+  ```
+
+  A NEGATIVE router lifetime advertised this box as a default router for
+  the MAXIMUM the field can express. `pruneUnmarshalableOptions` probes
+  only the OPTIONS for a marshal abort; the header fields marshal without
+  complaint precisely because they wrap silently, so nothing noticed.
+
+  Flooring at 0 invents no intent: 0 is the documented neutral for all
+  three — "not a default router" for the lifetime, "unspecified, use your
+  own defaults" for the other two — and is what the RA carried before
+  these leaves existed. Above the field width the value SATURATES, which
+  is monotone where wrapping is not (70000 s used to marshal as 4464, a
+  lifetime an order of magnitude SHORTER than asked for).
+
+  Both clamps bind `config.RARouterMaxLifetimeSeconds` /
+  `config.RAReachableRetransMaxMillis` — the same constants the commit
+  gate uses — rather than a local literal, so the gate and the sender
+  cannot disagree about the ceiling. #4525 put a runtime floor on the
+  advertisement INTERVAL for exactly this ingress; the header timers were
+  not covered by it.
 - **A supersession bump must accompany superseding RESPONSIBILITY (#8597).**
   #4961 scoped the interface-scoped withdraws' bump to the interfaces they
   NAME. `WithdrawOnce` then bumped every named interface in a loop that ran
