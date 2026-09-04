@@ -177,6 +177,42 @@ func (c *xpfCollector) initControlPlaneDescriptors() {
 			"every 30s; 0 once it is serving.",
 		nil, nil,
 	)
+	// #8195: the state of EACH management listener, with its address.
+	//
+	// xpf_management_listener_down above is kept exactly as it is — dashboards
+	// and alerts already reference it — and this ADDS what it cannot express.
+	// Three things it cannot:
+	//
+	//   1. It is a bare 0/1 with NO ADDRESS, so an operator cannot tell WHICH
+	//      endpoint failed to bind, which is the first question asked.
+	//   2. It reads the HTTP leg only (mgmtListenerDown ->
+	//      effectiveHTTPListener), so the gRPC listener is absent entirely.
+	//   3. It collapses three states into two. StateDisabled — a listener the
+	//      configuration deliberately turned off — is indistinguishable from
+	//      StateListening at 0, and telling a genuinely-off listener from a
+	//      serving one is the distinction `show system services` already draws.
+	//
+	// The gRPC leg is the one this exists for. Its state's only consumer today
+	// is `show system services`, reachable over the gRPC listener itself — so
+	// when it fails, the surface that reports the failure is the surface that
+	// is down. That circularity is why a metric, scraped over the SEPARATE
+	// HTTP listener, is the right shape rather than another CLI verb.
+	//
+	// Emitted as a state set: one series per (surface, state) with value 1 for
+	// the current state and 0 for the others, the standard Prometheus encoding
+	// for an enum. A single gauge with a numeric state would make
+	// `listener_state == 2` a magic constant in every alert.
+	c.managementListenerState = prometheus.NewDesc(
+		"xpf_management_listener_state",
+		"1 for the management listener's CURRENT state, 0 for its other states "+
+			"(#8195). Labelled by surface (grpc/http), the bind address, and the "+
+			"state (listening/failed/disabled). Complements "+
+			"xpf_management_listener_down, which is HTTP-only, address-less and "+
+			"cannot distinguish a deliberately disabled listener from a serving "+
+			"one. The gRPC row is the load-bearing one: its only other consumer "+
+			"is `show system services`, which is reached OVER the gRPC listener.",
+		[]string{"surface", "address", "state"}, nil,
+	)
 	c.schedulerRepublishFailed = prometheus.NewDesc(
 		"xpf_scheduler_republish_failed",
 		"1 while the most recent scheduler-driven policy republish "+

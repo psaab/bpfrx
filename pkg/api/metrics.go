@@ -12,6 +12,8 @@ import (
 
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+
+	"github.com/psaab/xpf/pkg/sysservices"
 )
 
 // xpfCollector implements prometheus.Collector, reading BPF maps on each scrape.
@@ -254,10 +256,11 @@ type xpfCollector struct {
 	// #7615: the remaining debt-driven retry owners. Each is 1 while its loop
 	// owes a repair, so a node re-driving a failing recovery stops looking
 	// identical to a healthy one.
-	raDeadSenderPending    *prometheus.Desc
-	proxyARPUnresolved     *prometheus.Desc
-	fabricOverlayMissing   *prometheus.Desc
-	managementListenerDown *prometheus.Desc
+	raDeadSenderPending     *prometheus.Desc
+	proxyARPUnresolved      *prometheus.Desc
+	fabricOverlayMissing    *prometheus.Desc
+	managementListenerDown  *prometheus.Desc
+	managementListenerState *prometheus.Desc
 
 	// #3780: 0/1 gauge — 1 while the most recent scheduler-driven policy
 	// republish failed and has not yet converged (stale enforcement past
@@ -867,6 +870,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.proxyARPUnresolved
 	ch <- c.fabricOverlayMissing
 	ch <- c.managementListenerDown
+	ch <- c.managementListenerState
 	ch <- c.configPersistDegraded
 	ch <- c.rollbackHistoryDegraded
 	ch <- c.userspacePolicyContentRejected
@@ -1300,6 +1304,42 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 			v = 1
 		}
 		ch <- prometheus.MustNewConstMetric(s.desc, prometheus.GaugeValue, v)
+	}
+
+	// #8195: the per-listener state set. Emitted from the SAME
+	// sysservices.Listeners snapshot `show system services` renders, so the
+	// metric and the CLI can never disagree about a listener's state — the
+	// failure one surface over that #8183 was about.
+	if c.srv.managementListenersFn != nil {
+		ls := c.srv.managementListenersFn()
+		for _, row := range []struct {
+			surface string
+			l       sysservices.Listener
+		}{
+			{"grpc", ls.GRPC},
+			{"http", ls.HTTP},
+		} {
+			// Every state gets a series, not just the current one. A state set
+			// that emitted only the active state would make an alert on
+			// `state{state="failed"} == 1` silently un-evaluable while the
+			// listener is healthy, because the series would not exist — the
+			// absent-series-reads-as-healthy trap.
+			for _, st := range []struct {
+				name string
+				want sysservices.State
+			}{
+				{"listening", sysservices.StateListening},
+				{"failed", sysservices.StateFailed},
+				{"disabled", sysservices.StateDisabled},
+			} {
+				v := 0.0
+				if row.l.State == st.want {
+					v = 1
+				}
+				ch <- prometheus.MustNewConstMetric(c.managementListenerState,
+					prometheus.GaugeValue, v, row.surface, row.l.Addr, st.name)
+			}
+		}
 	}
 
 	// #3780: scheduler republish-failure is a control-plane signal (the
