@@ -586,6 +586,29 @@ type SessionSync struct {
 	// Zero value false = pre-#7441 behaviour exactly: nothing is ever evicted.
 	strictSessionAuth strictSessionAuthState
 
+	// configureConn is the PER-INSTANCE seam for the #5303 buffer deferral,
+	// replacing a package-level function variable (#8182).
+	//
+	// The package-level version was a shared global that a test SWAPPED and
+	// restored with defer, and the assertion built on it is a NEGATIVE — "this
+	// must not have been called". pkg/cluster has 36 t.Parallel() calls and
+	// seven test files that reach handleNewConnection, so a parallel sibling
+	// completing a successful handshake while the swap was installed satisfied
+	// the hook and reddened the assertion. The failure was a FALSE NEGATIVE for
+	// the property under test: the deferral was intact.
+	//
+	// That is worse than an annoyance. A negative assertion over shared global
+	// state cannot distinguish "the deferral was reverted" from "a neighbour
+	// ran", so a real revert of #5303 would have been indistinguishable from
+	// the noise and waved through by the same re-run reflex the noise trains.
+	//
+	// Nil means the production behaviour: see configureSyncConn. It is written
+	// only before the connection goroutines that read it start, so the `go`
+	// statement supplies the happens-before edge and no lock is needed — this
+	// field is deliberately NOT under mu, which the connection paths already
+	// hold when they reach the call site.
+	configureConn func(net.Conn)
+
 	localAddr string
 	peerAddr  string
 	sessions  dataplane.SessionStore
