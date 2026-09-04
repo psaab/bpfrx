@@ -86,27 +86,13 @@ chassis device-map unmapped-interface-policy	empty
 event-options policy	empty
 event-options policy xpfarg within	empty
 interfaces xpfname aggregated-ether-options lacp periodic	empty
-interfaces xpfname aggregated-ether-options link-speed	empty
-interfaces xpfname aggregated-ether-options minimum-links	empty
 interfaces xpfname description	partial
 interfaces xpfname duplex	partial
 interfaces xpfname encapsulation	partial
-interfaces xpfname gigether-options 802.3ad	empty
-interfaces xpfname gigether-options redundant-parent	empty
 interfaces xpfname mtu	partial
 interfaces xpfname native-vlan-id	partial
 interfaces xpfname speed	partial
-interfaces xpfname tunnel destination	empty
-interfaces xpfname tunnel keepalive-retry	empty
-interfaces xpfname tunnel mode	empty
 interfaces xpfname tunnel routing-instance destination	partial
-interfaces xpfname tunnel source	empty
-interfaces xpfname tunnel ttl	empty
-interfaces xpfname tunnel wireguard listen-port	empty
-interfaces xpfname tunnel wireguard peer	empty
-interfaces xpfname tunnel wireguard peer xpfarg allowed-ips	empty
-interfaces xpfname tunnel wireguard peer xpfarg endpoint	empty
-interfaces xpfname tunnel wireguard peer xpfarg persistent-keepalive	empty
 interfaces xpfname unit	partial
 policy-options policy-statement xpfarg term xpfarg then as-path-prepend	partial
 policy-options policy-statement xpfarg term xpfarg then community	partial
