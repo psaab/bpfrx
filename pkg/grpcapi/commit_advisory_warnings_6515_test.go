@@ -31,8 +31,12 @@ import (
 // store commit the daemon's seam ultimately performs, so what is pinned here is
 // the handler's own projection: that each of the three commit RPCs returns the
 // compiled config's warnings rather than only CommitCheck doing so. The
-// daemon-side seams (grpcCommitFn -> commitAndApplyOperator) are separately
-// covered in pkg/daemon.
+// daemon-side seam (commitWithGenBinding, the origin of the `compiled` value
+// every layer above renders) is covered by
+// pkg/daemon/commit_seam_advisory_8484_test.go. That cover did NOT exist when
+// this sentence was first written: a mutant stripping Warnings in the seam
+// survived pkg/daemon, pkg/grpcapi, cmd/cli, pkg/cli, pkg/config and
+// pkg/configstore with zero failures (#8484).
 
 // hostInboundNarrowingStore stages a candidate whose interface stanza takes
 // `ssh` away from an interface the zone admits it on, with the commit seams

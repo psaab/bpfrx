@@ -409,6 +409,36 @@ spelling and silently miss the **anchored** one — the spelling Juniper's
 guidance tells operators to use. A guard that covers one spelling of the same
 intent reads as coverage and is not.
 
+## Commit advisories: a four-hop chain, and the hop that had no cell (#8484)
+
+A commit-time advisory is only worth having if the operator SEES it. It
+crosses four hops, and each one can drop it silently:
+
+| # | hop | code | bound by |
+|---|---|---|---|
+| 1 | produce | `cfg.Warnings` in the compiler | each advisory's own cell |
+| 2 | seam | `commitWithGenBinding` returns the compiled config | `pkg/daemon/commit_seam_advisory_8484_test.go` |
+| 3 | transport | `configWarnings()` -> `CommitResponse.warnings` | `commit_advisory_warnings_6515_test.go`, `commit_advisory_transport_8484_test.go` |
+| 4 | render | `printRemoteConfigWarnings` in the remote CLI; `printConfigWarnings` in the local CLI | `cmd/cli/remote_commit_advisory_render_8484_test.go` |
+
+**The delivery mechanism is generic and must stay that way.** `configWarnings`
+projects `cfg.Warnings` wholesale, so a NEW advisory needs no delivery wiring
+at all — #8189's login-class advisory reached the remote CLI with zero
+transport work. If an advisory ever needs its own plumbing, the next one will
+be dropped; fix the carrier instead.
+
+**Hop 2 is the one to watch.** #8484 was filed believing two advisories were
+produced and dropped; measured, they were not — every hop carried them. But
+hop 2 had NO cell: a mutant that strips `Warnings` in `commitWithGenBinding`
+survived `pkg/daemon`, `pkg/grpcapi`, `cmd/cli`, `pkg/cli`, `pkg/config` and
+`pkg/configstore` with **zero** failures. Every advisory cell in the tree
+asserted `cfg.Warnings` (hop 1); nothing asserted what the operator reads.
+
+**Every cell here carries an accept-side silence control.** A commit raising no
+advisory must render nothing. Without that, a path printing unconditionally
+satisfies every delivery assertion while inventing advisories on clean configs
+— and an advisory an operator learns to ignore is worse than none.
+
 ## Callers
 
 `cmd/xpfd` (instantiates and runs); `cmd/cli` (consumes); HTTP REST
