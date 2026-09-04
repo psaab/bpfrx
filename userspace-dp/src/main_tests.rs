@@ -1760,7 +1760,10 @@ fn run_control_request(
     let (mut client, server) = std::os::unix::net::UnixStream::pair().expect("control socket pair");
     let running = Arc::new(AtomicBool::new(true));
     let state_file = state_file.to_string();
-    let handle = std::thread::spawn(move || handle_stream(server, &state_file, state, running));
+    let handle = {
+            let sd = state.lock().expect("state").afxdp.session_domain().clone();
+            std::thread::spawn(move || handle_stream(server, &state_file, state, running, sd))
+        };
 
     serde_json::to_writer(&mut client, &request).expect("write request");
     std::io::Write::write_all(&mut client, b"\n").expect("newline");
@@ -1950,7 +1953,10 @@ fn apply_snapshot_rejects_unsupported_protocol_version() {
     let handle = {
         let state = state.clone();
         let running = running.clone();
-        std::thread::spawn(move || handle_stream(server, &state_file, state, running))
+        {
+            let sd = state.lock().expect("state").afxdp.session_domain().clone();
+            std::thread::spawn(move || handle_stream(server, &state_file, state, running, sd))
+        }
     };
 
     let request = ControlRequest {
@@ -1997,7 +2003,10 @@ fn apply_snapshot_for_test(
         let state = state.clone();
         let running = running.clone();
         let state_file = state_file.clone();
-        std::thread::spawn(move || handle_stream(server, &state_file, state, running))
+        {
+            let sd = state.lock().expect("state").afxdp.session_domain().clone();
+            std::thread::spawn(move || handle_stream(server, &state_file, state, running, sd))
+        }
     };
 
     let request = ControlRequest {
@@ -5223,7 +5232,10 @@ fn apply_snapshot_rejects_a_newer_protocol_version_too() {
     let handle = {
         let state = state.clone();
         let running = running.clone();
-        std::thread::spawn(move || handle_stream(server, &state_file, state, running))
+        {
+            let sd = state.lock().expect("state").afxdp.session_domain().clone();
+            std::thread::spawn(move || handle_stream(server, &state_file, state, running, sd))
+        }
     };
 
     let request = ControlRequest {

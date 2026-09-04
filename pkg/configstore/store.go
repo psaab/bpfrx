@@ -165,6 +165,25 @@ type Store struct {
 	// the removal durably. Default false.
 	confirmRemoveDegraded bool
 
+	// confirmRemoveDebtID identifies WHICH commit-confirmed record the two
+	// removal debts above are owed for (#7675). Both debts used to be UNKEYED:
+	// the retry loop and the deferred finalize called DeleteConfirm()
+	// unconditionally, deleting whatever confirm.json happened to be on disk.
+	// An operator who armed a BRAND-NEW `commit confirmed` while a debt was
+	// outstanding therefore had the NEW window's crash-recovery file deleted by
+	// a retry that believed it was clearing the old one — measured deterministic
+	// on master, not a race: the in-memory timer stays armed so nothing looks
+	// wrong, and a restart before the new deadline then leaves the UNCONFIRMED
+	// config standing with no rollback, the exact #4577 failure the record
+	// exists to prevent. A newer arm durably REPLACES the file
+	// (WriteConfirm is temp+fsync+rename+dir-fsync), so the older record is
+	// already gone and its removal debt is satisfied by construction: the retry
+	// clears the debt instead of deleting. Empty when no debt is held, or when
+	// the record could not be identified at debt time (already unlinked with the
+	// directory barrier still owed) — in which case ANY present readable record
+	// is a newer one and must not be deleted.
+	confirmRemoveDebtID string
+
 	// Commit confirmed state. confirmGen is a generation token
 	// guarding the auto-rollback callback against staleness: a timer
 	// that has already fired and is blocked on s.mu when a nested

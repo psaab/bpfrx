@@ -35,6 +35,7 @@ mod snapshot;
 mod stop_workers;
 mod sync_session;
 
+use crate::afxdp::SessionDomain;
 use super::super::*;
 use super::helpers::{refresh_status, wait_for_binding_settle, write_state};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
@@ -48,6 +49,11 @@ pub(crate) fn handle_stream(
     state_file: &str,
     state: Arc<Mutex<ServerState>>,
     running: Arc<AtomicBool>,
+    // #7209: the session-domain handle, passed EXPLICITLY rather than derived
+    // from `state` — deriving it would need the very mutex this exists to
+    // avoid. Taking it as a parameter also puts the fact in the signature: this
+    // dispatcher can serve one verb without `ServerState` at all.
+    session_domain: SessionDomain,
 ) -> Result<(), String> {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -134,7 +140,39 @@ pub(crate) fn handle_stream(
     // taking the rest of a #5380 bulk batch down with it).
     let mut settle_wait: Option<Duration> = None;
 
-    {
+    // #7209: THE ONE VERB SERVED WITHOUT `state.lock()`.
+    //
+    // Everything below this block takes the snapshot-wide mutex, which
+    // `apply_snapshot` holds across a 10 s worker-readiness barrier, a 500 ms
+    // mlx5 teardown quiesce, worker `join()`s and BPF map-pin opens. Go budgets
+    // 3 s for a session round-trip, and #5380 aborts the REST of a bulk batch on
+    // the first transport failure — so a `sync_session` queued behind an
+    // `apply_snapshot` did not arrive late, it took up to 255 session mirrors
+    // down with it, during the failover this path exists to serve.
+    //
+    // The socket split (#452) gave this verb its own socket and thread but not
+    // its own critical section. This is the split that was missing.
+    //
+    // NO STATUS ATTACH, AND THAT IS THE POINT. An earlier draft kept the
+    // `!suppress_status` attach here, reasoning that a caller asking for status
+    // is asking for a `refresh_status` and may pay for its own lock. That left
+    // the verb STARVABLE — by a caller that simply omits the flag — and the
+    // acceptance cell written for this issue asserts the property
+    // unconditionally, which is the stronger and correct reading.
+    //
+    // Measured before removing it: NOTHING consumes `status` on a
+    // `sync_session` response. Both daemon senders set `SuppressStatus`
+    // (`pkg/dataplane/userspace/manager_sessionsync_transmit.go`), no Go caller
+    // reads the field, and none of the 18 Rust cells driving this verb asserts
+    // on it. So the attach was not a service being withdrawn; it was the last
+    // remaining path by which an HA session mirror could queue behind a 10 s
+    // worker-readiness barrier.
+    let served_off_lock = request.request_type == "sync_session";
+    if served_off_lock {
+        sync_session::handle(&session_domain, request.session_sync, &mut response);
+    }
+
+    if !served_off_lock {
         let mut guard = state.lock().expect("server state poisoned");
         match request.request_type.as_str() {
             "ping" | "status" => {}
@@ -267,7 +305,6 @@ pub(crate) fn handle_stream(
                 &mut response,
                 &mut persist_state,
             ),
-            "sync_session" => sync_session::handle(&mut guard, request.session_sync, &mut response),
             // #8121 part 2: the idle persistent-NAT lease channel. Both verbs
             // take the clock from the coordinator, never from the request.
             "export_idle_leases" => idle_leases::export(&mut guard, &mut response),

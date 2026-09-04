@@ -666,12 +666,67 @@ func (s *Store) removeConfirmState() error {
 // commit, HA sync, demotion, timeout rollback, boot recovery) ignore the return
 // and rely on the retained retry debt to converge. Caller holds s.mu.
 func (s *Store) resolveConfirmRemovalLocked(action string) error {
+	// #7675: capture WHICH record this removal is for BEFORE deleting it, so a
+	// retained debt cannot later delete a DIFFERENT (newer) record. An empty id
+	// means the record was already absent or unreadable — the debt is then only
+	// the #4864 directory barrier, never a delete of a present file.
+	id := s.confirmRecordIdentityOnDiskLocked()
 	if err := s.removeConfirmState(); err != nil {
+		s.confirmRemoveDebtID = id
 		s.noteConfirmRemoveFailureLocked(action, err)
 		return err
 	}
 	s.confirmRemoveDegraded = false
+	s.confirmRemoveDebtID = ""
 	return nil
+}
+
+// confirmRecordIdentity returns a stable identity for a persisted
+// commit-confirmed record (#7675). Two records are the SAME arm iff they agree
+// on the config they guard, the deadline they expire at, and whether the
+// rollback target is the empty bootstrap tree. `writeConfirmState` is the sole
+// production `WriteConfirm` caller and every arm / nested re-arm goes through
+// it with a freshly computed deadline, so a later arm always yields a different
+// identity. Returns "" for a nil record.
+func confirmRecordIdentity(rec *confirmRecord) string {
+	if rec == nil {
+		return ""
+	}
+	return fmt.Sprintf("%s|%d|%t", rec.GuardedHash, rec.Deadline.UnixNano(), rec.FirstCommit)
+}
+
+// confirmRecordIdentityOnDiskLocked reads the persisted record and returns its
+// identity, or "" when there is none, the DB is absent, or it cannot be read.
+// Caller holds s.mu.
+func (s *Store) confirmRecordIdentityOnDiskLocked() string {
+	if s.db == nil {
+		return ""
+	}
+	rec, err := s.db.ReadConfirm()
+	if err != nil || rec == nil {
+		return ""
+	}
+	return confirmRecordIdentity(rec)
+}
+
+// confirmRemovalSupersededLocked reports whether the record whose removal is
+// owed has already been durably REPLACED by a newer arm (#7675), in which case
+// the debt is satisfied by construction and re-driving the delete would destroy
+// the NEW window's crash-recovery file.
+//
+// Absent or unreadable is deliberately NOT superseded: an absent record leaves
+// the #4864 directory barrier owed, and an unreadable one cannot be a fresh arm
+// (`writeConfirmState` always writes a record `ReadConfirm` accepts), so
+// re-driving the delete is correct for both. Caller holds s.mu.
+func (s *Store) confirmRemovalSupersededLocked() bool {
+	if s.db == nil {
+		return false
+	}
+	rec, err := s.db.ReadConfirm()
+	if err != nil || rec == nil {
+		return false
+	}
+	return confirmRecordIdentity(rec) != s.confirmRemoveDebtID
 }
 
 // noteConfirmRemoveFailureLocked records that a resolved window's confirm.json

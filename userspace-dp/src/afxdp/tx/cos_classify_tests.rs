@@ -972,9 +972,36 @@ fn flowless_packet_gets_ba_classification_from_dscp() {
 
     // Cached-descriptor path.
     assert_eq!(
-        resolve_cached_cos_tx_selection(&forwarding, 202, ef_meta, None).queue_id,
+        resolve_cached_cos_tx_queue_id(&forwarding, 202, ef_meta, None),
         Some(1),
         "cached flowless BA classification must also hit the EF queue",
+    );
+
+    // #8367 WIRING: the port-mirror path is the caller this entry point exists
+    // for, and it must reach the SAME queue. Asserting only the entry point
+    // leaves `mirror_cos_queue_id` free to be re-pointed at anything —
+    // including back at the descriptor arm whose filter verdict it discards.
+    assert_eq!(
+        crate::afxdp::mirror::mirror_cos_queue_id(
+            &forwarding,
+            202,
+            crate::afxdp::types::ForwardPacketMeta::from(ef_meta),
+            None
+        ),
+        Some(1),
+        "#8367: a FLOWLESS mirror clone must resolve the same BA queue the cached \
+         entry point does — the split is queue-preserving by construction"
+    );
+    assert_eq!(
+        crate::afxdp::mirror::mirror_cos_queue_id(
+            &forwarding,
+            202,
+            crate::afxdp::types::ForwardPacketMeta::from(be_meta),
+            None
+        ),
+        Some(0),
+        "#8367: and an unmarked flowless mirror clone still falls back to the \
+         interface default queue"
     );
 }
 
@@ -1238,7 +1265,7 @@ fn resolve_cached_cos_tx_selection_prefers_egress_output_filter_and_keeps_counte
             dscp: 0,
             ..Default::default()
         },
-        Some(&SessionKey {
+        &SessionKey {
             addr_family: libc::AF_INET as u8,
             protocol: PROTO_TCP,
             src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
@@ -1247,7 +1274,7 @@ fn resolve_cached_cos_tx_selection_prefers_egress_output_filter_and_keeps_counte
             dst_port: 443,
                     discriminator: Default::default(),
                     routing_domain: 0,
-        }),
+        },
     );
 
     assert_eq!(cached.queue_id, Some(1));
@@ -1487,7 +1514,7 @@ fn resolve_cached_cos_tx_selection_uses_ingress_input_filter_when_no_output_exis
             dscp: 0,
             ..Default::default()
         },
-        Some(&SessionKey {
+        &SessionKey {
             addr_family: libc::AF_INET as u8,
             protocol: PROTO_TCP,
             src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
@@ -1496,7 +1523,7 @@ fn resolve_cached_cos_tx_selection_uses_ingress_input_filter_when_no_output_exis
             dst_port: 443,
                     discriminator: Default::default(),
                     routing_domain: 0,
-        }),
+        },
     );
 
     assert_eq!(cached.queue_id, Some(1));
@@ -1668,8 +1695,8 @@ fn ingress_input_filter_rewalk_uses_prenat_key_5158() {
         &forwarding,
         202,
         meta,
-        Some(&egress_wire_key),
-        Some(&ingress_key),
+        &egress_wire_key,
+        &ingress_key,
     );
     assert_eq!(
         cached.queue_id,
@@ -1699,8 +1726,8 @@ fn ingress_input_filter_rewalk_uses_prenat_key_5158() {
         &forwarding,
         202,
         meta,
-        Some(&egress_wire_key),
-        Some(&egress_wire_key),
+        &egress_wire_key,
+        &egress_wire_key,
     );
     assert_eq!(reverted_cached.queue_id, Some(0));
 }
@@ -1775,7 +1802,7 @@ fn resolve_cached_cos_tx_selection_keeps_counter_only_output_filter_hits() {
             dscp: 0,
             ..Default::default()
         },
-        Some(&SessionKey {
+        &SessionKey {
             addr_family: libc::AF_INET as u8,
             protocol: PROTO_TCP,
             src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
@@ -1784,7 +1811,7 @@ fn resolve_cached_cos_tx_selection_keeps_counter_only_output_filter_hits() {
             dst_port: 443,
                     discriminator: Default::default(),
                     routing_domain: 0,
-        }),
+        },
     );
 
     assert_eq!(cached.queue_id, Some(0));
@@ -2026,6 +2053,31 @@ fn flowless_v4_meta(dst: [u8; 4]) -> UserspaceDpMeta {
         flow_src_addr,
         flow_dst_addr,
         ..Default::default()
+    }
+}
+
+/// #8367: the POST-NAT on-wire L3 key that the cached flowless entry point now
+/// REQUIRES alongside `flowless_v4_meta`.
+///
+/// These fixtures are NON-NAT, so the post-NAT tuple IS the meta tuple with
+/// ports 0 — bit-identical to what `l3_wire_session_flow_from_meta` produces
+/// when the packet's `NatDecision` rewrites nothing. Every cell migrated onto
+/// this helper therefore keeps asserting exactly what it asserted while the key
+/// was implicit; the NAT'd case (where the two tuples differ, and the point of
+/// #8367) is covered by `cached_flowless_output_filter_matches_the_postnat_*`.
+fn flowless_v4_wire_key(dst: [u8; 4]) -> SessionKey {
+    SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+        dst_ip: IpAddr::V4(Ipv4Addr::from(dst)),
+        // A flowless packet has no L4 header (#2344/#3290); the cached flowless
+        // arm evaluates through the PORTLESS evaluator (#7992) and never reads
+        // these.
+        src_port: 0,
+        dst_port: 0,
+        discriminator: Default::default(),
+        routing_domain: 0,
     }
 }
 
@@ -2272,8 +2324,12 @@ fn resolve_cached_cos_tx_selection_flowless_enforces_output_discard() {
     let forwarding = build_forwarding_state(&snapshot);
 
     // Flowless packet whose L3 dst MATCHES the deny term → must fail closed.
-    let matched =
-        resolve_cached_cos_tx_selection(&forwarding, 202, flowless_v4_meta([172, 16, 80, 200]), None);
+    let matched = resolve_cached_cos_tx_selection_flowless(
+        &forwarding,
+        202,
+        flowless_v4_meta([172, 16, 80, 200]),
+        &flowless_v4_wire_key([172, 16, 80, 200]),
+    );
     assert!(
         matched.drop,
         "#6055: a flowless cached-arm packet matching an output `then discard` \
@@ -2284,8 +2340,12 @@ fn resolve_cached_cos_tx_selection_flowless_enforces_output_discard() {
 
     // Control: a flowless packet that does NOT match any deny term still
     // egresses (pass-through unchanged, #2357/#3290 preserved).
-    let unmatched =
-        resolve_cached_cos_tx_selection(&forwarding, 202, flowless_v4_meta([172, 16, 80, 201]), None);
+    let unmatched = resolve_cached_cos_tx_selection_flowless(
+        &forwarding,
+        202,
+        flowless_v4_meta([172, 16, 80, 201]),
+        &flowless_v4_wire_key([172, 16, 80, 201]),
+    );
     assert!(
         !unmatched.drop,
         "#6055: a flowless cached-arm packet not matching any deny term must NOT drop"
@@ -2321,8 +2381,12 @@ fn resolve_cached_cos_tx_selection_flowless_enforces_output_reject() {
     };
     let forwarding = build_forwarding_state(&snapshot);
 
-    let selection =
-        resolve_cached_cos_tx_selection(&forwarding, 202, flowless_v4_meta([172, 16, 80, 200]), None);
+    let selection = resolve_cached_cos_tx_selection_flowless(
+        &forwarding,
+        202,
+        flowless_v4_meta([172, 16, 80, 200]),
+        &flowless_v4_wire_key([172, 16, 80, 200]),
+    );
     assert!(selection.drop, "#6055: flowless cached `then reject` must drop");
     assert!(
         selection.reject,
@@ -2361,8 +2425,12 @@ fn resolve_cached_cos_tx_selection_flowless_enforces_output_log() {
     };
     let forwarding = build_forwarding_state(&snapshot);
 
-    let selection =
-        resolve_cached_cos_tx_selection(&forwarding, 202, flowless_v4_meta([172, 16, 80, 200]), None);
+    let selection = resolve_cached_cos_tx_selection_flowless(
+        &forwarding,
+        202,
+        flowless_v4_meta([172, 16, 80, 200]),
+        &flowless_v4_wire_key([172, 16, 80, 200]),
+    );
     assert!(
         selection.filter_log.is_some(),
         "#6055: a flowless cached-arm packet matching an output `then log` term must log"
@@ -2404,8 +2472,12 @@ fn resolve_cached_cos_tx_selection_flowless_port_term_does_not_spuriously_drop()
     };
     let forwarding = build_forwarding_state(&snapshot);
 
-    let selection =
-        resolve_cached_cos_tx_selection(&forwarding, 202, flowless_v4_meta([172, 16, 80, 200]), None);
+    let selection = resolve_cached_cos_tx_selection_flowless(
+        &forwarding,
+        202,
+        flowless_v4_meta([172, 16, 80, 200]),
+        &flowless_v4_wire_key([172, 16, 80, 200]),
+    );
     assert!(
         !selection.drop,
         "#6055: a port-bearing output term must NOT drop a flowless (port 0) cached packet"
@@ -2461,11 +2533,11 @@ fn resolve_cached_cos_tx_selection_flowless_captures_counter_only_output_filter(
     };
     let forwarding = build_forwarding_state(&snapshot);
 
-    let cached = resolve_cached_cos_tx_selection(
+    let cached = resolve_cached_cos_tx_selection_flowless(
         &forwarding,
         202,
         flowless_v4_meta([172, 16, 80, 200]),
-        None,
+        &flowless_v4_wire_key([172, 16, 80, 200]),
     );
     assert!(
         !cached.filter_counters.is_empty(),
@@ -2480,15 +2552,307 @@ fn resolve_cached_cos_tx_selection_flowless_captures_counter_only_output_filter(
     // Control: a flowless packet whose L3 dst does NOT match the counted term
     // captures no counter — proves the assertion binds the term MATCH, not the
     // mere presence of a counter-only output filter.
-    let unmatched = resolve_cached_cos_tx_selection(
+    let unmatched = resolve_cached_cos_tx_selection_flowless(
         &forwarding,
         202,
         flowless_v4_meta([172, 16, 80, 201]),
-        None,
+        &flowless_v4_wire_key([172, 16, 80, 201]),
     );
     assert!(
         unmatched.filter_counters.is_empty(),
         "#6360: a flowless packet not matching the counted term captures no counter",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #8367 — the CACHED flowless arm must read the POST-NAT on-wire tuple.
+// ---------------------------------------------------------------------------
+//
+// WHAT THESE GUARD, STATED HONESTLY. This arm has no production caller that
+// reaches it. `flow_cache.rs`'s seed always supplies a flow key, and the
+// port-mirror path (`mirror_cos_queue_id`) consumes only `.queue_id` — and
+// since #8367 it asks for only the queue (`resolve_cached_cos_tx_queue_id`), so
+// it no longer reaches the descriptor arm at all. These are HARDENING cells,
+// not an outage repair, and that distinction belongs next to them rather than
+// in a commit message nobody re-reads.
+//
+// The trap is real all the same. #6055 populated `.drop` / `.reject` /
+// `.filter_log` here DELIBERATELY, for a caller that does not exist yet, so
+// that the next one to arrive would fail closed instead of waving a
+// would-be-dropped flowless packet past an egress `then discard`. Reading the
+// ingress (pre-NAT) `meta` for the family, the addresses and the protocol made
+// those fields *confidently wrong* rather than merely absent — a trap that
+// would present, long after the commit that armed it, as "the output filter
+// matched the wrong address". Junos applies an interface `filter output` on the
+// EGRESS interface AFTER NAT (#3642).
+//
+// #8367 removes the trap at the type level: `resolve_cached_cos_tx_selection_flowless`
+// REQUIRES the post-NAT key, and there is deliberately no entry point that lets
+// it be omitted. These cells bind that the required key is what the three reads
+// actually use — a required parameter that nothing reads would be a guarantee
+// in shape only.
+
+/// #8367: the cached flowless arm matches the output filter on the POST-NAT
+/// SOURCE, and a pre-NAT `from source-address` term no longer fires.
+///
+/// The fixture is the shape interface SNAT produces: `meta` carries the PRE-NAT
+/// source 10.0.61.100 (what arrived), the wire key carries the POST-NAT source
+/// 172.16.80.8 (what leaves). Both are IPv4, so — unlike #7656's NAT64 case —
+/// there is no family signal at all; the ADDRESS is the only discriminator,
+/// which is exactly why the #7656 fixture warning applies here in full. An
+/// address-less term fires on whichever tuple the evaluator was handed and
+/// cannot tell the two apart.
+///
+/// Arm C is the flow-bearing POSITIVE CONTROL. Without it, arms A and B are
+/// also explained by a filter that never matches anything at all.
+#[test]
+fn cached_flowless_output_filter_matches_the_postnat_source_8367() {
+    // The PRE-NAT ingress tuple, as the shim stamped it on the arriving packet.
+    let prenat_meta = UserspaceDpMeta {
+        ingress_ifindex: 5,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        dscp: 0,
+        pkt_len: 1514,
+        flow_src_addr: [10, 0, 61, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        flow_dst_addr: [172, 16, 80, 200, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        ..Default::default()
+    };
+    // The POST-NAT on-wire L3 tuple: interface SNAT rewrote the source to the
+    // egress interface address. This is what `forward_wire_key(&forward_key,
+    // decision.nat)` produces, with ports 0 because a flowless packet has no L4
+    // header (#2344/#3290).
+    let postnat_wire = SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+        src_port: 0,
+        dst_port: 0,
+        discriminator: Default::default(),
+        routing_domain: 0,
+    };
+
+    let snapshot = |term_source: &str| ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "reth0.0".into(),
+            ifindex: 202,
+            hardware_addr: "02:bf:72:00:80:08".into(),
+            filter_output_v4: "wan-src".into(),
+            ..Default::default()
+        }],
+        filters: vec![FirewallFilterSnapshot {
+            name: "wan-src".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "by-source".into(),
+                source_addresses: vec![term_source.into()],
+                source_constrained: true,
+                protocols: vec!["tcp".into()],
+                action: "discard".into(),
+                log: true,
+                ..Default::default()
+            }],
+        }],
+        ..Default::default()
+    };
+
+    // ARM A — the POST-NAT source. The packet's on-wire source IS the pool /
+    // interface address, so an operator's `from source-address 172.16.80.8/32
+    // then discard` MUST fire. Before #8367 this arm read 10.0.61.100 out of
+    // `meta`, the term did not match, and the flowless packet was waved past a
+    // configured deny.
+    let forwarding = build_forwarding_state(&snapshot("172.16.80.8/32"));
+    let postnat =
+        resolve_cached_cos_tx_selection_flowless(&forwarding, 202, prenat_meta, &postnat_wire);
+    assert!(
+        postnat.drop,
+        "#8367: the cached flowless arm must match the output filter on the \
+         POST-NAT on-wire source (172.16.80.8). A `false` here means it is still \
+         reading the pre-NAT `meta` tuple, so an egress `then discard` on the \
+         NAT pool address never fires for a fragment"
+    );
+    assert!(
+        postnat.filter_log.is_some(),
+        "#8367: and the `then log` on that term must be captured, so the event \
+         is attributed to the tuple the packet actually left with"
+    );
+
+    // ARM B — the PRE-NAT source. This is the address the packet ARRIVED with
+    // and no longer carries on the wire, so the term must NOT match. This arm
+    // is what makes arm A's `true` about the post-NAT tuple rather than about
+    // "any source-address term matches": a mixture that selected the right
+    // filter and matched the wrong addresses passes neither arm.
+    let forwarding = build_forwarding_state(&snapshot("10.0.61.100/32"));
+    let prenat =
+        resolve_cached_cos_tx_selection_flowless(&forwarding, 202, prenat_meta, &postnat_wire);
+    assert!(
+        !prenat.drop,
+        "#8367: a `from source-address <pre-NAT>` term must NOT match a packet \
+         whose on-wire source has been translated away from it. A `true` here is \
+         the pre-#8367 behaviour: the ingress `meta` source is being matched"
+    );
+    assert_eq!(
+        prenat.filter_log, None,
+        "#8367: and no log event is owed for a term that did not match"
+    );
+
+    // ARM C — FLOW-BEARING POSITIVE CONTROL. Same filter, same interface, same
+    // post-NAT tuple, but through the flow-keyed arm (which has always used the
+    // post-NAT wire key, #3642). It proves the term is well-formed,
+    // TX-eligible, correctly attached, and reachable — so arm B's `false` is
+    // about the pre-NAT address and not about a dead fixture.
+    let forwarding = build_forwarding_state(&snapshot("172.16.80.8/32"));
+    let flow_key = SessionKey {
+        src_port: 40000,
+        dst_port: 443,
+        ..postnat_wire
+    };
+    let keyed = resolve_cached_cos_tx_selection(&forwarding, 202, prenat_meta, &flow_key);
+    assert!(
+        keyed.drop,
+        "#8367 POSITIVE CONTROL: the flow-bearing arm must drop on the same \
+         post-NAT source term. If this fails the fixture is broken and neither \
+         flowless arm above proves anything"
+    );
+}
+
+/// #8367: the output-filter FAMILY and the matched PROTOCOL come from the same
+/// wire key as the addresses — one choice, not three reads.
+///
+/// A mixture is the failure mode #7656 named and this cell is the cached arm's
+/// version of it: selecting the egress family while still matching the ingress
+/// addresses picks the right filter and then cannot match any address-bearing
+/// term in it, which is *less* correct than the original bug and invisible to
+/// any fixture whose terms are address-less.
+///
+/// Neither a family nor a protocol change is reachable through today's cached
+/// callers — `flow_cache::should_cache` excludes NAT64 (`&& !decision.nat.nat64`),
+/// and NAT64 is the only translation that moves either field. The cell exists
+/// anyway, because the arm's whole reason to be populated is the caller that
+/// does not exist yet (#6055), and a caller that supplies a cross-family key
+/// must not be silently evaluated against the ingress family. Deleting this
+/// cell is a decision to re-derive that; do it deliberately or not at all.
+#[test]
+fn cached_flowless_output_filter_reads_family_and_protocol_from_the_wire_key_8367() {
+    // PROTOCOL. `meta` says TCP; the wire key says UDP. The term matches UDP,
+    // so it fires only if the protocol came from the key.
+    let tcp_meta = UserspaceDpMeta {
+        ingress_ifindex: 5,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        pkt_len: 1514,
+        flow_src_addr: [10, 0, 61, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        flow_dst_addr: [172, 16, 80, 200, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        ..Default::default()
+    };
+    let udp_wire = SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_UDP,
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+        src_port: 0,
+        dst_port: 0,
+        discriminator: Default::default(),
+        routing_domain: 0,
+    };
+    let proto_snapshot = |protocol: &str| ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "reth0.0".into(),
+            ifindex: 202,
+            hardware_addr: "02:bf:72:00:80:08".into(),
+            filter_output_v4: "wan-proto".into(),
+            ..Default::default()
+        }],
+        filters: vec![FirewallFilterSnapshot {
+            name: "wan-proto".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "by-proto".into(),
+                destination_addresses: vec!["172.16.80.200/32".into()],
+                destination_constrained: true,
+                protocols: vec![protocol.into()],
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        ..Default::default()
+    };
+    let forwarding = build_forwarding_state(&proto_snapshot("udp"));
+    assert!(
+        resolve_cached_cos_tx_selection_flowless(&forwarding, 202, tcp_meta, &udp_wire).drop,
+        "#8367: the matched protocol must come from the wire key (udp), not from \
+         `meta.protocol` (tcp)"
+    );
+    // Control: the term that matches `meta`'s protocol must NOT fire. Without
+    // it, "the udp term matched" is also explained by a protocol match that is
+    // not being evaluated at all.
+    let forwarding = build_forwarding_state(&proto_snapshot("tcp"));
+    assert!(
+        !resolve_cached_cos_tx_selection_flowless(&forwarding, 202, tcp_meta, &udp_wire).drop,
+        "#8367: a term matching the INGRESS meta protocol must not fire on a \
+         packet that leaves as another protocol"
+    );
+
+    // FAMILY. `meta` says AF_INET; the wire key says AF_INET6. BOTH families
+    // have an output filter attached, so neither per-family lookup can
+    // short-circuit and a verdict always means "this family's filter ran".
+    // The v6 filter discards, the v4 filter accepts-and-logs, so `drop` alone
+    // says which family was selected.
+    let v6_wire = SessionKey {
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V6("2001:db8::1".parse().expect("v6 src")),
+        dst_ip: IpAddr::V6("2001:db8::2".parse().expect("v6 dst")),
+        src_port: 0,
+        dst_port: 0,
+        discriminator: Default::default(),
+        routing_domain: 0,
+    };
+    let family_snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "reth0.0".into(),
+            ifindex: 202,
+            hardware_addr: "02:bf:72:00:80:08".into(),
+            filter_output_v4: "wan-v4".into(),
+            filter_output_v6: "wan-v6".into(),
+            ..Default::default()
+        }],
+        filters: vec![
+            FirewallFilterSnapshot {
+                name: "wan-v4".into(),
+                family: "inet".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "accept-all".into(),
+                    action: "accept".into(),
+                    log: true,
+                    ..Default::default()
+                }],
+            },
+            FirewallFilterSnapshot {
+                name: "wan-v6".into(),
+                family: "inet6".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "drop-all".into(),
+                    action: "discard".into(),
+                    ..Default::default()
+                }],
+            },
+        ],
+        ..Default::default()
+    };
+    let forwarding = build_forwarding_state(&family_snapshot);
+    let selection = resolve_cached_cos_tx_selection_flowless(&forwarding, 202, tcp_meta, &v6_wire);
+    assert!(
+        selection.drop,
+        "#8367: the output-filter FAMILY must come from the wire key (inet6), \
+         not `meta.addr_family` (inet). A `false` here means the v4 filter ran \
+         on a packet leaving as IPv6"
+    );
+    assert_eq!(
+        selection.filter_log, None,
+        "#8367: and the v4 filter's `then log` must NOT have fired — that would \
+         be the wrong-family filter both matching and logging"
     );
 }
 
@@ -3663,7 +4027,7 @@ fn cos_dscp_rewrite_keys_on_forwarding_class_and_loss_priority() {
         let selection =
             resolve_cos_tx_selection(&forwarding, 202, meta, Some(&key), TermMatchExtra::default());
         // The cached-descriptor path must resolve identically.
-        let cached = resolve_cached_cos_tx_selection(&forwarding, 202, meta, Some(&key));
+        let cached = resolve_cached_cos_tx_selection(&forwarding, 202, meta, &key);
         assert_eq!(
             selection.dscp_rewrite, cached.dscp_rewrite,
             "runtime and cached CoS rewrite must agree for DSCP {dscp}",
@@ -4698,7 +5062,7 @@ fn pbr_recovers_classify_modifiers_on_cached_tx_selection() {
     let forwarding = build_forwarding_state(&pbr_classify_then_route_snapshot());
     let key = pbr_classify_flow_key();
 
-    let cached = resolve_cached_cos_tx_selection(&forwarding, 202, pbr_classify_meta(), Some(&key));
+    let cached = resolve_cached_cos_tx_selection(&forwarding, 202, pbr_classify_meta(), &key);
     assert_eq!(
         cached.queue_id,
         Some(1),
@@ -5226,7 +5590,7 @@ fn cache_hit_replays_input_count_exactly_once_v4() {
     // cos rebuild folds the input filter's count into `tx_selection.filter_counters`
     // (no output filter present) and the dedicated input replay set is deduped
     // against it (`retain_absent_from`) so the count lives in exactly ONE set.
-    let tx = resolve_cached_cos_tx_selection(&forwarding, 202, meta, Some(&key));
+    let tx = resolve_cached_cos_tx_selection(&forwarding, 202, meta, &key);
     let mut input_counters = crate::filter::evaluate_interface_input_filter_counters_cached(
         &forwarding.filter_state,
         101,
@@ -5425,7 +5789,7 @@ fn resolve_cached_cos_tx_selection_preserves_input_fc_under_counter_only_output_
             dscp: 0,
             ..Default::default()
         },
-        Some(&SessionKey {
+        &SessionKey {
             addr_family: libc::AF_INET as u8,
             protocol: PROTO_TCP,
             src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
@@ -5434,7 +5798,7 @@ fn resolve_cached_cos_tx_selection_preserves_input_fc_under_counter_only_output_
             dst_port: 443,
                     discriminator: Default::default(),
                     routing_domain: 0,
-        }),
+        },
     );
     assert_eq!(
         cached.queue_id,
@@ -5743,7 +6107,7 @@ fn inet_precedence_classifier_marks_flow_for_ba_reclassification() {
             dscp: 46,
             ..Default::default()
         },
-        Some(&key),
+        &key,
     );
     assert!(
         descriptor.ba_reclassify,
@@ -5769,7 +6133,7 @@ fn no_classifier_leaves_flow_without_ba_reclassification() {
             dscp: 46,
             ..Default::default()
         },
-        Some(&key),
+        &key,
     );
     assert!(!descriptor.ba_reclassify);
 }
@@ -5822,7 +6186,7 @@ fn inet_precedence_classifier_loss_priority_selects_the_egress_rewrite() {
             dscp: 40,
             ..Default::default()
         },
-        Some(&key),
+        &key,
     );
     assert_eq!(descriptor.queue_id, Some(5));
     assert_eq!(
@@ -5876,11 +6240,11 @@ fn cached_cos_tx_selection_carries_the_reject_message_type_6854() {
 
     // A configured message-type must reach the descriptor as its resolved codes.
     let forwarding = build_forwarding_state(&snap("host-unreachable"));
-    let selection = resolve_cached_cos_tx_selection(
+    let selection = resolve_cached_cos_tx_selection_flowless(
         &forwarding,
         202,
         flowless_v4_meta([172, 16, 80, 200]),
-        None,
+        &flowless_v4_wire_key([172, 16, 80, 200]),
     );
     assert!(
         selection.reject,
@@ -5913,7 +6277,7 @@ fn cached_cos_tx_selection_carries_the_reject_message_type_6854() {
             dscp: 0,
             ..Default::default()
         },
-        Some(&SessionKey {
+        &SessionKey {
             addr_family: libc::AF_INET as u8,
             protocol: PROTO_TCP,
             src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
@@ -5922,7 +6286,7 @@ fn cached_cos_tx_selection_carries_the_reject_message_type_6854() {
             dst_port: 443,
                     discriminator: Default::default(),
                     routing_domain: 0,
-        }),
+        },
     );
     assert!(
         keyed.reject,
@@ -5938,11 +6302,11 @@ fn cached_cos_tx_selection_carries_the_reject_message_type_6854() {
     // change is invisible to a config that does not use the feature. Without
     // this arm, a fill that hardcoded `host-unreachable` would pass above.
     let forwarding = build_forwarding_state(&snap(""));
-    let selection = resolve_cached_cos_tx_selection(
+    let selection = resolve_cached_cos_tx_selection_flowless(
         &forwarding,
         202,
         flowless_v4_meta([172, 16, 80, 200]),
-        None,
+        &flowless_v4_wire_key([172, 16, 80, 200]),
     );
     assert_eq!(
         (

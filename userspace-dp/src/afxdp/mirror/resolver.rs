@@ -90,6 +90,17 @@ pub(in crate::afxdp) fn sample_then_admit_mirror_clone(
     ))
 }
 
+/// #8367: the mirror/span path consumes a QUEUE and nothing else, so it asks
+/// for one. It used to build the whole cached TX-selection descriptor and read
+/// `.queue_id` off it, which meant that for a FLOWLESS clone (`flow_key ==
+/// None`) it was the one production caller reaching an arm that evaluated the
+/// egress output filter against the ingress PRE-NAT tuple — populating `.drop`,
+/// `.reject` and `.filter_log` with a verdict it then threw away. This path has
+/// no `NatDecision` to synthesize a post-NAT tuple from, and threading one
+/// through the mirror path to populate fields the mirror path discards would be
+/// a poor trade; `resolve_cached_cos_tx_queue_id` returns the identical queue
+/// (behavior-aggregate classification is 5-tuple independent) and leaves the
+/// filter verdict to callers that can supply the tuple it must be computed on.
 #[inline]
 pub(in crate::afxdp) fn mirror_cos_queue_id(
     forwarding: &ForwardingState,
@@ -97,7 +108,7 @@ pub(in crate::afxdp) fn mirror_cos_queue_id(
     meta: ForwardPacketMeta,
     flow_key: Option<&SessionKey>,
 ) -> Option<u8> {
-    resolve_cached_cos_tx_selection(forwarding, output_ifindex, meta.into(), flow_key).queue_id
+    resolve_cached_cos_tx_queue_id(forwarding, output_ifindex, meta.into(), flow_key)
 }
 
 #[inline]
