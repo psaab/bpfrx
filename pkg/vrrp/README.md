@@ -146,6 +146,46 @@ This is the package that drives chassis-cluster failover.
 - `vrrp.go` — `Instance` config type plus `CollectInstances` /
   `CollectRethInstances` config extraction.
 
+## Configured priority is bounded before it is stored (#8597)
+
+`instance_send.go` puts `uint8(priority)` on the wire while the local
+state machine reads `vi.cfg.Priority` as an int (`instance_preempt.go`,
+three sites; `track.go`'s `getPriority`). A configured value outside
+[1,255] therefore made the local decision on a number the peer can never
+see — and a configured 256 truncated onto **0**, which in VRRP is not a
+low priority but the RFC 5798 RESIGNATION beacon this package uses to
+hand mastership over (`manager.go` `ResignRG`). The node would advertise
+"take over now" on every advert while believing itself the most preferred
+candidate.
+
+`clampConfigPriority` bounds the value at both config entry points —
+`newInstance` and `updateConfig`; the day-2 commit path reaches only the
+second, so a clamp on the constructor alone would let a running instance
+acquire the value it was protected from at startup. The internal writes
+in `manager.go` (`ResignRG` setting 0, `UpdateRGPriority` restoring from
+cluster state) are deliberately NOT clamped: those are runtime sentinels,
+not config.
+
+The two clamp targets differ on purpose, and a single target would be
+wrong in two distinct ways:
+
+- **low -> 1, never 0** — clamping to 0 would install the resignation
+  sentinel from config, which is the bug rather than a bound;
+- **high -> 254, never 255** — 255 is the IP-ADDRESS-OWNER priority and
+  carries semantics beyond "most preferred" (`preemptEnabled()` treats an
+  owner as always-preempting; `track.go` exempts it from track-down
+  demotion). Saturating to 255 would silently grant those properties to a
+  config that only asked for a big number. An explicit 255 passes through
+  untouched: that is how an operator declares the address owner.
+
+Reachability is the tolerant ingress. The `vrrp-group ... priority` leaf
+carries `ValidateInteger(1, 255)`, which the tolerant `Store.Load` /
+`Store.SyncApply` path downgrades to a warning per #1960 — the same door
+its chassis-cluster sibling travels (#8597 K17). gemini-review-048
+finding 17 recorded this mechanism as real with its reachability
+unestablished; `config_priority_domain_8597_test.go` drives both compile
+paths rather than asserting it.
+
 ## Callers
 
 `pkg/daemon`, `pkg/api`, `pkg/grpcapi`, `pkg/cli`.
