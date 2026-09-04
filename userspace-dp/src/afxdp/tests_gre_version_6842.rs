@@ -363,7 +363,7 @@ fn the_refusal_total_survives_a_config_apply_8291() {
 #[test]
 fn the_status_surface_reports_the_forwarding_states_total_8291() {
     let mut coordinator = crate::afxdp::Coordinator::new();
-    coordinator.forwarding = build_forwarding_state(&gre_to_self_snapshot());
+    coordinator.set_forwarding_for_test(build_forwarding_state(&gre_to_self_snapshot()));
     assert_eq!(
         coordinator.gre_decap_unsupported_version_refusals_total(),
         0,
