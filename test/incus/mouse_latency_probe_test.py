@@ -79,69 +79,69 @@ class PercentileTests(unittest.TestCase):
 class ValidityTests(unittest.TestCase):
     def test_clean_high_concurrency(self):
         attempts = [600] * 10  # 6000 total, M=10 floor=5000
-        v = compute_validity(10, attempts, completed=5970, errors=30)
+        v = compute_validity(10, attempts, completed=5970, errors=30, coroutine_diagnostics=None)
         self.assertTrue(v["ok"], v["reasons"])
 
     def test_error_rate_too_high(self):
         attempts = [600] * 10
         # 200/6000 = 3.3% > 1%
-        v = compute_validity(10, attempts, completed=5800, errors=200)
+        v = compute_validity(10, attempts, completed=5800, errors=200, coroutine_diagnostics=None)
         self.assertFalse(v["ok"])
         self.assertTrue(any("error_rate" in r for r in v["reasons"]))
 
     def test_degenerate_coroutine_min_attempts(self):
         # 9 coroutines did 600, one did 200; median=600, min=200 < 300
         attempts = [600] * 9 + [200]
-        v = compute_validity(10, attempts, completed=5790, errors=10)
+        v = compute_validity(10, attempts, completed=5790, errors=10, coroutine_diagnostics=None)
         self.assertFalse(v["ok"])
         self.assertTrue(any("degenerate-coroutine" in r for r in v["reasons"]))
 
     def test_below_min_attempts_floor_m10(self):
         attempts = [400] * 10  # 4000 total, M=10 floor=5000
-        v = compute_validity(10, attempts, completed=4000, errors=0)
+        v = compute_validity(10, attempts, completed=4000, errors=0, coroutine_diagnostics=None)
         self.assertFalse(v["ok"])
         self.assertTrue(any("min-attempts" in r for r in v["reasons"]))
 
     def test_min_attempts_floor_m1(self):
         # M=1: floor=500
-        v_pass = compute_validity(1, [500], completed=500, errors=0)
+        v_pass = compute_validity(1, [500], completed=500, errors=0, coroutine_diagnostics=None)
         self.assertTrue(v_pass["ok"], v_pass["reasons"])
-        v_fail = compute_validity(1, [499], completed=499, errors=0)
+        v_fail = compute_validity(1, [499], completed=499, errors=0, coroutine_diagnostics=None)
         self.assertFalse(v_fail["ok"])
         self.assertTrue(any("min-attempts" in r for r in v_fail["reasons"]))
 
     def test_m1_skips_degenerate_check(self):
         # Single coroutine cannot be "degenerate vs median" — gate
         # is concurrency >= 2.
-        v = compute_validity(1, [600], completed=600, errors=0)
+        v = compute_validity(1, [600], completed=600, errors=0, coroutine_diagnostics=None)
         self.assertTrue(v["ok"])
 
     def test_boundary_m10_exactly_5000(self):
         attempts = [500] * 10  # exactly 5000
-        v = compute_validity(10, attempts, completed=5000, errors=0)
+        v = compute_validity(10, attempts, completed=5000, errors=0, coroutine_diagnostics=None)
         self.assertTrue(v["ok"], v["reasons"])
 
     def test_boundary_m10_exactly_4999(self):
         attempts = [500] * 9 + [499]
         # min=499 vs median=500 → 499 >= 0.5*500=250 → not degenerate.
         # Total=4999 < 5000 → fails min-attempts.
-        v = compute_validity(10, attempts, completed=4999, errors=0)
+        v = compute_validity(10, attempts, completed=4999, errors=0, coroutine_diagnostics=None)
         self.assertFalse(v["ok"])
 
     def test_boundary_m1_exactly_500(self):
-        v = compute_validity(1, [500], completed=500, errors=0)
+        v = compute_validity(1, [500], completed=500, errors=0, coroutine_diagnostics=None)
         self.assertTrue(v["ok"])
 
     def test_inconsistent_counts_completed_more_than_attempted(self):
         # Copilot R1 #4: surface the bookkeeping invariant rather
         # than letting completed go unused.
-        v = compute_validity(10, [600] * 10, completed=7000, errors=0)
+        v = compute_validity(10, [600] * 10, completed=7000, errors=0, coroutine_diagnostics=None)
         self.assertFalse(v["ok"])
         self.assertTrue(any("inconsistent-counts" in r for r in v["reasons"]))
 
     def test_inconsistent_counts_completed_plus_errors_neq_attempted(self):
         # 6000 attempts, 5500 completed, 100 errors → 5600 ≠ 6000
-        v = compute_validity(10, [600] * 10, completed=5500, errors=100)
+        v = compute_validity(10, [600] * 10, completed=5500, errors=100, coroutine_diagnostics=None)
         self.assertFalse(v["ok"])
         self.assertTrue(any("inconsistent-counts" in r for r in v["reasons"]))
 
@@ -394,3 +394,220 @@ class PersistentConnectionModeTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConcentratedTailAttributionTests(unittest.TestCase):
+    """#8277: the gate must be able to return FAIL on a concentrated tail.
+
+    The degenerate-coroutine rule is a FAIRNESS predicate that was applied as a
+    VALIDITY predicate. A mouse-latency gate under elephant load exists to
+    detect a tail; when the tail is concentrated in a minority of flows, those
+    flows necessarily complete far fewer transactions, so the rule fired on
+    exactly the reps that demonstrated the phenomenon and the cell reported
+    INSUFFICIENT-DATA. On master `d8a876042` a cell whose loaded p99.9 was
+    740-1349 ms against a 6.66 ms idle baseline -- 111x to 202x against a 2.0
+    gate -- reported INSUFFICIENT-DATA with 0 of 15 reps valid.
+
+    EVERY FIXTURE HERE SHARES ONE `attempts_per_coroutine`. That is the point
+    and it is what the issue's acceptance criterion asks for: the versions can
+    only be told apart by a rep where the two ATTRIBUTIONS differ, so the
+    starvation shape is held identical and only the phase maxima move. A
+    fixture built from a uniform rep, or one where the shapes also differ,
+    passes against both the old rule and the new one and proves nothing.
+    """
+
+    # The real shape, from #8277's recorded run: 100 coroutines, 13 starved at
+    # ~150 attempts, 21 at ~2500, 66 at ~2900. median is 2900, so the threshold
+    # is 1450 -- the 13 are starved and the 21 are not.
+    STARVED_IDS = list(range(13))
+
+    @classmethod
+    def attempts(cls):
+        return [150] * 13 + [2500] * 21 + [2900] * 66
+
+    @classmethod
+    def diagnostics(cls, starved_phase, starved_max=300_000):
+        """One `coroutines[]` block, built the way production builds it.
+
+        Goes through `coroutine_diagnostic_record` rather than hand-writing the
+        dict so the `max_<phase>` key spelling is the production spelling. A
+        hand-written fixture would keep passing if the producer renamed a key,
+        while the real consumer silently lost its attribution.
+        """
+        out = []
+        for i, attempted in enumerate(cls.attempts()):
+            starved = i in cls.STARVED_IDS
+            # A healthy coroutine: sub-millisecond echo, small client phases.
+            phases = {
+                "read_us": [800],
+                "sleep_overshoot_us": [3_600],
+                "drain_us": [69],
+                "connect_us": [120],
+                "start_gap_us": [40],
+            }
+            if starved:
+                phases[starved_phase] = [starved_max]
+            out.append(
+                probe.coroutine_diagnostic_record(
+                    i, attempted, attempted, 0, [starved_max if starved else 800], phases
+                )
+            )
+        return out
+
+    def test_echo_path_starvation_is_a_result_not_an_invalidation(self):
+        """The phenomenon. Starved on `read_us` -> the rep is VALID."""
+        v = compute_validity(
+            100, self.attempts(), completed=sum(self.attempts()), errors=0,
+            coroutine_diagnostics=self.diagnostics("read_us"),
+        )
+        self.assertTrue(
+            v["ok"],
+            f"a concentrated tail attributable to the echo path must be admitted "
+            f"so the gate can FAIL on it; reasons={v['reasons']}",
+        )
+        self.assertNotIn("degenerate-coroutine", " ".join(v["reasons"]))
+        # The admission is recorded, so a rep admitted DESPITE starvation is
+        # distinguishable in probe.json from one with no starvation at all.
+        self.assertEqual(v["starvation"]["verdict"], "concentrated-tail-is-a-result")
+        self.assertEqual(v["starvation"]["starved_coroutines"], self.STARVED_IDS)
+        self.assertEqual(v["starvation"]["attribution"], {"read_us": self.STARVED_IDS})
+
+    def test_timer_wake_starvation_still_invalidates(self):
+        """The artifact the rule was written for. Same shape, other cause."""
+        v = compute_validity(
+            100, self.attempts(), completed=sum(self.attempts()), errors=0,
+            coroutine_diagnostics=self.diagnostics("sleep_overshoot_us"),
+        )
+        self.assertFalse(v["ok"], "client-side timer starvation must still invalidate")
+        joined = " ".join(v["reasons"])
+        self.assertIn("degenerate-coroutine", joined)
+        self.assertIn("client-side=", joined)
+
+    def test_socket_backpressure_starvation_still_invalidates(self):
+        """The other client-side cause: local socket drain."""
+        v = compute_validity(
+            100, self.attempts(), completed=sum(self.attempts()), errors=0,
+            coroutine_diagnostics=self.diagnostics("drain_us"),
+        )
+        self.assertFalse(v["ok"], "client-side socket backpressure must still invalidate")
+        self.assertIn("client-side=", " ".join(v["reasons"]))
+
+    def test_one_client_side_coroutine_invalidates_the_whole_rep(self):
+        """The conservative direction, asserted rather than assumed.
+
+        A rep is admitted only when EVERY starved coroutine is demonstrably on
+        the echo path. Without this the change would weaken the original rule
+        instead of narrowing it: a rep with one genuine client-side artifact
+        among many real ones would be admitted, and the artifact is exactly what
+        the rule exists to reject.
+        """
+        diags = self.diagnostics("read_us")
+        # Flip a SINGLE starved coroutine to the client-side cause.
+        contaminated = self.STARVED_IDS[0]
+        diags[contaminated] = probe.coroutine_diagnostic_record(
+            contaminated, 150, 150, 0, [300_000],
+            {"read_us": [800], "sleep_overshoot_us": [300_000], "drain_us": [69],
+             "connect_us": [120], "start_gap_us": [40]},
+        )
+        v = compute_validity(
+            100, self.attempts(), completed=sum(self.attempts()), errors=0,
+            coroutine_diagnostics=diags,
+        )
+        self.assertFalse(v["ok"])
+        self.assertIn(f"client-side=[{contaminated}]", " ".join(v["reasons"]))
+
+    def test_missing_diagnostics_keeps_the_pre_8277_behaviour(self):
+        """No attribution data means no attribution -- invalidate, as before.
+
+        This is the fail-safe direction, and it is why `coroutine_diagnostics`
+        has no default value: a caller that cannot supply it must choose this
+        behaviour explicitly rather than inherit it.
+        """
+        v = compute_validity(
+            100, self.attempts(), completed=sum(self.attempts()), errors=0,
+            coroutine_diagnostics=None,
+        )
+        self.assertFalse(v["ok"])
+        self.assertIn("unattributable=", " ".join(v["reasons"]))
+
+    def test_a_coroutine_that_recorded_no_phases_is_unattributable(self):
+        """A starved coroutine that completed nothing records no phase maxima.
+
+        It cannot be attributed, so it cannot be admitted. Without this the
+        `max()` over an empty set would decide the rep.
+        """
+        diags = self.diagnostics("read_us")
+        blank = self.STARVED_IDS[0]
+        diags[blank] = probe.coroutine_diagnostic_record(
+            blank, 150, 0, 150, [], {},
+        )
+        v = compute_validity(
+            100, self.attempts(), completed=sum(self.attempts()), errors=0,
+            coroutine_diagnostics=diags,
+        )
+        self.assertFalse(v["ok"])
+        self.assertIn(f"unattributable=[{blank}]", " ".join(v["reasons"]))
+
+    def test_uniform_rep_is_unaffected_in_both_directions(self):
+        """CONTROL. No starvation at all -> valid, and no starvation block.
+
+        Without this the change could be "delete the rule" and every assertion
+        above would still pass. The uniform case is also the one the issue notes
+        still FAILs correctly on its own -- the median moves with the min -- so
+        it must keep reaching the verdict untouched.
+        """
+        attempts = [2900] * 100
+        v = compute_validity(
+            100, attempts, completed=sum(attempts), errors=0,
+            coroutine_diagnostics=self.diagnostics("read_us"),
+        )
+        self.assertTrue(v["ok"], v["reasons"])
+        self.assertNotIn("starvation", v)
+
+    def test_the_admitted_rep_still_fails_every_other_gate_it_should(self):
+        """Admission is narrow: it removes ONE reason, not the whole §4.2 set.
+
+        The same echo-path-starved rep with a high error rate stays invalid. A
+        change that admitted the concentrated tail by short-circuiting the
+        remaining gates would pass every test above.
+        """
+        attempts = self.attempts()
+        total = sum(attempts)
+        v = compute_validity(
+            100, attempts, completed=total - 5000, errors=5000,
+            coroutine_diagnostics=self.diagnostics("read_us"),
+        )
+        self.assertFalse(v["ok"])
+        self.assertTrue(any("error_rate" in r for r in v["reasons"]))
+        self.assertFalse(any("degenerate-coroutine" in r for r in v["reasons"]))
+
+    def test_the_probe_json_key_names_are_pinned_to_their_literals(self):
+        """The `coroutines[]` key names are a published schema, not an internal detail.
+
+        Found by mutation: renaming the format in `phase_max_key` moved the
+        PRODUCER and the CONSUMER together, so every other cell in this class
+        stayed green while `probe.json` silently emitted different key names.
+        That is single-sourcing working as designed internally and losing a
+        guarantee externally -- the derived name has no test, so the pinned
+        literal the old hand-written dict provided was decommissioned by the
+        refactor that replaced it.
+
+        These three names are cited by number in #8277's acceptance criteria and
+        appear in the recorded analyses under docs/log/, so a rename would
+        invalidate the vocabulary of every historical run without failing
+        anything. Pinned here as an alias check: single-sourced in the code,
+        literal in the test.
+        """
+        rec = probe.coroutine_diagnostic_record(
+            0, 10, 10, 0, [800],
+            {"read_us": [800], "sleep_overshoot_us": [10], "drain_us": [5],
+             "connect_us": [120], "start_gap_us": [40]},
+        )
+        for literal in ("max_read_us", "max_sleep_overshoot_us", "max_drain_us"):
+            self.assertIn(
+                literal, rec,
+                f"probe.json's per-coroutine block must carry {literal!r} verbatim",
+            )
+        # And the consumer must read the SAME literals, or the attribution
+        # silently degrades to "unattributable" and #8277's defect returns.
+        self.assertEqual(probe.attribute_starvation(rec), "read_us")

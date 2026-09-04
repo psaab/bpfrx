@@ -2117,6 +2117,75 @@ number is the reverse-direction counterpart of the push-direction
 the per-class denominator" above — both directions hit the same
 hardware delivery ceiling on this cluster, NOT a CoS scheduler limit.
 
+## What the mouse-latency gate can and cannot render a verdict on (#8277)
+
+The mouse-latency gate measures a small-flow tail under elephant load. Its
+§4.2 validity rules decide which reps reach the verdict, and one of them
+determines which PHENOMENA the gate is capable of failing on at all. Stated
+here because "the instrument cannot see this shape" is not visible from a run's
+output — a cell that cannot fail looks exactly like a cell that passed.
+
+| tail shape | before #8277 | now |
+|---|---|---|
+| **uniform slowdown** — every coroutine slows together | FAIL, correctly. The median moves with the min, so `min/median` stays near 1 and the rule does not fire | unchanged |
+| **concentrated tail** — a minority of flows starved, the rest healthy | **could not FAIL.** The starved flows complete far fewer transactions, `min < 0.5 * median` fires, and enough such reps leave the cell at `INSUFFICIENT-DATA` | FAIL, when the starvation is attributable to the echo path |
+| **client-side artifact** — a coroutine starved by the probe's own event loop or local socket backpressure | invalidated, correctly — this is what the rule was written for | unchanged; still invalidated |
+
+### How the two are told apart
+
+The degenerate-coroutine rule is a **fairness** predicate. It was applied as a
+**validity** predicate, and a gate that exists to detect a tail cannot treat
+"the tail is concentrated" as a reason to discard the evidence. But deleting
+the rule would re-admit the client-side artifact it was written for, so the
+distinction is made from data the probe already records rather than by removing
+the check.
+
+For each starved coroutine, `attribute_starvation`
+(`test/incus/mouse_latency_probe.py`) compares the three per-coroutine phase
+maxima the run already emits — `max_read_us`, `max_sleep_overshoot_us`,
+`max_drain_us` — and takes the largest:
+
+- `read_us` dominant → the time went to the **echo path**. That is the thing
+  being measured, so the rep is a RESULT and is admitted.
+- `sleep_overshoot_us` (timer wake delay in the probe's own event loop) or
+  `drain_us` (local socket backpressure) dominant → **client-side**. The rep is
+  measuring the probe, and stays invalid.
+
+The comparison is threshold-free deliberately. An arbitrary cutoff is what put
+this rule in the position of invalidating its own phenomenon, and the observed
+separation is not marginal: #8277's recorded run had `read_us` p99.9 of
+740–1349 ms against `sleep_overshoot_us` of 3.1–3.6 ms and `drain_us` of
+53–69 µs.
+
+**A rep is admitted only when EVERY starved coroutine is attributable to the
+echo path.** One client-side or unattributable coroutine invalidates the rep.
+That is the conservative direction, and it keeps the original rule's full power
+over the artifact it was written for. A coroutine that completed nothing
+records no phase maxima and is therefore unattributable, not admitted.
+
+Whichever way it goes, the rep records a `validity.starvation` block naming the
+starved coroutines and their attribution — so a rep admitted *despite*
+starvation is distinguishable in `probe.json` from one that never starved.
+
+### What this does not fix
+
+- **Attribution of the verdict itself.** #8259 is the separate defect that mice
+  and elephants terminate on the same host, so a loaded/idle ratio cannot
+  separate firewall queueing from target-host service. Loosening this rule lets
+  a concentrated tail produce a FAIL; #8259 is what makes that FAIL mean
+  something. Neither subsumes the other.
+- **The `error_rate >= 0.01` rule**, which #8277 notes is the same shape: a
+  connection error rate that rises *because* flows are being starved is a
+  result, not a reason to discard the measurement. It was left alone
+  deliberately. Attributing an error to starvation needs evidence the probe does
+  not currently record, unlike the phase maxima above, and the gate can already
+  return FAIL without it — in #8277's run, 8 of the 10 probe-bearing reps
+  tripped only the degenerate-coroutine rule. Changing it is a separate change
+  with its own evidence.
+- **Historical `INSUFFICIENT-DATA` cells.** Every one on a concentrated-tail
+  fixture is a candidate masked FAIL, including the one reported on #7159 on
+  2026-08-31. They were not re-run as part of this change.
+
 ## Open questions for future contract iteration
 
 - Is `ε = 0.05` (5 percentage points implementation margin) the
