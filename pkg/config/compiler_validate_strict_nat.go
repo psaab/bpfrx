@@ -2472,6 +2472,14 @@ func validateNAT64PrefixStrict(cfg *Config, lenient bool) ([]string, error) {
 		// one rejects — all leading '+' — and rejects none that this one
 		// accepts. The backstop being LAXER is the safe direction; see the note
 		// at that call site before changing either side.
+		//
+		// It WAS reachable and it DID fail open: on the lenient path emit()
+		// only warned and the loop continued, so `/+96` reached the dataplane
+		// verbatim and the Rust loader installed it (measured: prefix_bytes
+		// 00:64:ff:9b:.., active, byte-identical to a canonical /96) while the
+		// warning told the operator the rule would not reach the dataplane.
+		// #8667 fixed that here, by splitting the two verdicts below.
+		//
 		// canonical: the spelling a commit must use. dataplaneOK: what the
 		// helper will actually accept. They differ only on a leading '+'.
 		canonical, dataplaneOK := false, false
