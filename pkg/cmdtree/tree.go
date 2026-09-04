@@ -99,6 +99,41 @@ type Node struct {
 	// Validator, if set, is called at SchemaValidate time to accept or
 	// reject the raw string at this leaf. cfg may be nil.
 	Validator LeafValidator
+
+	// AcceptsArgs marks a node that consumes trailing words this tree
+	// deliberately does not model, so Canonicalize resolves the command
+	// instead of returning CanonicalUnknown (#8304).
+	//
+	// It exists because "offers completions" and "accepts an argument" are
+	// DIFFERENT properties that HasDynamic conflated. `show log <filename>`
+	// takes an argument and has no completion source; before this the only
+	// way to say "an argument is legal here" was to attach a DynamicFn that
+	// returned nothing — declaring a completion source that does not exist in
+	// order to describe acceptance.
+	//
+	// Having no way to say it was not cosmetic. A caller enforcing a
+	// login-class restriction fails CLOSED on anything but CanonicalOK
+	// (evaluateCommandRegex, pkg/cli/permissions_regex.go), so an
+	// unmodelled-but-legal argument means ANY class carrying allow-commands or
+	// deny-commands is refused a lawful command outright. Measured before this
+	// change: `show log messages`, `show log 50` — the very `[N]` form that
+	// node's own Desc advertises — and every `show configuration <stanza>
+	// <deeper>` were CanonicalUnknown.
+	//
+	// OPT-IN, NEVER A RELAXATION. An unmarked node is exactly as strict as
+	// before, so this cannot re-open the #8289 sibling-descent bypass. Set it
+	// only where the dispatcher genuinely reads trailing words: it is a claim
+	// that the command is REAL, and modelling one the CLI refuses is the
+	// mirror defect. `clear security flow session all` is the worked example —
+	// it looks like a peer of these, but parseClearSessionFilter rejects `all`
+	// as an unknown filter, so it is correctly CanonicalUnknown and is NOT
+	// marked.
+	//
+	// Like HasDynamic it consumes ARBITRARILY MANY trailing words, because
+	// Canonicalize leaves currentNode in place across the skip. That is what a
+	// config hierarchy path needs, and why a typed-leaf ValueType — admitting
+	// exactly one — cannot express these.
+	AcceptsArgs bool
 }
 
 // HasDynamic returns true if the node has any dynamic completion function.
@@ -291,23 +326,32 @@ var OperationalTree = map[string]*Node{
 				}},
 			}},
 		}},
+
+		// #8304: every stanza below is a CONFIG HIERARCHY ROOT, and
+		// `show configuration <path...>` joins every remaining word into that
+		// path (pkg/cli/cli_show.go). The depth is unbounded and belongs to the
+		// config schema, not to this tree, so each leaf declares AcceptsArgs
+		// rather than the tree trying to mirror a second schema. Before this,
+		// `show configuration security zones` and every sibling — system
+		// services, interfaces ge-0/0/0, firewall filter f1 — were
+		// CanonicalUnknown, so a restricted class was refused all of them.
 		"configuration": {Desc: "Show active configuration", Children: map[string]*Node{
-			"applications":       {Desc: "Application protocol definitions"},
-			"chassis":            {Desc: "Chassis configuration"},
-			"class-of-service":   {Desc: "Class-of-service configuration"},
-			"event-options":      {Desc: "Event processing configuration"},
-			"firewall":           {Desc: "Firewall filter configuration"},
-			"forwarding-options": {Desc: "Forwarding options configuration"},
-			"interfaces":         {Desc: "Interface configuration"},
-			"policy-options":     {Desc: "Policy framework configuration"},
-			"protocols":          {Desc: "Routing protocol configuration"},
-			"routing-instances":  {Desc: "Routing instance configuration"},
-			"routing-options":    {Desc: "Protocol-independent routing options"},
-			"schedulers":         {Desc: "Scheduler configuration"},
-			"security":           {Desc: "Security configuration"},
-			"services":           {Desc: "Service configuration"},
-			"snmp":               {Desc: "SNMP configuration"},
-			"system":             {Desc: "System configuration"},
+			"applications":       {Desc: "Application protocol definitions", AcceptsArgs: true},
+			"chassis":            {Desc: "Chassis configuration", AcceptsArgs: true},
+			"class-of-service":   {Desc: "Class-of-service configuration", AcceptsArgs: true},
+			"event-options":      {Desc: "Event processing configuration", AcceptsArgs: true},
+			"firewall":           {Desc: "Firewall filter configuration", AcceptsArgs: true},
+			"forwarding-options": {Desc: "Forwarding options configuration", AcceptsArgs: true},
+			"interfaces":         {Desc: "Interface configuration", AcceptsArgs: true},
+			"policy-options":     {Desc: "Policy framework configuration", AcceptsArgs: true},
+			"protocols":          {Desc: "Routing protocol configuration", AcceptsArgs: true},
+			"routing-instances":  {Desc: "Routing instance configuration", AcceptsArgs: true},
+			"routing-options":    {Desc: "Protocol-independent routing options", AcceptsArgs: true},
+			"schedulers":         {Desc: "Scheduler configuration", AcceptsArgs: true},
+			"security":           {Desc: "Security configuration", AcceptsArgs: true},
+			"services":           {Desc: "Service configuration", AcceptsArgs: true},
+			"snmp":               {Desc: "SNMP configuration", AcceptsArgs: true},
+			"system":             {Desc: "System configuration", AcceptsArgs: true},
 		}},
 		"dhcp": {Desc: "Show DHCP information", Children: map[string]*Node{
 			"leases":            {Desc: "Show DHCP leases"},
@@ -332,7 +376,7 @@ var OperationalTree = map[string]*Node{
 		"flow-monitoring": {Desc: "Show flow monitoring/NetFlow configuration", Children: map[string]*Node{
 			"statistics": {Desc: "Show per-collector NetFlow v9/IPFIX write-health"},
 		}},
-		"log": {Desc: "Show daemon log entries [N]"},
+		"log": {Desc: "Show daemon log entries [N]", AcceptsArgs: true},
 		"route": {Desc: "Show routing table information", Children: map[string]*Node{
 			"<destination>": {Desc: "IP address or prefix to look up", Children: map[string]*Node{
 				"exact":    {Desc: "Exactly match the prefix"},
@@ -1721,7 +1765,10 @@ func Canonicalize(tree map[string]*Node, words []string) ([]string, Canonicalize
 				parentTyped = false
 				continue
 			}
-			if currentNode != nil && currentNode.HasDynamic() {
+			// #8304: AcceptsArgs is honoured HERE and not in the completion
+			// walkers above, which ask a different question — those decide what
+			// to OFFER, and a node with no completion source has nothing to add.
+			if currentNode != nil && (currentNode.HasDynamic() || currentNode.AcceptsArgs) {
 				continue
 			}
 			if ph := findPlaceholder(current); ph != nil {
