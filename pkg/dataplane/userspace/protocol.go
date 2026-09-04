@@ -206,6 +206,35 @@ type IdleLeaseWire struct {
 	TimeoutNs      uint64 `json:"timeout_ns"`
 }
 
+// DisplayLeaseWire is the export_persistent_lease_display result (#8615): one
+// persistent-NAT lease as the SHOW table needs it, INCLUDING bindings that
+// still have live flows.
+//
+// A separate type from IdleLeaseWire on purpose. IdleLeaseWire is the record a
+// peer IMPORTS, and userspace-dp/src/nat/idle_lease_sync_8121.rs's first design
+// rule forbids carrying ActiveFlows on it — a standby installs a strict subset,
+// so a carried count credits a lease for sessions that node does not hold, it
+// never reaches zero, and no GC path reclaims it. Keeping the display record
+// distinct means that rule cannot be undone by a later edit to a shared struct.
+type DisplayLeaseWire struct {
+	Pool           string `json:"pool"`
+	Protocol       uint8  `json:"protocol"`
+	SrcIP          string `json:"src_ip"`
+	SrcPort        uint16 `json:"src_port"`
+	RemoteIP       string `json:"remote_ip,omitempty"`
+	RemotePort     uint16 `json:"remote_port,omitempty"`
+	TranslatedIP   string `json:"translated_ip"`
+	TranslatedPort uint16 `json:"translated_port"`
+	AddressOnly    bool   `json:"address_only,omitempty"`
+	// RemainingNs is RAW and is meaningful only when ActiveFlows == 0. While
+	// flows are live the allocator does not refresh the deadline (it is
+	// rewritten when the last flow closes), so this is routinely 0 for a
+	// perfectly healthy binding. Interpreting it is the renderer's job.
+	RemainingNs uint64 `json:"remaining_ns"`
+	TimeoutNs   uint64 `json:"timeout_ns"`
+	ActiveFlows uint32 `json:"active_flows,omitempty"`
+}
+
 type ControlRequest struct {
 	Type           string                    `json:"type"`
 	SuppressStatus bool                      `json:"suppress_status,omitempty"`
@@ -253,6 +282,9 @@ type ControlResponse struct {
 	SessionDeltas []SessionDeltaInfo `json:"session_deltas,omitempty"`
 	// IdleLeases is the export_idle_leases result (#8121).
 	IdleLeases []IdleLeaseWire `json:"idle_leases,omitempty"`
+
+	// DisplayLeases is the export_persistent_lease_display result (#8615).
+	DisplayLeases []DisplayLeaseWire `json:"display_leases,omitempty"`
 	// SessionCounters is the session_counters result (#7919), one row per
 	// worker. Empty for every other verb — callers must NOT read emptiness as
 	// "no worker holds this session": an unimplemented verb is reported by the

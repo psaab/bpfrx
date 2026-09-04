@@ -70,7 +70,21 @@ func TestTakeoverReadyReportsSessionMirrorFailure(t *testing.T) {
 	}
 }
 
-func TestTakeoverReadyReportsPersistentSourceNATHABoundary(t *testing.T) {
+// TestTakeoverReadyReportsACapabilityDisarmReason asserts the GENERIC property:
+// a node whose dataplane has disarmed forwarding for ANY capability reason is
+// not takeover-ready, and the reason is reported rather than swallowed.
+//
+// #8573 changed the SPECIMEN, not the property. The cell used to carry
+// persistentSourceNATHAUnsupportedReason, which was the only disarm reason a
+// clustered node could realistically hit — and that gate was removed after its
+// premise ("leases are not HA-synchronized") was measured false on the loss
+// userspace cluster. The specimen is now a reason that still exists, so the
+// cell keeps testing TakeoverReady rather than a retired constant.
+func TestTakeoverReadyReportsACapabilityDisarmReason(t *testing.T) {
+	// A live reason from deriveUserspaceCapabilities, spelled here rather than
+	// imported: it is a SPECIMEN of the class, and pinning it to a particular
+	// constant is what tied this cell to a gate that then went away.
+	const specimen = "userspace three-color policers require color-blind mode and then discard"
 	m := &Manager{
 		proc: &exec.Cmd{Process: &os.Process{Pid: 1}},
 		lastStatus: ProcessStatus{
@@ -78,7 +92,7 @@ func TestTakeoverReadyReportsPersistentSourceNATHABoundary(t *testing.T) {
 			ForwardingArmed: true,
 			Capabilities: UserspaceCapabilities{
 				ForwardingSupported: false,
-				UnsupportedReasons:  []string{persistentSourceNATHAUnsupportedReason},
+				UnsupportedReasons:  []string{specimen},
 			},
 		},
 		mode:              ModeUserspaceCompat,
@@ -87,10 +101,12 @@ func TestTakeoverReadyReportsPersistentSourceNATHABoundary(t *testing.T) {
 
 	ready, reasons := m.TakeoverReady()
 	if ready {
-		t.Fatal("TakeoverReady() = true, want false")
+		t.Fatal("TakeoverReady() = true, want false for a disarmed dataplane")
 	}
-	if !slices.Contains(reasons, persistentSourceNATHAUnsupportedReason) {
-		t.Fatalf("TakeoverReady() reasons = %v, missing persistent source NAT HA boundary", reasons)
+	if !slices.Contains(reasons, specimen) {
+		t.Fatalf("TakeoverReady() reasons = %v, missing the disarm reason — a standby "+
+			"that cannot forward must say WHY it is unfit, not merely that it is",
+			reasons)
 	}
 }
 

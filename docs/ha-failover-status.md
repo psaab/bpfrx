@@ -176,9 +176,11 @@ yet. Here is what is true today:
   proceeds; the unplanned/crash path is not gated. Surfaced in
   `show chassis cluster status` transfer-readiness reason as "standby config
   stale: applied gen=N behind peer committed gen=M"
-- HA configs that use per-pool source NAT `persistent-nat` are not admitted to
-  userspace forwarding because persistent-NAT leases are helper-local allocator
-  state and are not HA-synchronized (#1449)
+- (removed in #8573) HA configs that use per-pool source NAT `persistent-nat`
+  used to be refused userspace forwarding entirely, on the #1449 reasoning that
+  leases are helper-local and not HA-synchronized. Measured on the loss
+  userspace cluster, they are synchronized; the disarm is gone. The residual is
+  narrower and is described under "Persistent SNAT Lease Boundary"
 
 ## What Works
 
@@ -240,95 +242,102 @@ tests so the verdicts cannot drift.
 
 ## Persistent SNAT Lease Boundary
 
-Synced sessions carry the translated tuple needed for active-flow return
-traffic after failover. Per-pool `persistent-nat` leases are different: they
-are helper-local allocator state used only for future source-side allocations
-after the last live flow releases. The userspace helper does not synchronize or
-replay those leases to the peer.
-
-#1449 is closed as an admission boundary rather than partial lease replay. If
-a chassis cluster config has any source-NAT rule that references a pool with
-`persistent-nat`, userspace forwarding is marked unsupported with:
+**#8573: the admission boundary is LIFTED.** A chassis cluster whose source-NAT
+rules reference a pool with `persistent-nat` now forwards. The gate that refused
+it, and the reason string it reported —
 
 ```
 userspace persistent-nat source pool leases are not HA-synchronized
 ```
 
-**#8447: the boundary is now VISIBLE at all three surfaces it needs to be.**
-The admission boundary above is correct and deliberate, and it stopped transit
-*silently*: the interfaces stay up, the config commits cleanly, and the failure
-presents as a connectivity problem rather than a NAT one. The only surface was
-`Forwarding supported: false` inside a `show` nobody runs when the symptom is
-"the link went down" — and one investigation spent five rounds of cluster
-measurement rediscovering a contract the daemon already knew the reason for and
-threw away.
+— are both deleted, along with the #8447 commit advisory that announced them.
 
-| when | surface |
+### Why it was there, and why it is not
+
+#1449 closed as an admission boundary rather than partial lease replay: leases
+were held to be helper-local allocator state that the helper does not
+synchronize or replay to the peer, so the dataplane declined to forward rather
+than forward with semantics it could not honour. #8447 then found that the
+refusal was *silent* — the interfaces stay up, the config commits cleanly, and
+the failure presents as a connectivity problem rather than a NAT one — and made
+it visible at commit, at disarm, and as a metric.
+
+What neither could do was check the premise, because the gate disarmed the
+forwarding a check would have needed. #8573 was filed to unblock exactly that,
+and the answer is that the premise had stopped being true. Three sync routes had
+landed underneath it (#7360, #8132, #8121 — the census below), and their
+exhaustiveness is bound by a test rather than left in prose.
+
+**Measured on the loss userspace cluster, with the gate lifted on both nodes**
+and a rule-referenced `persistent-nat` pool committed:
+
+| | result |
 |---|---|
-| at commit | a `ValidateConfig` advisory naming the consequence — that forwarding stops, that it will look like a link failure, and where to look |
-| at disarm | the #8503 WARN, naming the reasons and the consequence |
-| continuously | `xpf_dataplane_forwarding_supported` — 0 while a capability gate has disarmed forwarding, which is what an alert keys on |
+| both nodes armed | `FWDD State Online`, pool SNAT allocating sequentially into the pool range |
+| lease reaches the standby | identical identity on both nodes — same source tuple, same translated address and port, same pool |
+| lease survives failover | present on both nodes after a manual RG0 failover |
+| lease is HONOURED after failback | node1 allocated a translated identity; node0 imported it with the remaining timeout intact; after failback node0 translated the SAME source identity to the SAME translated identity node1 had chosen |
 
-The commit advisory and the capability gate read **one** predicate
-(`config.UsesPersistentSourceNATPool`, called by
-`pkg/dataplane/userspace/capabilities.go`), so they cannot disagree. The tree's
-older habit here was to mirror such a predicate with a comment saying it
-mirrors; a mirror is a drift surface, and its failure mode is an advisory that
-stops firing for a config that still disarms forwarding — silence that reads
-exactly like safety.
+The last row is the whole of what persistent NAT promises, and it is the one a
+lease that merely *arrived* would not satisfy.
 
-Both are keyed on the **rule**, not the pool table: a `persistent-nat` pool that
-no rule references translates nothing, so it neither disarms forwarding nor
-warns.
+### What the residuals are
 
-That reason is visible in helper status as `Forwarding blocked by: ...` and is
-also propagated through takeover readiness. Operators should treat it as an
-expected capability gate, not allocator exhaustion. Non-HA persistent pools
-still report live-flow, used-port, persistent-lease, allocation, reuse, and
-exhaustion counters.
+Two, and both mean "this particular lease did not reach the standby" — never
+"the standby forwards with semantics it cannot honour".
 
-**The gate is now announced when it fires (#8447).** Until then it was visible
-only where someone thought to look for it — the commit SUCCEEDS, the reconcile
-that keeps forwarding disarmed short-circuits silently every second, and the
-only surface was a `show` field. What an operator saw was a total connectivity
-outage on a configuration they had just committed cleanly, with nothing in the
-journal naming NAT, the pool or the reconcile. #8447 was investigated across
-five rounds of cluster measurement — counter deltas, arm-order controls,
-log-line censuses — before the cause turned out to be this documented contract.
-`disarmBeforeUnsupportedPublishLocked` now logs at WARN, naming the reasons and
-saying that transit will STOP until the unsupported configuration is removed:
+**The sync window.** A lease created on the active in the interval before the
+next export/import cycle is not yet on the standby, so a failover inside that
+window drops it — the flow gets a fresh translated identity instead of its
+pinned one. That is a much narrower statement than "not HA-synchronized", and
+it is the same window every other synced object lives with.
+
+**A refused import.** A lease whose pool address the standby's config lacks,
+whose port bit is already held there, or that arrived already expired, is
+refused by design (#8121). Each refusal is correct: the standby mints its own
+translation rather than install a duplicate or a wrong translated identity. The
+helper logs one line per import BATCH naming the refusal classes —
 
 ```
-level=WARN msg="userspace dataplane: DISARMING forwarding — the committed
-  configuration is not supported by this dataplane, so transit will STOP until
-  the unsupported configuration is removed"
-  reason=unsupported-config
-  unsupported="userspace persistent-nat source pool leases are not HA-synchronized"
+xpf-dp: idle-lease import installed=N existing=N expired=N unknown_addr=N unknown_pool=N port_busy=N malformed=N
 ```
 
-The gate itself is unchanged, deliberately: the boundary is correct, and what
-#8447 found was that it was silent, not that it was wrong. **It remains
-cluster-only** — a standalone node has no peer to synchronize leases with, so
-persistent-NAT there keeps forwarding, and that is pinned by
-`TestStandalonePersistentNATKeepsForwarding8447` so a later widening of the
-condition cannot turn a cluster-only gate into a standalone outage.
+— and #8573 widened that line's trigger to fire on `unknown_addr` too. That is
+the class meaning the two nodes disagree about a pool's address list, and it
+previously logged NOTHING: a batch in which every lease was refused for it was
+silent. That mattered less while the gate refused to forward these configs at
+all; with the gate lifted it is the residual's main surface.
 
-Still missing, and worth its own change: there is no Prometheus series for
-`ForwardingSupported` / `ForwardingArmed` / the unsupported reasons, so this
-state is not alertable — only greppable.
+The other surface is the existing per-pool persistent-lease counters
+(`show security nat source persistent-nat-table detail`, and the pool status table's
+lease counts), which are per-node: comparing the two nodes shows whether the
+standby is tracking the active. They are the right surface for a post-lift
+world precisely because they are a *quantity to compare*, where the removed
+reason string was a verdict with no gradations — it could say only "refused",
+never "behind by three leases".
 
-A future change that admits HA persistent-NAT must add full lease sync or
-replay, including tuple-conflict handling for live synced sessions and stale
-lease cleanup. **All three parts now exist** — see the census below — so what
-remains is the decision to admit, not the mechanism to admit with.
+### What the operator sees now
+
+Nothing. The configuration commits and forwards, which is the point. The
+disarm machinery #8447 built is unchanged and still live for the capability
+reasons that remain (a color-aware three-color policer, a SYN-cookie screen
+profile with no root-authentication material): the WARN at disarm and
+`xpf_dataplane_forwarding_supported` are both untouched, and are more
+load-bearing now that a disarm is a rarer event an operator is even less likely
+to be looking for.
+
+The predicate `config.UsesPersistentSourceNATPool` SURVIVES the removal. It no
+longer gates forwarding, but `ensurePersistentSourceNATProtocolLocked` reads it
+to raise the required helper protocol version to
+`MinProtocolPersistentSourceNAT` — so a wrong answer still ships persistent-NAT
+config to a helper that cannot honour it. It stays keyed on the **rule**, not
+the pool table: a `persistent-nat` pool no rule references translates nothing.
 
 ### What the standby DOES rebuild today (#7360, #8132, #8121)
 
-The gate above is unchanged, and nothing below lifts it. But the sentence it
-ends with — "must add full lease sync or replay" — now describes less remaining
-work than it did, and reading this section without that is misleading: it
-suggests the standby holds nothing, when in fact it reconstructs a lease for
-every persistent session it imports.
+This is the census the lift above rests on. The standby does not hold nothing —
+it reconstructs a lease for every persistent session it imports, and receives
+the idle ones explicitly.
 
 **Reconstruction, not replay.** A lease is a property of the SOURCE; session
 sync carries SESSIONS. So the standby does not receive leases — it derives them
@@ -385,13 +394,19 @@ production sites that create a lease, by enclosing function, and reds until a
 new one is classified. It carries a positive control, because a scanner whose
 pattern has rotted compares empty to empty and passes forever.
 
-**What this bears on, and what it does not do.** The gate at the top of this
-section disarms forwarding for every HA persistent-NAT config, and its stated
-reason is that leases are not HA-synchronized. On the census above, that reason
-no longer describes the tree. Re-deciding the gate is deliberately NOT done
-here: it re-arms forwarding for a configuration class that has been disarmed,
-which is a user-facing availability change needing its own verification rather
-than a side effect of the work that removed its premise.
+**What this bears on.** This census was written as an argument that the #1449
+gate's stated reason no longer described the tree, deliberately stopping short
+of re-deciding the gate — re-arming forwarding for a disarmed configuration
+class is a user-facing availability change needing its own verification, not a
+side effect of the work that removed its premise. #8573 ran that verification
+and removed the gate.
+
+The census is therefore no longer an argument *against* a gate. It is what holds
+the gate's removal up, and its failure mode inverted with it: a sixth
+unclassified insert site used to mean an argument was overstated, and now means
+clustered persistent-NAT is forwarding with leases that do not survive a
+failover. `every_persistent_lease_creation_site_has_a_sync_route_8121` is the
+thing standing between those two states.
 
 ## What Was Fixed Recently
 

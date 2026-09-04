@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/netip"
 	"time"
@@ -52,21 +53,31 @@ import (
 // Filling the table the renderer already reads leaves both renderers, the
 // Reader interface and all three existing cells untouched.
 //
-// WHAT THIS SHOWS AND WHAT IT DOES NOT — stated because the gap is deliberate.
-// The helper export this uses (`export_idle_leases`, #8121) carries the IDLE
-// population only: `active_flows == 0 && expires_at_ns > now_ns`. A binding with
-// LIVE flows is not carried, and that cannot be fixed by widening this record:
+// WHAT THIS SHOWS — updated by #8615, which closed the gap this paragraph used
+// to describe as deliberate.
+//
+// #8607 filled the table from `export_idle_leases` (#8121), which carries the
+// IDLE population only (`active_flows == 0 && expires_at_ns > now_ns`), so a
+// binding was observable once its sessions were gone and NOT while they were
+// open. That could not be fixed by widening the sync record:
 // nat/idle_lease_sync_8121.rs's first design rule is "Never carry
 // `active_flows`", because a standby installs a strict subset and a carried
 // count credits a lease for sessions that node does not hold, so it never
-// reaches zero and no GC path can reclaim it. Showing live-flow bindings needs a
-// separate display record and control verb; it is filed rather than smuggled
-// onto the HA sync record.
+// reaches zero and no GC path can reclaim it.
 //
-// The idle half is the half that was entirely missing, and it is the half the
-// feature is about: while a session is open its translation is already visible
-// in `show security flow session`, and what persistent-nat-table uniquely
-// answers is which bindings SURVIVE the session. It is also exactly the
+// #8615 added a SEPARATE display-only record and verb instead —
+// `export_persistent_lease_display`, filtered by the allocator's own reuse
+// predicate (`active_flows > 0 || expires_at_ns > now_ns`) so the table answers
+// exactly "which bindings will this node reuse". The refresher below prefers it
+// and degrades to `ExportIdleLeases` only against a helper that predates it,
+// which is a rolling-upgrade window rather than a steady state. The sync record
+// is untouched and still cannot carry a flow count — pinned by
+// TestTheSyncLeaseRecordStillCarriesNoFlowCount8615.
+//
+// The idle half remains the half that was entirely missing, and it is still the
+// half that matters most: while a session is open its translation is already
+// visible in `show security flow session`, and what persistent-nat-table
+// uniquely answers is which bindings SURVIVE the session. It is also exactly the
 // population #8573's failover measurement has to assert.
 
 // persistentNatShowRefreshInterval paces the refresh.
@@ -123,8 +134,116 @@ func (d *Daemon) refreshPersistentNatShowTable() {
 		// path keeps doing so, and this refresher must not clear it.
 		return
 	}
-	leases, err := mgr.ExportIdleLeases()
-	applyPersistentNatShowRefresh(table, leases, err, time.Now())
+	// #8615: prefer the DISPLAY verb, which carries bindings with LIVE flows
+	// too. Degrade to the idle-only export only when the helper does not
+	// implement it — a mixed-version window during a rolling upgrade.
+	display, err := mgr.ExportPersistentLeaseDisplay()
+	if err == nil {
+		applyPersistentNatShowRefreshDisplay(table, display, nil, time.Now())
+		return
+	}
+	if !errors.Is(err, dpuserspace.ErrPersistentLeaseDisplayUnsupported) {
+		// A genuine failure. Hand it to the decision half, which keeps the
+		// previous snapshot rather than asserting an emptiness nobody observed.
+		applyPersistentNatShowRefreshDisplay(table, nil, err, time.Now())
+		return
+	}
+	// The helper predates #8615. Say so once per tick at Debug — loud enough to
+	// explain a table that shows only idle bindings, quiet enough for a 30s
+	// loop — then answer the half we can.
+	slog.Debug("userspace helper does not implement export_persistent_lease_display; "+
+		"persistent-NAT show table will omit bindings that still have live flows",
+		"verb", "export_persistent_lease_display")
+	leases, idleErr := mgr.ExportIdleLeases()
+	applyPersistentNatShowRefresh(table, leases, idleErr, time.Now())
+}
+
+// applyPersistentNatShowRefreshDisplay is applyPersistentNatShowRefresh for the
+// #8615 record. Same error discipline, stated there and not repeated: an error
+// leaves the previous snapshot standing rather than rendering an emptiness
+// nobody observed.
+func applyPersistentNatShowRefreshDisplay(
+	table *dataplane.PersistentNATTable,
+	leases []dpuserspace.DisplayLeaseWire,
+	err error,
+	now time.Time,
+) bool {
+	if table == nil {
+		return false
+	}
+	if err != nil {
+		slog.Debug("persistent-NAT show table refresh failed; keeping the previous "+
+			"snapshot rather than reporting an emptiness that was not observed",
+			"err", err)
+		return false
+	}
+	table.ReplaceAll(persistentNatBindingsFromDisplayLeases(leases, now))
+	return true
+}
+
+// persistentNatBindingsFromDisplayLeases converts the #8615 display record.
+//
+// THE ONE THING THIS DOES THAT THE IDLE CONVERTER DOES NOT, and it is the
+// reason the two are not one function: a binding with LIVE flows has a
+// meaningless RemainingNs. The allocator writes expires_at_ns at the most
+// recent reuse and does NOT refresh it per packet — the countdown is rewritten
+// only when the LAST flow closes (allocator.rs:2246-2250). So a long-lived
+// session routinely leaves a perfectly healthy binding reading
+// `remaining_ns == 0`, and back-dating LastSeen by (timeout - 0) would render
+// every actively-used binding as expired. That is a worse lie than the empty
+// table #8607 fixed, because it looks like data.
+//
+// While ActiveFlows > 0 the binding does not expire at all, and the floor on
+// its remaining life is the FULL timeout measured from whenever the last flow
+// closes. LastSeen = now renders exactly that floor.
+func persistentNatBindingsFromDisplayLeases(
+	leases []dpuserspace.DisplayLeaseWire,
+	now time.Time,
+) []*dataplane.PersistentNATBinding {
+	if len(leases) == 0 {
+		return nil
+	}
+	out := make([]*dataplane.PersistentNATBinding, 0, len(leases))
+	for _, l := range leases {
+		srcIP, err := netip.ParseAddr(l.SrcIP)
+		if err != nil {
+			continue
+		}
+		natIP, err := netip.ParseAddr(l.TranslatedIP)
+		if err != nil {
+			continue
+		}
+		timeout := time.Duration(l.TimeoutNs)
+		lastSeen := now
+		if l.ActiveFlows == 0 {
+			remaining := time.Duration(l.RemainingNs)
+			if remaining > timeout {
+				remaining = timeout
+			}
+			lastSeen = now.Add(-(timeout - remaining))
+		}
+		out = append(out, &dataplane.PersistentNATBinding{
+			SrcIP:    srcIP,
+			SrcPort:  l.SrcPort,
+			NatIP:    natIP,
+			NatPort:  l.TranslatedPort,
+			PoolName: l.Pool,
+			LastSeen: lastSeen,
+			Timeout:  timeout,
+			Permit:   persistentNatPermitFromDisplayWire(l),
+		})
+	}
+	return out
+}
+
+func persistentNatPermitFromDisplayWire(l dpuserspace.DisplayLeaseWire) config.PersistentNATPermit {
+	if l.RemoteIP == "" {
+		return config.PersistentNATPermitAnyRemoteHost
+	}
+	if l.RemotePort == 0 {
+		return config.PersistentNATPermitTargetHost
+	}
+	return config.PersistentNATPermitTargetHostPort
 }
 
 // applyPersistentNatShowRefresh is the DECISION half, extracted so the
