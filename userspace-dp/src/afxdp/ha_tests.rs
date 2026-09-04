@@ -3886,3 +3886,311 @@ fn reverse_prewarm_owner_rg_candidates_for_test(
         entry,
     )
 }
+
+// ---------------------------------------------------------------------------
+// #7209 scope item 2 — the four blocking calls off the `ServerState` lock.
+//
+// PREMISE RESULT, and it is a NEGATIVE one worth having in executable form:
+// scope item 2 is NOT independent of the derived-state work item 1 needs. It
+// was scoped as the route that needs no `forwarding` sharing, which is true —
+// and it still cannot be taken naively, for a different reason.
+//
+// Every one of the four blocking calls (the 10 s worker-readiness barrier, the
+// 500 ms mlx5 teardown quiesce, the unbounded worker `join()`, the map-pin
+// opens) runs INSIDE `Coordinator::reconcile`. Taking any of them off the lock
+// means dropping the `ServerState` guard partway through that transaction, and
+// the quiesce — a pure `thread::sleep` touching no coordinator state, so the
+// most obviously safe of the four — sits immediately AFTER `stop_inner(false)`,
+// which sets `self.forwarding = ForwardingState::default()`.
+//
+// So the window a released lock opens is precisely a window in which
+// `Coordinator.forwarding` is EMPTY, and `sync_session` dispatches through
+// that same mutex. An import landing there synthesizes its reverse companion
+// against the empty table.
+//
+// The cells below establish the two halves of why that matters, both green
+// today, both derived from running code rather than from the lock graph:
+//
+//   1. the companion IS built and published from an empty forwarding table
+//      (`synthesized_synced_reverse_entry` has exactly one early return, on
+//      `is_reverse`, so there is no forwarding-dependent `None` arm), and
+//   2. the reconcile's own replay does NOT repair it — `replay_synced_sessions`
+//      publishes `entry.decision` verbatim and re-queues the entry; it never
+//      re-synthesizes.
+//
+// Today that pair is LATENT rather than live: the only path that reaches this
+// state without a lock move is a standby taking bulk sync before its first
+// apply, and RG activation re-derives the companion through
+// `prewarm_reverse_synced_sessions_for_owner_rgs` before it can matter
+// (measured: NoRoute/ifindex 0/owner 0 before, ForwardCandidate/ifindex 6/
+// owner 2 after). A mid-life `apply_snapshot` on an already-ACTIVE node
+// reaches no activation, so once a lock release puts an import in this window
+// there is nothing left to repair it.
+//
+// These are characterization cells: they pin what the code does now, so
+// whoever changes it gets a red rather than a paragraph. When item 1 lands —
+// either refusing the companion when its inputs are absent, or deferring the
+// synthesis to the replay — cell 2 is the one that must flip, and flipping it
+// is the signal that item 2 became safe.
+
+/// #7209 item 2: a synced import taken while `forwarding` is empty publishes a
+/// reverse companion whose reply path resolves to NOTHING.
+///
+/// The control leg is what makes this a statement about the empty table rather
+/// than about the fixture: the same entry, imported against a populated table,
+/// resolves to a real egress.
+#[test]
+fn an_import_under_an_emptied_forwarding_table_publishes_a_dead_reverse_companion_7209() {
+    let entry = SyncedSessionEntry {
+        key: test_key(),
+        decision: test_decision(),
+        metadata: test_metadata(),
+        origin: SessionOrigin::SyncImport,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+        generation: 0,
+        session_id: 0,
+    };
+    let reverse_key = reverse_session_key(&entry.key, entry.decision.nat);
+
+    // CONTROL: a populated table resolves the companion's reply path.
+    let mut healthy = Coordinator::new();
+    healthy.forwarding = test_forwarding_state_split_rgs();
+    // HA state BEFORE the import, and it is load-bearing rather than setup:
+    // `owner_rg_for_resolution` only names an RG for a resolution the node can
+    // actually forward. With no RG locally active the reply path resolves to
+    // `FabricRedirect` and the companion's owner RG is 0 — the same value the
+    // empty-table leg produces, for a completely different reason. Without
+    // this the control could not distinguish "resolved to a real owner" from
+    // "resolved to nothing", which is the whole contrast.
+    healthy.update_ha_state(&[
+        HAGroupStatus {
+            rg_id: 1,
+            active: true,
+            ..HAGroupStatus::default()
+        },
+        HAGroupStatus {
+            rg_id: 2,
+            active: true,
+            ..HAGroupStatus::default()
+        },
+    ]);
+    assert_eq!(
+        healthy.upsert_synced_session(entry.clone()),
+        SyncedImportOutcome::Applied
+    );
+    let resolved = healthy
+        .sessions
+        .synced
+        .lock()
+        .expect("synced")
+        .get(&reverse_key)
+        .cloned()
+        .expect("CONTROL: the companion must exist at all");
+    // NOT pinned to a specific disposition: with this fixture's split RGs and
+    // `fabric_ingress` metadata the reply path resolves to `FabricRedirect`
+    // rather than `ForwardCandidate`, and either is a REAL resolution. What
+    // the control has to establish is that a populated table produces one at
+    // all — pinning the variant would be pinning the fixture's topology.
+    assert_ne!(
+        resolved.decision.resolution.disposition,
+        ForwardingDisposition::NoRoute,
+        "CONTROL: with a populated forwarding table the companion must resolve \
+         to SOMETHING. If it does not, the fixture — not the empty table — is \
+         what the main leg below is measuring"
+    );
+    assert!(
+        resolved.metadata.owner_rg_id > 0,
+        "CONTROL: the companion must take a real owner RG from the populated \
+         table, or the owner-RG assertion in the main leg proves nothing"
+    );
+
+    // THE WINDOW: exactly what `stop_inner(false)` leaves behind, which is the
+    // state a released lock would expose during the 500 ms mlx5 quiesce.
+    let mut torn_down = Coordinator::new();
+    torn_down.forwarding = ForwardingState::default();
+    assert_eq!(
+        torn_down.upsert_synced_session(entry.clone()),
+        SyncedImportOutcome::Applied,
+        "the import must be ADMITTED in this window — a refusal here would be a \
+         different (and better) outcome than the one this cell describes"
+    );
+    let dead = torn_down
+        .sessions
+        .synced
+        .lock()
+        .expect("synced")
+        .get(&reverse_key)
+        .cloned()
+        .expect(
+            "the companion was NOT published from an empty forwarding table. \
+             That would mean `synthesized_synced_reverse_entry` grew a \
+             forwarding-dependent None arm — the #7209 item-1 fix — and this \
+             cell has become the wrong description",
+        );
+    assert_eq!(
+        dead.decision.resolution.disposition,
+        ForwardingDisposition::NoRoute,
+        "the companion's reply path resolved to something other than NoRoute \
+         from an EMPTY forwarding table. Either the fixture is not exercising \
+         the window, or the synthesis grew an input this cell does not model"
+    );
+    assert_eq!(
+        dead.metadata.owner_rg_id, 0,
+        "the companion carries a real owner RG despite no forwarding state to \
+         derive one from"
+    );
+    assert_eq!(
+        dead.decision.resolution.egress_ifindex, 0,
+        "the companion carries a real egress ifindex despite an empty table"
+    );
+}
+
+/// #7209 item 2: the reconcile's replay does NOT re-derive a reverse companion,
+/// so a dead one survives the reconcile that would have to repair it.
+///
+/// This is the half that turns the cell above from an oddity into a blocker.
+/// `replay_synced_sessions` publishes `entry.decision` verbatim and re-queues
+/// the entry to each worker; there is no re-synthesis anywhere in it. So the
+/// dead companion an import created during a lock-released window is still dead
+/// on the far side of the reconcile, and the only mechanism that ever rebuilds
+/// it — `prewarm_reverse_synced_sessions_for_owner_rgs` at RG activation — is
+/// not reached by a mid-life `apply_snapshot` on an already-active node.
+#[test]
+fn the_reconcile_replay_does_not_repair_a_dead_reverse_companion_7209() {
+    let mut coordinator = Coordinator::new();
+    // The window: torn-down forwarding, exactly as `stop_inner(false)` leaves.
+    coordinator.forwarding = ForwardingState::default();
+    let entry = SyncedSessionEntry {
+        key: test_key(),
+        decision: test_decision(),
+        metadata: test_metadata(),
+        origin: SessionOrigin::SyncImport,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+        generation: 0,
+        session_id: 0,
+    };
+    let reverse_key = reverse_session_key(&entry.key, entry.decision.nat);
+    assert_eq!(
+        coordinator.upsert_synced_session(entry.clone()),
+        SyncedImportOutcome::Applied
+    );
+
+    // The reconcile now completes: forwarding comes back, and the replay runs
+    // over the live shared map (#8171). This is the node's ONLY chance to
+    // notice, short of an RG activation.
+    coordinator.forwarding = test_forwarding_state_split_rgs();
+    let replay_entries = coordinator.snapshot_shared_session_entries();
+    assert!(
+        replay_entries.iter().any(|e| e.key == reverse_key),
+        "the companion must be IN the replay set, or this cell is asserting \
+         that the replay left alone something it never saw"
+    );
+    let queues: BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>> =
+        BTreeMap::from([(0u32, Arc::new(Mutex::new(VecDeque::new())))]);
+    let replayed = coordinator.replay_synced_sessions(&replay_entries, &queues, -1);
+    assert!(
+        replayed > 0,
+        "the replay processed nothing, so it cannot be evidence about what a \
+         replay does"
+    );
+
+    let after = coordinator
+        .sessions
+        .synced
+        .lock()
+        .expect("synced")
+        .get(&reverse_key)
+        .cloned()
+        .expect("companion after replay");
+    assert_eq!(
+        after.decision.resolution.disposition,
+        ForwardingDisposition::NoRoute,
+        "THE REPLAY REPAIRED THE COMPANION. If that is now true, \
+         `replay_synced_sessions` grew a re-synthesis step and #7209 scope \
+         item 2 lost its blocker — which is good news, and this cell is the \
+         wrong description of the code. Re-derive the sequencing before \
+         deleting it: the point it was pinning is that a lock released inside \
+         `reconcile` exposes an EMPTY forwarding table to `sync_session`, and \
+         nothing downstream re-derived what an import built from it"
+    );
+    assert_eq!(
+        after.metadata.owner_rg_id, 0,
+        "the replay re-derived the companion's owner RG"
+    );
+}
+
+/// #7209 item 2: `stop_inner(false)` leaves `forwarding` EMPTY — which is what
+/// makes the two cells above a statement about a real window rather than a
+/// contrived one.
+///
+/// The three cells together are the whole argument for why two of the four
+/// blocking calls cannot be taken off the lock until item 1 lands:
+///
+///   1. `stop_inner(false)` empties `forwarding`            (this cell)
+///   2. an import in that state builds a dead companion     (the cell above)
+///   3. the reconcile's replay does not repair it           (the cell above)
+///
+/// and the quiesce + the worker `join()` both run INSIDE that window
+/// (`teardown::tear_down` calls `stop_inner(false)` and only then sleeps; the
+/// joins happen within `stop_inner` itself), so a lock released around either
+/// exposes exactly the state leg 2 measures.
+///
+/// The other two do NOT. `preflight_map_fds` runs BEFORE `tear_down`, with the
+/// previous table still installed; and the 10 s readiness barrier runs inside
+/// `bring_up_workers`, which `reconcile` calls AFTER `snapshot::apply_snapshot`
+/// has assigned `coord.forwarding = new_forwarding`. Both of those windows have
+/// a populated table, so neither is blocked by item 1 — which matters because
+/// the barrier is the one that blows the Go side's 3 s round-trip budget.
+///
+/// `clear_synced_state = false` is the reconcile's argument, and it is the
+/// interesting one: the shared synced map SURVIVES, which is why an import
+/// landing in the window is still there for the replay to find (#8171) — and
+/// therefore why the dead companion it built survives too.
+#[test]
+fn stop_inner_empties_the_forwarding_table_that_a_released_lock_would_expose_7209() {
+    let mut coordinator = Coordinator::new();
+    coordinator.forwarding = test_forwarding_state_split_rgs();
+    assert!(
+        !coordinator.forwarding.egress.is_empty(),
+        "fixture starts with an EMPTY table, so it cannot show that stop_inner \
+         is what empties it"
+    );
+    let entry = SyncedSessionEntry {
+        key: test_key(),
+        decision: test_decision(),
+        metadata: test_metadata(),
+        origin: SessionOrigin::SyncImport,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+        generation: 0,
+        session_id: 0,
+    };
+    assert_eq!(
+        coordinator.upsert_synced_session(entry.clone()),
+        SyncedImportOutcome::Applied
+    );
+
+    coordinator.stop_inner(false);
+
+    assert!(
+        coordinator.forwarding.egress.is_empty()
+            && coordinator.forwarding.connected_v4.is_empty(),
+        "stop_inner(false) no longer empties the forwarding table. If that is \
+         now true the window this issue's item 2 is blocked on has closed, and \
+         the two cells above describe a state that can no longer be reached — \
+         re-derive the sequencing before trusting either (#7209)"
+    );
+    assert!(
+        coordinator
+            .sessions
+            .synced
+            .lock()
+            .expect("synced")
+            .contains_key(&entry.key),
+        "stop_inner(false) must NOT clear the shared synced map — the replay \
+         reads it live (#8171), and an import that landed in the window is only \
+         reachable afterwards because this map survives"
+    );
+}
