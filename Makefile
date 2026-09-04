@@ -125,6 +125,12 @@ test-go: test-race-dp
 	# package (cmd/cli protobuf MessageState copy, pkg/cli unreachable
 	# code); widen to ./... once those are resolved.
 	$(GO) vet ./pkg/flowexport/...
+	# #8231: truncate the side file ONCE per invocation, before the first leg.
+	# The legs below APPEND (test-go has two), so without this a second
+	# `make test-go GOTESTJSON=x` would attribute over the union of both runs —
+	# a stale name from the previous run reads exactly like a current failure.
+	# scripts/mutate.sh truncates per CELL for the same reason.
+	@[ -z "$(GOTESTJSON)" ] || : > "$(GOTESTJSON)"
 	# #8231: GOTESTJSON=<path> additionally APPENDS the `go test -json` event
 	# stream to that file, so the mutation driver can attribute a KILLED verdict
 	# to a NAME without bypassing this target and losing the vet and -race legs

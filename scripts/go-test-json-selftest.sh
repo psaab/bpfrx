@@ -111,5 +111,26 @@ esac
 agree=$(mutation_verdict_for_target KILLED TestSomethingElseAlreadyRed TestSomethingElseAlreadyRed)
 check "control: a real kill still scores KILLED" "$agree" "KILLED"
 
+# ── 7. the wrapper APPENDS, and the caller is responsible for truncating ──
+# Both facts matter. test-go has two legs that must land in one file, so append
+# is required; and a caller that does not truncate between invocations
+# attributes over the union of two runs, where a stale name from the previous
+# run reads exactly like a current failure. The Makefile truncates once per
+# invocation and scripts/mutate.sh truncates once per cell; this pins the
+# behaviour they depend on.
+T="$WORK/append.json"
+( cd "$WORK/m" && bash "$here/go-test-json.sh" "$T" go ./... >/dev/null 2>&1 )
+one=$(wc -l <"$T")
+( cd "$WORK/m" && bash "$here/go-test-json.sh" "$T" go ./... >/dev/null 2>&1 )
+two=$(wc -l <"$T")
+if [ "$two" -gt "$one" ]; then
+	ok "append: a second run adds to the file rather than replacing it"
+else
+	bad "append: two runs produced $two lines against $one — the second leg of a multi-leg target would be lost"
+fi
+: > "$T"
+( cd "$WORK/m" && bash "$here/go-test-json.sh" "$T" go ./... >/dev/null 2>&1 )
+check "truncation: an explicitly emptied file holds exactly one run" "$(wc -l <"$T")" "$one"
+
 printf '\ngo-test-json-selftest: passed=%d failed=%d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
