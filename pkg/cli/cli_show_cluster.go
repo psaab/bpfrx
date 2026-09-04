@@ -404,7 +404,7 @@ func (c *CLI) showChassisClusterIPMonitoringStatus() error {
 
 func (c *CLI) showChassisEnvironment() error {
 	// Thermal zones
-	thermalZones, _ := filepath.Glob("/sys/class/thermal/thermal_zone*/temp")
+	thermalZones, _ := filepath.Glob(thermalZoneGlob)
 	if len(thermalZones) > 0 {
 		fmt.Println("Temperature:")
 		for _, tz := range thermalZones {
@@ -422,7 +422,7 @@ func (c *CLI) showChassisEnvironment() error {
 			if typeData, err := os.ReadFile(typeFile); err == nil {
 				name = strings.TrimSpace(string(typeData))
 			}
-			fmt.Printf("  %-30s %d.%d C\n", name, millideg/1000, (millideg%1000)/100)
+			fmt.Printf("  %-30s %s C\n", sanitizeTerminalText(name), formatMilliCelsius(millideg))
 		}
 		fmt.Println()
 	}
@@ -437,7 +437,8 @@ func (c *CLI) showChassisEnvironment() error {
 			if err != nil {
 				continue
 			}
-			fmt.Printf("  %-20s %s\n", name, strings.TrimSpace(string(status)))
+			fmt.Printf("  %-20s %s\n", sanitizeTerminalText(name),
+				sanitizeTerminalText(strings.TrimSpace(string(status))))
 		}
 		fmt.Println()
 	}

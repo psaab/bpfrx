@@ -214,7 +214,7 @@ func (c *CLI) showSystemBuffersDetail() error {
 }
 
 func (c *CLI) showCoreDumps() error {
-	dirs := []string{"/var/crash", "/var/lib/systemd/coredump"}
+	dirs := coreDumpDirs
 	var found bool
 	for _, dir := range dirs {
 		entries, err := os.ReadDir(dir)
@@ -230,7 +230,8 @@ func (c *CLI) showCoreDumps() error {
 				fmt.Printf("%-40s %-20s %10s\n", "Name", "Date", "Size")
 				found = true
 			}
-			fmt.Printf("%-40s %-20s %10d\n", e.Name(), info.ModTime().Format("2006-01-02 15:04:05"), info.Size())
+			fmt.Printf("%-40s %-20s %10d\n", sanitizeTerminalText(e.Name()),
+				info.ModTime().Format("2006-01-02 15:04:05"), info.Size())
 		}
 	}
 	if !found {
