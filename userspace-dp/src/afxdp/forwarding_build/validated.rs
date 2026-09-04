@@ -29,12 +29,48 @@ impl VlanId {
     /// collapsed to 0, so it maps to `VlanId(0)` (untagged) — preserving
     /// the old valid-path behavior. A value > `u16::MAX` is REJECTED
     /// (the pre-fix cast wrapped it to a different VLAN).
+    /// #8597 K39: the bound is **4095**, not `u16::MAX`.
+    ///
+    /// A VLAN id is a 12-bit field, and the emitter masks it:
+    /// `TxVlanTag::from` (`frame/headers.rs`) computes `vid & 0x0fff` and then
+    /// `present: vid > 0`. So accepting the full `u16` range here does not
+    /// produce a large VLAN downstream, it produces a DIFFERENT one, silently:
+    ///
+    /// * 4097 masks to 1 — the frame is emitted on VLAN 1, a live L2 domain the
+    ///   operator did not name.
+    /// * 4096 masks to 0, which makes `present` FALSE, so `header_len()` returns
+    ///   14 and the frame is emitted with **no tag at all** on an interface
+    ///   configured as tagged. That is not a wrong-VLAN delivery; the frame
+    ///   lands in the native VLAN or is dropped by the switch, and neither is
+    ///   the configured behaviour.
+    ///
+    /// Rejecting at the snapshot boundary is what the existing
+    /// `InterfaceVlanOutOfRange` variant is for, and it fails CLOSED: a
+    /// snapshot naming an unrepresentable VLAN is refused rather than
+    /// silently re-pointed at a domain that exists.
+    ///
+    /// 4095 rather than 4094 deliberately. The commit gate is
+    /// `ValidateInteger(1, 4094)` (`pkg/config/schema_interfaces.go`), so no
+    /// committed config can reach either bound — this guards the TOLERANT load
+    /// path and any future non-config producer. The invariant being restored is
+    /// "the boundary admits exactly the wire-representable range" (#6773), and
+    /// 4095 is representable; rejecting it here would make this stricter than
+    /// the wire rather than equal to it, which is a different claim from the
+    /// one this fixes.
+    ///
+    /// Negative stays `Self(0)` (untagged), unchanged.
     pub(in crate::afxdp) fn try_from_snapshot(
         vlan_id: i32,
         interface: &str,
     ) -> Result<Self, SnapshotIntegrityError> {
         if vlan_id < 0 {
             return Ok(Self(0));
+        }
+        if vlan_id > 0x0fff {
+            return Err(SnapshotIntegrityError::InterfaceVlanOutOfRange {
+                interface: interface.to_string(),
+                vlan_id,
+            });
         }
         u16::try_from(vlan_id).map(Self).map_err(|_| {
             SnapshotIntegrityError::InterfaceVlanOutOfRange {
