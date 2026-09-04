@@ -410,15 +410,201 @@ fn bare_worker_command_pushes(src: &str) -> Vec<(usize, String)> {
     }
     hits
 }
-
-pub(crate) fn is_fixture(rel: &str) -> bool {
-    rel == "tests.rs"
-        || rel.ends_with("/tests.rs")
-        || rel.ends_with("_tests.rs")
-        || rel.contains("/tests/")
-        || rel.starts_with("tests_")
-        || rel.contains("/tests_")
+/// is_fixture_with answers for one repo-relative path against a scanned set of
+/// `#[cfg(test)]` module FILES.
+///
+/// Keyed on the resolved FILE PATH rather than on the module name, and that is
+/// load-bearing: **85 of this tree's 179 `#[path = "..."]` declarations give the
+/// module a name that differs from the file stem** — `#[path = "tcp_tests.rs"]
+/// mod tests;` is the dominant form. A name-keyed set records `…::tests` while
+/// the file is `…/tcp_tests.rs`, so all 85 would be classified as production.
+/// The first version of this change did exactly that, and the agreement control
+/// below is what caught it.
+pub(crate) fn is_fixture_with(
+    rel: &str,
+    cfg_test_files: &std::collections::HashSet<String>,
+) -> bool {
+    cfg_test_files.contains(rel)
 }
+
+pub(crate) fn is_fixture(root: &std::path::Path, rel: &str) -> bool {
+    use std::sync::OnceLock;
+    static CFG_TEST: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
+    // Scanned ONCE, keyed relative to `src`, because the declaration graph is a
+    // property of the crate rather than of any caller's subtree.
+    let set = CFG_TEST.get_or_init(|| {
+        cfg_test_modules(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"))
+    });
+    // Callers walk DIFFERENT roots — `src/afxdp` for the worker-queue and
+    // forwarding-build canaries, `src/filter` for the filter one — and hand this
+    // function a path relative to their own root. The first version ignored that
+    // and compared `src`-relative keys against `src/afxdp`-relative paths, so
+    // NOTHING matched: the fixture set silently emptied and three canaries began
+    // scanning test files as production. They caught it, which is the system
+    // working, but the lesson is that a shared predicate taking a relative path
+    // must be told what it is relative TO.
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let root_rel = root
+        .strip_prefix(&src)
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default();
+    let key = if root_rel.is_empty() {
+        rel.to_string()
+    } else {
+        format!("{root_rel}/{rel}")
+    };
+    is_fixture_with(&key, set)
+}
+
+pub(crate) fn cfg_test_modules(root: &std::path::Path) -> std::collections::HashSet<String> {
+    fn normalise(cand: &std::path::Path, root: &std::path::Path) -> String {
+        // Textual `..` folding rather than canonicalize: the files exist, but an
+        // absolute canonical path no longer strips against `root`.
+        let mut parts: Vec<String> = Vec::new();
+        for seg in cand.to_string_lossy().replace('\\', "/").split('/') {
+            match seg {
+                "." | "" => {}
+                ".." => {
+                    parts.pop();
+                }
+                s => parts.push(s.to_string()),
+            }
+        }
+        let joined = parts.join("/");
+        let root_s = root.to_string_lossy().replace('\\', "/");
+        let root_s = root_s.trim_start_matches('/').to_string();
+        joined
+            .strip_prefix(&format!("{root_s}/"))
+            .unwrap_or(&joined)
+            .to_string()
+    }
+
+    // Pass 1 collects every module declaration in the tree, remembering for each
+    // OWNING FILE which files it brings in and whether the bringing-in carried
+    // #[cfg(test)]. Pass 2 takes the transitive closure, because `#[cfg(test)]`
+    // is INHERITED: a plain `mod control_frames;` inside a file that is itself
+    // only compiled under test is equally test-only. Without the closure, 36
+    // files under directories like `event_stream/tests/` were still classified
+    // as production — the third defect this control caught.
+    let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut edges: Vec<(String, String)> = Vec::new();
+    let mut files = Vec::new();
+    afxdp_rs_files(root, &mut files);
+    for path in files {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        // Where this file's `mod` declarations resolve from: for `a/b/mod.rs`
+        // that is `a/b`; for `a/b.rs` it is also `a/b`.
+        let owner = if path.file_name().is_some_and(|f| f == "mod.rs") {
+            match path.parent() {
+                Some(p) => p.to_path_buf(),
+                None => continue,
+            }
+        } else {
+            path.with_extension("")
+        };
+
+        let mut cfg_test = false;
+        let mut path_attr: Option<String> = None;
+        for line in text.lines() {
+            let t = line.trim();
+            if t.starts_with("#[cfg(test)]") {
+                cfg_test = true;
+                continue;
+            }
+            if let Some(rest) = t.strip_prefix("#[path = \"") {
+                if let Some(end) = rest.find('"') {
+                    path_attr = Some(rest[..end].to_string());
+                }
+                continue;
+            }
+            // Visibility is stripped generically rather than by listing forms.
+            // The first version matched only `mod ` and `pub mod `, and missed
+            // `pub(crate) mod tests;` — which is how two files that the filename
+            // patterns DID catch came back unresolved. A hand-listed set of
+            // spellings is the same shape as the filename predicate this change
+            // exists to remove.
+            let decl = t
+                .strip_prefix("pub(crate) ")
+                .or_else(|| t.strip_prefix("pub(super) "))
+                .or_else(|| t.strip_prefix("pub(in crate) "))
+                .or_else(|| t.strip_prefix("pub "))
+                .unwrap_or(t);
+            if let Some(rest) = decl.strip_prefix("mod ") {
+                if cfg_test {
+                    let name = rest.split(&[';', ' ', '{'][..]).next().unwrap_or("");
+                    // Two different resolution rules, and conflating them was
+                    // the second defect the agreement control caught (104 files):
+                    //
+                    //   `#[path = P] mod x;`  resolves P relative to the
+                    //       DIRECTORY CONTAINING this file — `src/nat64.rs`
+                    //       with `#[path = "nat64_tests.rs"]` means
+                    //       `src/nat64_tests.rs`, not `src/nat64/…`.
+                    //   `mod x;`              resolves to `<owner>/x.rs` or
+                    //       `<owner>/x/mod.rs`, where owner is the directory
+                    //       named after this file.
+                    let candidates: Vec<std::path::PathBuf> = match &path_attr {
+                        Some(p) => match path.parent() {
+                            Some(dir) => vec![dir.join(p)],
+                            None => vec![],
+                        },
+                        None => vec![
+                            owner.join(format!("{name}.rs")),
+                            owner.join(name).join("mod.rs"),
+                        ],
+                    };
+                    for cand in candidates {
+                        out.insert(normalise(&cand, root));
+                    }
+                } else {
+                    // Not test-gated HERE, but may inherit if this owning file
+                    // turns out to be test-only. Recorded for pass 2.
+                    let name = rest.split(&[';', ' ', '{'][..]).next().unwrap_or("");
+                    let candidates: Vec<std::path::PathBuf> = match &path_attr {
+                        Some(p) => match path.parent() {
+                            Some(dir) => vec![dir.join(p)],
+                            None => vec![],
+                        },
+                        None => vec![
+                            owner.join(format!("{name}.rs")),
+                            owner.join(name).join("mod.rs"),
+                        ],
+                    };
+                    let from = normalise(&path, root);
+                    for cand in candidates {
+                        edges.push((from.clone(), normalise(&cand, root)));
+                    }
+                }
+                cfg_test = false;
+                path_attr = None;
+                continue;
+            }
+            if !t.is_empty() && !t.starts_with("//") && !t.starts_with("#[") {
+                cfg_test = false;
+                path_attr = None;
+            }
+        }
+    }
+
+    // Pass 2: fixpoint. Bounded by the edge count, so it terminates even on a
+    // cyclic declaration graph — which cannot exist in valid Rust, but a
+    // scanner that hangs on malformed input is worse than one that stops early.
+    for _ in 0..edges.len().max(1) {
+        let mut grew = false;
+        for (from, to) in &edges {
+            if out.contains(from) && !out.contains(to) {
+                out.insert(to.clone());
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    out
+}
+
 
 pub(crate) fn afxdp_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
     for entry in std::fs::read_dir(dir).expect("read_dir under src/afxdp") {
@@ -448,7 +634,7 @@ fn worker_queue_6929_every_production_producer_routes_through_push_bounded() {
             .expect("under src/afxdp")
             .to_string_lossy()
             .replace('\\', "/");
-        if is_fixture(&rel) {
+        if is_fixture(&root, &rel) {
             fixtures += 1;
             continue;
         }
@@ -693,4 +879,108 @@ fn worker_queue_7201_did_work_consumes_the_backlog_signal() {
         "`commands_backlogged` must be destructured out of WorkerCommandResults \
          at the call site, not dropped by a `..` rest pattern"
     );
+}
+
+/// #8325: the `#[cfg(test)]`-derived predicate must AGREE with the filename
+/// patterns it replaces, on every file in the tree.
+///
+/// This is the control that makes the change safe to land. A derived predicate
+/// that quietly classified a PRODUCTION file as a fixture would weaken every
+/// canary built on it — silently, and in the direction where a canary stops
+/// looking at code rather than starting to look at the wrong code. Nothing else
+/// in the suite would notice: each canary is a content match against an expected
+/// set, so a shrunken population simply finds fewer things and still passes.
+///
+/// So the two are run side by side over the whole tree and every disagreement is
+/// reported with its path. The old patterns are reproduced here verbatim rather
+/// than referenced, because the point is to compare against what the tree used
+/// to believe, and a shared helper would make both sides move together.
+#[test]
+fn cfg_test_derived_fixture_predicate_agrees_with_the_filename_patterns_8325() {
+    fn legacy(rel: &str) -> bool {
+        rel == "tests.rs"
+            || rel.ends_with("/tests.rs")
+            || rel.ends_with("_tests.rs")
+            || rel.contains("/tests/")
+            || rel.starts_with("tests_")
+            || rel.contains("/tests_")
+    }
+
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let cfg_test = cfg_test_modules(&src);
+    let mut files = Vec::new();
+    afxdp_rs_files(&src, &mut files);
+
+    // Positive control on the scan itself. An empty declaration set would make
+    // the derived predicate answer `false` for everything, which reads as "no
+    // fixtures exist" and would fail below as a wall of disagreements rather
+    // than as the scanner defect it actually is.
+    assert!(
+        cfg_test.len() > 20,
+        "the #[cfg(test)] scan found only {} module declarations, which cannot be \
+         right for this tree — the scan is broken and every verdict below would \
+         be about the scanner rather than about the predicate",
+        cfg_test.len()
+    );
+    assert!(
+        files.len() > 100,
+        "the file walk found only {} .rs files under src/",
+        files.len()
+    );
+
+    let mut only_legacy = Vec::new();
+    let mut only_derived = Vec::new();
+    for path in &files {
+        let rel = path
+            .strip_prefix(&src)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let l = legacy(&rel);
+        let d = is_fixture_with(&rel, &cfg_test);
+        if l && !d {
+            only_legacy.push(rel);
+        } else if d && !l {
+            only_derived.push(rel);
+        }
+    }
+
+    // BOTH directions are reported before failing. The first version asserted
+    // them in sequence, so the second assert never ran while the first was red —
+    // and the two disagreements have completely different diagnoses. A test that
+    // can only ever show you one half of a comparison is not a comparison.
+    // ONLY_LEGACY is the safety property and it must be EMPTY. A file the
+    // filename patterns skipped but the derived rule does not resolve would be
+    // reclassified as PRODUCTION — the direction that adds files to a canary's
+    // population, which is loud rather than silent, but still a change nobody
+    // asked for.
+    //
+    // ONLY_DERIVED is the IMPROVEMENT, not a failure: files the patterns missed.
+    // It is asserted against a floor so a broken scan cannot silently shrink it
+    // back to the old behaviour, and reported by name so growth is visible.
+    const KNOWN_MISSED_BY_FILENAME: usize = 18;
+    assert!(
+        only_derived.len() >= KNOWN_MISSED_BY_FILENAME,
+        "#8325: the derived predicate now finds only {} test files that the \
+         filename patterns miss, against {} when this landed. The scan has \
+         regressed — files are being classified as PRODUCTION again. Do not \
+         lower this number to make the test pass; find what the scan stopped \
+         resolving.",
+        only_derived.len(),
+        KNOWN_MISSED_BY_FILENAME
+    );
+
+    let mut report = String::new();
+    if !only_legacy.is_empty() {
+        report.push_str(&format!(
+            "\n{} file(s) match a filename pattern but do not resolve from a \
+             #[cfg(test)] declaration. Either the declaration is missing the attribute \
+             — in which case the file IS production and the old predicate was wrong to \
+             skip it — or the scan failed to resolve it, most likely a #[path] or \
+             visibility form it does not handle:\n  {}\n",
+            only_legacy.len(),
+            only_legacy.join("\n  ")
+        ));
+    }
+    assert!(report.is_empty(), "#8325: predicates disagree.{report}");
 }
