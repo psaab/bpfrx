@@ -1514,6 +1514,28 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	c.collectZoneCounters(ch, c.srv.dp)
 
 	dp := c.srv.dp
+	// #8321 finding 14: the CONTROL-PLANE collectors run BEFORE the dataplane
+	// gate below, because none of them reads dataplane state and all of them
+	// matter most when the dataplane is absent.
+	//
+	// They sat after `if dp == nil || !dp.IsLoaded() { return }`, so on a
+	// config-only boot or a degraded dataplane the daemon's uptime, DHCP lease
+	// and DDNS metrics vanished from monitoring at exactly the moment an
+	// operator is trying to work out what happened. A metric that disappears
+	// during the incident it would explain is worse than one that was never
+	// added: its absence reads as "nothing to report".
+	//
+	// Verified dataplane-independent before hoisting -- none of the four
+	// references `c.srv.dp`, `IsLoaded` or the dataplane package (they live in
+	// metrics_system.go and read the config store, the DHCP client and the DDNS
+	// state). That check is what makes this a hoist rather than a behaviour
+	// change: on a LOADED dataplane the emitted set is byte-identical, just
+	// earlier in the scrape.
+	c.collectDHCPMetrics(ch)
+	c.collectDDNSMetrics(ch)
+	c.collectSurfaceADDNSMetrics(ch)
+	c.collectSystemMetrics(ch)
+
 	if dp == nil || !dp.IsLoaded() {
 		return
 	}
@@ -1548,10 +1570,6 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	// return above with exactly one emission per scrape.
 	c.collectNATPoolMetrics(ch, dp)
 	c.collectSessionGauges(ch, dp)
-	c.collectDHCPMetrics(ch)
-	c.collectDDNSMetrics(ch)
-	c.collectSurfaceADDNSMetrics(ch)
-	c.collectSystemMetrics(ch)
 	c.collectUserspaceStatus(ch, userspaceStatus)
 	// #6845: a top-level status-derived signal, emitted only when a status was
 	// actually read — see emitZoneCounterOverflow for why its absence and its 0
