@@ -364,8 +364,22 @@ pub(super) fn merge_owner_rg_candidate_keys(
 ///
 /// With deterministic reverse companions (#310), the Go sync path already
 /// pre-installs reverse entries via UpsertSynced. This function still runs
-/// at activation to re-resolve egress with local forwarding state (the
-/// pre-installed entries carry the peer's interface indices/MACs).
+/// at activation to re-resolve egress with local forwarding state.
+///
+/// #8612: the parenthetical that used to sit here — "the pre-installed
+/// entries carry the peer's interface indices/MACs" — described the
+/// pre-#7097 world and has been false since that scrub. They carry ZERO
+/// there: `ScrubNodeLocal` zeroes `FibIfindex`, `FibVlanID`, the MACs and
+/// the ingress pair on every peer-owned row. The re-resolution is therefore
+/// not a correction of the peer's numbering, it is the ONLY source of that
+/// numbering — which is why the re-resolve must run and cannot be skipped as
+/// an optimisation.
+///
+/// The one field that now survives is `FibGen` under
+/// `LogFlagUserspaceTunnelEndpoint`, because there it is a
+/// `StableTunnelEndpointID` (a fold of the interface NAME, identical on both
+/// nodes) rather than a node-local number. That is the identity this
+/// re-resolution has nothing to rebuild from if it is erased in transit.
 ///
 /// Use the union of the shared owner-RG session index and the narrower
 /// reverse-prewarm index here. Activation is infrequent, and locally promoted
