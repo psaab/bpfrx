@@ -332,6 +332,45 @@ pub(super) fn stage_native_gre_decap(
     (new_meta, owned_packet_frame)
 }
 
+/// Stage 6b — WireGuard transport-data decap (#8274 step 3).
+///
+/// The exact shape of `stage_native_gre_decap` above, and deliberately so: the
+/// consumer is the same, the substitution is the same, and a second convention
+/// for "replace the outer packet with its decapsulated inner for the rest of
+/// this pass" is the divergence `logical_ingress`'s module comment exists to
+/// prevent.
+///
+/// Returns the ORIGINAL meta and `None` for every packet that is not an
+/// inbound WireGuard transport-data record for a configured listener, which is
+/// almost all of them; see `wg::decap::try_wg_decap_from_frame` for the gates
+/// and for why a rejection here is not a drop.
+///
+/// The peer identity travels with the decapsulated packet rather than being
+/// discarded: the control thread learns a peer's endpoint from authenticated
+/// datagrams, and moving transport-data records off its socket takes its
+/// dominant source of that signal away. The caller reports it back.
+#[inline]
+pub(super) fn stage_wg_decap(
+    raw_frame: &[u8],
+    meta: UserspaceDpMeta,
+    forwarding: &ForwardingState,
+    wg_scratch: &crate::afxdp::wg::WgWorkerScratch,
+) -> (UserspaceDpMeta, Option<Vec<u8>>) {
+    // Shape mirrors `stage_native_gre_decap` deliberately: meta + optional
+    // owned frame, nothing else. The decapped peer's roaming endpoint is
+    // reported to the engine INSIDE `try_wg_decap_from_frame` (the control
+    // thread drains it on its timer pass), so handing the pubkey back up to
+    // the poll loop would only create a value with no consumer — and a
+    // returned-but-unused identity is how a "the caller will handle it"
+    // comment outlives the caller that did.
+    let decapped = crate::afxdp::wg::decap::try_wg_decap_from_frame(
+        raw_frame, meta, forwarding, wg_scratch,
+    );
+    let new_meta = decapped.as_ref().map(|p| p.meta).unwrap_or(meta);
+    let owned_packet_frame = decapped.map(|p| p.frame);
+    (new_meta, owned_packet_frame)
+}
+
 /// Stage 7+8 — parse session flow and learn the source-side
 /// dynamic neighbor.
 ///

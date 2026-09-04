@@ -75,7 +75,9 @@ use ipv6_ext_walk::{
     EH_CLASS_TERMINAL, FragHdr, MAX_EXT_HDRS, PROTO_FRAGMENT_NO_L4, eh_class, eh_class_table,
     read_bytes,
 };
-use wg_classify::{wg_record_is_transport_data, wg_steer_to_kernel_on_port_match};
+use wg_classify::{
+    wg_record_is_transport_data, wg_steer_to_kernel_on_port_match, wg_worker_claims_record,
+};
 // MAX_INTERFACES is threaded in from bpf/headers/xpf_common.h via the
 // pkg/dataplane/build-userspace-xdp.sh wrapper, which does
 // `export MAX_INTERFACES=$(awk ... xpf_common.h)` before `cargo build`.
@@ -714,7 +716,27 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
                     );
                     return Ok(cpumap_or_pass(ctrl));
                 }
-                if is_local_destination(&parsed) {
+                // #8274 step 3: a WireGuard TRANSPORT-DATA record for a
+                // configured local listener is NOT local delivery any more —
+                // the worker decaps it and adjudicates the inner packet under
+                // the tunnel's logical ingress zone. Everything else that is
+                // locally destined still goes to the kernel exactly as before.
+                //
+                // This is the arm that made step 2 inert: the WireGuard arm
+                // above had already stopped claiming type-4 records, and this
+                // predicate caught them and returned the same
+                // `cpumap_or_pass`. Declining here is what actually moves them
+                // onto the AF_XDP redirect.
+                let wg_worker_claim = (ctrl.flags & USERSPACE_CTRL_FLAG_WG_RX) != 0
+                    && wg_worker_claims_record(
+                        true,
+                        (ctrl.wg_listen_port & 0xffff) as u16 != 0
+                            && parsed.protocol == PROTO_UDP
+                            && parsed.flow_dst_port == (ctrl.wg_listen_port & 0xffff) as u16,
+                        true,
+                        parsed.udp_wg_transport_data,
+                    );
+                if is_local_destination(&parsed) && !wg_worker_claim {
                     record_trace(
                         ctrl.flags,
                         ingress_ifindex,

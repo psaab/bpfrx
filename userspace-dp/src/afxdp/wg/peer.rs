@@ -202,6 +202,36 @@ pub(crate) struct Peer {
     /// (`Arc<Peer>` reused per pubkey), so it survives config commits like the
     /// timer stamps above. Was an engine-GLOBAL `AtomicBool` in S2a
     /// (single-peer); this is the #1434/S6 per-peer generalization.
+    /// #8274 step 3: an endpoint a WORKER observed on an authenticated
+    /// transport-data record, waiting for the control thread to adopt it.
+    ///
+    /// Moving type-4 decap into the worker takes the control thread's DOMINANT
+    /// source of endpoint-learning signal off its socket: it learns a peer's
+    /// endpoint from authenticated datagrams, and data records are most of
+    /// them. Without this the learning degrades to handshake/keepalive cadence.
+    ///
+    /// What it does NOT affect, measured rather than assumed: transit ENCAP
+    /// never read a learned endpoint. `peer_for_dest` returns
+    /// `entry.config.endpoint` from the per-snapshot config bundle, and
+    /// `reconcile_peers` — its only writer — has exactly one production caller,
+    /// `WgEngine::new`. The learned map (`effective_endpoints`) is referenced
+    /// only inside `coordinator/wg_control/mod.rs`. So what degrades without
+    /// this slot is the control thread's OWN sends — keepalives, handshake
+    /// initiations, the TUN-read egress — not the dataplane's forwarding.
+    ///
+    /// Shaped like `handshake_request_pending` beside it: per-peer,
+    /// last-write-wins, lossy-tolerable, drained by the control thread's
+    /// existing per-peer timer pass. A roam has exactly last-write-wins
+    /// semantics, so coalescing is correct rather than merely acceptable.
+    /// A `Mutex<Option<SocketAddr>>` and not an atomic because a `SocketAddr`
+    /// does not fit one: the lock is taken only on a CHANGE (the worker
+    /// compares first), so the steady state pays one relaxed load per record
+    /// and never the lock.
+    pub(crate) roamed_endpoint: std::sync::Mutex<Option<SocketAddr>>,
+    /// Relaxed mirror of `roamed_endpoint.is_some()`, so the per-packet path
+    /// can skip the mutex entirely once a roam is already pending and the
+    /// control thread has not yet drained it.
+    pub(crate) roamed_endpoint_pending: AtomicBool,
     pub(crate) handshake_request_pending: AtomicBool,
     /// #5164: monotonic timestamp of THIS peer's last accepted handshake
     /// request edge (0 = never). Drives the per-peer rate-limit gate only;
@@ -243,6 +273,8 @@ impl Peer {
             previous: RwLock::new(None),
             next: RwLock::new(None),
             greatest_tai64n: Mutex::new([0u8; TAI64N_LEN]),
+            roamed_endpoint: std::sync::Mutex::new(None),
+            roamed_endpoint_pending: AtomicBool::new(false),
             handshake_request_pending: AtomicBool::new(false),
             handshake_request_last_ns: AtomicU64::new(0),
             rekey_request_pending: AtomicBool::new(false),

@@ -474,6 +474,32 @@ Acceptance for step 2:
 the IPsec capture measurement (B1's reachability on real hardware), which
 does not depend on steps 2–3.
 
+### 4.0 Step 3 as BUILT (#8274) — the step that moves packets
+
+Landed. `try_wg_decap_from_frame` (`userspace-dp/src/afxdp/wg/decap.rs`) runs
+as stage 6b of `poll_binding_process_descriptor`, immediately after native GRE
+decap and guarded on `owned_packet_frame.is_none()`; the shim's
+`wg_worker_claims_record` stops handing type-4 records to the kernel so the
+stage is reachable. The two edits are one change — either alone is broken.
+
+The inner packet is rebound through `build_logical_ingress_packet` with the
+TUNNEL's `logical_ifindex`, which is what satisfies **invariant 2** of this
+document for WireGuard: the inner flow is adjudicated in the tunnel's zone, not
+the underlay's. Generations are INHERITED from the RX meta (**invariant 5**);
+fabricating them would make every packet look current and silently defeat
+attachment fencing. Both are pinned by mutation-killed cells — see
+`docs/log/8274.md` for the table of which mutation killed which cell.
+
+Two limits on the claim, so this section is not read as more than it is:
+
+- The control thread's plaintext TUN write is UNCHANGED. It is unreachable for
+  type-4 on any shim-covered ingress, and it remains the only path on an
+  ingress the shim does not cover. The adjudication gap is closed on the
+  measured path and open on an unmeasured one.
+- Host-inbound over a WireGuard tunnel still reaches the local stack via that
+  TUN write. GRE has a `local_tunnel_deliveries` seam for this; WireGuard does
+  not, and building one is separate work.
+
 ### 4.1 Step 2 as BUILT (#8274), and two things it corrected
 
 Landed. The classification lives in `userspace-xdp/src/wg_classify.rs`, a

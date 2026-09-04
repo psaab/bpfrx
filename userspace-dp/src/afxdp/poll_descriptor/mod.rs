@@ -75,7 +75,7 @@ use session_admission::{new_flow_session_limit_drop, strict_syn_check_drops_new_
 use super::poll_stages::{
     FabricIngressOutcome, IpsecPassthroughOutcome, ScreenCheckOutcome, StageOutcome,
     SynCookieAckOutcome, stage_classify_fabric_ingress, stage_ipsec_passthrough_check,
-    stage_link_layer_classify, stage_native_gre_decap, stage_parse_flow_and_learn,
+    stage_link_layer_classify, stage_native_gre_decap, stage_parse_flow_and_learn, stage_wg_decap,
     stage_screen_check, stage_screen_syn_cookie_ack_on_session_miss,
 };
 use super::*;
@@ -197,6 +197,31 @@ pub(super) fn poll_binding_process_descriptor(
                 // stage-12+ code at lines below calls `.take()`.
                 let (mut meta, mut owned_packet_frame) =
                     stage_native_gre_decap(raw_frame, meta, worker_ctx.forwarding);
+                // #8274 step 3 — stage 6b: WireGuard transport-data decap.
+                //
+                // Runs only when GRE did not already claim the frame: a packet
+                // is one tunnel's or the other's, never both, and re-entering
+                // decap on an already-decapsulated inner would adjudicate a
+                // synthesized frame as if it were an outer datagram.
+                //
+                // Everything downstream then sees the INNER packet — flow
+                // parse, screen, session, policy, NAT, forward build — which is
+                // the entire point of the issue: an authenticated peer's inner
+                // plaintext is adjudicated under the tunnel's logical ingress
+                // zone instead of being written to the wgN TUN for the kernel
+                // to forward with no zone policy at all.
+                if owned_packet_frame.is_none() {
+                    let (wg_meta, wg_frame) = stage_wg_decap(
+                        raw_frame,
+                        meta,
+                        worker_ctx.forwarding,
+                        &binding.wg_scratch,
+                    );
+                    if wg_frame.is_some() {
+                        meta = wg_meta;
+                        owned_packet_frame = wg_frame;
+                    }
+                }
                 let packet_frame = owned_packet_frame.as_deref().unwrap_or(raw_frame);
                 // #946 Phase 1 stage 7+8: parse session flow and
                 // learn the source-side dynamic neighbor.

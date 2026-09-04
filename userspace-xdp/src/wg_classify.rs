@@ -109,3 +109,35 @@ pub fn wg_record_is_transport_data(first_payload_byte: Option<u8>) -> bool {
 pub fn wg_steer_to_kernel_on_port_match(local_destination: bool, is_transport_data: bool) -> bool {
     local_destination && !is_transport_data
 }
+
+/// #8274 step 3: does the WORKER claim this datagram for decap?
+///
+/// Step 2 stopped the WireGuard arm from steering transport-data records to the
+/// kernel, and that was deliberately INERT: the record then fell through to the
+/// session-miss path and was matched by `is_local_destination` a few arms down,
+/// which returns the same `cpumap_or_pass` — so it still reached the kernel and
+/// the tunnel kept working with no worker-side decap to receive it.
+///
+/// Step 3 is where that changes. The worker now HAS a decap stage, so a
+/// transport-data record must reach it instead: `is_local_destination` must not
+/// claim it, and the packet continues to the AF_XDP redirect like any other
+/// transit traffic.
+///
+/// The two callers are the same predicate read in opposite directions, which is
+/// why they share one function: the WireGuard arm steers to the kernel when
+/// this is FALSE, and the local-destination arm declines to steer when it is
+/// TRUE. Spelling that twice is how the two drift apart.
+///
+/// `local_destination` is still required. A transport-data record to a
+/// destination that is not ours is transit traffic that merely happens to use
+/// the listen port, and it must take the ordinary policy path rather than being
+/// handed to a decap stage that would not find a session for it anyway.
+#[inline(always)]
+pub fn wg_worker_claims_record(
+    wg_rx_enabled: bool,
+    port_matches: bool,
+    local_destination: bool,
+    is_transport_data: bool,
+) -> bool {
+    wg_rx_enabled && port_matches && local_destination && is_transport_data
+}

@@ -1,0 +1,249 @@
+//! #8274 step 3: WireGuard transport-data decap INSIDE the AF_XDP worker.
+//!
+//! # What this fixes
+//!
+//! WireGuard's two directions were asymmetric. Encap has always run inside the
+//! worker, on a packet that has been through screen, session, route, policy and
+//! NAT. Decap did not: the shim steered every datagram on the listen port to
+//! the kernel, the control thread's socket read it, `try_decap` authenticated
+//! it, and `slowpath::write_packet_nonblocking` put the plaintext straight onto
+//! the `wgN` TUN for the kernel to route. Between `try_decap` and that write
+//! there was an RFC 6040 ECN combine and nothing else — no zone lookup, no
+//! session, no route/PBR/filter/NAT, no zone counter, no policy-deny event.
+//!
+//! A peer's `allowed-ips` is a cryptographic check on the inner SOURCE address.
+//! It has no destination, no zone pair, no application and no direction. It is
+//! not a security policy, and it was the only thing standing between an
+//! authenticated peer and the kernel's forwarding path.
+//!
+//! # Why this half is cheap
+//!
+//! Every input was already here. `ForwardingState.wg_engines` holds the live
+//! engine (the encap path reads it per packet); `try_decap` takes `&self` and is
+//! internally synchronised, so N workers may call it concurrently on one `Arc`;
+//! the tunnel's `logical_ifindex` is on the endpoint; and
+//! `logical_ingress::build_logical_ingress_packet` (#8062) does the
+//! synthesize / ECN-combine / reparse / logical-rebind tail that native GRE
+//! already proves in production.
+//!
+//! Two things are strictly BETTER here than in the control thread:
+//!
+//!   * **the outer ECN bits.** The outer IP header is still in the frame, so
+//!     `outer_ecn_bits` reads them directly. The socket path has to recover them
+//!     out-of-band through `IP_RECVTOS` / `IPV6_RECVTCLASS` cmsg, because the
+//!     kernel UDP stack stripped the header before the record arrived.
+//!   * **the attachment generations.** `LogicalIngressParams` deliberately has
+//!     no `Default` and no `Option` on `config_generation` / `fib_generation`,
+//!     and its doc names the WireGuard control thread as the caller that has no
+//!     value to inherit and would have to fabricate one — which "would compile,
+//!     adjudicate, and violate the fencing invariant SILENTLY, because a
+//!     fabricated generation always looks current". A worker caller inherits
+//!     both from the triggering RX meta, exactly as GRE does.
+//!
+//! # Direction of the change
+//!
+//! This is a TIGHTENING, and it is visible on the first packet. Inner traffic
+//! that an authenticated peer sends today is forwarded by the kernel with no
+//! zone adjudication at all; after this it is adjudicated like any other
+//! transit packet, under the tunnel's logical ingress zone. Traffic that flows
+//! today can therefore start being DENIED — by the operator's own policy, which
+//! previously never ran on it. That is the point of the issue, not a regression,
+//! but it is availability-visible on upgrade and it is why this is a security
+//! label rather than a cleanup.
+
+use super::super::*;
+use super::WG_TYPE_DATA;
+use crate::afxdp::gre::{
+    outer_datagram_end, outer_ecn_bits, packet_trimmed_len, parse_inner_protocol_and_offsets,
+};
+
+/// A decapsulated WireGuard transport-data record, ready to replace its outer
+/// frame for the rest of the worker's pass.
+///
+/// Shaped exactly like `NativeGrePacket` because the consumer is the same: the
+/// poll loop shadows `meta` and rebinds `packet_frame`, and everything
+/// downstream adjudicates the INNER packet.
+pub(in crate::afxdp) struct WgDecapPacket {
+    pub(in crate::afxdp) frame: Vec<u8>,
+    pub(in crate::afxdp) meta: UserspaceDpMeta,
+    /// The peer whose session keys authenticated the record. Proven, not
+    /// inferred: `try_decap` demuxes the session from `hdr.receiver_index`
+    /// before any AEAD work and the record is authenticated by the time the
+    /// outcome is built.
+    pub(in crate::afxdp) peer_pubkey: [u8; 32],
+}
+
+/// The WireGuard tunnel endpoint listening on `dst_port`, with its live engine.
+///
+/// Walks `wg_engines` rather than `tunnel_endpoints` deliberately: that map IS
+/// the WireGuard-only set, so the scan is over the number of WG tunnels (0, 1 or
+/// 2 in practice) instead of over every tunnel endpoint on the box. A GRE-mode
+/// row cannot appear in it, so no kind re-check is needed — but the mode is
+/// checked anyway, for the same defence-in-depth reason `match_tunnel_endpoint`
+/// re-checks `TunnelKind::Gre` against its own index.
+fn wg_endpoint_for_listen_port(
+    forwarding: &ForwardingState,
+    dst_port: u16,
+) -> Option<(&TunnelEndpoint, &std::sync::Arc<super::WgEngine>)> {
+    for (id, engine) in forwarding.wg_engines.iter() {
+        let endpoint = forwarding.tunnel_endpoints.get(id)?;
+        if endpoint.wg_listen_port == dst_port
+            && tunnel_mode_kind(&endpoint.mode) == TunnelKind::WireGuard
+        {
+            return Some((endpoint, engine));
+        }
+    }
+    None
+}
+
+/// Decapsulate an inbound WireGuard transport-data record, or `None`.
+///
+/// `None` means "not ours, or not decryptable" and the caller leaves the packet
+/// alone — it is NOT a drop. Every rejection here is a record this stage has no
+/// business claiming: a non-UDP packet, a datagram on no configured listen
+/// port, a handshake record (which the shim still steers to the kernel, where
+/// the control thread owns the state machine), or a record whose AEAD failed.
+///
+/// # The decap buffer
+///
+/// `scratch` is the per-worker `WgWorkerScratch`, whose module doc has named
+/// this integration as its consumer since it was written: "No `vec![]` in
+/// encap/decap." Allocating per packet on the decap path would be the hot-path
+/// allocation `docs/engineering-style.md` treats as a defect by default.
+pub(in crate::afxdp) fn try_wg_decap_from_frame(
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    forwarding: &ForwardingState,
+    scratch: &super::WgWorkerScratch,
+) -> Option<WgDecapPacket> {
+    // #1432 §4.5's cheap gate first: a box with no WireGuard tunnel never
+    // probes the engine map, and a non-UDP packet never reads a byte.
+    if !forwarding.has_wg_tunnels || meta.protocol != PROTO_UDP {
+        return None;
+    }
+    // #6748's bound, for the same reason GRE takes it: the outer IP header's
+    // own declared length is the authoritative end of this datagram, and bytes
+    // past it are a trailer the sender appended rather than part of the record.
+    // Reading the WireGuard record out of the FRAME instead would let a peer
+    // append bytes past the datagram and have them authenticated as ciphertext.
+    let outer_end = outer_datagram_end(frame, meta)?;
+    let outer = frame.get(..outer_end)?;
+
+    let l4 = meta.l4_offset as usize;
+    let udp = outer.get(l4..l4.checked_add(8)?)?;
+    let dst_port = u16::from_be_bytes([udp[2], udp[3]]);
+    let src_port = u16::from_be_bytes([udp[0], udp[1]]);
+
+    let record = outer.get(meta.payload_offset as usize..)?;
+    // Only TRANSPORT DATA. Handshake and cookie records (types 1, 2, 3) belong
+    // to the control thread, which owns the handshake state machine and the
+    // #1865 unknown-type accounting; the shim still steers those to the kernel.
+    if record.first().copied() != Some(WG_TYPE_DATA) {
+        return None;
+    }
+
+    let (endpoint, engine) = wg_endpoint_for_listen_port(forwarding, dst_port)?;
+
+    let mut decap_buf = scratch.decap_out.borrow_mut();
+    let outcome = engine.try_decap(record, &mut decap_buf).ok()?;
+    // The contract on `try_decap` is that `out` MUST NOT be inspected on Err —
+    // every post-AEAD error arm zeroes it — which the `?` above honours by not
+    // reaching this line.
+    let inner = decap_buf.get(..outcome.len)?;
+    // A keepalive is a zero-length payload and decodes to an empty inner. It
+    // authenticated, so the control thread's endpoint learning still wants it,
+    // but there is no inner packet to adjudicate and nothing to forward.
+    if inner.is_empty() {
+        return None;
+    }
+
+    let (inner_family, inner_eth_proto) = match inner.first().map(|b| b >> 4) {
+        // Same ethertypes `gre_inner_family_and_proto` writes, for the same
+        // synthesized Ethernet header.
+        Some(4) => (libc::AF_INET as u8, 0x0800u16),
+        Some(6) => (libc::AF_INET6 as u8, 0x86ddu16),
+        _ => return None,
+    };
+    let inner_len = packet_trimmed_len(inner, inner_family)?;
+    let inner = inner.get(..inner_len)?;
+    let (protocol, rel_l4_offset, payload_offset) =
+        parse_inner_protocol_and_offsets(inner, inner_family)?;
+
+    let (synthetic, inner_meta) = crate::afxdp::logical_ingress::build_logical_ingress_packet(
+        forwarding,
+        &crate::afxdp::logical_ingress::LogicalIngressParams {
+            inner_packet: inner,
+            inner_family,
+            inner_eth_proto,
+            protocol,
+            rel_l4_offset,
+            payload_offset,
+            // The TUNNEL's logical ifindex, never the underlay's. This is what
+            // makes the inner packet adjudicate under the tunnel's zone
+            // (#7167 invariant 2) instead of the WAN's.
+            logical_ifindex: endpoint.logical_ifindex,
+            // Strictly better than the control thread has it: the outer IP
+            // header is still in the frame.
+            outer_ecn: outer_ecn_bits(frame, meta),
+            ecn_illegal_drops: &crate::afxdp::gre::WG_DECAP_ECN_ILLEGAL_DROPS,
+            // NOT `GRE_DECAP_INGRESS_FLAG`. The GRE flag selects the
+            // `tcp-mss gre-in` clamp value (#2486), which is the wrong number
+            // for a WireGuard tunnel — its clamp is computed from the endpoint
+            // by `wg_tcp_mss` on the EGRESS side. "Whatever GRE passes" is
+            // explicitly not an answer for another protocol.
+            meta_flags: 0,
+            rx_queue_index: meta.rx_queue_index,
+            // Inherited from the triggering RX meta, which is the whole reason
+            // this decap belongs in the worker. See the module comment.
+            config_generation: meta.config_generation,
+            fib_generation: meta.fib_generation,
+        },
+    )?;
+
+    // #8274 step 3: the roam report, made HERE because this is where the
+    // authentication is proven and the engine is already in hand. `try_decap`
+    // demuxed the session from `hdr.receiver_index` before any AEAD work and
+    // the record is authenticated by the time `outcome` exists, so the peer
+    // this endpoint is attributed to is proven rather than guessed — the same
+    // basis the control thread's own learning stands on.
+    //
+    // Reported only for a record that DECRYPTED. An unauthenticated datagram
+    // must never move a peer's endpoint, or anyone who can send to the listen
+    // port could redirect a tunnel's egress.
+    if let Some(src_ip) = outer_source_ip(outer, meta) {
+        engine.note_worker_observed_endpoint(
+            &outcome.peer_pubkey,
+            std::net::SocketAddr::new(src_ip, src_port),
+        );
+    }
+
+    Some(WgDecapPacket {
+        frame: synthetic,
+        meta: inner_meta,
+        peer_pubkey: outcome.peer_pubkey,
+    })
+}
+
+/// The outer datagram's SOURCE address, for the roam report.
+///
+/// Read from the outer IP header still present in the frame — the same header
+/// `outer_ecn_bits` reads. The control thread gets this from `recvfrom`; here
+/// it is parsed, which is why it is bounds-checked rather than assumed.
+fn outer_source_ip(outer: &[u8], meta: UserspaceDpMeta) -> Option<std::net::IpAddr> {
+    let l3 = meta.l3_offset as usize;
+    match meta.addr_family as i32 {
+        libc::AF_INET => {
+            let b = outer.get(l3.checked_add(12)?..l3.checked_add(16)?)?;
+            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                b[0], b[1], b[2], b[3],
+            )))
+        }
+        libc::AF_INET6 => {
+            let b = outer.get(l3.checked_add(8)?..l3.checked_add(24)?)?;
+            let mut a = [0u8; 16];
+            a.copy_from_slice(b);
+            Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(a)))
+        }
+        _ => None,
+    }
+}
