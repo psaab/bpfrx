@@ -722,6 +722,29 @@ routing, and only on double fault).
     whenever the config-derived set already covers the same
     `(table, family, prefix)`, so an operator's route always wins and no
     existing precedence contract changes.
+  - It is **BOUNDED, and refuses rather than truncates (#8355).** A
+    learned route serializes to ~113 bytes — stable to within 1.5% from
+    one route to 500,000, which is what makes a route COUNT derivable
+    from a byte budget at all. The binding constraint turned out not to
+    be size: 500k routes are ~56 MiB, under the 64 MiB
+    `MaxControlRequestBytes` ceiling, which admits ~595,000 routes. It
+    is TIME. The control-socket deadline grants 3s plus 1s per MiB, so
+    that publish would hold for **56 seconds** a socket the 1/s status
+    poll, HA sync, session installs and forwarding sync all share.
+    `learnedRoutePublishBudget` (10s) is the policy input and the route
+    cap is *derived* from it through the same deadline constants, so a
+    change to either moves the cap with it rather than leaving a number
+    wearing the shape of a budget.
+    Over the cap the import is **declined entirely**, not truncated. Both
+    options leave some destinations on the `NoRoute` slow path, so
+    neither is an outage — the kernel still forwards. They differ in
+    predictability: a bounded subset would be selected by emission sort
+    order, so two prefixes to one peer land on opposite sides of the cut
+    and fast-path eligibility becomes per-destination with no rule an
+    operator can state. Declining is uniform and describable. The
+    decline logs at WARN naming the count, the cap and the consequence,
+    and increments a counter (`LearnedRouteCapHits`) so the state is
+    readable without log scraping.
   - It **narrows a window rather than closing it.** The snapshot is
     republished on operator commit and on ip-monitoring actuation only —
     there is no kernel route-event subscription — so a route learned

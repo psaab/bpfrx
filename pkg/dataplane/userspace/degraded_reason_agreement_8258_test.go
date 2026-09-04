@@ -103,7 +103,7 @@ func TestDegradedPathReasonNamesAgreeWithTheShim_8258(t *testing.T) {
 			"agreement between the Go table and an empty set", len(byIndex), byIndex)
 	}
 	if max <= 0 {
-		t.Fatalf("USERSPACE_FALLBACK_REASON_MAX was not found in the shim "+
+		t.Fatalf("USERSPACE_FALLBACK_REASON_MAX was not found in the shim " +
 			"source, so the array-length agreement below is unanchored")
 	}
 
@@ -156,9 +156,9 @@ func TestDegradedPathReasonNamesAgreeWithTheShim_8258(t *testing.T) {
 // genuinely cannot agree, rather than a silent omission. Both are residue: the
 // constant outlived the code that passed it.
 //
-//   * `icmp` — the shim's ICMP fallback was removed by `13241e75e`
+//   - `icmp` — the shim's ICMP fallback was removed by `13241e75e`
 //     ("remove ICMP fallback from XDP shim and create outer GRE sessions");
-//   * `no_session` — removed by `324d6b9d1` ("eliminate nearly all eBPF
+//   - `no_session` — removed by `324d6b9d1` ("eliminate nearly all eBPF
 //     fallbacks from userspace dataplane").
 //
 // They are left in place rather than deleted on purpose: removing them

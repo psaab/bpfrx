@@ -739,6 +739,12 @@ func addLearnedRouteSnapshots(cfg *config.Config, existing []RouteSnapshot, addS
 	if len(learned) == 0 {
 		return nil
 	}
+	// #8355: refuse a table larger than one publish can carry, rather than
+	// importing a prefix of it. See learned_route_cap_8355.go for why this
+	// degrades to NO import instead of a bounded subset.
+	if learnedRouteCapExceeded(len(learned)) {
+		return nil
+	}
 
 	covered := make(map[string]struct{}, len(existing))
 	for _, snap := range existing {
