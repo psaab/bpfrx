@@ -321,6 +321,53 @@ A future change that admits HA persistent-NAT must add full lease sync or
 replay, including tuple-conflict handling for live synced sessions and stale
 lease cleanup.
 
+### What the standby DOES rebuild today (#7360, #8132, #8121)
+
+The gate above is unchanged, and nothing below lifts it. But the sentence it
+ends with — "must add full lease sync or replay" — now describes less remaining
+work than it did, and reading this section without that is misleading: it
+suggests the standby holds nothing, when in fact it reconstructs a lease for
+every persistent session it imports.
+
+**Reconstruction, not replay.** A lease is a property of the SOURCE; session
+sync carries SESSIONS. So the standby does not receive leases — it derives them
+from the imports that actually succeeded, in `reserve_synced_on_first_pool_owner`
+(`userspace-dp/src/nat/source/synced.rs`). Deriving rather than carrying is the
+load-bearing choice: the standby installs a strict subset of what the active
+sends (reserve refusal, capacity, stale generation, discriminator withhold), so
+a carried `active_flows` would credit the lease for sessions this node does not
+hold — and a refcount that never reaches zero is never idle, so the lease would
+never enter the expiry index and no GC path could reclaim it.
+
+There are two reserve paths, and they needed separate fixes because they are
+separate functions:
+
+| path | selected by | reserve | fixed in |
+|---|---|---|---|
+| port-translating (PAT) | a translated port on the wire | `reserve_flow_maybe_persistent` | #7360 |
+| address-only | `port no-translation`, or a port-less protocol (GRE/ESP/…) | `reserve_address_only_maybe_persistent` | #8132 |
+
+**The two paths pin different things, and that changes what can fail.** Under
+PAT the lease pins a `(address, port)` and the PORT is the fragile half — with
+`address-persistent` the address survives a failover for free, because
+`sticky_pool_index` is a pure function of `(src_ip, pool_len)` and both nodes
+compute it. Under `port no-translation` the client keeps its own source port on
+the wire, so there is no translated port at all: the lease pins an ADDRESS, and
+the address is the whole promise. A test that asserts the address while
+`address-persistent` is on measures the hash rather than the repair, which is
+why the cells for both live on multi-address pools with that flag OFF and decoy
+flows interleaved.
+
+**What is still not rebuilt: an IDLE lease.** A lease whose flows have all
+closed but whose inactivity window is still open has no session to be derived
+from, so nothing above reaches it. #8121 added the explicit
+`export_idle_leases` / `import_idle_leases` verbs for exactly that population.
+Its wire is pinned across the two languages (`idle_lease_wire` in
+`protocol_wire_v1.json`), and its Rust core has cells — but its live acceptance
+run is blocked by the gate at the top of this section, which disarms forwarding
+for the very configuration the run needs. That circularity is recorded on #8121;
+it is a real dependency, not an oversight.
+
 ## What Was Fixed Recently
 
 ### P0: Barrier delivery during bulk sync — FIXED (PR #407)
