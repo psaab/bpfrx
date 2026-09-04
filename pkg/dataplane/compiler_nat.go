@@ -458,7 +458,13 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 					if pool.PersistentNAT != nil {
 						pnat := dp.GetPersistentNAT()
 						if pnat != nil {
-							timeout := time.Duration(pool.PersistentNAT.InactivityTimeout) * time.Second
+							// #8642: assessed — the `== 0` guard is weaker than
+							// the `> 0` ones elsewhere in this family. A wrapped
+							// value is non-zero, so it does not even fall back to
+							// the 300s default; the lease inactivity window
+							// collapses to ~512ns and every persistent lease
+							// expires immediately.
+							timeout := config.SecondsToDuration(pool.PersistentNAT.InactivityTimeout, 0)
 							if timeout == 0 {
 								timeout = 300 * time.Second
 							}

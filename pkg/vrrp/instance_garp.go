@@ -151,7 +151,10 @@ func (vi *vrrpInstance) sendGARP(force bool) {
 	if !vi.garpSendAllowed(force, time.Now().UnixNano()) {
 		return
 	}
-	count := vi.cfg.GARPCount
+	// #8597 (muse-004 K20): under vi.mu — updateConfig writes this field on the
+	// manager goroutine while sendGARP runs on the run loop, on detached
+	// `go vi.sendGARP` goroutines, AND synchronously from ReconcileVIPs.
+	count := vi.garpCount()
 	if count <= 0 {
 		count = 3 // default
 	} else if clamped, was := config.ClampGratuitousARPCount(count); was {

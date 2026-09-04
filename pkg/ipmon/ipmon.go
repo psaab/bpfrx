@@ -480,8 +480,11 @@ func (e *Engine) Apply(cfg *config.IPMonitoringConfig, results []*rpm.ProbeResul
 				if prev.cfg.HoldDownSecs == pol.HoldDownSecs {
 					st.pendingRecoveryAt = prev.pendingRecoveryAt
 				} else if !prev.pendingRecoveryAt.IsZero() {
-					oldHold := time.Duration(prev.cfg.HoldDownSecs) * time.Second
-					newHold := time.Duration(pol.HoldDownSecs) * time.Second
+					// #8642: a wrapped hold is ~512ns, which passes the
+					// `newHold > 0` check below and undamps the very route flap
+					// the hold-down exists to damp.
+					oldHold := config.SecondsToDuration(prev.cfg.HoldDownSecs, 0)
+					newHold := config.SecondsToDuration(pol.HoldDownSecs, 0)
 					if newHold > 0 {
 						st.pendingRecoveryAt = prev.pendingRecoveryAt.Add(newHold - oldHold)
 					}
@@ -844,7 +847,7 @@ func (e *Engine) evaluateLocked(now time.Time) bool {
 			// Still failed: cancel any pending recovery.
 			st.pendingRecoveryAt = time.Time{}
 		case !anyFailed && st.failed:
-			hold := time.Duration(st.cfg.HoldDownSecs) * time.Second
+			hold := config.SecondsToDuration(st.cfg.HoldDownSecs, 0) // #8642
 			if hold > 0 {
 				if st.pendingRecoveryAt.IsZero() {
 					st.pendingRecoveryAt = now.Add(hold)

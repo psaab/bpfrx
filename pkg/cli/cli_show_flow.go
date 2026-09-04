@@ -769,7 +769,19 @@ func (c *CLI) showTopTalkers(f sessionFilter) error {
 		}
 	}
 	now := monotonicSeconds()
-	var entries []topTalkerEntry
+	collector := newTopTalkerCollector(topTalkerLimit)
+
+	// #8597 (muse-004 K05): the scan does NOTHING per session but copy the
+	// key/value into a fixed-size candidate. No net.IP conversion, no Sprintf,
+	// no appid resolution, no closure — every one of those allocates, and an
+	// allocation inside the callback is an allocation per SESSION, which is the
+	// defect regardless of how few rows are eventually printed.
+	//
+	// This is not the first shape that was tried. Deferring the formatting
+	// behind a closure per candidate looks bounded and is not: the closure
+	// itself heap-allocates on every offer, and the zone/address work still
+	// ran before it. The allocation-ratio cell caught that at 125x, which is
+	// why it measures a ratio rather than asserting the design.
 
 	// A backend iterator error (e.g. helper restart mid-scan) must fail
 	// the command rather than printing a truncated top-talkers list as if
@@ -782,33 +794,7 @@ func (c *CLI) showTopTalkers(f sessionFilter) error {
 		if f.hasFilter() && !f.matchesV4(key, val) {
 			return true
 		}
-		srcIP := net.IP(key.SrcIP[:])
-		dstIP := net.IP(key.DstIP[:])
-		inZone := zoneNames[val.IngressZone]
-		outZone := zoneNames[val.EgressZone]
-		if inZone == "" {
-			inZone = fmt.Sprintf("%d", val.IngressZone)
-		}
-		if outZone == "" {
-			outZone = fmt.Sprintf("%d", val.EgressZone)
-		}
-		var age uint64
-		if now > val.Created {
-			age = now - val.Created
-		}
-		entries = append(entries, topTalkerEntry{
-			src:      fmt.Sprintf("%s:%d", srcIP, ntohs(key.SrcPort)),
-			dst:      fmt.Sprintf("%s:%d", dstIP, ntohs(key.DstPort)),
-			proto:    protoNameFromNum(key.Protocol),
-			zone:     inZone + "->" + outZone,
-			state:    sessionStateName(val.State),
-			app:      appid.ResolveSessionName(f.appNames, f.cfg, key.Protocol, ntohs(key.SrcPort), ntohs(key.DstPort), val.AppID),
-			fwdPkts:  val.FwdPackets,
-			revPkts:  val.RevPackets,
-			fwdBytes: val.FwdBytes,
-			revBytes: val.RevBytes,
-			age:      age,
-		})
+		collector.offerV4(topTalkerMetric(f.sortBy, val.FwdBytes, val.RevBytes, val.FwdPackets, val.RevPackets), key, val)
 		return true
 	}); err != nil {
 		return fmt.Errorf("iterate sessions: %w", err)
@@ -821,54 +807,25 @@ func (c *CLI) showTopTalkers(f sessionFilter) error {
 		if f.hasFilter() && !f.matchesV6(key, val) {
 			return true
 		}
-		srcIP := net.IP(key.SrcIP[:])
-		dstIP := net.IP(key.DstIP[:])
-		inZone := zoneNames[val.IngressZone]
-		outZone := zoneNames[val.EgressZone]
-		if inZone == "" {
-			inZone = fmt.Sprintf("%d", val.IngressZone)
-		}
-		if outZone == "" {
-			outZone = fmt.Sprintf("%d", val.EgressZone)
-		}
-		var age uint64
-		if now > val.Created {
-			age = now - val.Created
-		}
-		entries = append(entries, topTalkerEntry{
-			src:      fmt.Sprintf("[%s]:%d", srcIP, ntohs(key.SrcPort)),
-			dst:      fmt.Sprintf("[%s]:%d", dstIP, ntohs(key.DstPort)),
-			proto:    protoNameFromNum(key.Protocol),
-			zone:     inZone + "->" + outZone,
-			state:    sessionStateName(val.State),
-			app:      appid.ResolveSessionName(f.appNames, f.cfg, key.Protocol, ntohs(key.SrcPort), ntohs(key.DstPort), val.AppID),
-			fwdPkts:  val.FwdPackets,
-			revPkts:  val.RevPackets,
-			fwdBytes: val.FwdBytes,
-			revBytes: val.RevBytes,
-			age:      age,
-		})
+		collector.offerV6(topTalkerMetric(f.sortBy, val.FwdBytes, val.RevBytes, val.FwdPackets, val.RevPackets), key, val)
 		return true
 	}); err != nil {
 		return fmt.Errorf("iterate sessions_v6: %w", err)
 	}
 
-	if f.sortBy == "bytes" {
-		sort.Slice(entries, func(i, j int) bool {
-			return (entries[i].fwdBytes + entries[i].revBytes) > (entries[j].fwdBytes + entries[j].revBytes)
-		})
-	} else {
-		sort.Slice(entries, func(i, j int) bool {
-			return (entries[i].fwdPkts + entries[i].revPkts) > (entries[j].fwdPkts + entries[j].revPkts)
-		})
-	}
+	entries := collector.top(f, zoneNames, now)
 
-	limit := 20
+	// The print cap stays explicit and independent of the collection cap.
+	// Deriving it from len(entries) would make the two bounds one bound: a
+	// change that widened collection would silently widen the printed table
+	// too, and the mutation that removes the collection bound would then hang a
+	// test on a full pipe instead of failing it. Two bounds, stated separately.
+	limit := topTalkerLimit
 	if limit > len(entries) {
 		limit = len(entries)
 	}
 
-	fmt.Printf("Top %d sessions by %s (of %d total):\n", limit, f.sortBy, len(entries))
+	fmt.Printf("Top %d sessions by %s (of %d total):\n", limit, f.sortBy, collector.total)
 	fmt.Printf("%-5s %-22s %-22s %-5s %-20s %12s %12s %5s %s\n",
 		"#", "Source", "Destination", "Proto", "Zone", "Bytes(f/r)", "Pkts(f/r)", "Age", "App")
 	for i := 0; i < limit; i++ {

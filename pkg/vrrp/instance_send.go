@@ -41,16 +41,36 @@ func (vi *vrrpInstance) sendAdvert(priority int) {
 	// puts in it (#6779).
 	v4Addrs, v6Addrs := splitVIPsByFamily(vi.cfg.VirtualAddresses)
 
+	// #8597 (muse-004 K20): snapshot the mu-guarded advertise interval ONCE,
+	// under the lock, before either arm reads it.
+	//
+	// This ran on the instance run loop (a 30ms advert timer on RETH) reading
+	// the config field directly while updateConfig writes it under vi.mu on the
+	// manager goroutine — the #5087 day-2 path, reached by any commit that
+	// changes reth-advertise-interval. `go test -race` reports it at
+	// instance_send.go:46 against instance.go:378.
+	//
+	// One snapshot for both arms, not one call per arm: a dual-stack instance
+	// sends a v4 and a v6 advert from the same call, and two reads could
+	// straddle a writer and put DIFFERENT MaxAdverInt values in the two
+	// families' packets. The peer derives its master-down interval from that
+	// field, so the two families would then disagree about the failover
+	// horizon — the flapping mechanism gemini-048 finding 06 describes.
+	//
+	// The value is milliseconds; the /10 below converts to the centiseconds
+	// RFC 5798 puts on the wire.
+	advertMS := vi.advertiseIntervalMS()
+
 	// Send IPv4 advertisement if we have any IPv4 VIPs.
 	if len(v4Addrs) > 0 {
-		maxAdvert := uint16(vi.cfg.AdvertiseInterval / 10) // milliseconds → centiseconds
+		maxAdvert := uint16(advertMS / 10) // milliseconds → centiseconds
 		pkt := &VRRPPacket{
 			VRID:         uint8(vi.cfg.GroupID),
 			Priority:     uint8(priority),
 			MaxAdvertInt: maxAdvert,
 			IPAddresses:  v4Addrs,
 		}
-		if err := vi.sendPacket(pkt, false); err != nil {
+		if err := sendPacketFn(vi, pkt, false); err != nil {
 			slog.Debug("vrrp: failed to send IPv4 advert",
 				"key", vi.key(), "err", err)
 		}
@@ -58,14 +78,14 @@ func (vi *vrrpInstance) sendAdvert(priority int) {
 
 	// Send IPv6 advertisement if we have any IPv6 VIPs.
 	if len(v6Addrs) > 0 {
-		maxAdvert := uint16(vi.cfg.AdvertiseInterval / 10) // ms → centiseconds
+		maxAdvert := uint16(advertMS / 10) // ms → centiseconds
 		pkt := &VRRPPacket{
 			VRID:         uint8(vi.cfg.GroupID),
 			Priority:     uint8(priority),
 			MaxAdvertInt: maxAdvert,
 			IPAddresses:  v6Addrs,
 		}
-		if err := vi.sendPacket(pkt, true); err != nil {
+		if err := sendPacketFn(vi, pkt, true); err != nil {
 			slog.Debug("vrrp: failed to send IPv6 advert",
 				"key", vi.key(), "err", err)
 		}
@@ -73,6 +93,18 @@ func (vi *vrrpInstance) sendAdvert(priority int) {
 }
 
 // sendPacket sends a VRRP advertisement via the per-instance raw socket.
+// sendPacketFn is the seam sendAdvert emits through. Production is
+// (*vrrpInstance).sendPacket; tests replace it to observe what a single
+// sendAdvert call actually put on the wire.
+//
+// #8597: it exists because the one-snapshot property of sendAdvert is otherwise
+// unobservable. A per-arm locked read silences the race detector and still lets
+// the v4 and v6 adverts of ONE call carry different MaxAdverInt values, and the
+// only way to state that as a test is to see both packets.
+var sendPacketFn = func(vi *vrrpInstance, pkt *VRRPPacket, isIPv6 bool) error {
+	return vi.sendPacket(pkt, isIPv6)
+}
+
 func (vi *vrrpInstance) sendPacket(pkt *VRRPPacket, isIPv6 bool) error {
 	if isIPv6 {
 		return vi.sendPacketIPv6(pkt)

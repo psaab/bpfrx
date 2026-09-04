@@ -2,6 +2,8 @@ package vrrp
 
 import (
 	"time"
+
+	"github.com/psaab/xpf/pkg/config"
 )
 
 // vrrpInstance timing: advertisement interval derivation (local vs learned),
@@ -68,11 +70,21 @@ func (vi *vrrpInstance) advertIntervalLocked() time.Duration {
 
 // advertIntervalFromMS converts a configured advertise interval in
 // milliseconds (0 or negative → the 1000 ms default) to a Duration.
+//
+// #8642: the ceiling is as load-bearing as the floor here, and this is the most
+// severe site in that sweep. `vg.AdvertiseInterval` is set by a bare
+// `strconv.Atoi` with no range check (compiler_interfaces.go), the schema
+// ceilings (1..40 for `advertise-interval`, 10..40959 for
+// `reth-advertise-interval`) are downgraded to warnings on the tolerant
+// Store.Load / peer-sync ingress, and the old `ms <= 0` guard was blind to
+// overflow by construction: past MaxDurationMillis the multiply wraps, and with
+// `gcd(1e6, 2^64) = 64` the residue bottoms out at **64ns**.
+//
+// A 64ns advertisement timer on a RETH instance is an advert storm on the
+// 30ms heartbeat HA failover timing is built on — the control-path starvation
+// CLAUDE.md warns about, at ~1.5e7/s.
 func advertIntervalFromMS(ms int) time.Duration {
-	if ms <= 0 {
-		ms = 1000
-	}
-	return time.Duration(ms) * time.Millisecond
+	return config.MillisToDuration(ms, 1000*time.Millisecond)
 }
 
 // effectiveAdvertInterval picks the advertisement interval that drives the
@@ -86,10 +98,11 @@ func effectiveAdvertInterval(localMS int, learned time.Duration) time.Duration {
 	if learned > 0 {
 		return learned
 	}
-	if localMS <= 0 {
-		return 1000 * time.Millisecond
-	}
-	return time.Duration(localMS) * time.Millisecond
+	// #8642: same bound as advertIntervalFromMS — this reads the same
+	// unbounded config int, so guarding only the zero end here would leave the
+	// cold-start path (before any advert has been heard) carrying the overflow
+	// the other path no longer has.
+	return config.MillisToDuration(localMS, 1000*time.Millisecond)
 }
 
 // masterDownInterval returns the master-down timer value.
@@ -121,4 +134,46 @@ func stopAndDrainTimer(t *time.Timer) {
 		default:
 		}
 	}
+}
+
+// garpCount returns the configured gratuitous-ARP burst count under vi.mu.
+//
+// #8597 (muse-004 K20): sendGARP read vi.cfg.GARPCount with no lock while
+// updateConfig writes it under vi.mu on the manager goroutine — the #5087 day-2
+// path. Every other reader of a mu-guarded cfg field in this package snapshots
+// under the lock (instance_preempt.go, track.go, manager.go, advertInterval
+// here); the send paths were the exception.
+func (vi *vrrpInstance) garpCount() int {
+	vi.mu.RLock()
+	defer vi.mu.RUnlock()
+	return vi.cfg.GARPCount
+}
+
+// startupLogFields snapshots the two mu-guarded fields run()'s starting log
+// emits, in ONE RLock.
+//
+// #8597: the log itself is not a forwarding decision, so the consequence of the
+// unlocked read is a possibly-stale line rather than a wrong election — but
+// `go test -race` does not grade races by consequence, and a snapshot that took
+// the lock twice would still be able to straddle a writer and print two fields
+// from different configs.
+func (vi *vrrpInstance) startupLogFields() (priority int, preempt bool) {
+	vi.mu.RLock()
+	defer vi.mu.RUnlock()
+	return vi.cfg.Priority, vi.cfg.Preempt
+}
+
+// advertiseIntervalMS returns the raw configured advertise interval in
+// MILLISECONDS under vi.mu, for the one caller that needs the wire encoding
+// rather than a Duration (sendAdvert's RFC 5798 centisecond field).
+//
+// Deliberately not advertInterval(): that applies advertIntervalFromMS, which
+// substitutes the 1000 ms default for a non-positive value. The wire field must
+// carry what the peer will use to derive ITS master-down interval, and folding
+// the default in here would make a misconfigured instance advertise a cadence
+// it is not actually sending at.
+func (vi *vrrpInstance) advertiseIntervalMS() int {
+	vi.mu.RLock()
+	defer vi.mu.RUnlock()
+	return vi.cfg.AdvertiseInterval
 }
