@@ -267,3 +267,72 @@ fn revoked_keys_are_drained_from_the_bindings_own_scratch_7212() {
         "and handed back with its capacity, not replaced by a fresh Vec"
     );
 }
+
+/// #8114 item 3 — THE MEASUREMENT. The revocation window is OPEN until the
+/// drain and CLOSED for every binding after it, which is what makes its extent
+/// exactly "the descriptors already queued behind the revoking one in this
+/// `poll_binding` call".
+///
+/// The existing cells above assert the second half only — that the drain
+/// evicts. That leaves the window itself unmeasured, and an eviction moved
+/// EARLIER (into the descriptor loop, the mechanism #8114 contemplates) would
+/// pass every one of them. Asserting the slots are STILL LIVE before the drain
+/// is what turns "the eviction works" into "and here is what it costs to wait
+/// for it".
+///
+/// It also refutes the issue's localisation. #8114 says the exposed descriptor
+/// arrives "on a sibling binding of the same worker". `drain_revoked_flow_cache
+/// _keys` evicts across `left` + `current` + `right` in one call, and a sibling
+/// binding's ring is not polled until its own `poll_binding` — which runs after
+/// this drain. So binding B below is clean before a single one of its
+/// descriptors is looked at. The window is on the SAME binding, and its size is
+/// [`REVOCATION_FLOW_CACHE_WINDOW_DESCRIPTORS`].
+///
+/// Fail-on-revert: move the eviction into the descriptor loop and the
+/// "still live before the drain" assertions red — which is the point. They are
+/// the cells a mechanism for item 3 would have to change deliberately.
+#[test]
+fn the_revocation_window_is_open_until_the_drain_and_shut_after_it_8114() {
+    let epochs = epochs();
+    let revoked = key(12345, 5201);
+    let mut current = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    let mut sibling = BindingWorker::new_for_mirror_test(1, 0, 25, 0);
+    seed(&mut current, &revoked);
+    seed(&mut sibling, &revoked);
+
+    // The revoking packet has been adjudicated: the session is gone and the key
+    // is recorded, but nothing has been evicted yet. This is the state every
+    // later descriptor of this batch is processed in.
+    current
+        .scratch
+        .scratch_filter_revoked_keys
+        .push(revoked.clone());
+
+    assert!(
+        hits(&mut current, &revoked, &epochs),
+        "THE WINDOW: the revoked flow's own descriptor is still served off this \
+         binding's cached RewriteDescriptor until the drain runs. Bounded by \
+         REVOCATION_FLOW_CACHE_WINDOW_DESCRIPTORS ({}) — the descriptors already \
+         queued behind the revoking one in this poll_binding call",
+        crate::afxdp::worker::REVOCATION_FLOW_CACHE_WINDOW_DESCRIPTORS
+    );
+    assert!(
+        hits(&mut sibling, &revoked, &epochs),
+        "fixture liveness: the sibling's slot is seeded too, so the assertion \
+         below that it is gone is about the drain and not about an empty cache"
+    );
+
+    drain_revoked_flow_cache_keys(&mut [], &mut current, std::slice::from_mut(&mut sibling));
+
+    assert!(
+        !hits(&mut current, &revoked, &epochs),
+        "the window shuts at the drain, at the END of this binding's poll"
+    );
+    assert!(
+        !hits(&mut sibling, &revoked, &epochs),
+        "and it shuts for the SIBLING in the SAME call — before the worker polls \
+         that binding at all. #8114's 'a later descriptor arriving on a sibling \
+         binding' cannot happen: there is no such descriptor between the \
+         revocation and this eviction"
+    );
+}

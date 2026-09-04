@@ -773,25 +773,48 @@ pub(super) fn poll_binding_process_descriptor(
                                     // `RewriteDescriptor` with no session row.
                                     //
                                     // TWO windows remain, and both are stated
-                                    // rather than claimed closed. The keys are
-                                    // drained in `worker/lifecycle.rs` after
-                                    // this RX BATCH, so a LATER descriptor in
-                                    // the SAME batch, arriving on a sibling
-                                    // binding of this worker that holds a
-                                    // current-generation slot for the tuple, can
-                                    // still hit it — bounded by the remainder of
-                                    // one batch. Sibling WORKERS evict on their
-                                    // next tick via the
-                                    // `replicate_session_delete` -> DeleteSynced
-                                    // -> #6457 path the teardown already queues.
+                                    // rather than claimed closed. #8114 item 3
+                                    // MEASURED them, and corrected the first.
+                                    //
+                                    // (1) SAME BINDING, not a sibling one. The
+                                    // keys are drained in `worker/lifecycle.rs`
+                                    // at the END of this binding's
+                                    // `poll_binding`, so the descriptors that
+                                    // can still be served off the stale slot are
+                                    // the ones already queued behind this one in
+                                    // THIS binding's ring — at most
+                                    // `REVOCATION_FLOW_CACHE_WINDOW_DESCRIPTORS`
+                                    // (255 = 4 batches x 64, minus this
+                                    // descriptor). An earlier revision of this
+                                    // comment said "arriving on a sibling
+                                    // binding of this worker"; that cannot
+                                    // happen — the drain evicts across `left` +
+                                    // `current` + `right` in one call, before
+                                    // the worker's loop polls any sibling, so a
+                                    // sibling's slot is gone before one of its
+                                    // descriptors is looked at. Pinned by
+                                    // `the_revocation_window_is_open_until_the_
+                                    // drain_and_shut_after_it_8114`.
+                                    //
+                                    // (2) Sibling WORKERS evict on their next
+                                    // tick via the `replicate_session_delete` ->
+                                    // DeleteSynced -> #6457 path the teardown
+                                    // queues. That is the larger window, and it
+                                    // is entangled with #8114 item 4: a delete a
+                                    // FULL queue refuses is never delivered at
+                                    // all. #8576 repaired the NAT half of that
+                                    // drop; the cache half is not repairable
+                                    // from this thread.
+                                    //
                                     // Both are the promptness every other
                                     // revocation primitive here has, including
                                     // the operator's own `clear security flow
-                                    // session`; closing the first would mean
-                                    // breaking the RX batch on every revocation,
-                                    // which is a packet-path cost paid by every
-                                    // configuration to bound a window measured
-                                    // in microseconds. #8114.
+                                    // session`. Closing (1) means breaking the
+                                    // RX batch on every revocation — a
+                                    // packet-path cost every configuration pays
+                                    // — to bound 255 descriptors of one revoked
+                                    // flow. #8114 item 3 took the measurement
+                                    // and declined the mechanism.
                                     // #7212: `revoked_key` is the CANONICAL key
                                     // the revalidation resolved — NOT
                                     // `resolved.key`, which is the WIRE tuple
