@@ -254,6 +254,33 @@ a chassis cluster config has any source-NAT rule that references a pool with
 userspace persistent-nat source pool leases are not HA-synchronized
 ```
 
+**#8447: the boundary is now VISIBLE at all three surfaces it needs to be.**
+The admission boundary above is correct and deliberate, and it stopped transit
+*silently*: the interfaces stay up, the config commits cleanly, and the failure
+presents as a connectivity problem rather than a NAT one. The only surface was
+`Forwarding supported: false` inside a `show` nobody runs when the symptom is
+"the link went down" — and one investigation spent five rounds of cluster
+measurement rediscovering a contract the daemon already knew the reason for and
+threw away.
+
+| when | surface |
+|---|---|
+| at commit | a `ValidateConfig` advisory naming the consequence — that forwarding stops, that it will look like a link failure, and where to look |
+| at disarm | the #8503 WARN, naming the reasons and the consequence |
+| continuously | `xpf_dataplane_forwarding_supported` — 0 while a capability gate has disarmed forwarding, which is what an alert keys on |
+
+The commit advisory and the capability gate read **one** predicate
+(`config.UsesPersistentSourceNATPool`, called by
+`pkg/dataplane/userspace/capabilities.go`), so they cannot disagree. The tree's
+older habit here was to mirror such a predicate with a comment saying it
+mirrors; a mirror is a drift surface, and its failure mode is an advisory that
+stops firing for a config that still disarms forwarding — silence that reads
+exactly like safety.
+
+Both are keyed on the **rule**, not the pool table: a `persistent-nat` pool that
+no rule references translates nothing, so it neither disarms forwarding nor
+warns.
+
 That reason is visible in helper status as `Forwarding blocked by: ...` and is
 also propagated through takeover readiness. Operators should treat it as an
 expected capability gate, not allocator exhaustion. Non-HA persistent pools

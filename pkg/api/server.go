@@ -336,6 +336,12 @@ type Config struct {
 	// dataplane is NOT loaded -- "has this helper been crashing?" is most worth
 	// answering exactly then. nil disables the metric.
 	HelperCrashEpisodesFn func() int
+
+	// ForwardingSupportedFn reports whether the userspace dataplane is
+	// forwarding transit, feeding xpf_dataplane_forwarding_supported (#8447).
+	// nil disables the metric -- deliberately, so a daemon that cannot see the
+	// dataplane emits no series rather than a fabricated 1.
+	ForwardingSupportedFn func() bool
 	// SchedulerRepublishStaleSecondsFn returns how long the current
 	// scheduler-republish failure streak has gone unconverged, in
 	// seconds (0 when healthy) (#3780). Backs the
@@ -514,6 +520,7 @@ type Server struct {
 	managementListenersFn                func() sysservices.Listeners
 	schedulerRepublishFailedFn           func() bool
 	helperCrashEpisodesFn                func() int
+	forwardingSupportedFn                func() bool
 	schedulerRepublishStaleSecondsFn     func() float64
 	schedulerRepublishFailClosedFn       func() bool
 	ipmonStatusFn                        func() []ipmon.PolicyStatus
@@ -632,6 +639,7 @@ func NewServer(cfg Config) *Server {
 		managementListenersFn:                cfg.ManagementListenersFn,
 		schedulerRepublishFailedFn:           cfg.SchedulerRepublishFailedFn,
 		helperCrashEpisodesFn:                cfg.HelperCrashEpisodesFn,
+		forwardingSupportedFn:                cfg.ForwardingSupportedFn,
 		schedulerRepublishStaleSecondsFn:     cfg.SchedulerRepublishStaleSecondsFn,
 		schedulerRepublishFailClosedFn:       cfg.SchedulerRepublishFailClosedFn,
 		ipmonStatusFn:                        cfg.IPMonStatusFn,
