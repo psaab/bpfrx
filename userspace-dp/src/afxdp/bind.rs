@@ -917,3 +917,109 @@ mod fill_prime_tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// #7497 acceptance criterion 1: the UMEM memory figures are a CONTRACT.
+// ---------------------------------------------------------------------------
+//
+// `etc/sysctl.d/99-xpf-hugepages.conf` reserves a hugepage pool, and
+// `docs/userspace-dataplane-architecture.md` states a per-binding cost and a
+// RAM sizing formula. Both are arithmetic over THIS function, and until now
+// neither had a test — so a change to `MAX_RESERVED_TX_FRAMES` or to the
+// reserved-TX policy would silently invalidate an operator's provisioning
+// without failing anything.
+//
+// The numbers below were cross-checked against a live measurement, not derived
+// from the doc: on `loss:xpf-userspace-fw1` (mlx5, `--ring-entries 16384`,
+// 3 binding candidates x 6 queues = 18 bindings) `/proc/<pid>/smaps_rollup`
+// reported `Private_Hugetlb: 2949120 kB` = 2880 MiB = 18 x 160 MiB.
+#[cfg(test)]
+mod umem_sizing_contract_tests {
+    use super::{binding_frame_count_for_driver, reserved_tx_frames_for_driver};
+
+    const FRAME: u64 = 4096;
+    const MIB: u64 = 1024 * 1024;
+    const HUGE: u64 = 2 * MIB;
+
+    fn mib_per_binding(driver: Option<&str>, ring: u32) -> u64 {
+        binding_frame_count_for_driver(driver, ring) as u64 * FRAME / MIB
+    }
+
+    /// At the maximum permitted `ring_entries` the reserved-TX CLAMP makes both
+    /// drivers cost the SAME, and that is the non-obvious half.
+    ///
+    /// `reserved_tx_frames_for_driver` prefers `ring_entries` for virtio_net
+    /// and `ring_entries / 2` otherwise, but then clamps to
+    /// `MAX_RESERVED_TX_FRAMES` (8192). At ring = 16384 the virtio preference
+    /// (16384) is clamped down to 8192 — the same value mlx5 arrives at from
+    /// below — so both are `8192 + 2*16384 = 40960` frames.
+    ///
+    /// The architecture doc claimed virtio_net cost `3 x ring_entries` =
+    /// 192 MB per binding at ring = 16384. That ignores the clamp and
+    /// over-states the figure by 20%; it is corrected in the same change that
+    /// added this test.
+    #[test]
+    fn per_binding_umem_at_max_ring_entries_is_160_mib_for_both_drivers_7497() {
+        for driver in [Some("mlx5_core"), Some("virtio_net"), None] {
+            assert_eq!(
+                reserved_tx_frames_for_driver(driver, 16384),
+                8192,
+                "reserved TX at ring=16384 must be the MAX_RESERVED_TX_FRAMES \
+                 clamp for driver {driver:?}; if this moves, the hugepage \
+                 reservation in etc/sysctl.d/99-xpf-hugepages.conf is wrong"
+            );
+            assert_eq!(
+                binding_frame_count_for_driver(driver, 16384),
+                40960,
+                "driver {driver:?} at ring=16384 must cost 40960 frames"
+            );
+            assert_eq!(
+                mib_per_binding(driver, 16384),
+                160,
+                "driver {driver:?} at ring=16384 must cost 160 MiB per binding \
+                 — the figure both the architecture doc and the hugepage \
+                 sysctl are computed from"
+            );
+        }
+    }
+
+    /// Below the clamp the two drivers genuinely DIFFER, so the equality above
+    /// is a property of ring=16384 and not of the function. Without this cell a
+    /// mutation collapsing the virtio branch into the default would leave the
+    /// test above green.
+    #[test]
+    fn reserved_tx_still_differs_by_driver_below_the_clamp_7497() {
+        assert_eq!(reserved_tx_frames_for_driver(Some("virtio_net"), 8192), 8192);
+        assert_eq!(reserved_tx_frames_for_driver(Some("mlx5_core"), 8192), 4096);
+        assert_eq!(mib_per_binding(Some("virtio_net"), 8192), 96);
+        assert_eq!(mib_per_binding(Some("mlx5_core"), 8192), 80);
+    }
+
+    /// The quantity `etc/sysctl.d/99-xpf-hugepages.conf` must be sized in.
+    ///
+    /// The shipped reservation was 600 pages, derived from "one NIC's UMEM"
+    /// (6 bindings). Since #7497 the planner mints `Σ min(rx_i, 16)` across
+    /// ALL binding candidates — the fabric IPVLAN parent included — so the
+    /// pool has to cover the SUM, not one interface's share. The measured
+    /// loss-cluster topology is 3 candidates x 6 queues.
+    #[test]
+    fn hugepages_needed_tracks_total_bindings_not_one_nic_7497() {
+        let per_binding_pages = binding_frame_count_for_driver(Some("mlx5_core"), 16384) as u64
+            * FRAME
+            / HUGE;
+        assert_eq!(per_binding_pages, 80, "160 MiB / 2 MiB");
+
+        let one_nic = 6 * per_binding_pages;
+        assert_eq!(one_nic, 480, "the old 'one NIC' basis for nr_hugepages=600");
+
+        // 3 binding candidates x 6 queues, measured on loss:xpf-userspace-fw1.
+        let measured_cluster = 18 * per_binding_pages;
+        assert_eq!(measured_cluster, 1440);
+        assert!(
+            measured_cluster > 600,
+            "the shipped nr_hugepages=600 does NOT cover the measured 18-binding \
+             topology ({measured_cluster} pages needed); the reservation must be \
+             sized from the total binding count"
+        );
+    }
+}

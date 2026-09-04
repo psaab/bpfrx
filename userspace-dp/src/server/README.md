@@ -232,15 +232,31 @@ dataplane has no path to hand a plaintext frame back *into* an xfrmi for the
 egress direction.
 
 The reason the exclusion is **load-bearing**, and the one that can be
-demonstrated without a NIC, is the queue count. An xfrm interface has exactly
-**one** RX queue (`ip -d link` reports `numrxqueues 1`;
-`/sys/class/net/<if>/queues` holds a single `rx-0`), and
-`replan_bindings_from_candidates` takes the **global minimum** queue count
-across every candidate. One zoned xfrmi therefore re-plans *every physical
+demonstrated without a NIC, is that admitting the tunnel mints an AF_XDP
+binding on a netdev this dataplane can never transmit back into. An xfrm
+interface has exactly **one** RX queue (`ip -d link` reports `numrxqueues 1`;
+`/sys/class/net/<if>/queues` holds a single `rx-0`), so the binding is real,
+consumes a slot against `MAX_BINDING_SLOTS`, and can only drop.
+
+**Until #7497 the harm was global, and every cite of this exclusion led with
+that.** `replan_bindings_from_candidates` took the **global minimum** queue
+count across every candidate, so one zoned xfrmi re-planned *every physical
 interface on the box* onto a single queue and a single worker — the #3091
-single-worker regression by another route.
-`secure_tunnel_would_collapse_the_global_queue_count` is the fail-on-revert
-guard. It is also why the exclusion cannot be split: an ifindex left in the
+single-worker regression by another route. Since #7497 each interface
+contributes its own `min(rx_queues, 16)`, so a spurious xfrmi costs **one
+spurious binding** and no other interface's queue count moves.
+
+That change also retired the guard this section used to name.
+`secure_tunnel_would_collapse_the_global_queue_count` asserted that the LAN
+kept its own queue count; under per-interface planning that is true whether or
+not the exclusion exists, so the test passed with
+`include_userspace_binding_interface` mutated to admit the tunnel — it had
+stopped being a fail-on-revert. The live guards are
+`secure_tunnel_adds_nothing_to_the_binding_plan` and
+`binding_candidate_excludes_secure_tunnel`, both measured to fail under that
+mutation.
+
+It is also why the exclusion cannot be split: an ifindex left in the
 shim's ingress-adjudication map with no READY binding takes
 `drop_degraded_transit` (`userspace-xdp/src/lib.rs`, `BINDING_MISSING`), so
 "adjudicate but do not bind" is the dead-tunnel configuration, not a
