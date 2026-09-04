@@ -87,7 +87,18 @@ func (m *Manager) resolveRedistribute(export string, po *config.PolicyOptionsCon
 				"protocol", self)
 			return ""
 		}
-		return fmt.Sprintf(" redistribute %s\n", export)
+		// #8597 (muse-004 K87): sanitized for PARITY, not because this site is
+		// reachable with a dirty operand.
+		//
+		// This branch is gated by knownRedistProtocol above — an ALLOWLIST,
+		// which is the stronger belt — so a control byte can never arrive here.
+		// Measured: knownRedistProtocol("static\n x") is false. The belt is
+		// here so the file has no unbelted `redistribute %s` interpolation for
+		// a future audit to have to reason about, and so a future change that
+		// widens the allowlist does not silently open the hole.
+		//
+		// The two-operand site below is the one that WAS reachable.
+		return fmt.Sprintf(" redistribute %s\n", sanitizeFRRValue(export))
 	}
 
 	if po != nil && po.PolicyStatements != nil {
@@ -126,7 +137,32 @@ func (m *Manager) resolveRedistribute(export string, po *config.PolicyOptionsCon
 				}
 				var sb strings.Builder
 				for _, proto := range sorted {
-					fmt.Fprintf(&sb, " redistribute %s route-map %s\n", proto, rmName)
+					// #8597 (muse-004 K87): both operands are RAW CONFIG
+					// STRINGS — `proto` comes from term.FromProtocols and
+					// `rmName` from the policy name — and both reached frr.conf
+					// with no belt and no allowlist. Measured before the fix:
+					//
+					//	proto  "static\n line two"
+					//	  -> " redistribute static\n line two route-map exp\n"
+					//	rmName "exp\nrouter bgp 65000"
+					//	  -> " redistribute static route-map exp\nrouter bgp 65000\n"
+					//
+					// Each injects a second frr.conf statement. Every other operand interpolation in this
+					// package goes through sanitizeFRRValue (bfd.go,
+					// config_render.go, prefix_list_render.go); these two were
+					// missed, so an audit using the #4482 inventory to ask "are
+					// all FRR interpolations belted" would answer yes and stop.
+					//
+					// sanitizeFRRValue maps control bytes to a space, which is
+					// the sink's own separator — the weaker belt this package's
+					// README describes under #6796. It is applied here for
+					// PARITY, not because it is the strongest available check:
+					// a protocol allowlist would be stronger, and is a separate
+					// change with its own over-rejection question. What this
+					// closes is a newline or NUL splitting one statement into
+					// two.
+					fmt.Fprintf(&sb, " redistribute %s route-map %s\n",
+						sanitizeFRRValue(proto), sanitizeFRRValue(rmName))
 				}
 				return sb.String()
 			}
