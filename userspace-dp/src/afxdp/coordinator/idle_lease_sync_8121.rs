@@ -13,7 +13,7 @@
 
 use super::super::monotonic_nanos;
 use super::Coordinator;
-use crate::nat::{IdleLeaseImport, IdleLeaseRecord};
+use crate::nat::{DisplayLeaseRecord, IdleLeaseImport, IdleLeaseRecord};
 use std::collections::HashSet;
 use std::net::IpAddr;
 
@@ -22,6 +22,15 @@ use std::net::IpAddr;
 pub(crate) struct PoolIdleLease {
     pub(crate) pool_name: String,
     pub(crate) lease: IdleLeaseRecord,
+}
+
+/// #8615: a display lease tagged with the pool it belongs to. Separate from
+/// `PoolIdleLease` for the same reason its inner record is separate from
+/// `IdleLeaseRecord` — the import path must remain unable to receive a count.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PoolDisplayLease {
+    pub(crate) pool_name: String,
+    pub(crate) lease: DisplayLeaseRecord,
 }
 
 /// What one import batch did. Counted rather than logged per record: a batch
@@ -81,6 +90,36 @@ impl Coordinator {
             }
         }
         out
+    }
+
+    /// #8615: every persistent lease this node would honour, tagged with its
+    /// pool, for the SHOW table.
+    ///
+    /// Deduplicated by pool name for the same reason the idle export is:
+    /// several rules can share one allocator (`SourceNatPoolAllocatorKey` is
+    /// built from the pool, not the rule), so iterating RULES would emit the
+    /// same lease once per rule pointing at that pool.
+    pub(crate) fn export_display_persistent_leases(&self, now_ns: u64) -> Vec<PoolDisplayLease> {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut out = Vec::new();
+        for rule in &self.forwarding.source_nat_rules {
+            if !rule.pool_mode || !seen.insert(rule.pool_name.as_str()) {
+                continue;
+            }
+            for lease in rule.pool_allocator.export_display_leases(now_ns) {
+                out.push(PoolDisplayLease {
+                    pool_name: rule.pool_name.clone(),
+                    lease,
+                });
+            }
+        }
+        out
+    }
+
+    /// Export using THIS node's clock — see `export_idle_persistent_leases_now`
+    /// for why the clock is taken here rather than accepted from a caller.
+    pub(crate) fn export_display_persistent_leases_now(&self) -> Vec<PoolDisplayLease> {
+        self.export_display_persistent_leases(monotonic_nanos())
     }
 
     /// Install a batch of peer idle leases.

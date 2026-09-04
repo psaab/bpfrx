@@ -561,6 +561,23 @@ pub(crate) enum FilterRevalidationTarget {
     NoLocalEntry,
 }
 
+/// #8356: the zone-policy sibling of [`FilterRevalidationTarget`]. Same three
+/// answers, same resolution rules; it differs only in comparing a
+/// generation-only stamp (see `SessionEntry::policy_revalidated_gen` for why
+/// the ingress ifindex is not part of this key).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PolicyRevalidationTarget {
+    /// The entry exists and its zone-policy verdict was already derived under
+    /// the live generation.
+    Fresh,
+    /// The entry exists and its verdict is stale. Carries the CANONICAL key so
+    /// a teardown acts on the session that was actually judged.
+    Stale(SessionKey),
+    /// No entry this tuple may safely name — the #2120 transient synced-hit
+    /// path, or a reused slab slot. Nothing to stamp, nothing to tear down.
+    NoLocalEntry,
+}
+
 #[derive(Clone, Debug)]
 struct SessionEntry {
     decision: SessionDecision,
@@ -729,6 +746,35 @@ struct SessionEntry {
     /// `SessionEntry` carries no serde, so this is on no wire and is not part of
     /// session identity.
     filter_revalidated: FilterRevalidationStamp,
+    /// #8356: the `config_generation` this entry's ZONE-POLICY verdict was last
+    /// derived under. `0` is UNVALIDATED and can never collide with a live
+    /// generation, for the same reason `FilterRevalidationStamp::UNVALIDATED`
+    /// cannot: the Go control plane's snapshot generation is a monotone counter
+    /// starting at 1, and `classify_metadata` additionally requires
+    /// `snapshot_installed`.
+    ///
+    /// GENERATION-ONLY, deliberately unlike `filter_revalidated`, which is keyed
+    /// `(generation, logical ingress ifindex)`. An input filter is a
+    /// per-INTERFACE object, so the same session reached on a different ingress
+    /// has a different filter to re-derive. A zone-policy verdict is keyed on
+    /// the (from_zone, to_zone) PAIR, and BOTH come from this entry —
+    /// `metadata.ingress_zone` and `decision.resolution.egress_ifindex` — never
+    /// from the interface a given packet happened to arrive on. Adding the
+    /// ifindex to this key would only make the stamp go spuriously stale and
+    /// re-walk policy terms that cannot produce a different verdict.
+    ///
+    /// Read only for the FORWARD direction. The reverse companion carries
+    /// SWAPPED zones (`afxdp/shared_ops.rs`, `afxdp/poll_descriptor/mod.rs`
+    /// both build it with `ingress_zone`/`egress_zone` exchanged), and this is a
+    /// STATEFUL firewall: the reply is permitted because the session exists, not
+    /// because a policy admits (to_zone -> from_zone). Re-deriving on the
+    /// reverse entry would deny the reply of every ordinary one-way-permitted
+    /// flow. See `poll_descriptor/policy_revalidation.rs`.
+    ///
+    /// Node-local derived state, like `filter_revalidated` beside it:
+    /// `SessionEntry` carries no serde, so this is on no wire and is not part of
+    /// session identity.
+    policy_revalidated_gen: u64,
     /// #2120: the RG epoch (`rg_epochs[owner_rg_id]`, or the node-level
     /// `rg_epochs[0]` for `owner_rg_id <= 0`) recorded the last time this
     /// entry was self-healed (the expire pass observed this node START
@@ -968,6 +1014,15 @@ pub(crate) struct SessionTable {
     /// also `FilterRevalidationStamp::UNVALIDATED`'s generation and is never
     /// live.
     filter_revalidation_gen: u64,
+    /// #8356: the live `config_generation` a zone-policy verdict is judged
+    /// against, published once per poll pass from the SAME `ValidationState`
+    /// the pass classifies packets with — so the stamp an entry carries and the
+    /// generation it is later compared to can never come from different
+    /// publishes. Separate from `filter_revalidation_gen` in ROLE but published
+    /// from the same source; they are two independent verdicts and must not
+    /// share a stamp, or one verdict's re-stamp suppresses the other's
+    /// re-derivation.
+    policy_revalidation_gen: u64,
     epoch_counter: u64,
     expired: u64,
     create_drops: u64,
@@ -1212,6 +1267,7 @@ impl SessionTable {
             opening_overrides: FxHashMap::default(),
             // #7212: no poll pass has published a generation yet.
             filter_revalidation_gen: 0,
+            policy_revalidation_gen: 0,
             epoch_counter: 0,
             expired: 0,
             create_drops: 0,
@@ -1383,34 +1439,8 @@ impl SessionTable {
         key: &SessionKey,
         logical_ingress_ifindex: i32,
     ) -> FilterRevalidationTarget {
-        let record = match self.key_to_handle.get(key).copied() {
-            Some(handle) => {
-                let Some(record) = self.entries.get(handle as usize) else {
-                    return FilterRevalidationTarget::NoLocalEntry;
-                };
-                if record.key != *key {
-                    // Stale primary handle: same guard `lookup_with_origin`
-                    // applies. Falling through to the alias index here could
-                    // resolve a different live session under this tuple.
-                    //
-                    // #8114 item 2: this is `NoLocalEntry`, not `Fresh`. The
-                    // caller can still DERIVE the flow's verdict — that needs
-                    // the flow and the interface, not the entry — it simply has
-                    // no entry it may safely stamp or tear down. Reporting it as
-                    // `Fresh` would have been the fail-open this issue is about.
-                    return FilterRevalidationTarget::NoLocalEntry;
-                }
-                record
-            }
-            None => {
-                let Some(handle) = self.resolve_reverse_translated_handle(key) else {
-                    return FilterRevalidationTarget::NoLocalEntry;
-                };
-                let Some(record) = self.entries.get(handle as usize) else {
-                    return FilterRevalidationTarget::NoLocalEntry;
-                };
-                record
-            }
+        let Some(record) = self.revalidation_record(key) else {
+            return FilterRevalidationTarget::NoLocalEntry;
         };
         let live = FilterRevalidationStamp::live(
             self.filter_revalidation_gen,
@@ -1420,6 +1450,39 @@ impl SessionTable {
             FilterRevalidationTarget::Fresh
         } else {
             FilterRevalidationTarget::Stale(record.key.clone())
+        }
+    }
+
+    /// #7212/#8356: resolve the entry record a WIRE tuple names, for the
+    /// revalidation probes. Extracted so the FILTER and POLICY stamps cannot
+    /// drift on WHICH entry a tuple resolves to — that resolution took two bugs
+    /// to get right (#7212's alias path, #8114 item 2's stale-handle guard) and
+    /// a second copy of it is a second place for them to come back.
+    ///
+    /// Mirrors `lookup_with_origin` exactly: the primary key WITH its
+    /// stale-handle guard (a `key_to_handle` hit whose stored key does NOT match
+    /// is a freed-and-reused slab slot and must NOT fall through to the alias
+    /// index, where a live alias entry for the same tuple would resolve a
+    /// DIFFERENT session that the caller would then revoke), then the
+    /// reverse-translated index.
+    fn revalidation_record(&self, key: &SessionKey) -> Option<&SessionRecord> {
+        match self.key_to_handle.get(key).copied() {
+            Some(handle) => {
+                let record = self.entries.get(handle as usize)?;
+                if record.key != *key {
+                    // #8114 item 2: a reused slab slot is `None`, not a hit. The
+                    // caller can still DERIVE a verdict — that needs the flow and
+                    // the interface, not the entry — it simply has no entry it
+                    // may safely stamp or tear down. Reporting it as resolved
+                    // would be the fail-open this guard exists for.
+                    return None;
+                }
+                Some(record)
+            }
+            None => {
+                let handle = self.resolve_reverse_translated_handle(key)?;
+                self.entries.get(handle as usize)
+            }
         }
     }
 
@@ -1475,6 +1538,52 @@ impl SessionTable {
             self.filter_revalidation_target(key, logical_ingress_ifindex),
             FilterRevalidationTarget::Stale(_)
         )
+    }
+
+    /// #8356: publish the live generation zone-policy verdicts are judged
+    /// against. Called from the same place, and with the same value, as
+    /// `set_filter_revalidation_gen`.
+    pub(crate) fn set_policy_revalidation_gen(&mut self, generation: u64) {
+        self.policy_revalidation_gen = generation;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn policy_revalidation_gen(&self) -> u64 {
+        self.policy_revalidation_gen
+    }
+
+    /// #8356: resolve the entry this WIRE tuple names and report whether its
+    /// zone-policy verdict is stale, in ONE probe.
+    ///
+    /// Resolution is delegated to `filter_revalidation_target`'s own resolver so
+    /// the two features cannot drift on WHICH entry a tuple names — including
+    /// the stale-handle guard and the NAT reverse-translated alias path, both of
+    /// which took a bug to get right (#7212, #8114 item 2). Only the staleness
+    /// COMPARISON differs, and it is made here against the generation-only
+    /// stamp.
+    pub(crate) fn policy_revalidation_target(&self, key: &SessionKey) -> PolicyRevalidationTarget {
+        let Some(record) = self.revalidation_record(key) else {
+            return PolicyRevalidationTarget::NoLocalEntry;
+        };
+        if record.entry.policy_revalidated_gen == self.policy_revalidation_gen {
+            PolicyRevalidationTarget::Fresh
+        } else {
+            PolicyRevalidationTarget::Stale(record.key.clone())
+        }
+    }
+
+    /// #8356: record that this entry's zone-policy verdict has been re-derived
+    /// under the live generation. Takes the CANONICAL key, so it is a
+    /// primary-index write; idempotent, and a miss is a no-op (the session was
+    /// torn down between the probe and here).
+    pub(crate) fn mark_policy_revalidated(&mut self, key: &SessionKey) {
+        let live_gen = self.policy_revalidation_gen;
+        if let Some(handle) = self.key_to_handle.get(key).copied()
+            && let Some(record) = self.entries.get_mut(handle as usize)
+            && record.key == *key
+        {
+            record.entry.policy_revalidated_gen = live_gen;
+        }
     }
 
 
@@ -3103,3 +3212,6 @@ mod tcp_close_state_7342_tests;
 #[cfg(test)]
 #[path = "filter_revalidation_7212_tests.rs"]
 mod filter_revalidation_7212_tests;
+#[cfg(test)]
+#[path = "policy_revalidation_8356_tests.rs"]
+mod policy_revalidation_8356_tests;

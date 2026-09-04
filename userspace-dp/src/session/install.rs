@@ -174,6 +174,17 @@ impl SessionTable {
                 // `UNVALIDATED`, so the first packet of each direction derives
                 // its own verdict against the interface it actually arrived on.
                 filter_revalidated: FilterRevalidationStamp::UNVALIDATED,
+                // #8356: UNVALIDATED at install, matching `filter_revalidated`
+                // beside it. The session exists because the session-MISS path
+                // just evaluated zone policy, so a live stamp would be TRUE —
+                // but it would also have to be true for every caller of this
+                // constructor, and the transient-local-seed origins do not all
+                // carry a fresh policy verdict. `0` is the fail-closed default
+                // and costs nothing measurable: a generation bump invalidates
+                // every flow-cache entry, and in steady state the packet that
+                // would pay for the re-derivation is served by the flow cache
+                // this install populates, not by the session-hit path.
+                policy_revalidated_gen: 0,
                 expires_after_ns: session_timeout_ns(
                     protocol,
                     tcp_flags,
@@ -423,6 +434,12 @@ impl SessionTable {
                 // flow the primary revoked, because the promoted copy
                 // revalidates before it forwards.
                 filter_revalidated: FilterRevalidationStamp::UNVALIDATED,
+                // #8356: the peer adjudicated this flow against the PEER's
+                // zone policy. `0` makes the first packet this node forwards
+                // re-derive against THIS node's policy — the same failover fence
+                // `filter_revalidated` gets, for the verdict #7323 accepted as a
+                // residual and this issue closes.
+                policy_revalidated_gen: 0,
                 expires_after_ns: session_timeout_ns(
                     protocol,
                     tcp_flags,

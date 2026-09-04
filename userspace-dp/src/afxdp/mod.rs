@@ -532,7 +532,7 @@ mod coordinator;
 #[cfg(test)]
 pub(crate) use coordinator::neigh_monitor_test_serial;
 // #8121 part 2: idle persistent-NAT lease sync records.
-pub(crate) use coordinator::PoolIdleLease;
+pub(crate) use coordinator::{PoolDisplayLease, PoolIdleLease};
 // afxdp/tests.rs (14k-LOC catch-all) was split into cohesive per-subsystem
 // sibling test modules plus a shared support module in #4840. Pure test
 // code-motion; each file carries the union use-block and reaches production
@@ -563,6 +563,9 @@ mod tests_embedded_poll_filter;
 #[cfg(test)]
 #[path = "tests_filter_revocation_7212.rs"]
 mod tests_filter_revocation_7212;
+#[cfg(test)]
+#[path = "tests_policy_revocation_8356.rs"]
+mod tests_policy_revocation_8356;
 // #7160 (#2387): the routing-domain stamp on the REAL poll path — the WIRING,
 // which no unit-level cell can reach.
 #[cfg(test)]

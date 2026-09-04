@@ -445,3 +445,119 @@ fn the_lease_census_actually_finds_its_population_8121() {
         files.len()
     );
 }
+
+// --- #8615: the DISPLAY export ------------------------------------------
+//
+// Read these against `a_lease_with_live_flows_is_not_exported_8121` above. That
+// cell asserts the SYNC export omits a live-flow lease and is still correct —
+// #8615 does not relax it. These assert the DISPLAY export includes exactly the
+// population that one excludes, on the same fixture, so the two answers are
+// visibly different reads of one allocator rather than two notions of liveness
+// that could drift.
+
+/// The defect #8615 is about: a binding with LIVE flows is invisible to the
+/// SHOW table because the only export available was the sync one.
+#[test]
+fn the_display_export_carries_a_lease_the_sync_export_omits_8615() {
+    let addrs = pool();
+    let active = PortAllocator::new(1, 1024, 65535);
+    let busy = flow("10.0.61.50", 40000);
+    let idle = flow("10.0.61.51", 40001);
+    let held = mint_persistent(&active, &addrs, busy, 1_000);
+    let released = mint_persistent(&active, &addrs, idle, 1_000);
+    assert!(active.release_flow(idle, released, 2_000, NatHolder::Untracked));
+
+    // CONTROL, and it is the whole comparison: the sync export sees one lease.
+    assert_eq!(
+        active.export_idle_leases(3_000).len(),
+        1,
+        "control: the sync export must still omit the busy lease — #8615 does \
+         not relax design rule 1, it adds a second read"
+    );
+
+    let shown = active.export_display_leases(3_000);
+    assert_eq!(
+        shown.len(),
+        2,
+        "the DISPLAY export must carry BOTH the idle lease and the one with \
+         live flows. Seeing only the idle one is the #8615 defect: an operator \
+         running `show security nat source persistent-nat-table` during traffic \
+         is told there are no bindings"
+    );
+    let busy_row = shown
+        .iter()
+        .find(|r| r.translated_port == held.port && r.translated_ip == held.ip)
+        .expect("the busy lease must appear in the display export");
+    assert_eq!(
+        busy_row.active_flows, 1,
+        "the display record must carry the live-flow COUNT — that field is the \
+         entire reason this record type exists separately from the sync one"
+    );
+}
+
+/// The display filter is the ALLOCATOR's own reuse predicate
+/// (`active_flows > 0 || expires_at_ns > now_ns`), so the table answers exactly
+/// "which bindings will this node reuse".
+///
+/// The load-bearing half is the FIRST clause. A lease with live flows whose
+/// deadline has passed is still honoured — `expires_at_ns` is written at the
+/// last reuse and is NOT refreshed per packet — so filtering on the deadline
+/// alone would hide precisely the long-lived sessions an operator is most
+/// likely to be looking at.
+#[test]
+fn the_display_export_keeps_a_busy_lease_past_its_stale_deadline_8615() {
+    let addrs = pool();
+    let active = PortAllocator::new(1, 1024, 65535);
+    let busy = flow("10.0.61.50", 40000);
+    let held = mint_persistent(&active, &addrs, busy, 1_000);
+
+    // Far beyond the 300s persistence timeout stamped at mint. The flow never
+    // closed, so nothing refreshed the deadline.
+    let long_after = 1_000 + 600 * 1_000_000_000u64;
+
+    // CONTROL: the deadline really is stale, so the assertion below is not
+    // true for free.
+    assert!(
+        active.export_idle_leases(long_after).is_empty(),
+        "control: by this clock the lease is past its deadline, so a \
+         deadline-only filter drops it"
+    );
+
+    let shown = active.export_display_leases(long_after);
+    assert_eq!(
+        shown.len(),
+        1,
+        "a lease with live flows must stay in the display export past its \
+         stale deadline, because the allocator still honours it \
+         (`reuse_existing_lease_locked`: active_flows > 0 || expires > now). \
+         Dropping it here would hide the longest-lived sessions — the ones an \
+         operator is most likely to be asking about"
+    );
+    assert_eq!(shown[0].translated_port, held.port);
+    assert_eq!(
+        shown[0].remaining_ns, 0,
+        "and its RAW remaining is 0, which is why the presentation layer must \
+         not render it as a countdown — see persistentNatBindingsFromDisplayLeases"
+    );
+}
+
+/// A lease that is genuinely finished — no flows AND past its deadline — is not
+/// shown. Without this the display filter could be "everything", which would
+/// pass both cells above while reporting bindings this node will not honour.
+#[test]
+fn the_display_export_drops_a_lease_that_is_idle_and_expired_8615() {
+    let addrs = pool();
+    let active = PortAllocator::new(1, 1024, 65535);
+    let done = flow("10.0.61.50", 40000);
+    let minted = mint_persistent(&active, &addrs, done, 1_000);
+    assert!(active.release_flow(done, minted, 2_000, NatHolder::Untracked));
+
+    let long_after = 2_000 + 600 * 1_000_000_000u64;
+    assert!(
+        active.export_display_leases(long_after).is_empty(),
+        "an idle, expired lease must NOT be displayed — the allocator will not \
+         reuse it, so showing it would report a binding that does not exist. A \
+         display export with no filter at all passes the two cells above and \
+         fails here"
+    );
+}
