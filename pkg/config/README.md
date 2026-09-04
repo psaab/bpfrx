@@ -56,6 +56,46 @@ they return on the FIRST bad token. Do NOT remove the cap. Regression coverage:
 + ordering + depth×token interaction + `FuzzParseErrorBound_5827`),
 `pkg/configstore/parse_error_cap_5827_test.go` (load-path concise-error /
 no-partial-apply).
+
+**The AST itself is a fifth guard (#8597).** #5827's own words are the hole:
+*"only the parser's RETENTION is capped"*. The TREE was not, and a
+VALID-syntax payload produces zero diagnostics, so it passes the #5827 cap by
+construction. Measured (`runtime.MemStats.HeapAlloc` after GC, tree alive):
+
+```
+stmts=10000    live heap  1,824,960   -> 182 B/statement
+stmts=100000   live heap 18,589,296   -> 185 B/statement
+stmts=500000   live heap 92,647,960   -> 185 B/statement
+```
+
+Linear, roughly 60x the input bytes for a minimal `a;` statement — so the
+16 MiB `MaxConfigSize` ceiling admits ~5.6M statements and about a GIGABYTE of
+live AST, built before any gate runs. `configstore.CheckText` validates a
+day-0 config-drive blob on first boot with no operator involved; the same
+parser sits behind load/commit and HA config-sync.
+
+Neither earlier guard covers it: `maxParseDepth` bounds STACK and a flat
+`a;a;a;…` payload never nests, and the group-expansion budget runs after the
+tree already exists.
+
+`maxParseNodes` (200,000) bounds nodes BUILT, parser-wide rather than
+per-block, and `noteNodeBudget` records one deterministic diagnostic. That
+diagnostic is appended DIRECTLY, bypassing `maxParseErrors`, for the same
+reason the suppressed-count summary is: a hostile payload can exhaust both
+caps, and the one error explaining why the tree is truncated must never be the
+one that gets dropped — a truncated tree with no error is silently accepted as
+the whole configuration.
+
+**The number is chosen against real configurations, not against the input
+ceiling.** The largest configuration in this repository
+(`test/incus/xpf-test.conf`) is 250 statements and the largest shipped one
+(`docs/ha-cluster-userspace.conf`) is 120; the cap is ~800x the former and
+bounds the live AST to about 37 MB. Deriving it from `MaxConfigSize` would
+defeat the purpose — 16 MiB of minimal statements IS 5.6M nodes. Regression
+coverage: `pkg/config/parse_node_budget_8597_test.go` (bounded-heap ratio with
+a positive control, the diagnostic-cap interaction, a
+10x-real-configuration over-reach control, and the parser-wide-vs-per-block
+distinction).
 - `ParseSetCommand(input string) ([]string, error)` — `parser.go`.
   Parses one flat-set line into the path components. The caller then
   applies that path with `tree.SetPath()` to build the AST.

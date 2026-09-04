@@ -41,11 +41,51 @@ const maxParseDepth = 256
 // (skipToBlockClose) that already records one error for a pathological payload.
 const maxParseErrors = 64
 
+// maxParseNodes bounds the number of AST nodes a single parse BUILDS (#8597,
+// muse-004 K14).
+//
+// #5827 capped the retained DIAGNOSTICS and said so precisely — "only the
+// parser's RETENTION is capped". The tree itself was not capped, and a
+// valid-syntax payload produces zero diagnostics, so it sails past that cap by
+// construction.
+//
+// Measured (runtime.MemStats.HeapAlloc after GC, tree kept alive):
+//
+//	stmts=10000   live heap 1,824,960   -> 182 B/statement
+//	stmts=100000  live heap 18,589,296  -> 185 B/statement
+//	stmts=500000  live heap 92,647,960  -> 185 B/statement
+//
+// Linear, at roughly 60x the input bytes for the minimal `a;\n` statement. The
+// 16 MiB MaxConfigSize ceiling therefore admits ~5.6M statements and about a
+// GIGABYTE of live AST — built before any gate runs, on entry points that take
+// untrusted input: configstore.CheckText validates a day-0 config-drive blob on
+// first boot with no operator involved, and the same parser sits behind
+// load/commit and HA config-sync.
+//
+// Neither existing cap covers it. maxParseDepth bounds STACK, and a flat
+// `a;a;a;...` payload never nests. The group-expansion budget bounds EXPANSION
+// and runs after the tree already exists.
+//
+// 200,000 is chosen against real configurations, not against the input ceiling.
+// The largest configuration in this repository — test/incus/xpf-test.conf — is
+// 250 statements, and the largest shipped one (docs/ha-cluster-userspace.conf)
+// is 120. The cap is ~800x the former, bounds the live AST to about 37 MB at
+// the measured 185 B/node, and sits in the same order as the existing
+// 100,000-unit group-expansion budget. Deriving it from MaxConfigSize would
+// defeat the purpose: 16 MiB of minimal statements IS 5.6M nodes.
+const maxParseNodes = 200_000
+
 // Parser implements a recursive descent parser for Junos configuration syntax.
 type Parser struct {
 	lexer  *Lexer
 	errors []ParseError
 	depth  int // current block-nesting depth (bounded by maxParseDepth)
+	// nodes counts AST nodes built by this parse, bounded by maxParseNodes
+	// (#8597). nodeBudgetExceeded latches once the cap is hit so every nesting
+	// level unwinds immediately and Parse's stray-token loop stops rather than
+	// re-entering parseStatements once per remaining token.
+	nodes              int
+	nodeBudgetExceeded bool
 	// suppressed counts ParseError diagnostics dropped once errors reached
 	// maxParseErrors (#5827). Parse folds it into a single trailing summary.
 	suppressed int
@@ -80,6 +120,12 @@ func (p *Parser) Parse() (*ConfigTree, []ParseError) {
 	for {
 		tok := p.lexer.Peek()
 		if tok.Type == TokenEOF {
+			break
+		}
+		if p.nodeBudgetExceeded {
+			// #8597: the budget error is already recorded; consuming the rest
+			// of a hostile payload one stray token at a time would be O(input)
+			// work for a parse that is already going to be rejected.
 			break
 		}
 		p.addErrorf(tok.Line, tok.Column, "unexpected %s at top level (unmatched '}'?)", tok)
@@ -279,6 +325,10 @@ func (p *Parser) parseStatements() []*Node {
 
 	var nodes []*Node
 	for {
+		if p.nodeBudgetExceeded {
+			// Latched: unwind every nesting level without parsing further.
+			break
+		}
 		tok := p.lexer.Peek()
 		if tok.Type == TokenEOF || tok.Type == TokenRBrace {
 			break
@@ -288,8 +338,13 @@ func (p *Parser) parseStatements() []*Node {
 			p.lexer.Next() // consume error token
 			continue
 		}
+		if p.nodes >= maxParseNodes {
+			p.noteNodeBudget(tok.Line, tok.Column)
+			break
+		}
 		node := p.parseStatement()
 		if node != nil {
+			p.nodes++
 			nodes = append(nodes, node)
 		}
 	}
@@ -593,5 +648,31 @@ func (p *Parser) addErrorf(line, col int, format string, args ...any) {
 		Line:    line,
 		Column:  col,
 		Message: fmt.Sprintf(format, args...),
+	})
+}
+
+// noteNodeBudget records the single deterministic diagnostic for a parse that
+// hit maxParseNodes, and latches so no further statements are parsed (#8597).
+//
+// Appended DIRECTLY, bypassing the maxParseErrors cap, for the same reason the
+// #5827 suppressed-count summary is: a payload that exhausts the node budget
+// may also have exhausted the diagnostic budget, and the ONE error that
+// explains why the tree is truncated must never be the one that gets dropped.
+// A truncated tree with no error would be silently accepted as the whole
+// configuration.
+func (p *Parser) noteNodeBudget(line, col int) {
+	if p.nodeBudgetExceeded {
+		return
+	}
+	p.nodeBudgetExceeded = true
+	p.errors = append(p.errors, ParseError{
+		Line:   line,
+		Column: col,
+		Message: fmt.Sprintf(
+			"configuration exceeds the %d-statement parse budget; parsing stopped "+
+				"(the largest configuration this product ships is under 300 statements — "+
+				"a payload this large is corrupt or hostile, and building its tree would "+
+				"cost roughly %d MB of live heap)",
+			maxParseNodes, (maxParseNodes*185)/(1<<20)),
 	})
 }
