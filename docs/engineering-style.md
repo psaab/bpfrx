@@ -694,15 +694,36 @@ Three instances in one day, from three lanes, across two guards:
 | `TestOperatorPackagesOnlyUseDocumentedLegacyDataplaneImports` | `pkg/dataplane` | a new file in `pkg/cli` |
 | `TestRetirementBoundaryDocsMentionLegacyImportAllowlist` | `pkg/dataplane` | an allowlist entry with no docs row |
 
-**So the merge gate has a step that is deliberately NOT scoped to your diff:**
+**So the merge gate has a step that is deliberately NOT scoped to your diff.**
+
+The honest form of that step is **`go test ./...`**, and the reason is a measured
+one: content-scanning guards live in **18 packages**, not two —
 
 ```
-gofmt -l .                                    # whole tree, not just touched files
-go test ./pkg/dataplane/                      # where the boundary canaries live
+pkg/api          pkg/cli          pkg/cmdtree      pkg/config
+pkg/configstore  pkg/daemon       pkg/dataplane    pkg/dataplane/userspace
+pkg/durationaudit pkg/eventengine pkg/fsatomic    pkg/grpcapi
+pkg/linuxsock    pkg/memlockcensus pkg/nftables   pkg/osident
+pkg/refactoraudit pkg/upgrade
 ```
 
-Run both regardless of what you changed. They are seconds, and the alternative is
-a red master that blocks every concurrent lane.
+found by looking for tests that walk the tree or the schema rather than a fixture
+(`filepath.Walk`, `packages.Load`, `parser.ParseDir`, `setSchema`). That list will
+be out of date the next time someone adds a census, which is exactly why **the
+rule is a category and not a command list**: any enumeration you run against is a
+snapshot, and the guard that bites you is the one added after it.
+
+At minimum, always:
+
+```
+gofmt -l .            # whole tree, not just touched files
+go test ./...         # ~6-8 min; the only reliable cover for the category
+```
+
+`go test ./pkg/dataplane/` alone is **not** sufficient — it was the first place we
+found boundary canaries, not the only place they live. A narrower run is a bet
+that your diff did not perturb any of the other seventeen packages' censuses, and
+that bet is unverifiable from inside your diff.
 
 **Corollary — when you satisfy a guard by adding to its allowlist, find the guard
 that guards the allowlist.** A registry that exists to record exceptions is
