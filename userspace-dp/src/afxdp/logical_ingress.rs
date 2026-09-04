@@ -147,7 +147,13 @@ pub(in crate::afxdp) fn build_logical_ingress_packet(
         .get(&params.logical_ifindex)
         .copied()
         .unwrap_or_default();
-    let pkt_len = u16::try_from(params.inner_packet.len()).ok()?;
+    // #8581: the length of the buffer this meta describes — the synthetic
+    // 14-byte Ethernet header PLUS the inner packet — matching every other
+    // construction site, so `pkt_len - l3_offset` is the L3 length everywhere.
+    // This carried the INNER length alone, so the same L3 packet counted 14
+    // bytes fewer in every filter, policy, policer, session and zone byte
+    // counter when it arrived decapsulated than when it arrived native.
+    let pkt_len = u16::try_from(14 + params.inner_packet.len()).ok()?;
     let inner_meta = UserspaceDpMeta {
         magic: USERSPACE_META_MAGIC,
         version: USERSPACE_META_VERSION,
@@ -177,4 +183,125 @@ pub(in crate::afxdp) fn build_logical_ingress_packet(
     };
 
     Some((synthetic, inner_meta))
+}
+
+#[cfg(test)]
+mod pkt_len_invariant_8581_tests {
+    use super::*;
+    use crate::afxdp::types::ForwardingState;
+    use std::sync::atomic::AtomicU64;
+
+    static ECN_DROPS: AtomicU64 = AtomicU64::new(0);
+
+    /// #8581: `pkt_len` is THE LENGTH OF THE BUFFER THE META DESCRIBES, at every
+    /// construction site, so `pkt_len - l3_offset` is uniformly the L3 length.
+    ///
+    /// This site carried the INNER packet length while writing `l3_offset: 14`
+    /// over a buffer that is `14 + inner` long — the only one of the five that
+    /// did. The other four (`userspace-xdp/src/lib.rs`,
+    /// `coordinator/inject.rs` twice, `tunnel.rs::local_origin_packet_meta`)
+    /// all report their whole buffer, two of them with `l3_offset` 0 because
+    /// their buffer IS a bare IP packet.
+    ///
+    /// WHY IT MATTERED, and why nothing was red. No consumer indexes with
+    /// `pkt_len` except `trim_l3_payload`, whose metadata FALLBACK tries it as
+    /// an L3 length and then as a frame length — two arms that self-select on
+    /// the `l3_offset` a site carries, so both spellings produced the same
+    /// slice. What differed was ACCOUNTING: `pkt_len` is the byte count fed to
+    /// every filter, policy, policer, session and zone counter, so the same L3
+    /// packet counted 14 bytes fewer arriving decapsulated than arriving
+    /// native. An operator comparing those totals cannot see the difference and
+    /// would not suspect it.
+    ///
+    /// The alternative fix — leave this site and make the accounting consumers
+    /// use `pkt_len - l3_offset` everywhere — is equally consistent but changes
+    /// every NATIVE byte counter by -14, which is a larger behaviour change
+    /// owing its own validation. This is the one 4 of 5 sites already hold.
+    fn params<'a>(inner: &'a [u8]) -> LogicalIngressParams<'a> {
+        LogicalIngressParams {
+            inner_packet: inner,
+            inner_family: libc::AF_INET as u8,
+            inner_eth_proto: 0x0800,
+            protocol: 6,
+            rel_l4_offset: 20,
+            payload_offset: 40,
+            logical_ifindex: 42,
+            outer_ecn: None,
+            ecn_illegal_drops: &ECN_DROPS,
+            meta_flags: 0,
+            rx_queue_index: 0,
+            config_generation: 1,
+            fib_generation: 1,
+        }
+    }
+
+    /// A minimal well-formed IPv4/TCP inner packet of the requested total size.
+    fn inner_v4(total: usize) -> Vec<u8> {
+        let mut p = vec![0u8; total];
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+        p[9] = 6;
+        p[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        p[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        p
+    }
+
+    #[test]
+    fn logical_ingress_pkt_len_is_the_buffer_length_8581() {
+        let fw = ForwardingState::default();
+        // PARAMETERISED over the inner size on purpose. A single fixture would
+        // pass against a hardcoded constant, and the property under test is a
+        // RELATIONSHIP between two lengths, not either length's value.
+        for inner_len in [40usize, 60, 128, 1500] {
+            let inner = inner_v4(inner_len);
+            let (frame, meta) = build_logical_ingress_packet(&fw, &params(&inner))
+                .expect("a well-formed inner packet must build");
+
+            // PREMISE: the buffer really does carry a synthetic L2 header, or
+            // the two assertions below are the same statement twice.
+            assert_eq!(
+                frame.len(),
+                14 + inner_len,
+                "the synthetic frame must be the 14-byte Ethernet header plus the inner packet",
+            );
+            assert_eq!(
+                meta.l3_offset, 14,
+                "the meta must describe the buffer FROM offset 0, with the L3 header at 14",
+            );
+
+            assert_eq!(
+                meta.pkt_len as usize,
+                frame.len(),
+                "#8581: pkt_len must be the length of the buffer this meta describes. It \
+                 carried the INNER length ({inner_len}), so a decapsulated packet was billed \
+                 14 bytes fewer than the identical packet arriving natively, in every filter, \
+                 policy, policer, session and zone byte counter.",
+            );
+            assert_eq!(
+                meta.pkt_len as usize - meta.l3_offset as usize,
+                inner_len,
+                "#8581: and therefore `pkt_len - l3_offset` is the L3 length here, exactly as \
+                 it is at the other four construction sites — the property that lets a \
+                 consumer compute it without knowing who built the meta",
+            );
+        }
+    }
+
+    /// The CONTROL that fails on the over-broad fix: adding a constant 14 to
+    /// whatever was there is not the same as reporting the buffer's length. A
+    /// site that hardcoded the offset would satisfy the assertions above and
+    /// break the moment the synthetic header size or `l3_offset` changed.
+    #[test]
+    fn logical_ingress_pkt_len_tracks_the_frame_not_a_constant_8581() {
+        let fw = ForwardingState::default();
+        let small = inner_v4(40);
+        let large = inner_v4(1400);
+        let (fs, ms) = build_logical_ingress_packet(&fw, &params(&small)).expect("small builds");
+        let (fl, ml) = build_logical_ingress_packet(&fw, &params(&large)).expect("large builds");
+        assert_eq!(
+            ml.pkt_len as i64 - ms.pkt_len as i64,
+            fl.len() as i64 - fs.len() as i64,
+            "#8581: pkt_len must move with the BUFFER length, not by a constant",
+        );
+    }
 }
