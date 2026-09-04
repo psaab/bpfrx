@@ -45,6 +45,16 @@ func (c *xpfCollector) initGlobalDescriptors() {
 			"host-inbound reads).",
 		nil, nil,
 	)
+	// #8312: labelled per limiter so one series answers "is this budget ever
+	// exhausted" for each admission bound independently. See
+	// metrics_admission_refusals_8312.go for why the refusal count, and not a
+	// per-item cost, is the number the weighted-cost question needs.
+	c.admissionRefusalsTotal = prometheus.NewDesc(
+		"xpf_admission_refusals_total",
+		"Total control-surface admission requests refused at the concurrency "+
+			"cap, by limiter (session_walk, remote_walk, diagnostic).",
+		[]string{"limiter"}, nil,
+	)
 	c.sessionsCreatedTotal = prometheus.NewDesc(
 		"xpf_sessions_created_total",
 		"Total sessions created.",
