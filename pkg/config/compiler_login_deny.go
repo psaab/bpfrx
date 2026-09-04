@@ -67,7 +67,18 @@ var loginClassLeafAllowRegex = map[string]bool{
 	"deny-commands":       false,
 	"deny-configuration":  false,
 	"login-alarms":        false,
-	"login-tip":           false,
+	// #7971: the `*-regexps` family is REFUSED at strict commit
+	// (schema_login_regexps_7971.go), so no value ever reaches the compiler and
+	// there is no presence to record. Classified explicitly as `false` rather
+	// than omitted because #5831's guard treats an omission as an oversight —
+	// which is right: if the family is ever implemented, these rows are where
+	// its presence semantics must be stated, and `deny-*-regexps` will need
+	// `true` in the restrictive table.
+	"allow-commands-regexps":      false,
+	"deny-commands-regexps":       false,
+	"allow-configuration-regexps": false,
+	"deny-configuration-regexps":  false,
+	"login-tip":                   false,
 }
 
 var loginClassLeafRestrictive = map[string]bool{
@@ -78,7 +89,18 @@ var loginClassLeafRestrictive = map[string]bool{
 	"deny-commands":       true,
 	"deny-configuration":  true,
 	"login-alarms":        false,
-	"login-tip":           false,
+	// #7971: the `*-regexps` family is REFUSED at strict commit
+	// (schema_login_regexps_7971.go), so no value ever reaches the compiler and
+	// there is no presence to record. Classified explicitly as `false` rather
+	// than omitted because #5831's guard treats an omission as an oversight —
+	// which is right: if the family is ever implemented, these rows are where
+	// its presence semantics must be stated, and `deny-*-regexps` will need
+	// `true` in the restrictive table.
+	"allow-commands-regexps":      false,
+	"deny-commands-regexps":       false,
+	"allow-configuration-regexps": false,
+	"deny-configuration-regexps":  false,
+	"login-tip":                   false,
 }
 
 // describePerms renders a coarse permission set for an operator-facing
