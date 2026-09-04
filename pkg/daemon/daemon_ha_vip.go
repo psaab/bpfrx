@@ -687,6 +687,18 @@ func (d *Daemon) directSendGARPs(rgID int) {
 			}
 		}
 	}
+
+	// #8405: announce the POOL addresses too, not just the VIPs.
+	//
+	// #8297 stopped the standby ANSWERING proxy-ARP for a pool address on an RG
+	// it does not own. That is necessary and not sufficient: removing a
+	// responder does not invalidate a binding already cached upstream. Measured
+	// on the cluster -- the seven misdelivered SYN-ACKs carried the STANDBY's
+	// MAC (`02:bf:72:16:01:01`) on a non-promiscuous NIC, so they were
+	// addressed to it, so the upstream had the pool address bound to the
+	// standby. The new owner has to ANNOUNCE rather than wait for the upstream
+	// to re-resolve on its own schedule.
+	d.announceProxyARPPoolAddresses(cfg, rgID, stillValid)
 }
 
 // resetVIPWarnings drops the VIP warning-suppression set so a new config gets
@@ -723,4 +735,94 @@ func (d *Daemon) clearVIPWarning(ifName string) {
 	d.vipWarnedMu.Lock()
 	defer d.vipWarnedMu.Unlock()
 	delete(d.vipWarnedIfaces, ifName)
+}
+
+// proxyARPAnnounceMaxAddresses bounds how many pool addresses one RG's
+// ownership change announces.
+//
+// #8405. A proxy-arp statement expands to at most proxyARPMaxExpandedHosts
+// (256) addresses and an interface may carry several, so an unbounded announce
+// would fan hundreds of raw-socket sends per failover — recreating the
+// self-inflicted CPU/socket-exhaustion vector that GratuitousARPBurstClamp
+// exists to prevent, arriving through a different door.
+//
+// 64 is chosen against the shape of the fault rather than as a round number: a
+// pool address needs announcing only if an upstream has it CACHED, which
+// requires it to have been used for translation, and a deployment translating
+// through more than 64 distinct pool addresses in the lifetime of one upstream
+// ARP entry is not the one this fix is for. Exceeding it warns once per RG and
+// announces the first 64 in configured order — deterministic, so the same
+// addresses are announced on every failover rather than an arbitrary subset.
+const proxyARPAnnounceMaxAddresses = 64
+
+// announceProxyARPPoolAddresses sends ONE gratuitous ARP per proxy-ARP pool
+// address on the interfaces belonging to rgID.
+//
+// ONE, not a burst of garpCount. The burst exists to survive loss on a path
+// where a single VIP must be re-bound; here the job is breadth — invalidating
+// one upstream binding per address — and depth × breadth is what turns this
+// into a storm. A missed announce is recovered by the upstream's own ARP
+// ageing, which is the pre-#8405 behaviour for every address.
+//
+// The RG filter is `proxyARPRedundancyGroupFor`, the SAME predicate #8297's
+// suppression uses. That is deliberate: this announces exactly the set the
+// standby stops answering for, so the two cannot disagree about which
+// addresses belong to which RG. A divergence there would announce an address
+// this node does not own — telling the upstream to send us traffic for an RG
+// the peer is primary for, which is worse than the stale binding being fixed.
+func (d *Daemon) announceProxyARPPoolAddresses(cfg *config.Config, rgID int, stillValid cluster.BurstStillValid) {
+	if cfg == nil || rgID <= 0 {
+		return
+	}
+	sent := 0
+	truncated := false
+	for _, entry := range cfg.Security.NAT.ProxyARP {
+		if proxyARPRedundancyGroupFor(cfg, entry.Interface) != rgID {
+			continue
+		}
+		ifName := cfg.ResolveKernelIfName(entry.Interface)
+		if ifName == "" {
+			continue
+		}
+		for _, cidr := range entry.Addresses {
+			if stillValid != nil && !stillValid() {
+				return // ownership moved again mid-announce; stop rather than lie
+			}
+			if sent >= proxyARPAnnounceMaxAddresses {
+				truncated = true
+				break
+			}
+			ip, _, err := net.ParseCIDR(cidr)
+			if err != nil {
+				if ip = net.ParseIP(cidr); ip == nil {
+					continue
+				}
+			}
+			if ip.To4() == nil {
+				// IPv6 pool addresses need an unsolicited NA, not an ARP. Not
+				// sent here: the measured fault is IPv4, and announcing v6
+				// through the v4 path would be silently wrong rather than
+				// merely absent.
+				continue
+			}
+			if err := directGARPBurstFn(ifName, ip, 1, stillValid); err != nil {
+				slog.Warn("directSendGARPs: pool proxy-ARP announce failed",
+					"iface", ifName, "ip", ip, "rg", rgID, "err", err)
+				continue
+			}
+			sent++
+		}
+		if truncated {
+			break
+		}
+	}
+	if truncated && d.warnGARPClampOnce(rgID) {
+		slog.Warn("directSendGARPs: pool proxy-ARP announce truncated",
+			"rg", rgID, "announced", sent, "max", proxyARPAnnounceMaxAddresses,
+			"consequence", "the remaining pool addresses rely on upstream ARP ageing")
+	}
+	if sent > 0 {
+		slog.Info("directSendGARPs: announced pool proxy-ARP addresses",
+			"rg", rgID, "count", sent)
+	}
 }
