@@ -46,6 +46,7 @@ mod host_inbound_policy;
 mod nat64_icmp_error;
 mod nat_exception;
 mod prerouting_scope;
+mod policy_revalidation;
 pub(in crate::afxdp) mod reject_reply;
 mod resolver_enqueue;
 mod rx_telemetry;
@@ -87,6 +88,7 @@ use prerouting_scope::{PreroutingIngressScope, prerouting_ingress_scope};
 use reject_reply::{deny_reply_and_emit, enqueue_filter_reject_reply};
 use resolver_enqueue::try_enqueue_resolver;
 
+use policy_revalidation::revalidate_zone_policy_on_session_hit;
 use filter::{
     collect_revoked_flow_cache_keys, emit_input_filter_log_match,
     evaluate_input_filter_on_session_hit,
@@ -154,6 +156,12 @@ pub(super) fn poll_binding_process_descriptor(
     // and the established-hit revalidation compares against that same value. One
     // u64 store per binding per tick.
     sessions.set_filter_revalidation_gen(validation.config_generation);
+    // #8356: the zone-policy verdict's generation, published from the SAME
+    // `ValidationState` in the SAME statement pair, so the two stamps can never
+    // be compared against generations from different publishes. They stay
+    // SEPARATE stamps — sharing one would let a filter ACCEPT re-stamp suppress
+    // a pending policy re-derivation, and vice versa.
+    sessions.set_policy_revalidation_gen(validation.config_generation);
     let mut received = binding.xsk.rx.receive(available);
     binding.scratch.scratch_recycle.clear();
     binding.scratch.scratch_forwards.clear();
@@ -875,6 +883,79 @@ pub(super) fn poll_binding_process_descriptor(
                                 binding.scratch.scratch_recycle.push(desc.addr);
                                 continue;
                             }
+                        }
+                        // #8356: re-derive ZONE POLICY on the established
+                        // hit, at most once per session per config generation.
+                        //
+                        // #7212 above does this for the input FILTER. Not doing
+                        // it for zone policy was the asymmetry #7323 accepted as
+                        // a residual: a flow THIS node's newer policy would deny,
+                        // whose filters permit it, surviving as a session until
+                        // it ends. Peer-synced imports are where that bites
+                        // hardest — they carry the PEER's verdict — and they are
+                        // fenced for free, because `upsert_synced` stamps
+                        // generation 0, which is never live.
+                        //
+                        // Deliberately AFTER the filter block: Junos order is
+                        // filter then policy, and a flow the filter already
+                        // denied is gone before policy is asked.
+                        //
+                        // Runs on EVERY session, forward direction only. See
+                        // `policy_revalidation.rs` for the three ways this does
+                        // NOT mirror #7212, the reverse-companion trap in
+                        // particular.
+                        if let Some(revocation) = revalidate_zone_policy_on_session_hit(
+                            worker_ctx.forwarding,
+                            sessions,
+                            &resolved.key,
+                            &resolved.metadata,
+                            resolved.decision,
+                            Some(flow),
+                            meta,
+                        ) {
+                            // The live zone policy denies this FLOW. Same
+                            // pair-aware teardown the filter revocation uses
+                            // (#5622): forward AND reverse deleted, source-NAT /
+                            // NAT64 reservation released exactly once via the
+                            // forward entry, forward close delta emitted. Then
+                            // evict both directions' flow-cache slots on every
+                            // binding of this worker in THIS tick, or the
+                            // descriptor outlives the session it was seeded from
+                            // (#6457) and the revoked 5-tuple keeps forwarding
+                            // off a cached RewriteDescriptor with no session row.
+                            //
+                            // `canonical_key` is the key the revalidation
+                            // resolved — NOT `resolved.key`, which is the WIRE
+                            // tuple and, on the NAT reverse-translated alias
+                            // path, names no entry in the primary index.
+                            delete_terminal_filtered_session(
+                                sessions,
+                                binding.bpf_maps.session_map_fd,
+                                conntrack_v4_fd,
+                                conntrack_v6_fd,
+                                worker_ctx.shared_sessions,
+                                worker_ctx.shared_nat_sessions,
+                                worker_ctx.shared_forward_wire_sessions,
+                                &worker_ctx.shared_owner_rg_indexes,
+                                worker_ctx.peer_worker_commands,
+                                worker_ctx.worker_commands_by_id,
+                                worker_ctx.forwarding,
+                                &revocation.canonical_key,
+                                resolved.decision,
+                                &resolved.metadata,
+                                resolved.origin,
+                                now_ns,
+                                worker_id,
+                            );
+                            collect_revoked_flow_cache_keys(
+                                &resolved.key,
+                                &revocation.canonical_key,
+                                resolved.decision.nat,
+                                &mut binding.scratch.scratch_filter_revoked_keys,
+                            );
+                            telemetry.dbg.policy_revoked_sessions += 1;
+                            binding.scratch.scratch_recycle.push(desc.addr);
+                            continue;
                         }
                         // #3070 + #3485: on the session-HIT local-delivery path,
                         // the host-inbound-traffic zone gate runs BEFORE the lo0
