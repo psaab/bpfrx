@@ -727,7 +727,13 @@ func (mon *Monitor) IPGlobalThreshold(rgID int) (threshold, weight int, ok bool)
 			return 0, 0, false
 		}
 		w, _ := config.ClampInterfaceMonitorWeight(rg.IPMonitoring.GlobalWeight)
-		return rg.IPMonitoring.GlobalThreshold, w, true
+		// #8597 (muse-004 K71): report the EFFECTIVE threshold, the one the
+		// election actually compares against — see desiredRGIPDebts. A status
+		// surface showing a threshold the decision does not use is the #6534
+		// shape: the screen and the behaviour disagree, and the screen is the
+		// only thing the operator can see.
+		t, _ := config.ClampInterfaceMonitorWeight(rg.IPMonitoring.GlobalThreshold)
+		return t, w, true
 	}
 	return 0, 0, false
 }
@@ -888,7 +894,29 @@ func (mon *Monitor) desiredRGIPDebts(rg *config.RedundancyGroup) map[string]int 
 				cumulative += mon.ipTargetWeight(rg, target)
 			}
 		}
-		if cumulative >= rg.IPMonitoring.GlobalThreshold {
+		// #8597 (muse-004 K71): clamp the THRESHOLD too, not only the weight.
+		//
+		// The weight below has been bounded since #6549; the threshold this
+		// comparison uses was the raw configured value. Both are bounded to
+		// [0,255] by the same strict gate (schema_chassis.go's
+		// ValidateInteger(0, 255) and validateChassisClusterStrict), and both
+		// reach runtime unbounded on the tolerant load / peer-sync path, so
+		// bounding one and not the other left the pair inconsistent in the
+		// direction that matters.
+		//
+		// `cumulative` is a sum of per-target weights that ARE clamped
+		// (ipTargetWeight, #6549), so a lenient-loaded threshold of 1000000 can
+		// never be reached however many probes fail. The RG never demotes, the
+		// status shows no failure, and failover is effectively OFF for that RG
+		// while the operator believes they configured protection. A monitor
+		// that cannot fire is worse than a missing one: it is a missing one
+		// that reports healthy.
+		//
+		// Binding config.ClampInterfaceMonitorWeight rather than a literal 255
+		// keeps this in step with the gate — the threshold and the weights
+		// share one domain, which is why one clamp serves both.
+		threshold, _ := config.ClampInterfaceMonitorWeight(rg.IPMonitoring.GlobalThreshold)
+		if cumulative >= threshold {
 			// #6549: same bound as ipTargetWeight — the aggregate debt is the
 			// raw configured global-weight, and an out-of-range one reaches
 			// runtime on the tolerant load / peer-sync path. Clamping here
