@@ -195,36 +195,53 @@ func scrubGateSet(before reflect.Value, gate uint64) bool {
 	return f.Uint()&gate != 0
 }
 
-func assertScrubCensus(t *testing.T, before, after reflect.Value) {
-	t.Helper()
+// scrubCensusViolations is the census PROPER, returning one string per
+// violation instead of reporting them.
+//
+// EXTRACTED (#8612 follow-up) for the reason `headroomCensusViolations` was:
+// a census that has only ever run against the real structs and the real
+// declaration maps is indistinguishable from one that always returns nil. The
+// `partial` arm made that concrete -- once its only entry
+// was removed, the arm could not fail against any input the suite offered, so
+// nothing would have noticed it rotting. Taking the maps as parameters lets a
+// synthetic fixture drive every arm in BOTH directions.
+func scrubCensusViolations(
+	before, after reflect.Value,
+	nodeLocal map[string]bool,
+	partial map[string]uint64,
+	conditional map[string]uint64,
+) []string {
+	var viol []string
+	add := func(format string, args ...any) { viol = append(viol, fmt.Sprintf(format, args...)) }
 	scrubbed := zeroedFields(before, after)
 	if len(scrubbed) == 0 {
-		t.Fatal("the scrub zeroed NOTHING — the fixture or the call did not run, " +
+		add("the scrub zeroed NOTHING — the fixture or the call did not run, " +
 			"and the two directional checks below would both pass vacuously (#7097)")
+		return viol
 	}
-	for name := range nodeLocalSessionFields {
+	for name := range nodeLocal {
 		if !scrubbed[name] {
-			t.Errorf("%s is NODE-LOCAL but survived the peer-install scrub. A "+
+			add("%s is NODE-LOCAL but survived the peer-install scrub. A "+
 				"peer-owned row can then inherit this node's number and render a "+
 				"confidently wrong answer — worse than the zero the consumer falls "+
 				"back on (#7097)", name)
 		}
 	}
 	for name := range scrubbed {
-		if nodeLocalSessionFields[name] {
+		if nodeLocal[name] {
 			continue
 		}
 		// #8612: a conditional field may legitimately be zeroed -- but only on
 		// the arm where its gate bit is CLEAR. Zeroing it with the bit SET is
 		// the defect this issue is about, and is caught by the conditional
 		// block below rather than silently excused here.
-		if gate, ok := conditionallyNodeLocalSessionFields[name]; ok {
+		if gate, ok := conditional[name]; ok {
 			if scrubGateSet(before, gate) {
 				continue // reported precisely below
 			}
 			continue
 		}
-		t.Errorf("the scrub zeroes %s, which is NOT declared node-local. Either "+
+		add("the scrub zeroes %s, which is NOT declared node-local. Either "+
 			"it is node-local and this list is stale, or the scrub is destroying "+
 			"a field the peer legitimately owns (#7097)", name)
 	}
@@ -234,22 +251,22 @@ func assertScrubCensus(t *testing.T, before, after reflect.Value) {
 	// must survive. Both directions are asserted, so neither "always zero it"
 	// (the pre-#8612 erasure) nor "never zero it" (which would leak this node's
 	// FIB generation onto a peer row) passes.
-	for name, gate := range conditionallyNodeLocalSessionFields {
+	for name, gate := range conditional {
 		b := before.FieldByName(name)
 		a := after.FieldByName(name)
 		if !b.IsValid() || !a.IsValid() {
-			t.Errorf("conditionally-node-local field %s is not present on this "+
+			add("conditionally-node-local field %s is not present on this "+
 				"struct — the declaration is stale (#8612)", name)
 			continue
 		}
 		if b.Uint() == 0 {
-			t.Fatalf("the fixture left %s at zero, so neither arm of the "+
+			add("the fixture left %s at zero, so neither arm of the "+
 				"conditional assertion can distinguish preserved from scrubbed — "+
 				"fillNonZero must seed it (#8612)", name)
 		}
 		if scrubGateSet(before, gate) {
 			if a.Uint() != b.Uint() {
-				t.Errorf("%s was scrubbed to %#x with its gate bit %#x SET, but under "+
+				add("%s was scrubbed to %#x with its gate bit %#x SET, but under "+
 					"that bit the field is a StableTunnelEndpointID — a pure fold of "+
 					"the interface NAME that both nodes compute identically and that "+
 					"pkg/cluster/sync_protocol.go encodes on the wire. Zeroing it "+
@@ -260,7 +277,7 @@ func assertScrubCensus(t *testing.T, before, after reflect.Value) {
 			continue
 		}
 		if a.Uint() != 0 {
-			t.Errorf("%s survived the scrub with its gate bit %#x CLEAR. Without that "+
+			add("%s survived the scrub with its gate bit %#x CLEAR. Without that "+
 				"bit the field is a node-local FIB generation, and a peer row "+
 				"inheriting this node's number renders a confidently wrong answer "+
 				"(#7097)", name, gate)
@@ -273,7 +290,7 @@ func assertScrubCensus(t *testing.T, before, after reflect.Value) {
 	// declared.
 	changed := changedFields(before, after)
 	for name := range changed {
-		if nodeLocalSessionFields[name] {
+		if nodeLocal[name] {
 			continue
 		}
 		// #8612: conditional fields get BOTH their directions asserted in the
@@ -281,12 +298,12 @@ func assertScrubCensus(t *testing.T, before, after reflect.Value) {
 		// value against the gate rather than merely allowing a change. Skipping
 		// here would be a hole if that block did not exist; it does, and the
 		// `!b.IsValid()` arm there fails if a declaration goes stale.
-		if _, ok := conditionallyNodeLocalSessionFields[name]; ok {
+		if _, ok := conditional[name]; ok {
 			continue
 		}
-		mask, declared := partiallyScrubbedSessionFields[name]
+		mask, declared := partial[name]
 		if !declared {
-			t.Errorf("the scrub MODIFIES %s, which is declared neither node-local nor "+
+			add("the scrub MODIFIES %s, which is declared neither node-local nor "+
 				"partially scrubbed. A field the scrub edits rather than zeroes is "+
 				"invisible to the zero-transition census above, so it has to be "+
 				"declared here or not touched (#8612)", name)
@@ -295,33 +312,47 @@ func assertScrubCensus(t *testing.T, before, after reflect.Value) {
 		b := before.FieldByName(name)
 		a := after.FieldByName(name)
 		if b.Kind() < reflect.Uint || b.Kind() > reflect.Uint64 {
-			t.Errorf("%s is declared partially scrubbed but is kind %s; the mask "+
+			add("%s is declared partially scrubbed but is kind %s; the mask "+
 				"comparison below only models unsigned integers (#8612)", name, b.Kind())
 			continue
 		}
 		if got, want := a.Uint(), b.Uint()&^mask; got != want {
-			t.Errorf("the scrub changed %s to %#x, want %#x (%#x with mask %#x "+
+			add("the scrub changed %s to %#x, want %#x (%#x with mask %#x "+
 				"cleared). It may clear ONLY the declared bits — the rest of this "+
 				"field is metadata the peer owns (#8612)", name, got, want, b.Uint(), mask)
 		}
 	}
-	for name, mask := range partiallyScrubbedSessionFields {
+	for name, mask := range partial {
 		b := before.FieldByName(name)
 		if !b.IsValid() {
 			continue
 		}
 		if b.Uint()&mask == 0 {
-			t.Fatalf("the fixture left %s with none of the mask %#x set, so the "+
+			add("the fixture left %s with none of the mask %#x set, so the "+
 				"partial-scrub assertion is vacuous — fillNonZero must seed those "+
 				"bits (#8612)", name, mask)
 		}
 		if !changed[name] {
-			t.Errorf("%s carries declared node-local bits %#x that SURVIVED the "+
+			add("%s carries declared node-local bits %#x that SURVIVED the "+
 				"scrub. FibGen is zeroed, so a surviving "+
 				"LogFlagUserspaceTunnelEndpoint asserts a tunnel endpoint the row no "+
 				"longer carries — an invariant a flag-only consumer would trust (#8612)",
 				name, mask)
 		}
+	}
+	return viol
+}
+
+// assertScrubCensus reports what the census found, against the real maps.
+func assertScrubCensus(t *testing.T, before, after reflect.Value) {
+	t.Helper()
+	for _, v := range scrubCensusViolations(
+		before, after,
+		nodeLocalSessionFields,
+		partiallyScrubbedSessionFields,
+		conditionallyNodeLocalSessionFields,
+	) {
+		t.Error(v)
 	}
 }
 
@@ -697,4 +728,110 @@ func TestEveryFibGenReaderIsFlagGated8612(t *testing.T) {
 	}
 	t.Logf("#8612 FibGen reader census: %d guarded, %d unguarded — %v",
 		len(guarded), len(unguarded), guarded)
+}
+
+// #8612 follow-up: exercise the census machinery itself, against a SYNTHETIC
+// struct and synthetic declaration maps.
+//
+// WHY THIS EXISTS. `partiallyScrubbedSessionFields` is now empty — its only
+// entry declared the tunnel-bit clearing that #8612 removed. An empty map means
+// the arm that reads it cannot fail against anything the suite offers, so the
+// machinery added in #8613 to make partial scrubs visible became unfalsifiable:
+// it would be discovered broken by the first person to declare a real partially
+// scrubbed field, which is the worst possible time.
+//
+// Keeping the map without exercising it is a claim written into inert code. So
+// the arms are driven here with fixtures the real structs cannot currently
+// produce, in BOTH directions — a census that only ever returns nil is
+// indistinguishable from a correct one.
+type synthScrubRow struct {
+	LogFlags uint64
+	Meta     uint32
+	Gen      uint16
+}
+
+func synthCensus(before, after synthScrubRow, nodeLocal map[string]bool,
+	partial map[string]uint64, conditional map[string]uint64) []string {
+	return scrubCensusViolations(
+		reflect.ValueOf(before), reflect.ValueOf(after), nodeLocal, partial, conditional)
+}
+
+func TestScrubCensusPartialArmCanActuallyFail8612(t *testing.T) {
+	nodeLocal := map[string]bool{"Gen": true}
+	partial := map[string]uint64{"Meta": 0x0f}
+	conditional := map[string]uint64{}
+
+	// CLEAN: only the declared bits of Meta are cleared, and the declared
+	// node-local field is zeroed. The census must be silent.
+	before := synthScrubRow{LogFlags: 0xff, Meta: 0xff, Gen: 7}
+	clean := synthScrubRow{LogFlags: 0xff, Meta: 0xff &^ 0x0f, Gen: 0}
+	if v := synthCensus(before, clean, nodeLocal, partial, conditional); len(v) != 0 {
+		t.Fatalf("the census reported %v on a correct partial scrub — it cannot "+
+			"distinguish compliance from violation, so the checks below prove nothing", v)
+	}
+
+	// VIOLATION 1: an EXTRA bit outside the declared mask was cleared. This is
+	// the case the arm exists for, and the case that has had no coverage since
+	// the map was emptied.
+	extra := synthScrubRow{LogFlags: 0xff, Meta: 0xff &^ 0x1f, Gen: 0}
+	if v := synthCensus(before, extra, nodeLocal, partial, conditional); len(v) == 0 {
+		t.Error("the census accepted a scrub that cleared bits OUTSIDE the declared " +
+			"mask. The partial-scrub arm is inert — the exact rot this cell exists " +
+			"to prevent (#8612)")
+	}
+
+	// VIOLATION 2: the field is modified but NOT declared partially scrubbed.
+	// Distinct arm, distinct failure.
+	undeclared := synthScrubRow{LogFlags: 0xf0, Meta: 0xff, Gen: 0}
+	if v := synthCensus(before, undeclared, nodeLocal, map[string]uint64{}, conditional); len(v) == 0 {
+		t.Error("the census accepted a modification to a field declared neither " +
+			"node-local nor partially scrubbed (#8612)")
+	}
+
+	// VIOLATION 3: the fixture does not set the declared mask bits, so the
+	// assertion would be vacuous. The census must say so rather than pass.
+	vacuous := synthScrubRow{LogFlags: 0xff, Meta: 0xf0, Gen: 7}
+	if v := synthCensus(vacuous, synthScrubRow{LogFlags: 0xff, Meta: 0xf0, Gen: 0},
+		nodeLocal, partial, conditional); len(v) == 0 {
+		t.Error("the census passed on a fixture that never set the declared mask " +
+			"bits — a vacuous partial-scrub assertion must be reported (#8612)")
+	}
+}
+
+// The conditional arm gets the same treatment, and for the same reason: today
+// it has exactly one real declaration, so a fixture-shaped hole in it would be
+// invisible.
+func TestScrubCensusConditionalArmCanActuallyFail8612(t *testing.T) {
+	// `Meta` is a genuine node-local field here purely so the fixture always
+	// zeroes SOMETHING: the census's own degeneracy guard fires on a scrub that
+	// zeroed nothing, and it is right to — without it every arm below would pass
+	// vacuously. Discovered by that guard firing on the first draft of this cell.
+	nodeLocal := map[string]bool{"Meta": true}
+	partial := map[string]uint64{}
+	conditional := map[string]uint64{"Gen": 0x40}
+
+	// Gate SET -> the value must survive.
+	setBefore := synthScrubRow{LogFlags: 0x40, Meta: 3, Gen: 9}
+	if v := synthCensus(setBefore, synthScrubRow{LogFlags: 0x40, Meta: 0, Gen: 9},
+		nodeLocal, partial, conditional); len(v) != 0 {
+		t.Fatalf("preserving a gated value was reported as a violation: %v", v)
+	}
+	if v := synthCensus(setBefore, synthScrubRow{LogFlags: 0x40, Meta: 0, Gen: 0},
+		nodeLocal, partial, conditional); len(v) == 0 {
+		t.Error("the census accepted ZEROING a field whose gate bit was SET — that " +
+			"is the #8612 erasure itself, and the conditional arm must catch it")
+	}
+
+	// Gate CLEAR -> the value must be zeroed.
+	clearBefore := synthScrubRow{LogFlags: 0x00, Meta: 3, Gen: 9}
+	if v := synthCensus(clearBefore, synthScrubRow{LogFlags: 0x00, Meta: 0, Gen: 0},
+		nodeLocal, partial, conditional); len(v) != 0 {
+		t.Fatalf("zeroing an ungated value was reported as a violation: %v", v)
+	}
+	if v := synthCensus(clearBefore, synthScrubRow{LogFlags: 0x00, Meta: 0, Gen: 9},
+		nodeLocal, partial, conditional); len(v) == 0 {
+		t.Error("the census accepted PRESERVING a field whose gate bit was CLEAR — " +
+			"in that state it is a node-local FIB generation and must not reach a " +
+			"peer row (#7097)")
+	}
 }
