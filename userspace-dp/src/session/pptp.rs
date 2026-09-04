@@ -262,18 +262,20 @@ impl PptpAssociations {
     /// expired under it; a call whose peer vanished stops refreshing and ages
     /// out without anyone announcing its death.
     ///
-    /// **Still no production caller, and the packet-path dispatch did NOT
-    /// change that.** The dispatch (#7699) wires the CONTROL channel — a
-    /// TCP/1723 segment reaches the parser and its association is installed and
-    /// broadcast. What reaches this function is the DATA channel: a GRE
-    /// version-1 packet resolving its call id to a handle, which
-    /// `gre_discriminator` still refuses outright (`TunnelDiscriminator::Pptp(_)
-    /// => return None`). That is a separate join and it is not built.
+    /// **WIRED as of #7699's data-channel resolve.** This comment previously
+    /// said there was no production caller and that the packet-path dispatch had
+    /// not changed it — true when written: the dispatch wired the CONTROL
+    /// channel, and the DATA channel was a separate join that
+    /// `gre_discriminator` refused outright. That join is
+    /// `gre_discriminator::pptp_data_session_flow`, called from the descriptor
+    /// loop, and it reaches this function for every version-1 GRE packet.
     ///
-    /// Consequence, unchanged: the idle clock advances only at install, so an
-    /// association's life is bounded from when it was LEARNED rather than from
-    /// its last packet — the conservative direction (it expires sooner, never
-    /// later), but not the intended semantics.
+    /// So the consequence that comment recorded is gone: the idle clock now
+    /// advances on DATA, which is what makes the timeout mean "no traffic"
+    /// rather than "old". It previously advanced only at install, bounding an
+    /// association's life from when it was LEARNED — conservative (it expired
+    /// sooner, never later), but wrong, because expiring a live call frees a
+    /// 16-bit id that is REUSED.
     pub(crate) fn resolve_and_touch(
         &mut self,
         dst: IpAddr,
@@ -315,9 +317,10 @@ impl PptpAssociations {
     /// reused call id. Intended to fire on FIN/RST or the control session's
     /// own timeout, not waiting for per-call notifies that will never arrive.
     ///
-    /// **Still no production caller.** The packet-path dispatch (#7699) added
-    /// the control-channel LEARN path; it does not observe a control channel
-    /// CLOSING. Recognising the FIN/RST — or the control session's own timeout —
+    /// **Still no production caller, and #7699's DATA-channel resolve did not
+    /// change that either.** The dispatch added the control-channel LEARN path
+    /// and the resolve added the data-channel READ path; neither observes a
+    /// control channel CLOSING. Recognising the FIN/RST — or the control session's own timeout —
     /// and calling this is a distinct piece of stage 3 that is not built, so
     /// this path is bound by its cells and by nothing else, and the idle bound
     /// above remains the only association lifetime that actually runs on a live

@@ -629,12 +629,17 @@ func (s *Store) writeConfirmState(prevTree *config.ConfigTree, deadline time.Tim
 		// boot recovery a mismatch means a later commit/confirm advanced the
 		// active config while this record's durable removal had failed — the
 		// record is then stale and must not resurrect a rollback.
-		GuardedHash: journalConfigHash(s.active),
+		GuardedHash: guardedConfigHash(s.active),
 	}
 	if err := s.db.WriteConfirm(rec); err != nil {
 		slog.Warn("failed to persist commit-confirmed state; auto-rollback will not "+
 			"survive a crash within the confirm window", "err", err, "issue", "#4577")
+		return
 	}
+	// #8566: a readable record now exists again, so the "boot lost the window"
+	// state is over. It clears on operator action rather than on its own
+	// because nothing else can heal it — the lost window cannot be recovered.
+	s.confirmRecoveryReadFailed = false
 }
 
 // removeConfirmState deletes the persisted pending commit-confirmed state
@@ -670,7 +675,14 @@ func (s *Store) resolveConfirmRemovalLocked(action string) error {
 	// retained debt cannot later delete a DIFFERENT (newer) record. An empty id
 	// means the record was already absent or unreadable — the debt is then only
 	// the #4864 directory barrier, never a delete of a present file.
-	id := s.confirmRecordIdentityOnDiskLocked()
+	rec := s.readConfirmRecordLocked()
+	id := confirmRecordIdentity(rec)
+	// #8565: TOMBSTONE BEFORE DELETE. If the delete does not become durable, the
+	// record that survives must say it was already RESOLVED — otherwise recovery
+	// cannot tell it from a live pending window and re-arms (or, past the
+	// deadline, reverts) a config the operator confirmed. Best-effort: a failed
+	// tombstone write degrades to exactly the pre-#8565 behaviour.
+	s.markConfirmResolvedLocked(rec)
 	if err := s.removeConfirmState(); err != nil {
 		s.confirmRemoveDebtID = id
 		s.noteConfirmRemoveFailureLocked(action, err)
@@ -678,6 +690,9 @@ func (s *Store) resolveConfirmRemovalLocked(action string) error {
 	}
 	s.confirmRemoveDegraded = false
 	s.confirmRemoveDebtID = ""
+	// #8566: an unreadable record that has now been removed is no longer
+	// standing between the operator and a clean state.
+	s.confirmRecoveryReadFailed = false
 	return nil
 }
 
@@ -695,18 +710,38 @@ func confirmRecordIdentity(rec *confirmRecord) string {
 	return fmt.Sprintf("%s|%d|%t", rec.GuardedHash, rec.Deadline.UnixNano(), rec.FirstCommit)
 }
 
-// confirmRecordIdentityOnDiskLocked reads the persisted record and returns its
-// identity, or "" when there is none, the DB is absent, or it cannot be read.
-// Caller holds s.mu.
-func (s *Store) confirmRecordIdentityOnDiskLocked() string {
+// readConfirmRecordLocked reads the persisted record, or nil when there is
+// none, the DB is absent, or it cannot be read. Caller holds s.mu.
+func (s *Store) readConfirmRecordLocked() *confirmRecord {
 	if s.db == nil {
-		return ""
+		return nil
 	}
 	rec, err := s.db.ReadConfirm()
-	if err != nil || rec == nil {
-		return ""
+	if err != nil {
+		return nil
 	}
-	return confirmRecordIdentity(rec)
+	return rec
+}
+
+// markConfirmResolvedLocked writes the #8565 resolution tombstone: the same
+// record with Resolved set, persisted durably so a delete that does not land
+// leaves behind a record recovery can recognise as already-resolved.
+//
+// Best-effort by design. A failed tombstone write leaves the unmarked record
+// exactly as the pre-#8565 code did, so this can only shrink the window in
+// which a resolved record is mistaken for a pending one, never widen it. Caller
+// holds s.mu.
+func (s *Store) markConfirmResolvedLocked(rec *confirmRecord) {
+	if s.db == nil || rec == nil || rec.Resolved {
+		return
+	}
+	tombstone := *rec
+	tombstone.Resolved = true
+	if err := s.db.WriteConfirm(&tombstone); err != nil {
+		slog.Warn("failed to tombstone the resolved commit-confirmed record before removing it; "+
+			"a restart before the removal lands may resurrect its rollback",
+			"err", err, "issue", "#8565")
+	}
 }
 
 // confirmRemovalSupersededLocked reports whether the record whose removal is

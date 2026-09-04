@@ -1811,6 +1811,13 @@ fn count_local_session_expiries(
             | SessionOrigin::ReverseFlow
             | SessionOrigin::LocalMiss
             | SessionOrigin::MissingNeighborSeed => true,
+            // #7770: a fabric PUNT SEED is installed without bumping
+            // `session_creates` — the punting node deliberately keeps its
+            // operator-visible create accounting unchanged, because the
+            // AUTHORITATIVE session for a punted flow is the peer's. Its expiry
+            // must therefore not be counted either, or `session_creates -
+            // session_expires` wraps.
+            SessionOrigin::FabricPuntSeed => false,
             // Synced-derived, never create-counted: must NOT be expire-counted.
             SessionOrigin::SyncImport
             | SessionOrigin::SharedMaterialize

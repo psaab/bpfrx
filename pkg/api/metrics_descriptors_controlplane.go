@@ -297,10 +297,13 @@ func (c *xpfCollector) initControlPlaneDescriptors() {
 	)
 	c.configPersistDegraded = prometheus.NewDesc(
 		"xpf_daemon_config_persist_degraded",
-		"1 while the running active configuration failed to persist "+
-			"to disk and the background retry has not yet succeeded "+
-			"(a daemon restart would load a stale config, #1799); 0 "+
-			"when config persistence is healthy.",
+		"1 while configuration persistence is degraded: the running "+
+			"active config failed to persist and the background retry "+
+			"has not yet succeeded (a restart would load a stale config, "+
+			"#1799), or a resolved commit-confirmed record's removal is "+
+			"not yet durable (#5835), or boot recovery could not read "+
+			"confirm.json and the pending rollback window was lost "+
+			"(#8566); 0 when config persistence is healthy.",
 		nil, nil,
 	)
 	c.rollbackHistoryDegraded = prometheus.NewDesc(

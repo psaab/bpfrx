@@ -558,3 +558,189 @@ pub(in crate::afxdp) fn prefer_local_forward_candidate_for_fabric_ingress(
     resolution
 }
 
+
+/// #7770: does this session-MISS packet qualify to leave a PUNT SEED behind?
+///
+/// EXTRACTED FROM THE CALL SITE ON PURPOSE. As an inline `&&` chain in
+/// `poll_descriptor` the middle condition was unbindable: `finalize_new_flow_
+/// ha_resolution` refuses to redirect a fabric-ingress packet back onto the
+/// fabric, so `FabricRedirect && fabric_ingress` is unreachable through the
+/// poll loop and deleting `!fabric_ingress` there changed no test result —
+/// measured, not assumed. A guard whose only proof is that another guard makes
+/// it unreachable is one refactor away from being wrong, and the one it guards
+/// is the security property of this whole change, so it is worth a function
+/// that can be driven directly.
+///
+/// The three conditions, and what each is for:
+///
+///  * **`FabricRedirect`** — the flow is leaving across the fabric
+///    unadjudicated, which is the only case that needs a seed. A
+///    `ForwardCandidate` is already evaluated and installed by the
+///    session-miss block, and every other disposition is a drop.
+///  * **`!fabric_ingress`** — the packet arrived on one of THIS node's own
+///    interfaces. This is what makes the seed unforgeable: nothing arriving on
+///    the shared fabric segment can mint the record that authorises a return,
+///    so #6458's accepted stamp-forgery residual — live during exactly the RG
+///    split this issue is about — cannot be escalated into an admission.
+///  * **no ingress translation** — the peer's NAT is transparent to us (it
+///    translates on its egress and untranslates on its ingress, so we see
+///    tuple `T` out and `reverse(T)` back whatever it did), but an ingress DNAT
+///    applied HERE would rewrite the tuple before the punt and the return would
+///    not match the key we seeded. Those flows keep today's behaviour rather
+///    than seeding a key that is probably wrong.
+pub(in crate::afxdp) fn should_seed_fabric_punt(
+    disposition: ForwardingDisposition,
+    fabric_ingress: bool,
+    nat: NatDecision,
+) -> bool {
+    disposition == ForwardingDisposition::FabricRedirect
+        && !fabric_ingress
+        && nat == NatDecision::default()
+}
+
+/// #7770: adjudicate a NEW flow this node is about to punt across the fabric,
+/// and return the metadata for a PUNT SEED session when its own policy permits
+/// it.
+///
+/// ## The defect this exists for
+///
+/// A sustained RG split (LAN on this node, WAN on the peer) costs the FIRST
+/// packet of EVERY new flow, indefinitely. The chain is not a convergence
+/// transient:
+///
+///  1. the LAN host's request ingresses HERE, resolves an egress RG the PEER
+///     owns, and is fabric-redirected — with NO policy evaluation, because the
+///     session-miss adjudication in `poll_descriptor` runs only for
+///     `ForwardCandidate`;
+///  2. the peer evaluates it under the stamped `lan` zone, permits it, creates
+///     the session and forwards it;
+///  3. the reply comes back in ~1-3 ms and the peer, whose egress for it is the
+///     LAN RG we own, punts it back here stamped `wan`;
+///  4. we have no session for the flow — the peer's HA sync lands ~200 ms later
+///     — so the reply is an unsolicited `wan -> lan` packet and hits the
+///     default deny. `wan -> lan` has no permit BY DESIGN: return traffic is
+///     admitted by a SESSION, never by policy.
+///
+/// So step 4 asks policy to authorise something policy can never authorise, and
+/// the race restarts for every new flow for as long as the split lasts.
+///
+/// ## Why the record is a SESSION and why THIS node's policy authorises it
+///
+/// The fix has to be local: the reply arrives 1-3 ms after the request leaves,
+/// which no control-plane sync can beat, and the alternative — honouring the
+/// peer's claim carried in the fabric stamp — is the option #7770 rules dead,
+/// because on a SHARED fabric segment during exactly this split the stamp is
+/// forgeable (#6458's accepted residual).
+///
+/// So the punting node keeps the authorisation itself. Two properties make that
+/// safe, and they are the whole argument:
+///
+///  * **It is adjudicated, not assumed.** The earlier framing of this option
+///    was rejected on the grounds that the punting node "never evaluates policy
+///    for the flow, so it would be minting sessions for traffic it never
+///    authorised". That is a description of the CURRENT code, not a constraint:
+///    this function evaluates the flow's REAL zone pair — its true local
+///    ingress zone and the egress zone of the PRE-redirect resolution — and
+///    returns `None` on anything but a permit. The seed is minted only from
+///    this node's own permit.
+///  * **It cannot be forged.** The caller installs a seed only for a packet
+///    that ingressed on a NON-fabric interface. Nothing arriving on the fabric
+///    can create one, so an attacker on the fabric segment cannot manufacture
+///    the record that would admit their return frame. A fabric-ingress packet
+///    with no matching seed is denied exactly as it is today — which is what
+///    `fabric_ingress_return_traffic_is_denied_on_the_lan_node_7770` keeps
+///    pinned.
+///
+/// The direction of the change is therefore: nothing that is permitted today
+/// becomes denied — this function NEVER changes the packet's disposition, so it
+/// adds no drop site — and one thing that is denied today becomes permitted:
+/// the reply of a flow this node itself ingressed and its own policy permitted.
+/// That is not a privilege the requester did not already hold.
+///
+/// ## What it deliberately does not carry
+///
+/// The seed is NAT-free and the caller only installs one when the flow carries
+/// no ingress translation. NAT applied by the FORWARDING node is transparent to
+/// the punting node — the peer translates on its egress and untranslates on its
+/// ingress, so we see tuple `T` outbound and `reverse(T)` inbound whatever it
+/// did in between — but an ingress DNAT applied HERE would rewrite the tuple
+/// before the punt, and matching the return against the pre-translation key is
+/// exactly the kind of silent key skew that is not worth guessing at. Those
+/// flows keep today's behaviour.
+///
+/// `policy_counter*` are dropped for the same reason in the other direction:
+/// the PEER counts the policy hit when it adjudicates the punted packet, and
+/// stamping the counter here as well would double-count every punted flow
+/// against the admitting rule. `log_session_init`/`log_session_close` are
+/// dropped so one flow does not emit two SESSION_CREATE/CLOSE records from two
+/// nodes; `policy_id` is kept, because `show security flow session` on this
+/// node should be able to say which policy admitted what it is holding.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::afxdp) fn fabric_punt_seed_metadata(
+    forwarding: &ForwardingState,
+    from_zone_id: u16,
+    to_zone_id: u16,
+    owner_rg_id: i32,
+    ingress_ifindex: u32,
+    ingress_vlan_id: u16,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    packet_icmp: Option<(u8, u8)>,
+    packet_len: u64,
+) -> Option<SessionMetadata> {
+    // #3110: 0 is the "unknown zone" sentinel, against which policy evaluation
+    // matches no rule and falls to the default. Refusing to seed on an
+    // unresolvable pair is what keeps this from turning a permitted flow into a
+    // seedless one on the strength of a zone we could not name — the punt
+    // itself is unchanged either way, so `None` here is precisely today's
+    // behaviour rather than a drop.
+    if from_zone_id == 0 || to_zone_id == 0 {
+        return None;
+    }
+    let policy_result = crate::policy::evaluate_policy_result_with_icmp(
+        &forwarding.policy,
+        from_zone_id,
+        to_zone_id,
+        src_ip,
+        dst_ip,
+        protocol,
+        src_port,
+        dst_port,
+        packet_icmp,
+        packet_len,
+    );
+    if !matches!(policy_result.action, crate::policy::PolicyAction::Permit) {
+        return None;
+    }
+    Some(SessionMetadata {
+        ingress_zone: from_zone_id,
+        egress_zone: to_zone_id,
+        // #4983: the TRUE ingress identity of the frame that created the seed.
+        // Unlike the fabric-ingress case this one is knowable and real — the
+        // packet arrived on one of THIS node's own interfaces, which is the
+        // property the caller's non-fabric gate guarantees.
+        ingress_ifindex,
+        ingress_vlan_id,
+        owner_rg_id,
+        // The seed is created BY a locally ingressed packet. Recording it as
+        // fabric_ingress would both be false and pull it into the
+        // fabric-ingress exclusions in the HA export walk for the wrong reason.
+        fabric_ingress: false,
+        is_reverse: false,
+        // The punting node applies no translation at all (see the doc above).
+        nat64_reverse: None,
+        log_session_init: false,
+        log_session_close: false,
+        policy_id: policy_result.policy_id,
+        // #3227: age the seed on the admitting application's idle window, so it
+        // does not outlive the peer's authoritative session for the same flow.
+        inactivity_timeout_ns: crate::session::app_inactivity_timeout_ns(
+            policy_result.inactivity_timeout,
+        ),
+        policy_counter_idx: 0,
+        policy_counter: None,
+    })
+}
