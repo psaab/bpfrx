@@ -215,6 +215,11 @@ func (s *Server) SystemAction(ctx context.Context, req *pb.SystemActionRequest) 
 		scheduleStopDaemon()
 		return &pb.SystemActionResponse{Message: "System zeroized. Configuration erased. Reboot to complete factory reset."}, nil
 
+	case "rescue-save", "rescue-delete":
+		// #8597 K47: `request system configuration rescue save|delete`, which
+		// the remote dispatcher used to refuse outright.
+		return s.rescueAction(req.Action)
+
 	case "clear-config-lock":
 		holder, locked := s.store.ConfigHolder()
 		if !locked {

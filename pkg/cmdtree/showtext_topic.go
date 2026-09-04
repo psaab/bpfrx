@@ -97,8 +97,13 @@ var showTextTopicCommand = map[string]string{
 	"screen":                    "show security screen",
 	"screen-ids-option:":        "show security screen ids-option",
 	"screen-ids-option-detail:": "show security screen ids-option",
-	"screen-statistics-all":     "show security screen statistics",
-	"screen-statistics:":        "show security screen statistics zone",
+	// #8597 K47: a `request` verb served over ShowText because it produces
+	// text and mutates nothing. The canonical command is the one the operator
+	// types, not a `show` spelling that does not exist.
+	"policies-check": "request security policies check",
+
+	"screen-statistics-all": "show security screen statistics",
+	"screen-statistics:":    "show security screen statistics zone",
 
 	// `show security nat ...`
 	"nat-static":             "show security nat static",

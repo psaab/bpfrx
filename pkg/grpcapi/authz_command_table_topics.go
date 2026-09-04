@@ -144,4 +144,6 @@ var systemActionVerbCommand = map[string]string{
 	"dhcp-renew":         "request dhcp renew",
 	"dynamic-dns-update": "request system dynamic-dns update",
 	"dynamic-dns-check":  "request system dynamic-dns check",
+	"rescue-save":        "request system configuration rescue save",
+	"rescue-delete":      "request system configuration rescue delete",
 }

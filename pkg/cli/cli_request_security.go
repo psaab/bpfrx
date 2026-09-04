@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/psaab/xpf/pkg/policymatch"
 	"github.com/psaab/xpf/pkg/wgkey"
 )
 
@@ -58,20 +59,11 @@ func (c *CLI) handleRequestSecurityPolicies(args []string) error {
 		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].Children["security"].Children["policies"].Children))
 		return nil
 	}
-	cfg := c.store.ActiveConfig()
-	if cfg == nil {
-		fmt.Println("no active configuration")
-		return nil
-	}
-	findings := analyzePolicyShadowing(cfg)
-	if len(findings) == 0 {
-		fmt.Println("Policy check complete: no shadowed or redundant policies detected.")
-		return nil
-	}
-	fmt.Printf("Policy check complete: %d issue(s) detected.\n\n", len(findings))
-	for _, f := range findings {
-		fmt.Println(f)
-	}
+	// #8597 K47: the ANALYSIS and its RENDERING both live in pkg/policymatch
+	// now, because the remote `cli` serves this verb through a gRPC ShowText
+	// topic that runs the same two functions. Two surfaces printing the same
+	// command must not each own a copy of the header line.
+	fmt.Print(policymatch.RenderPolicyCheck(c.store.ActiveConfig()))
 	return nil
 }
 
