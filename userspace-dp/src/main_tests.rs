@@ -5867,3 +5867,69 @@ fn carry_forward_follows_binding_identity_not_slot_7497() {
         );
     }
 }
+
+// #8640 (found while censusing #8612): the OTHER HALF of a cross-language
+// agreement. The Go half is
+// `pkg/config/nat_port_floor_sync_sentinel_8640_test.go`.
+//
+// `build_synced_session_entry` reads a zero translated port off the sync wire
+// as "this session has no port translation":
+//
+//	let nat_src_port = if req.nat_src_port != 0 { Some(req.nat_src_port) } else { None };
+//
+// That inference is sound ONLY because a source pool can never allocate port 0
+// — enforced in Go, by `parseSourcePoolPortRange`'s `n < 1` rejection, in
+// another package and another language, with nothing connecting the two except
+// these two tests.
+//
+// This pins THIS side of the agreement: the mapping is exactly
+// `0 -> None, n -> Some(n)`. If someone changes it (say, to carry an explicit
+// has-translation flag on the wire, which is what #4088 did for the allocator's
+// equivalent heuristic), this reds and the Go-side comment about what depends on
+// the floor stops being true — which is the point. Neither half can move
+// silently.
+#[test]
+fn a_zero_translated_port_means_no_translation_on_the_sync_wire_8640() {
+    let base = || SessionSyncRequest {
+        operation: "upsert".to_string(),
+        addr_family: libc::AF_INET as u8,
+        protocol: 6,
+        src_ip: "10.0.61.102".to_string(),
+        dst_ip: "172.16.80.200".to_string(),
+        src_port: 40000,
+        dst_port: 5201,
+        ingress_zone: "lan".to_string(),
+        egress_zone: "wan".to_string(),
+        owner_rg_id: 1,
+        egress_ifindex: 5,
+        nat_src_ip: "172.16.80.8".to_string(),
+        ..SessionSyncRequest::default()
+    };
+
+    // ZERO on the wire => None. This is the branch the Go floor protects.
+    let mut req = base();
+    req.nat_src_port = 0;
+    let entry = build_synced_session_entry(&req, &test_zone_name_to_id(), 0)
+        .expect("synced session entry (zero port)");
+    assert_eq!(
+        entry.decision.nat.rewrite_src_port, None,
+        "a zero nat_src_port must read as NO port translation. If this changed, \
+         pkg/config's port-floor agreement test is now describing a dependency \
+         that no longer exists — update both halves together"
+    );
+
+    // POSITIVE CONTROL: a real port must survive as Some(n). Without it, a
+    // build that dropped rewrite_src_port entirely would satisfy the assertion
+    // above, and this whole agreement would be pinning a field nothing sets.
+    let mut req = base();
+    req.nat_src_port = 51000;
+    let entry = build_synced_session_entry(&req, &test_zone_name_to_id(), 0)
+        .expect("synced session entry (real port)");
+    assert_eq!(
+        entry.decision.nat.rewrite_src_port,
+        Some(51000),
+        "a NON-zero nat_src_port must survive as the translated port; without \
+         this row the zero-case assertion is satisfied by a path that never \
+         sets rewrite_src_port at all"
+    );
+}
