@@ -418,13 +418,112 @@ def _max_or_none(values: List[int]) -> Optional[int]:
     return max(values) if values else None
 
 
+# The three phases a starved coroutine's time can be attributed to, and the
+# ONE place their names are written. `coroutine_diagnostic_record` builds the
+# `max_<phase>` keys from this tuple and `attribute_starvation` reads them back
+# through the same tuple, so a rename cannot desync producer from consumer.
+#
+# That desync is not hypothetical bookkeeping: if the consumer's lookup missed,
+# it would find no attribution, fall through to "cannot attribute", and
+# invalidate the rep — restoring #8277's defect silently while every test that
+# does not exercise the attribution stays green.
+ATTRIBUTION_PHASES = ("read_us", "sleep_overshoot_us", "drain_us")
+
+# Of those, the one that is the SERVER-SIDE echo path. Time here is the thing
+# the gate exists to measure. The other two are client-side: `sleep_overshoot_us`
+# is timer wake delay in the probe's own event loop, `drain_us` is local socket
+# backpressure. See attribute_starvation.
+SERVER_SIDE_PHASE = "read_us"
+
+
+def phase_max_key(phase: str) -> str:
+    """The `coroutines[]` diagnostic key holding the per-coroutine max of `phase`."""
+    return f"max_{phase}"
+
+
+def attribute_starvation(diag: dict) -> Optional[str]:
+    """Which phase dominates this coroutine's worst transaction.
+
+    Returns the phase name, or None when the record cannot support an
+    attribution (a coroutine that completed nothing records no phase maxima).
+
+    #8277. The degenerate-coroutine rule invalidates any rep in which a
+    coroutine completed fewer than half the median number of transactions. It
+    was written against a CLIENT-SIDE artifact — a coroutine starved by the
+    probe's own event loop is measuring the probe, not the firewall — and for
+    that it is correct.
+
+    But it was applied as a VALIDITY predicate while being a FAIRNESS predicate,
+    and a mouse-latency gate under elephant load exists to detect a tail. When
+    the tail is CONCENTRATED — a minority of flows starved while the rest are
+    fine — the starved flows necessarily complete far fewer transactions, so the
+    rule fires on exactly the reps that demonstrate the phenomenon. A UNIFORM
+    slowdown still FAILs correctly (median moves with the min), so it is
+    specifically the concentrated shape that was unreachable, and the gate could
+    emit PASS and INSUFFICIENT-DATA but never FAIL.
+
+    The distinction is made from evidence the probe ALREADY records rather than
+    by deleting the rule — deleting it would re-admit the client-side artifact
+    it was written for. Comparing the three phase maxima is threshold-free on
+    purpose: an arbitrary cutoff is what got this instrument into trouble, and
+    the measured separation is not marginal (#8277 recorded read_us p99.9 of
+    740-1349 ms against sleep_overshoot 3.1-3.6 ms and drain 53-69 us — two
+    orders of magnitude, not a judgement call).
+    """
+    maxima = {
+        phase: diag.get(phase_max_key(phase))
+        for phase in ATTRIBUTION_PHASES
+    }
+    present = {p: v for p, v in maxima.items() if isinstance(v, int)}
+    if not present:
+        return None
+    return max(present, key=lambda p: present[p])
+
+
+def coroutine_diagnostic_record(
+    index: int,
+    attempted: int,
+    completed: int,
+    errors: int,
+    rtts_us: List[int],
+    phases: dict,
+) -> dict:
+    """One entry of the `coroutines[]` block.
+
+    Extracted from `_run` so a test can build a record the way production does
+    (#8277). The three ATTRIBUTION_PHASES keys are generated through
+    `phase_max_key`, which is also how `attribute_starvation` reads them: the
+    producer and the consumer of these names cannot drift apart, because there
+    is only one spelling of them.
+    """
+    record = {
+        "id": index,
+        "attempted": attempted,
+        "completed": completed,
+        "errors": errors,
+        "max_rtt_us": _max_or_none(rtts_us),
+        "max_connect_us": _max_or_none(phases.get("connect_us", [])),
+        "max_start_gap_us": _max_or_none(phases.get("start_gap_us", [])),
+    }
+    for phase in ATTRIBUTION_PHASES:
+        record[phase_max_key(phase)] = _max_or_none(phases.get(phase, []))
+    return record
+
+
 def compute_validity(
     concurrency: int,
     attempts_per_coroutine: List[int],
     completed: int,
     errors: int,
+    coroutine_diagnostics: Optional[List[dict]],
 ) -> dict:
-    """Apply the §4.2 validity gates. Pure function — easy to unit-test."""
+    """Apply the §4.2 validity gates. Pure function — easy to unit-test.
+
+    `coroutine_diagnostics` is the `coroutines[]` block from the same run. It
+    has NO default: a caller that cannot supply it must pass None explicitly and
+    thereby choose the pre-#8277 behaviour, because a default would let a new
+    call site silently reinstate the defect this function was changed to fix.
+    """
     reasons: List[str] = []
     attempted = sum(attempts_per_coroutine)
     # Internal consistency: each attempt is either completed or errored.
@@ -442,17 +541,70 @@ def compute_validity(
     error_rate = errors / max(1, attempted)
     if error_rate >= 0.01:
         reasons.append(f"error_rate={error_rate:.4f} >= 0.01")
+    starvation: dict = {}
     if concurrency >= 2:
         median_a = statistics.median(attempts_per_coroutine) if attempts_per_coroutine else 0
         min_a = min(attempts_per_coroutine) if attempts_per_coroutine else 0
         if median_a > 0 and min_a < 0.5 * median_a:
-            reasons.append(
-                f"degenerate-coroutine: min={min_a} < 0.5 * median={median_a}"
+            # #8277: starvation is established. WHY it happened decides whether
+            # this rep is evidence or an artifact.
+            starved = [
+                i for i, a in enumerate(attempts_per_coroutine)
+                if a < 0.5 * median_a
+            ]
+            diags = coroutine_diagnostics or []
+            by_phase: dict = {}
+            unattributable: List[int] = []
+            for i in starved:
+                diag = diags[i] if i < len(diags) else None
+                phase = attribute_starvation(diag) if isinstance(diag, dict) else None
+                if phase is None:
+                    unattributable.append(i)
+                else:
+                    by_phase.setdefault(phase, []).append(i)
+            client_side = sorted(
+                i
+                for phase, ids in by_phase.items()
+                if phase != SERVER_SIDE_PHASE
+                for i in ids
             )
+            starvation = {
+                "starved_coroutines": starved,
+                "median_attempts": median_a,
+                "min_attempts": min_a,
+                "attribution": {p: ids for p, ids in sorted(by_phase.items())},
+                "unattributable": unattributable,
+            }
+            if client_side or unattributable:
+                # ANY client-attributable or unattributable starved coroutine
+                # invalidates. That is the conservative direction and it keeps
+                # the original rule's full power over the artifact it was
+                # written for: a rep is only admitted when EVERY starved
+                # coroutine is demonstrably starved on the echo path.
+                detail = []
+                if client_side:
+                    detail.append(f"client-side={client_side}")
+                if unattributable:
+                    detail.append(f"unattributable={unattributable}")
+                reasons.append(
+                    f"degenerate-coroutine: min={min_a} < 0.5 * median={median_a}"
+                    f" ({', '.join(detail)})"
+                )
+            else:
+                # Every starved coroutine is dominated by the echo path. This
+                # is the concentrated tail the gate exists to detect, so the rep
+                # is VALID and the tail reaches the verdict.
+                starvation["verdict"] = "concentrated-tail-is-a-result"
     floor = 5000 if concurrency >= 10 else 500 if concurrency == 1 else 1000
     if attempted < floor:
         reasons.append(f"min-attempts: attempted={attempted} < floor={floor}")
-    return {"ok": not reasons, "reasons": reasons}
+    out = {"ok": not reasons, "reasons": reasons}
+    if starvation:
+        # Recorded whichever way it went, so a run that was ADMITTED despite
+        # starvation says so in probe.json rather than being indistinguishable
+        # from a run with no starvation at all.
+        out["starvation"] = starvation
+    return out
 
 
 async def _run(args: argparse.Namespace) -> dict:
@@ -531,21 +683,17 @@ async def _run(args: argparse.Namespace) -> dict:
         ]
         for name in phase_names
     }
-    coroutine_diagnostics = []
-    for i in range(args.concurrency):
-        phases = phase_per_coro[i]
-        coroutine_diagnostics.append({
-            "id": i,
-            "attempted": attempts[i],
-            "completed": len(rtts_per_coro[i]),
-            "errors": errors_per_coro[i][0],
-            "max_rtt_us": _max_or_none(rtts_per_coro[i]),
-            "max_connect_us": _max_or_none(phases["connect_us"]),
-            "max_drain_us": _max_or_none(phases["drain_us"]),
-            "max_read_us": _max_or_none(phases["read_us"]),
-            "max_start_gap_us": _max_or_none(phases["start_gap_us"]),
-            "max_sleep_overshoot_us": _max_or_none(phases["sleep_overshoot_us"]),
-        })
+    coroutine_diagnostics = [
+        coroutine_diagnostic_record(
+            i,
+            attempts[i],
+            len(rtts_per_coro[i]),
+            errors_per_coro[i][0],
+            rtts_per_coro[i],
+            phase_per_coro[i],
+        )
+        for i in range(args.concurrency)
+    ]
 
     return {
         "config": {
@@ -578,6 +726,7 @@ async def _run(args: argparse.Namespace) -> dict:
         },
         "validity": compute_validity(
             args.concurrency, attempts, completed, errors,
+            coroutine_diagnostics,
         ),
     }
 
