@@ -1078,6 +1078,7 @@ fn test_close_flags() {
         observed_tos: 0,
         observed_tcp_flags: 0,
         session_id: 0,
+        bulk_resync: false,
     };
     let flags = close_flags(&delta);
     assert_eq!(flags & FLAG_FABRIC_REDIRECT, FLAG_FABRIC_REDIRECT);

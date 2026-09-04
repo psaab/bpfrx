@@ -526,6 +526,28 @@ pub(crate) struct SessionDelta {
     /// means "unknown" (a synthesized delta with no backing entry) and keeps the
     /// legacy "session id absent" rendering on the wire.
     pub(crate) session_id: u64,
+    /// #8593: this delta is part of a BULK OWNER-RG EXPORT, not an incremental
+    /// state change — the loss-of-sync resync re-announcing a live session so a
+    /// peer can re-derive a complete snapshot.
+    ///
+    /// It exists so a DROP of this delta does not arm the loss-of-sync latch,
+    /// because that latch triggers the very export that produced it. The export
+    /// publishes through `flush_session_deltas` into the per-binding RPC-fallback
+    /// buffer, which the export's own chunked drain does not empty and which the
+    /// Go side polls on the ~5 s `DrainSessionDeltas` cadence — so the export
+    /// overflows it, re-arms, and exports again. Measured on
+    /// `loss:xpf-userspace-fw0`: 92% of 25.26M deltas dropped from 125,780 real
+    /// session creates, still running ~149k deltas/s with zero traffic and zero
+    /// active flows, ending only as the owned sessions aged out.
+    ///
+    /// Carried on the DELTA rather than passed at the flush call site
+    /// deliberately. The call-site form was written first and is a worse shape:
+    /// a new drain call site that passes the wrong flag SUPPRESSES a genuine
+    /// arm, silently. Here the producer sets it, there is exactly one producer
+    /// (`SessionTable::emit_open_delta_with_origin`, whose only production
+    /// caller is the worker loop's chunked export), and a new call site cannot
+    /// get it wrong because it does not choose.
+    pub(crate) bulk_resync: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

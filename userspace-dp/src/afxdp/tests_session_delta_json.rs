@@ -72,6 +72,7 @@ fn delta_with_session_id(session_id: u64) -> SessionDelta {
         observed_tos: 0,
         observed_tcp_flags: 0,
         session_id,
+        bulk_resync: false,
     }
 }
 

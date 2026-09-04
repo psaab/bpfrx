@@ -2386,6 +2386,7 @@ impl SessionTable {
                 observed_tos,
                 observed_tcp_flags,
                 session_id,
+                bulk_resync: false,
             });
         }
         true
