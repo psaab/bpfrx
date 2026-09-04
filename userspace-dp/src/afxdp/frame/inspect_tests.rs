@@ -754,8 +754,20 @@ fn shim_parse_l4_resolves_exactly_the_set_metadata_tuple_complete_accepts_6837()
          has its identity parsed and then DISCARDED; one the predicate accepts but that is \
          missing here is a 0/0 placeholder being treated as resolved"
     );
+    // #8274 RE-DECIDED, not relaxed. `parse_l4` grew a SIXTH tuple element — the
+    // shim's WireGuard transport-data classification — so the pinned catch-all
+    // literal changed shape and this assertion fired, exactly as its message
+    // demands. The re-decision: the new element is orthogonal to
+    // `metadata_tuple_complete`, which is about whether the 5-TUPLE identity was
+    // resolved (ports and protocol) and says nothing about a payload byte. The
+    // catch-all is still the 0/0 placeholder for every field the predicate reads;
+    // it now also says `false` — "not a WireGuard transport-data record" — which
+    // is correct for every non-UDP protocol that lands here. So the pin is
+    // updated to the new shape rather than loosened to a prefix match: a prefix
+    // match would stop seeing a future arm that made one of the 0s non-zero,
+    // which is the thing this assertion is for.
     assert!(
-        body.contains("_ => Some((l4_offset, 0, 0, 0, 0))"),
+        body.contains("_ => Some((l4_offset, 0, 0, 0, 0, false))"),
         "#6837: the shim's catch-all must still be the 0/0 PLACEHOLDER this predicate exists to \
          refuse. If it changed shape, `metadata_tuple_complete` needs re-deciding, not this \
          assertion relaxing"
