@@ -1284,8 +1284,45 @@ func loginClassAdvisoryWarnings(cfg *Config) []string {
 		// restrictive-regex business entirely and describes only the
 		// permission mapping.
 		warnings = append(warnings, msg)
+		// #8189: and, as a SEPARATE advisory, whether the class's deny pattern
+		// can ever fire on a registered dispatch surface. Separate rather than
+		// appended to msg because it answers a different question -- msg is
+		// about permission MAPPING, this is about whether a restriction the
+		// operator wrote reaches a surface -- and an operator grepping commit
+		// output for one should not have to read the other.
+		//
+		// Only emitted when the class actually compiled a deny pattern and at
+		// least one registered surface reports a non-empty command set; see
+		// UnenforceableDenySurfaces for why every ambiguous case is silence.
+		// OperationalLoginRegexesFor is the SAME entry point the gRPC
+		// authorization path uses, deliberately: a commit-time answer built
+		// from a second construction could disagree with the runtime one, and
+		// two answers to "can this pattern ever fire" is the confusion this
+		// advisory exists to remove.
+		if rules, ok, err := OperationalLoginRegexesFor(cfg, lc.Name); ok && err == nil {
+			if surfaces := UnenforceableDenySurfaces(rules); len(surfaces) > 0 {
+				if src, ok := rules.DenySource(); ok {
+					warnings = append(warnings, fmt.Sprintf(
+						"system login class %q: deny-commands %q matches no command in the "+
+							"REGISTERED command set of %s, so it cannot restrict %s there; it "+
+							"still applies on the on-box CLI. (The registered set is what those "+
+							"surfaces declare, not a census of everything they can dispatch.)",
+						lc.Name, src, strings.Join(surfaces, ", "),
+						pluralSurface(len(surfaces))))
+				}
+			}
+		}
 	}
 	return warnings
+}
+
+// pluralSurface keeps the #8189 advisory grammatical without a second format
+// string.
+func pluralSurface(n int) string {
+	if n == 1 {
+		return "that surface"
+	}
+	return "those surfaces"
 }
 
 // sshHardeningAdvisoryWarnings notes the SSH knobs xpf recognizes but does not
