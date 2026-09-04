@@ -2656,7 +2656,7 @@ fn a_sibling_workers_replica_carries_zero_counters_for_a_live_session_7919() {
     // `counters`.
     let mirrored = |table: &crate::session::SessionTable| -> (u64, u64) {
         let mut out = (0u64, 0u64);
-        table.iter_with_idle_budgeted(0, 4096, t0 + 1_000_000_000, |k, _d, md, _idle, c| {
+        table.iter_with_idle_budgeted(0, 4096, t0 + 1_000_000_000, |k, _d, md, _idle, c, _exp| {
             if md.is_reverse || *k != key {
                 return;
             }
