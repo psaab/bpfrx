@@ -46,6 +46,7 @@ func (d *Daemon) effectiveListeners() sysservices.Listeners {
 		ls.GRPC = sysservices.Listener{Addr: d.opts.GRPCAddr, State: sysservices.StateListening}
 	}
 	ls.HTTP = d.mgmt.Load().effectiveHTTPListener()
+	ls.HTTPS = d.mgmt.Load().effectiveHTTPSListener()
 	return ls
 }
 

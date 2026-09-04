@@ -15,7 +15,23 @@ func (m *Manager) syncSnapshotLocked() error {
 	if m.publishedSnapshot >= m.lastSnapshot.Generation {
 		return nil
 	}
-	if m.lastStatus.LastSnapshotGeneration >= m.lastSnapshot.Generation {
+	// #8597 K82: the catch-up below presupposes the helper is holding a snapshot
+	// THIS Manager published. `m.generation` is per-incarnation and lives only
+	// in memory (manager.go), so a generation number from a helper that
+	// outlived a daemon restart is not comparable to this incarnation's at all:
+	// a retained helper (process.go returns without restarting when the config
+	// is equal and the ping succeeds) keeps reporting the OLD incarnation's
+	// LastSnapshotGeneration, which is >= this Manager's first snapshot for any
+	// prior value. The branch would then mark that first snapshot published AND
+	// applied without ever sending it, and suppress the publish until the next
+	// commit moved the generation past the stale one.
+	//
+	// `publishedSnapshot != 0` is the evidence the branch was always missing:
+	// until this Manager has published something, no generation the helper
+	// reports says anything about what it holds. A fresh Manager therefore
+	// falls through to the publish path below, which is what the fresh-Manager
+	// path in manager_compile.go already does unconditionally.
+	if m.publishedSnapshot != 0 && m.lastStatus.LastSnapshotGeneration >= m.lastSnapshot.Generation {
 		// #1197 v7 (Codex code-review v6): status-loop catch-up
 		// path. Helper has the snapshot; mirror the FULL
 		// successful-apply_snapshot bookkeeping, otherwise

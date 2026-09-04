@@ -493,6 +493,24 @@ func (s *Server) EffectiveHTTPAddr() string {
 // The answer is listenerLeg.serving(), not `!= nil && !dead`: a leg that is
 // draining is not carrying traffic either, and a caller asking "did the bind
 // land?" must not be told yes by a leg on its way out.
+// EffectiveHTTPSAddr is the HTTPS counterpart of EffectiveHTTPAddr (#8597 K86).
+// It returns the ACTUAL bound HTTPS address, or "" when no HTTPS leg is bound
+// or the leg is dead — the same three-way read EffectiveHTTPAddr performs, for
+// the same reason: the reconciler's converged fingerprint records what the last
+// successful reconcile bound, which is not evidence the socket is still up.
+//
+// It exists because the management status surface reported the HTTP leg only,
+// so an HTTPS leg that died to an unexpected serve exit read as healthy
+// everywhere while serving nothing.
+func (s *Server) EffectiveHTTPSAddr() string {
+	s.lifeMu.Lock()
+	defer s.lifeMu.Unlock()
+	if !s.httpsLeg.serving() {
+		return ""
+	}
+	return s.httpsLeg.ln.Addr().String()
+}
+
 func (s *Server) HTTPSServing() bool {
 	s.lifeMu.Lock()
 	defer s.lifeMu.Unlock()
