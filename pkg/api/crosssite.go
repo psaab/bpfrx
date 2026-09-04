@@ -90,7 +90,22 @@ func crossSiteRejectReason(r *http.Request) (string, bool) {
 	}
 
 	// (b) Origin host must match the target.
-	if origin := r.Header.Get("Origin"); origin != "" && !strings.EqualFold(strings.TrimSpace(origin), "null") {
+	//
+	// #8597 (muse-004 K89): there is no `null` carve-out, and there was one.
+	// `Origin: null` is precisely what a browser sends from the contexts an
+	// attacker controls — a sandboxed iframe (`sandbox` without
+	// `allow-same-origin`), a `data:` or `file:` document, and a cross-origin
+	// redirect — so exempting it turned this check off for exactly the
+	// provenance it exists to detect. It also contradicted this file's own
+	// stated policy three paragraphs up: "Origin ... Rejected when present and
+	// its host:port differs from the target". `null` differs from every host.
+	//
+	// Failing closed costs nothing reachable: `sameHostAs("null", host)` parses
+	// to an empty host and returns false, a non-browser client (curl, the CLI, a
+	// scraper) sends no Origin header at all and is unaffected, and the
+	// management UI is same-origin. The only requests this newly rejects are the
+	// ones whose provenance is a sandboxed or opaque context.
+	if origin := r.Header.Get("Origin"); origin != "" {
 		if !sameHostAs(origin, r.Host) {
 			return "origin-mismatch", true
 		}
