@@ -364,6 +364,26 @@ type censusResult struct {
 	divergent []string
 	checked   int
 	skipped   map[string]int
+	// dropShape records, for each DIVERGENT site, what the compact spelling
+	// actually produced:
+	//
+	//	"empty"   the compiled config is identical to the stanza with an EMPTY
+	//	          body — the folded value contributed nothing at all.
+	//	"partial" it differs from both the block form and the empty stanza —
+	//	          something was read, but not what was written.
+	//
+	// #8662: this is the distinction a normalizer increment needs per SITE, and
+	// it used to exist only in a scratch probe. Recording it in the census, and
+	// emitting it into the inventory, means a lane widening the normalizer
+	// checks the shape of the site it is about to touch instead of inferring it
+	// from the family the site belongs to.
+	//
+	// It is also the safety rule made checkable: a site is only safe to
+	// normalize by truncating its tail once the tail is measured to reach no
+	// reader, and "empty" IS that measurement. "partial" means something DOES
+	// consume it, so truncating could take away a value that is currently
+	// being read.
+	dropShape map[string]string
 	// state records the outcome for EVERY site the census considered:
 	// "equivalent", "divergent", or a skip reason.
 	//
@@ -378,7 +398,7 @@ type censusResult struct {
 
 func runCompactBlockCensus(t *testing.T) censusResult {
 	t.Helper()
-	res := censusResult{skipped: map[string]int{}, state: map[string]string{}}
+	res := censusResult{skipped: map[string]int{}, state: map[string]string{}, dropShape: map[string]string{}}
 	for _, s := range collectCompactSites() {
 		siteKey := strings.Join(s.container, " ") + " " + s.leaf
 		if len(s.container) > 0 && strings.HasPrefix(s.container[0], "groups") {
@@ -419,6 +439,14 @@ func runCompactBlockCensus(t *testing.T) censusResult {
 		if !cfgEqual(cb1, cc) {
 			res.divergent = append(res.divergent, siteKey)
 			res.state[siteKey] = "divergent"
+			// #8662: classify WHAT the compact spelling produced. The empty
+			// stanza is the reference for "the folded value contributed
+			// nothing"; anything else means a reader consumed part of it.
+			shape := "partial"
+			if skel := compileText(t, nest(parent, ctx+stanza+" { }")); skel != nil && cfgEqual(cc, skel) {
+				shape = "empty"
+			}
+			res.dropShape[siteKey] = shape
 		} else {
 			res.state[siteKey] = "equivalent"
 		}
@@ -444,10 +472,51 @@ func readInventory(t *testing.T) (sites []string, wantChecked int) {
 			}
 			continue
 		}
-		sites = append(sites, line)
+		site, _ := splitInventoryLine(line)
+		sites = append(sites, site)
 	}
 	sort.Strings(sites)
 	return sites, wantChecked
+}
+
+// splitInventoryLine separates a site from its drop-shape marker.
+//
+// #8662: inventory lines carry a trailing TAB + shape ("empty" / "partial").
+// The gate's equality assertion compares SITES, so the marker is stripped here
+// and the assertion's meaning is unchanged — the shape is metadata about a
+// member, not part of the membership.
+//
+// Lines without a marker are accepted so the file stays readable if a marker is
+// ever hand-edited away; the shape is then "" and a caller must treat that as
+// UNKNOWN rather than as "partial". Defaulting an unknown to either value would
+// silently license or forbid a normalization on no evidence.
+func splitInventoryLine(line string) (site, shape string) {
+	if i := strings.IndexByte(line, '\t'); i >= 0 {
+		return strings.TrimSpace(line[:i]), strings.TrimSpace(line[i+1:])
+	}
+	return line, ""
+}
+
+// readInventoryShapes returns site -> drop shape for every line that carries a
+// marker. Intended for a lane widening the normalizer: check the shape of the
+// site you are about to touch rather than inferring it from its family.
+func readInventoryShapes(t *testing.T) map[string]string {
+	t.Helper()
+	raw, err := os.ReadFile(inventoryPath)
+	if err != nil {
+		t.Fatalf("read inventory: %v", err)
+	}
+	out := map[string]string{}
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if site, shape := splitInventoryLine(line); shape != "" {
+			out[site] = shape
+		}
+	}
+	return out
 }
 
 // TestCompactBlockEquivalenceInventory2419 is the #2419 class gate.
