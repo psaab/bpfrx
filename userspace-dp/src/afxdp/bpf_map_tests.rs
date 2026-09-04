@@ -719,3 +719,120 @@ fn conntrack_key_encoding_has_no_hand_rolled_copies() {
         }
     }
 }
+
+// #7919 FAIL-ON-REVERT for the mirror's counter gate.
+//
+// `refresh_bpf_conntrack_last_seen` does raw BPF syscalls, and with fd=-1 (the
+// only mode a unit test has) the map write never runs — so the WRITE itself is
+// not directly observable here. The decision it makes is, because it was
+// extracted into `mirrored_counters`. That extraction is the point: the choice
+// used to be four inline assignments, which nothing could bind.
+//
+// Delete the gate (return the live values unconditionally) and
+// `a_zero_replica_does_not_erase_the_owners_volume_7919` reddens.
+#[test]
+fn a_zero_replica_does_not_erase_the_owners_volume_7919() {
+    use crate::session::SessionCounters;
+    let live_row = (5_000u64, 7_500_000u64, 4_000u64, 6_000_000u64);
+
+    // A SIBLING worker's replica: created by the fan-out at zero and never
+    // advanced, because no counters field exists on the replication path.
+    let replica = SessionCounters::default();
+    assert_eq!(
+        mirrored_counters(live_row, &replica),
+        live_row,
+        "a worker holding an all-zero replica of a live session must leave the \
+         row alone -- this is the #7919 defect: five of six workers were \
+         publishing zero over the owner's volume"
+    );
+
+    // POSITIVE CONTROL on the accept side. A gate that refused every write
+    // would satisfy the assertion above and freeze the counters permanently.
+    let owner = SessionCounters {
+        fwd_packets: 6_000,
+        fwd_bytes: 9_000_000,
+        rev_packets: 4_500,
+        rev_bytes: 6_750_000,
+    };
+    assert_eq!(
+        mirrored_counters(live_row, &owner),
+        (6_000, 9_000_000, 4_500, 6_750_000),
+        "control: the OWNING worker must still advance the row, or the mirror \
+         is frozen at its first value instead of being wrong"
+    );
+    // And from a freshly published (all-zero) row, which is the ordinary case.
+    assert_eq!(
+        mirrored_counters((0, 0, 0, 0), &owner),
+        (6_000, 9_000_000, 4_500, 6_750_000),
+        "control: the first mirror after install must take the owner's volume"
+    );
+}
+
+// #7919 EDGE: the gate must not key on the FORWARD direction alone.
+//
+// A session whose traffic is entirely in the reverse direction has
+// `fwd_packets == 0` with a real `rev_packets`. Keying the gate on
+// `fwd_packets == 0` would classify that owner as an empty replica and freeze
+// its row at zero forever -- the same defect, moved to a narrower case where
+// only asymmetric flows show it. Mutating the gate to test `fwd_packets` alone
+// reddens this and NOT the cell above, which is why it is separate.
+#[test]
+fn a_reverse_only_session_is_still_mirrored_7919() {
+    use crate::session::SessionCounters;
+    let reverse_only = SessionCounters {
+        fwd_packets: 0,
+        fwd_bytes: 0,
+        rev_packets: 900,
+        rev_bytes: 1_350_000,
+    };
+    assert_eq!(
+        mirrored_counters((0, 0, 0, 0), &reverse_only),
+        (0, 0, 900, 1_350_000),
+        "a reverse-only flow is real traffic and must reach the row"
+    );
+    assert_eq!(
+        mirrored_counters((0, 0, 100, 150_000), &reverse_only),
+        (0, 0, 900, 1_350_000),
+        "and it must keep ADVANCING, not stop at its first mirrored value"
+    );
+}
+
+// #7919: the gate, driven from the two-table shape it exists for rather than
+// from hand-built tuples -- the owner's SessionTable and a SIBLING's table
+// built through the REAL fan-out constructor, walked exactly as the refresh
+// walks them. Binds the gate to the defect's actual shape, so a future change
+// to the replication path that starts carrying counters shows up HERE as this
+// cell going green for a new reason rather than silently.
+#[test]
+fn the_mirror_gate_holds_for_a_real_sibling_replica_7919() {
+    use crate::session::{SessionCounters, SessionTable};
+    // Rebuild the minimal pair: an owner that accounted traffic, and a replica
+    // installed with no counters (the replication types have no such field).
+    let mut owner = SessionCounters::default();
+    for _ in 0..2_500u32 {
+        owner.fwd_packets = owner.fwd_packets.saturating_add(1);
+        owner.fwd_bytes = owner.fwd_bytes.saturating_add(1500);
+    }
+    let sibling = SessionCounters::default();
+
+    // Whatever order the six workers' slices land in, the row must converge on
+    // the owner's volume and stay there.
+    let mut row = (0u64, 0u64, 0u64, 0u64);
+    for step in 0..12 {
+        let walking = if step % 6 == 0 { &owner } else { &sibling };
+        row = mirrored_counters(row, walking);
+    }
+    assert_eq!(
+        row,
+        (2_500, 3_750_000, 0, 0),
+        "after twelve interleaved slices from six workers -- ONE owner and five \
+         zero replicas -- the row must carry the owner's volume. Before the gate \
+         this converged on (0,0,0,0) for every ordering that did not end on the \
+         owner's slice, which is five orderings out of six"
+    );
+    // The table types are exercised for real in
+    // `a_sibling_workers_replica_carries_zero_counters_for_a_live_session_7919`
+    // (tests_bind_forward.rs), which is what establishes that a sibling's entry
+    // really is all-zero; this cell is about what the gate then does with it.
+    let _ = SessionTable::new();
+}

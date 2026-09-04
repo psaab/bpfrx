@@ -2523,3 +2523,176 @@ fn subnet_directed_broadcast_is_never_locally_delivered_8061() {
          reaches (#8061)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #7919 DEFECT PIN — why a live transit session reports `Pkts: 0, Bytes: 0`.
+//
+// NOT a pacing/staleness problem. The mirror refresh
+// (`refresh_bpf_conntrack_last_seen`) is budgeted and paced to a ~10s window,
+// and a first reading of this issue attributed the zeros to a session being
+// listed before its first slice. That cannot be the cause, on the issue's own
+// recorded data: three samples at t=8/22/38s all read zero when one full cycle
+// is ~6.4s, and EXACTLY ONE row in the listing carried a live counter while
+// the rest read zero — a cursor sweep covers every slab slot in a cycle, so it
+// cannot leave all-but-one frozen.
+//
+// The mechanism is STRUCTURAL, and this cell is its necessary and sufficient
+// precondition:
+//
+//  1. a local transit install fans the session to EVERY worker
+//     (`replicate_session_upsert`, `poll_descriptor/mod.rs`; the doc on
+//     `handle_upsert_synced` says "fanned out to every worker");
+//  2. the replication types carry NO COUNTERS AT ALL — neither
+//     `SyncedSessionEntry` (afxdp/worker/mod.rs) nor `SessionInstall`
+//     (session/ctx.rs) has a counters field — so a sibling's copy is created
+//     at ZERO and nothing on that path can ever advance it. Only
+//     `account_packet` advances counters, and it runs on the worker the flow's
+//     packets actually land on;
+//  3. EVERY worker runs `refresh_bpf_conntrack_last_seen` over its OWN table
+//     (`worker/loop_body/mod.rs`), not gated to the owner;
+//  4. `iter_with_idle_budgeted` yields every slab record with NO origin filter
+//     and the refresh closure skips only `metadata.is_reverse`;
+//  5. publish and refresh build the BPF key with the SAME
+//     `bpf_session_key_v4(..)` from the same session key, so a sibling's
+//     lookup HITS the owner's row and the `BPF_EXIST` update succeeds.
+//
+// So N workers write one BPF row and N-1 of them write zeros. On the loss
+// userspace cluster N is 6 (six combined RX queues, `ethtool -l`), so five
+// writers out of six publish zero over the owner's live value. That reproduces
+// what pacing cannot: zeros that persist far past one cycle, and per-flow
+// variation on a single path — worker ownership varies by RSS while the config
+// does not.
+//
+// This cell pins (2) — the half that makes it structural rather than a race.
+// It builds the OWNER's table and a SIBLING's table for the SAME key through
+// the REAL replication constructor and asserts they disagree about the value
+// the mirror refresh assigns.
+#[test]
+fn a_sibling_workers_replica_carries_zero_counters_for_a_live_session_7919() {
+    let key = SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+        src_port: 40180,
+        dst_port: 5201,
+        discriminator: Default::default(),
+        routing_domain: 0,
+    };
+    let decision = SessionDecision {
+        resolution: lookup_forwarding_resolution(
+            &build_forwarding_state(&nat_snapshot()),
+            IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+        ),
+        nat: NatDecision::default(),
+    };
+    let metadata = SessionMetadata {
+        ingress_zone: TEST_LAN_ZONE_ID,
+        egress_zone: TEST_WAN_ZONE_ID,
+        ingress_ifindex: 0,
+        ingress_vlan_id: 0,
+        owner_rg_id: 1,
+        fabric_ingress: false,
+        is_reverse: false,
+        nat64_reverse: None,
+        log_session_init: false,
+        log_session_close: false,
+        policy_id: 0,
+        inactivity_timeout_ns: None,
+        policy_counter_idx: 0,
+        policy_counter: None,
+    };
+    let t0 = 1_000_000_000u64;
+
+    // ---- the OWNING worker: install, then account real traffic ----
+    let mut owner = crate::session::SessionTable::new();
+    assert!(owner.install_with_protocol(
+        key.clone(),
+        decision,
+        metadata.clone(),
+        t0,
+        PROTO_TCP,
+        0x10,
+    ));
+    const PACKETS: u64 = 5_000;
+    for _ in 0..PACKETS {
+        owner.account_packet(&key, 1500, 0x10, 0);
+    }
+
+    // ---- a SIBLING worker: the same session, through the REAL replica path ----
+    let replicated = synced_replica_entry(&SyncedSessionEntry {
+        key: key.clone(),
+        decision,
+        metadata: metadata.clone(),
+        origin: SessionOrigin::ForwardFlow,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+        generation: 0,
+        session_id: 0,
+    });
+    let mut sibling = crate::session::SessionTable::new();
+    assert!(
+        sibling.upsert_synced_with_origin(
+            crate::session::SessionInstall {
+                key: replicated.key.clone(),
+                decision: replicated.decision,
+                metadata: replicated.metadata.clone(),
+                origin: replicated.origin,
+                now_ns: t0,
+                protocol: replicated.protocol,
+                tcp_flags: replicated.tcp_flags,
+                session_id: replicated.session_id,
+            },
+            false,
+        ),
+        "a worker that does not own the flow has no local entry for the key, so \
+         the fan-out replica installs — the reject at install.rs:332 fires only \
+         against a LOCALLY-owned incumbent"
+    );
+
+    // ---- what the mirror refresh would write, from each table ----
+    // Collected exactly as `refresh_bpf_conntrack_last_seen` does: walk with
+    // `iter_with_idle_budgeted`, skip only `metadata.is_reverse`, take
+    // `counters`.
+    let mirrored = |table: &crate::session::SessionTable| -> (u64, u64) {
+        let mut out = (0u64, 0u64);
+        table.iter_with_idle_budgeted(0, 4096, t0 + 1_000_000_000, |k, _d, md, _idle, c| {
+            if md.is_reverse || *k != key {
+                return;
+            }
+            out = (c.fwd_packets, c.fwd_bytes);
+        });
+        out
+    };
+    let (owner_pkts, owner_bytes) = mirrored(&owner);
+    let (sibling_pkts, sibling_bytes) = mirrored(&sibling);
+
+    // POSITIVE CONTROL. Without this the zero below is indistinguishable from
+    // "the walk found nothing", which is the same character as the defect.
+    assert_eq!(
+        (owner_pkts, owner_bytes),
+        (PACKETS, PACKETS * 1500),
+        "control: the OWNING worker's table must carry the live volume, or the \
+         sibling's zero proves nothing"
+    );
+
+    // THE DEFECT. Both tables hold a FORWARD entry under the SAME key, so both
+    // are refreshed into the SAME BPF row (`bpf_session_key_v4` is built from
+    // the session key at both the publish and the refresh site). The sibling's
+    // is zero and can never become anything else: no counters field exists on
+    // `SyncedSessionEntry` or `SessionInstall` to carry them, and
+    // `account_packet` only runs where the packets land.
+    assert_eq!(
+        (sibling_pkts, sibling_bytes),
+        (0, 0),
+        "DEFECT PIN (#7919): the sibling worker's replica of a live session \
+         carries zero counters, and its mirror refresh writes those zeros over \
+         the owner's live values for the same BPF conntrack row"
+    );
+    assert!(
+        !replicated.metadata.is_reverse,
+        "and the replica is a FORWARD entry, so the refresh's only skip \
+         (`metadata.is_reverse`) does not exclude it — if this ever becomes \
+         true the mechanism above changes and this cell must be re-derived"
+    );
+}
