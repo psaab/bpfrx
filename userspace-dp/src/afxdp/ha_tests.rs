@@ -1689,7 +1689,7 @@ fn purge_remapped_tunnel_sessions_records_drop_on_lossless_failure() {
     let (sender, _rx) = crate::event_stream::EventStreamSender::test_sender(false, 16);
     coordinator.event_stream = Some(sender);
 
-    let purged = coordinator.purge_remapped_tunnel_sessions(&[7]);
+    let purged = coordinator.purge_remapped_tunnel_sessions(&[7], &ForwardingState::default());
 
     // The local delete still happened and the count is accurate for the local
     // purge (the count is purely local; propagation failure is recorded
@@ -1731,7 +1731,7 @@ fn purge_remapped_tunnel_sessions_no_drop_on_lossless_success() {
     let (sender, rx) = crate::event_stream::EventStreamSender::test_sender(true, 16);
     coordinator.event_stream = Some(sender);
 
-    let purged = coordinator.purge_remapped_tunnel_sessions(&[7]);
+    let purged = coordinator.purge_remapped_tunnel_sessions(&[7], &ForwardingState::default());
 
     assert_eq!(
         purged, 1,
@@ -2029,7 +2029,7 @@ fn tunnel_remap_purge_still_purges_on_poisoned_shared_mutex_6653_sweep() {
 
     poison_shared_synced(&coordinator);
 
-    let purged = coordinator.purge_remapped_tunnel_sessions(&[7]);
+    let purged = coordinator.purge_remapped_tunnel_sessions(&[7], &ForwardingState::default());
     assert_eq!(
         purged, 1,
         "the #1873 R-D remapped-tunnel purge silently did NOTHING on a poisoned \
@@ -4282,4 +4282,259 @@ fn stop_inner_empties_the_forwarding_table_that_a_released_lock_would_expose_720
          reads it live (#8171), and an import that landed in the window is only \
          reachable afterwards because this map survives"
     );
+}
+
+
+// ===== #8138: the tunnel-remap purge must release the import-time reservation
+
+/// A snapshot carrying the pool-SNAT rule, optionally owning tunnel id 7.
+///
+/// Both states are built by the PRODUCTION builder from these snapshots, so the
+/// allocator carryover (`Arc::clone` in `forwarding_build`) is the real one —
+/// which is the whole reason a release against the NEW state reaches the
+/// reservation the OLD state minted.
+fn purge8138_snapshot(with_tunnel: bool) -> ConfigSnapshot {
+    use crate::ConfigSnapshot;
+    use crate::protocol::snapshot::TunnelEndpointSnapshot;
+    let mut snap = ConfigSnapshot::default();
+    snap.source_nat_rules = vec![crate::SourceNATRuleSnapshot {
+        name: "pool-snat".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "p".to_string(),
+        pool_addresses: vec!["203.0.113.1/32".to_string()],
+        port_low: 1024,
+        port_high: 65535,
+        ..crate::SourceNATRuleSnapshot::default()
+    }];
+    if with_tunnel {
+        snap.tunnel_endpoints = vec![TunnelEndpointSnapshot {
+            id: 7,
+            interface: "gr-0/0/0.0".to_string(),
+            ifindex: 77,
+            mode: "gre".to_string(),
+            outer_family: "inet".to_string(),
+            source: "10.1.1.1".to_string(),
+            destination: "10.1.1.2".to_string(),
+            ..Default::default()
+        }];
+    }
+    snap
+}
+
+fn purge8138_entry(src_port: u16, pool_port: u16, tunnel_id: u16) -> SyncedSessionEntry {
+    let mut e = reserve6600_entry(src_port, pool_port);
+    e.decision.resolution.tunnel_endpoint_id = tunnel_id;
+    e
+}
+
+/// True when `pool_port` is still held: a DIFFERENT flow naming the same
+/// translated tuple cannot reserve it.
+fn purge8138_port_held(
+    allocs: &std::sync::Arc<crate::nat::InterfaceNatAllocators>,
+    rules: &[crate::nat::SourceNatRule],
+    src_port: u16,
+    pool_port: u16,
+    now_ns: u64,
+) -> bool {
+    let probe = purge8138_entry(src_port, pool_port, 7);
+    !crate::nat::reserve_synced_source_nat_allocation_untracked(
+        allocs,
+        rules,
+        &probe.key,
+        probe.decision.nat,
+        probe.metadata.is_reverse,
+        None,
+        now_ns,
+    )
+}
+
+/// #8138 on the REAL refresh path: a tunnel-remap purge must free the pool port
+/// the coordinator reserved when it imported the session.
+///
+/// This drives `refresh_runtime_snapshot` — a production entry point — rather
+/// than calling the purge with a hand-picked forwarding. That distinction is the
+/// point of the test: #8124's removed repair worked in a fixture and freed
+/// nothing in production, because the state its caller actually held was never
+/// checked. Here the argument the purge receives is chosen by the production
+/// code, so a call site that reverts to a state holding no allocators reds this.
+#[test]
+fn tunnel_remap_purge_releases_untracked_reservation_on_refresh_8138() {
+    let mut coordinator = Coordinator::new();
+    coordinator.forwarding =
+        crate::afxdp::forwarding_build::build_forwarding_state(&purge8138_snapshot(true));
+    coordinator.validation.snapshot_installed = true;
+    assert!(
+        coordinator.forwarding.tunnel_endpoints.contains_key(&7),
+        "precondition: the prior forwarding must OWN tunnel id 7, or the refresh \
+         has no remap to purge and every assertion below passes vacuously. This \
+         fired on the first draft: the snapshot row was dropped by the builder \
+         for want of a parseable source/destination."
+    );
+    register_test_worker_7209(&mut coordinator);
+
+    let allocs = std::sync::Arc::clone(&coordinator.forwarding.iface_nat_allocators);
+    let rules = coordinator.forwarding.source_nat_rules.clone();
+
+    let entry = purge8138_entry(41000, 50100, 7);
+    let key = entry.key.clone();
+    coordinator.upsert_synced_session(entry);
+
+    assert!(
+        purge8138_port_held(&allocs, &rules, 41001, 50100, 1_000),
+        "precondition: the import must have taken the reservation — without it \
+         every assertion below passes by never exercising anything"
+    );
+    assert_eq!(
+        coordinator.tunnel_purge_reservations_released_total(),
+        0,
+        "nothing has been purged yet"
+    );
+
+    // The remap: the same config, tunnel id 7 gone. The pool rule SURVIVES, as
+    // it does in the field — a tunnel remap does not delete the NAT pool.
+    coordinator
+        .refresh_runtime_snapshot(&purge8138_snapshot(false))
+        .expect("refresh must succeed");
+
+    assert!(
+        !synced6600_contains(&coordinator, &key),
+        "the remapped session must be purged"
+    );
+    assert!(
+        !purge8138_port_held(&allocs, &rules, 41002, 50100, 2_000),
+        "#8138: the purge must RELEASE the import-time reservation. It is taken \
+         as NatHolder::Untracked, which contributes no holder bit, so the \
+         teardown sweeps -- which clear BITS -- free nothing against it and the \
+         (pool_addr, port) is held for the life of the allocator."
+    );
+    assert_eq!(
+        coordinator.tunnel_purge_reservations_released_total(),
+        1,
+        "exactly one reservation was stranded and exactly one was released"
+    );
+}
+
+/// The #8124 trap, made executable: releasing against the forwarding the
+/// RECONCILE caller holds frees nothing, and must therefore count nothing.
+///
+/// `coordinator/reconcile/snapshot.rs` runs the purge after `stop_inner(false)`
+/// has DEFAULTED `coord.forwarding` — no rules, no allocators. #8124 originally
+/// drove the release there; it freed nothing AND incremented the repair counter,
+/// reporting a repair that did not happen. It was removed before merge rather
+/// than shipped.
+///
+/// This cell is the negative control for that counter. It pins BOTH halves: the
+/// port stays held (so the caller cannot claim the leak is closed) and the
+/// counter stays 0 (so it cannot claim a repair). A counter incremented on
+/// attempt rather than on outcome passes the first half and fails here.
+#[test]
+fn purge_release_against_defaulted_forwarding_frees_nothing_and_counts_nothing_8138() {
+    let mut coordinator = Coordinator::new();
+    coordinator.forwarding =
+        crate::afxdp::forwarding_build::build_forwarding_state(&purge8138_snapshot(true));
+    register_test_worker_7209(&mut coordinator);
+
+    let allocs = std::sync::Arc::clone(&coordinator.forwarding.iface_nat_allocators);
+    let rules = coordinator.forwarding.source_nat_rules.clone();
+
+    coordinator.upsert_synced_session(purge8138_entry(41010, 50110, 7));
+    assert!(
+        purge8138_port_held(&allocs, &rules, 41011, 50110, 1_000),
+        "precondition: the reservation must be held"
+    );
+
+    // Exactly what the reconcile caller would pass if it read `self.forwarding`.
+    let purged = coordinator.purge_remapped_tunnel_sessions(&[7], &ForwardingState::default());
+
+    assert_eq!(purged, 1, "the session is still purged — this is about the port");
+    assert!(
+        purge8138_port_held(&allocs, &rules, 41012, 50110, 2_000),
+        "a release against a DEFAULTED forwarding has no allocators to free from"
+    );
+    assert_eq!(
+        coordinator.tunnel_purge_reservations_released_total(),
+        0,
+        "#8138/#8124: a repair that freed nothing must not be COUNTED. An \
+         operator reading a non-zero repair count here would conclude the leak \
+         is being handled while every port stayed held."
+    );
+}
+
+/// Negative control: a purged session that never took a reservation must not
+/// move the counter. Without this, a counter incremented once per purged
+/// session — rather than once per actual free — passes every cell above.
+#[test]
+fn purge_of_a_session_without_snat_counts_no_release_8138() {
+    let mut coordinator = Coordinator::new();
+    coordinator.forwarding =
+        crate::afxdp::forwarding_build::build_forwarding_state(&purge8138_snapshot(true));
+    register_test_worker_7209(&mut coordinator);
+
+    // Same session shape, but no source-NAT rewrite: nothing was ever reserved.
+    let mut entry = purge8138_entry(41020, 50120, 7);
+    entry.decision.nat.rewrite_src = None;
+    entry.decision.nat.rewrite_src_port = None;
+    coordinator.upsert_synced_session(entry);
+
+    let purged = coordinator.purge_remapped_tunnel_sessions(
+        &[7],
+        &coordinator.forwarding.clone(),
+    );
+
+    assert_eq!(purged, 1, "the session is purged");
+    assert_eq!(
+        coordinator.tunnel_purge_reservations_released_total(),
+        0,
+        "a session with no NAT rewrite reserved nothing, so there is nothing to \
+         release and nothing to count"
+    );
+}
+
+/// Bind the ARGUMENT both production call sites pass.
+///
+/// The cells above drive `refresh_runtime_snapshot`, which is one of the two
+/// call sites. The other — `coordinator/reconcile/snapshot.rs` — runs after
+/// worker teardown and cannot be stood up in a unit test, so nothing executable
+/// covers it. That is exactly the site where the argument matters most:
+/// `stop_inner(false)` has defaulted `coord.forwarding`, so reverting this
+/// argument to `&coord.forwarding` restores the #8124 behaviour (frees nothing)
+/// while every executable cell stays green.
+///
+/// A source assertion is the honest instrument available. It is keyed on the
+/// ARGUMENT, not on the call being present, and it carries a positive control:
+/// if the function name itself stops appearing, the pattern is wrong rather than
+/// the argument missing.
+#[test]
+fn both_purge_call_sites_release_against_new_forwarding_8138() {
+    for (path, src) in [
+        (
+            "coordinator/reconcile/snapshot.rs",
+            include_str!("coordinator/reconcile/snapshot.rs"),
+        ),
+        (
+            "coordinator/snapshot_refresh.rs",
+            include_str!("coordinator/snapshot_refresh.rs"),
+        ),
+    ] {
+        // POSITIVE CONTROL first: a file that no longer calls the purge at all
+        // would satisfy the argument assertion vacuously.
+        assert!(
+            src.contains("purge_remapped_tunnel_sessions("),
+            "positive control failed: {path} no longer calls \
+             purge_remapped_tunnel_sessions at all, so this cell is checking \
+             nothing. The call moved or was renamed — fix the pattern, do not \
+             delete the assertion."
+        );
+        assert!(
+            src.contains("purge_remapped_tunnel_sessions(&tunnel_purge_ids, &new_forwarding)"),
+            "#8138: {path} must release against `new_forwarding`. Releasing \
+             against `coord.forwarding`/`self.forwarding` is the #8124 defect: \
+             at the reconcile call site `stop_inner(false)` has already \
+             DEFAULTED it, so the release frees nothing while looking like a \
+             repair. `new_forwarding` carries the same allocators by Arc::clone, \
+             which is why it reaches the reservation."
+        );
+    }
 }

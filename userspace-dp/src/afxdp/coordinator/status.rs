@@ -324,6 +324,14 @@ impl super::Coordinator {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// #8138: import-time `Untracked` reservations the tunnel-remap purge
+    /// actually freed. See `tunnel_purge_reservations_released`.
+    pub fn tunnel_purge_reservations_released_total(&self) -> u64 {
+        self.sessions
+            .tunnel_purge_reservations_released
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// #5674: total peer-synced session imports rejected by the coordinator's
     /// aggregate admission bound (`upsert_synced_session`). Locally-created
     /// sessions are capped per worker at `DEFAULT_MAX_SESSIONS`; peer-synced

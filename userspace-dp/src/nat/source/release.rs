@@ -43,7 +43,10 @@ pub(crate) fn release_source_nat_allocation(
     nat: NatDecision,
     is_reverse: bool,
     now_ns: u64,
-) {
+) -> bool {
+    // #8138: returns whether a reservation was actually freed, so the tunnel-remap
+    // purge can count repairs it performed rather than repairs it attempted.
+    // Statement-position callers are unaffected.
     release_source_nat_allocation_with_mode(
         iface_allocs,
         rules,
@@ -53,7 +56,7 @@ pub(crate) fn release_source_nat_allocation(
         now_ns,
         false,
         NatHolder::Untracked,
-    );
+    )
 }
 
 /// #6211 F2: release THIS worker's hold on a source-NAT allocation.
@@ -180,12 +183,18 @@ fn release_source_nat_allocation_with_mode(
     now_ns: u64,
     rollback: bool,
     holder: NatHolder,
-) {
+) -> bool {
+    // #8138: report whether anything was ACTUALLY freed. A caller that counts a
+    // repair it did not perform is worse than one that counts nothing — the
+    // operator gets a number that says the leak is being handled while the port
+    // stays held. `release_flow` / `rollback_flow` already return exactly this
+    // (false unless `live_by_flow[flow].translated` matches), so the signal was
+    // present and discarded.
     if is_reverse {
-        return;
+        return false;
     }
     let Some(rewrite_src) = nat.rewrite_src else {
-        return;
+        return false;
     };
     // #5269: a PAT decision carries its translated port in `rewrite_src_port`; an
     // ADDRESS-ONLY decision (`port no-translation` / port-less) leaves it unset
@@ -265,15 +274,18 @@ fn release_source_nat_allocation_with_mode(
     // claimed. The correctness argument above is what justifies it — a leaked
     // `(pool_addr, port)` is permanent and counts against `max_tracked_flows`
     // until exhaustion, while the extra locks are bounded and per-teardown.
+    let mut freed = false;
     for rule in rules {
         if !rule.pool_mode {
             continue;
         }
         if rollback {
-            rule.pool_allocator
+            freed |= rule
+                .pool_allocator
                 .rollback_flow(flow, translated, now_ns, holder);
         } else {
-            rule.pool_allocator
+            freed |= rule
+                .pool_allocator
                 .release_flow(flow, translated, now_ns, holder);
         }
     }
@@ -293,9 +305,10 @@ fn release_source_nat_allocation_with_mode(
     // `allocate_interface_identity` stored in both cases.
     if let Some(alloc) = iface_allocs.allocator_if_present(rewrite_src) {
         if rollback {
-            alloc.rollback_flow(flow, translated, now_ns, holder);
+            freed |= alloc.rollback_flow(flow, translated, now_ns, holder);
         } else {
-            alloc.release_flow(flow, translated, now_ns, holder);
+            freed |= alloc.release_flow(flow, translated, now_ns, holder);
         }
     }
+    freed
 }

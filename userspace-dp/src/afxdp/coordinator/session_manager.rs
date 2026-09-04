@@ -53,6 +53,11 @@ pub(in crate::afxdp) struct SessionManager {
     /// `WORKER_COMMAND_QUEUE_DROPS`, which counts every dropped command of any
     /// kind.
     pub(in crate::afxdp) delete_dropped_released: AtomicU64,
+    /// #8138: import-time `Untracked` reservations released by the tunnel-remap
+    /// purge. Incremented ONLY when the release actually freed a record — a
+    /// counter that also counted attempts would report the leak as handled
+    /// while the port stayed held.
+    pub(in crate::afxdp) tunnel_purge_reservations_released: AtomicU64,
     /// #7209: peer-synced imports whose `(from_zone, to_zone)` pair could not
     /// be resolved locally, so the source-NAT reservation was booked WITHOUT
     /// #6211's zone narrowing.
@@ -206,6 +211,7 @@ impl SessionManager {
             synced_reverse_rederived: AtomicU64::new(0),
             delete_stale_ignored: AtomicU64::new(0),
             delete_dropped_released: AtomicU64::new(0),
+            tunnel_purge_reservations_released: AtomicU64::new(0),
             import_cap_drops: AtomicU64::new(0),
             import_unknown_routing_domain: AtomicU64::new(0),
             import_reserve_refused: AtomicU64::new(0),
