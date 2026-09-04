@@ -123,6 +123,42 @@ type natRuleSetKey struct{ from, to string }
 type natSessionCounts struct {
 	total           int64
 	ruleSetSessions map[natRuleSetKey]int64
+	// #8321 finding 16: sessions aggregated by INGRESS zone alone, across
+	// every egress zone.
+	//
+	// `ruleSetSessions` is keyed {ingressZone, egressZone} from the session's
+	// real zones, and a DESTINATION rule-set has no `to` clause -- the
+	// compiler calls only applyNATFromScope, so `rs.ToZone` is always "". A
+	// real session's egress zone is never "", so the {FromZone, ""} lookup
+	// could never match and GetNATDestination returned an EMPTY
+	// RuleSetSessions on every call, whatever the traffic.
+	//
+	// A source rule-set does carry a to-zone, so it keeps the pair key. This
+	// index exists for the zone-pair-less case rather than replacing it.
+	fromZoneSessions map[string]int64
+}
+
+// ruleSetSessionCount resolves the active-session count for one NAT rule-set.
+//
+// #8321 finding 16: the resolution rule lives here, in ONE place that both
+// GetNATDestination and its tests call. A test that reimplemented the two-step
+// lookup would pass against a production copy that had changed — the defect
+// this fixes was itself a lookup key that no longer matched what the writer
+// produced, and reproducing that shape in the test would be a poor way to
+// guard it.
+//
+// A rule-set that NAMES an egress zone keeps the tighter pair key. Only a
+// rule-set with no `to` clause falls back to the from-zone aggregate, so a
+// future to-bearing destination rule-set is not silently widened.
+func (c natSessionCounts) ruleSetSessionCount(fromZone, toZone string) (int64, bool) {
+	if cnt, ok := c.ruleSetSessions[natRuleSetKey{fromZone, toZone}]; ok {
+		return cnt, true
+	}
+	if toZone == "" {
+		cnt, ok := c.fromZoneSessions[fromZone]
+		return cnt, ok
+	}
+	return 0, false
 }
 
 func (s *Server) countSNATSessions(ctx context.Context, zoneByID map[uint16]string) natSessionCounts {
@@ -148,7 +184,8 @@ func (s *Server) countDNATSessions(ctx context.Context, zoneByID map[uint16]stri
 // count for a client that has already disconnected is not worth an error path.
 func (s *Server) countNATSessions(ctx context.Context, flag uint16, zoneByID map[uint16]string) natSessionCounts {
 	counts := natSessionCounts{
-		ruleSetSessions: make(map[natRuleSetKey]int64),
+		ruleSetSessions:  make(map[natRuleSetKey]int64),
+		fromZoneSessions: make(map[string]int64),
 	}
 	if !s.dataplaneLoaded() {
 		return counts
@@ -161,6 +198,9 @@ func (s *Server) countNATSessions(ctx context.Context, flag uint16, zoneByID map
 		counts.total++
 		if zoneByID != nil {
 			counts.ruleSetSessions[natRuleSetKey{zoneByID[ingressZone], zoneByID[egressZone]}]++
+			// #8321 finding 16: the same session, indexed by ingress zone alone,
+			// for rule-sets that do not name an egress zone.
+			counts.fromZoneSessions[zoneByID[ingressZone]]++
 		}
 	}
 

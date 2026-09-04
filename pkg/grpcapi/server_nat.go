@@ -115,8 +115,19 @@ func (s *Server) GetNATDestination(ctx context.Context, _ *pb.GetNATDestinationR
 		counts := s.countDNATSessions(walkCtx, zoneByID)
 		resp.TotalActiveTranslations = clampInt32(counts.total)
 		for _, rs := range cfg.Security.NAT.Destination.RuleSets {
-			key := natRuleSetKey{rs.FromZone, rs.ToZone}
-			if cnt, ok := counts.ruleSetSessions[key]; ok {
+			// #8321 finding 16: a DESTINATION rule-set has no `to` clause, so
+			// `rs.ToZone` is always "" while the pair index is keyed by the
+			// session's REAL egress zone -- which is never "". The pair lookup
+			// therefore never matched and this response's RuleSetSessions was
+			// empty on every call, whatever the traffic.
+			//
+			// With no egress zone to match on, the count for the rule-set is
+			// every session entering its from-zone, summed across egress zones.
+			// The pair lookup is kept for a rule-set that DOES name one, so a
+			// future to-bearing destination rule-set keeps the tighter key
+			// rather than silently widening to the from-zone total.
+			cnt, ok := counts.ruleSetSessionCount(rs.FromZone, rs.ToZone)
+			if ok {
 				resp.RuleSetSessions = append(resp.RuleSetSessions, &pb.NATRuleSetSessions{
 					FromZone: rs.FromZone,
 					ToZone:   rs.ToZone,
