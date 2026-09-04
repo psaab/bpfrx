@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
-	"time"
 
 	"github.com/psaab/xpf/pkg/config"
 )
@@ -127,8 +126,13 @@ func (m *Manager) UpdateConfig(cfg *config.ClusterConfig) {
 	}
 
 	// Update heartbeat parameters.
-	if cfg.HeartbeatInterval > 0 {
-		m.hbInterval = time.Duration(cfg.HeartbeatInterval) * time.Millisecond
+	// #8642: `> 0` cannot see wrap — the residue is positive by construction.
+	// A wrapped heartbeat interval is a 64ns ticker on the HA control channel,
+	// which is CLAUDE.md's "adding a new control socket request at >1/s will
+	// starve session installs" with the rate set to ~1.5e7/s. Out-of-range
+	// falls back to the existing default rather than clamping to the maximum.
+	if d := config.MillisToDuration(cfg.HeartbeatInterval, 0); d > 0 {
+		m.hbInterval = d
 	}
 	if cfg.HeartbeatThreshold > 0 {
 		m.hbThreshold = cfg.HeartbeatThreshold
@@ -165,8 +169,10 @@ func (m *Manager) UpdateConfig(cfg *config.ClusterConfig) {
 		slog.Warn("cluster: invalid negative takeover hold time, using default immediate takeover",
 			"takeover_hold_time_ms", cfg.TakeoverHoldTime)
 	}
-	if cfg.TakeoverHoldTime > 0 {
-		m.takeoverHoldTime = time.Duration(cfg.TakeoverHoldTime) * time.Millisecond
+	// #8642: as above. A wrapped hold collapses to ~64ns, so takeover becomes
+	// immediate on exactly the configuration that asked for it not to be.
+	if d := config.MillisToDuration(cfg.TakeoverHoldTime, 0); d > 0 {
+		m.takeoverHoldTime = d
 	} else {
 		m.takeoverHoldTime = DefaultTakeoverHoldTime
 	}

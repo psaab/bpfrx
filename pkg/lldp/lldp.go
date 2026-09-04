@@ -322,7 +322,11 @@ func (m *Manager) Apply(ctx context.Context, cfg *LLDPConfig) (unresolved []stri
 	lldpCtx, cancel := context.WithCancel(ctx)
 	m.cancel = cancel
 
-	interval := time.Duration(cfg.Interval) * time.Second
+	// #8642: bounded at the conversion. The old `interval <= 0` check below is
+	// blind to overflow — past MaxDurationSeconds the multiply wraps to a
+	// 512ns-multiple POSITIVE residue, which sails through it and makes txLoop
+	// emit an LLDP frame every 512ns on every configured interface.
+	interval := config.SecondsToDuration(cfg.Interval, 0)
 	if interval <= 0 {
 		interval = defaultInterval
 	}

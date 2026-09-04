@@ -14,6 +14,8 @@ import (
 
 	"github.com/insomniacslk/dhcp/dhcpv4"
 	"github.com/insomniacslk/dhcp/dhcpv4/nclient4"
+
+	"github.com/psaab/xpf/pkg/config"
 )
 
 // runDHCPv4 runs the DHCPv4 acquisition and renewal cycle. The initial
@@ -31,9 +33,16 @@ func (m *Manager) runDHCPv4(ctx context.Context, ifaceName string) {
 	opts := m.v4opts[ifaceName]
 	m.mu.Unlock()
 
+	// #8642: the schema leaf here is `ValidateIntegerMin(1)` — no ceiling at
+	// all — so this is the one site in the sweep reachable from an ORDINARY
+	// STRICT commit, without the tolerant-ingress argument. The harm is bounded
+	// (`backoff = min(backoff*2, 60s)` climbs out in ~27 doublings, so it is a
+	// microsecond-scale burst rather than a storm), which is why it is fixed
+	// here rather than by adding a schema ceiling that would reject configs the
+	// runtime handles.
 	baseBackoff := time.Second
-	if opts != nil && opts.RetransmissionInterval > 0 {
-		baseBackoff = time.Duration(opts.RetransmissionInterval) * time.Second
+	if opts != nil {
+		baseBackoff = config.SecondsToDuration(opts.RetransmissionInterval, time.Second)
 	}
 	maxAttempts := 0 // unlimited
 	if opts != nil && opts.RetransmissionAttempt > 0 {
