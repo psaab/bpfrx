@@ -39,6 +39,23 @@ package dataplane
 // cross-node scrub. Neither implication holds.
 // `TestCompanionResetAndNodeLocalScrubAreDifferentRules7917` pins the divergence.
 
+// NO CALLER IN TREE SINCE #8015, AND THAT IS THE POINT. #8015 deleted the Go
+// control plane's explicitly built reverse companion (`mirrorSessionPairV4` /
+// `...V6`): the session mirror sends the forward alone and the Rust helper
+// synthesizes the companion itself, at import, against live node-local state.
+// The RULE this file states did not go with it — it moved to
+// `synthesized_synced_reverse_entry` (`userspace-dp/src/afxdp/shared_ops.rs`),
+// which sets `ingress_ifindex: 0` / `ingress_vlan_id: 0` for the same reason
+// and is pinned by
+// `synthesized_synced_reverse_entry_carries_no_ingress_identity_7917`.
+//
+// This declaration stays because the rule is the part worth keeping: the census
+// test below pins its divergence from `ScrubNodeLocal`, so a future node-local
+// field cannot silently become a companion reset or vice versa, and anything in
+// `pkg/dataplane` that builds a companion again has one correct answer to reach
+// for instead of a fresh hand-written list. That is exactly the failure #7097
+// documents.
+
 // ResetUnobservedForReverseCompanion clears every field that records something
 // the REVERSE direction has not observed yet. Call it on the copy destined to
 // become a forward session's reverse companion, after the zone swap.

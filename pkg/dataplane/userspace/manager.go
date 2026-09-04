@@ -327,21 +327,8 @@ type Manager struct {
 	// oversubscribed look unfit to take over. Atomic because it is read by the
 	// status path without m.mu.
 	syncedImportRefusals atomic.Uint64
-	// sessionPairOrphanedReverse counts pair transmits that left the helper
-	// holding a reverse-only entry: the forward was REFUSED by the helper (an
-	// application error, not a transport failure) while the explicit reverse
-	// was applied (#7179).
-	//
-	// The mirror is best-effort by design and its IPC error stays discarded —
-	// the periodic session sync reconciles a transient miss. That is correct
-	// for a pair the helper never applied, and wrong for one it half applied,
-	// and the two were indistinguishable because the result was dropped on the
-	// floor. A wholly-undelivered pair self-heals; a lone reverse is residue no
-	// later transmit necessarily corrects. Atomic because the status path reads
-	// it without m.mu.
-	sessionPairOrphanedReverse atomic.Uint64
-	deferWorkers               bool // skip worker spawn until NotifyLinkCycle
-	xskBoundNotified           bool // OnXSKBound fired at most once
+	deferWorkers         bool // skip worker spawn until NotifyLinkCycle
+	xskBoundNotified     bool // OnXSKBound fired at most once
 	// pendingWorkerArm records "generation debt" from a deferred-MAC
 	// re-apply that failed to publish (#5134). After a live RETH
 	// virtual-MAC change with no link cycle, the first apply publishes a

@@ -32,6 +32,31 @@ pub enum SyncedImportOutcome {
     RejectedCapacity,
     /// #6600: the translated NAT tuple could not be reserved for this import.
     RejectedReserve,
+    /// #8015: the request carried `is_reverse=true` with no forward of its own.
+    ///
+    /// A reverse entry is DERIVED state, never standalone authority. Every
+    /// legitimate reverse companion in this map is produced HERE, by
+    /// `synthesized_synced_reverse_entry` riding with the forward it was
+    /// derived from — so an entry arriving pre-flagged is either a redundant
+    /// duplicate of one this node will build better (it resolves egress/FIB,
+    /// fabric/tunnel and owner-RG against live node-local state, #5698) or, if
+    /// its forward was refused, a permit with nothing to anchor it.
+    ///
+    /// The unanchored case is the reason this refuses rather than deduplicates.
+    /// `delete_synced_session_gen` derives the companion to remove from the
+    /// STORED FORWARD; with no stored forward, a later delete of that forward
+    /// finds nothing and the reverse survives it, idling out only when
+    /// `reap_expired_sessions` collects it. Refusing at the door is what makes
+    /// that state unreachable instead of merely counted.
+    ///
+    /// No shipped daemon can produce this: #8015 also removed the one sender
+    /// (`mirrorSessionPairV4`/`V6`'s explicit companion pre-install), and the
+    /// peer path never reached here — Go's `SetClusterSyncedSessionV4`/`V6`
+    /// early-return on a reverse and write only the BPF mirror. So the refusal
+    /// gets no counter of its own: a metric that can only ever read zero says
+    /// nothing, and the typed outcome already reaches the caller as
+    /// `synced-import-refused:standalone-reverse`.
+    RejectedStandaloneReverse,
     /// #7160 (#2387): this node runs routing instances, and the request named
     /// no ingress identity to resolve the session's routing DOMAIN from.
     ///
@@ -65,6 +90,7 @@ impl SyncedImportOutcome {
             SyncedImportOutcome::RejectedStaleGeneration => Some("stale-generation"),
             SyncedImportOutcome::RejectedCapacity => Some("capacity"),
             SyncedImportOutcome::RejectedReserve => Some("reserve"),
+            SyncedImportOutcome::RejectedStandaloneReverse => Some("standalone-reverse"),
             SyncedImportOutcome::RejectedUnknownRoutingDomain => Some("unknown-routing-domain"),
         }
     }
@@ -287,6 +313,21 @@ impl crate::afxdp::Coordinator {
     }
 
     pub fn upsert_synced_session(&self, entry: SyncedSessionEntry) -> SyncedImportOutcome {
+        // #8015: refuse a STANDALONE reverse. This runs before every other
+        // decision below because none of them apply to an entry that must not
+        // be imported at all — and because the cap gate deliberately skips
+        // reverse keys (`!entry.metadata.is_reverse`), which is what let the
+        // old lone-reverse publish past a full map as the documented "+1
+        // orphan".
+        //
+        // The reverse companion of every forward imported here is built by
+        // `synthesized_synced_reverse_entry` a few lines down and published
+        // with its forward, so nothing this function admits ever needs a
+        // caller-supplied reverse. See `RejectedStandaloneReverse` for why the
+        // unanchored case cannot be cleaned up after the fact.
+        if entry.metadata.is_reverse {
+            return SyncedImportOutcome::RejectedStandaloneReverse;
+        }
         // #7209: ONE snapshot of the worker set for this whole import.
         //
         // Three decisions below ask about the workers — the admission cap, the
@@ -367,34 +408,36 @@ impl crate::afxdp::Coordinator {
         // forwards occupy 2K entries. With the entry cap at 2N (N = the logical
         // ceiling), a NEW forward is rejected exactly when 2K >= 2N ⇔ K >= N:
         // a full symmetric-peer set (N logical → 2N entries) EXACTLY fits and
-        // only a peer EXCEEDING its own logical ceiling is rejected. Gate ONLY
-        // FORWARD new keys (`!entry.metadata.is_reverse`): a synthesized reverse
-        // always rides with its forward (a rejected forward `return`s BEFORE
-        // publishing its reverse, so no half-sync), and a lone reverse import is
-        // never independently rejected at a boundary slot — it inserts one entry
-        // that its forward already accounted for.
+        // only a peer EXCEEDING its own logical ceiling is rejected.
         //
-        // #6413: that lone reverse does NOT arrive "off the wire from a peer" —
-        // a peer-received reverse never reaches this function at all. Go's
-        // `SetClusterSyncedSessionV4`/`V6` (`pkg/dataplane/userspace/
-        // manager_sessions.go`) early-returns on `!shouldMirrorUserspaceSession(
-        // val.IsReverse)` and writes ONLY the BPF mirror, so only FORWARD peer
-        // imports transit the helper — which then synthesizes their reverse
-        // companion locally (`synthesized_synced_reverse_entry`). The only
-        // `is_reverse=1` entry that reaches this gate is the LOCAL mirror
-        // companion `mirrorSessionPairV4`/`V6` (#310) pre-install as a
-        // SEPARATE upsert, dispatched through
-        // `server/handlers/sync_session.rs`, which calls
-        // `upsert_synced_session` unconditionally for any `is_reverse`.
+        // #8015 CLOSED THE "+1 ORPHAN" CORNER THIS GATE USED TO DOCUMENT. The
+        // gate keys on `!entry.metadata.is_reverse`, so a lone `is_reverse=1`
+        // import used to skip it and publish as a bounded orphan with no
+        // matching forward whenever the map was AT the cap and its own forward
+        // was cap-rejected. #6413 assessed that as self-inflicted and low-harm,
+        // which it was — the tuple and the decision were the FORWARD's own, so
+        // it admitted the reply direction of a flow this node had itself just
+        // adjudicated — but it could OUTLIVE its forward:
+        // `delete_synced_session_gen` derives the companion to remove from the
+        // STORED forward, and after a refusal there is no stored forward, so a
+        // later delete of that forward removed nothing and the reverse idled
+        // out on its own.
         //
-        // #6413 corner, documented rather than implied away: if the shared
-        // `synced` map is AT the 2N entry cap and that local mirror's FORWARD is
-        // cap-rejected, its separate `is_reverse=1` companion still skips this
-        // forward-only gate and publishes as a bounded **+1 orphan** entry with
-        // no matching forward. Self-inflicted and bounded by the local session
-        // rate, low-harm, and explicitly NOT the peer-DoS vector this cap
-        // targets — the Go reverse filter above already excludes the peer path.
-        // So fwd/rev pairing at this boundary is not perfect, by construction.
+        // The standalone-reverse refusal at the top of this function removes
+        // that shape at its root, and #8015 removed its only sender as well
+        // (`mirrorSessionPairV4`/`V6`'s explicit companion pre-install). The
+        // peer path never reached here in the first place: Go's
+        // `SetClusterSyncedSessionV4`/`V6` early-return on
+        // `!shouldMirrorUserspaceSession(val.IsReverse)` and write ONLY the BPF
+        // mirror, so only FORWARD peer imports transit the helper, which then
+        // synthesizes their companion locally.
+        //
+        // The `!entry.metadata.is_reverse` conditions in the rest of this
+        // function are therefore redundant with that early return. They stay as
+        // belt-and-suspenders — the same posture as the #2170 delete-side
+        // generation guard, whose own comment records that nothing reaches it
+        // today — so that weakening or moving the early return degrades to the
+        // previous behaviour rather than to an unguarded publish.
         //
         // Drop-NEWEST: reject a NEW forward key at/above
         // the ceiling (never enqueue it to any worker), but ALWAYS allow a
