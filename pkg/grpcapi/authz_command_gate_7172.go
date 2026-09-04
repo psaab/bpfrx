@@ -233,15 +233,44 @@ var allCanonicalCommands = sync.OnceValue(func() []string {
 // enforced on the box, and refusing it would refuse a legitimate restriction
 // because one of two surfaces cannot see it. It is reported so the operator
 // knows which half of their posture it covers.
+// #8189: this surface registers what it can produce so the COMMIT-time
+// advisory in pkg/config can reason about it. The import direction forbids the
+// reverse — pkg/grpcapi imports pkg/config, and the tables cannot move because
+// showTextTopicCommand is derived from cmdtree, which imports pkg/config too.
+//
+// The registered name is what an operator sees in the commit warning.
+// grpcSurfaceName is the one spelling, used by both the registration and the
+// lookup below. A literal repeated in two places would let the delegation
+// silently stop finding its own surface after a rename.
+const grpcSurfaceName = "the gRPC surface"
+
+func init() {
+	config.RegisterCommandSurface(grpcSurfaceName, allCanonicalCommands)
+}
+
+// unenforceableDenyPatterns now DELEGATES to pkg/config rather than keeping its
+// own loop (#8189). Two implementations of "can this pattern ever fire" would
+// be two things to keep in agreement, and the authorization-path answer
+// disagreeing with the commit-path answer is precisely the confusion the
+// commit-time advisory exists to remove.
 func unenforceableDenyPatterns(rules config.CompiledLoginRegexes) []string {
 	src, ok := rules.DenySource()
 	if !ok {
 		return nil
 	}
-	for _, cmd := range allCanonicalCommands() {
-		if !rules.Evaluate(cmd).Allowed {
-			return nil
+	// Scoped to THIS surface, not "any registered surface". They are the same
+	// set while gRPC is the only registrant, and they stop being the same the
+	// moment a second one registers — at which point an unscoped check would
+	// quietly answer a different question than its name promises.
+	found := false
+	for _, name := range config.UnenforceableDenySurfaces(rules) {
+		if name == grpcSurfaceName {
+			found = true
+			break
 		}
+	}
+	if !found {
+		return nil
 	}
 	return []string{src}
 }
