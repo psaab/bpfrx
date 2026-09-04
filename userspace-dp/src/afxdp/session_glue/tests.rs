@@ -3455,6 +3455,78 @@ fn synthesized_synced_reverse_entry_preserves_fabric_ingress_and_reverse_flag() 
     );
 }
 
+// #7917, re-homed by #8015: the synthesized reverse companion must not carry
+// the FORWARD direction's ingress identity.
+//
+// The forward flow's ingress is a PREDICTION of where the reply will arrive,
+// not an OBSERVATION of where it did, and routing may be asymmetric — so 0
+// ("unobserved") is truthful and inheriting would make the row confidently
+// wrong. `pkg/dataplane/types.go` names the reverse companion as the first
+// legitimate-`0` population for exactly this reason.
+//
+// THIS CELL EXISTS BECAUSE THE GUARD MOVED. The invariant used to be pinned on
+// the Go side, over `mirrorSessionPairV4`/`V6`'s explicitly built companion and
+// its `ResetUnobservedForReverseCompanion()` call. #8015 deleted that companion
+// — the helper's is the only one now — so the assertion has to live over the
+// implementation that survived, or the rule would be stated in a doc comment
+// and enforced nowhere.
+//
+// THE FIXTURE MUST NOT USE THE VALUE THE BUG FALLS BACK TO. `test_metadata()`
+// carries `ingress_ifindex: 0`, so a companion that INHERITED the forward's
+// identity would still read 0 and this cell would be green for the defect. The
+// forward is given a non-zero identity here for that reason, and the forward's
+// own metadata is asserted UNCHANGED as the over-reach control: clearing the
+// identity on both halves would satisfy the companion assertion while
+// destroying the datum #4983 exists to provide.
+#[test]
+fn synthesized_synced_reverse_entry_carries_no_ingress_identity_7917() {
+    let forwarding = test_forwarding_state();
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+    let mut metadata = test_metadata();
+    metadata.ingress_ifindex = 4242;
+    metadata.ingress_vlan_id = 80;
+    let entry = SyncedSessionEntry {
+        key: test_key(),
+        decision: test_decision(),
+        metadata,
+        origin: SessionOrigin::SyncImport,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+        generation: 0,
+        session_id: 0,
+    };
+
+    let reverse = synthesized_synced_reverse_entry(
+        &forwarding,
+        &BTreeMap::new(),
+        &dynamic_neighbors,
+        &entry,
+        1,
+    )
+    .expect("reverse companion");
+
+    assert_eq!(
+        reverse.metadata.ingress_ifindex, 0,
+        "the synthesized companion inherited the FORWARD direction's ingress \
+         ifindex. Where the reply will arrive is a prediction, not an \
+         observation, and routing may be asymmetric, so this names a device on \
+         a guess (#7917)"
+    );
+    assert_eq!(
+        reverse.metadata.ingress_vlan_id, 0,
+        "the synthesized companion inherited the FORWARD direction's ingress \
+         VLAN (#7917)"
+    );
+    // Over-reach control: the FORWARD entry keeps its own identity.
+    assert_eq!(
+        entry.metadata.ingress_ifindex, 4242,
+        "the forward entry must keep its ingress identity — clearing it on both \
+         halves would satisfy the companion assertions above while destroying \
+         the datum #4983 exists to provide (#7917)"
+    );
+    assert_eq!(entry.metadata.ingress_vlan_id, 80);
+}
+
 // #4565: the synthesized reverse companion of a peer-PROMOTED NAT64 forward
 // session must inherit the forward session's `nat64_reverse` (original v6
 // src/dst). `build_nat64_forwarded_frame`'s reverse (v4->v6) branch hard-

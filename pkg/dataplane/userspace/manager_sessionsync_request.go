@@ -391,7 +391,7 @@ func findUserspaceEgressInterfaceSnapshot(snapshot *ConfigSnapshot, fibIfindex i
 // buildSessionSyncRequest{V4,V6}, which are themselves `...Locked`-contract
 // helpers reached with the manager mutex held — from SetClusterSyncedSessionV4/V6
 // (the peer-import path, via syncSessionV{4,6}Locked) and from
-// mirrorSessionPairV{4,6} (the local-install path). An earlier revision took
+// mirrorSessionV{4,6} (the local-install path). An earlier revision took
 // m.mu here, which SELF-DEADLOCKED on the non-reentrant sync.Mutex the moment a
 // session carried a non-zero fold — and it locked before reading the resolver,
 // so a nil resolver did not save it. The lock was never needed at this depth:

@@ -3082,7 +3082,7 @@ identical**; the relationship is pinned by
 
 ### Control-socket round-trip deadline (#4036)
 
-The Go sender (`requestDetailedLocked`, `pkg/dataplane/userspace/process.go`)
+The Go sender (`requestDetailedLocked`, `pkg/dataplane/userspace/process_control.go`)
 sets a single read/write deadline on the control connection covering the
 whole round-trip: write the request body, then block on the helper's JSON
 response. The helper reads the whole body, decodes it, **applies** it, and
@@ -3115,6 +3115,99 @@ socket and so already get the scaled deadline. Sizing math and a fail-on-revert
 round-trip (a slow-but-successful large apply that trips a fixed 3s but not the
 scaled deadline; a hung helper that still times out) are pinned by
 `control_socket_deadline_4036_test.go`.
+
+### Stop bound on control round trips (#8526)
+
+The scaled deadline above is generous on purpose, and that generosity collides
+with the unit's stop budget. `m.mu` is held across a control round trip by a
+whole CLASS of `*Manager` methods — **21** at the time of writing, including
+`UpdatePolicyScheduleState`, `UpdateRGActive`, `PublishRouteOverlaySnapshot`,
+`ensureProcessLocked`, and the 1 Hz `statusLoop` — so the reachable **67s**
+bound is also the reachable bound on how long anything can wait for `m.mu`.
+The count is not pinned in prose anywhere: a hand census written for this
+issue said sixteen and was already stale (it missed the #8121 idle-lease pair
+and three `manager_status.go` / `manager_sessions.go` methods), so
+`TestEveryControlCallerHoldsTheManagerMutex8526` recomputes and logs the list
+on every run. `TimeoutStopSec` is **20s**
+(`test/incus/xpfd.service`), a 3.35x overrun, and two stop paths wait on
+exactly that lock:
+
+- `Manager.Close` / `Manager.Teardown` take `m.mu` before `stopLocked`; and
+- `runShutdownSequence` calls `d.stopPolicySchedulerLoop()` early, which ends
+  in an **unbounded** `d.schedulerWg.Wait()`. The goroutine it joins is the
+  policy scheduler, whose `updateFn` is `UpdatePolicyScheduleState`. A tick
+  inside a 67s round trip stalls the whole shutdown sequence before FRR stop,
+  RA withdraw, VRRP stop and dp teardown have run at all.
+
+A SIGKILLed xpfd never reaches `disableCtrlBeforeTeardownLocked`, so the XDP
+shim is left `ctrl`-enabled redirecting transit into the XSK fds of a helper
+systemd is about to kill alongside it — transit blackholed until the next
+start.
+
+**The fix does not narrow any critical section.** Releasing `m.mu` around the
+round trip in `UpdatePolicyScheduleState` would fix one door out of 21 (one of
+the others runs every second), and the long hold is not
+incidental: that method builds the snapshot from manager state, publishes it,
+and commits `m.generation` / `m.lastSnapshot` / `m.publishedSnapshot` from the
+same critical section. Dropping the lock across the publish opens exactly the
+window where `m.policySchedulerActive` and the helper's live snapshot disagree
+— the #3780 stale-permit failure the error return exists to prevent.
+
+Instead, `m.mu` keeps its scope and the **I/O performed under it becomes short
+once a stop is in progress**. `Manager.BeginControlShutdown`
+(`control_shutdown_8526.go`) pulls every in-flight round trip's connection
+deadline in to `controlShutdownCutover` (500ms) and caps every round trip
+started afterwards at `controlShutdownCeiling` (= `controlBaseDeadline`, 3s, so
+it is a no-op for every small request the teardown itself issues and binds only
+on a large `apply_snapshot` that slipped past the daemon's apply fence). One
+site fixes the whole class, because every member reaches the socket through
+`requestDetailedLocked` — and `TestControlDeadlineHasExactlyOneSite8526`
+asserts, as an EXACT set rather than a lower bound, that no other function in
+the package sets a socket deadline of its own.
+
+**Lock order.** `ctrlIOMu` guards the in-flight connection set and the
+shutdown latch, and is a **leaf**: nothing holding it acquires `m.mu`, and the
+only legal order is `m.mu -> ctrlIOMu`. `BeginControlShutdown` takes `ctrlIOMu`
+alone, which is what lets it run — and cut the round trip — while another
+goroutine holds `m.mu` across that very round trip. Registration and
+`SetDeadline` happen under the same `ctrlIOMu` acquisition, so a cut cannot be
+overwritten by an arm that was already computing its deadline.
+
+**Callers, and why the latch is scoped.** There are two entry points, and the
+split matters:
+
+- `BeginControlShutdown` (cut **and** latch the ceiling) has exactly one
+  caller: `runShutdownSequence`, at the very top of the daemon teardown, ahead
+  of the `applySem` drain, `wg.Wait()`, and the `schedulerWg` join. The process
+  does not return from there, so the latch cannot outlive the stop.
+- `Manager.Close` and `Manager.Teardown` call `cutInFlightControlIO` — cut
+  only, **no latch** — before taking `m.mu` (armed after the acquisition it
+  could never run, because the acquisition is what is blocked).
+
+`Teardown` must not latch because it is **not terminal**: the bootstrap
+rollback (`enterBootstrapMode`, `pkg/daemon/bootstrap.go`) tears the dataplane
+down and deliberately keeps the object *"so a later confirmed commit re-arms
+it via `runBootstrapExitStartup`"*. A latch there would cap every subsequent
+apply at `controlShutdownCeiling` for the life of the daemon, re-opening the
+#4036 false timeout on the first feed-heavy commit after a bootstrap rollback.
+`Close` is treated the same way rather than reasoned about separately, because
+the argument for latching it is only that it happens to be terminal today.
+
+The daemon reaches `BeginControlShutdown` through an optional interface
+(`controlShutdownBounder`) against the `*LegacyDataPlaneAdapter` it actually
+holds, so the adapter's pass-through is load-bearing: without it the assertion
+silently stops matching and nothing fails to build.
+
+Pinned by `control_shutdown_8526_test.go` (in-flight cut, post-stop ceiling,
+the clamp firing *only* after a stop, the non-latching `Close`/`Teardown`
+contract, the leaf lock-order rule, the adapter pass-through, and the
+cut-before-lock ordering inside `Close`),
+`control_shutdown_census_8526_test.go` (every control caller holds `m.mu`;
+exactly one set of deadline sites), and
+`pkg/daemon/daemon_control_shutdown_8526_test.go` (the shutdown-sequence call
+site, its position ahead of the scheduler join, and compile-time assertions
+that both userspace types still satisfy the interface). Every behavioural cell
+is time-bounded, because the mutant fails by hanging.
 
 ## Limitations and Mixed Boundaries
 

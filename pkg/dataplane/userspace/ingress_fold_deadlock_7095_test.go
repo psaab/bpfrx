@@ -15,7 +15,7 @@ import (
 // held, from two directions:
 //
 //	SetClusterSyncedSessionV{4,6}  -> syncSessionV{4,6}Locked -> build...  (peer import)
-//	mirrorSessionPairV{4,6}                                   -> build...  (local install)
+//	mirrorSessionV{4,6}                                       -> build...  (local install)
 //
 // `m.mu` is a plain `sync.Mutex`, so that second acquire never returns. The
 // manager mutex is then held forever and every other manager operation blocks
@@ -84,11 +84,11 @@ func TestPeerImportWithIngressFoldDoesNotDeadlock7095(t *testing.T) {
 
 func TestLocalMirrorWithIngressFoldDoesNotDeadlock7095(t *testing.T) {
 	localMirror := func(m *Manager, key dataplane.SessionKey, val *dataplane.SessionValue) {
-		m.mirrorSessionPairV4(key, *val)
+		m.mirrorSessionV4(key, *val)
 	}
 	if !runWithFold(t, 0xABCD1234, localMirror) {
-		t.Error("mirrorSessionPairV4 wedged on a session carrying a non-zero " +
-			"IngressIfaceFold; it takes m.mu for the whole pair build (#7095)")
+		t.Error("mirrorSessionV4 wedged on a session carrying a non-zero " +
+			"IngressIfaceFold; it takes m.mu for the whole request build (#7095)")
 	}
 	if !runWithFold(t, 0, localMirror) {
 		t.Error("control: the fold==0 case must complete, or the cell above is not " +

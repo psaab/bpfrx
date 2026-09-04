@@ -164,7 +164,16 @@ func (m *Manager) requestDetailedLocked(req ControlRequest) (ControlResponse, er
 	// controlRoundtripDeadline keeps the 3s base for small requests (status
 	// poll stays responsive) and scales up for a large apply, capped so a hung
 	// helper still times out.
-	_ = conn.SetDeadline(time.Now().Add(controlRoundtripDeadline(len(body))))
+	//
+	// #8526: the deadline is applied through armControlIO rather than set
+	// directly, so a stop in progress can bound it. EVERY *Manager method that
+	// holds m.mu across a control round trip reaches the socket here, so this
+	// single site is what keeps a 67s hold from outrunning the unit's 20s
+	// TimeoutStopSec. See control_shutdown_8526.go; the census and the
+	// single-site property are asserted, not asserted-by-comment, in
+	// control_shutdown_census_8526_test.go.
+	m.armControlIO(conn, controlRoundtripDeadline(len(body)))
+	defer m.releaseControlIO(conn)
 	// Reuse the pre-flight-serialized body; the Rust receiver frames on a
 	// single trailing newline (json.Encoder appends one).
 	if _, err := conn.Write(append(body, '\n')); err != nil {
@@ -241,11 +250,12 @@ func (m *Manager) sessionSocketPath() string {
 // THIS round trip alone, so unrelated session-socket callers interleave freely
 // between consecutive calls. That is the right discipline for a bulk batch (a
 // delete chunk is up to sessionHelperDeleteChunk requests — holding sessionMu
-// across the whole chunk would starve live session installs), but NOT for a
-// forward/reverse pair, which must not be split. A caller that needs a group of
-// requests to reach the helper with nothing in between takes sessionMu itself
-// and drives requestSessionSyncLocked per request — see syncSessionPairLocked
-// (#5698).
+// across the whole chunk would starve live session installs), and since #8015
+// it is the discipline for EVERY session-socket caller: the local mirror sends
+// one upsert, so no group has to reach the helper with nothing in between. A
+// future caller that needs that takes sessionMu itself and drives
+// requestSessionSyncLocked per request, which is why the unlocked inner stays
+// separable.
 func (m *Manager) requestSessionSync(req ControlRequest) error {
 	m.sessionMu.Lock()
 	defer m.sessionMu.Unlock()

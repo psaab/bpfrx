@@ -14,6 +14,19 @@ import (
 // can never stall the whole stop past the drain budget.
 const applyCloseoutDrainTimeout = 5 * time.Second
 
+// controlShutdownBounder is implemented by a dataplane runtime that can bound
+// its own control-socket round trips once a stop has begun (#8526). The
+// userspace runtime does: it holds its manager mutex across a control round
+// trip whose reachable deadline is 67s, which is 3.35x this unit's
+// TimeoutStopSec=20.
+//
+// It is an OPTIONAL interface rather than a method on RuntimeDataPlane because
+// the bound is a property of the userspace helper's socket transport, not of
+// every backend — but that makes the assertion below silent when it stops
+// matching, so pkg/daemon asserts the concrete userspace types against this
+// interface at compile time in daemon_control_shutdown_8526_test.go.
+type controlShutdownBounder interface{ BeginControlShutdown() }
+
 // runShutdownSequence performs the ordered post-run teardown: abort in-flight
 // apply, stop the signal context, wait background goroutines, then tear down
 // SNMP/flowexport/feeds/RPM/archive/event-engine/ipmon/natpool-alarm/FRR/LLDP,
@@ -52,6 +65,29 @@ func (d *Daemon) runShutdownSequence(wg *sync.WaitGroup, stop func(), runErr err
 	// drain the LAST apply this process performs, which is what the drain has
 	// always been documented to be.
 	d.fenceBackgroundApplies()
+
+	// #8526: bound the dataplane control socket FIRST, ahead of everything
+	// below, because three separate waits in this function can be blocked by a
+	// goroutine holding the userspace manager mutex across a control round
+	// trip — and that round trip's reachable deadline is 67s against a 20s
+	// TimeoutStopSec:
+	//
+	//   - the applySem drain below (bounded at 5s, but 5s of the budget spent
+	//     waiting on a hold that will outlast the budget anyway);
+	//   - wg.Wait(), which is unbounded; and
+	//   - d.stopPolicySchedulerLoop(), which ends in an unbounded
+	//     d.schedulerWg.Wait() joining the goroutine whose updateFn IS
+	//     UpdatePolicyScheduleState — the site #8526 was filed against.
+	//
+	// Cutting an in-flight publish short here is consistent with what the rest
+	// of this prologue already does: applies are fenced and cancelled two
+	// lines below, so a publish still in flight belongs to an apply this
+	// sequence has already decided to abandon. The #5643 host-authorization
+	// closeout the drain protects is nft + local credentials, not dataplane
+	// control I/O, so it is unaffected.
+	if b, ok := d.dataplane().(controlShutdownBounder); ok {
+		b.BeginControlShutdown()
+	}
 
 	// #6788: stop the DHCP client's address-change notifications BEFORE the
 	// drain, so the drain is not racing a callback that is about to be armed.
