@@ -38,14 +38,27 @@ func TestCompactNormalizeScopePreservesCompiledResult8690(t *testing.T) {
 	var admitted, violating, disarmed, fixtureLimited []string
 	emptyEquivalent := 0
 	seamObserved := 0
+	// SKIP ACCOUNTING. Making admission behavioural gave this loop a failure
+	// mode the earlier version could not have: it drives real parses and
+	// compiles, so it can now SKIP a site — and a site it skipped is not a site
+	// it found safe. Reported per reason, and the in-scope bucket is an error,
+	// because that one is a site production DOES normalize and this cell did
+	// not examine. (Credit: lane-8015 found this shape in the partial-site
+	// guard when making it behavioural; it applies identically here.)
+	var unsynthesizable, unparsable []string
+	var inScopeUnexaminable []string
 	for _, s := range collectCompactSites() {
 		if len(s.container) == 0 || strings.HasPrefix(s.container[0], "groups") {
 			continue
 		}
 		parent := s.container[:len(s.container)-1]
 		stanza := s.container[len(s.container)-1]
+		siteKeyEarly := strings.Join(s.container, " ") + " " + s.leaf
 		v1, v2, ok := synthPair(s.node)
 		if !ok {
+			// No distinguishing pair of values, so scope cannot even be
+			// determined for this site — it is UNKNOWN, not safe.
+			unsynthesizable = append(unsynthesizable, siteKeyEarly)
 			continue
 		}
 		ctx := contextFor(parent)
@@ -70,6 +83,7 @@ func TestCompactNormalizeScopePreservesCompiledResult8690(t *testing.T) {
 		// model, no drift.
 		probe, perrs := NewParser(elidedText).Parse()
 		if len(perrs) > 0 || probe == nil {
+			unparsable = append(unparsable, siteKey)
 			continue
 		}
 		if normalizeCompactStanzas(probe) == 0 {
@@ -79,6 +93,10 @@ func TestCompactNormalizeScopePreservesCompiledResult8690(t *testing.T) {
 		cb2 := compileText(t, nest(parent, ctx+stanza+" { "+s.leaf+" "+v2+"; }"))
 		ce := compileText(t, nest(parent, ctx+stanza+" { }"))
 		if cb1 == nil || cb2 == nil || ce == nil {
+			// The pass DOES normalize this site (checked above), but a
+			// reference spelling would not compile, so the safety property
+			// could not be evaluated. That is the dangerous bucket.
+			inScopeUnexaminable = append(inScopeUnexaminable, siteKey)
 			continue
 		}
 		if cfgEqual(cb1, cb2) {
@@ -204,6 +222,30 @@ func TestCompactNormalizeScopePreservesCompiledResult8690(t *testing.T) {
 			len(violating), violating)
 	}
 
+	sort.Strings(inScopeUnexaminable)
+	if n := len(unsynthesizable) + len(unparsable); n > 0 {
+		t.Logf("#8690 scope walk skipped %d site(s) before scope could be "+
+			"determined (%d unsynthesizable, %d unparsable). Those are UNKNOWN "+
+			"to this cell, not safe — the same gap a behavioural guard acquires "+
+			"in exchange for not modelling the predicate.",
+			n, len(unsynthesizable), len(unparsable))
+	}
+	// The in-scope-but-unexaminable set is asserted for EQUALITY against a
+	// checked-in list, the same shape as the #2419 inventory itself: a new
+	// member reds because the pass started rewriting something this cell cannot
+	// see, and a member that becomes examinable ALSO reds, so the list cannot
+	// quietly outlive its reason. A bare threshold would permit both.
+	if diff := diffSiteSets8690(inScopeUnexaminable, knownUnexaminable8690); diff != "" {
+		t.Errorf("the set of sites the pass normalizes but this cell cannot "+
+			"EXAMINE has changed:\n%s\n"+
+			"Production rewrites these and the cell says nothing about them, so "+
+			"they are counted as neither safe nor unsafe — silence that reads "+
+			"as a clean scope. A NEW entry means a widening admitted a site "+
+			"whose reference spelling will not compile in isolation; give it a "+
+			"compilable fixture (a required sibling is usually missing) rather "+
+			"than adding it here. A REMOVED entry means one became examinable "+
+			"and the list should shrink (#8690).", diff)
+	}
 	if len(fixtureLimited) > 0 {
 		t.Logf("#8690: %d admitted site(s) could not have their gate status "+
 			"measured, because the census fixture's value fails a different "+
@@ -435,4 +477,60 @@ func TestElidedSSHRootLoginReachesTheDaemon8690(t *testing.T) {
 			"root-login, so this cell is not observing the pass and would stay " +
 			"green if the pass were removed (#8690)")
 	}
+}
+
+// knownUnexaminable8690 are sites the pass normalizes but whose reference
+// spelling does not compile in isolation, so the safety property cannot be
+// evaluated for them. They are NOT known-safe; they are known-unmeasured.
+//
+// Every entry needs a required sibling INSIDE the stanza that the synthesized
+// fixture does not supply — a three-color-policer with no rate block, an
+// ip-monitoring policy with no probe. That is the #8436 duplicate-block
+// dependency lane-8526 measured: the compact spelling cannot carry the sibling
+// and re-opening the instance does not merge, so these are unmeasurable by this
+// method until #8436 lands, not merely unfixtured.
+var knownUnexaminable8690 = []string{
+	"class-of-service fairness rss-expectation interface xpfarg queue",
+	"class-of-service fairness rss-expectation interface xpfarg queue xpfarg active-workers",
+	"class-of-service fairness rss-expectation interface xpfarg queue xpfarg at-least-active-workers",
+	"class-of-service fairness rss-expectation interface xpfarg queue xpfarg cstruct",
+	"class-of-service fairness rss-expectation interface xpfarg queue xpfarg cstruct-max",
+	"class-of-service fairness rss-expectation interface xpfarg queue xpfarg max-worker-flow-share",
+	"firewall three-color-policer",
+	"firewall three-color-policer xpfarg single-rate committed-burst-size",
+	"firewall three-color-policer xpfarg single-rate committed-information-rate",
+	"firewall three-color-policer xpfarg single-rate excess-burst-size",
+	"firewall three-color-policer xpfarg then loss-priority",
+	"firewall three-color-policer xpfarg two-rate committed-burst-size",
+	"firewall three-color-policer xpfarg two-rate committed-information-rate",
+	"firewall three-color-policer xpfarg two-rate peak-burst-size",
+	"firewall three-color-policer xpfarg two-rate peak-information-rate",
+	"services ip-monitoring policy xpfarg match rpm-probe",
+	"services ip-monitoring policy xpfarg then preferred-route route xpfarg next-hop",
+	"services ip-monitoring policy xpfarg then preferred-route routing-instance xpfarg route xpfarg next-hop",
+}
+
+// diffSiteSets8690 returns a human-readable difference between a measured set and an
+// expected one, or "" when they match.
+func diffSiteSets8690(got, want []string) string {
+	w := map[string]bool{}
+	for _, x := range want {
+		w[x] = true
+	}
+	g := map[string]bool{}
+	for _, x := range got {
+		g[x] = true
+	}
+	var b strings.Builder
+	for _, x := range got {
+		if !w[x] {
+			b.WriteString("  NEW (pass normalizes it, cell cannot see it): " + x + "\n")
+		}
+	}
+	for _, x := range want {
+		if !g[x] {
+			b.WriteString("  GONE (now examinable, drop from the list): " + x + "\n")
+		}
+	}
+	return b.String()
 }
