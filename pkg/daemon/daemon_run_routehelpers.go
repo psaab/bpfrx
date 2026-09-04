@@ -29,7 +29,71 @@ import (
 // (reth → physical member, st0.N verbatim, irb → bridge) would
 // silently activate binds 0a has never performed and needs its own
 // ratification.
-func riMemberLinuxName(tunMap map[string]string, ifaceName string) string {
+// logicalUnitDeviceKey is THE derivation of the kernel device name for one
+// configured logical unit, and the single source both sides of this file use.
+//
+// #8670-adjacent (#8597 K84/K85): the netdev for an 802.1Q sub-interface is
+// named for the unit's VLAN ID, not its unit number. `set interfaces ge-0-0-1
+// unit 10 vlan-id 100` is created by networkd as `ge-0-0-1.100`. #8321 finding
+// 07 fixed the PRODUCER of `connectedByLogical` to key on the VLAN ID and left
+// every CONSUMER deriving its lookup key with config.LinuxIfName(), which
+// yields the unit number — so the producer wrote `ge-0-0-1.100` and the
+// consumers looked up `ge-0-0-1.10` and missed. The consumers were not wrong
+// about their own rule; they were agreeing with the rule as it stood BEFORE
+// #8321. Extracting the rule is what stops the two sides drifting again.
+//
+// config.DHCPLeaseIfName looks similar and is NOT interchangeable: it has no
+// unit-number fallback, so an untagged `unit 3` yields `base` there and
+// `base.3` here. Its own doc calls unit number and VLAN ID "distinct concepts,
+// bridged only here" — the invariant these consumers were violating.
+//
+// Deliberately NOT config.ResolveKernelIfName either, which additionally
+// resolves reth -> local physical member and tunnel devices. The producer does
+// neither, so routing a consumer through it would make `reth0.50` resolve to a
+// physical member name the map is not keyed by — trading a miss for a
+// different miss.
+func logicalUnitDeviceKey(base string, unitNum int, unit *config.InterfaceUnit) string {
+	if unit != nil && unit.VlanID > 0 {
+		return fmt.Sprintf("%s.%d", base, unit.VlanID)
+	}
+	// A unit with no vlan-id is not a tagged sub-interface, and there
+	// `base.<unit>` is correct — which is why this is not a substitution of
+	// one field for the other (#8321).
+	if unitNum != 0 {
+		return fmt.Sprintf("%s.%d", base, unitNum)
+	}
+	return base
+}
+
+// logicalUnitDeviceKeyForRef resolves a cross-subsystem interface REFERENCE
+// ("ge-0/0/1.10", "reth0.50") to the key logicalUnitDeviceKey would have built
+// for that unit, so a consumer holding a config reference and the producer
+// holding an (interface, unit) pair land on the same string.
+//
+// An unknown interface or an unparseable unit falls back to the pre-#8321
+// spelling rather than inventing one: those refs resolved to `base.<unit>`
+// before and still do, so this cannot turn a working lookup into a miss.
+func logicalUnitDeviceKeyForRef(cfg *config.Config, ref string) string {
+	canon := config.CanonicalInterfaceUnitRef(ref)
+	baseRef, unitTok, hasUnit := strings.Cut(canon, ".")
+	base := config.LinuxIfName(baseRef)
+	if !hasUnit {
+		return base
+	}
+	unitNum, _, err := config.CanonicalLogicalUnit(unitTok)
+	if err != nil {
+		return config.LinuxIfName(canon)
+	}
+	var unit *config.InterfaceUnit
+	if cfg != nil && cfg.Interfaces.Interfaces != nil {
+		if ifc, ok := cfg.Interfaces.Interfaces[baseRef]; ok && ifc != nil {
+			unit = ifc.Units[unitNum]
+		}
+	}
+	return logicalUnitDeviceKey(base, unitNum, unit)
+}
+
+func riMemberLinuxName(cfg *config.Config, tunMap map[string]string, ifaceName string) string {
 	// #5878 phase 2: resolve the routing-instance member on its CANONICAL
 	// logical-unit identity BEFORE the tunMap lookup so a `.01` member resolves
 	// to the SAME device as `.1` (and as the interface's `unit 1`). TunnelNameMap
@@ -47,13 +111,14 @@ func riMemberLinuxName(tunMap map[string]string, ifaceName string) string {
 	if name, ok := tunMap[ifaceName]; ok && name != "" {
 		return name
 	}
-	// Convert Junos name (gr-0/0/0.0) to Linux name (gr-0-0-0).
-	// Strip ".0" unit suffix — unit 0 is the base interface.
-	linuxName := config.LinuxIfName(ifaceName)
-	if strings.HasSuffix(linuxName, ".0") {
-		linuxName = strings.TrimSuffix(linuxName, ".0")
-	}
-	return linuxName
+	// #8597 K85: derive the device the same way the connected-prefix producer
+	// does. This was config.LinuxIfName + a ".0" strip, which names a tagged
+	// unit by its UNIT NUMBER — so a `unit 10 vlan-id 100` member resolved to
+	// `ge-0-0-1.10`, a device that does not exist, and BindInterfaceToVRF
+	// failed while the commit reported success and the member silently stayed
+	// in the main table. The unit-0 collapse the strip performed is now the
+	// `unitNum != 0` arm of logicalUnitDeviceKey.
+	return logicalUnitDeviceKeyForRef(cfg, ifaceName)
 }
 
 func collectAppliedTunnels(cfg *config.Config) []*config.TunnelConfig {
@@ -72,7 +137,7 @@ func collectAppliedTunnels(cfg *config.Config) []*config.TunnelConfig {
 			continue
 		}
 		for _, ifaceName := range ri.Interfaces {
-			riListMember[riMemberLinuxName(tunMap, ifaceName)] = ri.Name
+			riListMember[riMemberLinuxName(cfg, tunMap, ifaceName)] = ri.Name
 		}
 	}
 	var tunnels []*config.TunnelConfig
@@ -173,11 +238,10 @@ func inferIPv6StaticNextHopInterfaces(cfg *config.Config, overlay []config.Route
 			// The fallback matters: a unit with NO vlan-id is not a tagged
 			// sub-interface, and there `base.<unit>` is correct -- which is why
 			// this is not simply a substitution of one field for the other.
-			if unit.VlanID > 0 {
-				logical = fmt.Sprintf("%s.%d", base, unit.VlanID)
-			} else if unitNum != 0 {
-				logical = fmt.Sprintf("%s.%d", base, unitNum)
-			}
+			// #8597 K84/K85: the rule is shared with the consumers below
+			// (logicalUnitDeviceKeyForRef) so the two sides cannot drift
+			// apart again the way #8321 left them.
+			logical = logicalUnitDeviceKey(base, unitNum, unit)
 			// ipv6OnUnit tracks whether this logical unit participates in
 			// IPv6 at all, so it earns a synthetic fe80::/64 candidate even
 			// when it only carries a VRRP virtual address (bondless RETH,
@@ -284,7 +348,10 @@ func inferIPv6StaticNextHopInterfaces(cfg *config.Config, overlay []config.Route
 	}
 
 	collectPrefixesForInterface := func(ifName string) []connectedPrefix {
-		normalized := config.LinuxIfName(ifName)
+		// #8597 K84: keyed by the producer's rule, not by LinuxIfName —
+		// otherwise a tagged unit whose vlan-id differs from its unit number
+		// never matches and the VRF-scoped prefix is dropped.
+		normalized := logicalUnitDeviceKeyForRef(cfg, ifName)
 		var prefixes []connectedPrefix
 		if entries, ok := connectedByLogical[normalized]; ok {
 			prefixes = append(prefixes, entries...)
@@ -346,7 +413,10 @@ func inferIPv6StaticNextHopInterfaces(cfg *config.Config, overlay []config.Route
 			}
 			connectedByVRF[vrfName] = append(connectedByVRF[vrfName], prefixes...)
 			if vrfName != "" {
-				normalized := config.LinuxIfName(ifName)
+				// #8597: the third site of the same family, named in neither
+				// K84 nor K85. claimedByVRF is compared against producer-keyed
+				// names below, so it must use the producer's rule too.
+				normalized := logicalUnitDeviceKeyForRef(cfg, ifName)
 				claimedByVRF[normalized] = struct{}{}
 			}
 		}
