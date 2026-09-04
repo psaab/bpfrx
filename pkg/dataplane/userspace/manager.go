@@ -103,6 +103,14 @@ type Manager struct {
 	// which counts CONFIG snapshots: one config can outlive many helper
 	// processes across a crash-restart, and one helper can serve many configs.
 	procGen uint64
+	// helperCrashEpisodes is the #8397 bounded history of RECOVERED crash
+	// episodes, oldest-first, and helperCrashEpisodesTotal the unbounded count
+	// of them. Separate from helperCrash because that record is episode-scoped
+	// by contract and wiped on every recovery; see helper_crash_history_8397.go
+	// for why the wipe is worth preserving rather than extending.
+	helperCrashEpisodes      []HelperCrashEpisode
+	helperCrashEpisodesTotal int
+
 	// helperCrash records the last UNEXPECTED helper exit for the operator and
 	// drives the restart backoff. Zero value means "no crash on record".
 	helperCrash HelperCrashRecord

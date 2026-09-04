@@ -842,6 +842,12 @@ impl LiveCallSiteFixture {
 /// on lifted out of the UMEM's lifetime.
 struct StageRun {
     outcome: FlowCacheOutcome,
+    /// #8262: `SessionTable::lookup_miss_counts()` after the call —
+    /// `(no_handle, stale_handle, key_mismatch)`. The harness computed none of
+    /// this before, so the one counter that distinguishes "the key the stage
+    /// probed with is not the key the session was installed under" from every
+    /// other kind of miss was unreadable from a test.
+    session_lookup_miss_counts: (u64, u64, u64),
     /// #5190: the flow cache's own (hits, misses, evictions) tallies read
     /// IMMEDIATELY after the call — before the `cached_observed_bytes`
     /// probe below, whose `lookup` would itself move them.
@@ -991,6 +997,20 @@ struct StageSeed {
     /// and the lookup MISSED, no matter how the frame was built. Both sides
     /// have to move together.
     flow: Option<SessionFlow>,
+    /// #8262: the key the SESSION is installed under, when it must differ from
+    /// the cached entry's key.
+    ///
+    /// Without this seam the harness cannot express a key mismatch at all: the
+    /// install takes `entry_for_session.key` and the probe takes
+    /// `flow.forward_key`, and both default to `test_key()` — so the fixture
+    /// supplies BOTH OPERANDS OF THE COMPARISON FROM ONE VALUE and they agree
+    /// by construction. That harness can vary every other axis (TX headroom,
+    /// admission, mirror sampling, validation state) and never touch the one
+    /// axis a key-mismatch bug lives on.
+    ///
+    /// `None` installs from the cached entry's key, which is every pre-#8262
+    /// caller's behaviour.
+    install_key: Option<crate::session::SessionKey>,
     /// The `now_ns` handed to `stage_flow_cache_hit`. Separate from
     /// `install_ns` so a cell can choose whether the session is STALE at call
     /// time, which is the only axis `touch_if_stale` branches on.
@@ -1000,7 +1020,13 @@ struct StageSeed {
 impl Default for StageSeed {
     fn default() -> Self {
         // 1_000_000 is the `now_ns` every pre-#6997 caller passed inline.
-        Self { session: None, now_ns: 1_000_000, flow: None, tx_headroom: None }
+        Self {
+            session: None,
+            now_ns: 1_000_000,
+            flow: None,
+            tx_headroom: None,
+            install_key: None,
+        }
     }
 }
 
@@ -1063,7 +1089,10 @@ fn run_stage_seeded(
         // describes rather than an unrelated fixture.
         assert!(
             sessions.install_with_protocol(
-                entry_for_session.key.clone(),
+                seed
+                    .install_key
+                    .clone()
+                    .unwrap_or_else(|| entry_for_session.key.clone()),
                 entry_for_session.decision.clone(),
                 entry_for_session.metadata.clone(),
                 install_ns,
@@ -1148,6 +1177,7 @@ fn run_stage_seeded(
 
     StageRun {
         outcome,
+        session_lookup_miss_counts: sessions.lookup_miss_counts(),
         flow_cache_tallies,
         tx_pipeline: tx_pipeline_state,
         tx_counters: tx_counters_state,
@@ -3168,5 +3198,215 @@ fn live_flow_cache_replay_default_reject_message_still_sends_admin_prohibited_76
         "#7678: a cached reject with NO message-type must still send \
          administratively-prohibited (ICMPv4 type 3 code 13). If this reads 1, the \
          sibling cell's code-1 assertion is not tracking the cached field"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #8262: the session key and the flow-cache probe, built by their TWO
+// PRODUCTION ROUTES rather than from one literal.
+//
+// THE GAP THIS CLOSES. Every other cell in this file installs the session from
+// `entry_for_session.key` and probes with `flow.forward_key`, and both default
+// to `test_key()`. The fixture supplies BOTH OPERANDS OF THE COMPARISON FROM
+// ONE VALUE, so they agree by construction. Such a harness can vary every other
+// axis — TX headroom, admission, mirror sampling, validation state — and never
+// touch the axis a key-mismatch bug lives on. It is invisible to review because
+// the tests around it are real, thorough and passing.
+//
+// The cells below take the key from the FRAME, through
+// `parse_session_flow_from_bytes` and then the poll loop's own post-parse
+// mutation (`poll_descriptor/mod.rs` assigns `forward_key.routing_domain` from
+// `ingress_routing_domain`). Nothing is copied from `test_key()` into the
+// probe: the frame is the source, exactly as in production.
+//
+// WHY A CONTROL AND A RED CELL, not one: a harness that can only show agreement
+// proves nothing about its own power. The second cell exhibits a mismatch the
+// old fixture COULD NOT EXPRESS AT ALL, and it is the reason to believe the
+// first one would have noticed.
+//
+// THE LIMIT OF THIS HARNESS, measured at merge rather than assumed.
+// `production_route_flow` REPLICATES the poll loop's post-parse mutation; it
+// does not invoke the poll loop. So it is a faithful COPY of the production
+// route, not the route itself, and the copy is hand-maintained. Deleting the
+// `forward_key.routing_domain` assignment from `poll_descriptor/mod.rs` leaves
+// BOTH cells here green — that was checked, and it is not a defect in them:
+// the production line is guarded by
+// `tests_routing_domain_7160::a_segment_on_a_routing_instance_member_matches_that_instances_session_7160`,
+// which does go red. Coverage of that line was never this file's job.
+//
+// What the limit DOES mean: if a THIRD post-parse key mutation is added to the
+// poll loop and not mirrored into `production_route_flow`, this file's
+// "agreement" control goes quietly vacuous — the two routes would agree because
+// both are missing the same step, which is a subtler version of the very defect
+// #8262 was filed about. Whoever adds a post-parse mutation to
+// `poll_binding_process_descriptor` owes this helper a line.
+
+/// Build a `SessionFlow` the way production does: parse it out of the frame,
+/// then apply the poll loop's post-parse key mutation.
+///
+/// This is deliberately NOT handed a key. If it were, it would be the old
+/// fixture with more steps.
+fn production_route_flow(
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    forwarding: &ForwardingState,
+) -> SessionFlow {
+    let mut flow = crate::afxdp::frame::parse_session_flow_from_bytes(frame, meta)
+        .expect("the fixture frame must parse into a flow, or nothing below is exercised");
+    // The mutation the poll loop applies between the parse and every later use
+    // of the key (`poll_descriptor/mod.rs`, the `has_routing_domains` arm).
+    flow.forward_key.routing_domain = crate::afxdp::forwarding::ingress_routing_domain(
+        forwarding,
+        meta.ingress_ifindex as i32,
+        meta.ingress_vlan_id,
+        None,
+    );
+    flow
+}
+
+/// Give the fixture a routing-instance membership so `ingress_routing_domain`
+/// resolves a NON-ZERO domain. Without this the mutation is a no-op and the
+/// two routes cannot diverge on it — the cell would pass while testing nothing,
+/// which is the failure mode this whole file is being fixed for.
+fn with_routing_domain(fixture: &mut LiveCallSiteFixture, domain: u32) {
+    fixture.forwarding.has_routing_domains = true;
+    fixture
+        .forwarding
+        .ifindex_to_routing_domain
+        .insert(PHYS_INGRESS_IFINDEX, domain);
+    fixture
+        .forwarding
+        .ifindex_to_routing_domain
+        .insert(LOGICAL_INGRESS_IFINDEX, domain);
+}
+
+// CONTROL. Both routes run for real and AGREE, so the session installed under
+// the frame-derived key is found by the frame-derived probe. Establishes that
+// the harness drives a working path — without it, the red cell below could go
+// red for any reason at all.
+#[test]
+fn the_two_production_routes_agree_for_one_frame_8262() {
+    let mut fixture = LiveCallSiteFixture::new(MirrorTargetQueue::WithRoom);
+    with_routing_domain(&mut fixture, 7);
+    let frame = vlan_tagged_tcp_v4_frame(0);
+    let meta = test_meta(&frame);
+
+    let flow = production_route_flow(&frame, meta, &fixture.forwarding);
+    assert_eq!(
+        flow.forward_key.routing_domain, 7,
+        "precondition: the poll loop's mutation must actually move the key, or \
+         this cell and the next one differ in nothing"
+    );
+
+    let mut entry = cached_entry();
+    entry.key = flow.forward_key.clone();
+
+    let run = run_stage_seeded(
+        &fixture,
+        &frame,
+        meta,
+        entry,
+        0,
+        StageSeed {
+            session: Some((900_000, PROTO_TCP, 0x10)),
+            flow: Some(flow.clone()),
+            install_key: Some(flow.forward_key.clone()),
+            ..StageSeed::default()
+        },
+    );
+
+    assert_eq!(
+        run.session_lookup_miss_counts,
+        (0, 0, 0),
+        "the two routes agree for this frame, so the stage's session lookups \
+         must all HIT — no misses of any kind. This is the baseline the red \
+         cell below is read against, so it is asserted as the whole tuple \
+         rather than one counter"
+    );
+}
+
+// THE RED CELL — a mismatch the pre-#8262 fixture could not express.
+//
+// The probe key carries the poll loop's resolved routing domain; the session
+// was installed by a path that did NOT apply it. That is the shape of a real
+// defect: one of the two routes forgets a mutation the other applies, and the
+// 5-tuple is identical, so nothing about the packet looks wrong.
+//
+// The old fixture could not produce this at all — its install key and probe key
+// were one `test_key()` with `routing_domain: 0`, so the field could not differ
+// between them whatever else the cell varied.
+#[test]
+fn a_route_that_skips_the_poll_loop_mutation_is_a_key_mismatch_8262() {
+    let mut fixture = LiveCallSiteFixture::new(MirrorTargetQueue::WithRoom);
+    with_routing_domain(&mut fixture, 7);
+    let frame = vlan_tagged_tcp_v4_frame(0);
+    let meta = test_meta(&frame);
+
+    let flow = production_route_flow(&frame, meta, &fixture.forwarding);
+    // The divergent route: parsed from the SAME frame, but without the
+    // post-parse mutation.
+    let unmutated = crate::afxdp::frame::parse_session_flow_from_bytes(&frame, meta)
+        .expect("same frame, same parse")
+        .forward_key;
+    assert_eq!(
+        unmutated.routing_domain, 0,
+        "precondition: the un-mutated route leaves the domain at 0"
+    );
+    assert_ne!(
+        unmutated, flow.forward_key,
+        "precondition: the two routes must actually DIFFER, or this cell is the \
+         control with a longer name"
+    );
+
+    let mut entry = cached_entry();
+    entry.key = flow.forward_key.clone();
+
+    let run = run_stage_seeded(
+        &fixture,
+        &frame,
+        meta,
+        entry,
+        0,
+        StageSeed {
+            session: Some((900_000, PROTO_TCP, 0x10)),
+            flow: Some(flow.clone()),
+            install_key: Some(unmutated),
+            ..StageSeed::default()
+        },
+    );
+
+    let (no_handle, stale, key_mismatch) = run.session_lookup_miss_counts;
+    assert!(
+        no_handle > 0,
+        "the session was installed under the key ONE production route produced \
+         and probed with the key the OTHER produced, so the stage's lookups must \
+         MISS. Reading no misses here means the harness cannot see the axis it \
+         exists for. counts = {:?}",
+        run.session_lookup_miss_counts
+    );
+    assert_ne!(
+        run.session_lookup_miss_counts,
+        (0, 0, 0),
+        "and the tuple must differ from the agreeing case, which is the whole \
+         claim: a key that diverged between the two routes is OBSERVABLE here"
+    );
+
+    // MEASURED, and worth recording because it contradicts the obvious guess:
+    // a plain divergent key does NOT bump `lookup_miss_key_mismatch`. It misses
+    // with NO HANDLE, because the two keys hash to different slots and the
+    // probe never resolves a handle to compare a key against. `key_mismatch` is
+    // for a RESOLVED handle whose stored key disagrees — slab-handle reuse —
+    // which is a different defect entirely.
+    //
+    // This matters beyond the cell: #7919's cluster reading found
+    // `session_lookup_miss_key_mismatch_total` at 0 on every worker, and it
+    // would have been easy to read that as "no key divergence anywhere". It is
+    // not evidence of that, and this is where the reason is written down.
+    assert_eq!(
+        (stale, key_mismatch),
+        (0, 0),
+        "a diverged key misses with NO HANDLE; if it ever starts bumping the \
+         stale-handle or key-mismatch counters instead, the note above is stale \
+         and the reasoning that rests on it needs re-checking"
     );
 }

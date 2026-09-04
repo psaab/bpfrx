@@ -490,15 +490,27 @@ func (s *Server) writeSessionList(w http.ResponseWriter, r *http.Request, resp S
 				if peer := pr.GetPeer(); peer != nil {
 					resp.Peer = sessionListFromPB(peer)
 				}
-				// "ok" means the FETCH succeeded, which is the thing the
-				// discarded error was hiding. Scoped residual, stated rather
-				// than papered over: unlike GetSessionSummaryResponse and
-				// GetZonePairSummaryResponse, GetSessionsResponse carries no
-				// peer_status field, so this surface cannot distinguish a
-				// peer that returned an empty table from a standalone node
-				// the way the summary surfaces can. Closing that needs a
-				// proto addition and is not what this change is for.
-				resp.PeerStatus = "ok"
+				// #8308: the residual #8306 recorded here is closed.
+				// GetSessionsResponse now carries peer_status, so this
+				// surface reports what the SERVER classified instead of
+				// asserting "ok" locally — which meant only "the fetch
+				// succeeded" and could not distinguish a peer that returned
+				// an empty table from a standalone node.
+				//
+				// The local fallback survives for one case and one only: a
+				// server that predates the field sends UNSPECIFIED, which
+				// peerFetchStatusString maps to "". The fetch DID succeed, so
+				// reporting nothing would be a regression against #8306 on
+				// exactly the rolling-upgrade window this field was added
+				// carefully for.
+				if ps := peerFetchStatusString(pr.GetPeerStatus()); ps != "" {
+					resp.PeerStatus = ps
+				} else {
+					resp.PeerStatus = "ok"
+				}
+				if pe := pr.GetPeerError(); pe != "" {
+					resp.PeerError = pe
+				}
 			}
 		} else {
 			resp.PeerStatus = "not-applicable"
@@ -675,7 +687,14 @@ func peerFetchStatusString(s pb.PeerFetchStatus) string {
 		return "ok"
 	case pb.PeerFetchStatus_PEER_FETCH_STATUS_UNREACHABLE:
 		return "unreachable"
+	case pb.PeerFetchStatus_PEER_FETCH_STATUS_BUSY:
+		// #8308: same word peerFetchErrorStatus already returns, so the two
+		// routes into this surface cannot disagree about the same event.
+		return "busy"
 	default:
+		// Includes UNSPECIFIED, which means "this server does not report it"
+		// (an older peer, or a field it never set) rather than any outcome.
+		// Rendering it as a word would assert something the wire did not say.
 		return ""
 	}
 }

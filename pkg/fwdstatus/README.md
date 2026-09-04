@@ -26,6 +26,18 @@ one recorded fact cannot render two different ways.
 interface, matching the existing `Status()` probe, so `DataPlaneAccessor` stays
 the two-method surface every caller and test already implements.
 
+`HelperCrashHistory() ([]userspace.HelperCrashEpisode, int)` — the #8397
+companion, asserted independently of `HelperCrashState` because it has a
+different lifetime. `HelperCrashState` is episode-scoped and wiped by the
+successful restart that ends the episode; the history is what remains, and the
+one row it contributes to the block (`Helper crash episodes`) is emitted ABOVE
+the `!LastExitWasCrash && !RestartPending` early return. That placement is
+load-bearing: history exists for the helper that crashed repeatedly and is
+healthy now, which is precisely the state that guard returns on. A row placed
+after it renders in every case except the one it was written for, and the
+failure is invisible because a clean crash surface is what a healthy helper is
+supposed to look like.
+
 Three things about it are easy to break:
 
 - The probe is **not** gated on `Status()` succeeding. A crash runs

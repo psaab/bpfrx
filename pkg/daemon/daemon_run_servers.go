@@ -483,6 +483,7 @@ func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventB
 		// otherwise stale enforcement past the window is invisible to
 		// monitoring.
 		SchedulerRepublishFailedFn:       d.SchedulerRepublishFailed,
+		HelperCrashEpisodesFn:            d.helperCrashEpisodes,
 		SchedulerRepublishStaleSecondsFn: d.SchedulerRepublishStaleSeconds,
 		// #5669: surface the bounded-age fail-closed escalation so
 		// xpf_scheduler_republish_fail_closed reads 1 once a persistently
@@ -785,4 +786,23 @@ func (d *Daemon) resolveAPIBinds(apiCfg *api.Config, cfg *config.Config) {
 			apiCfg.HTTPSAddr = clamped
 		}
 	}
+}
+
+// helperCrashEpisodes reports how many userspace-dataplane helper crash
+// episodes this daemon has recovered from, for #8397's
+// xpf_dataplane_helper_crash_episodes_total.
+//
+// Returns 0 when the userspace manager is absent — a daemon with no helper has
+// had no helper crashes, and 0 is the honest answer rather than a missing
+// series. An absent series reads as healthy to an alert, which is the same
+// failure this metric exists to correct.
+func (d *Daemon) helperCrashEpisodes() int {
+	// Reuses the same adapter assertion the #8121 lease sync uses; the
+	// userspace Manager is reachable only through the published dataplane.
+	mgr := d.persistentNatLeaseManager()
+	if mgr == nil {
+		return 0
+	}
+	_, total := mgr.HelperCrashHistory()
+	return total
 }

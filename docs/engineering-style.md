@@ -630,6 +630,48 @@ not of the recipient's diligence:
 - prefer a signal that is **structurally** different between right and wrong, not a
   total. A count is exactly what collided here.
 
+## Crafted-frame probes need an arrival witness (#8336)
+
+Any measurement that sends a crafted frame at the cluster and reads a counter
+has a **third outcome** beside "it was dropped" and "it was not", and collapsing
+it into either produces a false finding. Two attempts at reproducing #8298 did
+exactly that.
+
+**A flat counter has two indistinguishable causes.** The frame never reached
+the firewall — routing, L2, the host stack, or the NIC discarding a malformed
+header before AF_XDP ever sees it — or it arrived and was not dropped, which is
+the actual result you were testing for. Only the second is a finding.
+
+So pair the subject with a **witness**: a companion frame crafted to trip a
+different, per-reason check, sent alongside it. The witness counter moving is
+what proves the path is live. A flat witness means **the measurement did not
+happen** — `VOID`, never a pass — and the check must be made *before* the
+subject is read, or a frame that never arrived reports as one that was
+permitted.
+
+Three specific traps, all of which cost a real attempt:
+
+- **The standard smoke exercises no screen code at all.** `stage_screen_check`
+  is gated on `has_screen_state()`, and the loss userspace cluster carries no
+  `security screen` configuration. A `cluster-deploy` plus `test-failover`
+  against a screen change is green for reasons unrelated to the change. Arm a
+  profile first, and disarm after — the cluster is shared, config syncs to the
+  peer, so verify removal on **both** nodes.
+- **The per-reason counter cannot see a parse-error drop.**
+  `extract_screen_info` failing closed yields reason `ip-malformed`, and that
+  reason — with `syn-cookie` and `icmp-fragment` — is surfaced *only* through
+  the aggregate `xpf_screen_drops_total`. There is no label to sample in
+  `xpf_screen_drops_by_reason_total`, so a fail-closed drop is invisible there
+  by construction and the zero reads exactly like "nothing happened". Sample
+  the aggregate for anything that may drop on a malformed header.
+- **"Did not move" and "could not be read" are different.** An absent metric, a
+  failed scrape and a helper restart mid-probe all render as "no number", and
+  treating any of them as zero turns a broken instrument into a clean result.
+
+`test/incus/screen-probe.sh` is the procedure; `screen-probe-lib.sh` is the
+verdict, hermetically tested by `make test-screen-probe-lib` so the ordering
+above is asserted rather than remembered.
+
 ## Review discipline
 
 ### Reviewing (adversarial by design)

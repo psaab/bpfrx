@@ -379,6 +379,10 @@ func (m *Manager) restartHelperAfterCrash(gen uint64) {
 	}
 	slog.Info("userspace dataplane helper restarted after unexpected exit",
 		"attempts", m.helperCrash.Restarts)
+	// #8397: this is the ONE moment an episode is known to have ended in
+	// recovery, and the next line destroys the only record of it. Append
+	// before the wipe, not after.
+	m.recordRecoveredCrashEpisodeLocked(time.Now())
 	m.helperCrash = HelperCrashRecord{}
 	// The crash tore the 1 Hz reconcile loop down with the generation it was
 	// polling; the replacement needs its own.

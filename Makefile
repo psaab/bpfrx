@@ -500,7 +500,7 @@ clean:
 # The standalone instance name defaults to xpf-fw; override it for an
 # ad-hoc/renamed VM with `XPF_INSTANCE=<name> make test-deploy` (#2162). The
 # env var flows through to setup.sh (INSTANCE_NAME=${XPF_INSTANCE:-xpf-fw}).
-.PHONY: test-env-init test-vm standalone-test-vm test-ct test-deploy test-deploy-lib test-mutate-lib test-cluster-lock-lib test-target-services-lib test-cluster-env-lib test-iperf-throughput-lib test-cos-apply-lib test-mouse-elephant-lib test-fbf-steering-lib test-host-inbound-lib test-host-inbound test-host-inbound-failover test-ssh test-destroy test-status test-start test-stop test-restart test-logs test-journal
+.PHONY: test-env-init test-vm standalone-test-vm test-ct test-deploy test-deploy-lib test-mutate-lib test-cluster-lock-lib test-target-services-lib test-cluster-env-lib test-iperf-throughput-lib test-cos-apply-lib test-mouse-elephant-lib test-fbf-steering-lib test-host-inbound-lib test-host-inbound test-host-inbound-failover test-ssh test-destroy test-status test-start test-stop test-restart test-logs test-journal test-screen-probe-lib
 
 test-env-init:
 	./test/incus/setup.sh init
@@ -747,6 +747,21 @@ harness-ledger-lint:
 
 test-iperf-throughput-lib:
 	bash ./test/incus/iperf-throughput-selftest.sh
+
+# Self-test the #8336 crafted-frame screen-probe analysis layer: the function
+# that turns an armed-state flag plus two counter sample pairs into DROPPED /
+# PASSED / VOID. The defect it guards is the one that produced the issue --
+# two attempts at reproducing #8298 on the cluster came back with a flat
+# aggregate counter and NO verdict, and a flat number with no verdict reads as
+# "we found nothing" when the truth was "we measured nothing".
+#
+# So the load-bearing properties are TOTALITY (every input class yields exactly
+# one verdict, including short argument lists) and ORDERING (a flat witness is
+# VOID and must be decided BEFORE the subject, or a frame that never arrived
+# reports as one that was permitted). Hermetic -- literal counter samples only;
+# no incus, cluster, network or crafted frames.
+test-screen-probe-lib:
+	bash ./test/incus/screen-probe-selftest.sh
 
 # Self-test the #4800 new-flow-ceiling analysis layer: the function that
 # turns two helper counter snapshots into "N new flows/sec, and here is

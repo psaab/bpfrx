@@ -2716,13 +2716,29 @@ the drop fails loudly instead of going quietly vacuous.
     operator debugging a fabric problem after a network fault that does not
     exist. Refusals now report `busy`; genuine failures still report
     `unreachable`, and both sides are pinned so the fix cannot degrade into
-    renaming everything. Two scoped residuals, stated rather than papered over:
-    `pb.PeerFetchStatus` has no BUSY member, so a gRPC client still sees
-    UNREACHABLE for a refusal (adding an enum value is a wire change whose
-    rolling-upgrade behaviour deserves its own decision); and
-    `GetSessionsResponse` carries no `peer_status` field at all, so unlike the
-    summary surfaces this one cannot distinguish a peer that returned an empty
-    table from a standalone node.
+    renaming everything.
+
+    **#8308 closes both of #7294's scoped residuals**, which were left open
+    because each is a wire change with its own rolling-upgrade question.
+    `pb.PeerFetchStatus` gains `PEER_FETCH_STATUS_BUSY = 4` and
+    `GetSessionsResponse` gains `peer_status` (8) and `peer_error` (9). Both
+    are ADDITIONS, never redefinitions: in a rolling HA upgrade the two nodes
+    run different binaries against one wire, so narrowing UNREACHABLE to mean
+    "unreachable or refused" would silently change what the older binary
+    reports about an unchanged event. The cost of the additive choice is that
+    an older client renders BUSY as the raw integer `4` rather than a word —
+    visibly odd rather than quietly wrong, which is the trade being bought, and
+    the member numbers are pinned so the redefinition cannot be reintroduced
+    (renumbering BUSY to 3 fails to COMPILE). The other direction is pinned
+    too: a response from an older server omits the new fields entirely, so a
+    new client decodes `UNSPECIFIED`, whose documented meaning is already "not
+    evaluated / older server" — a reader must treat it as "this server does not
+    report it", never as an outcome. The REST list surface consequently reports
+    what the SERVER classified instead of asserting `"ok"` locally, keeping the
+    local `"ok"` only for an UNSPECIFIED response so an older peer does not
+    regress below #7294's behaviour during the upgrade window. REST and gRPC
+    now agree on the word for a refusal, and the agreement is asserted rather
+    than either side being pinned to a literal.
     The path is currently UNREACHABLE — the REST handler stamps the session-walk
     lease before delegating, so `PeerSessions` takes `AcquireCtx`'s reuse arm and
     never returns `ErrBusy` — and #7294 item 3's separate remote budget is what

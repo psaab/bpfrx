@@ -322,6 +322,7 @@ run_bash test/incus/cluster-env-selftest.sh
 run_bash test/incus/cos-apply-lib-selftest.sh
 run_bash test/incus/host-inbound-selftest.sh
 run_bash test/incus/iperf-throughput-selftest.sh
+run_bash test/incus/screen-probe-selftest.sh
 run_bash test/incus/target-services-selftest.sh
 run_bash test/incus/with-cluster-selftest.sh
 # #7159: the mouse-latency elephant generator's remote lifecycle. Hermetic --
