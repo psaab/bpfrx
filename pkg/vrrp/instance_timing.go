@@ -122,3 +122,45 @@ func stopAndDrainTimer(t *time.Timer) {
 		}
 	}
 }
+
+// garpCount returns the configured gratuitous-ARP burst count under vi.mu.
+//
+// #8597 (muse-004 K20): sendGARP read vi.cfg.GARPCount with no lock while
+// updateConfig writes it under vi.mu on the manager goroutine — the #5087 day-2
+// path. Every other reader of a mu-guarded cfg field in this package snapshots
+// under the lock (instance_preempt.go, track.go, manager.go, advertInterval
+// here); the send paths were the exception.
+func (vi *vrrpInstance) garpCount() int {
+	vi.mu.RLock()
+	defer vi.mu.RUnlock()
+	return vi.cfg.GARPCount
+}
+
+// startupLogFields snapshots the two mu-guarded fields run()'s starting log
+// emits, in ONE RLock.
+//
+// #8597: the log itself is not a forwarding decision, so the consequence of the
+// unlocked read is a possibly-stale line rather than a wrong election — but
+// `go test -race` does not grade races by consequence, and a snapshot that took
+// the lock twice would still be able to straddle a writer and print two fields
+// from different configs.
+func (vi *vrrpInstance) startupLogFields() (priority int, preempt bool) {
+	vi.mu.RLock()
+	defer vi.mu.RUnlock()
+	return vi.cfg.Priority, vi.cfg.Preempt
+}
+
+// advertiseIntervalMS returns the raw configured advertise interval in
+// MILLISECONDS under vi.mu, for the one caller that needs the wire encoding
+// rather than a Duration (sendAdvert's RFC 5798 centisecond field).
+//
+// Deliberately not advertInterval(): that applies advertIntervalFromMS, which
+// substitutes the 1000 ms default for a non-positive value. The wire field must
+// carry what the peer will use to derive ITS master-down interval, and folding
+// the default in here would make a misconfigured instance advertise a cadence
+// it is not actually sending at.
+func (vi *vrrpInstance) advertiseIntervalMS() int {
+	vi.mu.RLock()
+	defer vi.mu.RUnlock()
+	return vi.cfg.AdvertiseInterval
+}

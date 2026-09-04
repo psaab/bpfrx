@@ -157,6 +157,40 @@ presenter's rendered output is byte-identical:
 
 ## Gotchas
 
+- **A session-derived view runs IN xpfd, so its memory is the control
+  plane's (#8597).** `showTopTalkers` used to append one formatted row per
+  SESSION, sort the whole slice, and print twenty. `MaxSessions` is dynamic
+  and large by design (`worker_count × per-worker`, #5323), so on a busy box
+  `show security flow session sort-by bytes` allocated millions of entries —
+  six strings each — inside the daemon, with no recover on the console path.
+  A legitimate, unprivileged diagnostic OOM-killed the process being
+  diagnosed.
+
+  The bound is on the COLLECTION, not the print: a `topTalkerLimit`-sized
+  min-heap of RAW session key/value copies, formatted only for the survivors.
+  Two properties are load-bearing and both have cells:
+
+  1. **The scan allocates nothing per session.** Not "less" — nothing.
+     Deferring the formatting behind a closure per candidate looks bounded and
+     is not; the closure heap-allocates on every session, and the address and
+     zone work still ran before it. That draft measured 125x growth over a
+     200x table and was rejected by the allocation-ratio cell, which is why
+     that cell measures a ratio between two real runs rather than asserting
+     the design.
+  2. **The output is unchanged**, including the `(of N total)` figure, which
+     still counts every session the filter admitted rather than the rows kept.
+     A bound that redefined that number would change what the operator reads.
+
+  The print cap stays explicit and independent of the collection cap. Deriving
+  it from `len(entries)` makes the two one bound — and a mutation removing the
+  collection bound then HANGS a test on a full stdout pipe instead of failing
+  it.
+
+  The REST side has treated a full conntrack walk as an admission decision
+  since #5318 (`sessionCountCap`); this is the console sibling that was never
+  brought along. The other CLI session views stream (`count++` and print), so
+  this was the only local accumulator.
+
 - **`load {override,merge,set} terminal` COMMITS only on Ctrl-D (#6548).**
   Ctrl-C — and any other read error — is an ABORT: the partial input is
   discarded and `handleLoad` returns an error, so the candidate is untouched.
