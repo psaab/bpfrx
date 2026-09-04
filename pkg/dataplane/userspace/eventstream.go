@@ -977,8 +977,44 @@ func (es *EventStream) handleOversizedFrame(conn net.Conn, length uint32, typ ui
 	es.DecodeErrors.Add(1)
 	es.triggerRateLimitedResync("oversized/framing-desync frame", seq)
 
-	// Loop-break: advance the watermark PAST this frame (its aligned-header seq is
-	// trustworthy) so the helper trims it and never re-sends it verbatim.
+	// LOOP-BREAK (#6160): advance the watermark PAST this frame so the helper
+	// trims it and never re-sends it verbatim. Without the advance the helper
+	// never trims, re-sends on reconnect, and the reader drops again — a
+	// permanent reconnect with no forward progress. That is why the advance is
+	// unconditional, and `Test_oversized_session_frame_over_ceiling_drops_and_
+	// flushes_ack_6160` pins it deliberately rather than incidentally.
+	//
+	// WHERE THE SAFETY ACTUALLY COMES FROM (#8597 K80). This comment used to
+	// justify the advance as "its aligned-header seq is trustworthy". That
+	// claim is FALSE on one of the two paths below: the branch that finds
+	// `length > maxDiscardableOversizedFrameBytes` has, by its own reasoning,
+	// just concluded the byte stream is DESYNCED — and a desynced stream's
+	// "header" is not a header, so its seq is whatever the payload bytes
+	// happened to be. The advance is safe anyway, but for a reason that lives
+	// in another component and another language, which is why the local claim
+	// was worth removing rather than repairing:
+	//
+	//   - The HELPER validates every ACK before acting on it (#2959,
+	//     `userspace-dp/src/event_stream/control.rs`). A sequence outside
+	//     [acked_seq, next_seq] — which a garbage seq overwhelmingly is —
+	//     is IGNORED, the replay buffer is left intact, and it is counted on
+	//     `frames_invalid_acks`. A poisoned watermark does not trim anything.
+	//   - The daemon-side effect on `lastRecvSeq` is absorbed by the
+	//     rate-limited full resync triggered above, which re-baselines from
+	//     table truth rather than from the sequence space.
+	//
+	// THE RESIDUAL, stated so nobody has to rediscover it: a garbage seq that
+	// happens to land INSIDE the live [acked_seq, next_seq] window is honoured
+	// and trims frames the daemon has not applied. Narrow, not impossible, and
+	// strictly smaller than the reconnect loop that removing the advance would
+	// create — which is why #8597 K80 was refuted rather than fixed.
+	//
+	// If that residual is ever worth closing, the remedy is NEITHER "always
+	// trust" nor "never trust" but a PLAUSIBILITY BOUND: a desynced seq is
+	// arbitrary while a real one is adjacent to `prevSeq`, so advancing only on
+	// a near-contiguous seq keeps #6160's loop-break and drops the poisoned
+	// path. That changes a protocol liveness property and is a decision to be
+	// taken deliberately, not a tidy-up to fold into an unrelated change.
 	*prevSeq = seq
 	es.lastRecvSeq.Store(seq)
 	// #6558: the advance goes behind anything still queued unapplied, so the
