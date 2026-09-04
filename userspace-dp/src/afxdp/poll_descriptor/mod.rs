@@ -709,6 +709,11 @@ pub(super) fn poll_binding_process_descriptor(
                         ) {
                             let input_filter_eval = input_filter_hit.eval;
                             let input_filter_revoked_key = input_filter_hit.revoked_key;
+                            // #8114 item 1: a verdict that came from a matched
+                            // `routing-instance` term is logged as PBR, the same
+                            // source `ingress_route_table_override` stamps on
+                            // that term for a session-MISS packet.
+                            let input_filter_log_source = input_filter_hit.log_source;
                             // #2521/#3615: a filter `then reject` synthesizes a
                             // TCP RST / ICMP unreachable back toward the source
                             // (same machinery as policy reject); `discard` stays
@@ -741,6 +746,7 @@ pub(super) fn poll_binding_process_descriptor(
                                     flow,
                                     meta,
                                     cached_log,
+                                    input_filter_log_source,
                                     reject_reply_enqueued,
                                     now_ns,
                                 );
@@ -1484,6 +1490,7 @@ pub(super) fn poll_binding_process_descriptor(
                                 flow,
                                 meta,
                                 cached_log,
+                                FilterLogSource::Input,
                                 reject_reply_enqueued,
                                 now_ns,
                             );
@@ -3573,6 +3580,7 @@ pub(super) fn poll_binding_process_descriptor(
                                 l3_flow,
                                 meta,
                                 cached_log,
+                                FilterLogSource::Input,
                                 // A flowless deny is always a SILENT drop (no L4
                                 // to synthesize a reject from), so a `then reject`
                                 // term logs the truthful DENY — same contract as
@@ -3742,6 +3750,7 @@ pub(super) fn poll_binding_process_descriptor(
                                 l3_flow,
                                 meta,
                                 cached_log,
+                                FilterLogSource::Input,
                                 // #3615: a flowless (non-first fragment / no-L4)
                                 // deny is ALWAYS a silent drop — no reply can be
                                 // synthesized — so a `then reject` term logs the

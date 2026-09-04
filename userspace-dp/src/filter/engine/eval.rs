@@ -622,6 +622,11 @@ fn evaluate_filter_ref_routing_instance_counted_v4<'a>(
     dscp: u8,
     extra: TermMatchExtra<'_>,
     packet_bytes: u64,
+    // #8114 item 1: `false` suppresses the `then count` records so the
+    // side-effect-free STATIC verdict for a route-lookup-affecting filter can
+    // reuse this walk. `record_filter_counter` bumps the PACKET count even with
+    // `packet_bytes = 0`, so passing zero bytes is not a substitute.
+    count: bool,
 ) -> Option<FilterRoutingInstanceResult<'a>> {
     let mut acc_log: Option<FilterLogMatch> = None;
     for term in &filter.terms {
@@ -630,7 +635,7 @@ fn evaluate_filter_ref_routing_instance_counted_v4<'a>(
         ) {
             continue;
         }
-        if term.has_count {
+        if count && term.has_count {
             record_filter_counter(&term.counter, packet_bytes);
         }
         // #2544: a matched fall-through term (no terminating action, no
@@ -684,6 +689,11 @@ fn evaluate_filter_ref_routing_instance_counted_v6<'a>(
     dscp: u8,
     extra: TermMatchExtra<'_>,
     packet_bytes: u64,
+    // #8114 item 1: `false` suppresses the `then count` records so the
+    // side-effect-free STATIC verdict for a route-lookup-affecting filter can
+    // reuse this walk. `record_filter_counter` bumps the PACKET count even with
+    // `packet_bytes = 0`, so passing zero bytes is not a substitute.
+    count: bool,
 ) -> Option<FilterRoutingInstanceResult<'a>> {
     let mut acc_log: Option<FilterLogMatch> = None;
     for term in &filter.terms {
@@ -692,7 +702,7 @@ fn evaluate_filter_ref_routing_instance_counted_v6<'a>(
         ) {
             continue;
         }
-        if term.has_count {
+        if count && term.has_count {
             record_filter_counter(&term.counter, packet_bytes);
         }
         // #2544: see the v4 variant — a matched fall-through term keeps scanning.
@@ -1080,6 +1090,70 @@ pub(crate) fn evaluate_filter_ref_routing_instance_event_counted<'a>(
     extra: TermMatchExtra<'_>,
     packet_bytes: u64,
 ) -> Option<FilterRoutingInstanceResult<'a>> {
+    evaluate_filter_ref_routing_instance_maybe_counted(
+        filter,
+        src_ip,
+        dst_ip,
+        protocol,
+        src_port,
+        dst_port,
+        dscp,
+        extra,
+        packet_bytes,
+        true,
+    )
+}
+
+/// #8114 item 1: the routing-instance walk with NO side effects — no `then
+/// count` record, and the caller ignores the log.
+///
+/// This is the PBR half of a static verdict. `filter_ref_static_verdict` runs
+/// the NON-routing walk, which DEFERS on a matched `routing-instance` term
+/// (returns the default `Accept` before the term's own action is examined), so
+/// it cannot see that `then { routing-instance X; discard; }` is a DROP (#4392).
+/// Asking this walk instead returns the term's OWN action, which is exactly what
+/// `ingress_route_table_override` drops on.
+pub(crate) fn evaluate_filter_ref_routing_instance_uncounted<'a>(
+    filter: &'a Filter,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+    extra: TermMatchExtra<'_>,
+) -> Option<FilterRoutingInstanceResult<'a>> {
+    evaluate_filter_ref_routing_instance_maybe_counted(
+        filter,
+        src_ip,
+        dst_ip,
+        protocol,
+        src_port,
+        dst_port,
+        dscp,
+        extra,
+        // No packet is charged, so there are no bytes to charge. Unlike the
+        // non-routing walk's `NonRoutingCountPolicy::Never`, zero bytes alone
+        // would NOT suppress the record — `record_filter_counter` still bumps
+        // the packet count — which is why `count` is a separate flag.
+        0,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_filter_ref_routing_instance_maybe_counted<'a>(
+    filter: &'a Filter,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+    extra: TermMatchExtra<'_>,
+    packet_bytes: u64,
+    count: bool,
+) -> Option<FilterRoutingInstanceResult<'a>> {
     match (src_ip, dst_ip) {
         (IpAddr::V4(src), IpAddr::V4(dst)) => evaluate_filter_ref_routing_instance_counted_v4(
             filter,
@@ -1091,6 +1165,7 @@ pub(crate) fn evaluate_filter_ref_routing_instance_event_counted<'a>(
             dscp,
             extra,
             packet_bytes,
+            count,
         ),
         (IpAddr::V6(src), IpAddr::V6(dst)) => evaluate_filter_ref_routing_instance_counted_v6(
             filter,
@@ -1102,6 +1177,7 @@ pub(crate) fn evaluate_filter_ref_routing_instance_event_counted<'a>(
             dscp,
             extra,
             packet_bytes,
+            count,
         ),
         _ => None,
     }
