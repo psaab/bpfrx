@@ -197,6 +197,158 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		"global policy":
 		return true
 	}
+
+	// #8690 family 3: the FORWARDING-BEHAVIOUR surface — class-of-service,
+	// forwarding-options and firewall. 52 inventory sites, every one recorded
+	// with drop shape "empty": the positive measurement that no reader consumes
+	// the tail today, so truncating it takes nothing away.
+	//
+	// SCOPED ON PAIRS, NEVER ON A CONTAINER KEYWORD ALONE — and here that is
+	// the difference between correct and destructive, not a style preference.
+	// `then` is shared. These families need (then, {count, dscp,
+	// forwarding-class, loss-priority, policer, routing-instance,
+	// traffic-class}); `policy-options policy-statement <p> term <t> then`
+	// carries EIGHT sites with drop shape "partial" — as-path-prepend,
+	// community, load-balance, local-preference, metric, metric-type, next-hop,
+	// origin. "partial" means something ALREADY CONSUMES part of that tail, so
+	// normalizing it removes a value that is read today while the config still
+	// commits clean. A scope written as `containerKeyword == "then"` would have
+	// swallowed all eight. The two head sets are disjoint, which is what makes
+	// the pairs below safe and the keyword unsafe.
+	//
+	// `group` is shared the same way: (group, interface) is wanted here for
+	// dhcp-relay, while `protocols bgp group <g>` uses the same container and
+	// holds `neighbor <n> peer-as` — one of the sites where widening DISARMS a
+	// commit gate despite measuring empty-equivalent. Admitting the pair rather
+	// than the keyword leaves bgp untouched.
+	//
+	// THE PAIRS WERE MEASURED, NOT READ OFF THE INVENTORY PATH. Production
+	// passes kw = node.Keys[0] and head = node.Keys[1+args], so the `xpfarg` in
+	// an inventory line is the node's ARG, not its container keyword. Deriving
+	// pairs by reading the path yields a predicate that silently UNDER-reports
+	// — the #8708 method note, where `system login user` was asked about as
+	// ("xpfarg", "class") and matched nothing. These came from running the pass
+	// with an instrumented gate and recording what it encountered.
+	//
+	// THREE SITES OUTSIDE THE THREE FAMILIES COME ALONG because they share a
+	// pair. Named here, because "the diff is bigger than the families I listed"
+	// is exactly the sentence a reviewer should be able to check:
+	//
+	//	policy-options policy-statement <p> term <t> from protocol  (from protocol)
+	//	system services dhcp-local-server group <g> interface       (group interface)
+	//	system services dhcpv6-local-server group <g> interface     (group interface)
+	//
+	// All three are recorded "empty", so the same safety measurement covers
+	// them. The policy-options member is a `from` site, NOT one of the eight
+	// forbidden `then` partials — the distinction the pair scoping exists to
+	// preserve.
+	switch containerKeyword + " " + head {
+	// class-of-service: 49 pairs.
+	case "buffer-size temporal",
+		"class-of-service interfaces",
+		"class-of-service scheduler-maps",
+		"class-of-service schedulers",
+		"class-of-service traffic-control-profiles",
+		"classifiers dscp",
+		"classifiers ieee-802.1",
+		"classifiers inet-precedence",
+		"dscp forwarding-class",
+		"exp forwarding-class",
+		"forwarding-class loss-priority",
+		"forwarding-class scheduler",
+		"ieee-802.1 forwarding-class",
+		"inet-precedence forwarding-class",
+		"interface queue",
+		"interfaces output-traffic-control-profile",
+		"interfaces priority-low-min-share",
+		"interfaces scheduler-map",
+		"interfaces shaping-rate",
+		"interfaces unit",
+		"loss-priority code-point",
+		"loss-priority code-points",
+		"oversubscription-policy guarantee-rate",
+		"queue active-workers",
+		"queue at-least-active-workers",
+		"queue cstruct",
+		"queue cstruct-max",
+		"queue max-worker-flow-share",
+		"rewrite-rules dscp",
+		"rewrite-rules exp",
+		"rewrite-rules ieee-802.1",
+		"rewrite-rules inet-precedence",
+		"rss-expectation interface",
+		"scheduler-maps forwarding-class",
+		"schedulers buffer-size",
+		"schedulers codel-target",
+		"schedulers equal-flow-target-policy",
+		"schedulers priority",
+		"schedulers transmit-rate",
+		"shaping-rate burst-size",
+		"traffic-control-profiles delay-buffer-rate",
+		"traffic-control-profiles guaranteed-rate",
+		"traffic-control-profiles scheduler-map",
+		"traffic-control-profiles shaping-rate",
+		"transmit-rate percent",
+		"unit output-traffic-control-profile",
+		"unit priority-low-min-share",
+		"unit scheduler-map",
+		"unit shaping-rate":
+		return true
+	// forwarding-options: 16 pairs.
+	case "dhcp-relay group",
+		"dhcp-relay server-group",
+		"flow-server port",
+		"flow-server source-address",
+		"flow-server version-ipfix-template",
+		"flow-server version9-template",
+		"group active-server-group",
+		"group interface",
+		"inet6 mode",
+		"input rate",
+		"output flow-server",
+		"output source-address",
+		"overrides maximum-hop-count",
+		"overrides maximum-packet-rate",
+		"port-mirroring instance",
+		"sampling instance":
+		return true
+	// firewall: 34 pairs.
+	case "filter term",
+		"firewall policer",
+		"firewall three-color-policer",
+		"flexible-match-range range",
+		"from destination-address",
+		"from destination-port",
+		"from destination-port-except",
+		"from dscp",
+		"from icmp-code",
+		"from icmp-type",
+		"from protocol",
+		"from source-address",
+		"from source-port",
+		"from source-port-except",
+		"from tcp-flags",
+		"from traffic-class",
+		"if-exceeding bandwidth-limit",
+		"if-exceeding burst-size-limit",
+		"inet filter",
+		"inet6 filter",
+		"single-rate committed-burst-size",
+		"single-rate committed-information-rate",
+		"single-rate excess-burst-size",
+		"then count",
+		"then dscp",
+		"then forwarding-class",
+		"then loss-priority",
+		"then policer",
+		"then routing-instance",
+		"then traffic-class",
+		"two-rate committed-burst-size",
+		"two-rate committed-information-rate",
+		"two-rate peak-burst-size",
+		"two-rate peak-information-rate":
+		return true
+	}
 	return false
 }
 

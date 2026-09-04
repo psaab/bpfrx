@@ -270,6 +270,14 @@ func validateDuplicateNamedBlockAST(tree *ConfigTree, lenient bool) ([]string, e
 		}
 	}
 
+	// #8704: containers that sit below a named-instance level, which
+	// namedDupRule's stanza/inner/keyword shape cannot express. Folded in here
+	// rather than given their own emit path so they inherit the SAME message
+	// vocabulary on both paths — dupEffectStrict / dupEffectLenient already
+	// distinguish first-wins / last-wins / split-instances, and a second
+	// diagnostic vocabulary for the same defect is how the two drift.
+	dups = append(dups, findDeepDupBlocks(tree)...)
+
 	if len(dups) == 0 && len(emptyKinds) == 0 {
 		return nil, nil
 	}

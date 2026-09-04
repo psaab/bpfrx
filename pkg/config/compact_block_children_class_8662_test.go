@@ -45,10 +45,24 @@ func TestChildrenBearingFoldedTokensAreCensused8662(t *testing.T) {
 	t.Logf("#8662: %d censused sites whose folded token declares children", withChildren)
 }
 
-// The divergence itself, asserted on the compiled config rather than on the
-// inventory file — so it stays true if the inventory is regenerated, and reds
-// if someone "fixes" the reader without updating the inventory.
-func TestVerifiedChildrenClassDivergences8662(t *testing.T) {
+// Asserted on the compiled config rather than on the inventory file — so it
+// stays true if the inventory is regenerated, and reds if someone changes the
+// reader without updating the inventory.
+//
+// #8690 family 3 flipped this cell's SIDE, exactly as the zone-member cell
+// below was flipped by family 2, and for the same reason it is kept rather than
+// deleted. It began as "braced compiles transmit-rate to 125000000, elided to
+// 0" — a verified divergence. `class-of-service schedulers <n> transmit-rate`
+// is now in the normalizer's scope, so the two spellings AGREE and the cell
+// asserts that instead.
+//
+// It announced the transition itself: it failed with "compact/block now AGREE
+// … the reader was fixed. Remove the line from the inventory and update the
+// note" rather than going quietly vacuous. That is the property worth keeping —
+// deleting it would stop the site being checked in EITHER direction, which is
+// the stale-allowlist failure the #2419 inventory exists to prevent, and a
+// future change that puts the divergence back would then be silent.
+func TestVerifiedChildrenClassIsNormalized8662(t *testing.T) {
 	braced := compileText(t, "class-of-service { schedulers be { transmit-rate 1g; } }")
 	elided := compileText(t, "class-of-service { schedulers be transmit-rate 1g; }")
 	if braced == nil || elided == nil {
@@ -65,11 +79,12 @@ func TestVerifiedChildrenClassDivergences8662(t *testing.T) {
 		t.Fatal("the braced spelling compiled transmit-rate to 0 — the fixture no longer " +
 			"demonstrates the value being read, so the divergence assertion is vacuous")
 	}
-	if es.TransmitRateBytes == bs.TransmitRateBytes {
-		t.Logf("compact/block now AGREE for schedulers transmit-rate (%d) — the reader was fixed. "+
-			"Remove `class-of-service schedulers xpfarg transmit-rate` from %s and update the "+
-			"#8662 note", bs.TransmitRateBytes, inventoryPath)
-		t.Fail()
+	if es.TransmitRateBytes != bs.TransmitRateBytes {
+		t.Errorf("elided transmit-rate compiled to %d, braced to %d — the two spellings "+
+			"must AGREE now that `class-of-service schedulers <n> transmit-rate` is in "+
+			"the normalizer's scope (#8690 family 3). A brace-elided scheduler rate that "+
+			"compiles to %d silently gives the queue no shaping on a commit reporting "+
+			"success.", es.TransmitRateBytes, bs.TransmitRateBytes, es.TransmitRateBytes)
 	}
 }
 
