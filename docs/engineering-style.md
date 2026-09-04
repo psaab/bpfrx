@@ -1515,6 +1515,24 @@ they repeatedly bite:
   stores `pkt_len` after the call rather than passing it, so both
   coordinates still travel as bare u32s).
 
+  **A "revert the fix" mutation on the shim is silently vacuous whenever
+  the mutant fails to verify (#8249).** `make generate` is verify-then
+  -install: a candidate the kernel verifier rejects is correctly NOT
+  installed, so the tracked `.o` stays at the previous — working —
+  object, and `make test-shim-run` loads that. The mutation then reports
+  a clean PASS, which reads as the mutation ESCAPING: the most alarming
+  possible result, and the one most likely to be chased rather than
+  distrusted. The gate is doing its job; it just makes a whole class of
+  mutation meaningless without saying so.
+
+  Two remedies, both cheap. **A sound shim mutation must produce a
+  VERIFIABLE object with the defect restored** — reverting the whole
+  change does; removing one guard from a fix often does not, because the
+  guard was also pruning verifier state. And **assert the object md5
+  moved** before believing any shim measurement, mutation or otherwise:
+  a stale object answers every question confidently and with the wrong
+  build.
+
   And **sharing duplicated code between subprograms is not generically
   profitable here.** Sharing an inner map lookup between the two GRE
   classifiers saved 23,181 instructions; sharing the port-parse beside it

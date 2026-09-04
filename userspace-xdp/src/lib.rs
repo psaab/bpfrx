@@ -437,6 +437,24 @@ const USERSPACE_SESSION_ACTION_PASS_TO_KERNEL: u8 = 2;
 static USERSPACE_FALLBACK_STATS: PerCpuArray<u64> =
     PerCpuArray::with_max_entries(USERSPACE_FALLBACK_REASON_MAX, 0);
 
+// #8249: a per-CPU scratch slot that LAUNDERS the IPv6 non-first-fragment
+// sighting out of the extension-header walk's exit state.
+//
+// WHY A MAP AND NOT A FIELD. Reading a SECOND value out of the walk defeats
+// the verifier's state merging at the loop exit: exit states that previously
+// merged on equal `protocol` now differ in the fragment flag and cannot. That
+// cost is multiplied by every stateful thing downstream, and it is why four
+// consumption channels were rejected at the 1,000,000-insn cap. A map read is
+// opaque to the verifier, so `protocol` depends on an unknown value instead of
+// on the walk's exit state. Measured: consuming the flag directly REJECTS at
+// 1,000,001; laundered it costs +298,128 and verifies.
+//
+// PER-CPU is required, not a preference. Native XDP runs one program instance
+// per RX queue on distinct CPUs concurrently; a shared array would let one
+// CPU's fragment flag decide another CPU's packet.
+#[map(name = "userspace_v6frag_scratch")]
+static USERSPACE_V6FRAG_SCRATCH: PerCpuArray<u8> = PerCpuArray::with_max_entries(1, 0);
+
 #[map(name = "userspace_trace")]
 static USERSPACE_TRACE: HashMap<u32, UserspaceTraceValue> = HashMap::with_max_entries(1024, 0);
 
@@ -1560,7 +1578,51 @@ fn parse_ipv6(
     // COMPARABLE: userspace-dp's executable parity corpus
     // reads this field against its own `non_first_fragment_offset_seen`, which
     // was impossible while the walk returned a bare `(offset, protocol)`.
-    let (offset, protocol) = (walk.offset, walk.protocol);
+    // #7494/#8249: a non-first fragment carries no L4 header — the bytes at the
+    // resolved offset are PAYLOAD. Substituting the sentinel routes it into
+    // `parse_l4`'s existing unknown-protocol arm, which returns zeroed ports and
+    // cannot fail, closing both v6 exposures at one site: no payload-derived
+    // tuple can match a session, and the TCP arm's data-offset drop — a
+    // disposition an off-path party selected by choosing a payload byte —
+    // disappears. This is the v4 fix at `parse_ipv4`, finally affordable for v6.
+    //
+    // THE GATE IS NOT AN OPTIMISATION, it is what makes the cost acceptable. A
+    // non-first fragment requires a Fragment extension header, and the header
+    // chain starts at `ip6[6]`. If that is a terminal L4 protocol the packet has
+    // NO extension headers, so it cannot be a fragment and the laundering is
+    // skipped entirely. `ip6[6]` is a direct read of the fixed header, not a
+    // walk result, so the gate itself costs no exit-state correlation. Ordinary
+    // IPv6 — which is nearly all traffic — takes the left branch and pays
+    // nothing.
+    let protocol = if eh_class(ip6[6]) == EH_CLASS_TERMINAL {
+        walk.protocol
+    } else {
+        // FAIL CLOSED. The slot outlives the packet, so a write we did not make
+        // leaves the PREVIOUS packet's value in it on this CPU — and a stale
+        // `true` would sentinel an ordinary flow into a zero-ported
+        // unknown-protocol one. Both map operations are therefore checked, and
+        // either failing is treated as "this may be a fragment": the sentinel
+        // makes the packet a guaranteed session miss that falls through to the
+        // AF_XDP redirect, where the full dataplane adjudicates it. That defers,
+        // it does not drop.
+        let wrote = if let Some(p) = USERSPACE_V6FRAG_SCRATCH.get_ptr_mut(0) {
+            unsafe { *p = walk.non_first_fragment as u8 };
+            true
+        } else {
+            false
+        };
+        let seen = unsafe { USERSPACE_V6FRAG_SCRATCH.get(0) }.copied();
+        let non_first = match (wrote, seen) {
+            (true, Some(v)) => v != 0,
+            _ => true,
+        };
+        if non_first {
+            PROTO_FRAGMENT_NO_L4
+        } else {
+            walk.protocol
+        }
+    };
+    let offset = walk.offset;
 
     let flow_lbl0 = ip6[1];
     let dscp = ((version_priority & 0x0f) << 2) | (flow_lbl0 >> 6);
