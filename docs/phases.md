@@ -540,7 +540,12 @@ Gap audit: `docs/archived/userspace-forwarding-and-failover-gap-audit.md` (PR #3
 #### OSPF Passive-Interface Default & Network Type (`f58ee41`)
 - **OSPF passive-interface default:** `passive` at OSPF protocol level → FRR `passive-interface default`
 - **OSPF no-passive override:** Per-interface `passive disable` → FRR `no passive-interface <iface>`
-- **OSPF interface network type:** `interface-type point-to-point` or `broadcast` → FRR `ip ospf network <type>`
+- **OSPF interface network type:** `interface-type <type>` → FRR `ip ospf network <type>`.
+  Typed since #8481 against the four spellings vtysh accepts (`broadcast`,
+  `non-broadcast`, `point-to-multipoint`, `point-to-point`); the Junos spellings
+  `p2p`, `nbma` and `p2mp` are accepted and translated. The token used to be
+  passed through unvalidated, so an unrecognised one emitted a line vtysh
+  rejects and failed the ENTIRE managed-section reload.
 - Parser + compiler + FRR generation + tests
 
 #### Route-Map Attributes, BGP Neighbor Features, OSPFv3, DPDK Sync (`383173c`)

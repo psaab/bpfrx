@@ -248,7 +248,19 @@ var gateBlindCeiling = map[gateBlindClass]int{
 	// property of the leaf's purpose, not slack — and if the `-regexps` family
 	// is ever implemented, these four must LEAVE this class and the ceiling must
 	// come back down by four.
-	gateBlindUnreachable: 140,
+	// #8443 raised this 140 -> 142, deliberately, for the two
+	// `protocols ospf ... interface <*> authentication-type` leaves (top-level
+	// and the routing-instances copy). Like the #7971 `-regexps` family above,
+	// they are modeled SOLELY so they are refused at commit
+	// (schema_ospf_authentication_8443.go) — OSPF has no such leaf, and leaving
+	// it unmodeled meant it committed clean and left the adjacency
+	// UNAUTHENTICATED. Both spellings of a refused leaf produce the same
+	// rejection, so the differential can observe no difference between them.
+	// Not a gap it could close: a leaf whose every value is refused has no
+	// output for a spelling to move. If OSPF ever gains a real
+	// `authentication-type`, these two must LEAVE this class and the ceiling
+	// must come back down by two.
+	gateBlindUnreachable: 142,
 	// #7132 raised this 175 -> 176 for `system ntp server ... prefer`.
 	//
 	// Raised deliberately, and it is the one kind of raise that is not a

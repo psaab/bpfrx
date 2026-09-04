@@ -603,6 +603,10 @@ struct LiveCallSiteFixture {
     recent_exceptions: Arc<Mutex<ExceptionEventRing>>,
     last_resolution: Arc<Mutex<Option<ResolutionEvent>>>,
     peer_worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>>,
+    /// #7699: the PPTP control inbox `worker_ctx()` hands the stages. Owned by
+    /// the fixture because `worker_ctx` RETURNS the context — a local would be
+    /// borrowed out of the method.
+    pptp_control: Arc<crate::session::pptp_control::PptpControlInbox>,
     dnat_fds: DnatTableFds,
     rg_epochs: [AtomicU32; MAX_RG_EPOCHS],
     /// #6999: an event stream for the cached filter-LOG emissions to reach.
@@ -714,6 +718,9 @@ impl LiveCallSiteFixture {
             recent_exceptions: Arc::new(Mutex::new(ExceptionEventRing::new())),
             last_resolution: Arc::new(Mutex::new(None)),
             peer_worker_commands: Vec::new(),
+            pptp_control: Arc::new(
+                crate::session::pptp_control::PptpControlInbox::default(),
+            ),
             dnat_fds: DnatTableFds::default(),
             rg_epochs: std::array::from_fn(|_| AtomicU32::new(0)),
         }
@@ -805,6 +812,7 @@ impl LiveCallSiteFixture {
 
     fn worker_ctx(&self) -> WorkerContext<'_> {
         WorkerContext {
+            pptp_control: &self.pptp_control,
             ident: &self.ident,
             binding_lookup: &self.binding_lookup,
             mirror_targets: &self.mirror_targets,

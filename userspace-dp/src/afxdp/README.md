@@ -380,7 +380,47 @@ sync.
     failover. The seq-0 absorb in `process_dump_batch` (`#2918`) is the
     sibling completeness fix on the success path and is preserved.
 - `poll_stages.rs` — sibling of `worker/`, not inside it. Holds the
-  per-packet pipeline stages extracted in #946 Phase 1. The screen and
+  per-packet pipeline stages extracted in #946 Phase 1.
+  - **#7699 — the PPTP control-segment dispatch.**
+    `stage_parse_flow_and_learn` recognises a TCP flow with 1723 on EITHER
+    side (`is_pptp_control_flow`) and copies the segment's payload into
+    `WorkerContext::pptp_control` (`capture_pptp_control_segment`, `#[cold]`).
+    It does NOT parse. The worker's periodic drain
+    (`worker_queue::drain_pptp_control_inbox`, called from `loop_body`
+    beside the association expiry) parses, installs into the local table and
+    broadcasts to the siblings. Three things about this are load-bearing:
+    - **Why a stage and not `loop_body`.** No `&mut SessionTable` site in the
+      worker loop has a packet frame, and no stage has a mutable session
+      table — frame and table are never co-located. Writing through a shared
+      handle on `WorkerContext` is the same solution `dynamic_neighbors`
+      already uses, under the identical constraint its doc states: *the caller
+      does not need visibility into what was learned for the same packet*. An
+      association is needed by the GRE data packets that FOLLOW, never by the
+      control segment that taught it.
+    - **The interval gate lives in `PptpControlInbox::take_pending`, not at
+      the call site.** The drain's caller runs at packet rate, so a call-site
+      gate is one edit from becoming per-poll work — the defect #8399 shipped
+      when the association expiry landed above `expire_stale_entries_ha`'s
+      gate. Keeping it in the callee makes "how often" a property of the
+      function.
+    - **The drain installs locally AND broadcasts.**
+      `WorkerContext::peer_worker_commands` EXCLUDES this worker, so a
+      broadcast alone teaches everyone but the worker that saw the segment —
+      and RSS does not co-locate the control and data channels, so that
+      worker is as likely as any to be the one the GRE data lands on.
+
+    Recognising the port is two comparisons on a tuple the stage already
+    parsed; COPYING additionally needs the TCP data-offset read
+    (`frame::tcp_payload_offset`). "Off the hot path" buys the parse, not the
+    test for whether to parse.
+
+    **Still not wired after this:** the DATA-channel resolve. A GRE
+    version-1 packet does not consult the association table —
+    `gre_discriminator.rs` returns `None` for `TunnelDiscriminator::Pptp(_)` —
+    so `PptpAssociations::resolve_and_touch` and the `unassociated` counter
+    have no production caller, and the `pptp` `alg_type` does not exist.
+
+  The screen and
   SYN-cookie stages decide the L3 offset (14 vs 18) on tag PRESENCE
   (`meta.ingress_vlan_present != 0`), not `vlan_id > 0` — 802.1p
   priority-tagged frames carry a real 802.1Q tag with VID 0, so a

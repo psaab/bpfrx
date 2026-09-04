@@ -289,6 +289,68 @@ pub(in crate::afxdp) fn broadcast_pptp_install(
     accepted
 }
 
+/// #7699: drain the PPTP control inbox — parse, install locally, publish.
+///
+/// Returns how many associations were learned on this pass.
+///
+/// **This is the production join.** Every other piece of #7699 works in
+/// isolation: the parser parses, the table resolves, the broadcast fans out,
+/// the drain applies. Until this function existed nothing chained them, and
+/// each end's cells stayed green against a build where the middle was missing.
+///
+/// # It is safe to call every poll iteration, and that is a property of the
+/// callee
+///
+/// The interval gate lives inside [`PptpControlInbox::take_pending`], not here
+/// and not at the call site. The caller is the worker poll loop, which runs at
+/// packet rate; a gate written at the call site would be one edit away from
+/// running per-poll — the defect that shipped in #8399, where the association
+/// expiry landed ABOVE `expire_stale_entries_ha`'s gc-interval gate and scanned
+/// the whole map on every call.
+///
+/// # Why it installs locally AND broadcasts
+///
+/// `peer_worker_commands` EXCLUDES this worker (built with a
+/// `filter(|(id, _)| **id != worker_id)` at the coordinator's bring-up). A
+/// broadcast alone would therefore teach every worker but the one that saw the
+/// segment — and since RSS does not co-locate the control and data channels,
+/// that worker is as likely as any to be the one the call's GRE data lands on.
+/// The local install is not a duplicate of the broadcast; it is the half the
+/// broadcast structurally cannot reach.
+pub(in crate::afxdp) fn drain_pptp_control_inbox(
+    inbox: &crate::session::pptp_control::PptpControlInbox,
+    sessions: &mut crate::session::SessionTable,
+    peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
+    now_ns: u64,
+) -> usize {
+    let mut learned = 0;
+    for seg in inbox.take_pending(now_ns) {
+        let Some(call) = crate::session::pptp_control::learn_from_control_segment(
+            seg.src,
+            seg.dst,
+            &seg.payload,
+        ) else {
+            // Not a control message, truncated, or a call that did not connect.
+            // All three mean no association — the call's data takes the
+            // unassociated path, forwarded and counted.
+            continue;
+        };
+        let control = crate::session::pptp::ControlChannelId::new(
+            seg.src,
+            seg.src_port,
+            seg.dst,
+            seg.dst_port,
+        );
+        if let Err(e) = sessions.pptp_mut().install(call, control, now_ns) {
+            debug_log!("PPTP association refused on the local worker: {:?}", e);
+            continue;
+        }
+        broadcast_pptp_install(peer_worker_commands, call, control, now_ns);
+        learned += 1;
+    }
+    learned
+}
+
 /// #7699: broadcast a PPTP association teardown to every worker.
 ///
 /// Same broadcast reasoning as the install, and a stronger reason to notice a
