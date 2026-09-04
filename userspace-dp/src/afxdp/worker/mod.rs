@@ -8,6 +8,10 @@ use super::worker_runtime::CoSQueueLeaseUndergrantCounters;
 // Issue 73 step 2: per-poll BindingWorker lifecycle (the central
 // `poll_binding` orchestrator) lives in worker/lifecycle.rs.
 mod lifecycle;
+/// #8114 item 3: the derived size of the same-worker flow-cache revocation
+/// window. Re-exported so the decision's figure is nameable from outside the
+/// module that computes it.
+pub(crate) use lifecycle::REVOCATION_FLOW_CACHE_WINDOW_DESCRIPTORS;
 use lifecycle::poll_binding;
 
 // #959 Phase 1: per-worker debug counters live in worker/telemetry.rs.
