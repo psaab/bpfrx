@@ -304,7 +304,21 @@ var gateBlindCeiling = map[gateBlindClass]int{
 	// `configstore.CheckText` and every valid form still commits
 	// (policer_then_conflict_8445_test.go), and the compiled ThenAction /
 	// ThenActions are asserted directly on the tolerant path.
-	gateBlindFlag:       178,
+	//
+	// #8296 raises this 178 -> 179 for `security flow tcp-session
+	// strict-syn-check`. Same shape and the same unrescuable reason: it is a
+	// PRESENCE-only flag, so the spelling differential — which works by VARYING
+	// a leaf's value — has nothing to vary. Modelling it as anything else would
+	// misrepresent the Junos grammar to buy a gate reading.
+	//
+	// It is not untested, and #8296 is precisely the change that made it
+	// testable: before it the keyword was in no schema, read by no compiler and
+	// named by no advisory, so there was nothing to assert. Now
+	// `flow_session_closed_world_8296_test.go` asserts it reaches the typed
+	// config AND produces its accepted-only advisory, and it is a member of the
+	// accept-side keyword corpus that guards the tcp-session closed-world flip
+	// against false-rejecting it.
+	gateBlindFlag:       179,
 	gateBlindErr:        43,
 	gateBlindValueMoves: 1,
 }

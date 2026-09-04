@@ -291,6 +291,21 @@ type TCPSessionConfig struct {
 	// completion) and is the single seam a future sequence-checking dataplane
 	// would read.
 	NoSequenceCheck bool
+	// StrictSynCheck records `set security flow tcp-session strict-syn-check`
+	// (#8296). ACCEPTED-ONLY: the userspace AF_XDP dataplane tracks no TCP
+	// sequence/window state and reads neither this knob nor NoSynCheck, and it
+	// applies two handshake guards of its own that neither knob selects (see
+	// docs/feature-gaps.md "TCP Strict SYN Check").
+	//
+	// It exists because the keyword was previously accepted by NOTHING: absent
+	// from setSchema, absent from this compiler, and — contrary to what
+	// feature-gaps.md claimed — carrying no advisory either. So a real Junos
+	// keyword committed clean, rendered back, and reached no consumer, which is
+	// #8296's own defect for a documented knob. Modelling it is also what makes
+	// the tcp-session subtree LEAF-COMPLETE, which is the precondition
+	// schemaNode.closedWorld requires before that subtree can reject unknown
+	// keywords.
+	StrictSynCheck bool
 }
 
 // LogConfig holds logging/syslog configuration.

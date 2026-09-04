@@ -574,6 +574,11 @@ func compileFlow(node *Node, sec *SecurityConfig) error {
 			case "no-sequence-check":
 				sec.Flow.TCPSession.NoSequenceCheck = true
 				continue
+			case "strict-syn-check":
+				// #8296: accepted-only, and now ADVISED as such. Reading it
+				// here is what lets validateAcceptedOnlyWarnings see it.
+				sec.Flow.TCPSession.StrictSynCheck = true
+				continue
 			}
 			if len(opt.Keys) < 2 {
 				continue
