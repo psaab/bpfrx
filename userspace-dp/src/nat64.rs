@@ -762,12 +762,34 @@ impl Nat64State {
             // trades a harmless, unreachable divergence for the one failure
             // mode this code exists to prevent.
             //
-            // Unreachable in supported operation, which is why it is recorded
-            // rather than fixed: reaching it needs a snapshot carrying `/+96`,
-            // and no xpf version can produce one — ParseUint has never accepted
-            // a sign, so the value cannot survive the commit that would persist
-            // it. It would take out-of-band edition of the config DB or a
-            // foreign implementation on the other end of HA sync.
+            // REACHABLE, and the consequence is a fail-open. An earlier
+            // revision of this note called it unreachable, reasoning that no
+            // xpf version can persist a `/+96` because the commit gate rejects
+            // it. That is a COMMIT-path argument, and the commit path does not
+            // bound what reaches this loader — the same mistake #8597 K51
+            // documents one file over. Measured end to end instead:
+            //
+            //   1. strict commit           -> REJECTED
+            //   2. Store.Load / SyncApply  -> compiles LENIENTLY, and
+            //      validateNAT64PrefixStrict(cfg, lenient=true) only WARNS and
+            //      `continue`s: the rule is not dropped and not zeroed, so
+            //      NAT64RuleSnapshot.prefix arrives here as "64:ff9b::/+96"
+            //      verbatim.
+            //   3. this loader             -> INSTALLS the rule; prefix_bytes
+            //      = 00:64:ff:9b:.. (64:ff9b::), active and translating.
+            //      Control: "/64" gives is_active=false, 0 prefixes, so the
+            //      loader does reject a bad length — acceptance of "/+96" is
+            //      the '+' specifically.
+            //
+            // So a hand-edited or peer-synced config reaches a state where the
+            // DATAPLANE IS RUNNING A NAT64 RULE THE CONTROL PLANE BELIEVES IS
+            // INERT — and worse, the lenient warning tells the operator in so
+            // many words that "this rule ... will not reach the dataplane until
+            // it is corrected", which is false for exactly this input.
+            //
+            // Tracked as #8667; do not fix it by tightening the parse
+            // below (see above). The divergence is on the Go side of the
+            // lenient path, which is where the false claim is made.
             let parts: Vec<&str> = snap.prefix.split('/').collect();
             if parts.len() != 2 || parts[1].parse::<u8>().ok() != Some(96) {
                 eprintln!(
