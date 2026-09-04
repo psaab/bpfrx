@@ -764,6 +764,16 @@ const proxyARPAnnounceMaxAddresses = 64
 // into a storm. A missed announce is recovered by the upstream's own ARP
 // ageing, which is the pre-#8405 behaviour for every address.
 //
+// #8621: that recovery sentence is TRUE ONLY NOW. It assumes the upstream's
+// re-ARP gets an answer, and until #8621 nothing answered for a pool address
+// inside its own egress interface's connected subnet -- every arm of the
+// kernel's proxy branch is gated on the route egressing a DIFFERENT device than
+// the request arrived on, so the NTF_PROXY entry and the `proxy_arp` sysctl the
+// daemon installs were both inert there. This announce was therefore the ONLY
+// thing that ever bound the address upstream, and the "recovery" was an ageing
+// timer into a blackhole. The userspace responder
+// (daemon_proxyarp_responder_8621.go) is what makes the assumption hold.
+//
 // The RG filter is `proxyARPRedundancyGroupFor`, the SAME predicate #8297's
 // suppression uses. That is deliberate: this announces exactly the set the
 // standby stops answering for, so the two cannot disagree about which
