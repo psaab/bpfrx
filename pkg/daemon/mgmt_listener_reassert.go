@@ -104,7 +104,16 @@ func (d *Daemon) mgmtListenerDown() bool {
 	if mgmt == nil {
 		return false
 	}
-	return mgmt.effectiveHTTPListener().State == sysservices.StateFailed
+	// #8597 K86: ask BOTH legs. This asked only HTTP, so an HTTPS leg that died
+	// to an unexpected serve exit was never re-driven by this always-on owner —
+	// the repair waited for the operator's next commit, which is the one event a
+	// broken management plane makes hard to deliver. The commit path already
+	// asked the right question (`next.TLS && !m.srv.HTTPSServing()`); this is
+	// that question asked by the loop whose entire job is to notice.
+	if mgmt.effectiveHTTPListener().State == sysservices.StateFailed {
+		return true
+	}
+	return mgmt.effectiveHTTPSListener().State == sysservices.StateFailed
 }
 
 // reassertMgmtListenersOnce re-drives one management reconcile if a listener is
