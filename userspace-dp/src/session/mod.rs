@@ -1768,6 +1768,33 @@ impl SessionTable {
         self.entry_by_key(key).map(|e| e.session_id).unwrap_or(0)
     }
 
+    /// #8125: the session's OWN inactivity window, in whole seconds, for the
+    /// `Timeout:` column of `show security flow session`.
+    ///
+    /// That column read a hardcoded `1800` for every session regardless of the
+    /// window actually in force — the Junos default for `established-timeout`,
+    /// stamped by the conntrack publisher and never corrected. It was wrong in
+    /// both directions at once: 1800 for an ESTABLISHED session whose real
+    /// window is 300 s unless configured, and 1800 for a half-closed session on
+    /// a 30 s (or a configured 3 s) closing window. The reap behaviour proved
+    /// the windows differed by an order of magnitude while the column read the
+    /// same number for both.
+    ///
+    /// `expires_after_ns` is the per-entry window the expiry wheel itself uses,
+    /// so this reports what actually governs the session rather than a
+    /// re-derivation that could disagree with it. After #7342 that is one of
+    /// established / initial / closing / time-wait / the RST abort window,
+    /// selected on the entry as its state moves.
+    ///
+    /// Returns 0 for an absent key. The publisher treats 0 as "no live entry"
+    /// and leaves the previous value rather than stamping a zero window, which
+    /// would render as an immediate expiry the session is not on.
+    pub(crate) fn timeout_secs_for(&self, key: &SessionKey) -> u32 {
+        self.entry_by_key(key)
+            .map(|e| (e.expires_after_ns / 1_000_000_000) as u32)
+            .unwrap_or(0)
+    }
+
     #[inline]
     fn contains_key(&self, key: &SessionKey) -> bool {
         self.key_to_handle.contains_key(key)

@@ -607,6 +607,9 @@ pub(super) fn poll_binding_process_descriptor(
                             // installed table entry so `show security flow
                             // session` reports the SAME id RT_FLOW emits.
                             let session_id = sessions.session_id_for(&flow.forward_key);
+                            // #8125: resolved from the same entry, so the row's
+                            // `Timeout:` column reports the window in force.
+                            let timeout_secs = sessions.timeout_secs_for(&flow.forward_key);
                             publish_bpf_conntrack_entry(
                                 conntrack_v4_fd,
                                 conntrack_v6_fd,
@@ -617,6 +620,7 @@ pub(super) fn poll_binding_process_descriptor(
                                 worker_ctx.forwarding.alg_disable_flags,
                                 app_id,
                                 session_id,
+                                timeout_secs,
                             );
                         }
                         // Log first N session hits from WAN (return path)
@@ -2161,6 +2165,9 @@ pub(super) fn poll_binding_process_descriptor(
                                 // RT_FLOW.
                                 let session_id =
                                     sessions.session_id_for(&flow.forward_key);
+                                // #8125: see the sibling site.
+                                let timeout_secs =
+                                    sessions.timeout_secs_for(&flow.forward_key);
                                 publish_bpf_conntrack_entry(
                                     conntrack_v4_fd,
                                     conntrack_v6_fd,
@@ -2171,6 +2178,7 @@ pub(super) fn poll_binding_process_descriptor(
                                     worker_ctx.forwarding.alg_disable_flags,
                                     app_id,
                                     session_id,
+                                    timeout_secs,
                                 );
                             }
                         }
@@ -2894,6 +2902,9 @@ pub(super) fn poll_binding_process_descriptor(
                                         // reports the SAME id RT_FLOW emits.
                                         let ct_session_id =
                                             sessions.session_id_for(&flow.forward_key);
+                                        // #8125: see the sibling site.
+                                        let ct_timeout_secs =
+                                            sessions.timeout_secs_for(&flow.forward_key);
                                         publish_bpf_conntrack_entry(
                                             conntrack_v4_fd,
                                             conntrack_v6_fd,
@@ -2904,6 +2915,7 @@ pub(super) fn poll_binding_process_descriptor(
                                             worker_ctx.forwarding.alg_disable_flags,
                                             ct_app_id,
                                             ct_session_id,
+                                            ct_timeout_secs,
                                         );
                                         publish_shared_session(
                                             worker_ctx.shared_sessions,
@@ -5608,6 +5620,9 @@ pub(super) fn poll_binding_process_descriptor(
                                         // matches RT_FLOW.
                                         let session_id =
                                             sessions.session_id_for(&flow.forward_key);
+                                        // #8125: see the sibling site.
+                                        let timeout_secs =
+                                            sessions.timeout_secs_for(&flow.forward_key);
                                         publish_bpf_conntrack_entry(
                                             conntrack_v4_fd,
                                             conntrack_v6_fd,
@@ -5618,6 +5633,7 @@ pub(super) fn poll_binding_process_descriptor(
                                             worker_ctx.forwarding.alg_disable_flags,
                                             app_id,
                                             session_id,
+                                            timeout_secs,
                                         );
                                         // #2244: count failed reverse-NAT publishes so
                                         // map-pressure loss is operator-visible.

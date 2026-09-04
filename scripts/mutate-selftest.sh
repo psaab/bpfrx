@@ -238,6 +238,70 @@ ck "a kill that does NOT name the target is not a kill" 	"ESCAPED(other tests fa
 # exists to prevent.
 ck "a VOID verdict is not refined by names" "VOID(build break)" 	"$(mutation_verdict_for_target 'VOID(build break)' TestTarget TestOther)"
 
+echo "== ANCHORING (#8213): every anchor variant fails somewhere =="
+# THE FIXTURE IS THE POINT. Three real failing tests in three different
+# shapes, including the spliced line captured verbatim from the #8000 matrix
+# (note the truncated `TestR` fragment — two goroutines writing at once).
+# A hand-written fixture with three tidy top-level lines cannot reproduce
+# this and would score every pattern below identically.
+cat > "$W/anchor.log" <<'EOF'
+ok  	github.com/psaab/xpf/pkg/cli	6.409s
+--- FAIL: TestTopLevel (0.01s)
+    --- FAIL: TestParent/subtest (0.00s)
+        barrier_test.go:171: took 300ms: the singular path left the barrier armed --- FAIL: TestR--- FAIL: TestRemoteFailoverDisarmsSupersededBarrier8000 (0.60s)
+FAIL	github.com/psaab/xpf/pkg/cluster	1.2s
+EOF
+
+# The two anchors fail in OPPOSITE directions. Pinning both is what stops a
+# future "fix" from tightening one and silently reopening the other.
+ck "^--- FAIL misses the indented subtest AND the splice" \
+	"1" "$(grep -cE '^--- FAIL' "$W/anchor.log")"
+ck "^\\s+--- FAIL misses the TOP-LEVEL line (it has no leading whitespace)" \
+	"1" "$(grep -cE '^\s+--- FAIL' "$W/anchor.log")"
+ck "^\\s*--- FAIL catches both of those and still misses the splice" \
+	"2" "$(grep -cE '^\s*--- FAIL' "$W/anchor.log")"
+
+# The landed mitigation. Sound for the VERDICT because the decision is only
+# "was anything named" — 3 real failures, and the count is >= 1 either way.
+# FOUR, not three: the spliced line carries TWO markers (the truncated
+# `TestR` fragment and the real name), so the count OVER-reports by one.
+# That is the correct trade and it is why the counter is only used for the
+# verdict — over-counting cannot turn a kill into an escape, while the
+# anchored under-count could and did.
+ck "the production unanchored counter sees every failure (and over-counts the splice)" \
+	"4" "$(mutation_go_failed "$W/anchor.log")"
+ck "the spliced log scores as a KILL, not an escape" \
+	"yes 2 4 KILLED" "$(mutation_score_log go "$W/anchor.log" yes)"
+
+# NEGATIVE CONTROL. Without this, a counter that returned a constant >= 1
+# would satisfy every positive check above. A genuinely un-killed mutation
+# must still score ESCAPED.
+cat > "$W/anchor-clean.log" <<'EOF'
+ok  	github.com/psaab/xpf/pkg/cli	6.409s
+ok  	github.com/psaab/xpf/pkg/cluster	1.2s
+EOF
+ck "NEGATIVE CONTROL: a run with no failures still scores ESCAPED" \
+	"yes 2 0 ESCAPED" "$(mutation_score_log go "$W/anchor-clean.log" yes)"
+
+# ATTRIBUTION is where the unanchored count stops being enough: the splice
+# yields a PHANTOM name from the truncated `TestR` fragment. Anything
+# reporting WHICH test killed a mutant must use the -json path instead.
+ck "the unanchored scan invents a phantom name from the truncated fragment" \
+	"1" "$(grep -oE -- 'TestR--- FAIL' "$W/anchor.log" | grep -c . || true)"
+
+# Rust is NOT exposed: libtest holds the stdout lock per result line, so its
+# anchor is sound. Measured on a full parallel run of 5217 tests — zero
+# markers off column 0. Pinned so nobody "fixes" it by symmetry with Go.
+cat > "$W/rust-parallel.log" <<'EOF'
+test afxdp::ha::tests::alpha ... ok
+test afxdp::ha::tests::beta ... FAILED
+test afxdp::ha::tests::gamma ... ok
+EOF
+ck "the Rust anchor still counts collection under parallelism" \
+	"3" "$(mutation_rust_collected "$W/rust-parallel.log")"
+ck "the Rust anchor still counts the failure under parallelism" \
+	"1" "$(mutation_rust_failed "$W/rust-parallel.log")"
+
 echo
 if [ "$fails" -eq 0 ]; then
 	echo "mutate-selftest: all checks passed"

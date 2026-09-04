@@ -579,7 +579,7 @@ impl SessionTable {
         cursor: usize,
         budget: usize,
         now_ns: u64,
-        mut f: impl FnMut(&SessionKey, SessionDecision, &SessionMetadata, u64, SessionCounters),
+        mut f: impl FnMut(&SessionKey, SessionDecision, &SessionMetadata, u64, SessionCounters, u64),
     ) -> usize {
         // #6297: bound the round-robin walk to the live-extent
         // high-watermark, NOT the monotonic `entries.capacity()`. The slab
@@ -608,7 +608,19 @@ impl SessionTable {
             if let Some(record) = self.entries.get(idx) {
                 let entry = &record.entry;
                 let idle_ns = now_ns.saturating_sub(entry.last_seen_ns);
-                f(&record.key, entry.decision, &entry.metadata, idle_ns, entry.counters);
+                // #8125: the entry's OWN window, so the refresh can correct the
+                // `Timeout:` column the publisher stamped with a constant. Read
+                // here rather than looked up again by the callback: the walk
+                // already holds the entry, and a second lookup by key could
+                // observe a different entry than the one being refreshed.
+                f(
+                    &record.key,
+                    entry.decision,
+                    &entry.metadata,
+                    idle_ns,
+                    entry.counters,
+                    entry.expires_after_ns,
+                );
             }
         }
         // Wrap to 0 on cycle completion so the caller can detect "table fully
