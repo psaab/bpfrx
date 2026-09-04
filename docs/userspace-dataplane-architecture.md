@@ -2542,6 +2542,16 @@ stopped.
   = 18 bindings); it replaces a previous `600`, which was derived from one NIC's
   6 bindings and covered only 7 of those 18.
 
+  **The appliance image ships NO reservation.** `scripts/image/bake.py` writes
+  `/etc/sysctl.d/99-xpf.conf` with forwarding and BPF-JIT settings only; nothing
+  in the bake or the deploy installs `99-xpf-hugepages.conf`. That is correct for
+  the default `ring-entries` (a binding is ~10 MiB at 1024, so no pool is needed),
+  but it means raising `ring-entries` to 16384 on a baked appliance takes the THP
+  fallback on **every** binding unless the operator adds the reservation in the
+  same change. Sizing a blind reservation at bake time would be worse — a pool is
+  taken from ordinary memory for the whole boot, and the appliance's RAM is not
+  known then.
+
   Apply with `sysctl --system` (or reboot). Verify with `grep HugePages_ /proc/meminfo`.
   If the pool cannot back a UMEM, `MAP_HUGETLB` fails and the daemon falls back to
   THP, which is advisory and not guaranteed to promote all pages. That fallback is

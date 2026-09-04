@@ -133,10 +133,12 @@ impl MmapArea {
             eprintln!(
                 "xpf-ha: WARNING: the 2 MB hugepage pool could not back this UMEM. \
                  THP promotion is advisory, so throughput may stall in TLB-miss \
-                 latency. Raise vm.nr_hugepages (etc/sysctl.d/99-xpf-hugepages.conf) \
-                 to cover {} x 2 MB pages per binding across ALL binding candidates \
-                 (the planner mints the SUM of each interface's min(rx_queues, 16) \
-                 since #7497), then `sysctl --system` and restart xpfd. Verify with \
+                 latency. This region alone needed {} x 2 MB pages; size \
+                 vm.nr_hugepages (etc/sysctl.d/99-xpf-hugepages.conf) to cover \
+                 EVERY region, i.e. the SUM of each interface's \
+                 min(rx_queues, 16) over all binding candidates since #7497 \
+                 (a shared-UMEM group is one region spanning several bindings). \
+                 Then `sysctl --system` and restart xpfd; verify with \
                  `grep HugePages_ /proc/meminfo`.",
                 aligned_len.div_ceil(HUGE_PAGE_SIZE)
             );
