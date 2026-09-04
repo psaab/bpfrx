@@ -340,6 +340,29 @@ than the thing the status renders. A single string would be a false statement
 in the fail-closed case, where the daemon does not know a candidate exists and
 no marker may ever be written.
 
+**There is deliberately no equivalent hold for an image ROLL (#7559), and it
+must not be added here.** The kernel roll and the image roll look like the same
+problem — an unverified node booting into an election it can win — but they are
+not. The kernel hold is keyed on the on-node upgrade journal, and
+`kernel_selfrecover.go` folds a clean `ENOENT` to "never armed" with no hold.
+That is correct for a REBOOT, which preserves the journal. An image roll
+DESTROYS the disk, so `ENOENT` there means "the evidence was wiped" — and
+nothing left on the node can tell those two apart, because the artifact that
+would say so is exactly what the recreate removed. Widening the fold, or
+holding by default on a journal-less node, would hold every legitimate
+first boot of a new cluster: both nodes are journal-less, neither has seen a
+peer, and the marker that releases the hold is one a fresh install never
+writes. The cluster would never come up.
+
+The image-roll window is closed **outside this package**, by not starting the
+elector: `scripts/deploy/xpf-deploy.py image-roll` asks the recreate hook to
+keep `xpfd` from auto-starting on the recreated node's first boot, evaluates
+the #5075 identity gate with the daemon DOWN (`xpfd protocol-versions` is a
+pure binary invocation and `/etc/xpf/node-id` is a file read — neither needs a
+running daemon), and starts `xpfd` only once the node is proven to be the
+expected node on the expected build. A node that fails the gate is never
+started, so there is no election to hold. See `docs/in-place-upgrade.md`.
+
 Two properties of that line are load-bearing rather than cosmetic:
 
 - It is **node-scoped and rendered once**, in the node header rather than

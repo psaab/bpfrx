@@ -1806,19 +1806,135 @@ use:
   **This DETECTS the exposure; it does not close it.** The election happens
   during the recreated node's own bringup (`daemon_run_bringup.go` runs
   `UpdateConfig`, which elects on the single-node path) long before any driver
-  command lands. Closing it needs a hold that survives the disk wipe, and the
-  kernel-roll's mechanism cannot supply one:
+  command lands. No hold that lives ON the node can help:
   `holdSecondaryIfKernelCandidateArmed` keys on the on-node kernel journal, and
   a clean ENOENT is folded to "never armed" with no hold. A reboot preserves
   that journal so ENOENT truly means "never armed"; a recreate destroys it, so
   ENOENT means "the evidence was wiped" — and nothing on the node can tell those
   apart. That is NOT a defect in `kernel_selfrecover.go`: the distinction is
   correct for the path it was written for and has no way to be right for this
-  one. The design options are recorded on #7559.
+  one.
 
   Scope: `election.go`'s fresh-boot guard already keeps a NON-preempt RG with a
   reachable peer at SECONDARY, so the exposure is `preempt`-configured RGs and
   boots where the peer is not visible at first election.
+
+- **Daemon hold across the recreate (#7559)** — the window above, closed. The
+  detector stays as the net for an unprotected roll; this is the guard.
+
+  The framing that made #7559 look expensive was "closing it needs a signal
+  that survives the disk wipe". It does not. The election is run by a DAEMON
+  whose start the driver already controls end to end. If `xpfd` never starts
+  until the identity gate has passed, there is no election to hold and nothing
+  has to survive anything.
+
+  What makes it work is that **the #5075 gate is evaluable with the daemon
+  down**: `xpfd protocol-versions` is a pure binary invocation
+  (`cmd/xpfd/main.go` `cmdProtocolVersions` prints compile-time constants and
+  returns before any daemon/config/state path), and `/etc/xpf/node-id` is read
+  with `cat`. So the driver can prove "the expected node on the expected build"
+  BEFORE the node is able to claim a redundancy group.
+
+  That property also makes this the only candidate design that covers the case
+  #5075 was actually filed for. Every hold that lives inside `xpfd` — a peer
+  veto carried in the heartbeat, a day-0-seeded on-node marker — is honoured
+  only by an image that KNOWS about it, so a hook that relaunched the OLD image
+  ignores it and elects anyway. Not starting the daemon works no matter which
+  image the hook launched.
+
+  Sequence, per node, inside the existing boot poll:
+
+  1. the recreate hook is invoked with `XPF_ROLL_DAEMON_HOLD=1` plus
+     `XPF_ROLL_EXPECT_VERSION` / `XPF_ROLL_EXPECT_NODE_ID` — the identity this
+     roll expects the node it is about to create to have;
+  2. the hook keeps `xpfd` from auto-starting on the guest's FIRST boot. Mask
+     the unit before the guest boots — an `/etc/systemd/system/xpfd.service`
+     symlink to `/dev/null` in the launched filesystem is enough, and for
+     incus that is `incus create` + inject + `incus start` rather than
+     `incus launch`. A hook that only `systemctl disable`s the unit is also
+     recognised as a hold;
+  3. each poll tick reads the node's daemon state BEFORE the identity gate.
+     The order is load-bearing: a node that came back with `xpfd` already
+     RUNNING was never protected, and that stays true on the very tick where
+     the gate happens to pass. Deciding afterwards would record the fastest
+     possible failure — a node that booted, elected and answered within one
+     poll interval — as a protected roll;
+  4. once the gate PASSES, and only then, the driver runs `systemctl unmask
+     xpfd && systemctl enable --now xpfd` and waits (bounded, 180s) for the
+     daemon to be READY before rejoining. A node that FAILS the gate never
+     reaches that line — every failure path `die()`s with the never-both-down
+     leases held — so a wrong-image / wrong-node-id recreate is left **inert**,
+     not merely detected.
+
+  **The transport must not depend on xpfd, so the hold is backend-gated.** The
+  hold makes the node inert, and on the sealed appliance image that includes
+  its MANAGEMENT ADDRESS: `scripts/image/bake.py` purges cloud-init and deletes
+  every netplan / `interfaces.d` file, so xpfd's own bootstrap lifeline is the
+  only thing that ever addresses `fxp0`. That is what makes a held node safe
+  (no addresses, nothing to forward) and it is the same fact that decides which
+  transport can still reach it:
+
+  - `--backend incus` — `incus exec` reaches the guest through the baked
+    incus-agent, not by IP. The hold is requested here.
+  - `--backend ssh` — the driver reaches the node by IP. A held xpfd means no
+    IP, so the boot poll would never see the node at all, time out, and leave
+    it masked, addressless and console-only. That trades a transient integrity
+    exposure for a persistent outage, so the hold is **not** requested; the
+    roll is bit-identical to its pre-#7559 behaviour. `--require-daemon-hold`
+    overrides — an operator whose platform addresses the node independently of
+    xpfd is the only one who can know that, and asking for the guarantee is
+    how they say so.
+
+  **"Ready" is not "systemd active".** `xpfd.service` is `Type=simple`, so
+  `enable --now` returns the instant the process forks, while the gRPC listener
+  comes up only after config compile+commit, interface rename, the networkd
+  apply, the AF_XDP load and the FRR reload. The very next step is
+  `xpfd upgrade kernel rejoin`, and `RejoinAndConfirm`
+  (`pkg/upgrade/kernel_drain.go`) calls `ResetFailover()` **outside** its retry
+  loop — one un-retried gRPC dial with a 5s timeout. Waiting on `ActiveState`
+  alone would therefore fail the roll on a cold daemon with an opaque transport
+  error. The driver waits for BOTH the unit to be running AND
+  `show chassis cluster status` to answer with a redundancy-group block, which
+  is the same gRPC path the rejoin uses and proves the cluster manager is
+  populated.
+
+  **Three daemon states, not two.** `held` (masked or disabled, and not
+  running), `running`, and `pending`/`unknown` — a unit that is enabled but not
+  yet up is a guest still BOOTING, and an unreadable state is a transport blip.
+  Neither is protection, and folding either into "held" would report an
+  unprotected roll as protected. `systemctl is-active` alone cannot make this
+  distinction: it exits non-zero for every inactive state, so a masked unit and
+  an unreachable node look identical. The driver reads `systemctl show xpfd -p
+  LoadState -p UnitFileState -p ActiveState` in one round trip instead, and
+  decides `running` FIRST — a unit masked in the unit file but nevertheless up
+  can elect.
+
+  **Not enforced by default, deliberately.** Holding the daemon is an act of
+  the operator-supplied hook; every hook written before this change leaves
+  `xpfd` auto-starting, so making an unheld daemon fatal by default would break
+  every existing roll for a window those rolls have always run with. The new
+  environment variables are purely ADDITIVE — a pre-#7559 hook ignores them and
+  behaves exactly as it did — which is precisely why the driver VERIFIES the
+  hold rather than assuming it: an unheld daemon is reported loudly and the
+  #6759 detector remains the net. `--require-daemon-hold` turns the report into
+  a refusal, with a DISTINCT message for "came back running" versus "the daemon
+  state was never readable" — two causes rendered as one indistinguishable
+  refusal is the #6495 blindness again, with two causes instead of one.
+
+  If the driver dies between the recreate and the release, the node is left
+  with `xpfd` held and the peer still primary: **redundancy is degraded,
+  availability is not**, and the failure names its own remedy (`systemctl
+  unmask xpfd && systemctl enable --now xpfd`), reachable over the same
+  agent transport the driver was using. That is the same residual the
+  peer-authority design carried, without the new cluster state or wire field it
+  needed. Nothing self-recovering is lost in that state either: the bounded
+  local self-recovery wired at `daemon_run_bringup.go` gates on `LocalDrained()`
+  and a RECREATED node is not drained — the recreate wiped the in-memory drain
+  along with the disk — so it is a no-op on this path with or without the hold.
+
+  Covered by `scripts/deploy/test_xpf_deploy_daemon_hold_7559.py` (RED on
+  revert: move the release before the poll loop and a wrong-build recreate is
+  started; delete it and a correct recreate is left inert and never rejoined).
   Because `die()` is a `SystemExit`, `kernel-roll`'s `finally` still runs
   after a fence-abort — and its own best-effort restore-forwarding rejoin
   IS a pair mutation. So the fence records the loss (a `lost_lease` flag,
@@ -2030,6 +2146,17 @@ node from a new baked image ONE AT A TIME (built on the existing per-node
    mechanics stay environment-specific). The node boots the new base,
    factory-bootstraps its config DB from the day-0 text, verifies the
    dataplane.
+
+   **Hook contract.** The hook is invoked as `<hook> <node>` with
+   `XPF_ROLL_NODE`, `XPF_ROLL_BACKEND`, and — since #7559 —
+   `XPF_ROLL_EXPECT_VERSION`, `XPF_ROLL_EXPECT_NODE_ID` and
+   `XPF_ROLL_DAEMON_HOLD=1` in the environment. The last three are the
+   identity this roll expects of the node the hook is about to create, and
+   the request that `xpfd` be kept from auto-starting on its FIRST boot so
+   the driver can prove that identity before the node can win an election
+   (see the #7559 note above). They are purely additive: a hook written
+   before #7559 ignores them and behaves exactly as it did, which is why
+   the driver verifies the hold rather than assuming it.
 4. **poll** until it is back **as the EXPECTED node on the EXPECTED
    build**, then **rejoin** + confirm sync BEFORE touching node[1]
    (never-both-down; the INC-2 `rejoin` verb). Repeat for node[1].

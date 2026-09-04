@@ -2306,6 +2306,202 @@ def _node_is_primary_for_any_rg(runner, backend, node, node_id):
     return False
 
 
+# ── #7559: the image-roll election window, closed by not starting the elector ──
+#
+# The recreate DESTROYS the node's disk, so no on-node artifact can carry a
+# "hold" across it — that is what #7559 records, and it is why the kernel-roll's
+# journal-keyed `holdSecondaryIfKernelCandidateArmed` cannot be reused here (it
+# folds a clean ENOENT to "never armed", which is exactly what a wiped disk
+# produces).
+#
+# But the window does not need a signal that survives the wipe. The election is
+# run by a DAEMON whose start this driver already controls: the recreated node
+# elects inside its own bringup (`daemon_run_bringup.go` calls
+# `cluster.UpdateConfig`, which elects on the single-node path). If xpfd never
+# starts until the #5075 identity gate has passed, there is no election to hold
+# and nothing has to survive anything.
+#
+# What makes it work is that the gate is evaluable with the daemon DOWN:
+# `xpfd protocol-versions` is a pure binary invocation (cmd/xpfd/main.go
+# `cmdProtocolVersions` prints compile-time constants and returns before any
+# daemon/config/state path is touched), and `/etc/xpf/node-id` is read with
+# `cat`. So the driver can prove "the expected node on the expected build"
+# BEFORE the node is able to claim a redundancy group — and, unlike every
+# design that puts a hold inside xpfd, this works no matter WHICH image the
+# hook actually launched, including one that predates the mechanism. That is
+# the case #5075 was filed for.
+#
+# Holding the daemon is an act of the operator-supplied `--recreate-hook`: only
+# it can inject state before the guest's first boot. Every hook written before
+# this change leaves xpfd auto-starting, so an unheld daemon is REPORTED rather
+# than fatal (the #6759 unverified-primary detector still fails closed if the
+# node actually went primary). `--require-daemon-hold` turns the report into a
+# refusal for operators who want the guarantee enforced.
+
+# xpfd is RUNNING (or on its way to, or on its way down from, running) — in all
+# of these the node either can elect or already has. Fail toward "unprotected".
+_DAEMON_RUNNING_STATES = ("active", "activating", "reloading", "deactivating")
+# The unit was deliberately kept from starting. `systemctl mask` reports
+# LoadState=masked; a hook that merely disables the unit reports
+# UnitFileState=disabled. Both are holds.
+_DAEMON_HELD_UNIT_FILE_STATES = ("masked", "masked-runtime", "disabled")
+
+# Bound on how long the driver waits for a released xpfd to be READY. Separate
+# from --boot-deadline (which bounds the node coming BACK at all): by this point
+# the node is proven to be the expected build, and all that remains is a cold
+# daemon start. Generous on purpose — "ready" here means the gRPC surface is
+# answering, which is AFTER config compile+commit, interface rename, the
+# networkd apply, the AF_XDP dataplane load and the FRR reload.
+_DAEMON_START_DEADLINE = 180
+_DAEMON_START_POLL = 5
+
+
+def _daemon_hold_supported(backend, require_hold):
+    """May this roll ask the recreate hook to hold xpfd? (#7559)
+
+    The hold makes the node inert, and on the sealed appliance image that
+    includes its MANAGEMENT ADDRESS: `scripts/image/bake.py` purges cloud-init
+    and deletes every netplan / interfaces.d file, so the only thing that ever
+    addresses fxp0 is xpfd's own bootstrap lifeline. Hold the daemon on that
+    image and the node has no IP — which is harmless for a transport that does
+    not need one and FATAL for a transport that does:
+
+      - incus: `incus exec` reaches the guest through the incus-agent
+        (baked at scripts/image/bake.py, a vsock transport), so the driver can
+        still run the identity gate and later release the hold. Supported.
+      - ssh:   the driver reaches the node by IP. A held xpfd means no IP, so
+        the boot poll would never see the node at all, time out, and leave it
+        masked, addressless and console-only — turning a transient integrity
+        exposure into a persistent outage. NOT supported by default.
+
+    `--require-daemon-hold` overrides: an operator whose platform supplies the
+    management address independently of xpfd (a hypervisor-managed NIC, a
+    day-0-written mgmt .network) is asserting that the transport survives the
+    hold, and is the only one who can know that.
+    """
+    return bool(require_hold) or backend == "incus"
+
+
+def _daemon_cli_ready(status_out):
+    """Is the daemon's gRPC surface actually answering? (#7559)
+
+    `systemctl enable --now xpfd` returns as soon as the process forks
+    (`Type=simple`), and ActiveState=active means only that. The step that
+    follows is `xpfd upgrade kernel rejoin`, whose `RejoinAndConfirm` calls
+    `ResetFailover()` OUTSIDE its retry loop (pkg/upgrade/kernel_drain.go) over
+    gRPC with a 5s dial timeout — so a single un-retried dial against a daemon
+    that is still loading the dataplane fails the whole roll. Readiness must
+    therefore be observed on the gRPC path, not from systemd.
+
+    `show chassis cluster status` is the probe because it is exactly that path
+    AND requires the cluster manager to be populated; the roll always runs
+    against a two-node cluster, so a node that answers with a redundancy-group
+    block is past every startup phase the rejoin depends on.
+    """
+    return bool(status_out) and "Redundancy group" in status_out
+
+
+def _daemon_hold_state(show_out):
+    """Classify `systemctl show xpfd -p LoadState -p UnitFileState -p ActiveState`
+    output. Returns one of:
+
+      "running" — xpfd is up (or starting/stopping): the node CAN elect.
+      "held"    — the unit is masked or disabled AND not running: the recreate
+                  hook honoured the #7559 daemon hold.
+      "pending" — the unit is enabled but not (yet) running: the guest is still
+                  booting, or xpfd crashed. NOT a hold.
+      "unknown" — nothing parseable came back (transport blip, no systemd,
+                  dry-run). NOT a hold.
+
+    Pure so the three-way decision is testable without a node, and ordered
+    running-first on purpose: a unit that is masked in the unit file but somehow
+    RUNNING is running, and reading it as "held" would report protection that
+    does not exist.
+
+    `systemctl is-active` alone cannot do this job — it exits non-zero for every
+    inactive state, and it cannot tell a masked unit from a node that is merely
+    still booting.
+    """
+    props = {}
+    for line in (show_out or "").splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            props[k.strip()] = v.strip()
+    active = props.get("ActiveState", "")
+    load = props.get("LoadState", "")
+    unit_file = props.get("UnitFileState", "")
+    if not active and not load and not unit_file:
+        return "unknown"
+    if active in _DAEMON_RUNNING_STATES:
+        return "running"
+    if load == "masked" or unit_file in _DAEMON_HELD_UNIT_FILE_STATES:
+        return "held"
+    if active:
+        return "pending"
+    return "unknown"
+
+
+def _node_daemon_hold_state(runner, backend, node):
+    """Read the #7559 daemon-hold state of xpfd on `node` in ONE round trip.
+
+    Uses the structured exec result and decides from the OUTPUT, never from the
+    exit status: `systemctl show` on a node whose transport is still coming up
+    returns nothing, and that is "unknown" — an unreadable state must never be
+    read as protection."""
+    res = _node_exec_result(runner, backend, node,
+                            ["systemctl", "show", "xpfd",
+                             "-p", "LoadState",
+                             "-p", "UnitFileState",
+                             "-p", "ActiveState"])
+    return _daemon_hold_state(res.out)
+
+
+def _release_daemon_hold(runner, backend, node):
+    """Start xpfd on a node whose recreate hook held it (#7559).
+
+    Unmask-first and idempotent: the hook holds the daemon by masking the unit
+    before the guest's first boot (an `/etc/systemd/system/xpfd.service` ->
+    /dev/null symlink), so `enable --now` alone would fail on a masked unit; a
+    hook that only disabled the unit is covered by the same two calls. Both legs
+    are check=False because the WAIT that follows is the real gate — it reports
+    the daemon's actual state rather than a systemctl exit code."""
+    _node_exec(runner, backend, node, ["systemctl", "unmask", "xpfd"],
+               check=False)
+    _node_exec(runner, backend, node, ["systemctl", "enable", "--now", "xpfd"],
+               check=False)
+
+
+def _wait_daemon_ready(runner, backend, node, deadline_secs=None, poll=None):
+    """Wait (bounded) for a just-released xpfd to be READY, and report what was
+    actually observed: "ready", or the last daemon-hold state seen.
+
+    Never rejoin a daemon that has not answered: `xpfd upgrade kernel rejoin`
+    dials gRPC once, un-retried, and without this wait a released-but-still-
+    starting xpfd surfaces as an opaque "command failed" from the rejoin rather
+    than naming what went wrong. Both conditions are required — the unit must be
+    RUNNING and the gRPC surface must ANSWER — because each alone is a false
+    ready: a masked unit that never started reports neither, and a Type=simple
+    unit reports active the instant it forks."""
+    if deadline_secs is None:
+        deadline_secs = _DAEMON_START_DEADLINE
+    if poll is None:
+        poll = _DAEMON_START_POLL
+    import time as _time
+    deadline = _time.time() + deadline_secs
+    state = "unknown"
+    while True:
+        state = _node_daemon_hold_state(runner, backend, node)
+        if state == "running":
+            out = _node_exec(runner, backend, node,
+                             ["cli", "-c", "show chassis cluster status"],
+                             check=False)
+            if _daemon_cli_ready(out):
+                return "ready"
+        if _time.time() >= deadline:
+            return state
+        _time.sleep(poll)
+
+
 def _recreated_node_matches(live_versions, want_version, live_node_id, want_node_id):
     """#5075 identity+version gate for a node recreated from the new image.
     Returns (ok: bool, reason: str).
@@ -2533,6 +2729,20 @@ def cmd_image_roll(args):
     print(f"==> LANE-2 HA image roll: {nodes[0]} then {nodes[1]} "
           f"(recreate each from {os.path.basename(args.manifest)}; peer keeps forwarding)")
 
+    # #7559: may this roll ask the hook to hold xpfd, and can the driver then
+    # still reach the node? Decided ONCE, from the backend, before anything is
+    # mutated — see _daemon_hold_supported.
+    hold_supported = _daemon_hold_supported(backend, args.require_daemon_hold)
+    if hold_supported:
+        print(f"   #7559 daemon hold: REQUESTED of the recreate hook "
+              f"({'enforced' if args.require_daemon_hold else 'reported only'})")
+    else:
+        print(f"   #7559 daemon hold: not requested on the {backend} backend "
+              f"(the driver reaches the node by IP, and a held xpfd leaves the "
+              f"appliance image with no management address). Pass "
+              f"--require-daemon-hold if this platform addresses the node "
+              f"independently of xpfd.")
+
     def roll_one(node, peer, is_second):
         nid = node_ids[node]
         print(f"\n--- rolling {node} (node-id {nid}); {peer} stays primary ---")
@@ -2659,7 +2869,10 @@ def cmd_image_roll(args):
                 runner, backend, node, args,
                 keepalive=lambda: _keepalive_leases(
                     runner, backend, [(peer, nid)], holder, lease_ttl),
-                keepalive_interval=max(5, lease_ttl // 3))
+                keepalive_interval=max(5, lease_ttl // 3),
+                expect_version=new_img.get("xpf-version", ""),
+                expect_node_id=node_ids[node],
+                daemon_hold=hold_supported)
             if recreate_lost:
                 die(f"{recreate_lost}: LOST the roll lease while the recreate hook "
                     f"for {node} was running — another orchestrator reclaimed the "
@@ -2684,6 +2897,12 @@ def cmd_image_roll(args):
             want_nid = node_ids[node]
             deadline = _time.time() + boot_deadline
             back = False
+            # #7559 daemon-hold observation. Deliberately THREE outcomes, not a
+            # boolean: "the hook held xpfd" and "we could not tell" are
+            # different facts and must not collapse into one, or an unreadable
+            # state would be reported as protection.
+            daemon_held = False    # observed masked/disabled before gate-pass
+            daemon_running = False # observed RUNNING before gate-pass
             last_reason = ("did not come back within the boot deadline "
                            "(xpfd never answered protocol-versions)")
             while _time.time() < deadline:
@@ -2702,6 +2921,37 @@ def cmd_image_roll(args):
                         f"reclaimed the pair reservation. Stopping; investigate "
                         f"the half-rolled cluster (a successor may be mutating "
                         f"this pair).")
+                # #7559: read the daemon-hold state BEFORE the identity gate.
+                # Order is load-bearing: a node that came back with xpfd already
+                # RUNNING was never protected, and that stays true on the very
+                # tick where the gate happens to pass. Deciding after the gate
+                # would let the fastest possible failure — a node that booted,
+                # elected, and answered within one poll interval — be recorded
+                # as a protected roll.
+                hold_state = (_node_daemon_hold_state(runner, backend, node)
+                              if hold_supported else "unknown")
+                if hold_state == "running":
+                    if not daemon_running:
+                        daemon_running = True
+                        print(f"   NOTE: {node} came back with xpfd ALREADY "
+                              f"RUNNING — this roll is NOT protected against "
+                              f"the #7559 election window (the recreate hook "
+                              f"did not honour XPF_ROLL_DAEMON_HOLD). The node "
+                              f"could have won an election before its identity "
+                              f"was proven; the unverified-primary check below "
+                              f"(#6759) is the remaining net.")
+                    if args.require_daemon_hold:
+                        die(f"{node} came back with xpfd RUNNING before the "
+                            f"image/identity gate passed, and "
+                            f"--require-daemon-hold was given. The recreate "
+                            f"hook must keep xpfd from auto-starting on the "
+                            f"first boot (mask the unit before the guest "
+                            f"boots); the driver starts it once the node is "
+                            f"proven to be node-id {want_nid} on "
+                            f"{want_ver!r}. STOPPING with the never-both-down "
+                            f"leases HELD (#7559).")
+                elif hold_state == "held":
+                    daemon_held = True
                 pv = _node_protocol_versions(runner, backend, node)
                 # Only read the node-id marker once xpfd is actually answering,
                 # to avoid an extra `cat` on every poll while the node is down.
@@ -2742,6 +2992,46 @@ def cmd_image_roll(args):
                     f"{last_reason}. STOPPING with the never-both-down leases HELD "
                     f"— {peer} stays primary. Investigate the recreate (#5075).")
             print(f"   {node} back on the new image: {last_reason}")
+
+            # 3b. #7559: the identity gate has PASSED — only NOW may the elector
+            #     run. Releasing here, and only here, is the whole mechanism:
+            #     while xpfd was held the node could not elect, so there was no
+            #     window in which an unverified image could claim a redundancy
+            #     group. A node that FAILED the gate never reaches this line —
+            #     every failure path above die()s with the leases held — so a
+            #     wrong-image / wrong-node-id recreate is left inert rather than
+            #     merely detected.
+            if daemon_held:
+                print(f"   identity gate passed with xpfd held — starting xpfd "
+                      f"on {node}...")
+                _release_daemon_hold(runner, backend, node)
+                state = _wait_daemon_ready(runner, backend, node)
+                if state != "ready":
+                    die(f"{node} passed the image/identity gate but xpfd was "
+                        f"not READY within {_DAEMON_START_DEADLINE}s after the "
+                        f"daemon hold was released (last observed: {state}). "
+                        f"NOT rejoining a daemon that has not answered — "
+                        f"`rejoin` dials gRPC once, un-retried, and would fail "
+                        f"the roll with an opaque transport error. STOPPING "
+                        f"with the never-both-down leases HELD — {peer} stays "
+                        f"primary. On {node}: `systemctl unmask xpfd && "
+                        f"systemctl enable --now xpfd`, then check "
+                        f"`journalctl -u xpfd` (#7559).")
+            elif hold_supported and args.require_daemon_hold:
+                # Never observed a hold AND never observed it running: the
+                # daemon state was unreadable for the whole poll (no systemd,
+                # a transport that only ever answered the version probe). The
+                # flag asks for an ENFORCED guarantee, and an unobservable
+                # daemon is an unproven one — a distinct reason from
+                # "came back running", and it must say so rather than reuse
+                # that message.
+                die(f"--require-daemon-hold was given but the daemon-hold "
+                    f"state of {node} was never readable during the boot poll, "
+                    f"so the #7559 election window cannot be shown to have been "
+                    f"closed. STOPPING with the never-both-down leases HELD. "
+                    f"(`systemctl show xpfd` must be runnable on the node "
+                    f"through the {backend} backend for the guarantee to be "
+                    f"verifiable.)")
 
             # 4. rejoin + confirm sync BEFORE touching the peer (never-both-down).
             # FENCE (#5816): re-verify ownership before rejoin re-enables the
@@ -2788,11 +3078,19 @@ def cmd_image_roll(args):
 
 
 def _recreate_node_from_image(runner, backend, node, args, keepalive=None,
-                             keepalive_interval=None):
+                             keepalive_interval=None, expect_version=None,
+                             expect_node_id=None, daemon_hold=True):
     """Recreate ONE node from the new image. Delegates to the operator-supplied
     recreate hook (a script that does the backend-specific destroy+launch+day-0),
     because the recreate mechanics differ per environment (incus launch, libvirt
-    redefine, bare-metal re-flash). The hook gets XPF_ROLL_NODE in the env.
+    redefine, bare-metal re-flash). The hook gets XPF_ROLL_NODE and
+    XPF_ROLL_BACKEND in the env, plus (#7559) XPF_ROLL_EXPECT_VERSION,
+    XPF_ROLL_EXPECT_NODE_ID and XPF_ROLL_DAEMON_HOLD=1 — the identity this roll
+    expects the recreated node to have, and the request that xpfd be kept from
+    auto-starting on its first boot so the driver can prove that identity
+    BEFORE the node is able to win an election. The extra variables are purely
+    additive: a pre-#7559 hook ignores them and behaves exactly as before, so
+    the caller VERIFIES the hold instead of assuming it.
 
     LEASE RENEWAL RUNS *DURING* THE HOOK (#6762). The caller passes `keepalive`,
     a zero-argument callable returning the name of a target whose lease is
@@ -2823,6 +3121,16 @@ def _recreate_node_from_image(runner, backend, node, args, keepalive=None,
             f"This keeps the never-both-down sequencing here while the recreate "
             f"mechanics stay environment-specific.")
     env = dict(os.environ, XPF_ROLL_NODE=node, XPF_ROLL_BACKEND=backend)
+    # #7559: tell the hook what this roll expects of the node it is about to
+    # create, and ask it to hold the daemon. Purely ADDITIVE — a hook written
+    # before this change ignores the extra variables and behaves exactly as it
+    # did — which is why the driver VERIFIES the hold rather than assuming it.
+    if expect_version is not None:
+        env["XPF_ROLL_EXPECT_VERSION"] = str(expect_version)
+    if expect_node_id is not None:
+        env["XPF_ROLL_EXPECT_NODE_ID"] = str(expect_node_id)
+    if daemon_hold:
+        env["XPF_ROLL_DAEMON_HOLD"] = "1"
     print(f"   recreating {node} via {hook}...")
     if keepalive is None:
         # No reservation to keep alive (dry-run / single-node paths).
@@ -2983,7 +3291,22 @@ def main():
         sub.add_argument("--recreate-hook", dest="recreate_hook",
                          help="script invoked as <hook> <node> to destroy+launch "
                               "the node from the new image + re-apply day-0 "
-                              "(backend-specific); receives XPF_ROLL_NODE in env")
+                              "(backend-specific); receives XPF_ROLL_NODE, "
+                              "XPF_ROLL_BACKEND, XPF_ROLL_EXPECT_VERSION, "
+                              "XPF_ROLL_EXPECT_NODE_ID and XPF_ROLL_DAEMON_HOLD "
+                              "in env")
+        sub.add_argument("--require-daemon-hold", action="store_true",
+                         help="REFUSE the roll unless the recreate hook is "
+                              "observed to have kept xpfd from auto-starting on "
+                              "the recreated node (#7559). Without it an "
+                              "unheld daemon is reported and the roll proceeds "
+                              "with today's exposure — the recreated node can "
+                              "win an election before its identity is proven. "
+                              "Also FORCES the hold on --backend ssh, where it "
+                              "is otherwise skipped because a held xpfd leaves "
+                              "the appliance image with no management address "
+                              "for ssh to reach: pass it only if this platform "
+                              "addresses the node independently of xpfd.")
         sub.add_argument("--backend", default="incus", choices=["incus", "ssh"])
         sub.add_argument("--node0-id", type=int, default=0,
                          help="cluster node-id of the FIRST --node (default 0)")
