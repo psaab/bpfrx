@@ -151,6 +151,80 @@ import (
 // how often starts publish, not whether they can.
 const startCostMicros = 61
 
+// measureStartCost is what actually paces the teardown loop, and it exists
+// because `startCostMicros` above is calibrated on an IDLE box (#8207/#8345).
+//
+// The const's own comment reasons that "being wrong by 2x changes how often
+// starts publish, not whether they can". That is true at 2x and false at the
+// factor a full `go test ./...` run produces. Under oversubscription a start
+// costs far more than 61us — two socket binds while several times the core
+// count of goroutines compete — while the teardown's sleep stays pinned to
+// 61us, so the stop:start ratio climbs back toward the unpaced regime and every
+// start is superseded again. That is exactly the failure both issues report:
+// `240 of 240 starts were SUPERSEDED before publishing`, on a machine where the
+// probe passes 8/8 in isolation.
+//
+// Raising the const would be widening a margin against an unbounded quantity.
+// Measuring it removes the assumption instead: if the box is 10x slower, the
+// observed cost is 10x larger, the gap the teardown leaves grows with it, and
+// the publish rate is preserved. The probe becomes scale-invariant rather than
+// calibrated.
+//
+// The calibration is UNCONTENDED on purpose — it runs before the two goroutines
+// start — so it measures the cost of a start on this machine right now, which
+// is the quantity the pacing needs. It is not a happens-before edge with
+// anything in the contended phase and cannot order the race the probe detects.
+func measureStartCost(t *testing.T, samples int) time.Duration {
+	t.Helper()
+	m := NewManager(0, 1)
+	// One warm-up pair, discarded: the first bind on this path pays lazy
+	// runtime initialisation that no later start repeats, and folding it into
+	// the mean biases the pacing high — the safe direction for publishing, but
+	// it would make the measurement a claim about startup rather than about
+	// steady-state cost.
+	_ = m.StartHeartbeat("127.0.0.1", "127.0.0.1", "")
+	m.StopHeartbeat()
+
+	start := time.Now()
+	for i := 0; i < samples; i++ {
+		if err := m.StartHeartbeat("127.0.0.1", "127.0.0.1", ""); err != nil {
+			t.Fatalf("calibration start %d failed: %v — the pacing below cannot "+
+				"be derived and the probe would silently fall back to an "+
+				"idle-box constant", i, err)
+		}
+		m.StopHeartbeat()
+	}
+	per := time.Since(start) / time.Duration(samples)
+
+	// Floor at the idle-box constant. The calibration can only ever report a
+	// cost this low on a machine at least as fast as the one the const was
+	// measured on, and a pacing gap SHORTER than the const is the regime that
+	// produced the original vacuity. There is no corresponding ceiling: a large
+	// observed cost is the signal this function exists to carry.
+	if floor := startCostMicros * time.Microsecond; per < floor {
+		per = floor
+	}
+	return per
+}
+
+// heartbeatProbeAttempts bounds how many times the race probe is re-run when it
+// comes back degenerate.
+//
+// Calibration measures the load at calibration time, and a full-suite run's
+// load is not stationary — another package's test can start between the
+// calibration and the contended phase. A retry costs one more attempt; the
+// alternative is a red gate whose named cause is a timing artifact, which
+// trains re-running a red reflexively until it goes green (#8345). That habit
+// is the actual cost, because a genuine intermittent regression here would be
+// waved through by the same reflex.
+//
+// It does NOT hide a structural degeneracy: a probe that cannot reach its
+// window by construction reaches it zero times on every attempt, and the test
+// still fails with the same message. The retry only distinguishes "this machine
+// was busy" from "this probe is broken", which is the distinction the single
+// attempt could not make.
+const heartbeatProbeAttempts = 3
+
 const teardownProgressBudget = 30 * time.Second
 
 func waitForTeardownProgress(t *testing.T, stops *atomic.Int64, within time.Duration) {
@@ -200,8 +274,48 @@ func waitForTeardownProgress(t *testing.T, stops *atomic.Int64, within time.Dura
 	}
 }
 
+// heartbeatProbeResult reports what one attempt of the race probe reached.
+type heartbeatProbeResult struct {
+	published, superseded, starts, stops int64
+	pacing                               time.Duration
+}
+
+// TestStartHeartbeatDoesNotRaceStopHeartbeat7257 is the race probe. The
+// contended run lives in runHeartbeatRaceProbe7257; this wrapper only decides
+// what a degenerate attempt MEANS (see heartbeatProbeAttempts).
 func TestStartHeartbeatDoesNotRaceStopHeartbeat7257(t *testing.T) {
+	var attempts []heartbeatProbeResult
+	for i := 0; i < heartbeatProbeAttempts; i++ {
+		res := runHeartbeatRaceProbe7257(t)
+		attempts = append(attempts, res)
+		if res.published > 0 {
+			t.Logf("#7257 race probe (attempt %d/%d, pacing %v): %d published / "+
+				"%d superseded of %d starts, %d stops",
+				i+1, heartbeatProbeAttempts, res.pacing, res.published,
+				res.superseded, res.starts, res.stops)
+			return
+		}
+		t.Logf("#7257 race probe attempt %d/%d was DEGENERATE (pacing %v): "+
+			"0 published, %d superseded, %d stops — retrying",
+			i+1, heartbeatProbeAttempts, res.pacing, res.superseded, res.stops)
+	}
+	// #7663: the precondition is REACH, not stop volume. Every attempt failed
+	// to reach it, so this is not a busy machine — see heartbeatProbeAttempts.
+	t.Fatalf("#7257 probe is degenerate on all %d attempts: no start ever "+
+		"reached the publish window. `StartHeartbeat` returns nil only after it "+
+		"publishes m.hbSender/m.hbReceiver, so zero published starts means the "+
+		"race this probe exists to detect was never executed — a green here "+
+		"would be vacuous, not evidence (#7663). Per-attempt: %+v",
+		heartbeatProbeAttempts, attempts)
+}
+
+func runHeartbeatRaceProbe7257(t *testing.T) heartbeatProbeResult {
+	t.Helper()
 	m := NewManager(0, 1)
+
+	// #8207/#8345: paced against the cost measured on THIS machine under THIS
+	// load, not against the idle-box constant. See measureStartCost.
+	startCost := measureStartCost(t, 20)
 
 	const startAttempts = 240
 	var stops, starts, published, superseded atomic.Int64
@@ -262,7 +376,7 @@ func TestStartHeartbeatDoesNotRaceStopHeartbeat7257(t *testing.T) {
 			// no channel, no handshake, no happens-before edge — so the race
 			// detector still sees unsynchronised accesses. That is the property;
 			// pacing changes only how often the probe reaches it.
-			time.Sleep(time.Duration(rand.Intn(2*startCostMicros)) * time.Microsecond)
+			time.Sleep(time.Duration(rand.Int63n(int64(2 * startCost))))
 			// #7970 RETRO-EXPLANATION. This mechanism accounts for every
 			// symptom the flake showed, which is how you tell it is THE cause
 			// rather than a cause:
@@ -346,16 +460,15 @@ func TestStartHeartbeatDoesNotRaceStopHeartbeat7257(t *testing.T) {
 	// — so the old floor and the property were in strict opposition, and the
 	// floor won every time. A probe that cannot reach the window it probes is
 	// degenerate no matter how contended it is.
-	if published.Load() == 0 {
-		t.Fatalf("#7257 probe is degenerate: %d of %d starts were SUPERSEDED before "+
-			"publishing and none reached the window (%d stops). `StartHeartbeat` "+
-			"returns nil only after it publishes m.hbSender/m.hbReceiver, so zero "+
-			"published starts means the race this probe exists to detect was never "+
-			"executed — a green here would be vacuous, not evidence (#7663)",
-			superseded.Load(), startAttempts, stops.Load())
+	// The degeneracy verdict is the CALLER's, because a single degenerate
+	// attempt no longer means the probe is broken — see heartbeatProbeAttempts.
+	return heartbeatProbeResult{
+		published:  published.Load(),
+		superseded: superseded.Load(),
+		starts:     starts.Load(),
+		stops:      stops.Load(),
+		pacing:     startCost,
 	}
-	t.Logf("#7257 race probe: %d published / %d superseded of %d starts, %d stops",
-		published.Load(), superseded.Load(), starts.Load(), stops.Load())
 }
 
 // TestStartHeartbeatSupersededByStopDoesNotPublish7257 is the deterministic
