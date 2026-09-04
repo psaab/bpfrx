@@ -311,6 +311,45 @@ Mirrors the BPF firewall-filter pipeline in userspace.
   comparisons, so a policy added later must classify itself on both axes instead
   of inheriting whichever answer a negated comparison happened to give it.
 
+  **The route-lookup-affecting case is COMPOSED, not declined (#8114 item 1).**
+  `filter_ref_static_verdict` alone cannot answer for a filter carrying a
+  `routing-instance` term: its walk DEFERS on a matched one, returning the
+  default `Accept` before that term's own action is examined, and #4392
+  established that `then { routing-instance X; discard; }` is a DROP. #7212
+  therefore declined such filters outright, which cost the revocation even for
+  flows their plain static deny terms matched.
+
+  The revalidation now composes the verdict exactly the way the packet path
+  composes it, so the two cannot disagree:
+
+  - Ask `evaluate_filter_ref_routing_instance_uncounted` first. `Some(r)` means a
+    matched TERMINATING term carried a routing-instance — what
+    `ingress_route_table_override` acts on. It drops on `Reject`/`Discard` and
+    otherwise applies the table override and forwards, so `r.action` IS the
+    verdict.
+  - `None` means no PBR term terminated the walk (a matched terminating term had
+    no routing-instance, or nothing matched). Production returns
+    `RouteOverride::None` there and the ordinary non-routing verdict applies, so
+    `filter_ref_static_verdict` is asked.
+
+  The only case where the two walks differ is the matched routing-instance term
+  carrying a drop action — precisely the gap.
+
+  `_uncounted` is a separate entry point rather than the counted one with
+  `packet_bytes = 0`, because `record_filter_counter` bumps the PACKET count even
+  with zero bytes; the flag is what suppresses the record. On the DENY exit the
+  caller replays the COUNTED routing walk once, so the newly denied packet is
+  charged and logged exactly once — the routing-aware twin of the `Always`
+  replay above. A PLAIN `routing-instance` term (no drop action) is a PERMIT that
+  changes the route table and does NOT revoke: #7212 revokes on DENY, and
+  revoking on a route CHANGE is a separate question with a different blast
+  radius.
+
+  The emitted record carries `FilterLogSource::Pbr` for a verdict from a
+  routing-instance term, which is what `ingress_route_table_override` stamps on
+  the same term for a session-MISS packet. Labelling it `Input` would not change
+  what is dropped; it would mislabel the record an operator correlates against.
+
   **The revalidation passes `TermMatchExtra::default()`, not the frame — and
   `varies_per_packet_within_flow()` is NOT a complete purity gate.** That
   predicate covers the #1430 DSCP condition and the #2362 per-packet-L4

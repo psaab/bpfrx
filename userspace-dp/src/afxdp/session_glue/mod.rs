@@ -384,6 +384,9 @@ pub(super) fn purge_sessions_for_input_dscp_filter_revalidation(
     shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_owner_rg_indexes: &SharedSessionOwnerRgIndexes,
     peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
+    // #8114 item 4: forwarded to `delete_terminal_filtered_session` so a
+    // `DeleteSynced` a full sibling queue refuses is attributed and repaired.
+    worker_commands_by_id: &BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
     forwarding: &ForwardingState,
     purge_v4: bool,
     purge_v6: bool,
@@ -422,6 +425,7 @@ pub(super) fn purge_sessions_for_input_dscp_filter_revalidation(
             shared_forward_wire_sessions,
             shared_owner_rg_indexes,
             peer_worker_commands,
+            worker_commands_by_id,
             forwarding,
             &key,
             decision,
@@ -501,6 +505,10 @@ pub(super) fn delete_terminal_filtered_session(
     shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_owner_rg_indexes: &SharedSessionOwnerRgIndexes,
     peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
+    // #8114 item 4: the same queues keyed by worker id, forwarded to
+    // `delete_terminal_half` so a `DeleteSynced` a full sibling queue refuses
+    // can be attributed and repaired.
+    worker_commands_by_id: &BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
     forwarding: &ForwardingState,
     key: &SessionKey,
     decision: SessionDecision,
@@ -551,6 +559,7 @@ pub(super) fn delete_terminal_filtered_session(
         shared_forward_wire_sessions,
         shared_owner_rg_indexes,
         peer_worker_commands,
+        worker_commands_by_id,
         forwarding,
         key,
         decision,
@@ -571,6 +580,7 @@ pub(super) fn delete_terminal_filtered_session(
             shared_forward_wire_sessions,
             shared_owner_rg_indexes,
             peer_worker_commands,
+            worker_commands_by_id,
             forwarding,
             &companion_key,
             companion_decision,
@@ -601,6 +611,11 @@ fn delete_terminal_half(
     shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_owner_rg_indexes: &SharedSessionOwnerRgIndexes,
     peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
+    // #8114 item 4: the same queues keyed by worker id, so a `DeleteSynced` a
+    // full sibling queue REFUSES can be attributed and that sibling's NAT
+    // holder bit released on its behalf. See
+    // `replicate_session_delete_repairing`.
+    worker_commands_by_id: &BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
     forwarding: &ForwardingState,
     key: &SessionKey,
     decision: SessionDecision,
@@ -642,7 +657,15 @@ fn delete_terminal_half(
         shared_owner_rg_indexes,
         key,
     );
-    replicate_session_delete(peer_worker_commands, key);
+    replicate_session_delete_repairing(
+        peer_worker_commands,
+        worker_commands_by_id,
+        forwarding,
+        key,
+        decision.nat,
+        metadata.is_reverse,
+        now_ns,
+    );
     sessions.emit_close_delta_with_origin(key.clone(), decision, metadata.clone(), origin);
 }
 
@@ -1078,6 +1101,66 @@ pub(super) fn replicate_session_upsert(
     }
 }
 
+/// #8114 item 4: a `DeleteSynced` a sibling worker's queue REFUSED, because it
+/// was already at `MAX_PENDING_WORKER_COMMANDS`.
+///
+/// Counted separately from `WORKER_COMMAND_QUEUE_DROPS` (which counts every
+/// refused command of any kind) because the consequences of losing a DELETE are
+/// specific: the sibling keeps its local session entry and flow-cache slot for a
+/// session that no longer exists, AND keeps its NAT holder bit, so the
+/// reservation is held for the life of the allocator.
+pub(crate) static SESSION_DELETE_REPLICA_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// #8114 item 4: refused deletes whose owning worker was IDENTIFIED and whose
+/// NAT teardown was therefore run on its behalf.
+///
+/// The difference `SESSION_DELETE_REPLICA_DROPPED - SESSION_DELETE_REPLICA_DROP_REPAIRED`
+/// is the number of refused deletes that could not be attributed to a worker id
+/// — a caller that had no `worker_commands_by_id` to resolve against. It is
+/// deliberately a SECOND counter rather than a conditional increment of the
+/// first: a single number could not distinguish "no drops" from "drops nobody
+/// repaired", and those have opposite remediations.
+pub(crate) static SESSION_DELETE_REPLICA_DROP_REPAIRED: AtomicU64 = AtomicU64::new(0);
+
+/// #8114 item 4: what one `replicate_session_delete_repairing` fan-out did,
+/// per call.
+///
+/// `dropped` counts sibling queues that REFUSED the delete; `repaired` counts
+/// the subset of those whose worker id resolved, so the NAT teardown ran on
+/// their behalf. `dropped - repaired` is the unattributable remainder — a caller
+/// with no id map to resolve against. Two fields rather than one because a
+/// single number cannot distinguish "no drops" from "drops nobody repaired", and
+/// those have opposite remediations.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct DeleteReplicationOutcome {
+    pub(super) dropped: u32,
+    pub(super) repaired: u32,
+}
+
+/// Resolve a worker command queue to the worker id that owns it.
+///
+/// By `Arc` IDENTITY, not by position: `peer_worker_commands` is built in
+/// `reconcile/bringup.rs` as
+/// `.filter(|(id, _)| **id != worker_id).map(|(_, queue)| queue.clone())`, so the
+/// ids are gone by the time the fan-out sees the slice, and its ORDER relative
+/// to the id-keyed map depends on which worker is excluded. Asking the map
+/// "which id is THIS allocation?" cannot desynchronise the way a parallel
+/// `&[u32]` would — the two structures hold the same `Arc`s, not the same facts
+/// written down twice.
+///
+/// `None` when the caller passed a map that does not contain the queue, which is
+/// the case for fixtures that do not exercise the repair. That is a no-op, not a
+/// wrong repair.
+fn worker_id_for_command_queue(
+    worker_commands_by_id: &BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
+    queue: &Arc<Mutex<VecDeque<WorkerCommand>>>,
+) -> Option<u32> {
+    worker_commands_by_id
+        .iter()
+        .find(|(_, candidate)| Arc::ptr_eq(candidate, queue))
+        .map(|(id, _)| *id)
+}
+
 pub(super) fn replicate_session_delete(
     worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     key: &SessionKey,
@@ -1086,8 +1169,102 @@ pub(super) fn replicate_session_delete(
         // #1807: recover-and-push — `if let Ok` silently DROPPED the
         // DeleteSynced replica for a poisoned worker queue.
         let mut pending = worker_queue::lock_recover(commands);
-        worker_queue::push_bounded(&mut pending, WorkerCommand::DeleteSynced(key.clone()));
+        if !worker_queue::push_bounded(&mut pending, WorkerCommand::DeleteSynced(key.clone())) {
+            // #8114 item 4: still unrepaired on this path — see
+            // `replicate_session_delete_repairing`. Counted so the drop is not
+            // silent even where it cannot be repaired.
+            SESSION_DELETE_REPLICA_DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
     }
+}
+
+/// #8114 item 4: `replicate_session_delete`, plus the NAT teardown a sibling
+/// worker will now never run because its queue refused the `DeleteSynced`.
+///
+/// The drop is not a missed optimisation. `handle_delete_synced` is what a
+/// worker does with the command, and it releases that worker's source-NAT and
+/// NAT64 holder bits; the port is freed by whichever worker drops the LAST bit.
+/// A worker that never receives the command never drops its bit, so the
+/// reservation is held for the life of the allocator — the same stranding
+/// `Coordinator::delete_synced_session_gen` repairs on the control-plane side
+/// (#6979 F4, whose probe recorded "queue-drop delta 1, pool port still
+/// occupied, `dead` false, dead-worker sweep freed 0").
+///
+/// WHY RELEASING ON ITS BEHALF CANNOT OVER-RELEASE, which is the direction of
+/// error that would matter: the command was REFUSED, so that worker will never
+/// run this teardown itself, and `release_flow` no-ops unless the allocator's
+/// `live_by_flow[flow].translated` equals this exact tuple — so a worker whose
+/// own `UpsertSynced` is still queued (no reservation taken yet) is untouched.
+/// The rule at `PortAllocator::drop_holder_locked` is satisfied: this clears the
+/// bit of a worker that provably cannot forward this flow again. It is also why
+/// "just release for every worker id" is NOT a substitute for resolving the id —
+/// that would clear the bit of a worker still forwarding the flow, and its port
+/// could then be handed to another.
+///
+/// NOT REPAIRED HERE, deliberately, and it is the half the issue names first:
+/// the sibling also never deletes its LOCAL session-table entry or invalidates
+/// its flow-cache slots, so it can keep serving the revoked session until the
+/// entry ages out. Neither is reachable from this thread — both live behind that
+/// worker's `&mut SessionTable` and its own per-binding caches — and the signal
+/// that would have to reach it cannot travel through the queue that is full. The
+/// NAT reservation is the part with no other owner, so it is the part repaired.
+///
+/// Returns a PER-CALL [`DeleteReplicationOutcome`] as well as bumping the
+/// process-wide counters. The counters are the operator signal; the return
+/// value is what a cell can assert on without racing every other test in the
+/// binary, which the globals cannot offer (they are shared across the parallel
+/// test threads, so `before + 1` is a flake waiting for a busy run).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn replicate_session_delete_repairing(
+    peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
+    worker_commands_by_id: &BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
+    forwarding: &ForwardingState,
+    key: &SessionKey,
+    nat: NatDecision,
+    is_reverse: bool,
+    now_ns: u64,
+) -> DeleteReplicationOutcome {
+    let mut outcome = DeleteReplicationOutcome::default();
+    for commands in peer_worker_commands {
+        let mut pending = worker_queue::lock_recover(commands);
+        let queued =
+            worker_queue::push_bounded(&mut pending, WorkerCommand::DeleteSynced(key.clone()));
+        // Release the command queue BEFORE touching allocator mutexes: the two
+        // are unrelated locks and holding both would invent an ordering, which
+        // is the lock-graph change a green suite cannot see.
+        drop(pending);
+        if queued {
+            continue;
+        }
+        SESSION_DELETE_REPLICA_DROPPED.fetch_add(1, Ordering::Relaxed);
+        outcome.dropped += 1;
+        let Some(worker_id) = worker_id_for_command_queue(worker_commands_by_id, commands) else {
+            continue;
+        };
+        SESSION_DELETE_REPLICA_DROP_REPAIRED.fetch_add(1, Ordering::Relaxed);
+        outcome.repaired += 1;
+        // Byte-for-byte the two releases `handle_delete_synced` would have run,
+        // with that worker's id as the holder, so the mask empties on the same
+        // last-release rule and the port is returned exactly once.
+        release_source_nat_allocation_for_worker(
+            &forwarding.iface_nat_allocators,
+            &forwarding.source_nat_rules,
+            key,
+            nat,
+            is_reverse,
+            now_ns,
+            worker_id,
+        );
+        crate::nat64::release_nat64_allocation_for_worker(
+            &forwarding.nat64,
+            key,
+            nat,
+            is_reverse,
+            now_ns,
+            worker_id,
+        );
+    }
+    outcome
 }
 
 pub(super) fn should_teardown_tcp_rst(_meta: UserspaceDpMeta, _flow: Option<&SessionFlow>) -> bool {

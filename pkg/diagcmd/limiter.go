@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 )
 
 // MaxConcurrentDiagnostics bounds how many host-level ping/traceroute
@@ -35,6 +36,24 @@ var ErrBusy = errors.New("diagnostic concurrency limit reached")
 // unusable; construct with NewLimiter.
 type Limiter struct {
 	sem chan struct{}
+	// refused counts Acquire calls rejected at capacity, cumulatively and for
+	// the process lifetime (#8312).
+	//
+	// WHY THIS EXISTS AT ALL, since a counter on a semaphore looks like
+	// decoration. #7294 item 2 asks for a WEIGHTED cost model — charge a full
+	// list more slots than a cursor page — and its acceptance criterion is that
+	// the model be "stated with a measurement, not asserted". Two attempts have
+	// now tried to measure the PER-ITEM COST: a cluster REST sweep, whose ~80ms
+	// of HTTP+JSON fixed cost buried the walk and produced five negative
+	// slopes, and a proposed Go benchmark, which needs BPF_MAP_CREATE and could
+	// not be run.
+	//
+	// Both were aimed at the wrong number. A weighting changes nothing unless
+	// some request is refused today that a weighted budget would admit — and
+	// NOTHING IN THIS PROCESS HAS EVER COUNTED A REFUSAL. The cost model cannot
+	// be evaluated, however precisely it is measured, until this is non-zero
+	// somewhere. That makes the counter the first instrument, not an extra one.
+	refused atomic.Uint64
 }
 
 // NewLimiter returns a Limiter admitting at most n concurrent holders.
@@ -61,6 +80,7 @@ func (l *Limiter) Acquire() (release func(), err error) {
 		var once sync.Once
 		return func() { once.Do(func() { <-l.sem }) }, nil
 	default:
+		l.refused.Add(1)
 		return nil, ErrBusy
 	}
 }
@@ -116,6 +136,18 @@ func (l *Limiter) AcquireCtx(ctx context.Context) (release func(), out context.C
 // tests and future metrics; it is a point-in-time read.
 func (l *Limiter) InFlight() int { return len(l.sem) }
 
+// Refusals reports how many Acquire calls this limiter has rejected at
+// capacity since process start. Monotonic; never reset.
+//
+// It counts REFUSALS, not attempts, and deliberately does not count the
+// AcquireCtx lease-reuse path: a nested handler reusing an ancestor's
+// admission was never a candidate for refusal, so counting it would inflate
+// the number with calls the cap does not govern. Exported as
+// xpf_admission_refusals_total (pkg/api), labelled per limiter, so the
+// question "is any of these budgets ever actually exhausted" is answerable
+// from a running box instead of from argument.
+func (l *Limiter) Refusals() uint64 { return l.refused.Load() }
+
 // Cap reports the maximum number of concurrent holders.
 func (l *Limiter) Cap() int { return cap(l.sem) }
 
@@ -134,16 +166,67 @@ var DefaultLimiter = NewLimiter(MaxConcurrentDiagnostics)
 // walk reachable via the gRPC GetStatus RPC + the ShowText
 // "buffers"/"buffers-detail" (`show system buffers[-detail]`) surfaces (#5782)
 // AND the REST /api/v1/status handler (#5939) — share the single
-// SessionWalkLimiter below (#5708). SessionCount is count-only (no per-entry
-// alloc/enrich) but its KERNEL iteration + per-bucket lock cost is the same
-// O(table) contention, so it draws from the same budget.
-// Each walk holds
-// per-bucket BPF-map locks across the whole v4+v6 conntrack table while
-// contending with the live dataplane session-sync path, so an unbounded scan
-// flood on ANY surface multiplies that contention. Before #5708 only the REST
-// endpoints were gated; a gRPC caller could issue unbounded full-table scans
-// through the uncovered gRPC surface (codex-review-182 M35). The value mirrors
-// the original REST cap (#5318/#5433).
+// SessionWalkLimiter below (#5708).
+//
+// SessionCount draws from the same budget, and #8312 measured it as MORE
+// expensive than a list rather than less: it walks BOTH the v4 and v6 maps
+// unconditionally with no early exit (`maps_session.go`), paying for the
+// reverse companion entries too, where a filtered list can stop at its page.
+// The earlier framing here — "count-only (no per-entry alloc/enrich) but the
+// same O(table) contention" — was right about allocations and understated the
+// syscalls. Charging it the full budget is correct; the reason is the walk, not
+// a tie.
+//
+// WHAT A WALK ACTUALLY COSTS, corrected (#8312). This comment used to say
+// "Each walk holds per-bucket BPF-map locks across the whole v4+v6 conntrack
+// table while contending with the live dataplane session-sync path". Both
+// halves are wrong, and the correction matters because the cost model #7294
+// item 2 asks for would have been built on them:
+//
+//   - The read walks use `Iterate()` — BPF_MAP_GET_NEXT_KEY + BPF_MAP_LOOKUP_ELEM
+//     per row, two syscalls, no batching. On a BPF_F_NO_PREALLOC hash map the
+//     kernel serves both RCU-read-side (`htab_map_lookup_elem` asserts
+//     `rcu_read_lock_held()`); it is the BATCH path that takes
+//     `htab_lock_bucket`. So these walks do not hold per-bucket locks at all.
+//     The path that does — BatchIterateSessions, whose own comment says it
+//     exists "for reduced kernel lock contention" — is used by conntrack GC and
+//     cluster session sync and is NOT gated here. That asymmetry is deliberate
+//     enough to leave alone (both are internal and self-paced, yielding between
+//     batches) but it should not be described backwards.
+//   - The "live dataplane session-sync path" is no longer an in-kernel program.
+//     Under the userspace dataplane the other writers are the Rust helper's
+//     per-session BPF_MAP_UPDATE_ELEM and the Go HA session-sync install.
+//
+// The bound is still right: 2 syscalls per row over a map sized
+// userspaceShimMaxSessions, times N unbounded callers, is real CPU and RCU
+// pressure however the kernel locks it. Only the mechanism was misstated.
+//
+// Before #5708 only the REST endpoints were gated; a gRPC caller could issue
+// unbounded full-table scans through the uncovered gRPC surface
+// (codex-review-182 M35). The value mirrors the original REST cap
+// (#5318/#5433).
+//
+// WHY THIS IS STILL 1 SLOT PER OPERATION (#7294 item 2 / #8312). A weighted
+// model was proposed — charge a full list more than a cursor page. Three
+// things stopped it, and they are recorded here so it is not re-derived:
+//
+//  1. The differentiations mostly are not there. SessionCount is not cheaper
+//     than a list (above). A cursor page IS O(rows examined) rather than
+//     O(table) — `IterateSessionsFrom` resumes with one NextKey and does not
+//     re-walk to the cursor — but "rows examined" equals the page only for an
+//     UNFILTERED query; a selective filter walks the whole map for one empty
+//     page. The limiter cannot know which at acquire time, so the one real
+//     differentiation is not statically expressible.
+//  2. Multi-slot acquisition is not available on this primitive. Acquire is a
+//     non-blocking send on a buffered channel and there is no atomic
+//     multi-send, so W slots means W sends — and a caller that gets 2 of 3 and
+//     fails has occupied the budget while being refused, refusing a third
+//     caller that would otherwise have been admitted. Today a refusal never
+//     costs another caller a slot. See
+//     TestMultiSlotAcquireIsNotAvailableOnThisLimiter8312.
+//  3. Nothing had ever counted a refusal, so no per-item cost could decide it.
+//     Refusals() and xpf_admission_refusals_total exist for that; if they stay
+//     at 0 in the field the weighting changes nothing that can be observed.
 const MaxConcurrentSessionWalks = 4
 
 // SessionWalkLimiter is the process-wide session-scan limiter shared by the

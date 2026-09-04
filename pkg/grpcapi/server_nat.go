@@ -12,6 +12,7 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
+	"github.com/psaab/xpf/pkg/natshow"
 	"github.com/psaab/xpf/pkg/vrrp"
 )
 
@@ -332,18 +333,14 @@ func (s *Server) GetNATRuleStats(_ context.Context, req *pb.GetNATRuleStatsReque
 				continue
 			}
 			for _, rule := range rs.Rules {
-				action := "interface"
-				if rule.Then.PoolName != "" {
-					action = "pool " + rule.Then.PoolName
-				}
-				srcMatch := "0.0.0.0/0"
-				if rule.Match.SourceAddress != "" {
-					srcMatch = rule.Match.SourceAddress
-				}
-				dstMatch := "0.0.0.0/0"
-				if rule.Match.DestinationAddress != "" {
-					dstMatch = rule.Match.DestinationAddress
-				}
+				// #8580: one shared computation for every surface — see
+				// natshow.SourceRuleAction. This copy carried the same two
+				// defects the REST one did: `then source-nat off` reported as
+				// "interface" (#7640) and an address-book-scoped rule reported
+				// as 0.0.0.0/0 (#7363).
+				action := natshow.SourceRuleAction(rule)
+				srcMatch := natshow.RuleMatchSource(rule)
+				dstMatch := natshow.RuleMatchDestination(rule)
 				hitPkts, hitBytes, err := readCounter(dataplane.NATCounterTypeSource, rs.Name, rule.Name)
 				if err != nil {
 					return nil, status.Errorf(codes.Internal,
@@ -384,10 +381,8 @@ func (s *Server) GetNATRuleStats(_ context.Context, req *pb.GetNATRuleStatsReque
 					if rule.Then.PoolName != "" {
 						action = "pool " + rule.Then.PoolName
 					}
-					dstMatch := "0.0.0.0/0"
-					if rule.Match.DestinationAddress != "" {
-						dstMatch = rule.Match.DestinationAddress
-					}
+					// #8580: same singular-only copy, destination side.
+					dstMatch := natshow.RuleMatchDestination(rule)
 					if rule.Match.DestinationPort != 0 {
 						dstMatch += fmt.Sprintf(":%d", rule.Match.DestinationPort)
 					}

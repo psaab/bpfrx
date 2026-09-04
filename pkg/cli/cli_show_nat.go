@@ -100,6 +100,14 @@ func (c *CLI) showNATSource(cfg *config.Config, args []string) error {
 		fmt.Println("Source NAT pools:")
 		for name, pool := range cfg.Security.NAT.SourcePools {
 			fmt.Printf("  Pool: %s\n", name)
+			// #8580: this view rendered a DISARMED pool identically to an armed
+			// one. Its four siblings each say so — the summary via
+			// `sourceNATPoolNotInstalled`, the detail view via
+			// `SourceNATPoolReportablePorts`' reason — and this one, the view an
+			// operator reaches by typing the shortest command, did not.
+			if line := natNotInstalledLine(sourceNATPoolNotInstalled(pool), true); line != "" {
+				fmt.Println(line)
+			}
 			for _, addr := range pool.Addresses {
 				fmt.Printf("    Address: %s\n", addr)
 			}
@@ -121,13 +129,15 @@ func (c *CLI) showNATSource(cfg *config.Config, args []string) error {
 			fmt.Printf("Source NAT rule-set: %s\n", rs.Name)
 			fmt.Printf("  From zone: %s, To zone: %s\n", rs.FromZone, rs.ToZone)
 			for _, rule := range rs.Rules {
-				action := "interface"
-				if rule.Then.PoolName != "" {
-					action = "pool " + rule.Then.PoolName
-				}
+				// #8580: one shared computation for every surface — see
+				// natshow.SourceRuleAction. This copy defaulted to "interface",
+				// which named `then source-nat off` (a no-NAT exemption) as its
+				// exact opposite and named an ACTIONLESS rule as translating.
+				action := natshow.SourceRuleAction(rule)
 				fmt.Printf("  Rule: %s -> %s\n", rule.Name, action)
-				if rule.Match.SourceAddress != "" {
-					fmt.Printf("    Match source-address: %s\n", rule.Match.SourceAddress)
+				fmt.Printf("    Match source-address: %s\n", natshow.RuleMatchSource(rule))
+				if line := natNotInstalledLine(sourceNATRuleNotInstalled(cfg, rule), true); line != "" {
+					fmt.Println(line)
 				}
 			}
 			fmt.Println()
@@ -461,19 +471,17 @@ func (c *CLI) showNATSourceRuleSet(cfg *config.Config, rsName string) error {
 		fmt.Printf("Rule-set: %s\n", rs.Name)
 		fmt.Printf("  From zone: %s  To zone: %s\n", rs.FromZone, rs.ToZone)
 		for _, rule := range rs.Rules {
-			action := "interface"
-			if rule.Then.PoolName != "" {
-				action = "pool " + rule.Then.PoolName
-			}
+			// #8580: one shared computation for every surface — see
+			// natshow.SourceRuleAction. This copy defaulted to "interface",
+			// which named `then source-nat off` (a no-NAT exemption) as its
+			// exact opposite and named an ACTIONLESS rule as translating.
+			action := natshow.SourceRuleAction(rule)
 			fmt.Printf("  Rule: %s\n", rule.Name)
-			srcMatch := "0.0.0.0/0"
-			if rule.Match.SourceAddress != "" {
-				srcMatch = rule.Match.SourceAddress
-			}
-			dstMatch := "0.0.0.0/0"
-			if rule.Match.DestinationAddress != "" {
-				dstMatch = rule.Match.DestinationAddress
-			}
+			// #8580 (#7363 one surface over): the singular field alone renders
+			// an address-book-scoped rule as 0.0.0.0/0 — matching EVERYTHING —
+			// and a bracket list as only its first element.
+			srcMatch := natshow.RuleMatchSource(rule)
+			dstMatch := natshow.RuleMatchDestination(rule)
 			fmt.Printf("    Match: source %s destination %s\n", srcMatch, dstMatch)
 			// #7473
 			if line := natNotInstalledLine(sourceNATRuleNotInstalled(cfg, rule), true); line != "" {
@@ -513,18 +521,16 @@ func (c *CLI) showNATSourceRuleAll(cfg *config.Config) error {
 	for _, rs := range cfg.Security.NAT.Source {
 		for _, rule := range rs.Rules {
 			totalRules++
-			action := "interface"
-			if rule.Then.PoolName != "" {
-				action = "pool " + rule.Then.PoolName
-			}
-			srcMatch := "0.0.0.0/0"
-			if rule.Match.SourceAddress != "" {
-				srcMatch = rule.Match.SourceAddress
-			}
-			dstMatch := "0.0.0.0/0"
-			if rule.Match.DestinationAddress != "" {
-				dstMatch = rule.Match.DestinationAddress
-			}
+			// #8580: one shared computation for every surface — see
+			// natshow.SourceRuleAction. This copy defaulted to "interface",
+			// which named `then source-nat off` (a no-NAT exemption) as its
+			// exact opposite and named an ACTIONLESS rule as translating.
+			action := natshow.SourceRuleAction(rule)
+			// #8580 (#7363 one surface over): the singular field alone renders
+			// an address-book-scoped rule as 0.0.0.0/0 — matching EVERYTHING —
+			// and a bracket list as only its first element.
+			srcMatch := natshow.RuleMatchSource(rule)
+			dstMatch := natshow.RuleMatchDestination(rule)
 
 			fmt.Printf("Rule-set: %-20s Rule: %-12s %s -> %s  Action: %s\n",
 				rs.Name, rule.Name, rs.FromZone, rs.ToZone, action)
@@ -852,10 +858,10 @@ func (c *CLI) showNATDestinationRuleSet(cfg *config.Config, rsName string) error
 		fmt.Printf("  From zone: %s  To zone: %s\n", rs.FromZone, rs.ToZone)
 		for _, rule := range rs.Rules {
 			fmt.Printf("  Rule: %s\n", rule.Name)
-			dstMatch := "0.0.0.0/0"
-			if rule.Match.DestinationAddress != "" {
-				dstMatch = rule.Match.DestinationAddress
-			}
+			// #8580: the destination-NAT renderers carried the same
+			// singular-only copy the source side did, so an address-book-scoped
+			// destination rule rendered as 0.0.0.0/0 here too (#7363).
+			dstMatch := natshow.RuleMatchDestination(rule)
 			fmt.Printf("    Match destination-address: %s\n", dstMatch)
 			// #7473
 			if line := natNotInstalledLine(destNATRuleNotInstalled(cfg, rule), false); line != "" {
@@ -903,10 +909,10 @@ func (c *CLI) showNATDestinationRuleAll(cfg *config.Config) error {
 	for _, rs := range dnat.RuleSets {
 		for _, rule := range rs.Rules {
 			totalRules++
-			dstMatch := "0.0.0.0/0"
-			if rule.Match.DestinationAddress != "" {
-				dstMatch = rule.Match.DestinationAddress
-			}
+			// #8580: the destination-NAT renderers carried the same
+			// singular-only copy the source side did, so an address-book-scoped
+			// destination rule rendered as 0.0.0.0/0 here too (#7363).
+			dstMatch := natshow.RuleMatchDestination(rule)
 			if rule.Match.DestinationPort != 0 {
 				dstMatch += fmt.Sprintf(":%d", rule.Match.DestinationPort)
 			}

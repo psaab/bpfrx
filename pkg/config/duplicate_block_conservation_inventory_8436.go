@@ -34,13 +34,6 @@ var dupConservationInventory8436 = []string{
 	"class-of-service schedulers",
 	"class-of-service traffic-control-profiles",
 	"protocols isis interface",
-	"protocols ospf area xpfname interface",
-	"protocols ospf3 area xpfname interface",
-	"protocols router-advertisement interface",
-	"security dynamic-address feed-server",
-	"security nat source pool",
-	"services flow-monitoring version-ipfix template",
-	"services flow-monitoring version9 template",
 	"system ntp server",
 	"system services dynamic-dns provider",
 

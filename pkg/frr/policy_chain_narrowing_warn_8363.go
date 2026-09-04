@@ -24,6 +24,40 @@ import (
 // default action, so a deny at a non-final ghost position DELETES every later
 // member and renders deny-all. Making the narrowing visible is correct under
 // either outcome of that decision, which is why it lands separately from it.
+//
+// #8369 — THE DENY IS DEFERRED, NOT PENDING IMPLEMENTATION. Three reasons, and
+// the third is new evidence rather than a restatement of the issue.
+//
+//  1. THE DIRECTION IS A ROUTING CHANGE AT LOAD TIME. A narrowed chain is
+//     carrying traffic right now with its fall-through PERMITTED (#2998, the
+//     Junos BGP default-accept). A deny converts that to denied. Strict commit
+//     rejects an undefined policy reference in both directions, so the ENTIRE
+//     affected population arrives via the lenient path (Store.Load / SyncApply)
+//     — a reboot, a peer sync or a rollback. The operator gets a routing change
+//     triggered by an unrelated event, on a config they did not just edit, with
+//     no commit to warn them at, and a route-map deny is silent: the first
+//     symptom is a prefix simply absent from the neighbour's adj-rib.
+//     TestNarrowedChainStillPermitsFallThroughToday8369 asserts the direction
+//     so it cannot change silently.
+//
+//  2. THE POPULATION IS UNMEASURED, and #8369 makes measuring it a
+//     precondition ("Do not decide this from argument"). No fleet split has
+//     been collected.
+//
+//  3. THE GAUGE THAT WOULD SIZE IT OVER-COUNTS. A surviving policy statement
+//     that is DEFINED but carries no terms renders as one sequence with NO
+//     match clause — `route-map C permit 10` — which in FRR matches
+//     EVERYTHING. Every route is permitted there and nothing reaches a later
+//     sequence, so a deny synthesized for a trailing ghost is not merely hard
+//     to observe, it is UNREACHABLE. That shape counts as deny-safe
+//     (GhostsAreSuffix is true — the ghost is last), so
+//     xpf_frr_policy_chains_narrowed_deny_safe includes chains the change
+//     could not affect. Measured, not argued:
+//     TestEmptySurvivorMakesASynthesizedDenyUNREACHABLE8369.
+//
+// What a future implementation still owes, beyond the issue's own list: sizing
+// must exclude the empty-survivor shape, or the benefit is overstated by
+// however common it is.
 
 // narrowedChainSite is one attachment whose resolved chain is a strict, non-empty
 // subset of what the operator authored.

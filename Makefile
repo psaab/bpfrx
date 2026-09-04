@@ -500,7 +500,7 @@ clean:
 # The standalone instance name defaults to xpf-fw; override it for an
 # ad-hoc/renamed VM with `XPF_INSTANCE=<name> make test-deploy` (#2162). The
 # env var flows through to setup.sh (INSTANCE_NAME=${XPF_INSTANCE:-xpf-fw}).
-.PHONY: test-env-init test-vm standalone-test-vm test-ct test-deploy test-deploy-lib test-mutate-lib test-cluster-lock-lib test-target-services-lib test-cluster-env-lib test-iperf-throughput-lib test-cos-apply-lib test-mouse-elephant-lib test-fbf-steering-lib test-host-inbound-lib test-host-inbound test-host-inbound-failover test-ssh test-destroy test-status test-start test-stop test-restart test-logs test-journal test-screen-probe-lib
+.PHONY: test-env-init test-vm standalone-test-vm test-ct test-deploy test-deploy-lib test-mutate-lib test-cluster-lock-lib test-target-services-lib test-cluster-env-lib test-iperf-throughput-lib test-cos-apply-lib test-mouse-elephant-lib test-fbf-steering-lib test-host-inbound-lib test-host-inbound test-host-inbound-failover test-ssh test-destroy test-status test-start test-stop test-restart test-logs test-journal test-screen-probe-lib mouse-target-up mouse-target-status mouse-target-destroy
 
 test-env-init:
 	./test/incus/setup.sh init
@@ -762,6 +762,32 @@ test-iperf-throughput-lib:
 # no incus, cluster, network or crafted frames.
 test-screen-probe-lib:
 	bash ./test/incus/screen-probe-selftest.sh
+
+# #8259: provision the SECOND VLAN-80 target, so a mouse-latency verdict can be
+# ATTRIBUTED.
+#
+# Mice and elephants both terminated on 172.16.80.200, so the loaded cell added
+# the elephants' offered load to the host whose service time is inside every
+# mouse sample — and #8467 made the gate return VOID-NOT-ATTRIBUTABLE rather
+# than a PASS or FAIL it could not support. The blocker was never the check: the
+# standing target is external lab hardware with no management path, and the
+# firewall's WAN neighbour table held exactly two entries, so there was nowhere
+# to move a flow to. `up` creates a third — an incus container on an SR-IOV VF
+# tagged into VLAN 80, running target-services.sh's own grid (iperf3 5200-5211,
+# echo 6200-6211, port 7).
+#
+# Idempotent, and touches NO existing instance: it creates and reconciles one
+# container. It does not need the cluster lock for that reason, and does not
+# take it — a `mouse-target-up` running beside somebody's smoke changes nothing
+# the smoke reads.
+mouse-target-up:
+	bash ./test/incus/mouse-target-setup.sh up
+
+mouse-target-status:
+	bash ./test/incus/mouse-target-setup.sh status
+
+mouse-target-destroy:
+	bash ./test/incus/mouse-target-setup.sh destroy
 
 # Self-test the #4800 new-flow-ceiling analysis layer: the function that
 # turns two helper counter snapshots into "N new flows/sec, and here is

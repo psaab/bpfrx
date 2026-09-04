@@ -80,7 +80,34 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 			area := &OSPFArea{ID: areaInst.name}
 
 			for _, ifInst := range namedInstances(areaInst.node.FindChildren("interface")) {
-				iface := &OSPFInterface{Name: ifInst.name}
+				// #8436: FIND-OR-CREATE within the slice, keyed on the
+				// interface NAME.
+				//
+				// `Interfaces` is a slice and this appended unconditionally, so
+				// two `interface ge-0/0/0.0 { ... }` blocks under one area
+				// produced TWO entries with the same name — whichever consumer
+				// reads first wins and the other block's settings are
+				// unreachable. Same shape as `system login class` (#8548),
+				// where the slice made it look like a merge and it was not.
+				//
+				// THE DIFFERENT-NAMES CASE IS PRESERVED BY CONSTRUCTION, and
+				// that is why this family was safe to fix after three batches
+				// deferred it. Two blocks naming DIFFERENT interfaces do not
+				// match here, so they still append and still produce two
+				// entries — correct Junos authoring. Only two blocks naming the
+				// SAME interface merge, which is the case the #8436 census
+				// builds and the only one that was ever wrong.
+				var iface *OSPFInterface
+				for _, existing := range area.Interfaces {
+					if existing != nil && existing.Name == ifInst.name {
+						iface = existing
+						break
+					}
+				}
+				appendIface := iface == nil
+				if appendIface {
+					iface = &OSPFInterface{Name: ifInst.name}
+				}
 				// #7653: the body may be PACKED onto the instance line
 				//   interface ge-0/0/0.0 authentication simple-password "s";
 				// in which case Children is empty and every property below --
@@ -192,7 +219,9 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 						}
 					}
 				}
-				area.Interfaces = append(area.Interfaces, iface)
+				if appendIface {
+					area.Interfaces = append(area.Interfaces, iface)
+				}
 			}
 
 			// Parse area-type (stub/nssa)
@@ -696,7 +725,34 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 			area := &OSPFv3Area{ID: areaInst.name}
 
 			for _, ifInst := range namedInstances(areaInst.node.FindChildren("interface")) {
-				iface := &OSPFv3Interface{Name: ifInst.name}
+				// #8436: FIND-OR-CREATE within the slice, keyed on the
+				// interface NAME.
+				//
+				// `Interfaces` is a slice and this appended unconditionally, so
+				// two `interface ge-0/0/0.0 { ... }` blocks under one area
+				// produced TWO entries with the same name — whichever consumer
+				// reads first wins and the other block's settings are
+				// unreachable. Same shape as `system login class` (#8548),
+				// where the slice made it look like a merge and it was not.
+				//
+				// THE DIFFERENT-NAMES CASE IS PRESERVED BY CONSTRUCTION, and
+				// that is why this family was safe to fix after three batches
+				// deferred it. Two blocks naming DIFFERENT interfaces do not
+				// match here, so they still append and still produce two
+				// entries — correct Junos authoring. Only two blocks naming the
+				// SAME interface merge, which is the case the #8436 census
+				// builds and the only one that was ever wrong.
+				var iface *OSPFv3Interface
+				for _, existing := range area.Interfaces {
+					if existing != nil && existing.Name == ifInst.name {
+						iface = existing
+						break
+					}
+				}
+				appendIface := iface == nil
+				if appendIface {
+					iface = &OSPFv3Interface{Name: ifInst.name}
+				}
 				// #7653: same packed-instance shape as the OSPFv2 loop above.
 				for _, prop := range packedBodyChildren(ifInst.node,
 					schemaForPath("protocols", "ospf3", "area", "interface")) {
@@ -754,7 +810,9 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 						}
 					}
 				}
-				area.Interfaces = append(area.Interfaces, iface)
+				if appendIface {
+					area.Interfaces = append(area.Interfaces, iface)
+				}
 			}
 
 			proto.OSPFv3.Areas = append(proto.OSPFv3.Areas, area)
@@ -903,8 +961,22 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 
 func compileRouterAdvertisement(node *Node, proto *ProtocolsConfig) error {
 	for _, inst := range namedInstances(node.FindChildren("interface")) {
-		ra := &RAInterfaceConfig{
-			Interface: inst.name,
+		// #8436: FIND-OR-CREATE, keyed on the interface name — see the OSPF
+		// loops above for why the different-names case is preserved. The store
+		// here is `proto.RouterAdvertisement`, a slice, and the name lives on
+		// the `Interface` field rather than `Name`.
+		var ra *RAInterfaceConfig
+		for _, existing := range proto.RouterAdvertisement {
+			if existing != nil && existing.Interface == inst.name {
+				ra = existing
+				break
+			}
+		}
+		appendRA := ra == nil
+		if appendRA {
+			ra = &RAInterfaceConfig{
+				Interface: inst.name,
+			}
 		}
 
 		for _, prop := range inst.node.Children {
@@ -1030,7 +1102,9 @@ func compileRouterAdvertisement(node *Node, proto *ProtocolsConfig) error {
 			}
 		}
 
-		proto.RouterAdvertisement = append(proto.RouterAdvertisement, ra)
+		if appendRA {
+			proto.RouterAdvertisement = append(proto.RouterAdvertisement, ra)
+		}
 	}
 	return nil
 }

@@ -132,6 +132,38 @@ pub(super) struct UserspaceDpMeta {
     pub(super) l3_offset: u16,
     pub(super) l4_offset: u16,
     pub(super) payload_offset: u16,
+    /// THE LENGTH OF THE BUFFER THIS META DESCRIBES, measured from offset 0 —
+    /// not the L3 packet length (#8581).
+    ///
+    /// Every offset field above is relative to the same origin, and `pkt_len`
+    /// is the extent of that same buffer, so the L3 length is uniformly
+    /// `pkt_len - l3_offset` at EVERY construction site. That uniformity is the
+    /// property, and it is what makes the bytes counted for a packet
+    /// independent of which path presented it:
+    ///
+    ///   * `userspace-xdp/src/lib.rs` — an Ethernet frame, `l3_offset` 14/18,
+    ///     `pkt_len = data_end - data`;
+    ///   * `coordinator/inject.rs` (frame arm) — an Ethernet frame,
+    ///     `l3_offset` 14/18, `pkt_len = frame_len`;
+    ///   * `coordinator/inject.rs` (raw arm) — a bare IP packet, `l3_offset` 0,
+    ///     `pkt_len = packet_length`;
+    ///   * `tunnel.rs::local_origin_packet_meta` — a bare IP packet,
+    ///     `l3_offset` 0, `pkt_len = packet.len()`;
+    ///   * `logical_ingress.rs` — a SYNTHETIC 14-byte Ethernet header plus the
+    ///     decapsulated inner packet, `l3_offset` 14, `pkt_len = 14 + inner`.
+    ///
+    /// The last one carried the INNER length until #8581, which made the same
+    /// L3 packet count 14 bytes fewer in every filter, policy, policer, session
+    /// and zone byte counter when it arrived decapsulated than when it arrived
+    /// native — a difference an operator comparing those totals cannot see and
+    /// would not suspect. `trim_l3_payload` tolerated both spellings (its
+    /// metadata FALLBACK tries `pkt_len` as an L3 length before trying it as a
+    /// frame length, and the two arms self-select on the `l3_offset` a site
+    /// carries), which is why nothing was red.
+    ///
+    /// A NEW construction site owes this invariant. A `pkt_len` that is not the
+    /// buffer's length makes `pkt_len - l3_offset` mean something different
+    /// depending on who built the meta, and no consumer can tell which it has.
     pub(super) pkt_len: u16,
     pub(super) addr_family: u8,
     pub(super) protocol: u8,
@@ -168,6 +200,8 @@ pub(super) struct ForwardPacketMeta {
     pub(super) l3_offset: u16,
     pub(super) l4_offset: u16,
     pub(super) payload_offset: u16,
+    /// Buffer length from offset 0, carried through unchanged from
+    /// `UserspaceDpMeta::pkt_len` — see that field for the invariant (#8581).
     pub(super) pkt_len: u16,
     pub(super) addr_family: u8,
     pub(super) protocol: u8,

@@ -165,6 +165,24 @@ type Store struct {
 	// the removal durably. Default false.
 	confirmRemoveDegraded bool
 
+	// confirmRecoveryReadFailed records that boot recovery could NOT READ
+	// confirm.json (#8566): the file exists but the read, the decrypt, or the
+	// #5637 structural validation failed. `Load` still SUCCEEDS — a corrupt
+	// transient recovery file must not brick a boot (#1960) — but the pending
+	// commit-confirmed rollback window is GONE for the lifetime of this process:
+	// no timer is armed and the still-UNCONFIRMED config now stands
+	// indefinitely, which is exactly the #4577 failure the record exists to
+	// prevent. Before this flag that outcome was reported by a single WARN line
+	// and nothing else: `ConfigPersistDegraded()` was false, so /health returned
+	// 200 and `xpf_daemon_config_persist_degraded` read 0. The box came up
+	// looking fine.
+	//
+	// The record is deliberately NOT deleted — a decrypt failure can be a
+	// transient master-key problem and the window may be readable on a later
+	// boot — so this state clears on operator action instead: the next
+	// successful arm or removal of a confirm record.
+	confirmRecoveryReadFailed bool
+
 	// confirmRemoveDebtID identifies WHICH commit-confirmed record the two
 	// removal debts above are owed for (#7675). Both debts used to be UNKEYED:
 	// the retry loop and the deferred finalize called DeleteConfirm()

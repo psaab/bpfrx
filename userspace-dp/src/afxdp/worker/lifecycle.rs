@@ -204,6 +204,7 @@ pub(super) fn poll_binding(
             recent_exceptions,
             last_resolution,
             peer_worker_commands,
+            worker_commands_by_id,
             dnat_fds,
             rg_epochs,
             cold_path_sample_mask,
@@ -394,6 +395,45 @@ pub(super) fn poll_binding(
 /// "bind the WIRING, not the function it calls" rule — the cell that drives this
 /// starts from a binding whose scratch is populated, which is the state the poll
 /// pass actually leaves behind.
+/// #8114 item 3: the exact extent of the same-worker revocation window,
+/// derived rather than written down.
+///
+/// [`drain_revoked_flow_cache_keys`] runs INSIDE `poll_binding`, after that
+/// binding's descriptor loop and before the worker polls any other binding. So
+/// the slots a revocation leaves live are live for exactly the descriptors that
+/// were already queued behind the revoking one in THIS `poll_binding` call —
+/// at most `MAX_RX_BATCHES_PER_POLL` batches of `RX_BATCH_SIZE`, minus the
+/// revoking descriptor itself.
+///
+/// Two things this bound is NOT, both worth stating because #8114 states the
+/// first and a reader would assume the second:
+///
+/// - It is not a SIBLING-BINDING window. #8114 describes "a later descriptor in
+///   the same batch, arriving on a sibling binding of the same worker". No such
+///   descriptor exists: one `poll_binding` call processes ONE binding's ring,
+///   and the drain below evicts across `left` + `current` + `right` before the
+///   worker's loop reaches any sibling. A sibling's slot is already gone by the
+///   time its own poll runs. The window is on the SAME binding — the revoked
+///   flow's own packets, already in the ring.
+/// - It is not a SIBLING-WORKER window. Those evict on their next tick through
+///   the `replicate_session_delete` -> `DeleteSynced` -> #6457 path, which is a
+///   different (larger) window and is entangled with #8114 item 4: a delete a
+///   full queue refuses is never delivered at all.
+///
+/// Expressed as a product of the two constants that actually bound it, so a
+/// change to either moves this figure instead of leaving a stale number in a
+/// comment. Today that is **255**.
+///
+/// A companion cell asserting `== 255` was WRITTEN AND THEN REMOVED, and the
+/// reason is worth keeping: `afxdp/mod.rs` already carries
+/// `const _: () = assert!(RX_BATCH_SIZE == 64, ..)`, so the figure cannot move
+/// without failing to COMPILE. A runtime assertion behind a compile-time gate
+/// can never fail, and a check that cannot fail is not a guard — it is a
+/// sentence that looks like one. The derivation above is the guard; the
+/// compile-time pin is what makes 255 stable.
+pub(crate) const REVOCATION_FLOW_CACHE_WINDOW_DESCRIPTORS: usize =
+    MAX_RX_BATCHES_PER_POLL * (RX_BATCH_SIZE as usize) - 1;
+
 pub(super) fn drain_revoked_flow_cache_keys(
     left: &mut [BindingWorker],
     current: &mut BindingWorker,

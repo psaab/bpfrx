@@ -73,6 +73,66 @@ Why, and what a change here must not break:
   `exported_sequences.iter().max()` per pass, and FIFO makes each pass's
   max strictly greater than the last.
 
+## A refused cross-worker `DeleteSynced` (#8114 item 4)
+
+`replicate_session_delete` fans a `DeleteSynced` out to every sibling
+worker's queue, and `push_bounded` REFUSES at
+`MAX_PENDING_WORKER_COMMANDS` (4096) rather than evicting — the queue
+carries ordered state transitions, so dropping from the front would
+invert a key's state (see the section above).
+
+A refused DELETE is not a missed optimisation. `handle_delete_synced` is
+what a worker does with the command, and it drops **that worker's**
+source-NAT and NAT64 holder bits; the port is freed by whichever worker
+drops the last bit. A worker that never receives the command never drops
+its bit, and it is ALIVE — so neither the dead-worker sweep (#8069) nor
+the generation-teardown sweep (#7092) can see the bit. The reservation is
+held for the life of the allocator. That is a port LEAK on top of the
+stale-forwarding window #8114 names.
+
+`replicate_session_delete_repairing` runs the two releases on the refused
+worker's behalf, which is the worker-side twin of the repair
+`Coordinator::delete_synced_session_gen` already does (#6979 F4). Three
+things about it are load-bearing:
+
+- **The worker id is resolved by `Arc` identity, not by position.**
+  `peer_worker_commands` is built in `reconcile/bringup.rs` as
+  `.filter(|(id, _)| **id != worker_id).map(|(_, queue)| queue.clone())`,
+  so the ids are gone by the time the fan-out sees the slice, and its
+  order relative to the id-keyed map depends on which worker is excluded.
+  `WorkerContext::worker_commands_by_id` is asked "which id is THIS
+  allocation?". A parallel `&[u32]` would be the same fact written down
+  twice and would drift.
+- **Only a REFUSED push is repaired.** When the push succeeds that worker
+  will run the teardown itself, and freeing the port here would hand it
+  to a new flow while the old one is still being torn down — the
+  direction of error `PortAllocator::drop_holder_locked` forbids. This is
+  also why "release for every worker id" is not a substitute for
+  resolving the id.
+- **An unresolvable id is counted, not guessed.** A caller with no id map
+  (every pre-#8114 fixture) takes that path and behaves exactly as before.
+  `SESSION_DELETE_REPLICA_DROPPED` minus
+  `SESSION_DELETE_REPLICA_DROP_REPAIRED` is the unattributed remainder;
+  the per-call `DeleteReplicationOutcome` is the same pair without the
+  cross-test racing a process-wide counter has.
+
+**NOT repaired, and it is the half the issue names first.** The refused
+sibling also never deletes its LOCAL session-table entry and never
+invalidates its flow-cache slots, so it can keep serving the revoked
+session until the entry ages out. Neither is reachable from the deleting
+thread — both live behind that worker's `&mut SessionTable` and its own
+per-binding caches — and the signal that would have to reach it cannot
+travel through the queue that is full. Closing it needs a per-worker
+overflow epoch plus a local reconcile against shared authority, which is
+a design decision of its own: the naive form (sweep local entries absent
+from the shared map) can delete live locally-owned sessions.
+
+`teardown_tcp_rst_flow` still uses the non-repairing
+`replicate_session_delete`. It is currently unreachable —
+`should_teardown_tcp_rst` returns `false` unconditionally — so wiring the
+repair through it would be untestable code on a dead path; its drops are
+counted.
+
 ## Terminal-filtered session teardown (`delete_terminal_filtered_session`, #5622)
 
 When an *established* LocalDelivery session re-evaluates a terminal gate

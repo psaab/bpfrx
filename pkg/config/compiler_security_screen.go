@@ -551,13 +551,11 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 				case "source-ip-based":
 					recordKeyExtras("limit-session source-ip-based", opt, 2)
 					recordChildExtras("limit-session source-ip-based", opt)
-					recordChildExtras("limit-session source-ip-based", opt)
 					if n, ok := parseThresh("limit-session source-ip-based", val); ok {
 						profile.LimitSession.SourceIPBased = n
 					}
 				case "destination-ip-based":
 					recordKeyExtras("limit-session destination-ip-based", opt, 2)
-					recordChildExtras("limit-session destination-ip-based", opt)
 					recordChildExtras("limit-session destination-ip-based", opt)
 					if n, ok := parseThresh("limit-session destination-ip-based", val); ok {
 						profile.LimitSession.DestinationIPBased = n
