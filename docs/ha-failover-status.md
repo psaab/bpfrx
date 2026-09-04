@@ -281,16 +281,35 @@ and a rule-referenced `persistent-nat` pool committed:
 The last row is the whole of what persistent NAT promises, and it is the one a
 lease that merely *arrived* would not satisfy.
 
-### What the residual is
+### What the residuals are
 
-Sync is not instantaneous. A lease created on the active in the window before
-the next export/import cycle is not yet on the standby, so a failover inside
-that window can drop it — the flow gets a fresh translated identity instead of
-its pinned one. That is a much narrower statement than "not HA-synchronized",
-and it is the same window every other synced object lives with.
+Two, and both mean "this particular lease did not reach the standby" — never
+"the standby forwards with semantics it cannot honour".
 
-The operator surface for it is the existing per-pool persistent-lease counters
-(`show security nat source persistent-nat-detail`, and the pool status table's
+**The sync window.** A lease created on the active in the interval before the
+next export/import cycle is not yet on the standby, so a failover inside that
+window drops it — the flow gets a fresh translated identity instead of its
+pinned one. That is a much narrower statement than "not HA-synchronized", and
+it is the same window every other synced object lives with.
+
+**A refused import.** A lease whose pool address the standby's config lacks,
+whose port bit is already held there, or that arrived already expired, is
+refused by design (#8121). Each refusal is correct: the standby mints its own
+translation rather than install a duplicate or a wrong translated identity. The
+helper logs one line per import BATCH naming the refusal classes —
+
+```
+xpf-dp: idle-lease import installed=N existing=N expired=N unknown_addr=N unknown_pool=N port_busy=N malformed=N
+```
+
+— and #8573 widened that line's trigger to fire on `unknown_addr` too. That is
+the class meaning the two nodes disagree about a pool's address list, and it
+previously logged NOTHING: a batch in which every lease was refused for it was
+silent. That mattered less while the gate refused to forward these configs at
+all; with the gate lifted it is the residual's main surface.
+
+The other surface is the existing per-pool persistent-lease counters
+(`show security nat source persistent-nat-table detail`, and the pool status table's
 lease counts), which are per-node: comparing the two nodes shows whether the
 standby is tracking the active. They are the right surface for a post-lift
 world precisely because they are a *quantity to compare*, where the removed

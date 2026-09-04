@@ -111,16 +111,31 @@ func deriveUserspaceCapabilities(cfg *config.Config) UserspaceCapabilities {
 	//     allocated. The imported lease was HONOURED, not merely listed, which
 	//     is the whole of what persistent NAT promises a subscriber.
 	//
-	// THE KNOWN RESIDUAL IS NOT A FORWARDING HAZARD. A lease imported
-	// mid-reconcile, or one whose pool address the standby's config lacks, is
-	// refused by design (#8121) — a correct refusal, and the standby then mints
-	// its own translation rather than forwarding with semantics it cannot
-	// honour. Its operator surface is a per-batch journald line from the helper
-	// naming the refusal class, plus `show security nat source
-	// persistent-nat-table` on each node, which #8607 made non-empty — the
-	// surface the measurement above is built out of and which did not exist
-	// when this gate was written. Disarming the whole dataplane was standing in
-	// for observability that now exists.
+	// THE KNOWN RESIDUALS ARE NOT FORWARDING HAZARDS. There are two, and both
+	// mean "this particular lease did not reach the standby", never "the
+	// standby forwards with semantics it cannot honour":
+	//
+	//   1. THE SYNC WINDOW. A lease created on the active in the interval
+	//      before the next export/import cycle is not on the standby yet, so a
+	//      failover inside that window gives the flow a fresh translated
+	//      identity instead of its pinned one. That is the window every other
+	//      synced object lives in, and it is a far narrower statement than
+	//      "leases are not HA-synchronized".
+	//
+	//   2. A REFUSED IMPORT. A lease whose pool address the standby's config
+	//      lacks, whose port bit is already held, or that arrived expired, is
+	//      refused by design (#8121). Each refusal is correct — the standby
+	//      mints its own translation rather than install a duplicate or a
+	//      wrong translated identity.
+	//
+	// The operator surface for both is per-node and comparative: the per-batch
+	// journald line the helper emits naming the refusal classes (#8573 widened
+	// its trigger to include skipped_unknown_address, which is the config-
+	// divergence class and used to log nothing at all), plus `show security nat
+	// source persistent-nat-table` on each node, which #8607 made non-empty and
+	// which is the surface the measurement above is built out of. None of that
+	// existed when this gate was written; disarming the whole dataplane was
+	// standing in for observability that now exists.
 	// Firewall filters are supported in the userspace dataplane. Legacy
 	// single-rate `firewall policer` token buckets are ENFORCED as of #4514:
 	// a `then discard` policer is lowered at compile into the metered
