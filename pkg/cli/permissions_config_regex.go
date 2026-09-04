@@ -118,10 +118,27 @@ func (c *CLI) checkConfigRegex(line string) error {
 
 // checkConfigRegexWith is the store-free whole decision.
 //
-// Split out for the same reason cut 3's equivalent is: no supported path puts a
-// `deny-configuration` class into ActiveConfig until cut 6 retires #6838's
-// gate, so every branch here is unreachable through a store and would go
-// untested otherwise.
+// Split out for the same reason cut 3's equivalent is: driving the decision
+// directly is what keeps its error branches tested.
+//
+// #8597: this doc used to say "no supported path puts a `deny-configuration`
+// class into ActiveConfig until cut 6 retires #6838's gate, so every branch
+// here is unreachable through a store". That is STALE. #7172 cut 6 landed and
+// retired the #5831/#6838 admission gate — `pkg/config/compiler_tailgates.go`
+// records it in as many words — so such a config commits now AND takes effect,
+// and this path IS reachable by an ordinary operator config.
+//
+// The identical sentence in permissions_regex.go was corrected by #8289 for the
+// deny-COMMANDS half. The deny-CONFIGURATION half was not brought along, and
+// the cost was exactly what the stale rationale licensed: every cell in
+// permissions_config_regex_7172_test.go drove this function directly and NOT
+// ONE went through a store, so the wiring from ActiveConfig through the
+// session's class and edit path was untested for a deny-bypass-critical gate.
+// TestDenyConfigurationIsReachableThroughAStore_8597 closes that.
+//
+// A rationale asserting unreachability outlives the change that makes the thing
+// reachable, because nothing re-checks a comment. This is the second time the
+// same sentence has done it in this package.
 func checkConfigRegexWith(cfg *config.Config, class string, editPath []string, line string) error {
 	if class == "" {
 		return nil
