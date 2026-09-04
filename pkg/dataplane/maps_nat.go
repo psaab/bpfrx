@@ -159,7 +159,13 @@ func (m *Manager) SeedNATPortCounters() {
 	if err != nil || numCPUs <= 0 {
 		return
 	}
-	for poolID := uint32(0); poolID < 32; poolID++ {
+	// #8597 K75: the bound is the MAP's size, single-sourced. It used to be a
+	// literal 32 sitting next to a map declared with userspaceShimMaxNATPools —
+	// the same number twice, with nothing to notice if one moved. That constant
+	// mirrors MAX_NAT_POOLS in bpf/headers/xpf_common.h (the shared C/Go ABI, so
+	// widening it is a header change, not a Go one), and
+	// TestSeedNATPortCountersCoversTheWholeMap_8597 pins the agreement.
+	for poolID := uint32(0); poolID < userspaceShimMaxNATPools; poolID++ {
 		vals := make([]NATPortCounter, numCPUs)
 		// Only seed CPU 0; the CPU-interleaved formula ensures each CPU
 		// gets a distinct sequence regardless of starting offset.
