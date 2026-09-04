@@ -129,6 +129,9 @@ func (c *ctl) handleRequest(args []string) error {
 		}
 		fmt.Println(resp.Message)
 		return nil
+	case "configuration":
+		return c.handleRequestSystemConfiguration(args[2:])
+
 	case "dynamic-dns":
 		// #3276: operator force-now / check-now. `update` forces an immediate
 		// publish of all owned DDNS records; `check` re-observes and publishes
@@ -364,9 +367,33 @@ func (c *ctl) handleRequestSecurity(args []string) error {
 		return nil
 	case "wireguard":
 		return c.handleRequestSecurityWireguard(args[1:])
+	case "policies":
+		return c.handleRequestSecurityPolicies(args[1:])
 	default:
 		return fmt.Errorf("unknown request security target: %s", args[0])
 	}
+}
+
+// handleRequestSecurityPolicies implements `request security policies check`
+// over gRPC (#8597 K47).
+//
+// The verb is advertised by the SSOT command tree and implemented on the local
+// console, and this dispatcher used to answer "unknown request security target:
+// policies" — so tab-completion, served by that same tree, offered a command
+// the dispatcher then refused. It is a pure config lint with no dataplane call,
+// so the server runs it behind the `policies-check` ShowText topic and this
+// prints what comes back; the analysis AND its rendering are single-sourced in
+// pkg/policymatch, so the two surfaces cannot answer differently.
+func (c *ctl) handleRequestSecurityPolicies(args []string) error {
+	if len(args) == 0 || args[0] != "check" {
+		printRemoteTreeHelp("request security policies:", "request", "security", "policies")
+		return nil
+	}
+	if len(args) > 1 {
+		return fmt.Errorf("request security policies check does not accept "+
+			"arguments (%q)", strings.Join(args[1:], " "))
+	}
+	return c.showText("policies-check")
 }
 
 // handleRequestSecurityWireguard implements `request security wireguard
@@ -387,5 +414,49 @@ func (c *ctl) handleRequestSecurityWireguard(args []string) error {
 	}
 	fmt.Printf("Private key: %s\n", kp.PrivateKey)
 	fmt.Printf("Public key:  %s\n", kp.PublicKey)
+	return nil
+}
+
+// handleRequestSystemConfiguration implements `request system configuration
+// rescue save|delete` over gRPC (#8597 K47), mirroring pkg/cli's local handler.
+//
+// The rescue config is a store operation with a one-line result, so it goes
+// through SystemAction rather than a new RPC. The printed messages are the
+// server's and are byte-identical to the console's: an operator following a
+// runbook must see the same confirmation on either surface.
+func (c *ctl) handleRequestSystemConfiguration(args []string) error {
+	if len(args) == 0 {
+		printRemoteTreeHelp("request system configuration:", "request", "system", "configuration")
+		return nil
+	}
+	if args[0] != "rescue" {
+		return fmt.Errorf("unknown request system configuration command: %s", args[0])
+	}
+	if len(args) < 2 {
+		printRemoteTreeHelp("request system configuration rescue:",
+			"request", "system", "configuration", "rescue")
+		return nil
+	}
+	var action string
+	switch args[1] {
+	case "save":
+		action = "rescue-save"
+	case "delete":
+		action = "rescue-delete"
+	default:
+		return fmt.Errorf("unknown request system configuration rescue command: %s", args[1])
+	}
+	// A trailing token would otherwise be dropped silently, and this verb
+	// REPLACES the saved rescue config — the same reason `ipsec sa clear`
+	// refuses a selector rather than widening it.
+	if len(args) > 2 {
+		return fmt.Errorf("request system configuration rescue %s does not accept "+
+			"arguments (%q)", args[1], strings.Join(args[2:], " "))
+	}
+	resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{Action: action})
+	if err != nil {
+		return fmt.Errorf("%v", err)
+	}
+	fmt.Println(resp.Message)
 	return nil
 }

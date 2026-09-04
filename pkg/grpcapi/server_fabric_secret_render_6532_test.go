@@ -134,7 +134,7 @@ var showTextAuditTopics = []string{
 	"lldp", "lldp-neighbors",
 	"log", "login", "nat64", "nat-dest-rule-detail", "nat-nptv6",
 	"nat-source-rule-detail", "nat-static", "ntp", "persistent-nat",
-	"persistent-nat-detail", "policies-detail", "policies-hit-count",
+	"persistent-nat-detail", "policies-check", "policies-detail", "policies-hit-count",
 	"policy-options", "root-authentication", "route-all", "route-detail",
 	"route-instance", "route-map", "route-summary", "route-terse",
 	"routing-instances", "routing-instances-detail", "routing-options", "rpm",

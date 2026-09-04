@@ -1,13 +1,14 @@
-package cli
+package policymatch
 
 import (
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
 )
 
-// analyzePolicyShadowing runs a conservative shadow / redundancy pass over the
+// AnalyzePolicyShadowing runs a conservative shadow / redundancy pass over the
 // configured zone-pair policies (fable-167 C-1c, #4314), mirroring Junos
 // `request security policies check`. Within each ordered zone-pair list, an
 // earlier policy shadows a later one when it matches a SUPERSET of the later
@@ -27,7 +28,17 @@ import (
 // A finding distinguishes a pure REDUNDANT rule (same action as its shadower —
 // harmless but dead) from a SHADOWED rule whose distinct action never applies
 // (the operationally dangerous case).
-func analyzePolicyShadowing(cfg *config.Config) []string {
+//
+// IT LIVES HERE, NOT IN pkg/cli, BECAUSE TWO SURFACES RUN IT (#8597 K47). The
+// remote `cli` binary is the surface most operators actually use, and it
+// rejected `request security policies check` outright — the verb existed only
+// on the local console. pkg/grpcapi cannot import pkg/cli (pkg/cli imports
+// pkg/grpcapi), so a server-side implementation had to be either a second copy
+// of this analysis or a move. This package is where the operator-side policy
+// analysis already lives for exactly this reason: #3042 collapsed three
+// hand-written shadow matchers into one after all three diverged from the
+// runtime evaluator.
+func AnalyzePolicyShadowing(cfg *config.Config) []string {
 	if cfg == nil {
 		return nil
 	}
@@ -210,10 +221,10 @@ func policyMatchIsSuperset(a, b *config.Policy) bool {
 // An empty sub is treated as unconstrained (== "any") for safety, so it is
 // covered only when super is also "any".
 func nameSetSuperset(super, sub []string) bool {
-	if containsAny(super) {
+	if shadowNamesContainAny(super) {
 		return true
 	}
-	if len(sub) == 0 || containsAny(sub) {
+	if len(sub) == 0 || shadowNamesContainAny(sub) {
 		// sub is universal but super is not.
 		return false
 	}
@@ -229,7 +240,11 @@ func nameSetSuperset(super, sub []string) bool {
 	return true
 }
 
-func containsAny(names []string) bool {
+// shadowNamesContainAny reports whether a match-field name set includes the
+// universal "any" token. Named for the shadow analysis specifically: this
+// package already has a containsAny over IP prefixes, and the two answer
+// different questions over different types.
+func shadowNamesContainAny(names []string) bool {
 	for _, n := range names {
 		if n == "any" {
 			return true
@@ -249,4 +264,34 @@ func policyActionName(a config.PolicyAction) string {
 	default:
 		return "unknown"
 	}
+}
+
+// RenderPolicyCheck is the OPERATOR-FACING rendering of the shadow analysis,
+// single-sourced for the same reason the analysis is (#8597 K47).
+//
+// Sharing only AnalyzePolicyShadowing would leave each surface to write its own
+// header line, its own empty-result sentence and its own nil-config wording —
+// three strings that must agree for `request security policies check` to mean
+// the same thing on the console and over gRPC, with nothing to notice when one
+// of them changed. The local CLI prints this; the gRPC ShowText topic returns
+// it. TestPolicyCheckRendersIdenticallyOnBothSurfaces_8597 pins the agreement.
+//
+// A nil config is the "no active configuration" answer rather than an error:
+// asking a box with nothing committed to lint its policies has an answer, and
+// it is not a failure.
+func RenderPolicyCheck(cfg *config.Config) string {
+	if cfg == nil {
+		return "no active configuration\n"
+	}
+	findings := AnalyzePolicyShadowing(cfg)
+	if len(findings) == 0 {
+		return "Policy check complete: no shadowed or redundant policies detected.\n"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "Policy check complete: %d issue(s) detected.\n\n", len(findings))
+	for _, f := range findings {
+		b.WriteString(f)
+		b.WriteByte('\n')
+	}
+	return b.String()
 }

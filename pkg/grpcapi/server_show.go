@@ -114,6 +114,11 @@ func (s *Server) showText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 		return s.showScreenStatistics(req, cfg, &buf)
 	}
 
+	// #8597 K47: the remote `cli`'s `request security policies check`.
+	if req.Topic == "policies-check" {
+		return s.showPoliciesCheck(cfg, &buf)
+	}
+
 	if req.Topic == "screen-statistics-all" {
 		return s.showScreenStatisticsAll(cfg, &buf)
 	}

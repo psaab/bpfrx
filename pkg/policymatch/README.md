@@ -12,6 +12,27 @@ Single operator-side security-policy simulator shared by every
 Each surface is a THIN adapter: it parses/validates inputs and renders the
 verdict, then delegates the matching to `policymatch.Match`.
 
+It also holds the policy **shadow / redundancy lint** behind
+`request security policies check`, for the same reason and by the same rule:
+
+- CLI `request security policies check` (`pkg/cli` `handleRequestSecurityPolicies`)
+- gRPC `ShowText` `policies-check` topic (`pkg/grpcapi` `showPoliciesCheck`) —
+  what the REMOTE `cli` binary runs
+
+Both the analysis (`AnalyzePolicyShadowing`) and its operator-facing rendering
+(`RenderPolicyCheck`) are shared. Sharing only the analysis would leave each
+surface owning its own header line, empty-result sentence and nil-config
+wording — three strings that must agree for the command to mean the same thing
+on either surface, with nothing to notice when one of them changed.
+
+It moved here from `pkg/cli` in #8597 K47. The remote `cli` — the surface most
+operators use — rejected the verb outright (`unknown request security target:
+policies`) although the SSOT command tree advertises it and completion offers
+it, and `pkg/grpcapi` cannot import `pkg/cli` (`pkg/cli` imports
+`pkg/grpcapi`), so a server-side implementation had to be either a second copy
+of the analysis or a move. `pkg/cli/policy_check_surface_agreement_8597_test.go`
+pins that the two surfaces render identically.
+
 ## Port input validation (#3116)
 
 `Match` gates a port term on `SrcPort/DstPort > 0`, so a port of `0` means

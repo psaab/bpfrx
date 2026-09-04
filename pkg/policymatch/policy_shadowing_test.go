@@ -1,4 +1,4 @@
-package cli
+package policymatch
 
 import (
 	"strings"
@@ -43,7 +43,7 @@ func TestAnalyzePolicyShadowing(t *testing.T) {
 		},
 	}
 
-	findings := analyzePolicyShadowing(cfg)
+	findings := AnalyzePolicyShadowing(cfg)
 	joined := strings.Join(findings, "\n")
 
 	if !strings.Contains(joined, "block-web") || !strings.Contains(joined, "SHADOWED") {
@@ -108,7 +108,7 @@ func TestAnalyzePolicyShadowingExcludedLaterIsNotShadowed(t *testing.T) {
 			},
 		},
 	}
-	if findings := analyzePolicyShadowing(cfg); len(findings) != 0 {
+	if findings := AnalyzePolicyShadowing(cfg); len(findings) != 0 {
 		t.Fatalf("an excluded-sense later policy is reachable, must not shadow, got: %v", findings)
 	}
 }
@@ -131,7 +131,7 @@ func TestAnalyzePolicyShadowingGenuineStillReported(t *testing.T) {
 			},
 		},
 	}
-	findings := analyzePolicyShadowing(cfg)
+	findings := AnalyzePolicyShadowing(cfg)
 	if len(findings) != 1 || !strings.Contains(findings[0], "deny-A") || !strings.Contains(findings[0], "SHADOWED") {
 		t.Fatalf("expected genuine shadow of deny-A still reported, got: %v", findings)
 	}
@@ -164,7 +164,7 @@ func TestAnalyzePolicyShadowingScheduledEarlierIsNotShadower(t *testing.T) {
 			},
 		},
 	}
-	if findings := analyzePolicyShadowing(cfg); len(findings) != 0 {
+	if findings := AnalyzePolicyShadowing(cfg); len(findings) != 0 {
 		t.Fatalf("scheduled earlier policy must not shadow, got: %v", findings)
 	}
 }
@@ -192,7 +192,7 @@ func TestAnalyzePolicyShadowingGlobal(t *testing.T) {
 		// SHADOWED: a superset permit-any precedes this deny in the same tier.
 		gpol("g-block-web", config.PolicyDeny, []string{"http"}),
 	}
-	findings := analyzePolicyShadowing(cfg)
+	findings := AnalyzePolicyShadowing(cfg)
 	joined := strings.Join(findings, "\n")
 	if !strings.Contains(joined, "g-block-web") || !strings.Contains(joined, "SHADOWED") {
 		t.Fatalf("expected global g-block-web reported SHADOWED, got:\n%s", joined)
@@ -241,7 +241,7 @@ func TestAnalyzePolicyShadowingGlobalDisjointScopeNotShadowed(t *testing.T) {
 		// earlier trust-only permit cannot make it unreachable.
 		scoped("g-deny-untrust", config.PolicyDeny, []string{"untrust"}),
 	}
-	if findings := analyzePolicyShadowing(cfg); len(findings) != 0 {
+	if findings := AnalyzePolicyShadowing(cfg); len(findings) != 0 {
 		t.Fatalf("globals with disjoint from-zone scopes must not shadow, got: %v", findings)
 	}
 
@@ -252,7 +252,7 @@ func TestAnalyzePolicyShadowingGlobalDisjointScopeNotShadowed(t *testing.T) {
 		scopedTo("g-permit-to-untrust", config.PolicyPermit, []string{"untrust"}),
 		scopedTo("g-deny-to-dmz", config.PolicyDeny, []string{"dmz"}),
 	}
-	if findings := analyzePolicyShadowing(cfg); len(findings) != 0 {
+	if findings := AnalyzePolicyShadowing(cfg); len(findings) != 0 {
 		t.Fatalf("globals with disjoint to-zone scopes must not shadow, got: %v", findings)
 	}
 
@@ -263,7 +263,7 @@ func TestAnalyzePolicyShadowingGlobalDisjointScopeNotShadowed(t *testing.T) {
 		scopedTo("g-permit-to-any", config.PolicyPermit, nil),
 		scopedTo("g-deny-to-dmz", config.PolicyDeny, []string{"dmz"}),
 	}
-	findingsTo := analyzePolicyShadowing(cfg)
+	findingsTo := AnalyzePolicyShadowing(cfg)
 	if len(findingsTo) != 1 || !strings.Contains(findingsTo[0], "g-deny-to-dmz") || !strings.Contains(findingsTo[0], "SHADOWED") {
 		t.Fatalf("an all-zones to-zone earlier global must shadow a to-zone-dmz later global, got: %v", findingsTo)
 	}
@@ -274,7 +274,7 @@ func TestAnalyzePolicyShadowingGlobalDisjointScopeNotShadowed(t *testing.T) {
 		scoped("g-permit-trust", config.PolicyPermit, []string{"trust"}),
 		scoped("g-deny-all", config.PolicyDeny, nil),
 	}
-	if findings := analyzePolicyShadowing(cfg); len(findings) != 0 {
+	if findings := AnalyzePolicyShadowing(cfg); len(findings) != 0 {
 		t.Fatalf("an all-zones global is broader than a trust-only earlier, must not shadow, got: %v", findings)
 	}
 
@@ -284,7 +284,7 @@ func TestAnalyzePolicyShadowingGlobalDisjointScopeNotShadowed(t *testing.T) {
 		scoped("g-permit-all", config.PolicyPermit, nil),
 		scoped("g-deny-trust", config.PolicyDeny, []string{"trust"}),
 	}
-	findings := analyzePolicyShadowing(cfg)
+	findings := AnalyzePolicyShadowing(cfg)
 	if len(findings) != 1 || !strings.Contains(findings[0], "g-deny-trust") || !strings.Contains(findings[0], "SHADOWED") {
 		t.Fatalf("an all-zones earlier global must shadow a trust-only later global, got: %v", findings)
 	}
@@ -324,7 +324,7 @@ func TestAnalyzePolicyShadowingGlobalHostVsTransitNotShadowed(t *testing.T) {
 		g("g-transit-permit", config.PolicyPermit, nil),
 		g("g-host-deny", config.PolicyDeny, []string{"junos-host"}),
 	}
-	if findings := analyzePolicyShadowing(cfg); len(findings) != 0 {
+	if findings := AnalyzePolicyShadowing(cfg); len(findings) != 0 {
 		t.Fatalf("a transit global must not shadow a to-zone junos-host global, got: %v", findings)
 	}
 
@@ -334,7 +334,7 @@ func TestAnalyzePolicyShadowingGlobalHostVsTransitNotShadowed(t *testing.T) {
 		g("g-host-permit", config.PolicyPermit, []string{"junos-host"}),
 		g("g-transit-deny", config.PolicyDeny, nil),
 	}
-	if findings := analyzePolicyShadowing(cfg); len(findings) != 0 {
+	if findings := AnalyzePolicyShadowing(cfg); len(findings) != 0 {
 		t.Fatalf("a host-inbound global must not shadow a transit global, got: %v", findings)
 	}
 
@@ -359,7 +359,7 @@ func TestAnalyzePolicyShadowingGlobalHostVsTransitNotShadowed(t *testing.T) {
 		hostScoped("g-host-permit-any", config.PolicyPermit, nil),
 		hostScoped("g-host-deny-trust", config.PolicyDeny, []string{"trust"}),
 	}
-	findings := analyzePolicyShadowing(cfg)
+	findings := AnalyzePolicyShadowing(cfg)
 	if len(findings) != 1 || !strings.Contains(findings[0], "g-host-deny-trust") || !strings.Contains(findings[0], "SHADOWED") {
 		t.Fatalf("two host-inbound globals on the same path must still shadow, got: %v", findings)
 	}
@@ -399,7 +399,7 @@ func TestAnalyzePolicyShadowingGlobalExplicitAnyScopeShadows(t *testing.T) {
 		// action, so it is REDUNDANT.
 		g("g-permit-narrow", config.PolicyPermit, []string{"trust"}, []string{"untrust"}),
 	}
-	findings := analyzePolicyShadowing(cfg)
+	findings := AnalyzePolicyShadowing(cfg)
 	joined := strings.Join(findings, "\n")
 	if !strings.Contains(joined, "g-permit-narrow") || !strings.Contains(joined, "REDUNDANT") {
 		t.Fatalf("an explicit-any earlier global must make a narrower same-action later global REDUNDANT, got:\n%s", joined)

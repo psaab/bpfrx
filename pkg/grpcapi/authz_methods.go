@@ -201,6 +201,13 @@ var systemActionPermissions = map[string]config.LoginClassPermission{
 	"dhcp-renew":         config.PermControl,
 	"dynamic-dns-update": config.PermControl,
 	"dynamic-dns-check":  config.PermControl,
+	// #8597 K47: `request system configuration rescue save|delete`. Explicit
+	// rather than left to the PermMaint default, because pkg/cli charges
+	// PermControl — an absent entry would make the remote surface STRICTER
+	// than the console, which is the same parity defect in the other
+	// direction.
+	"rescue-save":   config.PermControl,
+	"rescue-delete": config.PermControl,
 }
 
 // systemActionPermission prices one SystemAction verb.
@@ -293,6 +300,13 @@ const systemActionMethodName = "SystemAction"
 // family's view tier. A key ending in ':' is a PREFIX rule (the topic is a
 // delimiter-packed parameter string); any other key is an exact topic.
 var showTextElevatedTopics = map[string]config.LoginClassPermission{
+	// #8597 K47: a `request` verb, not a `show` one. pkg/cli charges the
+	// `request` family's PermControl for `request security policies check`
+	// (it is not in requestSubcommandIsMaintenance's destructive set), so
+	// pricing it at the view tier here would make the remote surface LOOSER
+	// than the console.
+	"policies-check": config.PermControl,
+
 	"test-policy:":  config.PermControl,
 	"test-routing:": config.PermControl,
 	"test-zone:":    config.PermControl,
