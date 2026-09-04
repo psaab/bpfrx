@@ -394,6 +394,27 @@ by `engine_armed_debt_5063_test.go` (fail-on-revert: the debt case goes RED if
 `within <seconds> { trigger on N }` / `{ trigger until N }` are pinned to the
 Junos reading in `withinMatches` (`evaluate.go`):
 
+- **The window is range-checked at evaluate time, not trusted (#8597).**
+  `within` is bounded to `[config.MinEventWithinSeconds,
+  config.MaxEventWithinSeconds]` (1..86400) by
+  `validateEventOptionsWithinAST`, and that file notes the 24h ceiling is
+  also what keeps `Seconds * time.Second` inside int64 nanoseconds. The
+  gate is STRICT-only: the tolerant Load / peer-sync ingress downgrades a
+  violation to a warning and the compiler stores the raw `strconv.Atoi`
+  int — the same ingress the #3751 belt exists for. A large enough value
+  overflows the multiply and the residue can be small and POSITIVE, which
+  the #3751 `Seconds <= 0` check cannot see.
+  `withinWindow` re-checks the range against the config constants (never
+  a copied `86400`: two layers that disagree about the ceiling would be
+  the defect, not the fix) and fails CLOSED, which matters because the
+  consequence SPLITS by clause shape — an overflowing **`trigger until`**
+  clause counts 0, satisfies `0 > N` as false, and fires on EVERY event.
+  On the self-mutating surface that is an unauthorized remediation loop
+  throttled only by the 30s cooldown; the `trigger on` shape merely goes
+  dead. `pruneWindow` needs the check independently: it is not gated by
+  the PASS-1 belt, and a wrapped `maxWindow` would discard the history of
+  every event the policy watches, including its well-formed clauses'.
+
 - **`trigger on N` is EDGE-triggered** — the policy fires on the threshold
   CROSSING (the in-window count first reaching N), NOT on every event while the
   count stays at or above N. A per-`(policy, event)` latch (`policyRuntime.
