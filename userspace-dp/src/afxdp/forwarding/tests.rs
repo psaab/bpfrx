@@ -5367,53 +5367,55 @@ fn secure_tunnel_operator_deny_is_attributed_to_its_rule_6713() {
 /// returned 0. Round 10 collapsed the resolver to a single map read, so the
 /// short-circuit does not exist to bind.
 ///
-/// WHAT IT BINDS NOW, measured rather than asserted. The fixture builds the one
-/// producible state in which the two maps DISAGREE: a zoned trunk with a
-/// declared-but-unzoned unit 0, where unit 0 collapses onto the base netdev, so
-/// `ifindex_to_zone_id[90]` carries the trunk's `lan` while the ledger has no
-/// entry at all. That divergence is what makes the ONE remaining choice
-/// observable — which map the egress half reads. Point the resolver at
-/// `ifindex_to_zone_id` and this test reds with `left: 1  right: 0`.
+/// WHAT IT BINDS NOW, measured rather than asserted. The one remaining choice is
+/// WHICH MAP the egress half reads, and that is observable only in a state where
+/// the two maps DISAGREE. Point the resolver at `ifindex_to_zone_id` and this
+/// test reds with `left: 7  right: 0`.
+///
+/// RETARGETED IN #7509 — the fixture moved, the subject did not. Through #8407
+/// the diverging state was a zoned trunk with a declared-but-unzoned unit 0:
+/// `ifindex_to_zone_id[90]` carried the trunk's `lan` while the ledger had no
+/// entry. #7509 made INGRESS refuse that inheritance too, so both maps now
+/// answer 0 there and the cell could no longer tell "the egress half read the
+/// right map" from "nothing is zoned" — a green for the wrong reason.
+///
+/// The state that still diverges is two INTERFACES on one recycled ifindex that
+/// AGREE on a zone (`reused_ifindex_agreeing_zones_snapshot_7509`). Ingress
+/// admits `vpnb` because every row names it; egress refuses because
+/// `egressIdentitiesCohere` sees two independent claimants on one device and
+/// agreement between two unrelated claimants is not authorisation. Every other
+/// #6722 shape now answers the same on both halves, which is the #6727 symmetry
+/// arriving — this is the residue.
 ///
 /// Kept rather than deleted for that reason, and re-documented rather than
 /// left under its old claim: a test whose doc names a mechanism the code no
 /// longer has reads as coverage it is not providing.
 #[test]
 fn unzoned_interface_with_egress_row_stays_zone_zero_6713() {
-    let state = build_forwarding_state(&secure_tunnel_snapshot_6713(
-        TunnelPolicy6713::PermitLanToVpn,
-    ));
+    let state = build_forwarding_state(&reused_ifindex_agreeing_zones_snapshot_7509());
 
-    assert_eq!(
-        state
-            .egress
-            .get(&TRUNK_UNIT0_IFINDEX_6713)
-            .map(|iface| iface.zone_id),
-        Some(0),
-        "precondition: the shared ifindex HAS an egress row and the unzoned unit-0 \
-         row won it, so the row carries zone_id 0"
-    );
     assert_eq!(
         state
             .ifindex_to_zone_id
-            .get(&TRUNK_UNIT0_IFINDEX_6713)
+            .get(&SHARED_TUNNEL_IFINDEX_6722)
             .copied()
             .unwrap_or(0),
-        TEST_LAN_ZONE_ID,
-        "precondition: the SAME ifindex resolves the trunk's zone in \
-         ifindex_to_zone_id -- without that divergence this test cannot detect an \
-         over-firing fallback"
+        TEST_SIBLING_VPN_ZONE_ID_6722,
+        "precondition: INGRESS resolves `vpnb` for the recycled ifindex -- without \
+         that divergence this test cannot detect an over-firing fallback, because \
+         a resolver reading either map would answer 0"
     );
 
-    let (_, to_id) = zone_pair_ids_for_flow(&state, LAN_IFINDEX_6713, TRUNK_UNIT0_IFINDEX_6713);
+    let (_, to_id) =
+        zone_pair_ids_for_flow(&state, LAN_IFINDEX_6722, SHARED_TUNNEL_IFINDEX_6722);
     assert_eq!(
         to_id, 0,
         "the egress half must read `ifindex_unambiguous_zone_id`, NOT \
-         `ifindex_to_zone_id`. The latter is the INGRESS attribution map: it \
-         holds the last zoned row plus the child->parent propagation, so it \
-         carries `lan` for this ifindex while no identity on it was authored \
-         into a zone. Reading it here hands an interface a zone the operator \
-         never configured on it, which is the fail-OPEN direction"
+         `ifindex_to_zone_id`. The latter is the INGRESS attribution map, and it \
+         carries `vpnb` for this ifindex because both interfaces' rows happen to \
+         name it -- while the device itself was authorised into that zone by \
+         neither claimant alone. Reading it here hands a device a zone on the \
+         strength of a coincidence, which is the fail-OPEN direction"
     );
 }
 
@@ -5491,42 +5493,40 @@ fn adjudicate_lan_transit_6722(
 
 /// Assert the shared preconditions that make a #6722 case interesting at all:
 /// the ifindex has NO `egress` row (so the #6713 fallback is the only resolver
-/// in play) and `ifindex_to_zone_id` — what the egress half must NOT read —
-/// carries a NONZERO zone for it. Without the second half a "to-zone is 0"
-/// assertion would pass for a state that simply has no zone anywhere, i.e. it
-/// would equal the failure default.
-fn assert_ambiguous_ifindex_preconditions_6722(
-    state: &ForwardingState,
-    ifindex: i32,
-    expect_ingress_zone: u16,
-) {
+/// in play), and BOTH halves now resolve no zone for it.
+///
+/// #7509 removed the parameter this used to take. Through #8407 it said "what
+/// should INGRESS say for this cell's class", with 0 for a zoned-vs-zoned
+/// contest and the sibling's zone for a zoned-vs-UNZONED one — ingress still
+/// inherited there, on the ground that separating a sibling unit that must not
+/// inherit from a trunk parent that legitimately does needed provenance that was
+/// "not on the wire". It is on the wire: the base row's UNIT SIBLINGS on the
+/// same ifindex carry it, because `InterfaceZoneMap` fans a BARE reference DOWN
+/// onto every unit and a unit-suffixed one only UP. Every shape in this family
+/// now answers 0 on both halves, so a per-caller expectation would be a
+/// parameter with one value at every call site.
+///
+/// The non-vacuity protection that used to ride on that parameter ("to-zone 0
+/// must not be indistinguishable from an empty state") lives in the control
+/// below, and is stronger: an UNCONTESTED sibling ifindex in the SAME state must
+/// still be zoned, so a build that lost zoning entirely reds here instead of
+/// passing everywhere.
+fn assert_ambiguous_ifindex_preconditions_6722(state: &ForwardingState, ifindex: i32) {
     assert!(
         !state.egress.contains_key(&ifindex),
         "precondition: ifindex {ifindex} must have NO egress row -- without that \
          the #6713 fallback never fires and nothing here is exercised"
     );
-    // #7509: `expect_ingress_zone` now means WHAT INGRESS SHOULD SAY, so each
-    // caller states its class. 0 = the rows carry DIFFERENT zones and ingress
-    // refuses to pick, matching egress. Nonzero = the rows carry a zone and NO
-    // zone (`vpnb` vs none); ingress still inherits, because separating an
-    // unzoned SIBLING UNIT that must not inherit from an unzoned TRUNK PARENT
-    // that legitimately does needs the authored-vs-inherited fact, which is not
-    // on the wire. #7509 stays open for that case.
-    //
-    // The old `assert_ne!(expect_ingress_zone, 0)` guarded "to-zone 0 must not be
-    // indistinguishable from an empty state". 0 is now a legitimate expectation,
-    // so that protection moves to the control below, which is stronger: a
-    // sibling ifindex in the SAME state must still be zoned, so a build that
-    // lost zoning entirely reds here rather than passing everywhere.
     assert_eq!(
         state
             .ifindex_to_zone_id
             .get(&ifindex)
             .copied()
             .unwrap_or(0),
-        expect_ingress_zone,
-        "precondition: ingress zone for ifindex {ifindex} must be \
-         {expect_ingress_zone} for this cell's class (#7509)"
+        0,
+        "ifindex {ifindex} is shared by rows that do not agree about its zone, so \
+         INGRESS must refuse to attribute a zone to it too (#7509) -- not only \
+         egress"
     );
     assert_ne!(
         state
@@ -5552,14 +5552,16 @@ fn assert_ambiguous_ifindex_preconditions_6722(
 /// the sibling's zone — that applies an operator permit written for a
 /// DIFFERENT interface, forwarding out an IPsec SA the operator never
 /// authorised for this traffic.
+///
+/// #7509 note: the INGRESS half of this same shape is now bound by
+/// `shared_ifindex_ingress_and_egress_both_refuse_a_siblings_zone_7509` below.
+/// Until then this cell's precondition recorded ingress answering `vpnb` for
+/// ifindex 42 — i.e. it pinned the open half of the asymmetry as a fact about
+/// the state rather than as a defect.
 #[test]
 fn unzoned_macless_unit_does_not_inherit_a_zoned_siblings_zone_6722() {
     let state = build_forwarding_state(&sibling_tunnel_units_snapshot_6722());
-    assert_ambiguous_ifindex_preconditions_6722(
-        &state,
-        SHARED_TUNNEL_IFINDEX_6722,
-        TEST_SIBLING_VPN_ZONE_ID_6722,
-    );
+    assert_ambiguous_ifindex_preconditions_6722(&state, SHARED_TUNNEL_IFINDEX_6722);
 
     let (to_id, result) =
         adjudicate_lan_transit_6722(&state, "192.168.99.7", SHARED_TUNNEL_IFINDEX_6722);
@@ -5596,6 +5598,202 @@ fn unzoned_macless_unit_does_not_inherit_a_zoned_siblings_zone_6722() {
     );
 }
 
+/// #7509 ACCEPTANCE: the executable statement of the PAIR for the reported
+/// shared-ifindex shape — both directions, through the real
+/// `build_forwarding_state`, on the row shapes
+/// `pkg/dataplane/userspace/zone_propagation_6722_test.go` case A measures the
+/// Go builder emitting for exactly this config.
+///
+/// The reported config: `st0.1` in `vpnb`, `st0.0` deliberately in NO zone,
+/// both resolving to base ifindex 42 (`snapshotLinuxName` collapses a non-VLAN
+/// unit 0 onto its base netdev). Before this change the two halves disagreed:
+///
+/// | direction | resolved | mechanism |
+/// |---|---|---|
+/// | ingress | `vpnb` | `ifindex_to_zone_id` — the base row's INHERITED zone |
+/// | egress  | `0`    | `ifindex_unambiguous_zone_id` — the #6722 gate |
+///
+/// A packet arriving on ifindex 42 is a packet on `st0.0`. Attributing it to
+/// `vpnb` adjudicates it under the policy set the operator wrote for the tunnel
+/// unit that terminates an authorised SA — a policy BYPASS, and the exact
+/// asymmetry #6727 warned would be worse than leaving the whole thing alone.
+///
+/// WHY THE PERMIT IS IN THE FIXTURE. Without a `from-zone vpnb` rule, "ingress
+/// says vpnb" and "ingress says nothing" produce the same verdict under
+/// `deny-all`, and the cell would be a map reading rather than a statement about
+/// traffic. `sibling_tunnel_units_reverse_policy_snapshot_7509` adds
+/// `from-zone vpnb to-zone lan permit`, so the defect PERMITS and the fix DENIES.
+#[test]
+fn shared_ifindex_ingress_and_egress_both_refuse_a_siblings_zone_7509() {
+    let state = build_forwarding_state(&sibling_tunnel_units_reverse_policy_snapshot_7509());
+
+    // Precondition: the ifindex really is shared, and the zoned sibling really
+    // is on its own. Without this the cell could pass on a state where `st0.0`
+    // simply does not exist.
+    assert_eq!(
+        state
+            .ifindex_to_config_name
+            .get(&ZONED_TUNNEL_IFINDEX_6722)
+            .map(String::as_str),
+        Some("st0.1"),
+        "precondition: the zoned sibling is on its OWN ifindex 43"
+    );
+
+    // ---- the PAIR, both halves, for the shared ifindex ----
+    let (from_id, _) = zone_pair_ids_for_flow(&state, SHARED_TUNNEL_IFINDEX_6722, LAN_IFINDEX_6722);
+    assert_eq!(
+        from_id, 0,
+        "INGRESS: a packet arriving on ifindex 42 is a packet on `st0.0`, which the \
+         operator left in no zone. It must not be attributed to `st0.1`'s zone"
+    );
+    assert_ne!(
+        from_id, TEST_SIBLING_VPN_ZONE_ID_6722,
+        "specifically NOT `vpnb` -- naming the wrong value the bypass produces, so \
+         this cannot pass by resolving some other nonzero zone"
+    );
+    let (_, to_id) = zone_pair_ids_for_flow(&state, LAN_IFINDEX_6722, SHARED_TUNNEL_IFINDEX_6722);
+    assert_eq!(
+        to_id, 0,
+        "EGRESS: unchanged by #7509 -- the #6722 gate already refused. Asserted \
+         here so the PAIR is stated in one place rather than inferred from two \
+         cells that could drift apart"
+    );
+
+    // ---- the HARM, adjudicated through the real policy evaluator ----
+    let denied = crate::policy::evaluate_policy_result_with_icmp(
+        &state.policy,
+        from_id,
+        TEST_LAN_ZONE_ID,
+        "10.5.5.2".parse().expect("src"),
+        "10.0.61.102".parse().expect("dst"),
+        PROTO_TCP,
+        40000,
+        443,
+        None,
+        64,
+    );
+    assert_eq!(
+        denied.action,
+        PolicyAction::Deny,
+        "traffic in from the unzoned unit must not reach `from-zone vpnb to-zone \
+         lan permit` -- that rule was written for the tunnel unit the operator \
+         DID zone"
+    );
+    assert_eq!(
+        denied.policy_id,
+        crate::policy::DEFAULT_POLICY_SENTINEL_ID,
+        "and the verdict must come from the DEFAULT policy, not from an operator \
+         rule that happened to deny"
+    );
+
+    // ---- POSITIVE CONTROL on the accept side ----
+    // A gate that refused every ingress attribution would satisfy every
+    // assertion above. The zoned sibling on ifindex 43 must still resolve its
+    // own zone and still MATCH the operator's permit.
+    let (sibling_from, _) =
+        zone_pair_ids_for_flow(&state, ZONED_TUNNEL_IFINDEX_6722, LAN_IFINDEX_6722);
+    assert_eq!(
+        sibling_from, TEST_SIBLING_VPN_ZONE_ID_6722,
+        "control: `st0.1` owns ifindex 43 outright and must still be `vpnb`"
+    );
+    let permitted = crate::policy::evaluate_policy_result_with_icmp(
+        &state.policy,
+        sibling_from,
+        TEST_LAN_ZONE_ID,
+        "10.6.6.2".parse().expect("src"),
+        "10.0.61.102".parse().expect("dst"),
+        PROTO_TCP,
+        40000,
+        443,
+        None,
+        64,
+    );
+    assert_eq!(
+        permitted.action,
+        PolicyAction::Permit,
+        "control: the operator's `vpnb -> lan` permit must still match for the \
+         unit that IS in `vpnb`"
+    );
+    assert_ne!(
+        permitted.policy_id,
+        crate::policy::DEFAULT_POLICY_SENTINEL_ID,
+        "control: and it must be the RULE that permitted, not a permissive default"
+    );
+}
+
+/// #7509 SCOPE CONTROL, the direction the fix must NOT reach: a trunk parent
+/// whose units all have netdevs of their own still inherits (#921/#3618).
+///
+/// The refusal is scoped to a parent ifindex that carries a LOGICAL UNIT ROW of
+/// its own. That is the discriminator #6727 and #8407 both recorded as "not on
+/// the wire": a base row whose zone was AUTHORED by a bare
+/// `security-zone <z> interfaces <ifc>` reference has unit rows carrying that
+/// same zone, because `InterfaceZoneMap` fans a bare reference DOWN onto every
+/// unit; a base row whose zone was INHERITED from a unit-suffixed reference has
+/// unit siblings that do not. Provenance is not on the ROW — it is in the
+/// AGREEMENT between the row and its unit siblings on the same ifindex.
+///
+/// Here `st0` carries no unit row at all on ifindex 42 (unit 0 is absent from
+/// the config), so `st0.1`'s child->parent propagation is the only claim on it
+/// and nothing contradicts it. This is the case the propagation exists to serve,
+/// and widening the refusal to "a zoned row plus an unzoned row is a contest"
+/// would have broken it.
+#[test]
+fn a_parent_with_no_unit_row_still_inherits_its_childs_zone_7509() {
+    let mut snapshot = sibling_tunnel_units_snapshot_6722();
+    // Drop `st0.0` — the operator never configured unit 0 — and leave the base
+    // row and the zoned `st0.1` exactly as the builder emits them.
+    snapshot.interfaces.retain(|iface| iface.name != "st0.0");
+    assert!(
+        snapshot.interfaces.iter().any(|i| i.name == "st0")
+            && snapshot.interfaces.iter().any(|i| i.name == "st0.1"),
+        "precondition: the base row and the zoned unit must both survive the retain"
+    );
+    let state = build_forwarding_state(&snapshot);
+
+    assert_eq!(
+        state
+            .ifindex_to_zone_id
+            .get(&SHARED_TUNNEL_IFINDEX_6722)
+            .copied()
+            .unwrap_or(0),
+        TEST_SIBLING_VPN_ZONE_ID_6722,
+        "a parent ifindex with NO unit row of its own must keep inheriting \
+         (#921/#3618) -- #7509 refuses only where a unit row on the SAME ifindex \
+         contradicts the inheritance"
+    );
+}
+
+/// #7509 SCOPE CONTROL, the other side: a BARE base-interface zone reference
+/// still zones the shared ifindex.
+///
+/// `security-zone vpnb interfaces st0` fans DOWN onto every configured unit, so
+/// `st0.0`'s row carries `vpnb` too and agrees with the base. Over-tightening
+/// into "a base row and a unit row on one ifindex means no zone" would deny an
+/// ordinary single-unit tunnel — the #6713 deployment itself.
+#[test]
+fn a_bare_base_zone_reference_still_zones_the_shared_ifindex_7509() {
+    let state = build_forwarding_state(&unanimous_shared_ifindex_tunnel_snapshot_6722());
+    assert_eq!(
+        state
+            .ifindex_to_zone_id
+            .get(&SHARED_TUNNEL_IFINDEX_6722)
+            .copied()
+            .unwrap_or(0),
+        TEST_SIBLING_VPN_ZONE_ID_6722,
+        "the unit row AGREES with the base row, so nothing is refused"
+    );
+    let (to_id, result) =
+        adjudicate_lan_transit_6722(&state, "192.168.99.7", SHARED_TUNNEL_IFINDEX_6722);
+    assert_eq!(to_id, TEST_SIBLING_VPN_ZONE_ID_6722);
+    assert_eq!(result.action, PolicyAction::Permit);
+    assert_ne!(
+        result.policy_id,
+        crate::policy::DEFAULT_POLICY_SENTINEL_ID,
+        "and the operator's rule is what permitted it"
+    );
+}
+
 /// #6722, the alphabetical-accident shape. Two units in DIFFERENT zones on one
 /// `st0`: `buildInterfaceZoneMap`'s `out[base]` write is FIRST-write-wins over
 /// SORTED zone names, so the base row carries `vpnb` only because "vpnb" sorts
@@ -5604,15 +5802,7 @@ fn unzoned_macless_unit_does_not_inherit_a_zoned_siblings_zone_6722() {
 #[test]
 fn divergently_zoned_sibling_units_do_not_pick_a_zone_6722() {
     let state = build_forwarding_state(&divergent_zone_sibling_units_snapshot_6722());
-    assert_ambiguous_ifindex_preconditions_6722(
-        &state,
-        SHARED_TUNNEL_IFINDEX_6722,
-        // #7509: BOTH sibling units are zoned and they DISAGREE, so ingress now
-        // refuses to pick one exactly as egress already did. Was
-        // TEST_SIBLING_VPN_ZONE_ID_6722 -- the arbitrary pick this cell used to
-        // pin as its own precondition.
-        0,
-    );
+    assert_ambiguous_ifindex_preconditions_6722(&state, SHARED_TUNNEL_IFINDEX_6722);
 
     let (to_id, result) =
         adjudicate_lan_transit_6722(&state, "192.168.99.7", SHARED_TUNNEL_IFINDEX_6722);
@@ -5662,11 +5852,7 @@ fn quarantine_unzoned_base_does_not_inherit_the_surviving_childs_zone_6722() {
 
     // The propagation is REACHABLE: no row on ifindex 42 carries a zone, yet
     // `ifindex_to_zone_id` has one, and it can only have come from `st0.1`.
-    assert_ambiguous_ifindex_preconditions_6722(
-        &state,
-        SHARED_TUNNEL_IFINDEX_6722,
-        TEST_SIBLING_VPN_ZONE_ID_6722,
-    );
+    assert_ambiguous_ifindex_preconditions_6722(&state, SHARED_TUNNEL_IFINDEX_6722);
 
     let (to_id, result) =
         adjudicate_lan_transit_6722(&state, "192.168.99.7", SHARED_TUNNEL_IFINDEX_6722);

@@ -131,3 +131,121 @@ func TestCanonicalUnitRefsAreOneUnit7509(t *testing.T) {
 			differ.Warnings)
 	}
 }
+
+// sharedDeviceCfg7509 builds a config with real interface UNITS (the contested
+// helper above needs only zone refs; this half's predicate reads the units'
+// vlan-id and the interface's tunnel stanza, so those have to exist).
+func sharedDeviceCfg7509(t *testing.T, name string, tunnel bool, units map[int]int, zones map[string][]string) *Config {
+	t.Helper()
+	cfg := contestedCfg7509(t, zones)
+	cfg.Interfaces.Interfaces = map[string]*InterfaceConfig{}
+	ifc := &InterfaceConfig{Name: name, Units: map[int]*InterfaceUnit{}}
+	if tunnel {
+		ifc.Tunnel = &TunnelConfig{}
+	}
+	for num, vlan := range units {
+		ifc.Units[num] = &InterfaceUnit{Number: num, VlanID: vlan}
+	}
+	cfg.Interfaces.Interfaces[name] = ifc
+	return cfg
+}
+
+// TestSharedDeviceUnzonedUnitAdvisoryFires7509 is the fail-on-revert cell for
+// the zoned-vs-UNZONED half: unit 0 shares the trunk's kernel device and is in
+// no zone while the tagged unit is zoned, so untagged traffic stops being
+// adjudicated under the tagged unit's zone. The operator must learn that at
+// commit, not from traffic dying.
+func TestSharedDeviceUnzonedUnitAdvisoryFires7509(t *testing.T) {
+	cfg := sharedDeviceCfg7509(t, "ge-0/0/0", false,
+		map[int]int{0: 0, 100: 100},
+		map[string][]string{"lan": {"ge-0/0/0.100"}})
+	appendSharedDeviceUnzonedUnitAdvisoryLocked(cfg, compileOpts{})
+
+	got := warningsMentioning(cfg, "ge-0/0/0.0")
+	if len(got) != 1 {
+		t.Fatalf("expected exactly one advisory naming the unzoned device-sharing "+
+			"unit; got %d: %v", len(got), cfg.Warnings)
+	}
+	for _, want := range []string{"ge-0/0/0", "ge-0/0/0.0", "UNZONED", "default policy"} {
+		if !strings.Contains(got[0], want) {
+			t.Fatalf("advisory must name %q so it is actionable; got: %s", want, got[0])
+		}
+	}
+}
+
+// The reported #7509 shape itself: an interface-level tunnel whose unit 0 is
+// unzoned and whose unit 1 is zoned. EVERY unit of such a tunnel collapses onto
+// the tunnel device, so unit 0 is a device-sharing unit even though the
+// non-VLAN-unit-0 rule is not what admits it here.
+func TestSharedDeviceUnzonedTunnelUnitAdvisoryFires7509(t *testing.T) {
+	cfg := sharedDeviceCfg7509(t, "gr-0/0/0", true,
+		map[int]int{0: 0, 1: 0},
+		map[string][]string{"vpnb": {"gr-0/0/0.1"}})
+	appendSharedDeviceUnzonedUnitAdvisoryLocked(cfg, compileOpts{})
+
+	if got := warningsMentioning(cfg, "gr-0/0/0.0"); len(got) != 1 {
+		t.Fatalf("expected one advisory for the unzoned tunnel unit; got %d: %v",
+			len(got), cfg.Warnings)
+	}
+}
+
+// THE CONTROL THAT AIMS IT. A TAGGED unzoned unit has its OWN kernel device, is
+// adjudicated per unit, and is completely unaffected by the #7509 refusal.
+// Warning about it would describe a consequence that does not happen — and an
+// advisory that fires on configs nothing happened to is the noise that makes an
+// operator skip the one that matters.
+func TestTaggedUnzonedUnitIsSilent7509(t *testing.T) {
+	cfg := sharedDeviceCfg7509(t, "ge-0/0/0", false,
+		map[int]int{0: 0, 100: 100, 200: 200},
+		map[string][]string{"lan": {"ge-0/0/0.0", "ge-0/0/0.100"}})
+	appendSharedDeviceUnzonedUnitAdvisoryLocked(cfg, compileOpts{})
+
+	if len(cfg.Warnings) != 0 {
+		t.Fatalf("unit 200 is TAGGED, so it has its own device and #7509 never "+
+			"touches it: expected silence, got %v", cfg.Warnings)
+	}
+}
+
+// The other control: every unit zoned is an ordinary config and must be silent.
+// Paired with the fires-cell above, this is what shows the predicate keys on the
+// UNZONED unit rather than on "the interface has more than one unit".
+func TestFullyZonedInterfaceIsSilent7509(t *testing.T) {
+	cfg := sharedDeviceCfg7509(t, "ge-0/0/0", false,
+		map[int]int{0: 0, 100: 100},
+		map[string][]string{"lan": {"ge-0/0/0"}}) // BARE ref fans DOWN to both units
+	appendSharedDeviceUnzonedUnitAdvisoryLocked(cfg, compileOpts{})
+
+	if len(cfg.Warnings) != 0 {
+		t.Fatalf("a bare zone reference zones every unit, so nothing is refused: "+
+			"expected silence, got %v", cfg.Warnings)
+	}
+}
+
+// And the case with NO zoned unit at all: an interface entirely outside every
+// zone already fell to the default policy before #7509 and nothing changed for
+// it, so it must stay silent too.
+func TestWhollyUnzonedInterfaceIsSilent7509(t *testing.T) {
+	cfg := sharedDeviceCfg7509(t, "ge-0/0/0", false,
+		map[int]int{0: 0, 100: 100},
+		map[string][]string{"lan": {"ge-0/0/1.0"}})
+	appendSharedDeviceUnzonedUnitAdvisoryLocked(cfg, compileOpts{})
+
+	if len(cfg.Warnings) != 0 {
+		t.Fatalf("nothing on ge-0/0/0 is zoned, so #7509 changes nothing for it: "+
+			"expected silence, got %v", cfg.Warnings)
+	}
+}
+
+// Suppressed on the TOLERANT paths for the same reason as its sibling: Store.Load
+// (persisted-config boot) and Store.SyncApply (HA peer sync) would otherwise
+// replay it on every boot and every sync of a decision already made.
+func TestSharedDeviceUnzonedUnitAdvisorySuppressedOnTolerantPath7509(t *testing.T) {
+	cfg := sharedDeviceCfg7509(t, "ge-0/0/0", false,
+		map[int]int{0: 0, 100: 100},
+		map[string][]string{"lan": {"ge-0/0/0.100"}})
+	appendSharedDeviceUnzonedUnitAdvisoryLocked(cfg, compileOpts{suppressContestedTrunkZoneAdvisory: true})
+
+	if len(cfg.Warnings) != 0 {
+		t.Fatalf("tolerant path must be silent; got %v", cfg.Warnings)
+	}
+}
