@@ -481,12 +481,17 @@ else
 	fw0_proxy=$(incus exec "$FW0" -- ip neigh show proxy 2>/dev/null | grep -c "$POOL_NAT_ADDR" || true)
 	fw1_proxy=$(incus exec "$FW1" -- ip neigh show proxy 2>/dev/null | grep -c "$POOL_NAT_ADDR" || true)
 	if [[ "$fw0_proxy" -ge 1 && "$fw1_proxy" -ge 1 ]]; then
-		# The state on master today: #8314 was reverted, so both nodes answer.
-		known_gap 8297 "both nodes answer proxy-ARP for $POOL_NAT_ADDR (fw0=$fw0_proxy fw1=$fw1_proxy); the upstream sees one IP at two RETH virtual MACs" 1
+		# The #8297 defect. Was a tracked known_gap until #8646 closed it; now a
+		# plain failure, because a regression here is a regression and not a gap.
+		fail "both nodes answer proxy-ARP for $POOL_NAT_ADDR (fw0=$fw0_proxy fw1=$fw1_proxy); the upstream sees one IP at two RETH virtual MACs, which is the #8297 defect returning"
 	elif [[ "$fw0_proxy" -ge 1 && "$fw1_proxy" -eq 0 ]]; then
-		# The FIXED state. known_gap fails here on purpose: #8297 has landed and
-		# this cell owes promotion to a plain pass.
-		known_gap 8297 "only the RG owner answers proxy-ARP for $POOL_NAT_ADDR" 0
+		# PROMOTED from known_gap by #8646, which moved proxy-ARP ownership off
+		# VRRP events and onto the cluster. Measured before promoting: ten probes
+		# 6s apart on a settled cluster, fw0=1 fw1=0 on all ten. One sample was
+		# not enough — it cannot distinguish "the gate selected the owner" from
+		# "both answered and the owner's reply landed last", which is the error
+		# #8640 made on this same address.
+		pass "only the RG owner answers proxy-ARP for $POOL_NAT_ADDR"
 	else
 		# Neither the known state nor the fixed one. #8314 produced exactly this
 		# and it is strictly worse than the defect it replaced, so it stays a
