@@ -35,6 +35,8 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 # require_cluster_cell below and the protocol header in cluster-lock.sh.
 # shellcheck source=cluster-lock.sh
 source "${SCRIPT_DIR}/cluster-lock.sh"
+# shellcheck source=cluster-build-identity.sh
+source "${SCRIPT_DIR}/cluster-build-identity.sh"
 
 # Source env file for custom deployments (remote, SR-IOV config, etc.)
 if [[ -n "${BPFRX_CLUSTER_ENV:-}" && -f "$BPFRX_CLUSTER_ENV" ]]; then
@@ -664,6 +666,13 @@ cmd_deploy() {
 			all) deploy_rolling ;;
 		esac
 	fi
+
+	# This cell changed the build ON PURPOSE. Re-baseline so the cell's
+	# boundary check reports only a build that changed UNDER it — without
+	# this, every deploy cell would cry wolf and the warning would be
+	# trained away, which is the failure mode the check exists to avoid.
+	# A no-op outside a with-cluster.sh cell.
+	xpf_cluster_rebaseline_build
 }
 
 # deploy_vm_deb installs the .deb on a clustered node (STAGE-ONLY per the

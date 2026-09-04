@@ -1239,6 +1239,29 @@ they repeatedly bite:
     (`git diff <tested> <head>` → zero non-comment lines). That is luck, not
     method. Kill the cell and re-launch if you must amend, and echo the tested
     HEAD from inside the cell so the two can be compared afterwards.
+  - **The lock serialises ACCESS, not the ARTIFACT — verify the BUILD you
+    are measuring.** The bullet above is about your own tree changing under
+    a queued cell; this is its mirror image, and it bites without any
+    mistake on your part. A lane waited ~5 minutes for the lock, never
+    touched the holder, acquired cleanly, and measured a binary another
+    lane's deploy had installed moments earlier — whose subject was the
+    very code path under test. Every lock-level check said clean. The only
+    tell was a CLI banner reading `uptime: 1m46s` for a daemon it believed
+    it had deployed hours before, and the same lane had the build change
+    under it a SECOND time in a later cell. Two runs of careful,
+    plausible-looking numbers described the wrong binary.
+    `with-cluster.sh` now records the deployed `xpfd` sha per node at
+    acquire and reports a change at release (`cluster-build-identity.sh`).
+    The boundary report is ADVISORY — a cell that deploys on purpose
+    re-baselines (`xpf_cluster_rebaseline_build`, wired into
+    `cluster-setup.sh`'s deploy), and an unwired path that legitimately
+    replaces the binary must not break a working target for a diagnostic.
+    A MEASUREMENT should call `xpf_assert_cluster_build_unchanged`
+    immediately before it samples: that fails hard, and it fails on
+    "cannot tell" as well as on a change, because a measurement that
+    cannot name its subject is not evidence. `XPF_CLUSTER_BUILD_STRICT=1`
+    promotes the boundary report to fatal. Covered by
+    `make test-cluster-lock-lib` (mocked incus, no cluster).
   - Queue diagnosis: `cat /tmp/xpf-cluster.owner` +
     `fuser -v /tmp/xpf-cluster.lock`. A dead recorded pid with the
     lock still held means a child inherited the fd (pre-#1875 raw
