@@ -38,6 +38,41 @@ func (m *Manager) bootstrapNAPIQueuesAsyncLocked(reason string) {
 // events. Without at least one packet per queue, the fill ring stays
 // unconsumed and XDP_REDIRECT silently drops packets.
 //
+// THE PROBES ARE LOAD-BEARING, and that was established by measurement rather
+// than by reading (#8377). It is worth recording, because the code has three
+// things that LOOK like they would make a cold queue self-heal and the tree's
+// own history says they did not:
+//
+//   - `poll(POLLIN)` on the XSK fd from `maybe_wake_rx`
+//     (userspace-dp/src/afxdp/tx/rings.rs), on every empty RX poll;
+//   - the bind-time kick in `prime_fill_ring_offsets` / `drive_fill_prime_loop`
+//     (userspace-dp/src/afxdp/bind.rs), which always runs at least one
+//     iteration;
+//   - `SO_BUSY_POLL`, which makes those calls run `napi_busy_loop()` inline.
+//
+// `ffe0b5520` recorded "mlx5 zero-copy fill ring consumer (frC) stays at 0
+// after daemon restart despite correct XSKMAP registration. XDP_REDIRECT
+// succeeds but packets are silently dropped" WITH the poll wake already in the
+// tree, and `e0c01ac2b` then added SO_BUSY_POLL because "ndo_xsk_wakeup's ICOSQ
+// NOP mechanism FAILS when NAPI is already scheduled from other sources" — the
+// same early-outs the mlx5 driver's `mlx5e_xsk_wakeup` takes
+// (`napi_if_scheduled_mark_missed`, `MLX5E_SQ_STATE_PENDING_XSK_TX`). That
+// commit also observed the failure this file exists to prevent, on hardware:
+// "The ARP/NDP reply for the egress next-hop may hash to an XSK queue that
+// hasn't been bootstrapped yet."
+//
+// So do not delete or weaken these probes on the strength of a source reading
+// that one of the wake paths "should" cover it. Three separate readings of that
+// question have now inverted each other; the only measurement points the other
+// way, and it is the one in the commit log.
+//
+// HOW MANY PROBES (#8377). Queue selection is by RSS hash, so this is a
+// coupon-collector problem: covering n queues needs about n*(ln n + ln(1/eps))
+// draws, not the "~2x the queue count" an earlier version of this comment
+// claimed while the code sent a hard-coded 30. See napiProbeCount for the rule,
+// the measured shortfall at 8+ queues, and why the count is now derived from
+// the interface's own queue count instead of pinned.
+//
 // The probes are sent while ctrl is disabled, so only the local/control
 // boundary reaches the kernel; transit remains fail-closed.
 func (m *Manager) bootstrapNAPIQueuesLocked() {
@@ -81,21 +116,19 @@ func (m *Manager) bootstrapNAPIQueuesLocked() {
 		if target == "" {
 			continue
 		}
-		// Send multiple ICMP probes with different ICMP echo IDs to
-		// trigger NAPI on ALL NIC queues. mlx5 RSS distributes replies
-		// across queues based on hash(src, dst, proto, id). Sending
-		// ~2× the queue count with varying IDs makes it very likely
-		// that every queue sees at least one hardware RX event, which
-		// posts XSK fill ring WQEs for zero-copy packet reception.
 		targetIP := net.ParseIP(target)
 		if targetIP != nil {
 			// ICMP RSS hashes on (src, dst, proto) only — varying
 			// ICMP ID doesn't change the target queue. Use UDP probes
 			// with varying ports: mlx5 RSS hashes (src, dst, sport,
 			// dport) for UDP, distributing across all queues.
-			// Send 30 probes across port range 40000-40029.
-			for i := 0; i < 30; i++ {
-				sendUDPProbeForNAPI(linuxName, targetIP, uint16(40000+i))
+			//
+			// #8377: the count is DERIVED from the interface's RX queue
+			// count, not pinned. See napiProbeCount for the rule and for
+			// what these probes are and are not responsible for.
+			probes := napiProbeCount(userspaceRXQueueCount(linuxName))
+			for i := 0; i < probes; i++ {
+				sendUDPProbeForNAPI(linuxName, targetIP, uint16(napiProbeBasePort+i))
 				if i%6 == 5 {
 					time.Sleep(time.Millisecond)
 				}
