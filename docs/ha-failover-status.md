@@ -316,6 +316,29 @@ world precisely because they are a *quantity to compare*, where the removed
 reason string was a verdict with no gradations — it could say only "refused",
 never "behind by three leases".
 
+### What this does NOT say: pool-mode return traffic is separately broken
+
+The gate is lifted on the strength of the LEASE measurement, and that
+measurement was read from the session table and the persistent-NAT lease tables
+on both nodes — deliberately not from throughput, because pool-mode source-NAT
+return traffic on this cluster does not work at all, with or without
+`persistent-nat`.
+
+That is **#8621**, a different defect, and it is not attributable to this one:
+it reproduces with `persistent-nat` removed from the pool, while interface-mode
+SNAT from the same host to the same target got 7.44 Gbit/s at the same moment.
+Root cause is a kernel proxy-ARP arm the pool address cannot reach — `ip route
+get` for the pool address returns the egress interface itself, and all three
+arms of `arp_process`'s proxy branch are gated on the route's device differing
+from the ingress device — so the firewall never answers ARP for the pool
+address and no return frame is ever addressed to it.
+
+The distinction matters to an operator reading this section: **"HA persistent-NAT
+is supported" is a statement about lease survival across a failover, not a
+statement that pool-mode SNAT forwards end to end today.** Both are needed for
+the feature to be usable, they are independent, and only the first is what
+#8573 measured.
+
 ### What the operator sees now
 
 Nothing. The configuration commits and forwards, which is the point. The
