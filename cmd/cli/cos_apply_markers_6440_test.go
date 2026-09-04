@@ -295,8 +295,7 @@ func shellCodeLines(src string) []string {
 func TestEveryConfigCommittingSmokeUsesTheMarkerGate_6936(t *testing.T) {
 	const dir = "../../test/incus"
 	// name -> tracking issue for the known-ungated scripts.
-	exempt := map[string]string{
-	}
+	exempt := map[string]string{}
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {

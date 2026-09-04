@@ -348,10 +348,10 @@ security { nat { static { rule-set rs1 { from zone untrust;
 						"empty selection:\n  %v", tc.wantMatch, err)
 				}
 			} else if tc.wantMatch == "" {
-				t.Fatalf("a rule whose selected `match destination-address` is "+
-					"EMPTY committed clean. It lowers ExternalIP as \"\" and the "+
-					"Rust parse_nat_prefix drops the WHOLE mapping, so the "+
-					"operator authored a rule that does not exist at runtime "+
+				t.Fatalf("a rule whose selected `match destination-address` is " +
+					"EMPTY committed clean. It lowers ExternalIP as \"\" and the " +
+					"Rust parse_nat_prefix drops the WHOLE mapping, so the " +
+					"operator authored a rule that does not exist at runtime " +
 					"(#7216)")
 			}
 
