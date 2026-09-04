@@ -211,6 +211,17 @@ type Config struct {
 	// confirm record succeeds. /health returns 503 while degraded.
 	// Optional; if nil, the check and gauge are omitted.
 	ConfigPersistDegradedFn func() bool
+	// VRRPLocalPrioritiesFn returns this node's per-redundancy-group VRRP
+	// priorities (cluster.Manager.LocalPriorities), so the /vrrp handler can
+	// build the RETH instances the same way every other surface does (#8321
+	// finding 15). Without it the REST endpoint reported only the generic
+	// per-interface `vrrp-group` instances and returned an EMPTY set on a
+	// chassis cluster, where the VIPs live on RETH instances — a parity gap
+	// with the gRPC GetVRRPStatus, which has appended CollectRethInstances
+	// all along. Optional; if nil, only the generic instances are reported,
+	// which is the pre-#8321 behaviour and the right answer for a
+	// non-clustered node.
+	VRRPLocalPrioritiesFn func() map[int]int
 	// RollbackHistoryDegradedFn surfaces the configstore's
 	// rollback-history-degraded state via /health and the
 	// xpf_config_rollback_persist_degraded gauge (#3441, mirrors the
@@ -501,6 +512,8 @@ type Server struct {
 	ipsec             *ipsec.Manager
 	dhcp              *dhcp.Manager
 	vrrpMgr           *vrrp.Manager
+	// #8321 finding 15: see Config.VRRPLocalPrioritiesFn.
+	vrrpLocalPrioritiesFn func() map[int]int
 	commitFn          func(ctx context.Context, authority configstore.CommitAuthority, comment string) (*config.Config, error)
 	commitConfirmedFn func(ctx context.Context, authority configstore.CommitAuthority, minutes int) (*config.Config, error)
 	compileHealthFn   func() CompileHealthSnapshot
@@ -621,6 +634,7 @@ func NewServer(cfg Config) *Server {
 		ipsec:                                cfg.IPsec,
 		dhcp:                                 cfg.DHCP,
 		vrrpMgr:                              cfg.VRRPMgr,
+		vrrpLocalPrioritiesFn:                cfg.VRRPLocalPrioritiesFn,
 		commitFn:                             cfg.CommitFn,
 		commitConfirmedFn:                    cfg.CommitConfirmedFn,
 		compileHealthFn:                      cfg.CompileHealthFn,

@@ -1017,6 +1017,22 @@ pub(super) fn apply_lo0_filter_action(
     extra: TermMatchExtra<'_>,
     flow: Option<&SessionFlow>,
     meta: UserspaceDpMeta,
+    // #8321 (gemini-048 cohort item 1): the RESOLVED LOGICAL ingress ifindex,
+    // for the filter-log's ingress-zone attribution. `ifindex_to_zone_id` is
+    // keyed by the logical unit ifindex, with the physical parent inserted only
+    // as an INHERITED fallback that `forwarding_build::interfaces` REMOVES when
+    // the parent's units contest a zone (#7509). Reading the raw physical
+    // `meta.ingress_ifindex` here therefore attributed a VLAN host-bound packet
+    // to the parent's zone, or to zone 0 when the parent entry had been removed
+    // — a wrong `source-zone-name` on the RT_FLOW record, or an empty one.
+    //
+    // The wrapper `host_inbound_gated_lo0_action` already holds this value and
+    // already documents why the physical one is wrong (#3609, for the
+    // host-inbound override map keyed the same way); it simply was not threaded
+    // this far. The three sibling sites in this file
+    // (`evaluate_non_pbr_input_filter`, `..._log_only`, `..._counters_cached`)
+    // all resolve it before calling `filter_log_ingress_zone_id`.
+    logical_ingress_ifindex: i32,
     ingress_zone_override: Option<u16>,
     // #5857: poll-iteration monotonic timestamp — threaded so the lo0 filter
     // METERS each matched term's three-color policer (control-plane rate limit).
@@ -1067,7 +1083,7 @@ pub(super) fn apply_lo0_filter_action(
             forwarding,
             meta,
             ingress_zone_override,
-            meta.ingress_ifindex as i32,
+            logical_ingress_ifindex,
         ),
         egress_zone_id: 0,
         filter_id: log_match.filter_id,
@@ -1160,6 +1176,9 @@ pub(super) fn host_inbound_gated_lo0_action(
         extra,
         Some(flow),
         meta,
+        // #8321: the same resolved logical ifindex the host-inbound gate above
+        // uses — the filter-log's zone attribution reads the same map family.
+        logical_ingress_ifindex,
         lo0_ingress_zone_override,
         now_ns,
     ))
@@ -1392,6 +1411,138 @@ mod lo0_gate_tests {
             lo0_term_packets(&fw),
             0,
             "lo0 filter must NOT run when the logical override denies (#3609)",
+        );
+    }
+
+    /// #8321 (gemini-review-048 grouped-cohort item 1): the lo0 filter-log's
+    /// ingress-zone attribution must use the RESOLVED LOGICAL ingress ifindex,
+    /// not the raw physical bind port.
+    ///
+    /// `ifindex_to_zone_id` is keyed by the logical unit ifindex
+    /// (`forwarding_build::interfaces`), with the physical parent inserted only
+    /// as an INHERITED fallback that is REMOVED when the parent's units contest
+    /// a zone (#7509). So on a VLAN sub-interface a physical lookup answered
+    /// with the PARENT's zone — a different, wrong zone name on the RT_FLOW
+    /// record — or with 0 when the parent entry had been dropped.
+    ///
+    /// The wrapper already held the resolved value and already documented why
+    /// the physical one is wrong (#3609, for the host-inbound override map keyed
+    /// the same way). It simply was not threaded as far as the log. The three
+    /// sibling sites in this file all resolve it; this one did not, and an
+    /// asymmetry against three siblings is what made this decidable without
+    /// running traffic.
+    ///
+    /// Consequence is LOG-ONLY, established by reading the consumer:
+    /// `ingress_zone_id` is written into `PendingFilterLog` and read at exactly
+    /// one place, which passes it to `emit_filter_log_event`. No enforcement
+    /// path consumes it.
+    #[test]
+    fn lo0_filter_log_zone_uses_the_logical_vlan_ifindex_8321() {
+        const PHYS_IFINDEX: u32 = 11;
+        const LOGICAL_IFINDEX: i32 = 3011;
+        const PARENT_ZONE: u16 = 7;
+        const UNIT_ZONE: u16 = 9;
+
+        // A lo0 filter whose term LOGS, so a PendingFilterLog is produced at
+        // all. The shared `forwarding_with_lo0_reject` fixture counts but does
+        // not log, so a cell built on it could never see this field.
+        let logging_lo0 = || {
+            let mut fw = ForwardingState::default();
+            fw.filter_state = crate::filter::parse_filter_state(
+                &[crate::FirewallFilterSnapshot {
+                    name: "protect-re".into(),
+                    family: "inet".into(),
+                    terms: vec![crate::FirewallTermSnapshot {
+                        name: "log-web".into(),
+                        protocols: vec!["tcp".into()],
+                        destination_ports: vec!["443".into()],
+                        action: "accept".into(),
+                        log: true,
+                        ..Default::default()
+                    }],
+                }],
+                &[],
+                &[],
+                "protect-re",
+                "",
+            )
+            .expect("filter state compiles");
+            // Both zones must be NAMED or `filter_log_ingress_zone_id` skips the
+            // arm that resolved them and falls through to 0, which would make
+            // the assertions below pass or fail for the wrong reason.
+            fw.zone_id_to_name.insert(PARENT_ZONE, "parent-zone".into());
+            fw.zone_id_to_name.insert(UNIT_ZONE, "unit-zone".into());
+            fw
+        };
+
+        let zone_of = |fw: &ForwardingState| -> u16 {
+            let (flow, mut meta) = tcp_443_flow_and_meta();
+            meta.ingress_ifindex = PHYS_IFINDEX;
+            // Driven through the WRAPPER, not `apply_lo0_filter_action`
+            // directly. That is load-bearing: the wrapper is what HOLDS the
+            // resolved logical ifindex, and a cell calling the callee with a
+            // hand-supplied value stays green when the wrapper stops threading
+            // it — measured, that mutation escaped the first draft of this cell.
+            let (_action, pending) = host_inbound_gated_lo0_action(
+                fw,
+                LOGICAL_IFINDEX,
+                ADMIT_ZONE,
+                443,
+                false,
+                0,
+                extra(),
+                &flow,
+                meta,
+                // No override: this is the session-MISS / flowless shape, where
+                // the override is the fabric-MAC stamp and is None for all
+                // non-fabric traffic. With an override present the fallback
+                // arms never decide anything.
+                None,
+                0,
+            )
+            .expect("ADMIT_ZONE is absent from zone_host_inbound (admit-all), so the \
+                     host-inbound gate must admit and the lo0 filter must run");
+            pending
+                .expect("the logging lo0 term must produce a filter-log record")
+                .ingress_zone_id
+        };
+
+        // SUBJECT: the logical unit and its physical parent are in DIFFERENT
+        // zones, which is exactly what a VLAN trunk carrying units in separate
+        // zones looks like.
+        let mut fw = logging_lo0();
+        fw.ifindex_to_zone_id.insert(LOGICAL_IFINDEX, UNIT_ZONE);
+        fw.ifindex_to_zone_id.insert(PHYS_IFINDEX as i32, PARENT_ZONE);
+        assert_eq!(
+            zone_of(&fw),
+            UNIT_ZONE,
+            "#8321: the lo0 filter-log must attribute a VLAN host-bound packet to the \
+             LOGICAL unit's zone. Reading the raw physical bind port names the parent's \
+             zone instead, so the RT_FLOW record's source-zone-name is a real zone that \
+             the packet did not arrive on — wrong rather than missing, which is worse for \
+             anyone reading logs to reconstruct a flow.",
+        );
+
+        // CONTROL 1: with NO logical entry the physical fallback must still
+        // answer. That arm is deliberate (#921/#3618 child->parent inheritance)
+        // and a fix that simply DELETED it would satisfy the subject above while
+        // silently zeroing the zone on every untagged port.
+        let mut fw = logging_lo0();
+        fw.ifindex_to_zone_id.insert(PHYS_IFINDEX as i32, PARENT_ZONE);
+        assert_eq!(
+            zone_of(&fw),
+            PARENT_ZONE,
+            "#8321 control: with no logical-unit entry the inherited physical-parent \
+             mapping must still resolve the zone",
+        );
+
+        // CONTROL 2: neither mapping present resolves to 0, the documented
+        // "unknown" value. Without this the two arms above could both be
+        // explained by a resolver that returns whatever it last saw.
+        assert_eq!(
+            zone_of(&logging_lo0()),
+            0,
+            "#8321 control: an unresolvable ingress interface must attribute zone 0",
         );
     }
 
