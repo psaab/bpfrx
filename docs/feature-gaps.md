@@ -1140,7 +1140,23 @@ evidence, not as active eBPF source-removal blockers.
   interface -- broader than Junos `proxy-arp`, which proxies only the listed
   addresses. This is operator-opted-in (they configured proxy-arp on the
   interface) but matters on a WAN/untrust interface. Per-address narrowing
-  (#2197 item 3) is **PLAN-DEFER / lab-pending**.
+  (#2197 item 3) is **DONE in #8637**: the v4 `proxy_arp` sysctl is no longer
+  enabled (and is actively driven to 0, so the over-answer does not survive an
+  upgrade on boxes an older build already set it on). `proxy_ndp` is kept — see
+  below.
+- **#8637: the v4 sysctl's original justification was false too.** #2160 added
+  it, reporting that with `proxy_arp=0` the firewall would not answer for a
+  proxy-ARP'd static-NAT external address. Its own example is
+  `proxy-arp ge-0/0/1 address 10.0.2.50/32` on an interface carrying
+  `10.0.2.10/24` — the address is inside that interface's OWN connected subnet,
+  so `rt->dst.dev == dev`, and `arp_fwd_proxy` returns 0 on its first line
+  BEFORE reading the sysctl. **Setting it cannot have answered #2160's ARP.**
+  That case was genuinely fixed only by #8621's userspace responder.
+  Measured on the loss userspace cluster, with the pneigh entry installed
+  manually so the #8621 responder could not confound the reading: a
+  different-device target with an entry answers with `proxy_arp=0`; a
+  different-device target with NO entry answers only with `proxy_arp=1`. The
+  sysctl's sole distinct contribution was that second row — the over-answer.
 - **#8621 correction to the deferral's stated reason.** That deferral records
   "the sysctl is load-bearing for the same-L2 #2160 case, so dropping it would
   re-break that case". Measured, the sysctl does NOTHING for the same-L2 case:

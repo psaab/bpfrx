@@ -71,10 +71,16 @@ func TestReconcileProxyARP_LinkResolutionFallbackKeepsEnabledEntry(t *testing.T)
 
 			var wrote []string
 			prevSysctl := proxyARPSysctlSeam
-			proxyARPSysctlSeam = func(iface string, _ int, enable bool) error {
-				if enable {
-					wrote = append(wrote, iface)
-				}
+			// #8637: record EVERY write, not only enables. This cell's subject is
+			// that the fallback RE-ASSERTS the sysctl for a still-configured
+			// interface rather than merely preserving the inventory entry — the
+			// interface must be WRITTEN. Which value it is written to is a
+			// different question, now answered by proxyResponderSysctlEnabledFor
+			// (v4 goes to 0, v6 to 1) and pinned by the #8637 cells. Filtering on
+			// `enable` here conflated the two, so this went red on a change that
+			// left its own property intact.
+			proxyARPSysctlSeam = func(iface string, _ int, _ bool) error {
+				wrote = append(wrote, iface)
 				return nil
 			}
 			t.Cleanup(func() { proxyARPSysctlSeam = prevSysctl })
