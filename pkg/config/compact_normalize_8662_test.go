@@ -20,12 +20,28 @@ func compileBothSpellings8662(t *testing.T, braced, elided string) (*Config, *Co
 	return b, e
 }
 
-// A brace-elided IS-IS authentication-key must reach AuthKey, which
-// pkg/frr/protocols_render.go renders as `area-password md5` /
-// `domain-password md5`. Before this change the elided spelling compiled to an
-// empty AuthKey, so the commit succeeded and the adjacency came up
-// UNAUTHENTICATED.
-func TestElidedAuthenticationKeyReachesTheRenderedField8662(t *testing.T) {
+// A brace-elided IS-IS authentication-key must reach AuthKey. Before this
+// change the elided spelling compiled to an empty AuthKey on a commit that
+// reported success.
+//
+// WHAT THIS CELL OBSERVES, said explicitly because its previous name and
+// comment claimed more. It reads the COMPILED FIELD, `Protocols.ISIS.AuthKey`,
+// and nothing downstream of it. The consequence I originally wrote here — "FRR
+// renders no area-password, so the adjacency comes up unauthenticated" — is
+// evidence I checked by reading pkg/frr/protocols_render.go, NOT something this
+// assertion can see. It was named ...ReachesTheRenderedField, which is exactly
+// the claim it cannot make.
+//
+// That distinction has teeth: if the renderer stopped emitting AuthKey
+// tomorrow, this cell would stay green while the sentence in its comment became
+// false, and nothing would say so. The rendering half is asserted where it can
+// be — pkg/frr's own tests cover `area-password <alg> <key>` emission — and
+// this cell is the config half.
+//
+// The general form, which cost the team two corrections today: a guard that
+// names a MECHANISM while observing only an OUTCOME passes for the wrong reason
+// the moment that mechanism moves.
+func TestElidedAuthenticationKeyReachesTheCompiledField8662(t *testing.T) {
 	b, e := compileBothSpellings8662(t,
 		"protocols { isis { authentication-key secretkey1; } }",
 		"protocols { isis authentication-key secretkey1; }")
@@ -40,16 +56,20 @@ func TestElidedAuthenticationKeyReachesTheRenderedField8662(t *testing.T) {
 			"demonstrates the field being read", b.Protocols.ISIS.AuthKey.Reveal())
 	}
 	if got := e.Protocols.ISIS.AuthKey.Reveal(); got != "secretkey1" {
-		t.Errorf("the brace-elided authentication-key compiled to %q, so FRR renders no "+
-			"area-password and the IS-IS adjacency is UNAUTHENTICATED on a commit that "+
-			"reported success (#8662)", got)
+		t.Errorf("the brace-elided authentication-key compiled to %q, not the configured key, "+
+			"on a commit that reported success. The key therefore never reaches the FRR "+
+			"renderer — asserted in pkg/frr, not here — and the adjacency authenticates with "+
+			"nothing (#8662)", got)
 	}
 }
 
-// A brace-elided NAT rule match criterion must reach Match.SourceAddresses,
-// which pkg/dataplane/compiler_nat.go reads. A dropped criterion silently
-// changes what the rule matches.
-func TestElidedNATMatchReachesTheDataplaneField8662(t *testing.T) {
+// A brace-elided NAT rule match criterion must reach Match.SourceAddresses.
+//
+// Same observation boundary as the cell above: this reads the COMPILED FIELD.
+// That pkg/dataplane/compiler_nat.go consumes it is evidence I checked by
+// reading that file, not something asserted here — so the cell was renamed off
+// "...ReachesTheDataplaneField", which claimed an observation it does not make.
+func TestElidedNATMatchReachesTheCompiledField8662(t *testing.T) {
 	const braced = `security { nat { source { rule-set rs1 { rule r1 { match { source-address 10.0.0.0/8; } then { source-nat interface; } } } } } }`
 	const elided = `security { nat { source { rule-set rs1 { rule r1 { match source-address 10.0.0.0/8; then { source-nat interface; } } } } } }`
 	b, e := compileBothSpellings8662(t, braced, elided)
