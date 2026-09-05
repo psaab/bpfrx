@@ -50,24 +50,29 @@ func validateFilterCrossFamilyDSCPWarnings(cfg *Config) []string {
 				continue
 			}
 			for _, term := range f.Terms {
-				if term == nil || len(term.CrossFamilyDSCPSpelling) == 0 {
+				if term == nil || len(term.CrossFamilyMatchSpellings) == 0 {
 					continue
 				}
-				want := "dscp"
-				if family == "inet6" {
-					want = "traffic-class"
-				}
 				seen := map[string]bool{}
-				for _, spelling := range term.CrossFamilyDSCPSpelling {
+				for _, spelling := range term.CrossFamilyMatchSpellings {
 					if seen[spelling] {
 						continue
 					}
 					seen[spelling] = true
+					// Each spelling names its OWN counterpart. Deriving `want`
+					// from the family alone was correct while this list held
+					// only dscp/traffic-class, and became wrong the moment
+					// protocol/next-header joined it (#8781): a field-specific
+					// answer computed from a field-independent input.
+					want, ok := crossFamilyCounterpart[spelling]
+					if !ok {
+						continue
+					}
 					out = append(out, fmt.Sprintf(
 						"firewall family %s filter %q term %q matches `%s`, which is the "+
 							"%s spelling of this field; Junos spells it `%s` here. The "+
-							"match IS applied (both name the same six bits), but the "+
-							"configuration will not load on Junos as written (#8773)",
+							"match IS applied (both name the same thing), but the "+
+							"configuration will not load on Junos as written (#8773/#8781)",
 						family, name, term.Name, spelling, otherFamilyLabel(family), want))
 				}
 			}
@@ -76,6 +81,17 @@ func validateFilterCrossFamilyDSCPWarnings(cfg *Config) []string {
 	report("inet", cfg.Firewall.FiltersInet)
 	report("inet6", cfg.Firewall.FiltersInet6)
 	return out
+}
+
+// crossFamilyCounterpart maps a spelling to the one Junos uses in the OTHER
+// address family. Both directions are listed explicitly rather than derived,
+// so adding a third aliased field is a visible edit here rather than a silent
+// gap in a warning nobody reads.
+var crossFamilyCounterpart = map[string]string{
+	"traffic-class": "dscp",
+	"dscp":          "traffic-class",
+	"next-header":   "protocol",
+	"protocol":      "next-header",
 }
 
 func otherFamilyLabel(family string) string {

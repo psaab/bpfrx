@@ -1499,20 +1499,25 @@ type FirewallFilterTerm struct {
 	// field the snapshot builder emits and the Rust matcher evaluates).
 	UnknownFrom []string
 
-	// CrossFamilyDSCPSpelling records a `from` match written with the OTHER
-	// address family's spelling of the DSCP/Traffic-Class field: `traffic-class`
-	// inside a `family inet` filter, or `dscp` inside `family inet6`. Junos
-	// spells the field `dscp` for IPv4 and `traffic-class` for IPv6; they are
-	// the same six bits in different headers, so xpf compiles either into
-	// term.DSCPs rather than refusing a configuration that commits today.
+	// CrossFamilyMatchSpellings records `from` match leaves written with the
+	// OTHER address family's spelling of a field that both families carry:
 	//
-	// It is recorded because accepting it silently is the half of #8773 that a
-	// spelling-alignment fix would otherwise leave in place: before this, the
-	// BRACED spelling accepted the cross-family criterion while the PACKED
-	// spelling dropped it without a word, and making them agree on `accept`
-	// without saying so would trade one silent behaviour for another.
-	// Read by validateFilterCrossFamilyDSCPWarnings (advisory at commit).
-	CrossFamilyDSCPSpelling []string
+	//	dscp <-> traffic-class     the same six bits (IPv4 DSCP / IPv6 Traffic Class)
+	//	protocol <-> next-header   the same L4 protocol selector
+	//
+	// Junos spells each per family; xpf compiles either into the same typed
+	// field rather than refusing a configuration that commits today.
+	//
+	// It is recorded because accepting it silently is the half of #8773/#8781 a
+	// spelling-alignment fix would otherwise leave in place: the BRACED spelling
+	// accepted these while the PACKED spelling dropped them without a word, and
+	// making the two agree on `accept` without saying so would trade one silent
+	// behaviour for another. Read by validateFilterCrossFamilyDSCPWarnings.
+	//
+	// #8781 widened this from DSCP-only. The name lost its `DSCP` because a
+	// second field joined it; a DSCP-specific name on a list holding protocol
+	// spellings is the kind of stale label that later gets reasoned from.
+	CrossFamilyMatchSpellings []string
 }
 
 // FlexMatchConfig defines a flexible byte-offset match condition.

@@ -989,7 +989,7 @@ func compileFilterFrom(node *Node, term *FirewallFilterTerm, family string) {
 			// instead of accepting it silently.
 			if (family == "inet" && child.Name() == "traffic-class") ||
 				(family == "inet6" && child.Name() == "dscp") {
-				term.CrossFamilyDSCPSpelling = append(term.CrossFamilyDSCPSpelling, child.Name())
+				term.CrossFamilyMatchSpellings = append(term.CrossFamilyMatchSpellings, child.Name())
 			}
 		case "protocol", "next-header":
 			// `next-header` is the IPv6 spelling of `protocol` (Junos family
@@ -999,6 +999,15 @@ func compileFilterFrom(node *Node, term *FirewallFilterTerm, family string) {
 			// #3307 it had no switch case and was silently dropped (the term lost
 			// its protocol constraint); routing it to Protocols enforces it.
 			term.Protocols = append(term.Protocols, firewallMatchValues(child)...)
+			// #8781: Junos spells this `protocol` under family inet and
+			// `next-header` under family inet6. Like the dscp/traffic-class arm
+			// above, this one is deliberately family-blind — they select the
+			// same L4 protocol — but the cross-family spelling is recorded so
+			// the commit names it instead of accepting it silently.
+			if (family == "inet" && child.Name() == "next-header") ||
+				(family == "inet6" && child.Name() == "protocol") {
+				term.CrossFamilyMatchSpellings = append(term.CrossFamilyMatchSpellings, child.Name())
+			}
 		case "source-address":
 			// Multi-value (#2419/#2545): a bracket/flat-set list collapses
 			// onto child.Keys[1:] (firewallMatchValues), a hierarchical

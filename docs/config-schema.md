@@ -61,6 +61,24 @@ completion change.** If a compiler switch arm names a keyword, the schema has to
 declare it everywhere that arm can run, or the packed spelling of that keyword is
 quietly inert.
 
+**#8781 is the same defect found by CENSUS rather than by observation**, which is
+the cheaper way to find the rest of a class: enumerate the keywords each compiler
+switch arm handles, and check whether the schema declares each at that path.
+`from next-header` — the Junos spelling of the protocol match in a `family inet6`
+filter, handled by the compiler since #3307 — was never declared, so a correctly
+authored IPv6 term written in the packed spelling lost its protocol match and
+matched EVERY protocol. #3307 fixed the compiler arm; without the schema
+declaration the packed half stayed inert for two years.
+
+Two things that census taught, worth keeping:
+
+- **A candidate is not a finding.** `then next` was undeclared too, and measured
+  clean: both spellings leave `Action` empty, so they agree — by both being
+  wrong, which is a different defect and not this one.
+- **Enumerate the arms from the SOURCE, not from memory.** A hand-written list of
+  the `then` arms included `sample` and `port-mirror`, which are not compiler
+  arms at all, and reported both as defects.
+
 Two further instances were fixed this way (#6818, #6822), both failing in the
 security-relevant direction with **zero warnings on the strict commit path**:
 
