@@ -99,24 +99,10 @@
 # skipped (no two distinct synthesizable values): 7
 # skipped (under groups (schema re-host, duplicate coverage)): 806
 #
-applications application	empty
-applications application xpfarg alg	empty
-applications application xpfarg description	empty
-applications application xpfarg destination-port	empty
-applications application xpfarg icmp-code	empty
-applications application xpfarg icmp-type	empty
-applications application xpfarg inactivity-timeout	empty
-applications application xpfarg protocol	empty
-applications application xpfarg source-port	empty
-applications application xpfarg term	empty
-applications application xpfarg timeout	empty
-applications application-set	empty
 bridge-domains xpfname domain-type	partial
 bridge-domains xpfname routing-interface	partial
 chassis device-map interface	empty
 chassis device-map unmapped-interface-policy	empty
-event-options policy	empty
-event-options policy xpfarg within	empty
 interfaces xpfname description	partial
 interfaces xpfname duplex	partial
 interfaces xpfname encapsulation	partial
@@ -254,22 +240,6 @@ security policies from-zone xpfarg xpfarg xpfarg policy	empty
 security screen ids-option	empty
 security screen ids-option xpfarg limit-session destination-ip-based	empty
 security screen ids-option xpfarg limit-session source-ip-based	empty
-services flow-monitoring version-ipfix template	empty
-services flow-monitoring version-ipfix template xpfarg flow-active-timeout	empty
-services flow-monitoring version-ipfix template xpfarg flow-inactive-timeout	empty
-services flow-monitoring version-ipfix template xpfarg template-refresh-rate seconds	empty
-services flow-monitoring version9 template	empty
-services flow-monitoring version9 template xpfarg flow-active-timeout	empty
-services flow-monitoring version9 template xpfarg flow-inactive-timeout	empty
-services flow-monitoring version9 template xpfarg template-refresh-rate seconds	empty
-services rpm probe	empty
-snmp community	empty
-snmp community xpfarg clients	empty
-snmp trap-group	empty
-snmp trap-group xpfarg categories	empty
-snmp trap-group xpfarg targets	empty
-snmp trap-group xpfarg version	empty
-snmp v3 usm local-engine user	empty
 system dataplane control-socket	empty
 system domain-name	empty
 system login class	partial

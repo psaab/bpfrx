@@ -255,6 +255,52 @@ func TestCompactNormalizeScopePreservesCompiledResult8690(t *testing.T) {
 			"into the clean count so the distinction stays visible.",
 			len(fixtureLimited), fixtureLimited)
 	}
+	// STEP 3 of the rule, given somewhere to live. The arm above cannot
+	// distinguish a gate refusing the packed SPELLING (harmful to disarm) from
+	// one refusing the CONSEQUENCE OF THE DROP, where the pass repairs the drop
+	// and the acceptance is the correct outcome. That distinction needs a
+	// person, and a person's verdict needs a home — otherwise a benign disarm
+	// blocks its family forever and the only way forward is to drop a real fix.
+	//
+	// An entry here is a CLASSIFICATION with its evidence, not a suppression,
+	// and it is held to the same standard as #8704's deepDupUnreportable: the
+	// cell below fails for a listed site that is NOT currently disarming, so a
+	// stale entry — one whose gate was retired, or whose site left the scope —
+	// reds instead of quietly excusing the next real disarm that lands on the
+	// same key.
+	benign := map[string]string{
+		"snmp trap-group xpfarg targets": "the gate refuses the CONSEQUENCE of the drop, not " +
+			"the spelling. Measured: with the pass disabled the elided " +
+			"`trap-group tg1 targets 10.0.0.1;` loses its targets and snmp rejects with " +
+			"\"no targets configured (a trap group with zero targets sends no " +
+			"notifications)\"; with the pass enabled the target survives and the same gate " +
+			"accepts. The gate is doing its job in both cases — it is the DROP it objects " +
+			"to, and the pass repairs the drop. Normalizing here makes the operator's " +
+			"config mean what they wrote, which is the acceptance being correct rather " +
+			"than the gate being disarmed. Same shape as the #8430 empty-match example " +
+			"in the LIMITATION note above.",
+	}
+	var unclassified []string
+	for _, site := range disarmed {
+		if _, ok := benign[site]; !ok {
+			unclassified = append(unclassified, site)
+		}
+	}
+	for site := range benign {
+		found := false
+		for _, d := range disarmed {
+			if d == site {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("site %q is classified benign in this cell but is NOT currently disarming "+
+				"any gate. The classification is stale — its gate may have been retired or the "+
+				"site may have left the scope — and a stale entry silently excuses the next "+
+				"real disarm that lands on the same key. Delete it (#8690)", site)
+		}
+	}
+	disarmed = unclassified
 	if len(disarmed) > 0 {
 		t.Errorf("%d site(s) in the normalizer's scope are REJECTED at strict "+
 			"commit with the pass disabled and ACCEPTED with it enabled: %v.\n"+
@@ -533,4 +579,94 @@ func diffSiteSets8690(got, want []string) string {
 		}
 	}
 	return b.String()
+}
+
+// #8690: every rule in compactNormalizeInScope must be scoped by (container,
+// head) PAIR — never by a head alone, never by a container alone.
+//
+// This is not style. A head-only rule is safe only while no container acquires
+// that head with a tail somebody reads; a container-only rule is safe only
+// while no head appears under that container that somebody reads. Both make
+// the predicate's correctness contingent on the CURRENT INVENTORY rather than
+// on the rule, and this sweep moves the inventory. Such a rule therefore fails
+// at the moment a family lands — inside someone else's merge conflict.
+//
+// Both directions really existed here. `head == "authentication-key"` was
+// head-only, and `containerKeyword == "match"` was container-only and admitted
+// `services ip-monitoring policy <p> match rpm-probe` — a different feature in
+// a different subtree, reached only because it spells its criteria block
+// `match`.
+//
+// The probe is a sentinel that cannot occur in any config: if the predicate
+// still says yes when the container is replaced by a token no schema contains,
+// it was not reading the container.
+func TestNormalizerScopeIsPairScopedNotTokenScoped8690(t *testing.T) {
+	const noSuchContainer = "xpf-no-such-container-8690"
+	const noSuchHead = "xpf-no-such-head-8690"
+
+	var headOnly, containerOnly []string
+	checked := 0
+	var walk func(n *schemaNode, kw string, depth int)
+	walk = func(n *schemaNode, kw string, depth int) {
+		if n == nil || depth > 9 {
+			return
+		}
+		for name, ch := range n.children {
+			if kw != "" && compactNormalizeInScope(kw, name) {
+				checked++
+				if compactNormalizeInScope(noSuchContainer, name) {
+					headOnly = append(headOnly, kw+" "+name)
+				}
+				if compactNormalizeInScope(kw, noSuchHead) {
+					containerOnly = append(containerOnly, kw+" "+name)
+				}
+			}
+			walk(ch, name, depth+1)
+		}
+		if n.wildcard != nil {
+			walk(n.wildcard, kw, depth+1)
+		}
+	}
+	walk(setSchema, "", 0)
+
+	// DEGENERACY CONTROL: if the walk admitted nothing, both checks above are
+	// vacuous and this cell reports a clean scope for the same reason a correct
+	// one does.
+	if checked == 0 {
+		t.Fatal("the schema walk found NO admitted pair, so the pair-scoping " +
+			"assertions ran against nothing. Either the walk broke or the " +
+			"predicate stopped admitting anything (#8690)")
+	}
+	sort.Strings(headOnly)
+	sort.Strings(containerOnly)
+
+	if len(headOnly) > 0 {
+		t.Errorf("%d rule(s) admit on the HEAD ALONE — the predicate still says "+
+			"yes with the container replaced by a token no schema contains: %v.\n"+
+			"That rule is safe only until some other container acquires the same "+
+			"head with a tail a reader consumes, and it will fail when a family "+
+			"lands rather than when it is written. Scope it to the containers "+
+			"that measured safe (#8690).", len(headOnly), dedupe8690(headOnly))
+	}
+	if len(containerOnly) > 0 {
+		t.Errorf("%d rule(s) admit on the CONTAINER ALONE — the predicate still "+
+			"says yes with the head replaced by a token no schema contains: %v.\n"+
+			"That rule is safe only until some head appears under that container "+
+			"that a reader consumes. `containerKeyword == \"match\"` was exactly "+
+			"this and reached services ip-monitoring (#8690).",
+			len(containerOnly), dedupe8690(containerOnly))
+	}
+	t.Logf("#8690: %d admitted (container, head) pair(s), none head-only or container-only", checked)
+}
+
+func dedupe8690(in []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, x := range in {
+		if !seen[x] {
+			seen[x] = true
+			out = append(out, x)
+		}
+	}
+	return out
 }

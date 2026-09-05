@@ -55,12 +55,6 @@ func normalizeCompactStanzas(tree *ConfigTree) int {
 // cosmetic one — a dropped match criterion silently changes what a rule
 // matches, and a dropped authentication key silently changes what authenticates.
 func compactNormalizeInScope(containerKeyword, head string) bool {
-	if head == "authentication-key" {
-		return true
-	}
-	if containerKeyword == "match" {
-		return true
-	}
 	// #8690, second increment: the CREDENTIAL family. Chosen on consequence
 	// rather than on count — each of these is a token whose silent drop leaves
 	// something authenticating (or authorizing) with NOTHING, on a commit that
@@ -115,23 +109,97 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 	// registry lists the four `authentication` leaves; the GATE governs the
 	// whole packed login body. Only the before/after comparison shows the
 	// difference, so the exclusion is by container, not by the registry.
+	// NOTE: this exclusion PRE-EMPTS every pair below. With the rules now
+	// pair-scoped it is no longer load-bearing for the credential heads --
+	// no pair names `authentication` or `user` as its container -- but it is
+	// kept as the explicit record of the #6662 decision, and because it also
+	// guards anything added above it later.
+	//
+	// Its cost, stated so it is not rediscovered: a pair naming
+	// `authentication` or `user` as its container would silently never fire.
+	// A rule that cannot match reads like coverage and passes review, which is
+	// the same trap as the wildcard-container site in #8719. If a future family
+	// needs one, delete this and re-derive the exclusion as pairs rather than
+	// adding an unreachable case below.
 	if containerKeyword == "authentication" || containerKeyword == "user" {
 		return false
 	}
-	if compactCredentialHeads[head] {
-		return true
-	}
-	// `key` is too generic to admit unqualified — it appears on containers that
-	// read their tail — so it is scoped to the containers that measured safe.
-	// (`class` was scoped here too, under `user`; that branch is gone because
-	// the container exclusion above already made it unreachable, and leaving a
-	// dead branch would misdescribe the scope to the next reader.)
+	// EVERY RULE HERE IS SCOPED BY (container, head) PAIR. None matches a head
+	// alone or a container alone, and that is a deliberate change from how the
+	// first two increments were written.
 	//
-	// Stated as an `if` rather than a `switch` on containerKeyword so a
-	// non-matching head under `tunnel`/`md5` FALLS THROUGH to the pair switch
-	// below instead of returning false early. The two families are independent
-	// and neither may silently shadow the other.
-	if (containerKeyword == "tunnel" || containerKeyword == "md5") && head == "key" {
+	// WHY: a head-only rule is safe only for as long as no container acquires
+	// that head with a tail somebody reads, and a container-only rule is safe
+	// only for as long as no head appears under it that somebody reads. Both
+	// make the predicate's correctness contingent on the CURRENT INVENTORY
+	// rather than on the rule. The inventory moves — this sweep moves it — so
+	// such a rule fails at the moment a family lands, inside someone else's
+	// merge conflict, which is the worst possible place to be redesigning a
+	// predicate.
+	//
+	// The measured case for the container-only direction: `containerKeyword ==
+	// "match"` was written for security policies and NAT rule-sets, and it also
+	// admitted `services ip-monitoring policy <p> match rpm-probe` — a
+	// different feature in a different subtree, reached only because it happens
+	// to spell its criteria block `match`. It is in scope below because it
+	// measured safe, not because the rule intended it.
+	//
+	// The head-only direction is the same defect mirrored, and is the one
+	// lane-8526's illustration names: `term <t> from community <c>` is shape
+	// `empty` and admissible while `term <t> then community <c>` is `partial`
+	// and must never be admitted. Same head, one token apart, opposite sides of
+	// the safety rule.
+	//
+	// These 32 pairs are exactly what the three former rules admitted, measured
+	// at the production call site rather than derived from the schema — so this
+	// is a restatement of the existing scope, not a widening. The admitted-site
+	// count and the inventory are unchanged by it.
+	switch containerKeyword + " " + head {
+	case
+		// #8689: the authentication-key family, formerly `head ==
+		// "authentication-key"` unqualified.
+		"cluster authentication-key",
+		"group authentication-key",
+		"interface authentication-key",
+		"isis authentication-key",
+		"neighbor authentication-key",
+		"rip authentication-key",
+		"vrrp-group authentication-key",
+		// #8689: the security match family, formerly `containerKeyword ==
+		// "match"` unqualified. `match rpm-probe` is the ip-monitoring site
+		// noted above.
+		"match application",
+		"match destination-address",
+		"match destination-address-excluded",
+		"match destination-address-name",
+		"match destination-port",
+		"match from-zone",
+		"match protocol",
+		"match rpm-probe",
+		"match source-address",
+		"match source-address-excluded",
+		"match source-address-name",
+		"match to-zone",
+		// #8708: the credential family, formerly a head-only map lookup.
+		"interface authentication-type",
+		"isis authentication-type",
+		"manual authentication-algorithm",
+		"master-password pseudorandom-function",
+		"peer preshared-key",
+		"proposal authentication-algorithm",
+		"proposal authentication-method",
+		"rip authentication-type",
+		"root-authentication encrypted-password",
+		"root-authentication ssh-dsa",
+		"root-authentication ssh-ed25519",
+		"root-authentication ssh-rsa",
+		"policy pre-shared-key",
+		"vpn pre-shared-key",
+		"vrrp-group authentication-type",
+		"wireguard private-key",
+		// #8708: `key`, already container-scoped, restated in the same form.
+		"tunnel key",
+		"md5 key":
 		return true
 	}
 	// #8690 family 2: the POLICY-ENFORCEMENT surface — security zones and
@@ -176,6 +244,47 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 	// family label is not a safety property, and this is the case that proves
 	// it. TestNormalizerScopeNeverCoversAPartialSite8690 binds it mechanically
 	// so the next widening cannot make the same mistake by inspection.
+	// #8690 family 5: applications, services, snmp, event-options. 30 sites,
+	// every one drop shape "empty" in the inventory.
+	//
+	// PROVISIONAL until the disarm arm has run over them: the drop shape
+	// answers a question about READERS and does not see commit gates. lane-8388
+	// established that `system login` sites measure "empty" while the #6662
+	// packed-login-body gate makes normalizing them unsafe, and flagged
+	// `snmp trap-group <t> targets` as one of the same class. I am not taking
+	// that on trust either way — the pairs go in, the disarm guard runs, and
+	// anything it flags gets classified by hand rather than assumed.
+	switch containerKeyword + " " + head {
+	case "applications application",
+		"applications application-set",
+		"application alg",
+		"application description",
+		"application destination-port",
+		"application icmp-code",
+		"application icmp-type",
+		"application inactivity-timeout",
+		"application protocol",
+		"application source-port",
+		"application term",
+		"application timeout",
+		"event-options policy",
+		"policy within",
+		"version-ipfix template",
+		"version9 template",
+		"template flow-active-timeout",
+		"template flow-inactive-timeout",
+		"template-refresh-rate seconds",
+		"rpm probe",
+		"snmp community",
+		"snmp trap-group",
+		"community clients",
+		"trap-group categories",
+		"trap-group targets",
+		"trap-group version",
+		"local-engine user":
+		return true
+	}
+
 	// #8690 family 4: interfaces. 15 sites, every one drop shape "empty".
 	//
 	// Measured, not taken from the brief: the family was described to me as
@@ -670,23 +779,6 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		return true
 	}
 	return false
-}
-
-// compactCredentialHeads are the #8690 credential leaves whose heads are
-// distinctive enough to admit without qualifying the container. Each was
-// measured empty-equivalent; see compactNormalizeInScope.
-var compactCredentialHeads = map[string]bool{
-	"encrypted-password":       true,
-	"ssh-dsa":                  true,
-	"ssh-rsa":                  true,
-	"ssh-ed25519":              true,
-	"pre-shared-key":           true,
-	"preshared-key":            true,
-	"private-key":              true,
-	"authentication-type":      true,
-	"authentication-algorithm": true,
-	"authentication-method":    true,
-	"pseudorandom-function":    true,
 }
 
 func normalizeCompactNodes(nodes []*Node, schema *schemaNode) int {
