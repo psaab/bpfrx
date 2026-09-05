@@ -488,7 +488,16 @@ var schemaFirewall = &schemaNode{desc: "Firewall filters and policers", children
 							}},
 						}},
 					}},
-					"then": {desc: "Actions for matching packets", children: map[string]*schemaNode{
+					// issue 8939: packedStatements so a run written on ONE line --
+					// `then count c1 dscp af11;` -- splits into siblings instead
+					// of landing whole on this node's Keys, where the compiler
+					// reads the first statement and drops the rest.
+					//
+					// Declared on the NODE, not on a (container, head) pair, so
+					// the #8921 collision hazard does not apply: there are 14
+					// containers named `then` and this reaches only the two
+					// filter-term ones. See docs/config-schema.md.
+					"then": {desc: "Actions for matching packets", packedStatements: true, children: map[string]*schemaNode{
 						"accept": {desc: "Accept the packet", children: nil},
 						// #8807-followup: the compiler reads a message type after `reject`
 						// (compiler_firewall.go: child.Keys[1] for the packed form, a
@@ -588,7 +597,16 @@ var schemaFirewall = &schemaNode{desc: "Firewall filters and policers", children
 							}},
 						}},
 					}},
-					"then": {desc: "Actions for matching packets", children: map[string]*schemaNode{
+					// issue 8939: packedStatements so a run written on ONE line --
+					// `then count c1 dscp af11;` -- splits into siblings instead
+					// of landing whole on this node's Keys, where the compiler
+					// reads the first statement and drops the rest.
+					//
+					// Declared on the NODE, not on a (container, head) pair, so
+					// the #8921 collision hazard does not apply: there are 14
+					// containers named `then` and this reaches only the two
+					// filter-term ones. See docs/config-schema.md.
+					"then": {desc: "Actions for matching packets", packedStatements: true, children: map[string]*schemaNode{
 						"accept": {desc: "Accept the packet", children: nil},
 						// #8807-followup: the compiler reads a message type after `reject`
 						// (compiler_firewall.go: child.Keys[1] for the packed form, a
