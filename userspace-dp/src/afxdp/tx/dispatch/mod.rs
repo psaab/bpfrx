@@ -523,7 +523,16 @@ fn enqueue_copy_fallback_frame(
             // does not exist — the stale-pointer half of the
             // defect this change closes.
             if is_nat64 {
-                if crate::nat64::frame_is_nat64_exthdr_ineligible(
+                // #8890 FIRST, mirroring the builder's own guard order: the
+                // tunnel check is the first statement in
+                // `build_nat64_forwarded_frame`, so a tunnel-marked decision
+                // returns `None` for THAT reason whatever else the frame also
+                // is. Attributing it to an ext-header or fragment reason would
+                // send an operator chasing a translation problem when the real
+                // signal is "this NAT64 + tunnel route is not forwarded at all".
+                if request.decision.resolution.tunnel_endpoint_id != 0 {
+                    counters.record_nat64_tunnel_encap_unsupported();
+                } else if crate::nat64::frame_is_nat64_exthdr_ineligible(
                     source_frame,
                     request.meta.addr_family as i32,
                 ) {

@@ -75,16 +75,17 @@ type statusSummaryAggregates struct {
 	policyRejectRateLimitDrops        uint64
 	filterRejectRateLimitDrops        uint64
 
-	snatPackets             uint64
-	dnatPackets             uint64
-	nat64Translations       uint64
-	nat64NoSourcePool       uint64
-	nat64PoolExhausted      uint64
-	nat64FragDropped        uint64
-	nat64IneligibleSource   uint64
-	nat64IneligibleDest     uint64
-	nat64ExthdrIneligible   uint64
-	nat64IneligibleProtocol uint64
+	snatPackets                 uint64
+	dnatPackets                 uint64
+	nat64Translations           uint64
+	nat64NoSourcePool           uint64
+	nat64PoolExhausted          uint64
+	nat64FragDropped            uint64
+	nat64IneligibleSource       uint64
+	nat64IneligibleDest         uint64
+	nat64ExthdrIneligible       uint64
+	nat64TunnelEncapUnsupported uint64
+	nat64IneligibleProtocol     uint64
 	// #6122: fail-closed ordinary same-family NAT'd non-first-fragment miss
 	// drops (SNAT / static-NAT / DNAT / NPTv6). Same-family sibling of
 	// nat64FragDropped.
@@ -230,6 +231,7 @@ func aggregateStatusSummary(status userspace.ProcessStatus) statusSummaryAggrega
 		agg.nat64IneligibleSource += binding.Nat64IneligibleSource
 		agg.nat64IneligibleDest += binding.Nat64IneligibleDest
 		agg.nat64ExthdrIneligible += binding.Nat64ExthdrIneligible
+		agg.nat64TunnelEncapUnsupported += binding.Nat64TunnelEncapUnsupported
 		agg.nat64IneligibleProtocol += binding.Nat64IneligibleProtocol
 		agg.natFragUntranslatedDropped += binding.NatFragUntranslatedDropped
 		agg.txPackets += binding.TXPackets
@@ -513,6 +515,7 @@ func writeNATCountersSection(b *strings.Builder, agg statusSummaryAggregates) {
 	fmt.Fprintf(b, "  NAT64 ineligible-source drops:%d\n", agg.nat64IneligibleSource)
 	fmt.Fprintf(b, "  NAT64 ineligible-destination drops:%d\n", agg.nat64IneligibleDest)
 	fmt.Fprintf(b, "  NAT64 ext-header ineligible drops:%d\n", agg.nat64ExthdrIneligible)
+	fmt.Fprintf(b, "  NAT64 tunnel encap unsupported drops:%d\n", agg.nat64TunnelEncapUnsupported)
 	fmt.Fprintf(b, "  NAT64 ineligible-protocol drops:%d\n", agg.nat64IneligibleProtocol)
 	fmt.Fprintf(b, "  NAT frag untranslated drops:%d\n", agg.natFragUntranslatedDropped)
 }

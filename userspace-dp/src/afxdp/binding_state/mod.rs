@@ -350,6 +350,18 @@ pub(in crate::afxdp) struct BindingLiveState {
     /// counter; a non-zero value flags AH-protected or active-extension traffic
     /// aimed at a NAT64 prefix. Distinct from the source/pool/fragment counters.
     pub(super) nat64_exthdr_ineligible: AtomicU64,
+    /// #8890: cumulative fail-closed NAT64 TUNNEL-ENCAPSULATION drops — a
+    /// NAT64-translated packet whose route resolved through a GRE or
+    /// WireGuard endpoint. `build_nat64_forwarded_frame` performs no
+    /// encapsulation and the TX copy path selects it exclusively on
+    /// `is_nat64`, so before #8890 the inner packet was emitted on the
+    /// physical NIC as PLAINTEXT (measured byte-identical to the no-tunnel
+    /// control). It is now dropped instead, matching the #1873 R-E posture
+    /// for the unresolved-neighbour route. Surfaced as the `NAT64 tunnel
+    /// encap unsupported drops` operator counter; a non-zero value means a
+    /// NAT64 + tunnel route combination is configured and is NOT being
+    /// forwarded — an unsupported-configuration signal, not a capacity one.
+    pub(super) nat64_tunnel_encap_unsupported: AtomicU64,
     /// #8670: cumulative fail-closed NAT64 PROTOCOL-ineligibility drops — a
     /// packet addressed to a Pref64 destination whose IP protocol stateful
     /// NAT64 does not translate (RFC 6146 covers TCP, UDP and ICMP only), so it
@@ -901,9 +913,19 @@ const _: [(); 64] = [(); std::mem::align_of::<BindingLiveState>()];
 // exactly the reading the #6664 note warns about — an unchanged `size_of` is
 // not evidence the field failed to land, and here it is the OFFSETS that
 // carried the proof. Verified in both configurations per the note above.
+//
+// #8890 added `nat64_tunnel_encap_unsupported` and repeats #8670's case
+// exactly: `size_of` stayed 2368 (the #7156 alignment unit still has room)
+// while both offsets moved 2192 -> 2200 and 2320 -> 2328. The field is
+// UNCONDITIONAL, so the discriminator the note above demands was applied:
+// BOTH configurations were built and BOTH reported the same two shifts, by
+// the same 8 bytes. That agreement is what distinguishes re-measuring a real
+// layout change from defeating the guard — a `#[cfg(test)]` field would have
+// moved the test build alone, and one pair of literals could not have made
+// both green.
 const _: [(); 2368] = [(); std::mem::size_of::<BindingLiveState>()];
-const _: [(); 2192] = [(); std::mem::offset_of!(BindingLiveState, pending_tx_admitted)];
-const _: [(); 2320] = [(); std::mem::offset_of!(BindingLiveState, delta_loss_pending)];
+const _: [(); 2200] = [(); std::mem::offset_of!(BindingLiveState, pending_tx_admitted)];
+const _: [(); 2328] = [(); std::mem::offset_of!(BindingLiveState, delta_loss_pending)];
 
 impl BindingLiveState {
     pub(super) fn new() -> Self {
@@ -990,6 +1012,7 @@ impl BindingLiveState {
             nat64_ineligible_source: AtomicU64::new(0),
             nat64_ineligible_dest: AtomicU64::new(0),
             nat64_exthdr_ineligible: AtomicU64::new(0),
+            nat64_tunnel_encap_unsupported: AtomicU64::new(0),
             nat64_ineligible_protocol: AtomicU64::new(0),
             nat_alloc_fail: AtomicU64::new(0),
             nat_frag_untranslated_dropped: AtomicU64::new(0),

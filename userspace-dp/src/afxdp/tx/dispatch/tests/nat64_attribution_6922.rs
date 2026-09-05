@@ -272,3 +272,152 @@ fn nat64_never_reaches_the_in_place_rewrite_path_6922() {
          attribution block becomes live. Expression was:\n{expr}"
     );
 }
+
+/// #8890 — a tunnel-marked NAT64 build-`None` is attributed to
+/// `nat64_tunnel_encap_unsupported`, AHEAD of both #6922 reasons.
+///
+/// **This cell exists because the builder-level cell cannot answer the
+/// reachability question.** `nat64_8890_tunnel_marked_decision_is_not_emitted_plaintext`
+/// calls `build_nat64_forwarded_frame` directly and proves it fails closed.
+/// It says nothing about whether a tunnel-marked NAT64 request actually
+/// *reaches* that builder through the dispatcher — `enqueue_pending_forwards`
+/// refuses direct TX when `is_nat64 || uses_native_tunnel`, and that `||` is
+/// the whole routing argument of #8890. A gate on an unreachable path is inert,
+/// and inert is indistinguishable from working by inspection. This drives the
+/// real dispatcher.
+///
+/// It reuses `ah_fragment_v6_frame_6922` deliberately: that frame matches BOTH
+/// #6922 predicates, so all three attribution reasons are live at once and the
+/// guard order is observable. On a frame only the tunnel reason matched, any
+/// ordering would record the same counter and this cell would measure nothing —
+/// the lesson the top of this file records about its own first version.
+#[test]
+fn nat64_tunnel_marked_build_none_attributes_tunnel_first_8890() {
+    let mut bindings = vec![
+        BindingWorker::new_for_mirror_test(0, 0, 11, 0),
+        BindingWorker::new_for_mirror_test(1, 0, 22, 0),
+    ];
+    let frame = ah_fragment_v6_frame_6922();
+    unsafe { bindings[0].umem.area().slice_mut_unchecked(0, frame.len()) }
+        .expect("ingress frame")
+        .copy_from_slice(&frame);
+    bindings[1].tx_pipeline.free_tx_frames.clear();
+
+    let forwarding = test_forwarding_with_egress_mtu(1500);
+    let lookup = WorkerBindingLookup::from_bindings(&bindings);
+    let mirror_targets = MirrorTargetMap::default();
+
+    let mut decision = test_forwarding_decision_to_bound_ifindex(22);
+    decision.nat.nat64 = true;
+    // The ONLY difference from the #6922 cell above.
+    decision.resolution.tunnel_endpoint_id = 7;
+
+    let mut request = test_live_forward_request_for_frame(frame.len(), decision);
+    request.meta.addr_family = libc::AF_INET6 as u8;
+    let mut pending = vec![request];
+
+    let mut post_recycles = Vec::new();
+    let ingress_ident = bindings[0].identity();
+    let ingress_live = &*bindings[0].live as *const BindingLiveState;
+    let local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, LocalTunnelDelivery>>> =
+        Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
+    let worker_commands_by_id: BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>> = BTreeMap::new();
+    let mut dbg = DebugPollCounters::default();
+    let mut counters = BatchCounters::default();
+
+    let (left, rest) = bindings.split_at_mut(0);
+    let (ingress, right) = rest.split_first_mut().expect("ingress binding");
+    enqueue_pending_forwards(
+        left,
+        0,
+        ingress,
+        right,
+        &lookup,
+        &mirror_targets,
+        &mut pending,
+        &mut post_recycles,
+        1,
+        &forwarding,
+        &ingress_ident,
+        unsafe { &*ingress_live },
+        None,
+        &local_tunnel_deliveries,
+        &recent_exceptions,
+        &mut dbg,
+        &mut counters,
+        0,
+        &worker_commands_by_id,
+    );
+
+    // REACHABILITY + NON-VACUITY. Both must hold before any counter below
+    // means anything: the request has to have reached the NAT64 builder AND
+    // the builder has to have refused it.
+    assert_eq!(
+        dbg.build_fail, 1,
+        "a tunnel-marked NAT64 request must reach the copy-fallback builder and \
+         fail there. If this is 0 the request never got to the #8890 gate — a \
+         gate on an unreachable path is inert, and every counter assertion below \
+         would be describing a branch that did not run"
+    );
+
+    // THE SECURITY PROPERTY, at the dispatcher rather than the builder: nothing
+    // was handed to TX. This is the assertion that says "no plaintext left".
+    assert_eq!(
+        dbg.enqueue_ok, 0,
+        "#8890: no frame may be enqueued for TX for a NAT64 packet whose route \
+         resolved through a tunnel endpoint. An enqueue here is the inner packet \
+         going onto the underlay unencapsulated"
+    );
+
+    assert_eq!(
+        counters.nat64_tunnel_encap_unsupported, 1,
+        "#8890: the drop must be attributed to nat64_tunnel_encap_unsupported"
+    );
+    assert_eq!(
+        counters.nat64_exthdr_ineligible, 0,
+        "#8890 orders BEFORE #5625. This frame is also ext-header-ineligible, so \
+         an attribution chain that tested exthdr first would record that instead \
+         — and an operator would chase an AH/translation problem when the real \
+         signal is that a NAT64 + tunnel route is not forwarded at all"
+    );
+    assert_eq!(
+        counters.nat64_frag_dropped, 0,
+        "#8890 orders BEFORE #2562 as well — this frame is also a non-first \
+         fragment"
+    );
+
+    // The #2208 property, restated here for the new branch: a new early return
+    // in the attribution chain must not skip the recycle or the reinject.
+    assert_eq!(
+        ingress_recycled_count(&bindings[0]),
+        1,
+        "ingress descriptor must be recycled exactly once on the #8890 drop"
+    );
+    // BOTH EXITS ARE CLOSED, and this is the part worth reading.
+    //
+    // The frame does NOT reach `slow_path_drops`. It is intercepted one gate
+    // earlier by the #1873 R-C reinject guard in `slow_path.rs`, which is
+    // unconditional on `tunnel_endpoint_id != 0`: handing an UNENCAPSULATED
+    // inner packet to the kernel FIB is itself a plaintext leak whenever the
+    // kernel's view diverges from the userspace FIB.
+    //
+    // So #1873 had ALREADY closed the reinject exit against exactly this
+    // hazard. It could not help, because before #8890 the frame never got
+    // here — the builder returned `Some` and the packet was ENQUEUED FOR TX,
+    // taking the one exit nothing guarded. The two gates are siblings on the
+    // two ways out of a failed forward, and only one of them existed.
+    assert_eq!(
+        bindings[0]
+            .live
+            .tunnel_encap_unresolved_drops
+            .load(Ordering::Relaxed),
+        1,
+        "an #8890 drop must be caught by the #1873 R-C reinject gate on the way          out — the kernel must not receive the unencapsulated inner packet either"
+    );
+    assert_eq!(
+        bindings[0].live.slow_path_drops.load(Ordering::Relaxed),
+        0,
+        "and it must NOT fall through to the generic slow-path drop: #1873 R-C          claims it first. If this ever becomes 1, the reinject gate stopped          firing and the frame is being offered to the kernel FIB"
+    );
+}

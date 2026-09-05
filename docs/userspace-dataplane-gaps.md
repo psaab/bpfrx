@@ -508,6 +508,7 @@ These are not "missing", but they are not pure userspace forwarding either:
 |------|------------------|
 | SYN cookie flood protection | Userspace now publishes a snapshot key when cluster-synced root encrypted-password material exists, mints/validates cookies against the Unix wall-clock epoch, sends bounded SYN-ACK and validated-ACK RST replies through the AF_XDP TX path, and reports challenge/no-secret/SYN-ACK/ACK-RST/budget/valid/invalid/bypass counters. Active SYN-cookie screen profiles require that secret material at userspace capability admission; missing secret material also fails closed at runtime. #1374 is closed for the feature-gap audit; the final live HA/flood proof was delivered with the closed #1477 validation set. |
 | Kernel-owned traffic (ARP, local delivery, management, some non-IP) | cpumap or kernel pass-through from XDP |
+| NAT64 whose route resolves through a GRE / WireGuard endpoint | **Not forwarded — dropped fail-closed (#8890).** The NAT64 frame builder performs no encapsulation and the TX copy path selects it exclusively on `is_nat64`, so the two transforms do not compose. See [NAT64 does not compose with native tunnel egress](#nat64-does-not-compose-with-native-tunnel-egress-8890). |
 | GRE / ESP / explicit early filters | Live kernel-owned/tunnel-control cases use cpumap or pass-through; degraded helper/XSK states pass only proven local/control traffic and drop non-local transit |
 | IPsec / XFRM handling | Userspace detects and punts to kernel/slow-path as needed. The DECRYPTED plaintext is not zone-adjudicated — see [Tunnel plaintext is not zone-adjudicated](#tunnel-plaintext-is-not-zone-adjudicated-5618-wireguard-5619-ipsec) (#5619). |
 | WireGuard (`interfaces <if> tunnel mode wireguard`) | The XDP shim steers inbound WireGuard transport to the kernel (#5582) and the helper's WireGuard control thread owns the UDP socket and the `wgN` TUN. The DECAPSULATED plaintext is not zone-adjudicated — see [Tunnel plaintext is not zone-adjudicated](#tunnel-plaintext-is-not-zone-adjudicated-5618-wireguard-5619-ipsec) (#5618). |
@@ -617,6 +618,46 @@ inside the worker pipeline, rebinds `ingress_ifindex` to the tunnel's
 `logical_ifindex`, derives `ingress_zone` from
 `ForwardingState.ifindex_to_zone_id`, and continues through screen, session,
 route, filters and zone-pair policy.
+
+### NAT64 does not compose with native tunnel egress (#8890)
+
+A NAT64-translated packet whose route resolves through a native GRE or
+WireGuard endpoint is **dropped**, counted as `nat64_tunnel_encap_unsupported`
+and surfaced as the `NAT64 tunnel encap unsupported drops` operator row. It is
+not forwarded, encapsulated or otherwise delivered.
+
+**This is a deliberate fail-closed gap, and it replaced a confidentiality
+failure.** The TX copy path picks its frame builder on `is_nat64`
+*exclusively*, and only the branch it skips carries the tunnel post-pass. The
+NAT64 builder has no encapsulation path at all, so before #8890 the inner
+packet was emitted on the physical NIC unencapsulated — measured at
+`c2e0a9ecb` as **byte-identical to the no-tunnel control**, plain IPv4, no drop
+and no counter. Traffic an operator routed through WireGuard left as plaintext
+on the underlay. `enqueue_pending_forwards` refuses direct TX when `is_nat64 ||
+uses_native_tunnel`, so the combination was routed *into* that path rather than
+away from it.
+
+Dropping matches the posture this codebase had already chosen for the sibling
+case: #1873 R-E drops a tunnel-marked decision whose outer next-hop is
+unresolved rather than let a later in-place rewrite "TX PLAINTEXT", and #2327
+drops rather than emit for an unknown tunnel mode, because a fail-OPEN default
+in a security appliance is the defect. #1873's gate on the slow-path reinject
+exit was in fact already correct for this case — it simply never ran, because
+the build exit returned a frame and the packet was enqueued for TX. Both exits
+are now closed.
+
+**Encapsulating instead is the desirable behaviour and is tracked separately.**
+The tunnel post-pass wraps a finished inner frame, so it looks composable, but
+`wg_encap_frame` parses that inner frame using `inner_meta.addr_family` in three
+places (`packet_trimmed_len`, `inner_dst_ip` for AllowedIPs peer selection, and
+`inner_tos_byte`). After NAT64 the frame is IPv4 while `meta` still describes
+the IPv6 *ingress*, so passing `meta` through would parse an IPv4 packet as
+IPv6. Composing them needs a corrected meta and a re-derivation of the outer
+identity (#2680/#3992/#5292) for a family-translated inner packet.
+
+**Operator-visible signal:** a non-zero `NAT64 tunnel encap unsupported drops`
+means such a route is configured and is not being forwarded. That is an
+unsupported-configuration signal, not a capacity or fragmentation one.
 
 ## Observability — per-zone traffic + flood counters (both populated, #3651)
 

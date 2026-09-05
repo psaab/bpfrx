@@ -1537,3 +1537,100 @@ fn restore_icmpv6_identifier_skips_a_non_query_type_5191() {
         "MLD Maximum Response Delay must not be overwritten with a pseudo-port",
     );
 }
+
+/// #8890 — a tunnel-marked NAT64 decision must NOT produce a frame.
+///
+/// The measurement this cell replaces, taken at `c2e0a9ecb` before the gate
+/// existed, is the reason it is written this way:
+///
+/// ```text
+/// P8890 tunnel_endpoint_id=7 -> Some(len=58)  control_len=58  IDENTICAL_TO_PLAINTEXT=true
+/// P8890   ethertype=0x0800   ipproto@23=0x06
+/// ```
+///
+/// With a tunnel endpoint on the decision the builder returned a frame
+/// **byte-identical to the no-tunnel control** — plain IPv4, no encapsulation
+/// and no drop. Three outcomes were possible and that was the worst of them:
+/// encapsulating would have refuted the finding, `None` would have been
+/// fail-closed like #1873, and what actually happened was the inner packet
+/// leaving unencrypted on the underlay.
+///
+/// **THE CONTROL IS LOAD-BEARING AND IS THE FIRST ASSERTION FOR THAT REASON.**
+/// Asserting only `is_none()` on the subject is satisfied by a builder that
+/// returns `None` for any reason at all — a broken fixture, a bad MAC, a
+/// changed meta — so the cell would stay green while measuring nothing. The
+/// control is what proves the builder produces a real translated frame from
+/// this fixture, and byte-identity to a *working* output is what showed the
+/// tunnel field was simply ignored. The only variable between the two arms is
+/// `resolution.tunnel_endpoint_id`.
+#[test]
+fn nat64_8890_tunnel_marked_decision_is_not_emitted_plaintext() {
+    let client: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let synthetic: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let pool = Ipv4Addr::new(203, 0, 113, 1);
+    let server = Ipv4Addr::new(8, 8, 8, 8);
+    let frame = build_ipv6_tcp_syn_with_mss(client, synthetic, 5000, 443, 1460);
+
+    // CONTROL: identical in every respect except tunnel_endpoint_id == 0.
+    let control_decision =
+        icmp_test_decision(Nat64State::forward_decision(pool, server, 40001));
+    assert_eq!(
+        control_decision.resolution.tunnel_endpoint_id, 0,
+        "control arm must be untunnelled — if the fixture ever starts carrying a \
+         tunnel id, both arms would be the subject and the cell would compare \
+         nothing"
+    );
+    let control = build_nat64_forwarded_frame(
+        &frame,
+        nat64_forward_meta(),
+        &control_decision,
+        None,
+        false,
+    )
+    .expect(
+        "NON-VACUITY: the untunnelled control MUST translate. If this fixture \
+         cannot produce a frame, the `is_none()` assertion below is satisfied by \
+         the fixture being broken rather than by the #8890 gate, and the cell \
+         measures nothing",
+    );
+    // The control is a real, plain IPv4 frame — this is what "emitted as
+    // plaintext" meant when the subject returned these same bytes.
+    assert_eq!(
+        &control[12..14],
+        &0x0800u16.to_be_bytes(),
+        "control must be plain IPv4 (ethertype 0x0800) — no encapsulation"
+    );
+    assert_eq!(
+        &control[26..30],
+        &pool.octets(),
+        "control must be genuinely NAT64-translated, not a passthrough copy"
+    );
+
+    // SUBJECT: the same decision with a tunnel endpoint attached.
+    let mut tunnel_decision =
+        icmp_test_decision(Nat64State::forward_decision(pool, server, 40001));
+    tunnel_decision.resolution.tunnel_endpoint_id = 7;
+
+    let subject = build_nat64_forwarded_frame(
+        &frame,
+        nat64_forward_meta(),
+        &tunnel_decision,
+        None,
+        false,
+    );
+
+    assert!(
+        subject.is_none(),
+        "#8890: a NAT64 decision whose route resolved through a tunnel endpoint \
+         must FAIL CLOSED. This builder performs no encapsulation and the TX copy \
+         path selects it exclusively on `is_nat64`, so a returned frame is emitted \
+         on the physical NIC unencapsulated. Measured before the gate: the frame \
+         was byte-identical to the control above ({} bytes, ethertype 0x0800) — \
+         traffic an operator routed through WireGuard leaving as plaintext on the \
+         underlay. #1873 R-E already drops rather than 'later TX PLAINTEXT' on the \
+         unresolved-neighbour route; this is the resolved route via NAT64. Got \
+         {:?} bytes.",
+        control.len(),
+        subject.as_ref().map(|f| f.len()),
+    );
+}
