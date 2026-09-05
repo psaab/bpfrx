@@ -43,7 +43,21 @@ func compactAtDepth(container []string, leaf, val string, j int) (string, bool) 
 	parent := container[:len(container)-j]
 	tail := container[len(container)-j:]
 	inner := strings.Join(tail, " ") + " " + leaf + " " + val + ";"
-	return nest(parent, contextFor(parent)+inner), true
+	// #8690: the SAME scaffolding the base census uses. "Depth 1 IS the base
+	// census's spelling" is this file's premise, and the agreement cell below
+	// is what enforces it — it went red the moment the base census learned a
+	// scaffold this walker did not have, which is the cross-check working.
+	//
+	// The stanza a scaffold keys on is the FIRST token of the packed tail: at
+	// depth 1 that is the stanza the base census names, and at deeper j it is
+	// the outermost container being packed, which is the one whose siblings the
+	// compiler checks.
+	stanza := ""
+	if len(tail) > 0 {
+		stanza = tail[0]
+	}
+	return preambleFor(parent, stanza) +
+		nest(parent, contextForStanza(parent, stanza)+inner), true
 }
 
 type depthOutcome struct {
@@ -70,8 +84,10 @@ func runDepthCensus7653(t *testing.T) (map[int]*depthOutcome, int, map[string]bo
 		}
 		parent := s.container[:len(s.container)-1]
 		stanza := s.container[len(s.container)-1]
-		blockV1 := nest(parent, contextFor(parent)+stanza+" { "+s.leaf+" "+v1+"; }")
-		blockV2 := nest(parent, contextFor(parent)+stanza+" { "+s.leaf+" "+v2+"; }")
+		pre := preambleFor(parent, stanza)
+		ctx := contextForStanza(parent, stanza)
+		blockV1 := pre + nest(parent, ctx+stanza+" { "+s.leaf+" "+v1+"; }")
+		blockV2 := pre + nest(parent, ctx+stanza+" { "+s.leaf+" "+v2+"; }")
 		cb1, cb2 := compileText(t, blockV1), compileText(t, blockV2)
 		if cb1 == nil || cb2 == nil {
 			continue
