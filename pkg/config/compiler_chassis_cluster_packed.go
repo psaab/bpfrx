@@ -166,6 +166,32 @@ func clusterBodyStatements(cfgNode *Node, skip int) []*Node {
 func splitPackedClusterChild(c *Node) []*Node {
 	parts := splitClusterKeys(c.Keys, 0, c.Line, c.Column)
 	if len(parts) <= 1 {
+		// THE FLAT-SET CHAIN. `set chassis cluster authentication-key A
+		// additional-authentication-key B` is ONE command, and SetPath builds
+		// it as NESTED nodes rather than siblings:
+		//
+		//	[authentication-key A]
+		//	  [additional-authentication-key B]
+		//
+		// so the keys carry one statement, this splitter returns c unchanged,
+		// and the cluster reader -- which walks the cluster body's direct
+		// children -- never sees the second key. Measured: the alternate
+		// control-link PSK compiled to EMPTY, with strictErr=false and
+		// warnings=0.
+		//
+		// The hierarchical spelling of the same thing already works, because
+		// there both statements land on ONE node's Keys and splitClusterKeys
+		// separates them. Only the CLI chain is affected.
+		//
+		// Promotion is gated on the SCHEMA, not applied blanket: a nested body
+		// is legitimate under a container that declares children --
+		// `redundancy-group 1 { node 0 priority 100; }` -- and hoisting that
+		// would break the shape the comment above depends on. A leaf that
+		// declares NO children can hold nothing, so anything nested under it is
+		// the chain and nothing else.
+		if promoted := promoteChainedClusterLeaf8939(c); promoted != nil {
+			return promoted
+		}
 		return []*Node{c}
 	}
 	parts[len(parts)-1].Children = c.Children
@@ -280,6 +306,15 @@ func clusterBodyNeedsSplit(cn *Node, skip int) bool {
 		if len(splitClusterKeys(c.Keys, 0, c.Line, c.Column)) > 1 {
 			return true
 		}
+		// The flat-set CHAIN needs splitting too, and it is invisible to the
+		// key test above: `set chassis cluster authentication-key A
+		// additional-authentication-key B` packs nothing onto Keys -- SetPath
+		// nests the second statement UNDER the first instead. Without this
+		// clause the whole normalization is skipped for that shape and the
+		// second statement never reaches the reader.
+		if promoteChainedClusterLeaf8939(c) != nil {
+			return true
+		}
 	}
 	return false
 }
@@ -341,6 +376,56 @@ func normalizedChassisNode(chassisNode *Node) *Node {
 	}
 	if cluster != nil {
 		out.Children = append(out.Children, cluster)
+	}
+	return out
+}
+
+// promoteChainedClusterLeaf8939 hoists statements SetPath nested beneath a
+// terminating cluster leaf into siblings, or returns nil when c is not that
+// shape. Recursive, because a single `set` command can chain three or more
+// leaves and each level nests inside the last.
+//
+// Returns nil -- rather than a one-element slice -- when nothing moves, so the
+// caller keeps returning the SAME pointer and preserves Inactive, Annotation
+// and key provenance on the untouched path.
+func promoteChainedClusterLeaf8939(c *Node) []*Node {
+	if c == nil || len(c.Children) == 0 || len(c.Keys) == 0 {
+		return nil
+	}
+	clusterSchema := schemaForPath("chassis", "cluster")
+	if clusterSchema == nil {
+		return nil
+	}
+	leaf := resolveSchemaChild(clusterSchema, c.Keys[0])
+	// Only a leaf the schema says holds NOTHING. A container with declared
+	// children owns its body.
+	if leaf == nil || len(leaf.children) > 0 || leaf.wildcard != nil {
+		return nil
+	}
+	head := &Node{
+		Keys:       append([]string(nil), c.Keys...),
+		IsLeaf:     true,
+		Annotation: c.Annotation,
+		Inactive:   c.Inactive,
+		Line:       c.Line,
+		Column:     c.Column,
+	}
+	if c.KeysQuoted != nil {
+		head.KeysQuoted = append([]bool(nil), c.KeysQuoted...)
+	}
+	if c.KeysBracketed != nil {
+		head.KeysBracketed = append([]bool(nil), c.KeysBracketed...)
+	}
+	out := []*Node{head}
+	for _, gc := range c.Children {
+		if gc == nil {
+			continue
+		}
+		if deeper := promoteChainedClusterLeaf8939(gc); deeper != nil {
+			out = append(out, deeper...)
+			continue
+		}
+		out = append(out, gc)
 	}
 	return out
 }
