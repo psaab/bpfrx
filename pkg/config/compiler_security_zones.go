@@ -107,8 +107,69 @@ func dedupHostInboundTokens(vals []string) []string {
 	return out
 }
 
+// zoneGroupInstances8794 is namedInstances with Junos's bracketed zone GROUP
+// fanned out: `security-zone [ trust untrust ] { screen edge; }` yields one
+// instance per name, each sharing the body.
+//
+// #8794: namedInstances takes Keys[1] as the name and DISCARDS Keys[2:], so a
+// group produced only its first zone. Not a missing body -- the later zone was
+// never created:
+//
+//	security-zone [ trust untrust ] { screen edge; }   -> 1 zone
+//	two explicit blocks                                -> 2 zones
+//
+// and the syntax is affirmatively supported (formatset_container_bracket_6668
+// declares it valid with wantCommit: true).
+//
+// THE DISCRIMINATOR IS MEASURED, NOT ASSUMED, and it is why this cannot sweep
+// in a packed tail. The lexer strips brackets, so the parser gives:
+//
+//	security-zone [ trust untrust ] { screen edge; }  Keys=[..trust untrust] children=1
+//	security-zone trust untrust     { screen edge; }  Keys=[..trust untrust] children=1  (identical)
+//	security-zone trust screen edge;                  Keys=[..trust screen edge] children=0
+//
+// A group has surplus keys AND a braced body; a packed tail has surplus keys
+// and NO children. The two cannot overlap, so this is disjoint from the #8690
+// normalizer's `len(Children) == 0` construction by the same property that
+// separates them there.
+//
+// THERE IS NO BRACKET PROVENANCE TO PRESERVE, which dissolves the HA concern
+// about ConfigTree.Format emitting bare keys: the bracketed and bare spellings
+// parse to byte-identical trees (measured above), so a primary and a standby
+// running this code fan out identically whichever spelling crosses the
+// Format -> SyncApply boundary. A rolling upgrade still differs -- an OLD peer
+// compiles one zone where a NEW one compiles two -- but that is the pre-fix
+// behaviour on the old node, and it errs toward FEWER zones, which is the
+// direction that fails closed.
+//
+// Scoped to zones deliberately. namedInstances is shared by many containers and
+// fanning it out globally would change every one of them; that is a separate
+// decision with its own evidence.
+func zoneGroupInstances8794(nodes []*Node) []struct {
+	name string
+	node *Node
+} {
+	var out []struct {
+		name string
+		node *Node
+	}
+	for _, child := range nodes {
+		if len(child.Keys) >= 3 && len(child.Children) > 0 {
+			for _, nm := range child.Keys[1:] {
+				out = append(out, struct {
+					name string
+					node *Node
+				}{nm, child})
+			}
+			continue
+		}
+		out = append(out, namedInstances([]*Node{child})...)
+	}
+	return out
+}
+
 func compileZones(node *Node, sec *SecurityConfig) error {
-	for _, inst := range namedInstances(node.FindChildren("security-zone")) {
+	for _, inst := range zoneGroupInstances8794(node.FindChildren("security-zone")) {
 		// #4818: find-or-create by name rather than always allocating a
 		// fresh ZoneConfig. A hand-authored `load override` config can carry
 		// two literal `security-zone <name> { ... }` TOP-LEVEL sibling
