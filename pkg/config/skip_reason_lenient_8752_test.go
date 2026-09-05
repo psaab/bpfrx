@@ -108,6 +108,24 @@ func TestSkippedOnRefusalStillNeedsTheLenientAnswer8752(t *testing.T) {
 // to load -- a strictly worse and differently-shaped outcome than a policy set
 // that merely evaluates wrong.
 //
+// THE OTHER HALF OF THAT CHAIN IS ALREADY PINNED, AND THIS CELL DELIBERATELY
+// DOES NOT RE-ASSERT IT. The claim spans two packages, so it needs two cells:
+//
+//	this cell (pkg/config)                        duplicate  -> LenientContentDropped
+//	TestLenientWidenedPolicyLowersToSentinel5575  flag       -> __unsupported__ sentinel
+//	 (pkg/dataplane/userspace/lenient_permit_widening_5575_test.go)
+//
+// Cited as a CELL rather than as a line in policies_lower.go, because a line
+// number is prose the moment the file moves and a cell is runnable. That is the
+// same rule the register applies to its own `wrong-remedy` class -- a claim
+// without a runnable cite is prose -- turned on this comment. The original
+// draft of this note cited policies_lower.go:194 and would have rotted at the
+// next edit to that file.
+//
+// If this cell is ever the ONLY one left of the two, the consequence paragraph
+// in the census annotation has become unfalsifiable again: half a cross-package
+// chain asserts nothing about the chain.
+//
 // This cell is therefore the acceptance criterion for the #8752 fold: folding
 // the occurrences into one policy carrying the operator's criteria must clear
 // LenientContentDropped. An implementation that removes the duplicate OBJECT
