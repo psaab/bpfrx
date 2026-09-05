@@ -28,6 +28,36 @@ func TestSynthPairUsesSchemaValueHints8662(t *testing.T) {
 		{"unit number", &schemaNode{valueHint: ValueHintUnitNumber}, "0"},
 		{"interface name", &schemaNode{valueHint: ValueHintInterfaceName}, "ge-0/0/0.0"},
 		{"numeric placeholder", &schemaNode{placeholder: "<0..255>"}, "1"},
+		// #8690: these three cases carry the `protocols` family's synthesis
+		// coverage, which used to ride on a membership anchor below.
+		//
+		// `protocols bgp group <g> neighbor <n> peer-as` was that anchor — the
+		// last divergent protocols site, so its continued PRESENCE in the
+		// inventory proved synthesis still produced a valid value for it.
+		// Normalizing it emptied the family, and membership cannot carry a
+		// claim about a site that is no longer divergent.
+		//
+		// THE SHIPPED NODE IS COVERED TWICE, AND THAT IS WHY IT NEEDS THREE
+		// CASES RATHER THAN ONE. A first attempt asserted the shipped shape
+		// alone and claimed the value came from valueType. Mutation refuted
+		// both halves: disabling the `case ValueInteger` branch left the test
+		// GREEN, and measurement showed why — the placeholder heuristic runs
+		// FIRST and `<as-number>` matches it on the substring "number", so
+		// valueType is never consulted for this node. The mechanism was the
+		// opposite of the one written down.
+		//
+		// The redundancy is real and good for the census — a single-path
+		// regression cannot silently un-rule this leaf — but it makes a test
+		// over the shipped node mutation-INSENSITIVE by construction, because
+		// no single change can move it. So each path is pinned in isolation,
+		// and the shipped shape is kept to record that both cover it.
+		{"integer leaf, no placeholder (valueType path)",
+			&schemaNode{valueType: ValueInteger}, "1"},
+		{"non-numeric placeholder matching \"number\" (placeholder path)",
+			&schemaNode{placeholder: "<as-number>"}, "1"},
+		{"bgp peer-as as shipped — both paths cover it",
+			&schemaNode{valueType: ValueInteger, placeholder: "<as-number>",
+				validator: ValidateInteger(1, 4294967295)}, "1"},
 	} {
 		v1, v2, ok := synthPair(tc.node)
 		if !ok {
@@ -71,14 +101,22 @@ func TestHintExposedDivergencesStayVisible8662(t *testing.T) {
 		// This cell said what to do in its own failure message ("if the compact
 		// reader was FIXED, remove this line and say so"), and this is that.
 		//
-		// The protocols family is REPLACED rather than dropped, because the
-		// point of the list is one anchor per family the synthesis sweep
-		// exposed; losing the family silently narrows what a synthesis
-		// regression would be caught on. The replacement is the one protocols
-		// site family 4 deliberately did NOT normalize — its packed spelling is
-		// rejected by a commit gate, so it stays divergent and stays a valid
-		// anchor.
-		"protocols bgp group xpfarg neighbor xpfarg peer-as",
+		// The protocols family has NO membership anchor any more, and this is
+		// the one departure that could not be handled by replacement.
+		//
+		// `protocols bgp group <g> neighbor <n> peer-as` was the last divergent
+		// protocols site. #8690 classified it BENIGN — the gate objects to the
+		// dropped peer-as, and the pass restores it — and normalizing it emptied
+		// the family, so there is nothing left to point at. Replacing an anchor
+		// requires another divergent site in the same family; completion removes
+		// that option, which is a good outcome that costs a guard.
+		//
+		// The coverage is NOT dropped, it MOVED: the property this anchor
+		// proved — that synthesis still produces a valid value for that leaf —
+		// is now asserted directly in TestSynthPairUsesSchemaValueHints8662, on
+		// the node's shape rather than on its inventory membership. That form
+		// is strictly stronger here, because it keeps working after the site is
+		// fixed, which is precisely where the membership form stopped working.
 	} {
 		if !inInventory(want) {
 			t.Errorf("%q left the inventory. If the compact reader was FIXED, remove this line "+
