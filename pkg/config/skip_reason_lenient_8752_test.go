@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // #8752: a conservation exemption justified by "REFUSED at commit" is a
 // STRICT-path fact, and dupConservationSkipped8436 governs BOTH compile paths.
@@ -13,10 +16,19 @@ import "testing"
 //
 // This pins the LENIENT-path behaviour of the three entries in that group, so
 // the annotation is a measurement rather than prose. Two of them accept the
-// duplicate and silently keep both objects; one refuses on both paths and is
-// correctly skipped. If any of those three answers changes, this reds — and a
-// new entry added to that group owes the same measurement before its reason can
-// say "refused".
+// duplicate; one refuses on both paths and is correctly skipped. If any of
+// those three answers changes, this reds — and a new entry added to that group
+// owes the same measurement before its reason can say "refused".
+//
+// #8752 UPDATE — the two accepting entries used to keep BOTH objects silently,
+// and that was the defect. They now fold to ONE, because the #8752 merge runs
+// on exactly the path this cell is about. The strict-path premise is unchanged
+// and is still asserted below: both are still REFUSED at commit, so the skip
+// entries remain correctly skipped, and the reason they were suspect — that
+// their exemption rested on a strict-path-only fact — is what got answered
+// rather than what got removed. The expectations here and the census
+// annotation in duplicate_block_conservation_inventory_8436.go were updated
+// together, as this cell's own failure message required.
 func TestSkippedOnRefusalStillNeedsTheLenientAnswer8752(t *testing.T) {
 	cases := []struct {
 		name          string
@@ -31,7 +43,7 @@ func TestSkippedOnRefusalStillNeedsTheLenientAnswer8752(t *testing.T) {
 					policy p1 { match { source-address any; destination-address any; application any; } then { permit; } }
 					policy p1 { then { deny; } }
 				} } }`,
-			lenientAccept: true, wantObjects: 2,
+			lenientAccept: true, wantObjects: 1,
 		},
 		{
 			name: "security policies global policy",
@@ -39,7 +51,7 @@ func TestSkippedOnRefusalStillNeedsTheLenientAnswer8752(t *testing.T) {
 					policy g1 { match { source-address any; destination-address any; application any; } then { permit; } }
 					policy g1 { then { deny; } }
 				} } }`,
-			lenientAccept: true, wantObjects: 2,
+			lenientAccept: true, wantObjects: 1,
 		},
 		{
 			// Correctly skipped: refused on BOTH paths, so the exemption does
@@ -130,6 +142,29 @@ func TestSkippedOnRefusalStillNeedsTheLenientAnswer8752(t *testing.T) {
 // the occurrences into one policy carrying the operator's criteria must clear
 // LenientContentDropped. An implementation that removes the duplicate OBJECT
 // but leaves the flag set has not fixed the thing operators feel.
+//
+// #8752 HAS NOW LANDED, AND THIS CELL WAS RE-POINTED RATHER THAN DELETED — as
+// its own failure message instructed. It asserts the same chain, at the link
+// the fix changed:
+//
+//	before   duplicate -> second object -> LenientContentDropped -> sentinel -> whole snapshot rejected
+//	after    duplicate -> MERGED into the first occurrence -> flag CLEAR -> snapshot loads
+//
+// The second half of the chain is untouched and still pinned by
+// TestLenientWidenedPolicyLowersToSentinel5575: a policy that DOES carry the
+// flag still lowers to __unsupported__ and still fails the preflight. That is
+// the correct outcome — the flag is not wrong, the duplicate was. Breaking the
+// chain at its FIRST link is precisely what "fix the cause, not the symptom"
+// means here, and it is why the fold had to merge the occurrences rather than
+// suppress the flag on them.
+//
+// The measured equivalence that justifies the fold's SHAPE, recorded here
+// because it is the reason merging is not an invention: this fixture compiled
+// through the flat `set` spelling — the one operators actually type — produces
+// the SAME single policy, with the same terminal action and the same criteria,
+// and the same "2 conflicting terminal actions" warning. The two spellings
+// differ afterwards by exactly one warning: the hierarchical one additionally
+// reports the duplicate it merged, which the flat spelling never had.
 func TestTheDuplicatePolicyPoisonsTheSnapshot8752(t *testing.T) {
 	const text = `security {
   policies {
@@ -152,35 +187,67 @@ func TestTheDuplicatePolicyPoisonsTheSnapshot8752(t *testing.T) {
 	for _, pr := range cfg.Security.Policies {
 		pols = append(pols, pr.Policies...)
 	}
-	if len(pols) != 2 {
-		t.Fatalf("want the duplicate present as 2 objects, got %d. If this is now 1 the "+
-			"#8752 fold has landed — re-point this cell at the folded policy and assert "+
-			"LenientContentDropped is FALSE, which is the property the fold exists to "+
-			"deliver", len(pols))
+	if len(pols) != 1 {
+		t.Fatalf("want the duplicate FOLDED into 1 policy, got %d. If this is 2 again the "+
+			"#8752 fold has regressed: the second occurrence is back, it carries "+
+			"LenientContentDropped, and policies_lower.go will poison the snapshot so the "+
+			"operator's WHOLE configuration fails to load", len(pols))
 	}
-	// The operator's occurrence keeps its criteria and is NOT poisoned.
-	if got := pols[0].Match.SourceAddresses; len(got) != 1 || got[0] != "10.0.0.0/8" {
-		t.Errorf("policy[0] lost the operator's source criteria: %v", got)
+	got := pols[0]
+
+	// The operator's criteria survive the fold. A fix that produced one policy
+	// by discarding the occurrence that carried the match would be worse than
+	// the duplicate it replaced.
+	if src := got.Match.SourceAddresses; len(src) != 1 || src[0] != "10.0.0.0/8" {
+		t.Errorf("the folded policy lost the operator's source criteria: %v — the fold must "+
+			"MERGE into the first occurrence, not replace it", src)
 	}
-	if pols[0].LenientContentDropped {
-		t.Errorf("policy[0] is poisoned, but it carries a complete match — the harm would " +
-			"then not be attributable to the duplicate at all")
+	if len(got.Match.DestinationAddresses) == 0 || len(got.Match.Applications) == 0 {
+		t.Errorf("the folded policy lost destination/application criteria: dst=%d app=%d",
+			len(got.Match.DestinationAddresses), len(got.Match.Applications))
 	}
-	// The spurious occurrence is match-ANY (every dimension empty) and second.
-	if n := len(pols[1].Match.SourceAddresses) + len(pols[1].Match.DestinationAddresses) +
-		len(pols[1].Match.Applications); n != 0 {
-		t.Errorf("policy[1] has %d match tokens, want 0. The annotation's \"match-less\" "+
-			"description, and the match-ANY reading that follows from it, depend on this", n)
+
+	// THE CLAIM THAT MATTERS, inverted by the fix. This is the property #8752
+	// exists to deliver: no object carries the poison flag, so nothing lowers
+	// to __unsupported__ and the snapshot loads.
+	if got.LenientContentDropped {
+		t.Errorf("the folded policy carries LenientContentDropped. The fold removed the " +
+			"duplicate OBJECT but not the harm: policies_lower.go poisons such a rule with " +
+			"the __unsupported__ sentinel, the Rust integrity preflight rejects the WHOLE " +
+			"snapshot, and the operator's configuration does not load (previous-good " +
+			"retained; fresh-boot default-deny). That is the thing operators feel, and " +
+			"clearing it is the acceptance criterion this cell was written to hold (#8752)")
 	}
-	// THE CLAIM THAT MATTERS. If this stops holding, the census annotation's
-	// consequence paragraph is wrong and the #8752 fix is aimed at the wrong
-	// harm.
-	if !pols[1].LenientContentDropped {
-		t.Errorf("policy[1] does NOT carry LenientContentDropped. The census annotation " +
-			"(duplicate_block_conservation_inventory_8436.go) states that this flag is what " +
-			"makes policies_lower.go poison the rule with the __unsupported__ sentinel, so " +
-			"the Rust preflight rejects the WHOLE snapshot and the operator's config does " +
-			"not load. Without the flag that entire consequence paragraph is unsupported — " +
-			"correct the annotation rather than deleting this assertion (#8752)")
+
+	// Merging must not be SILENT. The strict path rejects this configuration,
+	// so a tolerant load that accepts it owes the operator a diagnostic —
+	// otherwise the fix converts a loud refusal into an invisible rewrite.
+	var warned bool
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "duplicate policy name") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Errorf("the fold merged without warning; warnings=%v. A configuration a strict "+
+			"commit REJECTS must not load silently just because the tolerant path can "+
+			"repair it", cfg.Warnings)
+	}
+
+	// The conflicting terminal action is still reported by the existing gate,
+	// and the fold resolves it the same way the flat `set` spelling does.
+	// Asserting it here keeps the fold from quietly becoming the thing that
+	// decides a policy's action.
+	var actionWarned bool
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "conflicting terminal actions") {
+			actionWarned = true
+		}
+	}
+	if !actionWarned {
+		t.Errorf("merging the two occurrences put `permit` and `deny` on one policy and no "+
+			"conflicting-terminal-action warning was raised; warnings=%v. The fold must not "+
+			"swallow that diagnosis — it is now the only thing telling the operator the two "+
+			"statements disagreed", cfg.Warnings)
 	}
 }

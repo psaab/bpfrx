@@ -210,6 +210,34 @@ func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) 
 	if !opts.skipCompactNormalize {
 		normalizeCompactStanzas(tree)
 	}
+	// #8752: fold a repeated named-instance statement into the first
+	// occurrence, on the TOLERANT path only. The strict path keeps rejecting
+	// (#3473) so the operator is still told to rename; the tolerant path cannot
+	// reject — it exists to boot a config already on disk — and its only other
+	// option is to split the statements into two policies, which is what it does
+	// today and which loses the second statement's content. Runs at BOTH compile
+	// entry points for the reason the comment above gives: a transform present on
+	// only one makes a peer compile the same config differently from the node
+	// that authored it.
+	//
+	// It also WARNS rather than merging silently. The #3473 gate's lenient arm
+	// exists to tell the operator their on-disk config has a duplicate; merging
+	// removes the duplicate and would therefore remove the diagnostic with it,
+	// swallowing exactly the information the gate was added to surface.
+	var dupMergeWarnings []string
+	if opts.lenientDuplicatePolicyNames {
+		for _, what := range mergeDuplicateNamedInstances(tree) {
+			// The wording deliberately carries "duplicate policy name" and
+			// "#3473": that is the existing contract for this diagnostic, and
+			// the #3473 cell matches on it. Merging must not silently retire a
+			// warning by rephrasing it.
+			dupMergeWarnings = append(dupMergeWarnings,
+				"duplicate policy name in `"+what+"` — the repeated statements were merged "+
+					"into the first occurrence on the tolerant path so the configuration "+
+					"loads as authored; a strict commit rejects the duplicate instead "+
+					"(#3473/#8752)")
+		}
+	}
 
 	// #1873 R-B: tunnel-endpoint id collision gate. Runs on the
 	// PRE-expansion tree (ExpandGroups removes the groups stanza) so
@@ -382,6 +410,7 @@ func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) 
 		cfg.Warnings = append(cfg.Warnings, `apply-groups "${node}" resolved using default node0 context during generic compile`)
 	}
 	cfg.Warnings = append(cfg.Warnings, tunnelIDWarnings...)
+	cfg.Warnings = append(cfg.Warnings, dupMergeWarnings...)
 	cfg.Warnings = append(cfg.Warnings, zoneIDWarnings...)
 	cfg.Warnings = append(cfg.Warnings, riTableIDWarnings...)
 	cfg.Warnings = append(cfg.Warnings, dupBlockWarnings...)
@@ -458,6 +487,34 @@ func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts
 	// see compact_normalize_8662.go.
 	if !opts.skipCompactNormalize {
 		normalizeCompactStanzas(tree)
+	}
+	// #8752: fold a repeated named-instance statement into the first
+	// occurrence, on the TOLERANT path only. The strict path keeps rejecting
+	// (#3473) so the operator is still told to rename; the tolerant path cannot
+	// reject — it exists to boot a config already on disk — and its only other
+	// option is to split the statements into two policies, which is what it does
+	// today and which loses the second statement's content. Runs at BOTH compile
+	// entry points for the reason the comment above gives: a transform present on
+	// only one makes a peer compile the same config differently from the node
+	// that authored it.
+	//
+	// It also WARNS rather than merging silently. The #3473 gate's lenient arm
+	// exists to tell the operator their on-disk config has a duplicate; merging
+	// removes the duplicate and would therefore remove the diagnostic with it,
+	// swallowing exactly the information the gate was added to surface.
+	var dupMergeWarnings []string
+	if opts.lenientDuplicatePolicyNames {
+		for _, what := range mergeDuplicateNamedInstances(tree) {
+			// The wording deliberately carries "duplicate policy name" and
+			// "#3473": that is the existing contract for this diagnostic, and
+			// the #3473 cell matches on it. Merging must not silently retire a
+			// warning by rephrasing it.
+			dupMergeWarnings = append(dupMergeWarnings,
+				"duplicate policy name in `"+what+"` — the repeated statements were merged "+
+					"into the first occurrence on the tolerant path so the configuration "+
+					"loads as authored; a strict commit rejects the duplicate instead "+
+					"(#3473/#8752)")
+		}
 	}
 
 	// #1873 R-B: union-of-groups tunnel id collision gate — see
@@ -609,6 +666,7 @@ func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts
 	}
 
 	cfg.Warnings = append(cfg.Warnings, tunnelIDWarnings...)
+	cfg.Warnings = append(cfg.Warnings, dupMergeWarnings...)
 	cfg.Warnings = append(cfg.Warnings, zoneIDWarnings...)
 	cfg.Warnings = append(cfg.Warnings, riTableIDWarnings...)
 	cfg.Warnings = append(cfg.Warnings, dupBlockWarnings...)
