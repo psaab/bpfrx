@@ -23,8 +23,22 @@ import (
 // EventRecord via logging.DecodeRawEventRecord / EventReader.ProcessRawEvent.
 //
 // Volume counters (offsets 56/64/112/120) and the created stamp (offset 108)
-// are intentionally 0 — the userspace dataplane does not yet maintain
-// per-session byte/packet accounting (tracked in #2501).
+// are intentionally 0 — this fixture exercises the DECODE path, and zero is a
+// legitimate wire value there.
+//
+// This comment previously said the dataplane "does not yet maintain
+// per-session byte/packet accounting (tracked in #2501)". That stopped being
+// true: userspace-dp/src/event_stream/codec/rt_flow.rs writes offsets 56 and
+// 64 from "real per-session forward volume harvested from the closing entry's
+// worker-owned counters", tagged #2501 in that file. #2501 is closed and the
+// work landed.
+//
+// Corrected under #8942, which is about this exact failure: a deferral comment
+// whose tracker is closed. It has two directions — the residual is still live
+// and now tracked nowhere, or (as here) the residual was DONE and the comment
+// still tells a reader the capability is missing. The second misleads about
+// current behaviour, which is how someone designs around an absence that is not
+// there.
 func buildSessionCloseRawEventV4(
 	proto uint8,
 	srcIP, dstIP [4]byte,
