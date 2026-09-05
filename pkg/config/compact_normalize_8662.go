@@ -828,6 +828,8 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		"host-inbound-traffic system-services",
 		"address-set address",
 		"address-set address-set",
+		"address-book address",
+		"global address",
 		"address-book address-set",
 		"policies default-policy-log",
 		"policies from-zone",
@@ -955,6 +957,7 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		return true
 	// firewall: 34 pairs.
 	case "filter term",
+		"firewall family",
 		"firewall policer",
 		"firewall three-color-policer",
 		"flexible-match-range range",
@@ -1500,19 +1503,38 @@ func normalizeCompactNodes(nodes []*Node, schema *schemaNode, inScope func(conta
 				node.Children = nil
 				node.IsLeaf = false
 				stmts := splitPackedStatements8768(tail, childSub)
-				for i, stmt := range stmts {
-					child := &Node{Keys: stmt, IsLeaf: true}
-					// The braced body belongs to the LAST packed statement --
-					// the deepest node the run names. Attaching it to the
-					// container, or to every statement, invents structure the
-					// operator did not write.
-					if i == len(stmts)-1 && len(body) > 0 {
-						child.Children = body
-						child.IsLeaf = false
+				// #8850: a braced body plus a MULTI-statement run is ambiguous --
+				// nothing in the tree says which statement the body belongs to.
+				// Measured: `address-book address-set s1 { address a1; } address a2
+				// ...;` compiled to the SET ONLY, losing a2, because the body was
+				// attached to the last statement while it belongs to the first.
+				//
+				// Decline rather than guess, per the #8768 rule for a tail outside
+				// the modelled grammar. A single-statement run is unambiguous (the
+				// body can only belong to it) and is exactly the zones/screens/
+				// host-inbound shape this relaxation exists for.
+				//
+				// Restore and fall THROUGH to the recursion below rather than
+				// `continue`: skipping it would leave the declined node's braced
+				// body unvisited, which is a change master does not make.
+				if len(body) > 0 && len(stmts) > 1 {
+					node.Keys = append(node.Keys, tail...)
+					node.Children = body
+				} else {
+					for i, stmt := range stmts {
+						child := &Node{Keys: stmt, IsLeaf: true}
+						// The braced body belongs to the LAST packed statement --
+						// the deepest node the run names. Attaching it to the
+						// container, or to every statement, invents structure the
+						// operator did not write.
+						if i == len(stmts)-1 && len(body) > 0 {
+							child.Children = body
+							child.IsLeaf = false
+						}
+						node.Children = append(node.Children, child)
 					}
-					node.Children = append(node.Children, child)
+					n++
 				}
-				n++
 			}
 		}
 		n += normalizeCompactNodes(node.Children, childSub, inScope)
@@ -1562,6 +1584,27 @@ func splitPackedStatements8768(tail []string, container *schemaNode) [][]string 
 		}
 		n, _ := consumeNodeKeys(rest, childSchema)
 		if n <= 0 || n > len(rest) {
+			return [][]string{tail}
+		}
+		// A CONTAINER head followed by more tokens is a NESTED ELISION, and the
+		// run cannot be split through it: nothing says whether what follows is
+		// the container's own elided BODY or a sibling statement. Splitting
+		// guesses "sibling", and that guess silently reparents data:
+		//
+		//	global address-set s1 address a1;
+		//	  split   -> address-set s1 (EMPTY) + a top-level address a1
+		//	             with no prefix
+		//	  whole   -> address-set s1 with member a1        (master, correct)
+		//
+		// The set still EXISTS after the bad split, just empty, with a phantom
+		// address beside it -- an object that reads as configured, which is the
+		// inversion this whole line of work exists to avoid. Both paths are
+		// silent: strict and lenient accept it either way.
+		//
+		// Returning the tail whole is exactly the pre-#8768 behaviour for this
+		// shape, so a container head costs the run its split rather than its
+		// meaning.
+		if len(childSchema.children) > 0 && n < len(rest) {
 			return [][]string{tail}
 		}
 		out = append(out, append([]string(nil), rest[:n]...))
