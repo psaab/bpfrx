@@ -1334,7 +1334,24 @@ func compileFilterThen(node *Node, term *FirewallFilterTerm) {
 		return
 	}
 
-	for _, child := range node.Children {
+	// issue 8939: FLATTEN A CHAIN BEFORE WALKING. The flat-set spelling
+	// `set … then count c1 dscp af11` is ONE command, and SetPath nests the
+	// leaves rather than making them siblings:
+	//
+	//	[then]
+	//	  [count c1]
+	//	    [dscp af11]
+	//
+	// so this loop -- which walks DIRECT children -- sees `count` and nothing
+	// else. The braced and packed-tail spellings are handled above and by
+	// packedStatements; this is the third shape.
+	//
+	// Same remedy as #6524's applicationDirectLeaves, and for the reason that
+	// issue recorded: the chain is a SUPPORTED spelling, so the reader learns
+	// to walk it rather than the schema learning to reject it -- a reject would
+	// leave the LENIENT path (boot load, HA SyncApply) untouched, which is
+	// exactly where already-stored configs are.
+	for _, child := range flattenThenChain8939(node.Children) {
 		switch child.Name() {
 		case "accept":
 			term.Action = "accept"
@@ -1402,4 +1419,74 @@ func compileFilterThen(node *Node, term *FirewallFilterTerm) {
 			term.UnknownActions = append(term.UnknownActions, child.Name())
 		}
 	}
+}
+
+// flattenThenChain8939 hoists actions that SetPath nested beneath a terminating
+// `then` action into siblings. Recursive: one `set` command can chain several.
+//
+// GATED ON THE SCHEMA, not applied blanket. `then reject <message-type>`
+// legitimately carries a body -- `reject` declares fourteen message-type
+// children -- and hoisting that would turn the message type into a sibling
+// action. Only an action the schema says holds NOTHING can have something
+// nested under it by the chain, and that is the discriminator.
+func flattenThenChain8939(children []*Node) []*Node {
+	var thenSchema *schemaNode
+	if fam := resolveSchemaChild(setSchema, "firewall"); fam != nil {
+		if f := resolveSchemaChild(fam, "family"); f != nil {
+			if inet := resolveSchemaChild(f, "inet"); inet != nil {
+				if filt := resolveSchemaChild(inet, "filter"); filt != nil {
+					if filt.wildcard != nil {
+						filt = filt.wildcard
+					}
+					if tm := resolveSchemaChild(filt, "term"); tm != nil {
+						if tm.wildcard != nil {
+							tm = tm.wildcard
+						}
+						thenSchema = resolveSchemaChild(tm, "then")
+					}
+				}
+			}
+		}
+	}
+	if thenSchema == nil {
+		return children
+	}
+	var out []*Node
+	changed := false
+	var visit func(n *Node)
+	visit = func(n *Node) {
+		if n == nil {
+			return
+		}
+		act := resolveSchemaChild(thenSchema, n.Name())
+		if act == nil || len(act.children) > 0 || act.wildcard != nil || len(n.Children) == 0 {
+			out = append(out, n)
+			return
+		}
+		// A terminating action carrying children: the chain. Keep the action,
+		// hoist what was nested under it.
+		changed = true
+		head := &Node{
+			Keys:       append([]string(nil), n.Keys...),
+			IsLeaf:     true,
+			Annotation: n.Annotation,
+			Inactive:   n.Inactive,
+			Line:       n.Line,
+			Column:     n.Column,
+		}
+		if n.KeysQuoted != nil {
+			head.KeysQuoted = append([]bool(nil), n.KeysQuoted...)
+		}
+		out = append(out, head)
+		for _, c := range n.Children {
+			visit(c)
+		}
+	}
+	for _, c := range children {
+		visit(c)
+	}
+	if !changed {
+		return children
+	}
+	return out
 }

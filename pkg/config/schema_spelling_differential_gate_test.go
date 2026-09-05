@@ -269,6 +269,60 @@ var mixedChildIsAModifierBlock = map[string]string{
 // entries create a second object rather than a second value.
 // ---------------------------------------------------------------------------
 var notAValueList = map[string]string{
+	// issue 8939: the filter-term `then` ACTIONS. These became comparable to
+	// this gate for the first time when `packedStatements` was declared on the
+	// two `then` nodes -- previously a run sat unsplit on the node's Keys and
+	// the gate could not reach the individual actions at all. So the gate is
+	// asking a question here that was never askable before, and the answer is
+	// that none of these is a value list:
+	//
+	//	accept / discard / log / syslog   args:0 -- no value to list
+	//	count / dscp / forwarding-class / loss-priority / policer /
+	//	routing-instance / traffic-class  args:1 -- exactly ONE value
+	//
+	// VERIFIED WHERE THE EXTRA TOKENS LAND, as this map's contract requires,
+	// rather than asserted from the arity:
+	//
+	//	then { count c1 c2; }        count="c1"        c2 DISCARDED
+	//	then { dscp af11 af21; }     dscp="af11"       af21 DISCARDED
+	//	then { accept extra1; }      action="accept"   extra1 DISCARDED
+	//
+	// strictRejects=false and warnings=0 on all three. The silent discard of a
+	// trailing token on a `then` action is a separate question from this issue
+	// -- it is malformed input rather than a lost list -- and is NOT fixed
+	// here; recorded so the next reader knows it was measured and scoped out
+	// rather than missed.
+	//
+	// REGISTERING THESE COSTS 14 SITES OF GATE COVERAGE (1098/706 -> 1076/692)
+	// and that cost is TRACKED AT ISSUE 8971 rather than absorbed here. The
+	// divergence these sites report is PRE-EXISTING -- they were invisible in
+	// a blind bucket until `packedStatements` made them comparable -- so this
+	// registration classifies leaves that were always non-lists; it does not
+	// hide something the fix broke. That distinction is the whole reason the
+	// tracker exists rather than a paragraph.
+	"firewall family inet filter <*> term <*> then accept":            "args:0 terminal action; extra tokens are DISCARDED, verified below",
+	"firewall family inet filter <*> term <*> then discard":           "args:0 terminal action; extra tokens are DISCARDED, verified below",
+	"firewall family inet filter <*> term <*> then log":               "args:0 flag; extra tokens are DISCARDED, verified below",
+	"firewall family inet filter <*> term <*> then syslog":            "args:0 flag; extra tokens are DISCARDED, verified below",
+	"firewall family inet filter <*> term <*> then count":             "args:1 — one counter name; extra tokens are DISCARDED, verified below",
+	"firewall family inet filter <*> term <*> then dscp":              "args:1 — one code point; extra tokens are DISCARDED, verified below",
+	"firewall family inet filter <*> term <*> then forwarding-class":  "args:1 — one class name; extra tokens are DISCARDED, verified below",
+	"firewall family inet filter <*> term <*> then loss-priority":     "args:1 — one priority; extra tokens are DISCARDED, verified below",
+	"firewall family inet filter <*> term <*> then policer":           "args:1 — one policer name; extra tokens are DISCARDED, verified below",
+	"firewall family inet filter <*> term <*> then routing-instance":  "args:1 — one instance name; extra tokens are DISCARDED, verified below",
+	"firewall family inet filter <*> term <*> then traffic-class":     "args:1 — one code point; extra tokens are DISCARDED, verified below",
+	"firewall family inet6 filter <*> term <*> then accept":           "args:0 terminal action; extra tokens are DISCARDED, verified below",
+	"firewall family inet6 filter <*> term <*> then discard":          "args:0 terminal action; extra tokens are DISCARDED, verified below",
+	"firewall family inet6 filter <*> term <*> then log":              "args:0 flag; extra tokens are DISCARDED, verified below",
+	"firewall family inet6 filter <*> term <*> then syslog":           "args:0 flag; extra tokens are DISCARDED, verified below",
+	"firewall family inet6 filter <*> term <*> then count":            "args:1 — one counter name; extra tokens are DISCARDED, verified below",
+	"firewall family inet6 filter <*> term <*> then dscp":             "args:1 — one code point; extra tokens are DISCARDED, verified below",
+	"firewall family inet6 filter <*> term <*> then forwarding-class": "args:1 — one class name; extra tokens are DISCARDED, verified below",
+	"firewall family inet6 filter <*> term <*> then loss-priority":    "args:1 — one priority; extra tokens are DISCARDED, verified below",
+	"firewall family inet6 filter <*> term <*> then policer":          "args:1 — one policer name; extra tokens are DISCARDED, verified below",
+	"firewall family inet6 filter <*> term <*> then routing-instance": "args:1 — one instance name; extra tokens are DISCARDED, verified below",
+	"firewall family inet6 filter <*> term <*> then traffic-class":    "args:1 — one code point; extra tokens are DISCARDED, verified below",
+
 	"applications application-set":  "named container: `application-set <name> { ... }`, not a value list",
 	"policy-options prefix-list":    "named container: `prefix-list <name> { <prefix>; }`",
 	"security nat destination pool": "named container: `pool <name> { ... }`",

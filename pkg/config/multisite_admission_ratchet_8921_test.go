@@ -108,6 +108,12 @@ func admittedDeclaringSites8921() map[string][]string {
 	return out
 }
 
+// SCOPE, so a reader does not mistake this for a gap: this walks ADMITTED PAIRS
+// -- entries in `compactNormalizeInScope`, which is keyed on (container, head)
+// and therefore reaches every container sharing that keyword. A
+// `packedStatements` opt-in is declared on a single schemaNode and cannot leak
+// to a same-named neighbour, so it is outside this population BY CONSTRUCTION
+// rather than by omission. See docs/config-schema.md.
 func TestMultisiteAdmissionsAreRecorded8921(t *testing.T) {
 	reg := multisiteRegistry8921(t)
 	if len(reg) == 0 {

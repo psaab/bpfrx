@@ -275,7 +275,29 @@ func gateLeafChangesWarnings(g gateLeaf, pre string, epath []string) bool {
 // drops 141 -> 140 (see the ceiling below). Both deltas are from this one
 // change -- ATTRIBUTED, not assumed: the only schema edit on this branch is
 // the #8844 declaration, and enumerated is unchanged at 1098.
-const gateCoverageFloor = 706
+// issue 8939 moves it 706 -> 692, a NET LOSS of 14 compared sites, and drops
+// the flag ceiling 209 -> 201. TRACKED AT ISSUE 8971 -- the drop is owed, not
+// justified: a floor that falls with a paragraph attached is absorbed, one that
+// falls with an open issue naming the sites is not.
+//
+// The sequence, because the middle step is counter-intuitive: `packedStatements`
+// on the two filter-term `then` nodes moved eight leaves OUT of the
+// value-less-flag blind bucket and made them comparable for the first time;
+// once comparable, 22 sites reported a #2419 shape-dependent drop; registering
+// them in notAValueList -- which this gate's own text prescribes for a leaf
+// that is not a list in any spelling -- removed them from enumeration.
+//
+// MEASURED, because the first reading was wrong: the divergence is PRE-EXISTING,
+// not introduced. `then { count c1 c2; }` and `then count c1 c2;` compile
+// IDENTICALLY, before and after the opt-in. The change exposed a divergence
+// among other spellings; it did not cause one.
+// ATTRIBUTED, not assumed: `packedStatements` on the two filter-term `then`
+// nodes means a run written on one line now SPLITS, so eight actions that were
+// previously unreachable to this gate -- they sat unsplit on the node's Keys
+// and read as value-less flags -- are now compared. `enumerated` is unchanged
+// at 1098, which is what says the movement is spelling coverage rather than a
+// change in the population.
+const gateCoverageFloor = 692
 
 var gateBlindCeiling = map[gateBlindClass]int{
 	// #7492 moved leaves out of `unreachable` in two rounds. The parent
@@ -479,7 +501,7 @@ var gateBlindCeiling = map[gateBlindClass]int{
 	// completion still offers only <[Enter]>, so it does not fix the defect. The
 	// children form was chosen on that measurement rather than on which number
 	// it moves.
-	gateBlindFlag: 209,
+	gateBlindFlag: 201, // 209 -> 201, issue 8939; coverage cost tracked at issue 8971
 	gateBlindErr:  43,
 	// TIGHTENED 1 -> 0. The single member of this class was
 	// `policy-options policy-statement <*> then`, and it is gone because the

@@ -304,9 +304,19 @@ func TestUnsplittablePairRatchet8880(t *testing.T) {
 	// population does not model, and the opt-in is not a candidate remedy for
 	// it. Same shape as the as-path correction recorded above: the cell's
 	// remedy advice is narrower than its membership.
+	// issue 8939 SHRINKS it 466 -> 460 at args>=1; args>=2 HOLDS at 100.
+	// `packedStatements` on the two filter-term `then` nodes means their packed
+	// runs SPLIT, so those pairs leave this population -- the SHRANK branch, and
+	// the constant is tightened rather than left loose.
+	//
+	// args>=2 holding is the expected divergence: every `then` action is args:0
+	// or args:1, so none was ever in that population. A change moving both
+	// would mean something else had happened.
+	//
+	// Re-derived at this base, twice, not computed as 466 - 6.
 	const (
 		wantArgs2 = 100
-		wantArgs1 = 466
+		wantArgs1 = 460
 	)
 	pairs2, _ := unsplittablePairs8880(2)
 	pairs1, conflict1 := unsplittablePairs8880(1)
