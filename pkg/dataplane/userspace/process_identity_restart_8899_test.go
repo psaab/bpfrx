@@ -473,7 +473,7 @@ func TestPollModeDefaultIsNotAProcessIdentityChange8899(t *testing.T) {
 // today; the type is what stops a third from drifting.
 func TestWritingADefaultExplicitlyIsNotAChange8899(t *testing.T) {
 	for _, c := range []struct {
-		field   string
+		field    string
 		explicit func(config.UserspaceConfig) config.UserspaceConfig
 		resolved func(config.UserspaceConfig) string
 	}{
