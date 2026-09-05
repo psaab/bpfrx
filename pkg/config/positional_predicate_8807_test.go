@@ -313,6 +313,16 @@ const posBlindness8807 = "\n\nWHAT THIS PREDICATE CANNOT SEE:\n" +
 	"field -- #8785's shape, which defeated predicate C five times.\n" +
 	"  (4) A head declared NOWHERE is excluded by design: that is #8787's predicate B, " +
 	"already enumerated there.\n" +
+	"  (5) FALSE NEGATIVE, and this is the serious one. The converse marks a head as " +
+	"READ if any .Name() clause at that container names it. It never checks that the " +
+	"clause does anything with the value, so a clause that reads into NOTHING is " +
+	"scored as a read and the row goes quiet -- which is #8785's own defect with a " +
+	"clause in front of it. `description` under `security ike proposal` is caught " +
+	"ONLY because no clause exists. The #8785 control therefore proves SENSITIVITY, " +
+	"not soundness: that the instrument fires when it should, never that it fires " +
+	"ONLY when it should. Answering \"unread\" properly means comparing whole " +
+	"compiled results with and without the statement, warnings included -- a " +
+	"behavioural predicate, not an AST one.\n" +
 	"So GREEN MEANS \"no new positional gap this predicate can localise\", NEVER \"the class " +
 	"is covered\".\n\n" +
 	"TWO INSTRUMENT BUGS THAT PRODUCED CONFIDENT WRONG ANSWERS HERE, so the next person " +
