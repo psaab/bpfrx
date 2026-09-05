@@ -545,7 +545,23 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			}},
 		}},
 		"destination": {desc: "Destination NAT configuration", children: map[string]*schemaNode{
-			"pool": {desc: "Destination NAT pool name", args: 1, valueHint: ValueHintPoolName, placeholder: "<pool-name>", children: nil},
+			// #8800 (follow-up): the SAME defect the source pool had, at the
+			// sibling path. compileNATDestination reads `address` here --
+			// parseDNATPoolAddress deliberately walks every token so
+			// `address <ip> port <n>` captures both -- but this pool declared
+			// `children: nil`, so the head was not a schema child, the
+			// brace-elision pass was never ASKED about it, and
+			// `destination pool <p> address <a>;` compiled to an EMPTY address
+			// while the braced spelling compiled correctly.
+			//
+			// groupReplace for the same reason as the source leaf: this one packs
+			// `port` onto its value list, so apply-groups token UNION would
+			// corrupt it -- measured, inheriting `address 10.0.0.2/32 port 8080;`
+			// over an inline `address 10.0.0.1/32 port 80;` compiled the ADDRESS
+			// as "8080".
+			"pool": {desc: "Destination NAT pool name", args: 1, valueHint: ValueHintPoolName, placeholder: "<pool-name>", children: map[string]*schemaNode{
+				"address": {desc: "Translated address (optionally with `port <n>`) for the destination NAT pool", args: 1, multi: true, groupReplace: true, placeholder: "<address>", children: nil},
+			}},
 			"rule-set": {desc: "Destination NAT rule-set name", args: 1, placeholder: "<rule-set-name>", children: map[string]*schemaNode{
 				// #3096: `from` scope by zone | interface | routing-instance.
 				// #3444: a destination-NAT rule-set has only a `from` clause —
