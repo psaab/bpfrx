@@ -1032,7 +1032,10 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			// (#8768). Declaring the arity is what makes the split possible.
 			"pre-shared-key": {desc: "Pre-shared key (ascii-text <key>)", args: 2, placeholder: "ascii-text <key>", children: nil},
 		}},
-		"gateway": {desc: "IKE gateway (VPN peer) name", args: 1, placeholder: "<gateway-name>", children: map[string]*schemaNode{
+		// packedStatements (#8768): compileIPsec reads address, external-interface,
+		// local-identity and the rest as separate statements; the packed spelling
+		// collapsed them into one node and lost everything after the first.
+		"gateway": {desc: "IKE gateway (VPN peer) name", args: 1, placeholder: "<gateway-name>", packedStatements: true, children: map[string]*schemaNode{
 			"address":            {desc: "Remote gateway address", args: 1, placeholder: "<address>", children: nil},
 			"local-address":      {desc: "Local IKE address", args: 1, placeholder: "<address>", children: nil},
 			"ike-policy":         {desc: "IKE policy reference", args: 1, placeholder: "<policy-name>", children: nil},
