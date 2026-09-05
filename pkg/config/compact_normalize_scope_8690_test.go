@@ -1508,3 +1508,94 @@ var knownDuplicatePairs8690 = []string{
 
 // itoa8690 keeps the reach-control message free of an extra import.
 func itoa8690(n int) string { return strconv.Itoa(n) }
+
+// #8690: no admitted (container, head) pair may be a rule that CANNOT FIRE.
+//
+// The pass folds a node only when `head` is a schema child of the node reached
+// by keyword `kw`. A pair with no such position anywhere in the schema can
+// never match anything — it sits in the switch reading as coverage, passes
+// review, and normalizes nothing.
+//
+// It arrived from a direction nobody was watching: the census fixture NESTS
+// every path segment, so for `family inet address 10.0.0.1/24` it records the
+// pair ("inet","address"), while the real spelling makes the pass ask
+// ("family","inet") first. Admitting the census's pair alone normalizes
+// NOTHING — measured: folds=0, addresses still empty — because the pass unfolds
+// outermost-first and the outer link is not admitted. So a scope rule derived
+// from the census path can be dead on arrival while the register and the
+// inventory both look satisfied.
+func TestNoAdmittedPairIsUnfireable8690(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "compact_normalize_8662.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse predicate source: %v", err)
+	}
+	admitted := map[string]bool{}
+	ast.Inspect(file, func(n ast.Node) bool {
+		cc, ok := n.(*ast.CaseClause)
+		if !ok {
+			return true
+		}
+		for _, e := range cc.List {
+			lit, ok := e.(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING {
+				continue
+			}
+			if v, err := strconv.Unquote(lit.Value); err == nil && strings.Contains(v, " ") {
+				admitted[v] = true
+			}
+		}
+		return true
+	})
+	if len(admitted) < 400 {
+		t.Fatalf("only %d admitted pairs parsed; the walk has lost reach over the "+
+			"predicate and this cell would report a clean scope for that reason "+
+			"(#8690)", len(admitted))
+	}
+
+	// Every schema position: keyword -> the set of names that are its children.
+	// The wildcard's children are recorded under the SAME keyword, because a
+	// wildcard is an ARGUMENT of its parent rather than a level of its own.
+	// Dropping that line makes 20 live pairs look dead, which is the mutation
+	// that proves the walk's completeness is load-bearing here.
+	kids := map[string]map[string]bool{}
+	var walk func(n *schemaNode, name string, depth int)
+	walk = func(n *schemaNode, name string, depth int) {
+		if n == nil || depth > 12 {
+			return
+		}
+		if kids[name] == nil {
+			kids[name] = map[string]bool{}
+		}
+		for cn, ch := range n.children {
+			kids[name][cn] = true
+			walk(ch, cn, depth+1)
+		}
+		if n.wildcard != nil {
+			walk(n.wildcard, name, depth+1)
+		}
+	}
+	walk(setSchema, "", 0)
+
+	var dead []string
+	for pair := range admitted {
+		f := strings.SplitN(pair, " ", 2)
+		if len(f) != 2 {
+			continue
+		}
+		if !kids[f[0]][f[1]] {
+			dead = append(dead, pair)
+		}
+	}
+	sort.Strings(dead)
+	if len(dead) > 0 {
+		t.Errorf("%d admitted pair(s) can NEVER fire — no schema position has the "+
+			"head as a child of the container: %v.\n"+
+			"Such a rule reads as coverage and normalizes nothing. The usual "+
+			"cause is deriving the pair from the CENSUS path, whose fixture nests "+
+			"every segment, instead of from the spelling production actually "+
+			"sees (#8690).", len(dead), dead)
+	}
+	t.Logf("#8690: %d admitted pairs, %d schema positions, %d unfireable",
+		len(admitted), len(kids), len(dead))
+}
