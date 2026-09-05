@@ -58,7 +58,9 @@ import (
 //
 // The SAME and NO-REFERENCE rows are the negative controls and are kept
 // deliberately: an instrument that flagged all 64 would be measuring itself.
-func TestSweepFull(t *testing.T) {
+// sweepPairVerdicts8859 is the MEASUREMENT: every site for every un-admitted
+// pair, keyed pair -> verdict -> an example leaf that produced it.
+func sweepPairVerdicts8859() (map[string]map[string]string, map[string]string, []string) {
 	dig := func(c *Config) string {
 		if c == nil {
 			return "<nil>"
@@ -102,10 +104,35 @@ func TestSweepFull(t *testing.T) {
 		return "<length only>"
 	}
 
-	type row struct{ pair, verdict, detail string }
-	var rows []row
-	seen := map[string]bool{}
-	counts := map[string]int{}
+	// EVERY SITE FOR A PAIR IS EVALUATED, not just the first.
+	//
+	// This loop used to `seen[pair]`-skip after the first site, so the published
+	// verdict was a property of WHICHEVER LEAF the enumeration reached first --
+	// and `collectCompactSites` order is not something a reader of the table can
+	// see. The gate column then claimed "this PAIR's elided spelling is refused
+	// / warned / silent" while the measurement supported only "the elided
+	// spelling OF THAT ONE LEAF was".
+	//
+	// They come apart whenever the strictness lives on the LEAF rather than on
+	// the container: a typed or validated leaf under an otherwise permissive
+	// container makes the whole pair read STRICT-REJECTS.
+	//
+	// MEASURED: 22 of 46 pairs disagree across their own sites. `interfaces
+	// <name>` alone yields SILENT (via link-speed), STRICT-REJECTS (via address)
+	// and WARNS (via periodic).
+	//
+	// THE DIRECTION OF THE ERROR IS THE HARMFUL ONE. This column is what decides
+	// admit-vs-decline, so a genuinely SILENT pair that happened to draw a strict
+	// leaf reads STRICT-REJECTS and gets skipped as "already loud" -- a silent
+	// drop, filed as handled. That is the `system login` trap inverted: there a
+	// handled row looked like a defect; here a defect row looks handled.
+	//
+	// So disagreement is published as its own verdict rather than resolved.
+	// Picking one would be choosing an answer from a sample of one and printing
+	// it with the authority of a measurement.
+	perPair := map[string]map[string]string{} // pair -> verdict -> example leaf
+	pairDetail := map[string]string{}
+	var pairOrder []string
 
 	for _, s := range collectCompactSites() {
 		if len(s.container) < 2 || strings.HasPrefix(s.container[0], "groups") {
@@ -113,14 +140,13 @@ func TestSweepFull(t *testing.T) {
 		}
 		stanza, child := s.container[0], s.container[1]
 		pair := stanza + " " + child
-		if seen[pair] || compactNormalizeInScope(stanza, child) {
+		if compactNormalizeInScope(stanza, child) {
 			continue
 		}
 		v1, _, ok := synthPair(s.node)
 		if !ok {
 			continue
 		}
-		seen[pair] = true
 		parent := s.container[:len(s.container)-1]
 		stanzaLeaf := s.container[len(s.container)-1]
 		inner := contextFor(parent) + stanzaLeaf + " " + s.leaf + " " + v1 + ";"
@@ -174,17 +200,66 @@ func TestSweepFull(t *testing.T) {
 			v = "CANDIDATE-DROP/" + g
 			d = firstDiff(dig(bc), dig(ec))
 		}
-		counts[v]++
-		rows = append(rows, row{pair, v, d})
+		if perPair[pair] == nil {
+			perPair[pair] = map[string]string{}
+			pairOrder = append(pairOrder, pair)
+		}
+		if _, dup := perPair[pair][v]; !dup {
+			perPair[pair][v] = s.leaf
+		}
+		if pairDetail[pair] == "" {
+			pairDetail[pair] = d
+		}
+	}
+	return perPair, pairDetail, pairOrder
+}
+
+type sweepRow8859 struct{ Pair, Verdict, Detail string }
+
+// sweepPublishedRows8859 is the PUBLICATION: it turns the measurement into the
+// rows the table prints, collapsing a pair to one verdict only when all of its
+// sites agree and emitting LEAF-CONTINGENT otherwise.
+//
+// TestSweepFull and TestSweepVerdictsAreNotSingleSample8859 BOTH call this.
+// The guard used to re-derive the measurement itself, which meant it asserted a
+// property of the DATA and said nothing about what the sweep PUBLISHES --
+// reverting the publication to one-verdict-per-pair left it green. One
+// predicate, one site to get wrong.
+func sweepPublishedRows8859() ([]sweepRow8859, map[string]int) {
+	perPair, pairDetail, pairOrder := sweepPairVerdicts8859()
+	var rows []sweepRow8859
+	counts := map[string]int{}
+	for _, pair := range pairOrder {
+		vs := perPair[pair]
+		if len(vs) == 1 {
+			for v := range vs {
+				counts[v]++
+				rows = append(rows, sweepRow8859{pair, v, pairDetail[pair]})
+			}
+			continue
+		}
+		var parts []string
+		for v, lf := range vs {
+			parts = append(parts, v+"(via "+lf+")")
+		}
+		sort.Strings(parts)
+		counts["LEAF-CONTINGENT"]++
+		rows = append(rows, sweepRow8859{pair, "LEAF-CONTINGENT",
+			"verdict depends on which leaf is synthesized: " + strings.Join(parts, " | ")})
 	}
 	sort.Slice(rows, func(i, j int) bool {
-		if rows[i].verdict != rows[j].verdict {
-			return rows[i].verdict < rows[j].verdict
+		if rows[i].Verdict != rows[j].Verdict {
+			return rows[i].Verdict < rows[j].Verdict
 		}
-		return rows[i].pair < rows[j].pair
+		return rows[i].Pair < rows[j].Pair
 	})
+	return rows, counts
+}
+
+func TestSweepFull(t *testing.T) {
+	rows, counts := sweepPublishedRows8859()
 	for _, r := range rows {
-		t.Logf("SW %-38s %-32s %s", r.pair, r.verdict, r.detail)
+		t.Logf("SW %-38s %-32s %s", r.Pair, r.Verdict, r.Detail)
 	}
 	t.Logf("SW === %d pairs swept: %v", len(rows), counts)
 }
@@ -304,4 +379,78 @@ func sweepGateVerdict8859(bracedText, elidedText string) string {
 		}
 	}
 	return "SILENT"
+}
+
+// #8859. A published sweep verdict must not be a single-sample claim.
+//
+// The sweep evaluates every site for a pair and publishes LEAF-CONTINGENT where
+// they disagree. This cell asserts the property that makes that worth doing:
+// the disagreement is REAL and the instrument can see it.
+//
+// Without it the fix is unfalsifiable — a sweep that never emits
+// LEAF-CONTINGENT looks identical whether the class is empty or the detection
+// is broken, which is the third state this file already documents for the WARNS
+// arm.
+//
+// THE SHAPE THAT MATTERS is a pair where one leaf says SAME and another says
+// CANDIDATE-DROP. That is the harmful direction: under first-site-wins the pair
+// could publish SAME — no defect — while a different leaf under it silently
+// loses its value. Measured at the time of writing, three pairs have exactly
+// that shape (`class-of-service classifiers` via inet-precedence vs dscp,
+// `class-of-service rewrite-rules` via exp vs dscp, and `system services`).
+func TestSweepVerdictsAreNotSingleSample8859(t *testing.T) {
+	// ASSERT ON WHAT THE SWEEP PUBLISHES, not on a re-derivation of it.
+	//
+	// The first version of this cell walked collectCompactSites() itself and
+	// built its own per-pair map. That asserted a property of the DATA -- true,
+	// and worth knowing -- while saying NOTHING about whether the sweep
+	// publishes the disagreement. Measured: reverting the publication to one
+	// verdict per pair left this cell GREEN.
+	//
+	// It is the fourth instance of that shape on this board in a day: a cell
+	// that verifies the ALGORITHM and not the WIRING, written in a change whose
+	// subject was measurement soundness. Re-deriving is the natural way to write
+	// the assertion, and the derived version passes for the right reason on the
+	// day you write it.
+	rows, counts := sweepPublishedRows8859()
+	if len(rows) == 0 {
+		t.Fatal("the sweep published no rows at all (#8859)")
+	}
+
+	contingent := 0
+	harmful := 0
+	for _, r := range rows {
+		if r.Verdict != "LEAF-CONTINGENT" {
+			continue
+		}
+		contingent++
+		// THE HARMFUL SHAPE: a pair whose sites include both SAME and a
+		// CANDIDATE-DROP. Under one-verdict-per-pair such a row could publish
+		// SAME -- no defect -- while another leaf under it silently drops.
+		if strings.Contains(r.Detail, "SAME(") && strings.Contains(r.Detail, "CANDIDATE-DROP") {
+			harmful++
+		}
+	}
+
+	if contingent == 0 {
+		t.Error("the sweep published NO LEAF-CONTINGENT row. Either every pair " +
+			"now agrees across its own sites, or the publication has gone back " +
+			"to collapsing a pair to one verdict -- and those look identical " +
+			"from the table. Check that sweepPublishedRows8859 still emits the " +
+			"contingent case before assuming the population changed (#8859)")
+	}
+	if harmful == 0 {
+		t.Error("no published LEAF-CONTINGENT row mixes SAME with " +
+			"CANDIDATE-DROP. That is the shape this cell exists for: a pair " +
+			"that would otherwise publish SAME -- no defect -- while another " +
+			"leaf under it silently loses its value. Contingency alone is only " +
+			"imprecision; this is the part that misleads (#8859)")
+	}
+	if counts["LEAF-CONTINGENT"] != contingent {
+		t.Errorf("the published counts disagree with the published rows: "+
+			"counts say %d LEAF-CONTINGENT, rows say %d (#8859)",
+			counts["LEAF-CONTINGENT"], contingent)
+	}
+	t.Logf("#8859: %d published rows, %d LEAF-CONTINGENT, %d of those mix SAME "+
+		"with CANDIDATE-DROP", len(rows), contingent, harmful)
 }
