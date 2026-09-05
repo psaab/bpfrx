@@ -107,9 +107,15 @@ func dedupHostInboundTokens(vals []string) []string {
 	return out
 }
 
-// zoneGroupInstances8794 is namedInstances with Junos's bracketed zone GROUP
+// bracketedGroupInstances8794 is namedInstances with Junos's bracketed zone GROUP
 // fanned out: `security-zone [ trust untrust ] { screen edge; }` yields one
 // instance per name, each sharing the body.
+//
+// #8810: NOT zone-specific despite where it lives. The same shape appears at
+// `chassis device-map interface [ a b ]` and `protocols ospf area <a>
+// interface [ a b ]`, so the helper is named for the SHAPE rather than the
+// container. It was `zoneGroupInstances8794` while zones were its only caller;
+// a zone-named helper enumerating a device-map reads as a mistake.
 //
 // #8794: namedInstances takes Keys[1] as the name and DISCARDS Keys[2:], so a
 // group produced only its first zone. Not a missing body -- the later zone was
@@ -145,7 +151,7 @@ func dedupHostInboundTokens(vals []string) []string {
 // Scoped to zones deliberately. namedInstances is shared by many containers and
 // fanning it out globally would change every one of them; that is a separate
 // decision with its own evidence.
-func zoneGroupInstances8794(nodes []*Node) []struct {
+func bracketedGroupInstances8794(nodes []*Node) []struct {
 	name string
 	node *Node
 } {
@@ -169,7 +175,7 @@ func zoneGroupInstances8794(nodes []*Node) []struct {
 }
 
 func compileZones(node *Node, sec *SecurityConfig) error {
-	for _, inst := range zoneGroupInstances8794(node.FindChildren("security-zone")) {
+	for _, inst := range bracketedGroupInstances8794(node.FindChildren("security-zone")) {
 		// #4818: find-or-create by name rather than always allocating a
 		// fresh ZoneConfig. A hand-authored `load override` config can carry
 		// two literal `security-zone <name> { ... }` TOP-LEVEL sibling

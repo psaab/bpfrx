@@ -56,7 +56,7 @@ func collectZoneNamesAST(securityNode *Node, out map[string]struct{}) {
 	if zonesNode == nil {
 		return
 	}
-	for _, inst := range zoneGroupInstances8794(zonesNode.FindChildren("security-zone")) {
+	for _, inst := range bracketedGroupInstances8794(zonesNode.FindChildren("security-zone")) {
 		if inst.name == "" {
 			continue
 		}
