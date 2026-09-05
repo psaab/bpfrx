@@ -824,12 +824,35 @@ func selectMSSToken(node *Node) (string, bool) {
 	// A genuine typo is still caught: `all-tcp msss 1350` selects "msss" and is
 	// refused, and `all-tcp mss` with no value selects "mss" and is refused.
 	// Only the exact keyword followed by a value token is consumed here.
+	//
+	// #8838 CORRECTS THAT SENTENCE. It was measured on the PACKED spelling and
+	// generalised to the braced one, which did not hold: braced
+	// `all-tcp { msss 1350; }` and `all-tcp { mss; }` were both ACCEPTED with
+	// the clamp silently at 0. The final branch below closes that.
 	if len(node.Keys) >= 3 && node.Keys[1] == "mss" {
 		return node.Keys[2], true
 	}
 	// Flat: ipsec-vpn 1360; (set syntax)
 	if len(node.Keys) >= 2 {
 		return node.Keys[1], true
+	}
+	// #8838: a BRACED body that yields no usable token is malformed, not empty.
+	//
+	// `all-tcp { msss 1350; }` has a child that is not `mss`; `all-tcp { mss; }`
+	// has the keyword with no value. Both reached here and returned "no token",
+	// which every caller reads as "nothing configured" — so the clamp silently
+	// sat at 0 while the packed spellings of the SAME mistakes were refused
+	// loudly. That asymmetry is the defect: the identical typo was loud in one
+	// spelling and silent in the other.
+	//
+	// Returning the offending keyword makes the braced form inherit the exact
+	// refusal the packed form already gives, rather than adding a second gate
+	// that could drift from it. An EMPTY body (`all-tcp { }`) still yields no
+	// token and stays accepted-as-unconfigured, which is what it is: the
+	// distinction is a body that says something unusable versus a body that
+	// says nothing.
+	if len(node.Children) > 0 {
+		return node.Children[0].Name(), true
 	}
 	return "", false
 }
