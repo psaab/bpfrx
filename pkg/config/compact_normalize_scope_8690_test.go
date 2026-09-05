@@ -348,6 +348,29 @@ func TestCompactNormalizeScopePreservesCompiledResult8690(t *testing.T) {
 			"stanza's own validator. Not a defect list; see the note above "+
 			"before treating a change in this number as one.", n)
 	}
+	// How much of the bucket is actually MEASURED. It reached zero unmeasured
+	// entries once; anything above zero is a widening that added an
+	// undecidable site without following the instruction in the message below.
+	// Reported rather than failed, because whether an unmeasured entry may land
+	// at all is a policy call across lanes rather than this cell's to make --
+	// but it is reported, because "recorded" and "measured" were previously
+	// indistinguishable here and that is what let a real disarm sit unnoticed.
+	if unmeasured := 0; true {
+		for _, v := range knownFixtureLimited8690 {
+			if v == notHandMeasured8690 {
+				unmeasured++
+			}
+		}
+		if unmeasured > 0 {
+			t.Logf("#8690: %d of %d entries in the gate-status-unknown bucket have "+
+				"NOT been hand-measured. This bucket held a real disarm before it "+
+				"was measured out; an entry here is a question, not a verdict.",
+				unmeasured, len(knownFixtureLimited8690))
+		} else {
+			t.Logf("#8690: all %d entries in the gate-status-unknown bucket carry a "+
+				"hand-measured verdict.", len(knownFixtureLimited8690))
+		}
+	}
 	if len(fixtureLimited) > 0 {
 		t.Logf("#8690: %d admitted site(s) could not have their gate status "+
 			"measured, because the census fixture's value fails a different "+
@@ -838,6 +861,37 @@ func dedupe8690(in []string) []string {
 // admitting a new one is a decision someone makes rather than a number that
 // moves.
 var knownFixtureLimited8690 = map[string]string{
+
+	// HAND-MEASURED IN BULK. Each was written out with a type-VALID value and
+	// the siblings its validator needs -- a NAT rule-set with a from/to zone
+	// and a then-block, a global address-book for the `-name` leaves, a policy
+	// with a then-block. That is what the census fixture cannot supply and why
+	// these read as undecidable to the arm.
+	"security nat destination rule-set xpfarg rule xpfarg match application":              natMatchBenign8690,
+	"security nat destination rule-set xpfarg rule xpfarg match destination-address":      natMatchBenign8690,
+	"security nat destination rule-set xpfarg rule xpfarg match destination-address-name": natMatchBenign8690,
+	"security nat destination rule-set xpfarg rule xpfarg match destination-port":         natMatchBenign8690,
+	"security nat destination rule-set xpfarg rule xpfarg match protocol":                 natMatchBenign8690,
+	"security nat destination rule-set xpfarg rule xpfarg match source-address":           natMatchBenign8690,
+	"security nat destination rule-set xpfarg rule xpfarg match source-address-name":      natMatchBenign8690,
+	"security nat source rule-set xpfarg rule xpfarg match application":                   natMatchBenign8690,
+	"security nat source rule-set xpfarg rule xpfarg match destination-address":           natMatchBenign8690,
+	"security nat source rule-set xpfarg rule xpfarg match destination-address-name":      natMatchBenign8690,
+	"security nat source rule-set xpfarg rule xpfarg match destination-port":              natMatchBenign8690,
+	"security nat source rule-set xpfarg rule xpfarg match source-address":                natMatchBenign8690,
+	"security nat source rule-set xpfarg rule xpfarg match source-address-name":           natMatchBenign8690,
+
+	"security policies from-zone xpfarg xpfarg xpfarg policy xpfarg match application":         policyMatchNoDisarm8690,
+	"security policies from-zone xpfarg xpfarg xpfarg policy xpfarg match destination-address": policyMatchNoDisarm8690,
+	"security policies from-zone xpfarg xpfarg xpfarg policy xpfarg match source-address":      policyMatchNoDisarm8690,
+	"security policies global policy xpfarg match application":                                 policyMatchNoDisarm8690,
+	"security policies global policy xpfarg match destination-address":                         policyMatchNoDisarm8690,
+	"security policies global policy xpfarg match source-address":                              policyMatchNoDisarm8690,
+
+	"protocols bgp group xpfarg neighbor xpfarg export": "HAND-MEASURED: SAFE. With a policy-statement defined and the group given a type and peer-as, BOTH spellings compile cleanly -- there is no gate here at all, and the arm read it as undecidable only because its minimal fixture lacked the referenced policy.",
+	"protocols bgp group xpfarg neighbor xpfarg import": "HAND-MEASURED: SAFE. With a policy-statement defined and the group given a type and peer-as, BOTH spellings compile cleanly -- there is no gate here at all, and the arm read it as undecidable only because its minimal fixture lacked the referenced policy.",
+
+	"security nat static rule-set xpfarg rule xpfarg match source-address": "HAND-MEASURED: NO DISARM POSSIBLE. With a complete static rule-set both spellings are REJECTED IDENTICALLY, so the pass changes no verdict here.",
 	// HAND-MEASURED. lane-8015 showed this bucket hides live disarms — it
 	// hand-measured the three its scope added and `security dynamic-address
 	// feed-server <n> url` proved to be a real one. So an entry carries the
@@ -893,31 +947,12 @@ var knownFixtureLimited8690 = map[string]string{
 	// bare, so the difference between "a person checked and it is fine" and
 	// "nobody has looked" is visible in the file. Every one is a candidate for
 	// the treatment above.
-	"protocols bgp group xpfarg neighbor xpfarg export":                                        notHandMeasured8690,
-	"protocols bgp group xpfarg neighbor xpfarg import":                                        notHandMeasured8690,
-	"security nat destination rule-set xpfarg rule xpfarg match application":                   notHandMeasured8690,
-	"security nat destination rule-set xpfarg rule xpfarg match destination-address":           notHandMeasured8690,
-	"security nat destination rule-set xpfarg rule xpfarg match destination-address-name":      notHandMeasured8690,
-	"security nat destination rule-set xpfarg rule xpfarg match destination-port":              notHandMeasured8690,
-	"security nat destination rule-set xpfarg rule xpfarg match protocol":                      notHandMeasured8690,
-	"security nat destination rule-set xpfarg rule xpfarg match source-address":                notHandMeasured8690,
-	"security nat destination rule-set xpfarg rule xpfarg match source-address-name":           notHandMeasured8690,
-	"security nat source rule-set xpfarg rule xpfarg match application":                        notHandMeasured8690,
-	"security nat source rule-set xpfarg rule xpfarg match destination-address":                notHandMeasured8690,
-	"security nat source rule-set xpfarg rule xpfarg match destination-address-name":           notHandMeasured8690,
-	"security nat source rule-set xpfarg rule xpfarg match destination-port":                   notHandMeasured8690,
-	"security nat source rule-set xpfarg rule xpfarg match source-address":                     notHandMeasured8690,
-	"security nat source rule-set xpfarg rule xpfarg match source-address-name":                notHandMeasured8690,
-	"security nat static rule-set xpfarg rule xpfarg match source-address":                     notHandMeasured8690,
-	"security policies from-zone xpfarg xpfarg xpfarg policy xpfarg match application":         notHandMeasured8690,
-	"security policies from-zone xpfarg xpfarg xpfarg policy xpfarg match destination-address": notHandMeasured8690,
-	"security policies from-zone xpfarg xpfarg xpfarg policy xpfarg match source-address":      notHandMeasured8690,
-	"security policies global policy xpfarg match application":                                 notHandMeasured8690,
-	"security policies global policy xpfarg match destination-address":                         notHandMeasured8690,
-	"security policies global policy xpfarg match source-address":                              notHandMeasured8690,
 }
 
 // notHandMeasured8690 marks a bucket entry nobody has measured by hand yet.
+// A NEW entry starts here and is expected to leave: write the site out with a
+// type-valid value and the siblings its validator needs, then replace this with
+// what you found. The count of entries still holding it is reported each run.
 // It is not a verdict; it is the absence of one.
 const notHandMeasured8690 = "NOT YET HAND-MEASURED: the census fixture could not decide, and no one has written this site out with a type-valid value to find out"
 
@@ -984,3 +1019,28 @@ func sortedKeys8690(m map[string]string) []string {
 	sort.Strings(out)
 	return out
 }
+
+// natMatchBenign8690 is the shared verdict for the thirteen `security nat
+// {source,destination} rule-set <r> rule <r> match <leaf>` sites. They are one
+// finding, not thirteen: every one trips the SAME gate for the SAME reason, and
+// writing the measurement out thirteen times would imply thirteen independent
+// confirmations of something established once.
+const natMatchBenign8690 = "HAND-MEASURED: BENIGN. Without the pass the elided " +
+	"spelling drops the criterion and #8430 refuses the result -- \"the match " +
+	"block constrains nothing, and the dataplane reads an EMPTY match set as " +
+	"UNCONSTRAINED -- this rule would translate EVERY packet reaching it, not " +
+	"none\". With the pass the criterion survives and it compiles. The decisive " +
+	"test is not the acceptance flip but that elided-with-pass compiles to a " +
+	"config IDENTICAL to the braced spelling's, verified directly: the gate " +
+	"objects to the DROP, not to the spelling."
+
+// policyMatchNoDisarm8690 covers the six `security policies ... match <leaf>`
+// sites, where the measurement is unusually direct: the ERROR TEXT ITSELF shows
+// the tail surviving.
+const policyMatchNoDisarm8690 = "HAND-MEASURED: NOT A DISARM, and it cannot " +
+	"become one. #3044 requires all three of source-address, destination-address " +
+	"and application, and the elided spelling can carry only ONE criterion, so " +
+	"BOTH spellings are rejected however good the fixture is. The pass is " +
+	"nonetheless demonstrably working, visible in the error shrinking: without " +
+	"it the gate reports three missing criteria, with it two. The surviving " +
+	"criterion is the one that was folded."
