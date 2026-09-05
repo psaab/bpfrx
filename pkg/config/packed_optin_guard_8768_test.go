@@ -55,6 +55,26 @@ type packedOptInCase8768 struct {
 	// comparison below. Required for every admitted leaf that is `multi: true`
 	// or `args >= 2`; see the same-leaf loop for why that is the population.
 	second map[string]string
+	// always is a statement the container CANNOT COMPILE WITHOUT, appended to
+	// BOTH arms of every comparison below.
+	//
+	// `security log stream <s>` is the first container to need it: a stream
+	// with no `host` does not compile at all, so a same-leaf fixture for any
+	// other leaf has BOTH arms at ABSENT and the non-vacuity check correctly
+	// refuses it -- a comparison of two nothings cannot tell a split from a
+	// swallow. That refusal is right and is not satisfiable by writing a better
+	// fixture, because the requirement is the container's, not the fixture's.
+	//
+	// The workaround does not exist either: declaring the stream in `prefix`
+	// and repeating the container statement does NOT help, because two
+	// `stream s1` blocks do not merge -- measured, the second block's
+	// `category` is discarded.
+	//
+	// It goes INSIDE the container body, so the packed arm packs it into the
+	// run exactly as an operator would write it. If the split works every
+	// statement survives; if it does not, the arms diverge and that is the
+	// signal this guard exists for.
+	always string
 	read   func(*Config) string
 }
 
@@ -399,6 +419,48 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 				"traffic-class":    "traffic-class af22",
 			},
 			read: firewallThenRead8939(true),
+		},
+		// issue 8932: the security-log stream, and the FIRST container to need
+		// `always`. A stream with no `host` does not compile, so without it
+		// every same-leaf comparison here has both arms ABSENT and the
+		// non-vacuity check refuses them -- correctly, and unsatisfiably.
+		//
+		// `host` is the existence requirement rather than a compared leaf: it
+		// appears once, in `always`, so the arms never carry it twice.
+		// `transport` is not admitted (args:0 with children), so a fixture for
+		// it would be inert.
+		"security/log/stream": {
+			prefix: "security { log { ",
+			open:   "stream s1",
+			closer: " } }",
+			always: "host 192.0.2.1",
+			stmts: map[string]string{
+				"category":         "category policy",
+				"facility":         "facility local0",
+				"format":           "format sd-syslog",
+				"port":             "port 5140",
+				"severity":         "severity info",
+				"source-address":   "source-address 192.0.2.9",
+				"source-interface": "source-interface ge-0/0/0.0",
+			},
+			second: map[string]string{
+				"category":         "category all",
+				"facility":         "facility local1",
+				"format":           "format syslog",
+				"port":             "port 5141",
+				"severity":         "severity warning",
+				"source-address":   "source-address 192.0.2.8",
+				"source-interface": "source-interface ge-0/0/1.0",
+			},
+			read: func(c *Config) string {
+				out := ""
+				for _, st := range c.Security.Log.Streams {
+					out += fmt.Sprintf("|%s host=%s cat=%s fac=%s fmt=%s port=%d sev=%s sa=%s si=%s",
+						st.Name, st.Host, st.Category, st.Facility, st.Format,
+						st.Port, st.Severity, st.SourceAddress, st.SourceInterface)
+				}
+				return out
+			},
 		},
 		"security/ipsec/proposal": {
 			prefix: "security { ipsec { ",
@@ -766,6 +828,19 @@ func TestPackedOptInHoldsForEveryLeafPair8768(t *testing.T) {
 				continue
 			}
 			if _, ok := c.stmts[leaf]; !ok {
+				// A leaf supplied as the container's EXISTENCE REQUIREMENT is
+				// already in BOTH arms of every comparison and is observed by
+				// `read`, so it IS compared -- just not with a varying value.
+				// Demanding a second fixture for it would put the statement in
+				// twice, which tests duplicate-leaf handling rather than the
+				// split.
+				//
+				// It is still exercised in the direction that matters: if the
+				// packed run fails to split, the existence statement is lost
+				// with everything else and every arm diverges at once.
+				if c.alwaysLeaf() == leaf {
+					continue
+				}
 				t.Errorf("container %q admits leaf %q with no fixture statement, so "+
 					"its packed spelling is never compared against its braced one "+
 					"(#8768)", name, leaf)
@@ -779,8 +854,8 @@ func TestPackedOptInHoldsForEveryLeafPair8768(t *testing.T) {
 				if a == b {
 					continue
 				}
-				packed := c.prefix + c.open + " " + c.stmts[a] + " " + c.stmts[b] + ";" + c.closer
-				braced := c.prefix + c.open + " { " + c.stmts[a] + "; " + c.stmts[b] + "; }" + c.closer
+				packed := c.prefix + c.open + " " + c.alwaysPacked() + c.stmts[a] + " " + c.stmts[b] + ";" + c.closer
+				braced := c.prefix + c.open + " { " + c.alwaysBraced() + c.stmts[a] + "; " + c.stmts[b] + "; }" + c.closer
 				got, want := compile(packed, c.read), compile(braced, c.read)
 				checked++
 				// NEITHER ARM MAY BE A COMPILE FAILURE. Without this the loop
@@ -928,8 +1003,8 @@ func TestPackedOptInHoldsForEveryLeafPair8768(t *testing.T) {
 					name, leaf)
 				continue
 			}
-			packed := c.prefix + c.open + " " + first + " " + sec + ";" + c.closer
-			braced := c.prefix + c.open + " { " + first + "; " + sec + "; }" + c.closer
+			packed := c.prefix + c.open + " " + c.alwaysPacked() + first + " " + sec + ";" + c.closer
+			braced := c.prefix + c.open + " { " + c.alwaysBraced() + first + "; " + sec + "; }" + c.closer
 			got, want := compile(packed, c.read), compile(braced, c.read)
 			sameChecked++
 
@@ -980,7 +1055,7 @@ func TestPackedOptInHoldsForEveryLeafPair8768(t *testing.T) {
 			// The second instance must MOVE the reader's output. If one instance
 			// and two produce the same string, the fixture cannot distinguish a
 			// split run from a swallowed one no matter what the packed arm does.
-			bracedOne := c.prefix + c.open + " { " + first + "; }" + c.closer
+			bracedOne := c.prefix + c.open + " { " + c.alwaysBraced() + first + "; }" + c.closer
 			if one := compile(bracedOne, c.read); one == want {
 				key := name + " " + leaf + "+" + leaf
 				if reason, ok := sameLeafUnobservable[key]; ok {
@@ -1054,8 +1129,8 @@ func TestPackedOptInHoldsForEveryLeafPair8768(t *testing.T) {
 		}
 		for i := 0; i+2 < len(leaves); i++ {
 			a, b, d := leaves[i], leaves[i+1], leaves[i+2]
-			packed := c.prefix + c.open + " " + c.stmts[a] + " " + c.stmts[b] + " " + c.stmts[d] + ";" + c.closer
-			braced := c.prefix + c.open + " { " + c.stmts[a] + "; " + c.stmts[b] + "; " + c.stmts[d] + "; }" + c.closer
+			packed := c.prefix + c.open + " " + c.alwaysPacked() + c.stmts[a] + " " + c.stmts[b] + " " + c.stmts[d] + ";" + c.closer
+			braced := c.prefix + c.open + " { " + c.alwaysBraced() + c.stmts[a] + "; " + c.stmts[b] + "; " + c.stmts[d] + "; }" + c.closer
 			got, want := compile(packed, c.read), compile(braced, c.read)
 			runChecked++
 			if strings.HasPrefix(want, "<") || strings.HasPrefix(got, "<") {
@@ -1238,4 +1313,30 @@ func firewallThenRead8939(v6 bool) func(*Config) string {
 		}
 		return out
 	}
+}
+
+// alwaysPacked renders the container's existence requirement for a PACKED arm:
+// part of the run, with a trailing space, or empty when the container has none.
+func (c packedOptInCase8768) alwaysPacked() string {
+	if c.always == "" {
+		return ""
+	}
+	return c.always + " "
+}
+
+// alwaysBraced renders it for a BRACED arm: its own statement.
+func (c packedOptInCase8768) alwaysBraced() string {
+	if c.always == "" {
+		return ""
+	}
+	return c.always + "; "
+}
+
+// alwaysLeaf names the leaf the container's existence requirement supplies, or
+// "" when there is none.
+func (c packedOptInCase8768) alwaysLeaf() string {
+	if c.always == "" {
+		return ""
+	}
+	return strings.Fields(c.always)[0]
 }

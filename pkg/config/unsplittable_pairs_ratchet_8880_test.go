@@ -314,9 +314,26 @@ func TestUnsplittablePairRatchet8880(t *testing.T) {
 	// would mean something else had happened.
 	//
 	// Re-derived at this base, twice, not computed as 466 - 6.
+	// issue 8932 SHRINKS it 460 -> 452 at args>=1; args>=2 HOLDS at 100.
+	// `packedStatements` on the `security log stream` node means its packed run
+	// SPLITS, so its eight pairs leave this population -- the SHRANK branch,
+	// and the constant is tightened rather than left loose.
+	//
+	// args>=2 holding is the expected divergence: every stream leaf is args:1,
+	// so none was ever in that population.
+	//
+	// AND THIS MEMBER IS A THIRD CAUSE THE ADVICE ABOVE DOES NOT FIT -- the
+	// note this cell now carries about membership being broader than the
+	// remedy. `stream <s>` is ARG-NAMED, so a pair-keyed admission is
+	// structurally unreachable: production calls the predicate with ("s1",
+	// "category"), never ("stream", "category"). Every pair up its chain was
+	// already admitted and every one inert. The remedy had to be a NODE opt-in;
+	// no admission could have worked.
+	//
+	// Re-derived at this base, twice, not computed as 460 - 8.
 	const (
 		wantArgs2 = 100
-		wantArgs1 = 460
+		wantArgs1 = 452
 	)
 	pairs2, _ := unsplittablePairs8880(2)
 	pairs1, conflict1 := unsplittablePairs8880(1)

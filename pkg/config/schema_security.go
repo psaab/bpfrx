@@ -753,7 +753,25 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			valueType: ValueIdentifier, valueDesc: "interface name (optionally .<unit>)",
 			valueExamples: []string{"ge-0-0-0", "reth1.100"},
 			validator:     ValidateSyslogSourceInterface, children: nil},
-		"stream": {desc: "Syslog stream name", args: 1, valueHint: ValueHintStreamName, placeholder: "<stream-name>", children: map[string]*schemaNode{
+		// issue 8932/8936: packedStatements so a run written on one line --
+		// `stream s1 host 192.0.2.1 category policy;` -- splits into siblings
+		// instead of landing whole on the node's Keys, where every statement
+		// after the first is dropped.
+		//
+		// The `category` loss FAILS OPEN: daemon_system.go sets Categories only
+		// when the field is non-empty, and logging/syslog.go documents
+		// Categories == 0 as ALL. A stream the operator scoped to `policy`
+		// silently carries EVERY category -- more data leaving the box than
+		// configured.
+		//
+		// AN ADMISSION CANNOT WORK HERE, which is why this is a node opt-in.
+		// `stream <s>` is ARG-NAMED, so production calls the scope predicate
+		// with the operator's actual stream name -- ("s1", "category"), never
+		// ("stream", "category"). Every pair up this chain is already admitted
+		// and every one of them inert. See docs/config-schema.md on why a
+		// pair-keyed admission is structurally unreachable for an arg-named
+		// container.
+		"stream": {desc: "Syslog stream name", args: 1, packedStatements: true, valueHint: ValueHintStreamName, placeholder: "<stream-name>", children: map[string]*schemaNode{
 			"host": {desc: "Syslog server address", args: 1, placeholder: "<address>", children: nil},
 			// `port` validation (direct AND nested host{port}) lives in the
 			// validateSecurityLogStreamPortsAST compiler pass (#3349): the
