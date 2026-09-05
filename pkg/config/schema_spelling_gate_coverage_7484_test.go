@@ -161,7 +161,12 @@ func classifyGateBlindLeaf(g gateLeaf) gateBlindClass {
 // +2 here. The gate itself asked for this: it reports a floor it can now beat
 // as "COVERAGE IMPROVED — TIGHTEN THE RATCHET (this is a good failure)", and
 // leaving it slack would let a later regression drop back to 689 unnoticed.
-const gateCoverageFloor = 705
+//
+// #8800 raised it 705 -> 706. Declaring `address` under `security nat
+// source pool` made that spelling COMPARE (+1); every blind bucket held
+// at its ceiling (141/179/43/1), so the new leaf is genuinely gate-covered
+// rather than having moved into a blind class.
+const gateCoverageFloor = 706
 
 var gateBlindCeiling = map[gateBlindClass]int{
 	// #7492 moved leaves out of `unreachable` in two rounds. The parent

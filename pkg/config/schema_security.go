@@ -399,6 +399,13 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			// accepts the un-modeled flat-leaf shape and ACCUMULATES across
 			// both shapes, so an old on-disk config keeps compiling.
 			"pool": {desc: "Source NAT pool name", args: 1, valueHint: ValueHintPoolName, placeholder: "<pool-name>", children: map[string]*schemaNode{
+				// #8800: the compiler has read `address` under a source NAT pool
+				// since #4521 (multi-value: Keys[1:] plus block children), but the
+				// schema never declared it. Undeclared meant (a) completion never
+				// offered it and (b) it was not a schema child, so the brace-elision
+				// pass was never even ASKED about (pool, address) and the packed
+				// spelling `pool p1 address <a>;` compiled to a ZERO-address pool.
+				"address": {desc: "Address or range in the source NAT pool", args: 1, multi: true, placeholder: "<address>", children: nil},
 				"port": {desc: "Source pool port block configuration", children: map[string]*schemaNode{
 					// #3906: `range <low> to <high>` (Junos) and the legacy
 					// `range low <lo> high <hi>` both collapse onto this multi
