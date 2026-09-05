@@ -133,3 +133,57 @@ func TestElidedAddressBook8850(t *testing.T) {
 		}
 	})
 }
+
+// #8850 REGRESSION. Opting the address books in to the #8768 split made the
+// splitter cut through `address-set`, which is args:1 WITH children -- a
+// CONTAINER. Everything after a container head in a packed run is that
+// container's elided BODY, not a sibling, and splitting it reparented the data:
+//
+//	security { address-book { global address-set s1 address a1; } }
+//	  master  set:s1(members=[a1])
+//	  broken  set:s1(members=[])  PLUS a top-level address a1 with NO prefix
+//
+// The set still EXISTED, just empty, with a phantom address beside it. That is
+// the missing-becomes-EMPTY inversion this whole issue exists to avoid, and it
+// was silent on BOTH paths -- strict and lenient both accept it.
+//
+// It also shows why the #8768 pair guard could not see it: that cell spells the
+// set BRACED (`address-set s1 { address a1; }`), which lands in the decline
+// branch and never reaches the splitter. The ELIDED spelling is a different
+// path through the same container, so this cell asserts on it directly.
+func TestPackedAddressSetKeepsItsMembers8850(t *testing.T) {
+	for _, tc := range []struct{ name, txt string }{
+		{"global-elided", "security { address-book { global address-set s1 address a1; } }"},
+		{"global-braced", "security { address-book { global { address-set s1 address a1; } } }"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tree, errs := NewParser(tc.txt).Parse()
+			if len(errs) > 0 {
+				t.Fatalf("parse: %v", errs)
+			}
+			cfg, err := CompileConfigLenient(tree)
+			if err != nil {
+				t.Fatalf("compile: %v", err)
+			}
+			if cfg.Security.AddressBook == nil {
+				t.Fatalf("no global address book compiled from %q", tc.txt)
+			}
+			set, ok := cfg.Security.AddressBook.AddressSets["s1"]
+			if !ok {
+				t.Fatalf("address-set s1 absent from %q", tc.txt)
+			}
+			// The set EXISTING is not the assertion -- it existed while broken.
+			if len(set.Addresses) != 1 || set.Addresses[0] != "a1" {
+				t.Errorf("address-set s1 lost its member: got %v, want [a1] (#8850)\n"+
+					"  %s\nA container head in a packed run owns everything after "+
+					"it; splitting there turns its body into siblings and leaves "+
+					"the set EMPTY but present.", set.Addresses, tc.txt)
+			}
+			// The member must NOT also appear as a top-level address.
+			if _, phantom := cfg.Security.AddressBook.Addresses["a1"]; phantom {
+				t.Errorf("`a1` was reparented into a top-level address entry as "+
+					"well as (or instead of) a member of s1 (#8850): %s", tc.txt)
+			}
+		})
+	}
+}

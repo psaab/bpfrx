@@ -1540,6 +1540,27 @@ func splitPackedStatements8768(tail []string, container *schemaNode) [][]string 
 		if n <= 0 || n > len(rest) {
 			return [][]string{tail}
 		}
+		// A CONTAINER head followed by more tokens is a NESTED ELISION, and the
+		// run cannot be split through it: nothing says whether what follows is
+		// the container's own elided BODY or a sibling statement. Splitting
+		// guesses "sibling", and that guess silently reparents data:
+		//
+		//	global address-set s1 address a1;
+		//	  split   -> address-set s1 (EMPTY) + a top-level address a1
+		//	             with no prefix
+		//	  whole   -> address-set s1 with member a1        (master, correct)
+		//
+		// The set still EXISTS after the bad split, just empty, with a phantom
+		// address beside it -- an object that reads as configured, which is the
+		// inversion this whole line of work exists to avoid. Both paths are
+		// silent: strict and lenient accept it either way.
+		//
+		// Returning the tail whole is exactly the pre-#8768 behaviour for this
+		// shape, so a container head costs the run its split rather than its
+		// meaning.
+		if len(childSchema.children) > 0 && n < len(rest) {
+			return [][]string{tail}
+		}
 		out = append(out, append([]string(nil), rest[:n]...))
 		rest = rest[n:]
 	}
