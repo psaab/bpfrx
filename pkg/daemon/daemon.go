@@ -134,7 +134,11 @@ type Daemon struct {
 	// way to ask it, and the reason #7409's staleness window went unnoticed
 	// long enough to need #7437.
 	routeListenerMarks atomic.Uint64
-	routeListenerLoop  atomic.Pointer[coalesce.Loop]
+	// routeListenerErrors counts netlink subscription errors (#8915). Each one
+	// forces a coalescer mark, because the bounded update channel means an
+	// overflow drops the only refresh edge the daemon has.
+	routeListenerErrors atomic.Uint64
+	routeListenerLoop   atomic.Pointer[coalesce.Loop]
 
 	// #7194: last session-delta schema fingerprint advertised by the RUNNING
 	// helper, recorded from the ProcessStatus that DrainSessionDeltas returns.
