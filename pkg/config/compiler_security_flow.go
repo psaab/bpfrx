@@ -415,11 +415,21 @@ var tcpMSSKinds = []string{"ipsec-vpn", "gre-in", "gre-out", "all-tcp"}
 //
 // The packed leaf's trailing keys are surfaced as a synthetic option node so
 // BOTH readers see the same thing — one source of truth for the shape, rather
-// than two loops that would drift. The synthetic node deliberately carries the
-// tokens VERBATIM: `tcp-mss all-tcp mss 1350` therefore yields
-// Keys=["all-tcp","mss","1350"] and inherits the SAME rejection the
-// half-packed form already gives (selectMSSToken picks the literal "mss"),
-// because `mss` is the hierarchical keyword and is a typo when inline.
+// than two loops that would drift. The synthetic node carries the tokens
+// VERBATIM: `tcp-mss all-tcp mss 1350` yields Keys=["all-tcp","mss","1350"].
+//
+// #8824 CORRECTED WHAT HAPPENS NEXT. This comment used to say that spelling
+// "inherits the SAME rejection the half-packed form already gives ... because
+// `mss` is the hierarchical keyword and is a typo when inline". That reasoning
+// does not hold: flat set IS hierarchical keywords written inline, which is
+// what CLAUDE.md's dual-AST rule says, and xpf accepts the braced
+// `all-tcp { mss 1350; }` — so it has to accept the flattening of it.
+// selectMSSToken now consumes the exact keyword `mss` followed by a token.
+//
+// A genuine typo is still refused, and that is the distinction the old
+// reasoning conflated with this one: `all-tcp msss 1350` selects "msss" and
+// fails, and `all-tcp mss` with no value selects "mss" and fails. Only the
+// exact keyword plus a value is consumed.
 func tcpMSSOptionNodes(mssNode *Node) []*Node {
 	out := mssNode.Children
 	if len(mssNode.Keys) > 1 {

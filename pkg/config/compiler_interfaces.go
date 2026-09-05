@@ -795,6 +795,18 @@ func selectMSSToken(node *Node) (string, bool) {
 		if _, err := strconv.Atoi(mssChild.Keys[1]); err == nil {
 			return mssChild.Keys[1], true
 		}
+		// #8824: the child is present and UNPARSEABLE. Falling through is
+		// correct only when a flat token exists to fall through TO — that is
+		// the #1979 mixed-shape precedence above. With no flat token there is
+		// nothing to select, and returning false here reported "no value
+		// configured" for a config that plainly configures one:
+		// `all-tcp { mss notanint; }` committed clean, clamped nothing, and
+		// warned nobody, while the same bad token flat was rejected and an
+		// out-of-range value in the SAME braced shape was rejected. Return the
+		// unparseable token so the gates that already exist can refuse it.
+		if len(node.Keys) < 2 {
+			return mssChild.Keys[1], true
+		}
 	}
 	// Flat: ipsec-vpn 1360; (set syntax)
 	if len(node.Keys) >= 2 {
