@@ -314,7 +314,20 @@ const posBlindness8807 = "\n\nWHAT THIS PREDICATE CANNOT SEE:\n" +
 	"  (4) A head declared NOWHERE is excluded by design: that is #8787's predicate B, " +
 	"already enumerated there.\n" +
 	"So GREEN MEANS \"no new positional gap this predicate can localise\", NEVER \"the class " +
-	"is covered\"."
+	"is covered\".\n\n" +
+	"TWO INSTRUMENT BUGS THAT PRODUCED CONFIDENT WRONG ANSWERS HERE, so the next person " +
+	"changing this cell is told rather than rediscovering:\n" +
+	"  (a) DO NOT REUSE THE ARITY CENSUS SITE COLLECTOR. compilerCaseIndices8807 records " +
+	"only clauses containing a CONSTANT Keys[i] -- the arity-shaped subset. The #8800 " +
+	"site reads `prop.Keys[1:]`, a SLICE, so that collector never sees it and this " +
+	"predicate FAILS its own #8800 control while otherwise looking like it works. An " +
+	"existence predicate needs every clause of every .Name() switch. That is the same " +
+	"shape as predicate A's `pre-shared-key` control, which kept firing after its fix: a " +
+	"control that cannot discriminate reads as diligence.\n" +
+	"  (b) KEY THE SCHEMA WALK ON (node, NAME), NOT node. A schema node reached under a " +
+	"second container name must record its children under BOTH; keying on the node alone " +
+	"made `application-set` report zero children and manufactured three false hits. A walk " +
+	"with that bug is a false-positive generator, and its hits cannot be adjudicated."
 
 func TestPositionalPredicateIsRatcheted8807(t *testing.T) {
 	hits := positionalHits8807(t)
