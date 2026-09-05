@@ -45,10 +45,21 @@ type packedOptInCase8768 struct {
 	open   string            // the container statement itself, e.g. `trap-group tg1`
 	closer string            // text after
 	stmts  map[string]string // admitted leaf -> a REAL statement for it
+	// second holds a DIFFERENT instance of the same leaf, for the same-leaf
+	// comparison below. Required for every admitted leaf that is `multi: true`
+	// or `args >= 2`; see the same-leaf loop for why that is the population.
+	second map[string]string
 	read   func(*Config) string
 }
 
 func packedOptInCases8768() map[string]packedOptInCase8768 {
+	// A SECOND declared proposal, so `proposals pr2` in the same-leaf fixture
+	// references something real. Pointing the second instance at pr1 would make
+	// the two statements identical, and a same-leaf comparison built from two
+	// identical statements cannot tell a split from a swallow.
+	const ikeProp2 = "proposal pr2 { authentication-method pre-shared-keys; " +
+		"dh-group group14; authentication-algorithm sha1; " +
+		"encryption-algorithm aes-128-cbc; }"
 	const ikeProp = "proposal pr1 { authentication-method pre-shared-keys; dh-group group14; " +
 		"authentication-algorithm sha1; encryption-algorithm aes-128-cbc; }"
 	return map[string]packedOptInCase8768{
@@ -74,6 +85,10 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 				"remote-identity":     "remote-identity hostname bar",
 				"dead-peer-detection": "dead-peer-detection",
 				"dynamic":             "dynamic hostname peer.example",
+			},
+			second: map[string]string{
+				"local-identity":  "local-identity hostname foo2",
+				"remote-identity": "remote-identity hostname bar2",
 			},
 			read: func(c *Config) string {
 				out := ""
@@ -107,6 +122,10 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 				"dead-peer-detection": "dead-peer-detection",
 				"dynamic":             "dynamic hostname peer.example",
 			},
+			second: map[string]string{
+				"local-identity":  "local-identity hostname foo2",
+				"remote-identity": "remote-identity hostname bar2",
+			},
 			read: func(c *Config) string {
 				out := ""
 				for _, g := range c.Security.IPsec.Gateways {
@@ -129,6 +148,10 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 				"targets":    "targets 10.0.0.1",
 				"version":    "version v2",
 				"categories": "categories authentication",
+			},
+			second: map[string]string{
+				"targets":    "targets 10.0.0.2",
+				"categories": "categories link",
 			},
 			read: func(c *Config) string {
 				if c.System.SNMP == nil {
@@ -230,6 +253,9 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 				"address":     "address a1 10.0.0.1/32",
 				"address-set": "address-set s1 { address a1; }",
 			},
+			second: map[string]string{
+				"address": "address a2 10.0.0.2/32",
+			},
 			read: func(c *Config) string {
 				for _, z := range c.Security.Zones {
 					if z.AddressBook == nil {
@@ -256,6 +282,9 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 				"address":     "address a1 10.0.0.1/32",
 				"address-set": "address-set s1 { address a1; }",
 			},
+			second: map[string]string{
+				"address": "address a2 10.0.0.2/32",
+			},
 			read: func(c *Config) string {
 				if c.Security.AddressBook == nil {
 					return "<no book>"
@@ -272,7 +301,7 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 			},
 		},
 		"security/ike/policy": {
-			prefix: "security { ike { " + ikeProp + " ",
+			prefix: "security { ike { " + ikeProp + " " + ikeProp2 + " ",
 			open:   "policy p1",
 			closer: " } }",
 			stmts: map[string]string{
@@ -281,11 +310,21 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 				"proposals":      "proposals pr1",
 				"proposal-set":   "proposal-set standard",
 			},
+			second: map[string]string{
+				"pre-shared-key": "pre-shared-key ascii-text SEKRIT2",
+				"proposals":      "proposals pr2",
+			},
 			read: func(c *Config) string {
 				out := ""
 				for _, p := range c.Security.IPsec.IKEPolicies {
-					out += fmt.Sprintf("mode=%q psk=%q props=%v pset=%q",
-						p.Mode, p.PSK, p.Proposals, p.ProposalSet)
+					// PSK BY LENGTH, NOT BY VALUE. The type redacts itself under
+					// %q (`<redacted>`), so `psk=%q` renders every distinct
+					// secret identically -- which made `pre-shared-key`
+					// unobservable in every comparison in this cell, not just
+					// the two-instance one. Length distinguishes the fixtures
+					// without printing the secret into a failure message.
+					out += fmt.Sprintf("mode=%q psklen=%d props=%v pset=%q",
+						p.Mode, len(p.PSK), p.Proposals, p.ProposalSet)
 				}
 				return out
 			},
@@ -416,6 +455,13 @@ func TestPackedOptInHoldsForEveryLeafPair8768(t *testing.T) {
 	}
 	sawDivergence := map[string]bool{}
 
+	// Two instances of one leaf that legitimately do NOT split, with the reason
+	// MEASURED rather than assumed. Same contract as the map above: an entry
+	// that stops diverging fails as stale, and an unadjudicated divergence still
+	// fails. Empty until a measurement puts something here.
+	sameLeafAdjudicated := map[string]string{}
+	sawSameLeaf := map[string]bool{}
+
 	checked := 0
 	for name, node := range optedIn {
 		c, ok := cases[name]
@@ -474,6 +520,116 @@ func TestPackedOptInHoldsForEveryLeafPair8768(t *testing.T) {
 			}
 		}
 	}
+	// SAME-LEAF PAIRS: two instances of ONE leaf.
+	//
+	// The loop above compares DISTINCT leaves and opens with `if a == b { continue }`,
+	// so a leaf was never compared against itself. That skip is exactly the
+	// defect class this guard exists for: one instance proves the statement is
+	// REACHABLE, and only two prove the RUN IS SPLIT. It is why this cell stayed
+	// green on both address books through the whole window in which they were
+	// folding a two-entry run into one and silently keeping only the first --
+	// it was measuring the axis that already worked.
+	//
+	// POPULATION: leaves that are `multi: true` or `args >= 2`. A leaf with
+	// args==1 and no multi consumes a fixed two tokens, so its boundary is not
+	// in question; the hazard is a multi leaf ABSORBING what follows it, or a
+	// wider arity making the boundary non-obvious to a one-instance fixture.
+	// Measured at the time of writing: 10 such leaves across 6 of the 10
+	// opted-in containers, out of 46 admitted leaves.
+	//
+	// A leaf in that population with no `second` fixture REDS, on the same terms
+	// as a missing `stmts` entry -- otherwise the population silently shrinks to
+	// whatever someone remembered.
+	sameChecked := 0
+	for name, node := range optedIn {
+		c, ok := cases[name]
+		if !ok {
+			continue
+		}
+		kw := containerKeywordOfPath8768(name)
+		var leaves []string
+		for leaf := range node.children {
+			if !compactNormalizeInScope(kw, leaf) {
+				continue
+			}
+			leaves = append(leaves, leaf)
+		}
+		sort.Strings(leaves)
+		for _, leaf := range leaves {
+			ln := node.children[leaf]
+			if ln == nil || (!ln.multi && ln.args < 2) {
+				continue
+			}
+			first, ok := c.stmts[leaf]
+			if !ok {
+				continue // already reported by the loop above
+			}
+			sec, ok := c.second[leaf]
+			if !ok {
+				t.Errorf("container %q admits %q, which is multi/args>=2, but has "+
+					"no `second` fixture, so the packed spelling is only ever "+
+					"compared at ONE instance -- the spelling that cannot "+
+					"distinguish a split run from a swallowed one (#8768)",
+					name, leaf)
+				continue
+			}
+			packed := c.prefix + c.open + " " + first + " " + sec + ";" + c.closer
+			braced := c.prefix + c.open + " { " + first + "; " + sec + "; }" + c.closer
+			got, want := compile(packed, c.read), compile(braced, c.read)
+			sameChecked++
+
+			// LIVENESS, and it is not optional here. `got == want` is satisfied
+			// perfectly by BOTH arms failing, and by a second instance the
+			// reader never surfaces. Either makes this comparison green while
+			// measuring nothing -- the same both-arms-empty trap that makes a
+			// braced-vs-elided cell read as "no defect" or "value lost"
+			// depending only on how the assertion is phrased.
+			if strings.HasPrefix(want, "<") {
+				t.Errorf("container %q: the BRACED reference for two instances of "+
+					"%q did not compile (%s), so comparing it against the packed "+
+					"spelling proves nothing (#8768)", name, leaf, want)
+				continue
+			}
+			// The second instance must MOVE the reader's output. If one instance
+			// and two produce the same string, the fixture cannot distinguish a
+			// split run from a swallowed one no matter what the packed arm does.
+			bracedOne := c.prefix + c.open + " { " + first + "; }" + c.closer
+			if one := compile(bracedOne, c.read); one == want {
+				t.Errorf("container %q: adding a SECOND instance of %q changes "+
+					"nothing the reader reports (%s), so this comparison is "+
+					"degenerate -- it would stay green if the packed spelling "+
+					"swallowed the second statement entirely. Give %q a second "+
+					"instance the reader distinguishes, or widen the reader "+
+					"(#8768)", name, leaf, one, leaf)
+				continue
+			}
+			if got == want {
+				continue
+			}
+			key := name + " " + leaf + "+" + leaf
+			if reason, ok := sameLeafAdjudicated[key]; ok {
+				sawSameLeaf[key] = true
+				t.Logf("#8768: %s two-instance divergence is ADJUDICATED: %s", key, reason)
+				continue
+			}
+			t.Errorf("%s: packed and braced DIFFER for TWO INSTANCES of %q (#8768)\n"+
+				"  packed %s\n  braced %s\n"+
+				"A one-instance fixture cannot see this. If only the FIRST "+
+				"instance survives the packed spelling, the container folds a "+
+				"multi-statement run into one; if the two spellings disagree in "+
+				"some other way, establish WHICH before changing anything and "+
+				"record it in sameLeafAdjudicated with the measurement.",
+				name, leaf, got, want)
+		}
+	}
+	for key, reason := range sameLeafAdjudicated {
+		if !sawSameLeaf[key] {
+			t.Errorf("%q is adjudicated as a two-instance divergence (%s) but the "+
+				"two spellings now AGREE, so the entry is stale and is hiding a "+
+				"comparison nothing checks. Delete it (#8768)", key, reason)
+		}
+	}
+
 	for key := range divergesByNestedElision {
 		if !sawDivergence[key] {
 			t.Errorf("%q is registered as diverging by NESTED ELISION but the two "+
@@ -488,7 +644,9 @@ func TestPackedOptInHoldsForEveryLeafPair8768(t *testing.T) {
 			"anything (#8768)")
 	}
 	t.Logf("#8768: %d opted-in container(s), %d ordered leaf pairs compared, "+
-		"%d registered as diverging by nested elision", len(optedIn), checked, len(divergesByNestedElision))
+		"%d registered as diverging by nested elision; %d same-leaf (two-instance) "+
+		"comparisons, %d adjudicated as correctly not splitting", len(optedIn), checked,
+		len(divergesByNestedElision), sameChecked, len(sameLeafAdjudicated))
 }
 
 // containerKeywordOfPath8768 returns the keyword the scope predicate is asked
