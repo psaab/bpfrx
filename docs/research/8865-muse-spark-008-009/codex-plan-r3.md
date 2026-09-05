@@ -436,3 +436,73 @@ The r1 defect was scheduling ~104 findings as one step. This replaces it with a
   itself a standing argument for one. What this plan excludes is an instrument
   built *speculatively*, with no class and no named coverage gap behind it.
 
+codex
+r3 makes real procedural changes, but its central claim of an evidence-driven revision is not established by the supplied text.
+
+**The eleven-High count is internally consistent, not independently derived.** The arithmetic \(5+1+2+2+1=11\) is correct. The table contains eleven distinct 008 H labels and four 009 Highs; M17 is explicitly an additional Medium.
+
+But §2b quotes only `## HIGH findings (5)`. It does not quote round entries establishing that `+1, +2, +2, +1` count **additional, distinct High findings**, nor show the source mapping from those entries to H6–H11. Those increments remain asserted counts. Agreement with “what 008’s own header says” provides no independent derivation.
+
+The defensible conclusion is: **the proposed inventory totals fifteen Highs, conditional on its source interpretation being correct.** The stronger claim that r3 has demonstrated the report’s correct count is unsupported. Arithmetic over quoted or asserted subtotals does not cure the original evidentiary problem.
+
+**The nine-member class remains a plausible hypothesis.** The descriptions establish a recurring symptom: information disappears from packed or elided configurations. They do not establish that every row reaches the same faulty transformation or fails the same causal condition. “Twin never splits,” an unadmitted head, and a modifier-first regression could involve different admission, dispatch, or folding failures.
+
+A shared preservation invariant could make this a useful class without requiring one identical implementation defect. But r3 must connect each member to that invariant and explain how the proposed guard reaches the relevant variants. “Does the tail fold to one statement” names an outcome; it does not establish that coverage.
+
+H3 is also already broadly phrased as losses at non-opted-in sites. Nine report IDs therefore do not establish nine independent defect sites. And the six listed containers describe H6–H11; the earlier `security-zone` examples sit outside that list. The population description itself needs reconciliation.
+
+There are concrete changes here: §5 adds six candidate Highs, requires a regression cell for #8793, and prohibits closing on the nine examples alone. Those changes matter. But “close it on the discriminator being guarded” leaves the decisive coverage obligation unspecified. Moreover, observed enumeration misses trigger Path C under §4’s own test; nine noticed examples do not independently strengthen the case for Path B.
+
+**The H4/CSA-R pairing establishes resemblance, not a demonstrated common mechanism.** “A write accepts what a later read refuses” is a useful round-trip invariant. It encompasses many causes: size limits, incompatible serialization, validation differences, or recovery-specific record handling.
+
+For H4, r3 identifies a candidate cause: a read-side 16 MiB ceiling without a visible corresponding commit gate. For CSA-R, it supplies no equivalent writer–reader trace or rejecting condition. Nothing quoted establishes that the same ceiling, representation, or missing check explains both.
+
+Checking CSA-R against the H4 hypothesis is sensible. Declaring them “the same mechanism” before that check is not. Nor is a second unresolved finding automatically a stronger “instrument”: reviewer independence does not establish diagnostic discrimination.
+
+The operational text also contradicts the claimed revision. §4 still lists packed fold as “H1, H2, H3, + M-rows” and commit/load asymmetry as “H4 — single instance.” The new conclusions have not been consistently propagated.
+
+So r3 is **partly revised**, rather than wholly cosmetic. But its emphatic prose about derivation substitutes for the missing evidence behind the count, class membership, and pairing. Consequently, “2 of 15” is presently a proposed classification result, not the measured adjudicated residue that §5b promises.
+
+PLAN-REVISE
+
+**1. RESOLVED — narrowly, as the requested procedural correction.** §2b assigns every asserted High a disposition, including individual adjudication for PHA-002 and DBK-001. §5b explicitly limits file matching to routing and requires per-finding adjudication, with inheritance of the discriminator rather than the verdict. This does not validate the inventory or its claimed current memberships.
+
+**2. NOT RESOLVED.** §4 correctly declares packed-fold completeness unknown, but still declares wire-count enumeration complete because it is “package bounded.” A package supplies an outer search boundary, not an independently established inventory of relevant allocations or an argument that four commands cover them all. Publish that coverage argument or mark this class’s completeness unknown too.
+
+**5. RESOLVED.** §8 explicitly replaces enumeration resistance as a prerequisite with §4’s effort, consequence, and additional-coverage rule, including observed misses and unknown completeness as reasons to build an instrument.
+tokens used
+13,578
+r3 makes real procedural changes, but its central claim of an evidence-driven revision is not established by the supplied text.
+
+**The eleven-High count is internally consistent, not independently derived.** The arithmetic \(5+1+2+2+1=11\) is correct. The table contains eleven distinct 008 H labels and four 009 Highs; M17 is explicitly an additional Medium.
+
+But §2b quotes only `## HIGH findings (5)`. It does not quote round entries establishing that `+1, +2, +2, +1` count **additional, distinct High findings**, nor show the source mapping from those entries to H6–H11. Those increments remain asserted counts. Agreement with “what 008’s own header says” provides no independent derivation.
+
+The defensible conclusion is: **the proposed inventory totals fifteen Highs, conditional on its source interpretation being correct.** The stronger claim that r3 has demonstrated the report’s correct count is unsupported. Arithmetic over quoted or asserted subtotals does not cure the original evidentiary problem.
+
+**The nine-member class remains a plausible hypothesis.** The descriptions establish a recurring symptom: information disappears from packed or elided configurations. They do not establish that every row reaches the same faulty transformation or fails the same causal condition. “Twin never splits,” an unadmitted head, and a modifier-first regression could involve different admission, dispatch, or folding failures.
+
+A shared preservation invariant could make this a useful class without requiring one identical implementation defect. But r3 must connect each member to that invariant and explain how the proposed guard reaches the relevant variants. “Does the tail fold to one statement” names an outcome; it does not establish that coverage.
+
+H3 is also already broadly phrased as losses at non-opted-in sites. Nine report IDs therefore do not establish nine independent defect sites. And the six listed containers describe H6–H11; the earlier `security-zone` examples sit outside that list. The population description itself needs reconciliation.
+
+There are concrete changes here: §5 adds six candidate Highs, requires a regression cell for #8793, and prohibits closing on the nine examples alone. Those changes matter. But “close it on the discriminator being guarded” leaves the decisive coverage obligation unspecified. Moreover, observed enumeration misses trigger Path C under §4’s own test; nine noticed examples do not independently strengthen the case for Path B.
+
+**The H4/CSA-R pairing establishes resemblance, not a demonstrated common mechanism.** “A write accepts what a later read refuses” is a useful round-trip invariant. It encompasses many causes: size limits, incompatible serialization, validation differences, or recovery-specific record handling.
+
+For H4, r3 identifies a candidate cause: a read-side 16 MiB ceiling without a visible corresponding commit gate. For CSA-R, it supplies no equivalent writer–reader trace or rejecting condition. Nothing quoted establishes that the same ceiling, representation, or missing check explains both.
+
+Checking CSA-R against the H4 hypothesis is sensible. Declaring them “the same mechanism” before that check is not. Nor is a second unresolved finding automatically a stronger “instrument”: reviewer independence does not establish diagnostic discrimination.
+
+The operational text also contradicts the claimed revision. §4 still lists packed fold as “H1, H2, H3, + M-rows” and commit/load asymmetry as “H4 — single instance.” The new conclusions have not been consistently propagated.
+
+So r3 is **partly revised**, rather than wholly cosmetic. But its emphatic prose about derivation substitutes for the missing evidence behind the count, class membership, and pairing. Consequently, “2 of 15” is presently a proposed classification result, not the measured adjudicated residue that §5b promises.
+
+PLAN-REVISE
+
+**1. RESOLVED — narrowly, as the requested procedural correction.** §2b assigns every asserted High a disposition, including individual adjudication for PHA-002 and DBK-001. §5b explicitly limits file matching to routing and requires per-finding adjudication, with inheritance of the discriminator rather than the verdict. This does not validate the inventory or its claimed current memberships.
+
+**2. NOT RESOLVED.** §4 correctly declares packed-fold completeness unknown, but still declares wire-count enumeration complete because it is “package bounded.” A package supplies an outer search boundary, not an independently established inventory of relevant allocations or an argument that four commands cover them all. Publish that coverage argument or mark this class’s completeness unknown too.
+
+**5. RESOLVED.** §8 explicitly replaces enumeration resistance as a prerequisite with §4’s effort, consequence, and additional-coverage rule, including observed misses and unknown completeness as reasons to build an instrument.
+CODEX_EXIT=0

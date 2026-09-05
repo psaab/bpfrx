@@ -1,6 +1,6 @@
 # Plan of action — muse-spark reviews 008 + 009 (#8865)
 
-- **Revision:** r4 (revised after Claude SMR r2 returned PLAN-REVISE on r3)
+- **Revision:** r5 (revised after Codex r3 — its objection 2 and the unrun §4 test both hold against r4)
 - **Base:** `b24e26d3b` (master at drafting)
 - **Reports:** `muse-spark-review-008` (109 findings across 5 rounds), `muse-spark-review-009` (4 High). 009 excludes 007 and 008, so the three are disjoint.
 - **Status:** revised. Verdicts r1: Claude SMR PLAN-REVISE, Codex PLAN-REVISE. r2: Codex PLAN-REVISE (objections 3 and 4 RESOLVED; 1, 2, 5 carried here). AGY infra-blocked throughout (2 documented retries, known `--print`/`--print-timeout` defect) — 2-of-3 exception applies.
@@ -202,10 +202,10 @@ Known classes, with today's evidence:
 
 | class | members | status |
 |---|---|---|
-| wire-count allocation | 5 enumerated | 3 safe/fixed, 2 live — *fix is one shape* |
-| multi-statement packed fold | H1, H2, H3, + M-rows | mechanism understood; `packedStatements` opt-in per container |
+| wire-count allocation | 4 sites found | 1 safe-pair, 1 fixed, 2 live — *fix is one shape*; completeness **UNKNOWN** (r5) |
+| multi-statement packed fold | **9 Highs: H1, H2, H3, H6-H11**, + M-rows | completeness **UNKNOWN**; `packedStatements` opt-in per container |
 | reserved-name collision | H5 | single instance; enumerate other hardcoded names |
-| commit/load asymmetry | H4 | single instance; enumerate other accept-then-refuse gates |
+| commit/load asymmetry | H4 + **009 CSA-R (PROVISIONAL)** | discriminator stated, not yet run against CSA-R |
 
 - **For:** the wire-count class is already enumerated and partitioned. The
   brace-elision class produced 6 defects and 2 instruments today, and the
@@ -231,8 +231,45 @@ Build a detector per class before fixing anything.
   enumeration has been observed to miss members — which is exactly what happened
   on #8830.
 
-**Recommendation: Path B as the default, decided PER CLASS by a stated test —
-not as a global preference.** The four-grep enumeration establishes that class
+### (r5) Running the §4 test on this plan's OWN classes — which r3 never did
+
+*(Codex r3: "observed enumeration misses trigger Path C under §4's own test; nine
+noticed examples do not independently strengthen the case for Path B." Correct,
+and it changes the recommendation.)*
+
+r2 through r4 stated a **per-class test** and then a **global recommendation**,
+without running the test on either class. Running it:
+
+| | wire-count | packed fold |
+|---|---|---|
+| **(1) mechanical predicate?** | yes — but see (3) | no; universe discovered by probing |
+| **(2) negative control?** | yes — 2 SAFE sites correctly not flagged | partial; #8859's 18 SAME rows |
+| **(3) comparable class observed to MISS?** | **YES** — the live member is `Split`, which a sized-allocation predicate does not match | **YES** — new members in all three review rounds |
+| **(4) coverage** | **UNKNOWN** (r5) | **UNKNOWN** |
+
+**Test (3) fires for BOTH classes, and test (3) says Path C regardless of (1).**
+So the plan's own rule returns:
+
+- **packed fold -> Path C (instrument-first).** Nine members across three rounds
+  with a moving boundary is the strongest possible trigger. **The nine were being
+  used as an argument FOR Path B; under the stated test they are an argument
+  AGAINST it** — noticing nine members of an unbounded class is evidence the
+  class resists enumeration, not evidence enumeration works.
+- **wire-count -> Path C as well**, on the `Split` miss — though here the fix
+  itself is trivial and known, so the instrument is owed *for the class*, not as
+  a precondition for fixing the two live sites. **Fix them; do not close the
+  class on them.**
+
+**This is what "decided per class by a stated test" is for**, and it took an
+external reviewer to point out that the plan had not once applied its own test to
+its own classes. **A rule stated in a document does not run itself** — the second
+instance of that in this plan, after §7's derive-don't-quote rule failed to catch
+the scope line one screen above it.
+
+**Revised recommendation: Path C for both enumerated classes, with Path B's fixes
+proceeding in parallel for the two live wire-count sites.**
+
+**On the residual preference between B and C:** The four-grep enumeration establishes that class
 enumeration *can* be cheap, not that it generally is; the brace-elision class is
 the counterexample, having needed two purpose-built instruments and remaining
 35-of-45 unverified.
@@ -264,9 +301,26 @@ the counterexample, having needed two purpose-built instruments and remaining
    - **(a) An independently bounded universe** — the candidate set is derived
      from something *other than the predicate itself* (a type, a generated
      table, a grammar production, a file-level enumeration), so membership does
-     not depend on the predicate noticing it. The wire-count class has this: the
-     universe is "every allocation sized from a wire-supplied count in
-     `pkg/cluster`", bounded by the package, not by the grep.
+     not depend on the predicate noticing it.
+
+     **(r5) The wire-count class was claimed under (a) and does not qualify.**
+     *(Codex r3 objection 2, correct.)* r3 said its universe is "every allocation
+     sized from a wire-supplied count in `pkg/cluster`, **bounded by the package,
+     not by the grep**". **A package is an outer search boundary, not an
+     inventory.** It says where to look; it does not enumerate what is there. The
+     four commands still have to *find* every site inside it, so membership
+     depends on the predicate noticing — the exact property (a) exists to
+     exclude. The claim was self-exempting: I applied the standard to the class I
+     was less sure of and skipped it on the one I had already published.
+
+     **And the class carries an observed miss, visible in its own §3 table.** Of
+     the four sites, three are `make(...)` and the live one is **`strings.Split`
+     — not an allocation call at all**. A predicate keyed on sized allocation
+     does not match `Split`, so **the member that is genuinely unbounded is the
+     member such a predicate misses.** Whether the Split grep was among the
+     original four or added after M17 was noticed, the class's coverage rests on
+     someone having thought of a second syntactic form — **a set assembled by
+     noticing.**
    - **(b) An explicit statement that completeness is UNKNOWN**, with the reason.
 
    **There is no third form, and (b) is not a failure state** — it is the correct
@@ -274,8 +328,10 @@ the counterexample, having needed two purpose-built instruments and remaining
    published under (b) is still actionable; what it may not do is claim its
    members are all of them. **A set assembled by NOTICING is not a population.**
 
-   Applied to this plan's own classes: the wire-count class is **(a)** — package
-   bounded, four commands, partitions completely. The **packed-fold class is (b)**
+   Applied to this plan's own classes: **the wire-count class is (b) —
+   completeness UNKNOWN** *(r5; r3 claimed (a) and was wrong, above)*. It
+   partitions the four sites it found completely, and "partitions what it found"
+   is a different claim from "found them all". The **packed-fold class is (b)**
    — its universe is "containers whose packed tail folds lossily", which is
    discovered by probing, and nine members arriving from six unrelated containers
    across three review rounds is evidence the boundary is still moving. **This
