@@ -451,7 +451,14 @@ var schemaFirewall = &schemaNode{desc: "Firewall filters and policers", children
 						"source-prefix-list":      {desc: "Match source addresses from a prefix list", children: nil},
 						"destination-prefix-list": {desc: "Match destination addresses from a prefix list", children: nil},
 						"protocol":                {desc: "Match IP protocol", args: 1, multi: true, placeholder: "<protocol>", children: nil},
-						"dscp":                    {desc: "Match DSCP value (name or number)", args: 1, multi: true, placeholder: "<dscp>", children: nil},
+						// #8781: the IPv6 spelling of `protocol`. Declared for the same
+						// reason `traffic-class` is declared here (#8773) — the compiler
+						// has handled it since #3307, and the PACKED spelling is read
+						// through this schema, so without the declaration
+						// `from next-header tcp;` was dropped SILENTLY while the braced
+						// spelling applied it. Advisory at commit.
+						"next-header": {desc: "Match IPv6 next header (IPv6 spelling of protocol; accepted in family inet — advisory at commit)", args: 1, multi: true, placeholder: "<next-header>", children: nil},
+						"dscp":        {desc: "Match DSCP value (name or number)", args: 1, multi: true, placeholder: "<dscp>", children: nil},
 						// #8773: Junos spells this field `dscp` for IPv4; `traffic-class`
 						// is the IPv6 spelling of the same six bits. It is declared here
 						// because the compiler already ACCEPTS it in a braced `from`
@@ -526,8 +533,14 @@ var schemaFirewall = &schemaNode{desc: "Firewall filters and policers", children
 						"destination-address":     {desc: "Match destination address", args: 1, multi: true, placeholder: "<address>", children: nil},
 						"source-prefix-list":      {desc: "Match source addresses from a prefix list", children: nil},
 						"destination-prefix-list": {desc: "Match destination addresses from a prefix list", children: nil},
-						"protocol":                {desc: "Match IP protocol", args: 1, multi: true, placeholder: "<protocol>", children: nil},
-						"traffic-class":           {desc: "Match traffic class (DSCP name or number)", args: 1, multi: true, placeholder: "<traffic-class>", children: nil},
+						"protocol":                {desc: "Match IP protocol (IPv4 spelling of next-header; accepted in family inet6 — advisory at commit)", args: 1, multi: true, placeholder: "<protocol>", children: nil},
+						// #8781: the Junos spelling for IPv6, and the one that was
+						// SILENTLY DROPPED in the packed form — a correctly-authored
+						// IPv6 term lost its protocol match and therefore matched every
+						// protocol. This is the defect #8781 exists for; the family-inet
+						// declaration above is its cross-family counterpart.
+						"next-header":   {desc: "Match IPv6 next header", args: 1, multi: true, placeholder: "<next-header>", children: nil},
+						"traffic-class": {desc: "Match traffic class (DSCP name or number)", args: 1, multi: true, placeholder: "<traffic-class>", children: nil},
 						// #8773: the IPv4 spelling of the same six bits, declared for the
 						// same reason `traffic-class` is declared under family inet --
 						// see the note there. Accepted with a commit advisory.
