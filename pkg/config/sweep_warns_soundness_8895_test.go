@@ -3,76 +3,58 @@ package config
 import "testing"
 
 // The WARNS branch of the sweep's gate check had no member and therefore no
-// control: the sweep's own header records that "nothing here proves it still
+// control: the sweep's own header recorded that "nothing here proves it still
 // fires". An unexercised branch is where an unsound rule survives, and this one
-// was unsound.
+// was unsound -- it asked "does the elided spelling produce ANY warnings?",
+// which any container with a standing advisory answers for free.
 //
-// The old test was "does the elided spelling produce ANY warnings?". That is a
-// different question from "is the operator told about THIS drop", and any
-// container carrying a standing advisory answers the first for free.
-//
-// These cells give the branch both controls it lacked.
+// THESE CELLS CALL THE PRODUCTION PREDICATE. An earlier version of this file
+// re-implemented the set comparison and asserted that the re-implementation was
+// correct, which left the sweep free to use anything at all: reverting
+// sweepGateVerdict8859 to the counting form kept every cell green. A cell that
+// re-implements the thing it guards verifies an algorithm and binds no wiring.
 
-// A STANDING warning -- present in BOTH spellings -- must NOT score WARNS.
-// `aggregated-ether-options` carries the #6544 accepted-only parity notice
-// whether or not the elision drops anything, so scoring it WARNS would report
-// a silent drop as handled. The operator is told LAG is unimplemented; they are
-// not told their `lacp active` was discarded.
+// A STANDING warning -- present in BOTH spellings -- must not be scored as
+// "the operator is told". `security alg h323` carries an accepted-but-inert
+// notice either way, so scoring it WARNS would report a silent drop as handled.
+//
+// This is the row that kills the old counting rule: under it the elided arm has
+// a warning, so it returned WARNS.
 func TestStandingWarningIsNotScoredAsHandled8895(t *testing.T) {
 	const (
-		braced = "interfaces { ae0 { aggregated-ether-options { lacp { active; } } } }"
-		elided = "interfaces { ae0 { aggregated-ether-options lacp { active; } } }"
+		braced = "security { alg { h323; } }"
+		elided = "security alg h323;"
 	)
-	warns := func(text string) []string {
-		tree, perrs := NewParser(text).Parse()
-		if len(perrs) > 0 {
-			t.Fatalf("fixture does not parse (%q): %v", text, perrs[0])
-		}
-		cfg, err := CompileConfigLenient(tree)
-		if err != nil || cfg == nil {
-			t.Fatalf("compile %q: %v", text, err)
-		}
-		return cfg.Warnings
-	}
-
-	b, e := warns(braced), warns(elided)
-	// LIVENESS: this cell is only meaningful while the standing warning exists.
-	// If #6544's notice is ever removed, the fixture stops exercising the
+	// LIVENESS: the cell is only meaningful while BOTH arms carry the standing
+	// advisory. If that notice is ever removed the fixture stops exercising the
 	// hazard and must be repointed rather than deleted.
-	if len(b) == 0 {
-		t.Skip("the braced arm no longer carries a standing warning — repoint this " +
-			"fixture at another accepted-only container rather than dropping the cell")
+	bw, ew := warningSet8859(braced), warningSet8859(elided)
+	if len(bw) == 0 || len(ew) == 0 {
+		t.Skipf("the accepted-but-inert notice is gone (braced=%d elided=%d warnings) — "+
+			"repoint this fixture at another standing-advisory container", len(bw), len(ew))
 	}
-	if len(e) == 0 {
-		t.Fatalf("the elided arm carries no warnings at all; this fixture cannot exercise " +
-			"the standing-warning hazard")
+	for w := range ew {
+		if !bw[w] {
+			t.Fatalf("the elided arm carries a warning the braced one does not (%q), so this "+
+				"fixture no longer isolates the STANDING-warning case", w)
+		}
 	}
 
-	// The hazard: counting warnings in the elided arm alone says "handled".
-	if len(e) > 0 {
-		// Comparing the SETS says otherwise, and that is the correct answer.
-		inBraced := map[string]bool{}
-		for _, w := range b {
-			inBraced[w] = true
-		}
-		onlyElided := 0
-		for _, w := range e {
-			if !inBraced[w] {
-				onlyElided++
-			}
-		}
-		if onlyElided != 0 {
-			t.Errorf("expected every warning on the elided arm to be standing (present in "+
-				"braced too), got %d unique to elided; the fixture no longer isolates the "+
-				"standing-warning case", onlyElided)
-		}
+	if got := sweepGateVerdict8859(braced, elided); got == "WARNS" {
+		t.Errorf("a STANDING advisory scored WARNS. Under the #8859 criterion that reads as " +
+			"HANDLED — the operator is told — but they are told the ALG is inert, not that " +
+			"anything was dropped. Compare the warning SETS between arms, not the count in one")
 	}
 }
 
-// And the opposite control: a warning that appears ONLY in the elided arm MUST
-// score WARNS, or the branch would be unreachable and the fix would have turned
-// an unsound rule into a dead one.
-func TestDropSpecificWarningStillScoresWarns8895(t *testing.T) {
+// The opposite control, so the fix cannot trade an unsound branch for a dead
+// one. It tests the PREDICATE's set logic directly, and says so: the WARNS arm
+// has no natural member in the current schema, because its only mechanism
+// (#6662's packed-login notice) sits behind a spelling the strict path rejects
+// first. Asserting reachability through a real config is therefore impossible
+// today, and inventing a fixture that manufactured one would be measuring the
+// fixture.
+func TestDropSpecificWarningWouldStillScoreWarns8895(t *testing.T) {
 	braced := map[string]bool{"standing notice": true}
 	elided := map[string]bool{"standing notice": true, "value dropped by packing": true}
 
@@ -90,7 +72,7 @@ func TestDropSpecificWarningStillScoresWarns8895(t *testing.T) {
 			"would again read as handled")
 	}
 	if !scoreWarns(braced, elided) {
-		t.Error("a warning unique to the elided arm did NOT score WARNS — the branch is now " +
-			"unreachable, which trades an unsound rule for a dead one")
+		t.Error("a warning unique to the elided arm did NOT score WARNS — the branch would be " +
+			"unreachable, trading an unsound rule for a dead one")
 	}
 }

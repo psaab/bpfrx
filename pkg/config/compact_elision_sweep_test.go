@@ -83,62 +83,6 @@ func TestSweepFull(t *testing.T) {
 	// a handled drop is indistinguishable from an unhandled one, which is how
 	// `system login` (#6662/#6706: LoginDroppedByPacking + strict reject +
 	// warning) sat in the candidate set looking exactly like a defect.
-	// warningSet returns the lenient-compile warnings of one spelling.
-	warningSet := func(text string) map[string]bool {
-		out := map[string]bool{}
-		tr, perrs := NewParser(text).Parse()
-		if len(perrs) > 0 || tr == nil {
-			return out
-		}
-		if cfg, err := CompileConfigLenient(tr); err == nil && cfg != nil {
-			for _, w := range cfg.Warnings {
-				out[w] = true
-			}
-		}
-		return out
-	}
-	// gated asks whether the OPERATOR IS TOLD ABOUT THIS DROP, and it needs
-	// BOTH spellings to answer that.
-	//
-	// It used to ask only "does the elided spelling produce any warnings?",
-	// which is a different question. Any container carrying a STANDING
-	// advisory -- a parity notice, a deprecation, an accepted-only warning --
-	// answers yes for free, and a real silent drop inside it then scores WARNS
-	// and reads as HANDLED. Measured on `aggregated-ether-options -> lacp`,
-	// where both arms carry the identical #6544 notice:
-	//
-	//	braced  warnings=1   "aggregated-ether-options configured but
-	//	elided  warnings=1    accepted-only -- xpf does not implement 802.3ad"
-	//
-	// The operator is told LAG is unimplemented. They are NOT told their
-	// `lacp active` was discarded. One channel, two questions.
-	//
-	// So compare the SETS: only a warning present in the ELIDED arm and absent
-	// from the braced one is about the drop. That is the liveness rule applied
-	// to the warning channel rather than to a value -- a warning in both arms
-	// is standing and proves nothing, exactly as a value present in neither
-	// arm proves nothing.
-	//
-	// The error direction matters: this bug could only ever score a real drop
-	// as HANDLED, never the reverse, so it under-reports.
-	//
-	// Found by lane-8388 on #8876 batch 11; reproduced here before the change.
-	gated := func(bracedText, elidedText string) string {
-		tr, perrs := NewParser(elidedText).Parse()
-		if len(perrs) > 0 || tr == nil {
-			return "?"
-		}
-		if _, err := compileConfigWithOpts(tr, compileOpts{}); err != nil {
-			return "STRICT-REJECTS"
-		}
-		braced := warningSet(bracedText)
-		for w := range warningSet(elidedText) {
-			if !braced[w] {
-				return "WARNS"
-			}
-		}
-		return "SILENT"
-	}
 	// firstDiff names the JSON field that differs, so a row can be adjudicated
 	// rather than counted.
 	firstDiff := func(a, b string) string {
@@ -226,7 +170,7 @@ func TestSweepFull(t *testing.T) {
 		case dig(bc) == dig(ec):
 			v, d = "SAME", "elided delivers what braced delivers"
 		default:
-			g := gated(bracedText, elidedText)
+			g := sweepGateVerdict8859(bracedText, elidedText)
 			v = "CANDIDATE-DROP/" + g
 			d = firstDiff(dig(bc), dig(ec))
 		}
@@ -265,37 +209,99 @@ func TestSweepFull(t *testing.T) {
 // everything, which would silently reclassify every SILENT row in the table as
 // handled -- the exact direction that makes a defect list under-report.
 func TestGateColumnArmsAreReachable8859(t *testing.T) {
-	gated := func(text string) string {
-		tr, perrs := NewParser(text).Parse()
-		if len(perrs) > 0 || tr == nil {
-			return "?"
-		}
-		if _, err := compileConfigWithOpts(tr, compileOpts{}); err != nil {
-			return "STRICT-REJECTS"
-		}
-		tr2, _ := NewParser(text).Parse()
-		if cfg, err := CompileConfigLenient(tr2); err == nil && cfg != nil && len(cfg.Warnings) > 0 {
-			return "WARNS"
-		}
-		return "SILENT"
-	}
-	for _, c := range []struct{ name, txt, want string }{
-		// Strict accepts, lenient raises an advisory.
-		{"warns-braced", "security { alg { h323; } }", "WARNS"},
-		{"warns-packed", "security alg h323;", "WARNS"},
+	for _, c := range []struct{ name, braced, elided, want string }{
+		// THE WARNS ARM HAS NO NATURAL MEMBER, AND THAT IS A MEASURED FACT
+		// RATHER THAN AN OMISSION. Its only mechanism -- #6662's packed-login
+		// notice -- is reached through a spelling the STRICT path rejects
+		// first, so the pair scores STRICT-REJECTS:
+		//
+		//	braced  system { login { user u1 { class super-user; } } }   1 warning
+		//	packed  system { login user u1 class super-user; }           2 warnings,
+		//	        one of them unique to the packed arm -- but strict refuses it
+		//
+		// The rows below therefore exercise the arm this cell CAN reach. The
+		// set-comparison logic itself is exercised directly in
+		// sweep_warns_soundness_8895_test.go, which is honest about testing the
+		// predicate rather than a configuration.
+		//
+		// A STANDING advisory must NOT score WARNS -- and this row is the one
+		// that kills the old counting rule. Both arms carry the same
+		// `alg ... accepted but inert` notice, so the operator is told about
+		// the ALG, not about any drop. These rows used to expect WARNS here,
+		// which is what the unsound rule returned.
+		{"standing-advisory-is-not-handled",
+			"security { alg { h323; } }", "security alg h323;", "SILENT"},
 		// Negatives: without these the cell passes on a gate stuck at WARNS.
-		{"silent-proposal", "security { ike { proposal P { description hi; } } }", "SILENT"},
-		{"silent-empty", "", "SILENT"},
+		{"silent-proposal",
+			"security { ike { proposal P { description hi; } } }",
+			"security ike proposal P { description hi; }", "SILENT"},
+		{"silent-empty", "", "", "SILENT"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			if got := gated(c.txt); got != c.want {
-				t.Errorf("gate arm for %q: got %s want %s (#8859)\n"+
+			if got := sweepGateVerdict8859(c.braced, c.elided); got != c.want {
+				t.Errorf("gate arm for %q vs %q: got %s want %s (#8859/#8895)\n"+
 					"The sweep's gate column decides whether a dropped value is a "+
 					"DEFECT or a HANDLED case. An arm that no longer fires "+
 					"reclassifies rows silently and in the under-reporting "+
-					"direction, and the sweep itself cannot detect it because "+
-					"WARNS currently has no member.", c.txt, got, c.want)
+					"direction.", c.braced, c.elided, got, c.want)
 			}
 		})
 	}
+}
+
+// warningSet8859 returns the lenient-compile warnings of one spelling.
+func warningSet8859(text string) map[string]bool {
+	out := map[string]bool{}
+	tr, perrs := NewParser(text).Parse()
+	if len(perrs) > 0 || tr == nil {
+		return out
+	}
+	if cfg, err := CompileConfigLenient(tr); err == nil && cfg != nil {
+		for _, w := range cfg.Warnings {
+			out[w] = true
+		}
+	}
+	return out
+}
+
+// sweepGateVerdict8859 asks whether the OPERATOR IS TOLD ABOUT THIS DROP, and
+// it needs BOTH spellings to answer that.
+//
+// It is package-level and has exactly ONE implementation, deliberately. It was
+// previously a closure inside TestSweepFull with a SECOND copy inside the
+// reachability cell, and when the unsound version was fixed only one copy
+// moved: the cell whose job was to prove the WARNS arm fires went on
+// validating the rule the sweep had stopped using. Two implementations of one
+// predicate is a difference that can only ever be a bug, never a policy
+// choice, and re-implementing it inside a test is what made the divergence
+// invisible from within that test.
+//
+// THE RULE. Asking only "does the elided spelling produce ANY warnings?" is a
+// different question, and any container carrying a STANDING advisory -- a
+// parity notice, a deprecation, an accepted-only warning -- answers it for
+// free. Measured on `aggregated-ether-options -> lacp`, both arms carry the
+// identical #6544 notice: the operator is told LAG is unimplemented, NOT that
+// `lacp active` was discarded. `security alg h323` behaves the same way.
+//
+// So compare the SETS: only a warning present in the ELIDED arm and absent
+// from the braced one is about the drop. The liveness rule applied to the
+// warning channel -- a warning in both arms is standing and proves nothing.
+//
+// The error direction matters: the old form could only score a real drop as
+// HANDLED, never the reverse, so it under-reported.
+func sweepGateVerdict8859(bracedText, elidedText string) string {
+	tr, perrs := NewParser(elidedText).Parse()
+	if len(perrs) > 0 || tr == nil {
+		return "?"
+	}
+	if _, err := compileConfigWithOpts(tr, compileOpts{}); err != nil {
+		return "STRICT-REJECTS"
+	}
+	braced := warningSet8859(bracedText)
+	for w := range warningSet8859(elidedText) {
+		if !braced[w] {
+			return "WARNS"
+		}
+	}
+	return "SILENT"
 }
