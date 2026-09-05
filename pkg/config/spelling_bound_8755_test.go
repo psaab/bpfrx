@@ -108,10 +108,33 @@ func TestAChainAdmissionDoesNotCloseTheIdiomaticElision_8755(t *testing.T) {
 	}
 }
 
-// The register's own claim, checked against the register: every `open` entry
-// must carry a spelling-bound note, so nobody reads `open` as "fully fixable".
+// The register's own claim, checked against the register — for the sites the
+// claim is ABOUT.
+//
+// THIS CELL WAS OVER-BROAD ON ITS FIRST DAY and reddened master. It required a
+// spelling-bound note from EVERY `open` entry, including two
+// `security policies ... scheduler-name` sites another lane added minutes
+// later. Those sites are not under a braced multi-key container and the bound
+// says nothing about them, so the guard was demanding a claim that would have
+// been false if written.
+//
+// A guard written for one population must SELECT that population, or it becomes
+// a tax on every lane that appends to the same file — and the first person to
+// pay it will make it green the cheapest way, which is by writing the note
+// whether or not it is true.
+//
+// The selector is a proxy and is named as one: the bound applies to a site
+// whose container passes through a braced MULTI-KEY node whose second token is
+// a child keyword. In this register that is exactly `family inet` /
+// `family inet6`; `unit <n>` does not qualify because its second token is an
+// instance arg.
+func siteIsUnderABracedMultiKey8755(site string) bool {
+	return strings.Contains(site, " family inet ") || strings.HasSuffix(site, " family inet") ||
+		strings.Contains(site, " family inet6 ") || strings.HasSuffix(site, " family inet6")
+}
+
 func TestEveryOpenEntryCarriesTheSpellingBound_8755(t *testing.T) {
-	var missing []string
+	var missing, considered []string
 	for _, l := range strings.Split(mustReadFile8690(t, "testdata/compact_block_permanent_exclusions_8690.txt"), "\n") {
 		if l == "" || strings.HasPrefix(l, "#") {
 			continue
@@ -120,9 +143,22 @@ func TestEveryOpenEntryCarriesTheSpellingBound_8755(t *testing.T) {
 		if len(f) < 3 || strings.TrimSpace(f[1]) != "open" {
 			continue
 		}
-		if !strings.Contains(f[2], "SPELLING BOUND") {
-			missing = append(missing, strings.TrimSpace(f[0]))
+		site := strings.TrimSpace(f[0])
+		if !siteIsUnderABracedMultiKey8755(site) {
+			continue
 		}
+		considered = append(considered, site)
+		if !strings.Contains(f[2], "SPELLING BOUND") {
+			missing = append(missing, site)
+		}
+	}
+	// NON-VACUITY: a selector that matches nothing reports no failures too, and
+	// this one is a string proxy that a register rename would silently defeat.
+	if len(considered) == 0 {
+		t.Fatal("the selector matched no `open` site, so the check below passed by " +
+			"selecting nothing. Either every such site has been normalized — in " +
+			"which case this cell can go — or the site-key shape changed and the " +
+			"proxy stopped matching (#8755)")
 	}
 	if len(missing) > 0 {
 		t.Errorf("%d `open` entries carry no spelling bound: %v.\n`open` reads as "+
