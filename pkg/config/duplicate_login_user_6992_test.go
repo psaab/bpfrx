@@ -131,10 +131,36 @@ func TestDuplicateUserFoldsToOneEntry_6992(t *testing.T) {
 	if u.Class != "ops" {
 		t.Errorf("folded class = %q, want ops (the LAST authored value)", u.Class)
 	}
-	if len(u.SSHKeys) != 1 || !strings.Contains(u.SSHKeys[0], "SECOND") {
-		t.Errorf("folded SSH keys = %v, want only the LAST block's key — that is the one "+
-			"applySystemLogin already writes to authorized_keys, so the fold must not "+
-			"change which credential is provisioned", u.SSHKeys)
+	// #8863 CHANGED THIS EXPECTATION, and the reason is that it was DERIVED
+	// rather than decided. This cell originally required only the LAST block's
+	// key, because the flat spelling replaced on a repeated `set … ssh-rsa` and
+	// the fold was written to match it.
+	//
+	// That flat behaviour was the #8863 defect: a second key REVOKED the first,
+	// and applyRootAuth / applySystemLogin write the compiled set as the WHOLE
+	// of authorized_keys, so the holder of the first key lost access at the next
+	// apply. With the flat path corrected to accumulate, matching it means
+	// accumulating here too.
+	//
+	// #6992's decision is intact: uid, class and password above still take the
+	// LAST authored value. Keys are a SET and are unioned; scalars are scalars
+	// and are replaced. Both keys are provisioned because the operator authored
+	// both, in both spellings.
+	//
+	// The CONTENTS are asserted, not the count: a fold that produced two entries
+	// of the same key, or the right count of the wrong keys, must not pass.
+	if len(u.SSHKeys) != 2 {
+		t.Errorf("folded SSH keys = %v, want BOTH authored keys — a key missing here is "+
+			"REVOKED at the next apply, because the compiled set becomes the whole of "+
+			"authorized_keys (#8863)", u.SSHKeys)
+	} else {
+		if !strings.Contains(u.SSHKeys[0], "FIRST") {
+			t.Errorf("folded SSH keys[0] = %q, want the FIRST block's key — dropping it is the "+
+				"#8863 revocation this fold used to perform", u.SSHKeys[0])
+		}
+		if !strings.Contains(u.SSHKeys[1], "SECOND") {
+			t.Errorf("folded SSH keys[1] = %q, want the SECOND block's key", u.SSHKeys[1])
+		}
 	}
 }
 

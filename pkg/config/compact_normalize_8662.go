@@ -786,6 +786,31 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		"ssh key-exchange",
 		"ssh root-login",
 		"static-binding host-name",
+		// issue 8858: the OUTER half of the root-authentication fold, and the
+		// only half that was missing. The four inner pairs
+		// (`root-authentication encrypted-password` / `ssh-dsa` / `ssh-ed25519`
+		// / `ssh-rsa`) have been admitted in the CREDENTIAL family above since
+		// #8690's first increment -- and were INERT the whole time, because the
+		// tail needs TWO splits:
+		//
+		//	system -> root-authentication          (this entry, absent)
+		//	root-authentication -> <credential>    (admitted, unreachable)
+		//
+		// The pass never reaches a container it has not yet created, so the
+		// inner admission could not fire and `system root-authentication
+		// encrypted-password "<hash>";` compiled to a NIL stanza. Measured
+		// empty-equivalent, and the gate check matters here specifically: the
+		// sibling `system login` case is excluded above because normalizing it
+		// would convert the loud #6662 commit rejection into a silent
+		// acceptance. Root-authentication has no such gate -- strict accepts
+		// the packed spelling and nothing warns -- so admitting it converts a
+		// silent DROP into a correct compile, not a rejection into a drop.
+		//
+		// Consequence if left out: applyRootAuth reads a nil stanza as "not
+		// configured" and REVOKES the credentials xpf provisioned, D2-locking
+		// root (#5276). It fails closed -- an availability hazard, not a
+		// breach.
+		"system root-authentication",
 		"system backup-router",
 		"system domain-search",
 		"system name-server",
@@ -1207,6 +1232,27 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		"routing-options static",
 		"security alg",
 		"security flow",
+		// issue 8875: the TOP-LEVEL security containers. `security` itself had
+		// no admitted children at all, while the children's own pairs
+		// (`policies from-zone`, `policies global`, `zones security-zone`) were
+		// admitted -- which is exactly why the braced and once-elided spellings
+		// deliver and the fully-elided one loses everything:
+		//
+		//	security { policies { from-zone a to-zone b { policy p } } }  1
+		//	security { policies from-zone a to-zone b { policy p } }      1
+		//	security policies from-zone a to-zone b { policy p }          0
+		//
+		// Silent on both paths -- strict and lenient accept, no warning. The
+		// zone-pair policy set is the product's primary enforcement surface, so
+		// losing it denies all inter-zone traffic: with no `default-policy` the
+		// compiled default is DENY (PolicyPermit is iota, but the compiler sets
+		// deny explicitly), making this a total outage and NOT a fail-open.
+		//
+		// One container, three symptoms: policies, zones and screen all fail on
+		// this single missing admission.
+		"security policies",
+		"security screen",
+		"security zones",
 		"flow route-change-timeout",
 		"friday start-time",
 		"friday stop-time",
@@ -1568,4 +1614,22 @@ func splitPackedStatements8768(tail []string, container *schemaNode) [][]string 
 		return [][]string{tail}
 	}
 	return out
+}
+
+// normalizeCompactForValidation returns a tree with every admitted compact
+// stanza folded, for the typed-leaf walk to validate (issue 8867).
+//
+// It never mutates the argument: SchemaValidate runs on the operator's
+// candidate tree, which the caller persists, so folding in place would rewrite
+// the stored configuration as a side effect of checking it. When nothing folds
+// the original is returned and the clone is discarded.
+func normalizeCompactForValidation(tree *ConfigTree) *ConfigTree {
+	if tree == nil {
+		return nil
+	}
+	clone := tree.Clone()
+	if normalizeCompactStanzas(clone) == 0 {
+		return tree
+	}
+	return clone
 }
