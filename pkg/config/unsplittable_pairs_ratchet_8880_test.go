@@ -9,6 +9,18 @@ import (
 // A COUNTED RATCHET over pairs that are admitted to the brace-elision scope but
 // whose container CANNOT SPLIT a multi-statement packed run.
 //
+// ON THE NUMBER IN THIS FILE'S NAME: 8880 was picked before issue #8880 existed
+// and it turned out to name one MEMBER of this population, not the population.
+// That was luck, so the attributions are spelled out rather than left implied:
+//
+//	#8880   policies from-zone -- the TRUNCATION member below
+//	#8883   system name-server -- the INJECTION member below
+//	(none)  this ratchet itself has no issue; it is the class those two
+//	        instantiate, and the count is what makes the class visible
+//
+// Both members are asserted here directly, so if either issue is fixed this
+// cell reds and says which one and in which direction.
+//
 // THERE ARE TWO FAILURE MODES AND THEY SPLIT ON THIS PREDICATE'S OWN
 // DISJUNCTION, which is why `multi || args >= N` is not one population wearing
 // two hats:
@@ -234,7 +246,7 @@ func TestUnsplittablePairRatchet8880(t *testing.T) {
 	// second statement, it absorbs that statement's KEYWORD as a value.
 	// TRUNCATION MODE, kept beside the injection ones so a reader does not
 	// generalise from a single mode. This is issue #8880: with the `policies`
-	// brace elided, the SECOND from-zone/to-zone block is discarded entirely,
+	// brace elided (issue #8880), the SECOND from-zone/to-zone block is discarded entirely,
 	// on a clean commit with zero warnings -- the product's primary enforcement
 	// surface losing a whole zone-pair policy set silently.
 	t.Run("member/policies from-zone (truncation)", func(t *testing.T) {
@@ -286,6 +298,7 @@ func TestUnsplittablePairRatchet8880(t *testing.T) {
 		pair, packed, braced string
 		read                 func(*Config) []string
 	}{
+		// #8883.
 		{"system name-server",
 			"system { name-server 1.1.1.1 name-server 8.8.8.8; }",
 			"system { name-server 1.1.1.1; name-server 8.8.8.8; }",
