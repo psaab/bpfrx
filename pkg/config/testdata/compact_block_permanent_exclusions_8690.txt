@@ -1,0 +1,161 @@
+# #8690 PERMANENT-EXCLUSION REGISTER — the classification of every line still in
+# compact_block_divergences_2419.txt.
+#
+# WHY THIS FILE EXISTS. The inventory counts sites that DIVERGE. It says nothing
+# about whether a site MAY be normalized, and by the end of the sweep those are
+# almost disjoint questions: 47 lines remain and ~43 of them must never be
+# normalized. A bare count of 47 reads as 47 units of work, and the only way to
+# "finish" it is to normalize sites the guards exist to protect. This file is
+# what the inventory's remainder actually means.
+#
+# FORMAT: <site>\t<class>\t<reason>
+#
+# CLASSES
+#   partial          something already consumes part of the tail. Truncating it
+#                    removes a value that is READ, on a config that commits
+#                    clean. Forbidden to every scope by
+#                    TestNormalizerScopeNeverCoversAPartialSite8690.
+#   gate-open-question
+#                    the disarm arm reds here: rejected at strict commit with the
+#                    pass disabled, accepted with it enabled. THAT IS A QUESTION,
+#                    NOT A VERDICT, and this register got it wrong at first by
+#                    recording such reds as permanent.
+#                    The arm cannot distinguish a gate refusing the packed
+#                    SPELLING (harmful to disarm) from one refusing the
+#                    CONSEQUENCE OF THE DROP — where the pass repairs the drop
+#                    and the acceptance is correct. Only a person can, and the
+#                    verdict's home is the `benign` map in
+#                    compact_normalize_scope_8690_test.go.
+#                    PROOF THAT THIS DISTINCTION IS LOAD-BEARING: `security ipsec
+#                    policy <p> proposal-set` and its ike collateral were listed
+#                    here as permanent on this arm's red alone. Classified, they
+#                    were BENIGN — the gate refuses the dropped proposal-set and
+#                    says so in its own message — and they normalized in
+#                    0c4818aa0. Two of the entries this register called permanent
+#                    were available work.
+#                    So these are NOT permanent. They are unanswered questions,
+#                    and answering one is the available work.
+#   gate-confirmed   classified BY A PERSON as a genuine disarm, with the
+#                    evidence. Permanent. Currently empty: no site here has been
+#                    carried through step 3.
+#   gate-collateral  not itself gate-disarming, but shares a (container, head)
+#                    pair with a `gate` site, and the predicate's two arguments
+#                    cannot express the difference. Lost with the pair.
+#   unmeasurable     the census fixture cannot produce a type-valid value, so
+#                    gate status cannot be measured. NOT known-safe.
+#   unreachable      no (container, head) rule can express it — the container is
+#                    wildcard-named, so production passes an arbitrary instance
+#                    name where a rule would need a keyword.
+#   hazard           normalizing breaks documented, shipped behaviour that no
+#                    disarm measurement detects.
+#   open             genuinely available work with no gate in the way.
+#   unclassified     in another lane's family and NOT measured here. Deliberately
+#                    distinct from `open`: "nobody has checked" is a third state,
+#                    and recording it as available asserts a measurement that was
+#                    not taken.
+#
+# THIS REGISTER WAS WRONG TWICE IN ITS FIRST HOUR, BOTH TIMES IN THE
+# OVER-RESTRICTIVE DIRECTION, AND BOTH ERRORS HAD THE SAME SHAPE: a result
+# established at one granularity, recorded at a finer one.
+#
+#   `security ipsec policy <p> proposal-set` (+ its ike collateral) were listed
+#   permanent on the DISARM ARM'S RED. That red is a question, not a verdict —
+#   the arm cannot tell a gate refusing the packed spelling from one refusing
+#   the CONSEQUENCE of the drop. Classified by a person, they were BENIGN, and
+#   they normalized in 0c4818aa0.
+#
+#   `chassis device-map interface` / `unmapped-interface-policy` were listed
+#   `hazard` on a PER-FAMILY bisection: admitting every chassis pair reds three
+#   redundancy-group cells. True of the family; not true of these two sites,
+#   whose pairs are different. Measured per site they are safe, and they
+#   normalized alongside schedulers.
+#
+# Four sites this file called permanent were available work. The lesson is the
+# one the sweep has been applying everywhere else and this register did not:
+# CHECK PER SITE, NOT PER FAMILY — and treat an instrument's red as the
+# question it is until a person answers it.
+#
+# SITES ARRIVE AS WELL AS LEAVE, and the register has to carry both. Twelve
+# entered between the #8729 measurement and this file landing — ten `services
+# rpm probe` leaves and two `policies ... scheduler-name` — not because a
+# compact-blind reader was introduced, but because another lane's
+# value-synthesis work made them OBSERVABLE to the census. `schedulers scheduler
+# <s> {start,stop}-date` arrived the same way mid-flight and moved a measured
+# family from 21 sites to 23.
+#
+# A blind-spot count that RISES is the instrument improving, and the register
+# must not treat an arrival as a defect. What it must do is refuse to let one
+# pass unclassified, which is what the set-equality assertion does.
+#
+# EVERY MEASUREMENT NAMES THE COMMIT IT WAS TAKEN AT, and that is not
+# bookkeeping. Two classifications in this register described sites that had
+# already left the inventory by the time anyone read them — a reader checking
+# the file finds nothing and cannot tell whether the site was fixed or was never
+# there. A verdict about a live artefact is only meaningful with its `as-of`.
+#
+# AND EVERY VERDICT HERE IS CONDITIONAL ON THE SCOPE AT THAT COMMIT. A
+# `gate-confirmed` or benign classification says what WOULD happen if the pair
+# were admitted; none of these pairs is admitted today, so nothing in this file
+# describes a live defect. Writing "is a disarm" where the evidence says "would
+# be a disarm if admitted" is the difference between a hole in the tree and a
+# hole caught before it was opened — this register only ever records the second.
+#
+# THIS FILE IS A GATE, NOT A REGISTRY. The guard asserts set-equality with the
+# inventory in BOTH directions, and drives every non-`open` site through the
+# real normalizer to confirm the pass still leaves it alone. A listed site that
+# becomes admissible reds; an inventory site missing from this file reds. An
+# exclusion list that only accumulates is a place to hide defects.
+
+bridge-domains xpfname domain-type	partial	drop shape "partial" in the inventory
+bridge-domains xpfname routing-interface	partial	drop shape "partial" in the inventory
+interfaces xpfname description	partial	drop shape "partial" in the inventory
+interfaces xpfname duplex	partial	drop shape "partial" in the inventory
+interfaces xpfname encapsulation	partial	drop shape "partial" in the inventory
+interfaces xpfname mtu	partial	drop shape "partial" in the inventory
+interfaces xpfname native-vlan-id	partial	drop shape "partial" in the inventory
+interfaces xpfname speed	partial	drop shape "partial" in the inventory
+interfaces xpfname tunnel routing-instance destination	partial	drop shape "partial" in the inventory
+interfaces xpfname unit	partial	drop shape "partial" in the inventory
+policy-options policy-statement xpfarg term xpfarg then as-path-prepend	partial	drop shape "partial"; the eight `then` actions family 2 nearly swallowed by scoping on the container keyword
+policy-options policy-statement xpfarg term xpfarg then community	partial	drop shape "partial"; same head as the safe `from community`, one token apart
+policy-options policy-statement xpfarg term xpfarg then load-balance	partial	drop shape "partial"
+policy-options policy-statement xpfarg term xpfarg then local-preference	partial	drop shape "partial"; also the #2419 positive-control anchor, chosen BECAUSE a partial site is immune to the sweep
+policy-options policy-statement xpfarg term xpfarg then metric	partial	drop shape "partial"
+policy-options policy-statement xpfarg term xpfarg then metric-type	partial	drop shape "partial"
+policy-options policy-statement xpfarg term xpfarg then next-hop	partial	drop shape "partial"
+policy-options policy-statement xpfarg term xpfarg then origin	partial	drop shape "partial"
+protocols bgp group xpfarg neighbor xpfarg peer-as	open	STEP 3 DONE — BENIGN, therefore AVAILABLE WORK, not an exclusion. Measured by admitting the pair: BRACED accepted with the pass both off and on (the config is legitimate), ELIDED rejected with the pass off (the neighbor has "missing/invalid peer-as"), ELIDED ACCEPTED with the pass on. The gate exists to catch the dropped value; the pass restores it, so the gate then passing is the intended interaction, not a disarm. Same argument and same shape as `security ipsec policy <p> proposal-set` in 0c4818aa0. MEASURED AT d8021931b; the pair is NOT admitted there, so this describes what admitting it would do, not a live disarm
+security dynamic-address feed-server xpfarg hostname	open	STEP 3 DONE — BENIGN, therefore AVAILABLE WORK, not an exclusion. Measured by admitting the pair: BRACED accepted with the pass both off and on (the config is legitimate), ELIDED rejected with the pass off (the feed-server "resolves to an empty endpoint"), ELIDED ACCEPTED with the pass on. The gate exists to catch the dropped value; the pass restores it, so the gate then passing is the intended interaction, not a disarm. Same argument and same shape as `security ipsec policy <p> proposal-set` in 0c4818aa0. MEASURED AT d8021931b; the pair is NOT admitted there, so this describes what admitting it would do, not a live disarm
+security dynamic-address feed-server xpfarg url	open	STEP 3 DONE — BENIGN, therefore AVAILABLE WORK, not an exclusion. Measured by admitting the pair: BRACED accepted with the pass both off and on (the config is legitimate), ELIDED rejected with the pass off (the feed-server "resolves to an empty endpoint"), ELIDED ACCEPTED with the pass on. The gate exists to catch the dropped value; the pass restores it, so the gate then passing is the intended interaction, not a disarm. Same argument and same shape as `security ipsec policy <p> proposal-set` in 0c4818aa0. MEASURED AT d8021931b; the pair is NOT admitted there, so this describes what admitting it would do, not a live disarm
+system dataplane control-socket	open	ADOPTED FROM lane-8526's independent derivation, which measured these directly rather than deferring: arm 2 passes with no disarm and the whole tree passes bar one bookkeeping cell. Recorded with provenance rather than merged into this lane's own measurements — an entry measured by a lane that does not own the family is more useful than one that silently blends two epistemics
+system domain-name	open	ADOPTED FROM lane-8526's independent derivation, which measured these directly rather than deferring: arm 2 passes with no disarm and the whole tree passes bar one bookkeeping cell. Recorded with provenance rather than merged into this lane's own measurements — an entry measured by a lane that does not own the family is more useful than one that silently blends two epistemics
+system login class	partial	drop shape "partial" in the inventory
+system login class xpfarg allow-commands	gate-confirmed	STEP 3 DONE — GENUINE disarm, permanent. Admitting the login-subtree pairs reds the dedicated TestCompactNormalizeDoesNotDisarmTheLoginPackedGate8690 AND five #6662 cells (LoginPackedRejectedAtCommit, ...NamesTheDroppedTokens, ...PreservesQuoting, ...ExplainsTheRBACCost, ...InsideAppliedGroupRejected). The gate refuses the packed SPELLING, not the consequence of a drop, so normalizing it defeats the gate outright. Independently reached by lane-8526, which measured the same subtree directly rather than deferring to the owning lane. MEASURED AT d8021931b; the pairs are NOT admitted there, so this is a disarm that would occur on admission, not one currently open
+system login class xpfarg allow-configuration	gate-confirmed	STEP 3 DONE — GENUINE disarm, permanent. Admitting the login-subtree pairs reds the dedicated TestCompactNormalizeDoesNotDisarmTheLoginPackedGate8690 AND five #6662 cells (LoginPackedRejectedAtCommit, ...NamesTheDroppedTokens, ...PreservesQuoting, ...ExplainsTheRBACCost, ...InsideAppliedGroupRejected). The gate refuses the packed SPELLING, not the consequence of a drop, so normalizing it defeats the gate outright. Independently reached by lane-8526, which measured the same subtree directly rather than deferring to the owning lane. MEASURED AT d8021931b; the pairs are NOT admitted there, so this is a disarm that would occur on admission, not one currently open
+system login class xpfarg deny-commands	gate-confirmed	STEP 3 DONE — GENUINE disarm, permanent. Admitting the login-subtree pairs reds the dedicated TestCompactNormalizeDoesNotDisarmTheLoginPackedGate8690 AND five #6662 cells (LoginPackedRejectedAtCommit, ...NamesTheDroppedTokens, ...PreservesQuoting, ...ExplainsTheRBACCost, ...InsideAppliedGroupRejected). The gate refuses the packed SPELLING, not the consequence of a drop, so normalizing it defeats the gate outright. Independently reached by lane-8526, which measured the same subtree directly rather than deferring to the owning lane. MEASURED AT d8021931b; the pairs are NOT admitted there, so this is a disarm that would occur on admission, not one currently open
+system login class xpfarg deny-configuration	gate-confirmed	STEP 3 DONE — GENUINE disarm, permanent. Admitting the login-subtree pairs reds the dedicated TestCompactNormalizeDoesNotDisarmTheLoginPackedGate8690 AND five #6662 cells (LoginPackedRejectedAtCommit, ...NamesTheDroppedTokens, ...PreservesQuoting, ...ExplainsTheRBACCost, ...InsideAppliedGroupRejected). The gate refuses the packed SPELLING, not the consequence of a drop, so normalizing it defeats the gate outright. Independently reached by lane-8526, which measured the same subtree directly rather than deferring to the owning lane. MEASURED AT d8021931b; the pairs are NOT admitted there, so this is a disarm that would occur on admission, not one currently open
+system login class xpfarg idle-timeout	gate-confirmed	STEP 3 DONE — GENUINE disarm, permanent. Admitting the login-subtree pairs reds the dedicated TestCompactNormalizeDoesNotDisarmTheLoginPackedGate8690 AND five #6662 cells (LoginPackedRejectedAtCommit, ...NamesTheDroppedTokens, ...PreservesQuoting, ...ExplainsTheRBACCost, ...InsideAppliedGroupRejected). The gate refuses the packed SPELLING, not the consequence of a drop, so normalizing it defeats the gate outright. Independently reached by lane-8526, which measured the same subtree directly rather than deferring to the owning lane. MEASURED AT d8021931b; the pairs are NOT admitted there, so this is a disarm that would occur on admission, not one currently open
+system login class xpfarg permissions	gate-confirmed	STEP 3 DONE — GENUINE disarm, permanent. Admitting the login-subtree pairs reds the dedicated TestCompactNormalizeDoesNotDisarmTheLoginPackedGate8690 AND five #6662 cells (LoginPackedRejectedAtCommit, ...NamesTheDroppedTokens, ...PreservesQuoting, ...ExplainsTheRBACCost, ...InsideAppliedGroupRejected). The gate refuses the packed SPELLING, not the consequence of a drop, so normalizing it defeats the gate outright. Independently reached by lane-8526, which measured the same subtree directly rather than deferring to the owning lane. MEASURED AT d8021931b; the pairs are NOT admitted there, so this is a disarm that would occur on admission, not one currently open
+system login user	partial	drop shape "partial" in the inventory
+system login user xpfarg authentication encrypted-password	gate-confirmed	STEP 3 DONE — GENUINE disarm, permanent. Admitting the login-subtree pairs reds the dedicated TestCompactNormalizeDoesNotDisarmTheLoginPackedGate8690 AND five #6662 cells (LoginPackedRejectedAtCommit, ...NamesTheDroppedTokens, ...PreservesQuoting, ...ExplainsTheRBACCost, ...InsideAppliedGroupRejected). The gate refuses the packed SPELLING, not the consequence of a drop, so normalizing it defeats the gate outright. Independently reached by lane-8526, which measured the same subtree directly rather than deferring to the owning lane. MEASURED AT d8021931b; the pairs are NOT admitted there, so this is a disarm that would occur on admission, not one currently open
+system login user xpfarg authentication ssh-dsa	gate-confirmed	STEP 3 DONE — GENUINE disarm, permanent. Admitting the login-subtree pairs reds the dedicated TestCompactNormalizeDoesNotDisarmTheLoginPackedGate8690 AND five #6662 cells (LoginPackedRejectedAtCommit, ...NamesTheDroppedTokens, ...PreservesQuoting, ...ExplainsTheRBACCost, ...InsideAppliedGroupRejected). The gate refuses the packed SPELLING, not the consequence of a drop, so normalizing it defeats the gate outright. Independently reached by lane-8526, which measured the same subtree directly rather than deferring to the owning lane. MEASURED AT d8021931b; the pairs are NOT admitted there, so this is a disarm that would occur on admission, not one currently open
+system login user xpfarg authentication ssh-ed25519	gate-confirmed	STEP 3 DONE — GENUINE disarm, permanent. Admitting the login-subtree pairs reds the dedicated TestCompactNormalizeDoesNotDisarmTheLoginPackedGate8690 AND five #6662 cells (LoginPackedRejectedAtCommit, ...NamesTheDroppedTokens, ...PreservesQuoting, ...ExplainsTheRBACCost, ...InsideAppliedGroupRejected). The gate refuses the packed SPELLING, not the consequence of a drop, so normalizing it defeats the gate outright. Independently reached by lane-8526, which measured the same subtree directly rather than deferring to the owning lane. MEASURED AT d8021931b; the pairs are NOT admitted there, so this is a disarm that would occur on admission, not one currently open
+system login user xpfarg authentication ssh-rsa	gate-confirmed	STEP 3 DONE — GENUINE disarm, permanent. Admitting the login-subtree pairs reds the dedicated TestCompactNormalizeDoesNotDisarmTheLoginPackedGate8690 AND five #6662 cells (LoginPackedRejectedAtCommit, ...NamesTheDroppedTokens, ...PreservesQuoting, ...ExplainsTheRBACCost, ...InsideAppliedGroupRejected). The gate refuses the packed SPELLING, not the consequence of a drop, so normalizing it defeats the gate outright. Independently reached by lane-8526, which measured the same subtree directly rather than deferring to the owning lane. MEASURED AT d8021931b; the pairs are NOT admitted there, so this is a disarm that would occur on admission, not one currently open
+system login user xpfarg class	gate-confirmed	STEP 3 DONE — GENUINE disarm, permanent. Admitting the login-subtree pairs reds the dedicated TestCompactNormalizeDoesNotDisarmTheLoginPackedGate8690 AND five #6662 cells (LoginPackedRejectedAtCommit, ...NamesTheDroppedTokens, ...PreservesQuoting, ...ExplainsTheRBACCost, ...InsideAppliedGroupRejected). The gate refuses the packed SPELLING, not the consequence of a drop, so normalizing it defeats the gate outright. Independently reached by lane-8526, which measured the same subtree directly rather than deferring to the owning lane. MEASURED AT d8021931b; the pairs are NOT admitted there, so this is a disarm that would occur on admission, not one currently open
+system login user xpfarg uid	gate-confirmed	STEP 3 DONE — GENUINE disarm, permanent. Admitting the login-subtree pairs reds the dedicated TestCompactNormalizeDoesNotDisarmTheLoginPackedGate8690 AND five #6662 cells (LoginPackedRejectedAtCommit, ...NamesTheDroppedTokens, ...PreservesQuoting, ...ExplainsTheRBACCost, ...InsideAppliedGroupRejected). The gate refuses the packed SPELLING, not the consequence of a drop, so normalizing it defeats the gate outright. Independently reached by lane-8526, which measured the same subtree directly rather than deferring to the owning lane. MEASURED AT d8021931b; the pairs are NOT admitted there, so this is a disarm that would occur on admission, not one currently open
+system services dhcp-local-server group xpfarg pool xpfarg static-binding xpfarg fixed-address	open	STEP 3 DONE — BENIGN, therefore AVAILABLE WORK, not an exclusion. Measured by admitting the pair: BRACED accepted with the pass both off and on (the config is legitimate), ELIDED rejected with the pass off (the static-binding "has no fixed-address"), ELIDED ACCEPTED with the pass on. The gate exists to catch the dropped value; the pass restores it, so the gate then passing is the intended interaction, not a disarm. Same argument and same shape as `security ipsec policy <p> proposal-set` in 0c4818aa0. MEASURED AT d8021931b; the pair is NOT admitted there, so this describes what admitting it would do, not a live disarm
+system services dhcpv6-local-server group xpfarg pool xpfarg static-binding xpfarg fixed-address	open	STEP 3 DONE — BENIGN, therefore AVAILABLE WORK, not an exclusion. Measured by admitting the pair: BRACED accepted with the pass both off and on (the config is legitimate), ELIDED rejected with the pass off (the static-binding "has no fixed-address"), ELIDED ACCEPTED with the pass on. The gate exists to catch the dropped value; the pass restores it, so the gate then passing is the intended interaction, not a disarm. Same argument and same shape as `security ipsec policy <p> proposal-set` in 0c4818aa0. MEASURED AT d8021931b; the pair is NOT admitted there, so this describes what admitting it would do, not a live disarm. ADOPTED FROM lane-8526, which hand-measured it out of arm 2's fixture-limited bucket where the v4 twin was caught by the arm and this one was not; re-derived here with the braced control, which lane-8526's measurement did not include and which is the leg that distinguishes benign from genuine
+system services ssh protocol-version	open	ADOPTED FROM lane-8526's independent derivation, which measured these directly rather than deferring: arm 2 passes with no disarm and the whole tree passes bar one bookkeeping cell. Recorded with provenance rather than merged into this lane's own measurements — an entry measured by a lane that does not own the family is more useful than one that silently blends two epistemics
+system services web-management api-auth user xpfname password	unreachable	lane-8388: wildcard-named container, so production passes an arbitrary instance name where a pair rule needs a keyword
+security policies from-zone xpfarg xpfarg xpfarg policy xpfarg scheduler-name	unmeasurable	excluded from the #8729 scope because the scope guard could not EXAMINE it: its reference spelling does not compile in isolation (a policy needs zones declared under `security` and a match/then body, neither reachable from the leaf's parent). Not measured, therefore not known-safe
+security policies global policy xpfarg scheduler-name	unmeasurable	same as the from-zone sibling above
+services rpm probe xpfarg test xpfarg destination-interface	unclassified	ENTERED the inventory after the #8729 measurement, from another lane's value-synthesis work — the same way `schedulers scheduler <s> {start,stop}-date` appeared mid-flight. In lane-8526's `services` family and NOT measured here
+services rpm probe xpfarg test xpfarg destination-port	unclassified	ENTERED the inventory after the #8729 measurement, from another lane's value-synthesis work — the same way `schedulers scheduler <s> {start,stop}-date` appeared mid-flight. In lane-8526's `services` family and NOT measured here
+services rpm probe xpfarg test xpfarg probe-count	unclassified	ENTERED the inventory after the #8729 measurement, from another lane's value-synthesis work — the same way `schedulers scheduler <s> {start,stop}-date` appeared mid-flight. In lane-8526's `services` family and NOT measured here
+services rpm probe xpfarg test xpfarg probe-interval	unclassified	ENTERED the inventory after the #8729 measurement, from another lane's value-synthesis work — the same way `schedulers scheduler <s> {start,stop}-date` appeared mid-flight. In lane-8526's `services` family and NOT measured here
+services rpm probe xpfarg test xpfarg probe-limit	unclassified	ENTERED the inventory after the #8729 measurement, from another lane's value-synthesis work — the same way `schedulers scheduler <s> {start,stop}-date` appeared mid-flight. In lane-8526's `services` family and NOT measured here
+services rpm probe xpfarg test xpfarg probe-type	unclassified	ENTERED the inventory after the #8729 measurement, from another lane's value-synthesis work — the same way `schedulers scheduler <s> {start,stop}-date` appeared mid-flight. In lane-8526's `services` family and NOT measured here
+services rpm probe xpfarg test xpfarg routing-instance	unclassified	ENTERED the inventory after the #8729 measurement, from another lane's value-synthesis work — the same way `schedulers scheduler <s> {start,stop}-date` appeared mid-flight. In lane-8526's `services` family and NOT measured here
+services rpm probe xpfarg test xpfarg source-address	unclassified	ENTERED the inventory after the #8729 measurement, from another lane's value-synthesis work — the same way `schedulers scheduler <s> {start,stop}-date` appeared mid-flight. In lane-8526's `services` family and NOT measured here
+services rpm probe xpfarg test xpfarg target	unclassified	ENTERED the inventory after the #8729 measurement, from another lane's value-synthesis work — the same way `schedulers scheduler <s> {start,stop}-date` appeared mid-flight. In lane-8526's `services` family and NOT measured here
+services rpm probe xpfarg test xpfarg test-interval	unclassified	ENTERED the inventory after the #8729 measurement, from another lane's value-synthesis work — the same way `schedulers scheduler <s> {start,stop}-date` appeared mid-flight. In lane-8526's `services` family and NOT measured here
