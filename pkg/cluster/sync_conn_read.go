@@ -235,15 +235,56 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		// our stored generations so a rebooted peer's bulk (whose genCounter
 		// restarted lower) is accepted by the install guard instead of being
 		// refused as stale (stale-RETAIN, the inverse of #2170).
-		s.resetRecvGen()
 		zoneSnap := s.snapshotZoneOwnership()
 		s.bulkMu.Lock()
+		// #8966: GUARD THE START THE WAY THE END IS GUARDED.
+		//
+		// `BulkEnd` at the bottom of this function refuses an epoch that does
+		// not match the in-progress one. `BulkStart` compared nothing: it
+		// assigned `bulkRecvEpoch` unconditionally and reset the accumulators,
+		// so a delayed or reordered BulkStart carrying a LOWER epoch -- the
+		// ordinary case with two fabric streams -- discarded the newer bulk's
+		// accumulated receive set, after which the newer BulkEnd was rejected
+		// as mismatched. Two handlers disagreeing about which epoch is
+		// authoritative, and only one of them checking.
+		//
+		// THE #2198 F2 RATIONALE ABOVE IS TRUE AND COVERS A DIFFERENT CASE. A
+		// rebooted peer legitimately restarts its genCounter lower, and
+		// refusing that bulk would strand the standby. But the code could not
+		// tell "the peer rebooted and is re-priming" from "an older BulkStart
+		// arrived late on the other stream", and applied the reboot treatment
+		// to both.
+		//
+		// `switched` -- already computed above for #6910's fabric preference --
+		// is exactly that discriminator, so the information was in hand and
+		// simply not consulted by the code that needed it. Across an
+		// incarnation change, keep accept-and-reset: that IS the #2198 case.
+		// Within one incarnation, a BulkStart must be strictly newer.
+		if !switched && s.bulkInProgress && epoch <= s.bulkRecvEpoch {
+			inProgress := s.bulkRecvEpoch
+			v4, v6 := len(s.bulkRecvV4), len(s.bulkRecvV6)
+			s.bulkMu.Unlock()
+			slog.Warn("cluster sync: ignoring stale BulkStart within the same boot incarnation",
+				"in_progress_epoch", inProgress, "got_epoch", epoch,
+				"accumulated_v4", v4, "accumulated_v6", v6,
+				"peer_incarnation", inc)
+			break
+		}
 		s.bulkInProgress = true
 		s.bulkRecvEpoch = epoch
 		s.bulkRecvV4 = make(map[dataplane.SessionKey]struct{})
 		s.bulkRecvV6 = make(map[dataplane.SessionKeyV6]struct{})
 		s.bulkZoneSnapshot = zoneSnap
 		s.bulkMu.Unlock()
+		// The generation reset moves to the ACCEPTED path only. It is the
+		// #2198 F2 remedy for a re-priming peer, and running it for a stale
+		// BulkStart discarded the generations of a bulk that was still valid.
+		//
+		// It stays OUTSIDE `bulkMu`, where it has always been. `resetRecvGen`
+		// takes `recvGenMu`, and pulling it inside would add a bulkMu ->
+		// recvGenMu edge to the lock graph as a side effect of a correctness
+		// fix -- a change nothing here needs and nobody would look for.
+		s.resetRecvGen()
 		// #6910: ACT on the switch, do not merely report it. Until now
 		// `switched` reached only this log line, so a reboot whose replacement
 		// primed on the alternate fabric left the corpse installed, stamped
