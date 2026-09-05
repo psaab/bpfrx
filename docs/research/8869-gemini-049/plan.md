@@ -1,6 +1,6 @@
 # Plan of action — gemini-review-049 (#8869)
 
-- **Revision:** r5 (after Codex r4: 3 of 4 resolved; the gate's combined triggers and the thresholds' standing are fixed here)
+- **Revision:** r6 — **PLAN-READY** (Codex r5). Two wording overstatements corrected.
 - **Base:** `f36be93c5` (origin/master at drafting)
 - **Report base:** `b0f3aba21`, which was master-identical when the review ran
 - **Status:** revised. Codex r1 `PLAN-REVISE` (8 findings). AGY infra-blocked (2-of-3 exception).
@@ -274,9 +274,11 @@ plan does not re-litigate that class.
    say what happens when `U >= 25%` and `T > 20 min` trigger together, nor
    whether the second decision pools the batches.)*
 
-   1. **`U >= 25%` wins over everything.** A sample whose targets are mostly
-      unresolved cannot support any decision, including "unaffordable" — fix the
-      resolver and re-run **the same batch** before reading `T` or `L` at all.
+   1. **`U >= 25%` wins over everything.** *(r6: this read "mostly unresolved",
+      which 25% is not — Codex r5.)* **A quarter of targets unresolved is enough
+      that the batch is measuring the resolver rather than the population**, and
+      no decision — including "unaffordable" — can rest on it. Fix the resolver
+      and re-run **the same batch** before reading `T` or `L` at all.
    2. **`T > 20 min` wins over `L`.** If the census is unaffordable, a high live
       rate does not make it affordable; it makes abandoning it more painful,
       which is a different fact.
@@ -305,7 +307,10 @@ plan does not re-litigate that class.
    The operational basis, stated so it can be argued with rather than deferred to:
 
    - **40%** — above this, classification is the cheapest route to the defects,
-     because most of what you classify is work you would have done anyway.
+     because **a large enough share** of what you classify is work you would have
+     done anyway. *(r6: this read "most", which 40% does not establish — Codex
+     r5. The threshold is where the ratio stops favouring targeted
+     investigation, not where a majority is reached.)*
    - **15%** — below this, ~7 judgements per defect, and the residue is better
      served by consequence-ordered investigation than by exhaustive census.
    - **25% unresolved** — a quarter of targets unresolved means the resolver, not
