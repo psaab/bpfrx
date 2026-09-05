@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -117,10 +118,18 @@ func compileNAT(node *Node, sec *SecurityConfig) error {
 				// Hierarchical range: Keys=["address","addr1","to","addr2"]
 				if len(prop.Keys) >= 4 && prop.Keys[2] == "to" {
 					expanded, err := expandAddressRange(prop.Keys[1], prop.Keys[3])
-					if err != nil {
+					switch {
+					case errors.Is(err, errNATAddressRangeTooLarge):
+						// #8814: record, do not fail. This chain carries no
+						// compileOpts, so a hard error here reaches the LENIENT
+						// path and a persisted config cannot boot.
+						entry.OversizedRangeSpecs = append(entry.OversizedRangeSpecs,
+							fmt.Sprintf("%s to %s: %v", prop.Keys[1], prop.Keys[3], err))
+					case err != nil:
 						return fmt.Errorf("proxy-arp interface %s: %w", inst.name, err)
+					default:
+						entry.Addresses = append(entry.Addresses, expanded...)
 					}
-					entry.Addresses = append(entry.Addresses, expanded...)
 					continue
 				}
 
@@ -131,10 +140,15 @@ func compileNAT(node *Node, sec *SecurityConfig) error {
 					high := nodeVal(toChild)
 					if low != "" && high != "" {
 						expanded, err := expandAddressRange(low, high)
-						if err != nil {
+						switch {
+						case errors.Is(err, errNATAddressRangeTooLarge):
+							entry.OversizedRangeSpecs = append(entry.OversizedRangeSpecs,
+								fmt.Sprintf("%s to %s: %v", low, high, err))
+						case err != nil:
 							return fmt.Errorf("proxy-arp interface %s: %w", inst.name, err)
+						default:
+							entry.Addresses = append(entry.Addresses, expanded...)
 						}
-						entry.Addresses = append(entry.Addresses, expanded...)
 						continue
 					}
 				}

@@ -162,6 +162,31 @@ func runUniformGatesNAT(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 		}
 	}
 
+	// #8814 NAT pool address-RANGE size gate. `address <low> to <high>` expands
+	// to one address per IP and is capped at 256; the cap used to be raised as a
+	// compile error inside expandAddressRange, which put it on the LENIENT path
+	// as well -- the security compiler chain carries no compileOpts, so nothing
+	// could downgrade it, and a persisted config with an oversized range FAILED
+	// TO LOAD. That defeats what CompileConfigLenient is for ("so an upgraded
+	// node boots through"), and it was true of the BRACED spelling on master
+	// independently of #8800; #8800 only removed the accident that hid it for
+	// the packed spelling.
+	//
+	// The compiler now records the range and this gate decides its severity:
+	// strict on commit / commit-check (hard-reject, so an operator still cannot
+	// author one), lenient on load / peer-sync (warn; the pool loads without
+	// that range and keeps its other addresses). Shares lenientDestNATAddresses
+	// with the pool gates above -- same NAT silent-drop doctrine, same
+	// population.
+	if err := validateNATPoolAddressRangeStrict(cfg); err != nil {
+		if opts.lenientDestNATAddresses {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("nat pool address range (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #5626 source/destination-NAT pool-REFERENCE definedness gate. A NAT rule
 	// whose `then ... pool <name>` names a pool NOT defined under `security nat
 	// source/destination pool` committed cleanly (warn-only) and then failed the

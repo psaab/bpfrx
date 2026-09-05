@@ -784,6 +784,23 @@ type ProxyARPEntry struct {
 	// compile. It does not cross the wire to the Rust helper and must not leak
 	// into configstore.ExportJSON's dump of the compiled *config.Config —
 	// mirrors NATPool.PortRangeInvalidSpec.
+	// OversizedRangeSpecs records `address <low> to <high>` statements whose
+	// inclusive size exceeds expandAddressRange's 256-address cap (#8814).
+	//
+	// Identical defect to NATPool.OversizedAddressRanges, reached through the
+	// OTHER caller of expandAddressRange, and measured rather than assumed to be
+	// the same: on master a 257-address proxy-arp range FAILED TO LOAD under
+	// CompileConfigLenient exactly as the pool case did, because both propagate
+	// the same compiler error through a chain that carries no compileOpts.
+	//
+	// It follows the treatment this struct already gives an over-cap PREFIX
+	// (proxyARPMaxExpandedHosts, #6559): the compiler declines to expand and
+	// leaves the gate to decide severity. The difference is that a prefix has a
+	// meaningful authored form to install and a RANGE does not, so nothing is
+	// installed for the statement -- fail closed, no ARP/ND answered for
+	// addresses the compiler could not enumerate.
+	OversizedRangeSpecs []string `json:"-"`
+
 	MalformedRangeSpecs []string `json:"-"`
 }
 
@@ -1002,6 +1019,35 @@ type NATPool struct {
 	// unaffected), and it would otherwise leak into configstore.ExportJSON's
 	// debug dump of the compiled *config.Config as a redundant duplicate of
 	// Port. The tag keeps it out of any json.Marshal of NATPool.
+	// OversizedAddressRanges records `address <low> to <high>` ranges whose
+	// inclusive size exceeds the 256-address expansion cap (#8814).
+	//
+	// The cap is enforced during EXPANSION, in expandAddressRange, because the
+	// widest legal spelling is `0.0.0.0/32 to 255.255.255.255/32` = 4294967296
+	// addresses and an unbounded expansion would allocate that many strings.
+	// But raising it as a compile ERROR made it fire on the LENIENT path too:
+	// appendPoolAddresses is reached through compileSecurity -> compileNATSource,
+	// which carries no compileOpts, so there was no seam at which to downgrade
+	// it. A persisted config with an oversized range therefore FAILED TO LOAD,
+	// defeating the guarantee CompileConfigLenient exists to provide -- its own
+	// doc says it is there "so an upgraded node boots through".
+	//
+	// Recording it gives both halves: the pool loads WITHOUT the oversized range
+	// on the tolerant load / peer-sync path, and validateNATPoolAddressRangeStrict
+	// hard-rejects at commit / commit-check so an operator still cannot author
+	// one. Same shape as PortRangeInvalidSpec below, and as
+	// FirewallFilterTerm.UnknownFrom (#3307).
+	//
+	// The population is configs arriving by a route OTHER than commit -- a config
+	// file loaded directly, a peer sync, or a node built with a different cap --
+	// which is exactly what the lenient path is written for.
+	// `json:"-"`: a compile-time diagnostic artifact recomputed from the
+	// ConfigTree on every compile, read only Go-side by the strict gate. It must
+	// never be serialized -- it does not cross the wire to the Rust helper and
+	// would otherwise leak into configstore.ExportJSON's dump of the compiled
+	// *config.Config. Mirrors PortRaw and ProxyARPEntry.MalformedRangeSpecs.
+	OversizedAddressRanges []string `json:"-"`
+
 	PortRaw  string `json:"-"`
 	PortLow  int    // source pool port range low (default 1024)
 	PortHigh int    // source pool port range high (default 65535)
