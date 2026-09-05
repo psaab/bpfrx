@@ -241,3 +241,119 @@ class CleanupOnFailureTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VirshProbeThreeStateTests(unittest.TestCase):
+    """#8977: a failed virsh probe must not read as 'domain absent'.
+
+    `virsh dominfo` exits non-zero for a missing domain AND for an unreachable
+    libvirtd, a permissions failure, or a timeout. Collapsing those to False
+    made "we could not tell" read as "there is nothing there" -- and both
+    teardown paths guarded only the DESTROY on it while leaving the disk
+    UNLINK unguarded, so a live VM's overlay was removed anyway.
+
+    ONE FUNCTION, TWO OPERATIONS, ONE GUARDED -- and the guard was on the
+    survivable half. Skipping a shutdown is harmless; deleting a running VM's
+    backing store is not, and one path escalates to `sudo rm -f` when the
+    unlink is refused.
+    """
+
+    @staticmethod
+    def _completed(rc, stderr=""):
+        return subprocess.CompletedProcess(args=["virsh"], returncode=rc,
+                                           stdout="", stderr=stderr)
+
+    def test_probe_separates_absent_from_unknown_8977(self):
+        cases = [
+            (0, "", xpf_deploy.DOMAIN_PRESENT),
+            (1, "error: failed to get domain 'fw1'", xpf_deploy.DOMAIN_ABSENT),
+            (1, "error: failed to connect to the hypervisor", xpf_deploy.DOMAIN_UNKNOWN),
+            (1, "error: authentication failed: permission denied", xpf_deploy.DOMAIN_UNKNOWN),
+            (1, "", xpf_deploy.DOMAIN_UNKNOWN),
+        ]
+        for rc, err, want in cases:
+            with mock.patch.object(subprocess, "run",
+                                   return_value=self._completed(rc, err)):
+                got = xpf_deploy._virsh_domain_state("fw1")
+            self.assertEqual(got, want, f"rc={rc} stderr={err!r}")
+
+    def test_missing_virsh_is_genuine_absence_8977(self):
+        # A MISSING BINARY is real absence -- virsh is not installed, so no
+        # libvirt domain can exist. That tolerance is correct and must survive;
+        # what must not is extending it to a tool that IS installed and failed
+        # to answer.
+        with mock.patch.object(subprocess, "run", side_effect=FileNotFoundError()):
+            self.assertEqual(xpf_deploy._virsh_domain_state("fw1"),
+                             xpf_deploy.DOMAIN_ABSENT)
+
+    def test_destroy_refuses_to_unlink_when_state_unknown_8977(self):
+        removed = []
+        with tempfile.TemporaryDirectory() as td:
+            overlay = os.path.join(td, "fw1.qcow2")
+            open(overlay, "w").close()
+            with mock.patch.object(xpf_deploy, "_virsh_domain_state",
+                                   return_value=xpf_deploy.DOMAIN_UNKNOWN), \
+                 mock.patch.object(xpf_deploy, "libvirt_overlay_path",
+                                   return_value=overlay), \
+                 mock.patch.object(xpf_deploy, "day0_iso_path",
+                                   return_value=os.path.join(td, "fw1.iso")), \
+                 mock.patch.object(os, "remove", side_effect=removed.append):
+                with self.assertRaises(SystemExit) as cm:
+                    xpf_deploy.destroy_libvirt(_bridge_ap("fw1"), xpf_deploy.Runner(dry=False))
+        self.assertIn("cannot determine", str(cm.exception.code))
+        self.assertEqual(removed, [],
+                         "#8977: teardown removed a file while the domain's "
+                         "existence was UNKNOWN -- if the domain is running "
+                         "that deletes a live VM's disk")
+        self.assertTrue(os.path.basename(overlay) in str(cm.exception.code)
+                        or overlay in str(cm.exception.code),
+                        "the refusal must name the file it declined to remove")
+
+    def test_destroy_still_unlinks_when_absent_8977(self):
+        # CONTROL. The whole point of the probe is to allow teardown when the
+        # domain is genuinely gone. A fix that refuses on ABSENT as well would
+        # pass the assertion above and break every ordinary teardown.
+        removed = []
+        with tempfile.TemporaryDirectory() as td:
+            overlay = os.path.join(td, "fw1.qcow2")
+            iso = os.path.join(td, "fw1.iso")
+            open(overlay, "w").close()
+            with mock.patch.object(xpf_deploy, "_virsh_domain_state",
+                                   return_value=xpf_deploy.DOMAIN_ABSENT), \
+                 mock.patch.object(xpf_deploy, "libvirt_overlay_path",
+                                   return_value=overlay), \
+                 mock.patch.object(xpf_deploy, "day0_iso_path", return_value=iso), \
+                 mock.patch.object(os, "remove", side_effect=removed.append):
+                try:
+                    xpf_deploy.destroy_libvirt(_bridge_ap("fw1"),
+                                               xpf_deploy.Runner(dry=False))
+                except SystemExit as exc:
+                    # Caught explicitly so the CONTROL explains itself. A fix
+                    # that refuses on ABSENT as well as UNKNOWN kills this cell
+                    # either way, but without this it dies as an unexplained
+                    # SystemExit -- caught by the wrong branch, which reads as
+                    # a crash rather than as the control it is.
+                    self.fail("CONTROL FAILED: an ABSENT domain must still have "
+                              "its overlay removed, but teardown refused: "
+                              f"{exc.code}")
+        self.assertEqual(removed, [overlay],
+                         "CONTROL FAILED: an ABSENT domain must still have its "
+                         "overlay removed, or teardown never cleans up")
+
+    def test_cleanup_leaves_overlay_when_state_unknown_8977(self):
+        # The failed-deploy cleanup path. It must not raise -- the caller is
+        # already handling a failure and re-raising would replace its diagnosis
+        # -- but it must not delete either.
+        removed = []
+        with tempfile.TemporaryDirectory() as td:
+            overlay = os.path.join(td, "fw1.qcow2")
+            open(overlay, "w").close()
+            with mock.patch.object(xpf_deploy, "_virsh_domain_state",
+                                   return_value=xpf_deploy.DOMAIN_UNKNOWN), \
+                 mock.patch.object(os, "remove", side_effect=removed.append):
+                xpf_deploy._cleanup_libvirt("fw1", overlay)
+        self.assertEqual(removed, [],
+                         "#8977: the cleanup path removed the overlay while the "
+                         "domain's existence was UNKNOWN. This path escalates to "
+                         "`sudo rm -f` when the unlink is refused, so it is the "
+                         "one that gets past a permissions barrier")

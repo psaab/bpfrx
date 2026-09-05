@@ -573,13 +573,63 @@ def _incus_exists(kind, name):
         return False
 
 
-def _virsh_domain_exists(name):
-    """True if a libvirt domain of this name is defined (query-only)."""
+# #8977: three states, not two. `virsh dominfo` exits non-zero for a domain that
+# does not exist AND for a libvirtd that could not be reached, a permissions
+# failure, or a timeout. Collapsing those to False made "we could not tell" read
+# as "there is nothing there" -- and the callers then removed a running VM's
+# backing overlay, in one path with a sudo escalation.
+DOMAIN_PRESENT = "present"
+DOMAIN_ABSENT = "absent"
+DOMAIN_UNKNOWN = "unknown"
+
+
+def _virsh_domain_state(name):
+    """PRESENT / ABSENT / UNKNOWN for a libvirt domain (query-only).
+
+    UNKNOWN is the state that did not exist before #8977, and it is the one the
+    destructive callers must refuse on.
+
+    A MISSING BINARY is genuine absence: virsh is not installed, so no libvirt
+    domain can exist. That is the tolerance the sibling `_incus_exists`
+    docstring describes and it is correct. What is not correct is extending it
+    to a tool that IS installed and FAILED TO ANSWER, where the domain's
+    existence is simply not known.
+
+    `virsh dominfo` distinguishes them in its stderr: a missing domain says so
+    explicitly, while a connection/permission failure names the transport. We
+    read that rather than the exit code, which cannot separate them.
+    """
     try:
-        return subprocess.run(["virsh", "dominfo", name],
-                              capture_output=True, text=True).returncode == 0
+        r = subprocess.run(["virsh", "dominfo", name],
+                           capture_output=True, text=True)
     except FileNotFoundError:
-        return False
+        # virsh absent -> no libvirt domains exist. Genuine absence.
+        return DOMAIN_ABSENT
+    except OSError:
+        return DOMAIN_UNKNOWN
+    if r.returncode == 0:
+        return DOMAIN_PRESENT
+    err = ((r.stderr or "") + (r.stdout or "")).lower()
+    # libvirt's own wording for "this domain is not defined".
+    if "failed to get domain" in err or "domain not found" in err or "no domain with" in err:
+        return DOMAIN_ABSENT
+    # Anything else -- cannot connect, permission denied, timeout, an
+    # unrecognised failure -- is UNKNOWN. Defaulting the unrecognised case to
+    # UNKNOWN rather than ABSENT is deliberate: the cost of a wrong ABSENT is
+    # deleting a live VM's disk, and the cost of a wrong UNKNOWN is refusing a
+    # teardown that the operator can retry.
+    return DOMAIN_UNKNOWN
+
+
+def _virsh_domain_exists(name):
+    """True if a libvirt domain of this name is defined (query-only).
+
+    Retained for the NON-destructive callers (preflight), where treating
+    UNKNOWN as "not present" is the pre-#8977 behaviour and is harmless: the
+    worst outcome is a name-collision check that passes and a later create that
+    fails loudly. Destructive callers must use `_virsh_domain_state`.
+    """
+    return _virsh_domain_state(name) == DOMAIN_PRESENT
 
 
 def _netdev_exists(dev):
@@ -1088,7 +1138,21 @@ def _cleanup_libvirt(name, overlay):
     """Best-effort teardown of a half-created libvirt VM: destroy+undefine the
     domain (if it got defined) and remove the per-VM overlay. Tolerant of a
     missing domain / file (fable-165 H-27)."""
-    if _virsh_domain_exists(name):
+    state = _virsh_domain_state(name)
+    if state == DOMAIN_UNKNOWN:
+        # #8977: this is the cleanup path of a FAILED deploy, so it must not
+        # itself destroy anything it cannot account for. If libvirtd is
+        # unreachable the domain may be running -- possibly a pre-existing one
+        # that shares the name -- and removing the overlay deletes its disk.
+        # Leaving the files is recoverable; deleting a live VM's backing store
+        # is not. Not a SystemExit here: the caller is already handling a
+        # failure and re-raising would replace its diagnosis with this one.
+        print(f"==> WARNING: cannot determine whether libvirt domain '{name}' "
+              f"exists (libvirtd unreachable, permission denied, or timed out)")
+        print(f"==> leaving {overlay} in place rather than risk deleting a "
+              f"running VM's disk; remove it by hand once libvirtd is reachable")
+        return
+    if state == DOMAIN_PRESENT:
         print(f"==> deploy of '{name}' failed; cleaning up the libvirt domain "
               f"so a re-run starts clean")
         subprocess.run(["virsh", "destroy", name], capture_output=True, text=True)
@@ -1210,7 +1274,22 @@ def destroy_libvirt(ap, runner):
         runner.run(["virsh", "undefine", "--nvram", name])
         runner.run(["rm", "-f", overlay])
         return
-    if _virsh_domain_exists(name):
+    state = _virsh_domain_state(name)
+    if state == DOMAIN_UNKNOWN:
+        # #8977: REFUSE. The probe could not reach libvirtd, so the domain may
+        # be RUNNING. The destroy is survivable to skip; the unlink below is
+        # not, and it used to run regardless of this branch -- deleting the
+        # backing overlay of a live VM, with a sudo escalation if the unlink
+        # was refused. The VM then continues on a deleted file until it touches
+        # unbacked storage.
+        raise SystemExit(
+            f"==> ERROR: cannot determine whether libvirt domain '{name}' exists "
+            f"(libvirtd unreachable, permission denied, or timed out).\n"
+            f"    REFUSING to remove {overlay} -- if the domain is running, that "
+            f"deletes a live VM's disk.\n"
+            f"    Fix libvirtd access and retry, or remove the files by hand once "
+            f"you have confirmed the domain is not running.")
+    if state == DOMAIN_PRESENT:
         print(f"==> destroying libvirt domain '{name}'")
         # destroy (power off) is best-effort — the domain may already be stopped.
         subprocess.run(["virsh", "destroy", name], capture_output=True, text=True)
