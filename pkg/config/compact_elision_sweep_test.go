@@ -44,7 +44,15 @@ import (
 // A CONSEQUENCE WORTH KNOWING: the WARNS branch of the gate check now has NO
 // member, because its only row turned out not to be a defect. The branch is
 // therefore unexercised by this sweep -- it is not dead code (the #6662/#6706
-// warning path is real) but nothing here proves it still fires. STRICT-REJECTS
+// warning path is real) but nothing here proves it still fires.
+//
+// AND AN UNEXERCISED BRANCH IS WHERE AN UNSOUND RULE SURVIVES. That is what
+// happened: the branch asked "does the elided spelling produce ANY warnings?",
+// so any container carrying a STANDING advisory scored WARNS for free and a
+// real silent drop inside it read as handled. It now compares the warning SETS
+// between the two arms. sweep_warns_soundness_8895_test.go supplies the two
+// controls this sweep cannot: a standing warning must not score WARNS, and a
+// warning unique to the elided arm must. STRICT-REJECTS
 // keeps two members, `system login` among them, and remains the positive
 // control that stops a handled drop being scored as a defect.
 //
@@ -75,17 +83,59 @@ func TestSweepFull(t *testing.T) {
 	// a handled drop is indistinguishable from an unhandled one, which is how
 	// `system login` (#6662/#6706: LoginDroppedByPacking + strict reject +
 	// warning) sat in the candidate set looking exactly like a defect.
-	gated := func(text string) string {
+	// warningSet returns the lenient-compile warnings of one spelling.
+	warningSet := func(text string) map[string]bool {
+		out := map[string]bool{}
 		tr, perrs := NewParser(text).Parse()
+		if len(perrs) > 0 || tr == nil {
+			return out
+		}
+		if cfg, err := CompileConfigLenient(tr); err == nil && cfg != nil {
+			for _, w := range cfg.Warnings {
+				out[w] = true
+			}
+		}
+		return out
+	}
+	// gated asks whether the OPERATOR IS TOLD ABOUT THIS DROP, and it needs
+	// BOTH spellings to answer that.
+	//
+	// It used to ask only "does the elided spelling produce any warnings?",
+	// which is a different question. Any container carrying a STANDING
+	// advisory -- a parity notice, a deprecation, an accepted-only warning --
+	// answers yes for free, and a real silent drop inside it then scores WARNS
+	// and reads as HANDLED. Measured on `aggregated-ether-options -> lacp`,
+	// where both arms carry the identical #6544 notice:
+	//
+	//	braced  warnings=1   "aggregated-ether-options configured but
+	//	elided  warnings=1    accepted-only -- xpf does not implement 802.3ad"
+	//
+	// The operator is told LAG is unimplemented. They are NOT told their
+	// `lacp active` was discarded. One channel, two questions.
+	//
+	// So compare the SETS: only a warning present in the ELIDED arm and absent
+	// from the braced one is about the drop. That is the liveness rule applied
+	// to the warning channel rather than to a value -- a warning in both arms
+	// is standing and proves nothing, exactly as a value present in neither
+	// arm proves nothing.
+	//
+	// The error direction matters: this bug could only ever score a real drop
+	// as HANDLED, never the reverse, so it under-reports.
+	//
+	// Found by lane-8388 on #8876 batch 11; reproduced here before the change.
+	gated := func(bracedText, elidedText string) string {
+		tr, perrs := NewParser(elidedText).Parse()
 		if len(perrs) > 0 || tr == nil {
 			return "?"
 		}
 		if _, err := compileConfigWithOpts(tr, compileOpts{}); err != nil {
 			return "STRICT-REJECTS"
 		}
-		tr2, _ := NewParser(text).Parse()
-		if cfg, err := CompileConfigLenient(tr2); err == nil && cfg != nil && len(cfg.Warnings) > 0 {
-			return "WARNS"
+		braced := warningSet(bracedText)
+		for w := range warningSet(elidedText) {
+			if !braced[w] {
+				return "WARNS"
+			}
 		}
 		return "SILENT"
 	}
@@ -130,7 +180,8 @@ func TestSweepFull(t *testing.T) {
 		parent := s.container[:len(s.container)-1]
 		stanzaLeaf := s.container[len(s.container)-1]
 		inner := contextFor(parent) + stanzaLeaf + " " + s.leaf + " " + v1 + ";"
-		bc, bok := compile(nest(parent, inner))
+		bracedText := nest(parent, inner)
+		bc, bok := compile(bracedText)
 		// ELIDE EXACTLY THE PAIR THIS ROW IS NAMED FOR, and nothing deeper.
 		//
 		// The earlier form packed the WHOLE container -- `strings.Join(s.container,
@@ -175,7 +226,7 @@ func TestSweepFull(t *testing.T) {
 		case dig(bc) == dig(ec):
 			v, d = "SAME", "elided delivers what braced delivers"
 		default:
-			g := gated(elidedText)
+			g := gated(bracedText, elidedText)
 			v = "CANDIDATE-DROP/" + g
 			d = firstDiff(dig(bc), dig(ec))
 		}
