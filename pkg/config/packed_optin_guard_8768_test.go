@@ -168,6 +168,12 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 				"ssh-rsa":            `ssh-rsa "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABrsa c@d"`,
 				"ssh-dsa":            `ssh-dsa "ssh-dss AAAAB3NzaC1kc3MAAACBAdsa e@f"`,
 			},
+			second: map[string]string{
+				"encrypted-password": `encrypted-password "$6$rounds=5000$xyz$uvw"`,
+				"ssh-ed25519":        `ssh-ed25519 "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKed2 g@h"`,
+				"ssh-rsa":            `ssh-rsa "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABrsa2 i@j"`,
+				"ssh-dsa":            `ssh-dsa "ssh-dss AAAAB3NzaC1kc3MAAACBAdsa2 k@l"`,
+			},
 			read: func(c *Config) string {
 				ra := c.System.RootAuthentication
 				if ra == nil {
