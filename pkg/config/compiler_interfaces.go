@@ -240,6 +240,8 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig, opts compileOpts, w
 					// routing-instance { destination <name>; }
 					if destNode := prop.FindChild("destination"); destNode != nil {
 						tc.RoutingInstance = nodeVal(destNode)
+					} else if v := packedTunnelRoutingInstance8936(prop); v != "" {
+						tc.RoutingInstance = v
 					} else if v := nodeVal(prop); v != "" {
 						tc.RoutingInstance = v
 					}
@@ -329,6 +331,8 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig, opts compileOpts, w
 					case "routing-instance":
 						if destNode := prop.FindChild("destination"); destNode != nil {
 							tc.RoutingInstance = nodeVal(destNode)
+						} else if v := packedTunnelRoutingInstance8936(prop); v != "" {
+							tc.RoutingInstance = v
 						} else if v := nodeVal(prop); v != "" {
 							tc.RoutingInstance = v
 						}
@@ -1549,4 +1553,34 @@ func compileInterfaceDynamicDNS(afNode *Node) *InterfaceDynamicDNSConfig {
 // argument above attached to the leaf it argues about.
 func fabricMemberValues(n *Node) []string {
 	return plainListValues(n)
+}
+
+// packedTunnelRoutingInstance8936 reads the instance name out of a
+// BRACE-ELIDED `tunnel { routing-instance destination <name>; }`, and returns
+// "" for every other shape so the callers' existing branches are unchanged.
+//
+// The braced spelling gives `routing-instance` a CHILD named `destination`, and
+// the callers read it with FindChild. The elided spelling packs the whole tail
+// onto the node's own Keys -- ["routing-instance", "destination", "<name>"] --
+// so there is no child, FindChild returns nil, and the fallback nodeVal(prop)
+// returns Keys[1], which is the literal keyword "destination".
+//
+// That is not a dropped value, it is a WRONG one: the tunnel compiled with
+// RoutingInstance="destination", binding it to a routing-instance that does not
+// exist, while the operator's actual instance name was discarded. A missing
+// value leaves the tunnel unbound and visible as unconfigured; this produced a
+// plausible-looking binding that silently resolves to nothing (#8936).
+//
+// The site was classed `partial` in the #8690 register on the strength of
+// "something consumed the tail". Something did -- and it was this defect, not a
+// reader entitled to it. Fixing the consumer is what makes the two spellings
+// agree; no scope admission is involved.
+func packedTunnelRoutingInstance8936(prop *Node) string {
+	if prop == nil || len(prop.Keys) < 3 {
+		return ""
+	}
+	if prop.Keys[1] != "destination" {
+		return ""
+	}
+	return prop.Keys[2]
 }
