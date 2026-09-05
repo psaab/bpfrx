@@ -1487,13 +1487,39 @@ func snapshotBindingPlanKey(snapshot *ConfigSnapshot) string {
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "workers=%d;ring=%d;", snapshot.Userspace.Workers, snapshot.Userspace.RingEntries)
+	// #8901: `shared_umem` is hashed by the Rust plan hash
+	// (`update_snapshot_binding_plan_key`, planning.rs) and was omitted here.
+	//
+	// This key gates the SAME-PLAN REFRESH EXCEPTION -- the rule that lets a
+	// FIB-only update publish during the pending-XSK-startup window, because
+	// blocking it deadlocks (XSK liveness needs RX traffic, transit traffic
+	// needs FIB data). A config changing only SharedUMEM therefore left this
+	// key unchanged, was classified as a same-plan refresh, and published
+	// straight through -- while the helper, whose hash DOES include it,
+	// rebuilt its AF_XDP bindings. Back-to-back reconciles in the window whose
+	// entire purpose is to prevent them.
+	//
+	// NOT the #8899 question. That one is process identity (argv, binary,
+	// sockets) and correctly EXCLUDES SharedUMEM, because a SharedUMEM change
+	// reaches the helper inside the snapshot rather than on the command line,
+	// so it needs no process restart. This is whether the two PLAN hashes
+	// agree about what constitutes a plan change.
+	if su := snapshot.Userspace.SharedUMEM; su != nil {
+		fmt.Fprintf(&b, "shared_umem=%s/%s/%s;", su.Mode, strings.Join(su.Interfaces, ","), su.Phase0ArtifactFile)
+	}
 	for _, iface := range snapshot.Interfaces {
 		if iface.Zone == "" || userspaceSkipsIngressInterface(iface) {
 			continue
 		}
+		// #8901: `vlan_id` and `parent_linux_name` were hashed by Rust and not
+		// here. #3091 records why Rust hashes them: `replan_queues` dedups a
+		// VLAN-child netdev onto its physical parent using exactly these two
+		// fields, so a re-parent or a VLAN-tag change moves the layout. Both
+		// are ordinary config edits, which makes this reachable by a far more
+		// routine change than the SharedUMEM case above.
 		fmt.Fprintf(
 			&b,
-			"iface=%s/%s/%d/%d/%d/%t/%t;",
+			"iface=%s/%s/%d/%d/%d/%t/%t/%d/%s;",
 			iface.Name,
 			iface.LinuxName,
 			iface.Ifindex,
@@ -1501,6 +1527,8 @@ func snapshotBindingPlanKey(snapshot *ConfigSnapshot) string {
 			iface.RXQueues,
 			iface.LogicalOnly,
 			iface.Tunnel,
+			iface.VLANID,
+			iface.ParentLinuxName,
 		)
 	}
 	for _, fab := range snapshot.Fabrics {
