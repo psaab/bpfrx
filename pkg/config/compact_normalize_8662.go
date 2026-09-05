@@ -484,6 +484,36 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		return true
 	}
 
+	// #8755 family 8: the part of the interface-unit family that is NOT blocked
+	// by the compoundKey traversal defect (#8763).
+	//
+	// 20 of that issue's 23 open sites sit under `family inet` / `family inet6`,
+	// which the pass cannot enter at the spelling operators write — so a scope
+	// entry for them closes one spelling and leaves the idiomatic one open, and
+	// they wait on #8763 and #8768. These two do not: `unit <n>` is an ARGS
+	// container, where the second token is an instance argument consumed by
+	// `identity`, so the recursion accounts for it correctly and the pass
+	// reaches the leaf.
+	//
+	// Measured at 97ba4fe2b:
+	//
+	//	unit 0 description "uplink";   before  folds=0 desc=""        after  folds=1 desc="uplink"
+	//	unit 0 vlan-id 10;             before  folds=0 vlan=0         after  folds=1 vlan=10
+	//	braced reference               desc="uplink" vlan=10 either way
+	//
+	// DELIBERATELY EXCLUDES `unit <n> inner-vlan-id`, the third unblocked site.
+	// That one INVERTS: braced `inner-vlan-id` is REJECTED by the QinQ /
+	// stacked-VLAN gate, and the elided form commits clean with the value
+	// dropped, so normalizing it RESTORES a rejection and turns a config that
+	// commits today into one that does not. Right outcome, different decision,
+	// and it belongs with #8755's introduces-rejection class rather than in a
+	// slice justified as "unblocked".
+	switch containerKeyword + " " + head {
+	case "unit description",
+		"unit vlan-id":
+		return true
+	}
+
 	// #8690 family 5: applications, services, snmp, event-options. 30 sites,
 	// every one drop shape "empty" in the inventory.
 	//
