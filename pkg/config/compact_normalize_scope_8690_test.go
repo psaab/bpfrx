@@ -348,6 +348,29 @@ func TestCompactNormalizeScopePreservesCompiledResult8690(t *testing.T) {
 			"stanza's own validator. Not a defect list; see the note above "+
 			"before treating a change in this number as one.", n)
 	}
+	// How much of the bucket is actually MEASURED. It reached zero unmeasured
+	// entries once; anything above zero is a widening that added an
+	// undecidable site without following the instruction in the message below.
+	// Reported rather than failed, because whether an unmeasured entry may land
+	// at all is a policy call across lanes rather than this cell's to make --
+	// but it is reported, because "recorded" and "measured" were previously
+	// indistinguishable here and that is what let a real disarm sit unnoticed.
+	if unmeasured := 0; true {
+		for _, v := range knownFixtureLimited8690 {
+			if v == notHandMeasured8690 {
+				unmeasured++
+			}
+		}
+		if unmeasured > 0 {
+			t.Logf("#8690: %d of %d entries in the gate-status-unknown bucket have "+
+				"NOT been hand-measured. This bucket held a real disarm before it "+
+				"was measured out; an entry here is a question, not a verdict.",
+				unmeasured, len(knownFixtureLimited8690))
+		} else {
+			t.Logf("#8690: all %d entries in the gate-status-unknown bucket carry a "+
+				"hand-measured verdict.", len(knownFixtureLimited8690))
+		}
+	}
 	if len(fixtureLimited) > 0 {
 		t.Logf("#8690: %d admitted site(s) could not have their gate status "+
 			"measured, because the census fixture's value fails a different "+
@@ -380,6 +403,46 @@ func TestCompactNormalizeScopePreservesCompiledResult8690(t *testing.T) {
 			"either way, so the config is legitimate and only the elided form was losing it. " +
 			"This gate was written to catch exactly this drop class, so the pass repairing the " +
 			"drop and the gate then passing is the intended interaction, not a disarm.",
+		// The three sites admitted with the #8690 `open` residue. All three were
+		// re-measured HERE with the pair ADMITTED, which is the only state in
+		// which the measurement means anything: for an EXCLUDED pair the pass
+		// touches 0 nodes, so `passDisabled` true and false are the same run and
+		// a "the pass is not load-bearing here" result is a restatement of the
+		// exclusion rather than a finding about the site. lane-8015 established
+		// that on `policy scheduler-name`. Here the axis genuinely moves — the
+		// elided spelling flips REJECTED -> accepted — which is what makes these
+		// gradeable at all.
+		//
+		// Measured, with type-VALID values, all three identical in shape:
+		//
+		//	BRACED passDisabled=true   <nil>      <- the config is legitimate
+		//	BRACED passDisabled=false  <nil>
+		//	ELIDED passDisabled=true   REJECTED   <- the gate catches the drop
+		//	ELIDED passDisabled=false  <nil>      <- the pass repairs it
+		//
+		// The braced leg is the one that decides benign-vs-genuine, and each
+		// gate's own message names the MISSING VALUE rather than the spelling.
+		"protocols bgp group xpfarg neighbor xpfarg peer-as": "the gate refuses the CONSEQUENCE of the drop. " +
+			"Measured with the pass disabled, elided `neighbor 10.0.0.2 peer-as 65001;` " +
+			"loses the peer-as and BGP rejects with \"missing/invalid peer-as — a BGP " +
+			"neighbor requires a peer-as\"; with the pass enabled the value survives and " +
+			"the same gate accepts. Braced is accepted either way. The gate names the " +
+			"absent value, so it is objecting to the drop and the pass repairs it.",
+		"security dynamic-address feed-server xpfarg hostname": "the gate refuses the CONSEQUENCE of the drop. " +
+			"Measured with the pass disabled, elided `feed-server f1 hostname " +
+			"\"feeds.example.com\";` loses the hostname and the compiler rejects with " +
+			"\"feed-server \\\"f1\\\" resolves to an empty endpoint (no url or hostname, or a " +
+			"slash-only url)\"; with the pass enabled it survives and the same gate " +
+			"accepts. Braced is accepted either way.",
+		"system services dhcp-local-server group xpfarg pool xpfarg static-binding xpfarg fixed-address": "the gate refuses the CONSEQUENCE of the " +
+			"drop. Measured with the pass disabled, elided `static-binding b1 " +
+			"fixed-address 10.0.1.50;` loses the address and the compiler rejects with " +
+			"\"static-binding \\\"b1\\\" has no fixed-address — a reservation cannot be " +
+			"empty\"; with the pass enabled it survives and the same gate accepts. " +
+			"Braced is accepted either way. ONE key covers the dhcp and dhcpv6 twins " +
+			"because they share dhcpStaticBindingSchema(); the v4 twin is what this arm " +
+			"grades, and the v6 twin is hand-measured in knownFixtureLimited8690 " +
+			"because the census fixture cannot give it a type-valid address.",
 		"snmp trap-group xpfarg targets": "the gate refuses the CONSEQUENCE of the drop, not " +
 			"the spelling. Measured: with the pass disabled the elided " +
 			"`trap-group tg1 targets 10.0.0.1;` loses its targets and snmp rejects with " +
@@ -647,6 +710,31 @@ func TestElidedSSHRootLoginReachesTheDaemon8690(t *testing.T) {
 // and re-opening the instance does not merge, so these are unmeasurable by this
 // method until #8436 lands, not merely unfixtured.
 var knownUnexaminable8690 = []string{
+	// #8690: this one is the INVERSE of every other entry, and the difference
+	// is worth stating because the failure message tells the next person to
+	// supply a missing sibling — which cannot work here.
+	//
+	// The cell evaluates three configs: `stanza { leaf v1; }`, `{ leaf v2; }`
+	// and the EMPTY skeleton `stanza { }`. For every other entry the empty
+	// skeleton fails because some OTHER required leaf is absent, so a richer
+	// fixture fixes it. Here the empty skeleton fails because `test T1 { }` is
+	// rejected with "target is required" — THE LEAF UNDER TEST IS ITSELF THE
+	// REQUIRED SIBLING. Any fixture that makes the control compile has to
+	// supply `target`, which is the value the control exists to omit.
+	//
+	// So this is not a fixture gap; it is a limit of the three-config method
+	// for a leaf whose own presence is the stanza's validity condition. It is
+	// listed rather than fixed, and the verdict comes from a HAND measurement
+	// taken with the pair admitted and the pass both ways:
+	//
+	//	BLOCK   test T { target address 1.2.3.4; }   passOFF clean   passON clean
+	//	COMPACT test T target address 1.2.3.4;       passOFF REJECT  passON clean, test registers
+	//
+	// which is the benign pattern — the gate refuses the consequence of the
+	// drop and the pass repairs it. Its nine sibling leaves are NOT benign and
+	// do not share this verdict; they are `sibling-blocked` in the register.
+	"services rpm probe xpfarg test xpfarg target",
+
 	"class-of-service fairness rss-expectation interface xpfarg queue",
 	"class-of-service fairness rss-expectation interface xpfarg queue xpfarg active-workers",
 	"class-of-service fairness rss-expectation interface xpfarg queue xpfarg at-least-active-workers",
@@ -798,12 +886,69 @@ func dedupe8690(in []string) []string {
 // admitting a new one is a decision someone makes rather than a number that
 // moves.
 var knownFixtureLimited8690 = map[string]string{
+
+	// HAND-MEASURED IN BULK. Each was written out with a type-VALID value and
+	// the siblings its validator needs -- a NAT rule-set with a from/to zone
+	// and a then-block, a global address-book for the `-name` leaves, a policy
+	// with a then-block. That is what the census fixture cannot supply and why
+	// these read as undecidable to the arm.
+	"security nat destination rule-set xpfarg rule xpfarg match application":              natMatchBenign8690,
+	"security nat destination rule-set xpfarg rule xpfarg match destination-address":      natMatchBenign8690,
+	"security nat destination rule-set xpfarg rule xpfarg match destination-address-name": natMatchBenign8690,
+	"security nat destination rule-set xpfarg rule xpfarg match destination-port":         natMatchBenign8690,
+	"security nat destination rule-set xpfarg rule xpfarg match protocol":                 natMatchBenign8690,
+	"security nat destination rule-set xpfarg rule xpfarg match source-address":           natMatchBenign8690,
+	"security nat destination rule-set xpfarg rule xpfarg match source-address-name":      natMatchBenign8690,
+	"security nat source rule-set xpfarg rule xpfarg match application":                   natMatchBenign8690,
+	"security nat source rule-set xpfarg rule xpfarg match destination-address":           natMatchBenign8690,
+	"security nat source rule-set xpfarg rule xpfarg match destination-address-name":      natMatchBenign8690,
+	"security nat source rule-set xpfarg rule xpfarg match destination-port":              natMatchBenign8690,
+	"security nat source rule-set xpfarg rule xpfarg match source-address":                natMatchBenign8690,
+	"security nat source rule-set xpfarg rule xpfarg match source-address-name":           natMatchBenign8690,
+
+	"security policies from-zone xpfarg xpfarg xpfarg policy xpfarg match application":         policyMatchNoDisarm8690,
+	"security policies from-zone xpfarg xpfarg xpfarg policy xpfarg match destination-address": policyMatchNoDisarm8690,
+	"security policies from-zone xpfarg xpfarg xpfarg policy xpfarg match source-address":      policyMatchNoDisarm8690,
+	"security policies global policy xpfarg match application":                                 policyMatchNoDisarm8690,
+	"security policies global policy xpfarg match destination-address":                         policyMatchNoDisarm8690,
+	"security policies global policy xpfarg match source-address":                              policyMatchNoDisarm8690,
+
+	"protocols bgp group xpfarg neighbor xpfarg export": "HAND-MEASURED: SAFE. With a policy-statement defined and the group given a type and peer-as, BOTH spellings compile cleanly -- there is no gate here at all, and the arm read it as undecidable only because its minimal fixture lacked the referenced policy.",
+	"protocols bgp group xpfarg neighbor xpfarg import": "HAND-MEASURED: SAFE. With a policy-statement defined and the group given a type and peer-as, BOTH spellings compile cleanly -- there is no gate here at all, and the arm read it as undecidable only because its minimal fixture lacked the referenced policy.",
+
+	"security nat static rule-set xpfarg rule xpfarg match source-address": "HAND-MEASURED: NO DISARM POSSIBLE. With a complete static rule-set both spellings are REJECTED IDENTICALLY, so the pass changes no verdict here.",
 	// HAND-MEASURED. lane-8015 showed this bucket hides live disarms — it
 	// hand-measured the three its scope added and `security dynamic-address
 	// feed-server <n> url` proved to be a real one. So an entry carries the
 	// verdict a person reached with a type-VALID value and the siblings the
 	// validator needs, not merely the fact that the census fixture could not
 	// decide. A visible unmeasured bucket is still unmeasured.
+	// The two halves of the #8690 `open` residue whose census value is not
+	// type-valid. Each is the TWIN of a site this arm DOES grade, in the same
+	// container one leaf over, and neither inherits its twin's verdict — that
+	// inference is what the v4/v6 static-binding pair disproved. Both were
+	// measured by hand, with the pair ADMITTED and a type-valid value.
+	"security dynamic-address feed-server xpfarg url": "HAND-MEASURED: BENIGN, and " +
+		"the twin of `feed-server <f> hostname` which this arm grades directly. With " +
+		"a real URL, elided `feed-server f1 url \"https://feeds.example.com/list\";` is " +
+		"refused without the pass (\"resolves to an empty endpoint (no url or " +
+		"hostname, or a slash-only url)\") and compiles with it; BRACED is accepted " +
+		"both ways, so the config is legitimate and only the elided form lost the " +
+		"value. Same gate and same message as the hostname twin, which is expected: " +
+		"one validator covers both leaves. NOTE ON PROVENANCE — this site was " +
+		"previously reported as a LIVE disarm; it was not, because the pair was not " +
+		"admitted at that time. It is live NOW, in this commit, because this change " +
+		"admits it.",
+
+	"system services dhcpv6-local-server group xpfarg pool xpfarg static-binding xpfarg fixed-address": "HAND-MEASURED: " +
+		"BENIGN, and the twin of the dhcp-local-server site this arm grades " +
+		"directly. With a real IPv6 address, elided `static-binding b1 fixed-address " +
+		"2001:db8::50;` is refused without the pass (\"has no fixed-address — a " +
+		"reservation cannot be empty\") and compiles with it; BRACED is accepted both " +
+		"ways. Measured SEPARATELY from its v4 twin rather than inheriting it: that " +
+		"pair is the one that established the rule, since arm 2 caught the v4 side " +
+		"and was structurally blind to this one.",
+
 	"security ipsec policy xpfarg proposals": "HAND-MEASURED: BENIGN. Elided " +
 		"`ipsec policy pol1 proposals pr1;` is refused without the pass (\"has no " +
 		"resolvable ipsec proposal ... the configured perfect-forward-secrecy group " +
@@ -827,31 +972,12 @@ var knownFixtureLimited8690 = map[string]string{
 	// bare, so the difference between "a person checked and it is fine" and
 	// "nobody has looked" is visible in the file. Every one is a candidate for
 	// the treatment above.
-	"protocols bgp group xpfarg neighbor xpfarg export":                                        notHandMeasured8690,
-	"protocols bgp group xpfarg neighbor xpfarg import":                                        notHandMeasured8690,
-	"security nat destination rule-set xpfarg rule xpfarg match application":                   notHandMeasured8690,
-	"security nat destination rule-set xpfarg rule xpfarg match destination-address":           notHandMeasured8690,
-	"security nat destination rule-set xpfarg rule xpfarg match destination-address-name":      notHandMeasured8690,
-	"security nat destination rule-set xpfarg rule xpfarg match destination-port":              notHandMeasured8690,
-	"security nat destination rule-set xpfarg rule xpfarg match protocol":                      notHandMeasured8690,
-	"security nat destination rule-set xpfarg rule xpfarg match source-address":                notHandMeasured8690,
-	"security nat destination rule-set xpfarg rule xpfarg match source-address-name":           notHandMeasured8690,
-	"security nat source rule-set xpfarg rule xpfarg match application":                        notHandMeasured8690,
-	"security nat source rule-set xpfarg rule xpfarg match destination-address":                notHandMeasured8690,
-	"security nat source rule-set xpfarg rule xpfarg match destination-address-name":           notHandMeasured8690,
-	"security nat source rule-set xpfarg rule xpfarg match destination-port":                   notHandMeasured8690,
-	"security nat source rule-set xpfarg rule xpfarg match source-address":                     notHandMeasured8690,
-	"security nat source rule-set xpfarg rule xpfarg match source-address-name":                notHandMeasured8690,
-	"security nat static rule-set xpfarg rule xpfarg match source-address":                     notHandMeasured8690,
-	"security policies from-zone xpfarg xpfarg xpfarg policy xpfarg match application":         notHandMeasured8690,
-	"security policies from-zone xpfarg xpfarg xpfarg policy xpfarg match destination-address": notHandMeasured8690,
-	"security policies from-zone xpfarg xpfarg xpfarg policy xpfarg match source-address":      notHandMeasured8690,
-	"security policies global policy xpfarg match application":                                 notHandMeasured8690,
-	"security policies global policy xpfarg match destination-address":                         notHandMeasured8690,
-	"security policies global policy xpfarg match source-address":                              notHandMeasured8690,
 }
 
 // notHandMeasured8690 marks a bucket entry nobody has measured by hand yet.
+// A NEW entry starts here and is expected to leave: write the site out with a
+// type-valid value and the siblings its validator needs, then replace this with
+// what you found. The count of entries still holding it is reported each run.
 // It is not a verdict; it is the absence of one.
 const notHandMeasured8690 = "NOT YET HAND-MEASURED: the census fixture could not decide, and no one has written this site out with a type-valid value to find out"
 
@@ -918,3 +1044,28 @@ func sortedKeys8690(m map[string]string) []string {
 	sort.Strings(out)
 	return out
 }
+
+// natMatchBenign8690 is the shared verdict for the thirteen `security nat
+// {source,destination} rule-set <r> rule <r> match <leaf>` sites. They are one
+// finding, not thirteen: every one trips the SAME gate for the SAME reason, and
+// writing the measurement out thirteen times would imply thirteen independent
+// confirmations of something established once.
+const natMatchBenign8690 = "HAND-MEASURED: BENIGN. Without the pass the elided " +
+	"spelling drops the criterion and #8430 refuses the result -- \"the match " +
+	"block constrains nothing, and the dataplane reads an EMPTY match set as " +
+	"UNCONSTRAINED -- this rule would translate EVERY packet reaching it, not " +
+	"none\". With the pass the criterion survives and it compiles. The decisive " +
+	"test is not the acceptance flip but that elided-with-pass compiles to a " +
+	"config IDENTICAL to the braced spelling's, verified directly: the gate " +
+	"objects to the DROP, not to the spelling."
+
+// policyMatchNoDisarm8690 covers the six `security policies ... match <leaf>`
+// sites, where the measurement is unusually direct: the ERROR TEXT ITSELF shows
+// the tail surviving.
+const policyMatchNoDisarm8690 = "HAND-MEASURED: NOT A DISARM, and it cannot " +
+	"become one. #3044 requires all three of source-address, destination-address " +
+	"and application, and the elided spelling can carry only ONE criterion, so " +
+	"BOTH spellings are rejected however good the fixture is. The pass is " +
+	"nonetheless demonstrably working, visible in the error shrinking: without " +
+	"it the gate reports three missing criteria, with it two. The surviving " +
+	"criterion is the one that was folded."
