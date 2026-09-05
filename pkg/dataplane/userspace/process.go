@@ -83,6 +83,11 @@ func preflightHelperPaths(cfg config.UserspaceConfig) error {
 // running helper down only once that preflight passes, so a config that cannot
 // bring up a new generation leaves the previous one — and its forwarding —
 // running (#5839).
+// defaultPollMode is the `--poll-mode` value used when none is configured.
+// SINGLE SOURCE: both the spawn path and configEqual read it through
+// effectivePollMode, so the comparison cannot drift from the argv (#8899).
+const defaultPollMode = "busy-poll"
+
 func (m *Manager) stopForNewGenerationLocked(cfg config.UserspaceConfig) error {
 	if err := preflightHelperPaths(cfg); err != nil {
 		return fmt.Errorf("refusing to restart userspace dataplane helper, "+
@@ -158,10 +163,7 @@ func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) error {
 		}
 		slog.Debug("userspace: cleared stale XSKMAP entries")
 	}
-	pollMode := cfg.PollMode
-	if pollMode == "" {
-		pollMode = "busy-poll"
-	}
+	pollMode := effectivePollMode(cfg)
 	cmd := exec.Command(binary,
 		"--control-socket", cfg.ControlSocket,
 		"--state-file", cfg.StateFile,
@@ -447,14 +449,79 @@ func (m *Manager) resetAfterHelperGoneLocked() {
 	m.sessionMirrorErr = ""
 }
 
+// processRestartRequiredDuringStartup reports whether a config applied during
+// the pending-XSK-startup window changes the helper's PROCESS IDENTITY and
+// therefore needs a restart that the binding-plan key cannot ask for (#8899).
+//
+// It exists as a named function rather than an inline `&&` so the production
+// path and its guard call the SAME predicate. A cell that re-derives this
+// expression would verify the arithmetic and not the wiring.
+func processRestartRequiredDuringStartup(
+	pendingXSKStartup bool,
+	running config.UserspaceConfig,
+	desired config.UserspaceConfig,
+) bool {
+	return pendingXSKStartup && !configEqual(running, desired)
+}
+
+// effectivePollMode is the value that actually reaches the helper's argv.
+// `--poll-mode` is passed unconditionally and an empty configured value is
+// defaulted at spawn (see ensureProcessLocked), so "" and "busy-poll" produce
+// the IDENTICAL child process.
+//
+// #8899: comparing the raw strings therefore reports a difference where none
+// exists on the wire — an operator explicitly writing the default they were
+// already running would be told the process identity changed. That was
+// harmless while the comparison only guarded the normal apply path, which
+// re-execs anyway; the startup-window trigger makes it a spurious RESTART, so
+// the two spellings are normalised at the one place both paths consult.
+func effectivePollMode(c config.UserspaceConfig) string {
+	if c.PollMode == "" {
+		return defaultPollMode
+	}
+	return c.PollMode
+}
+
+// helperSpawnIdentity is what the helper process IS: the exact set of values
+// `ensureProcessLocked` puts on its command line and binds its sockets to,
+// AFTER every default has been resolved.
+//
+// #8899: two of these fields have resolvers and the comparison used the RAW
+// value for both, so writing a default down explicitly compared unequal while
+// producing an identical child. `PollMode` was found by review and fixed;
+// `EventSocket` was the same defect one field over and the fix did not
+// generalise to it, because nothing tied the comparison to the resolution.
+//
+// This type is that tie. `configEqual` is defined AS identity equality, so a
+// field can no longer be compared by a different rule than the one the spawn
+// path applies — the two cannot drift, rather than being checked for drift.
+// A new argv field is added here once and both sides follow.
+type helperSpawnIdentity struct {
+	binary        string
+	controlSocket string
+	eventSocket   string
+	stateFile     string
+	pollMode      string
+	workers       int
+	ringEntries   int
+}
+
+// helperSpawnIdentityOf resolves a config to the process it would spawn.
+// Every field here is read from the same helper the spawn path uses.
+func helperSpawnIdentityOf(c config.UserspaceConfig) helperSpawnIdentity {
+	return helperSpawnIdentity{
+		binary:        c.Binary,
+		controlSocket: c.ControlSocket,
+		eventSocket:   helperEventSocketPath(c),
+		stateFile:     c.StateFile,
+		pollMode:      effectivePollMode(c),
+		workers:       c.Workers,
+		ringEntries:   c.RingEntries,
+	}
+}
+
 func configEqual(a, b config.UserspaceConfig) bool {
-	return a.Binary == b.Binary &&
-		a.ControlSocket == b.ControlSocket &&
-		a.EventSocket == b.EventSocket &&
-		a.StateFile == b.StateFile &&
-		a.Workers == b.Workers &&
-		a.RingEntries == b.RingEntries &&
-		a.PollMode == b.PollMode
+	return helperSpawnIdentityOf(a) == helperSpawnIdentityOf(b)
 }
 
 func (m *Manager) StartFIBSync(ctx context.Context) {
