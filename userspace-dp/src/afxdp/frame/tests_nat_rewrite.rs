@@ -1607,9 +1607,22 @@ fn nat64_8890_tunnel_marked_decision_is_not_emitted_plaintext() {
     );
 
     // SUBJECT: the same decision with a tunnel endpoint attached.
+    //
+    // SWEEP THE ID SPACE rather than pinning one value. The first version of
+    // this cell used only 7, and the reverse cell used 7 as well, so both arms
+    // sat at one point with the controls at 0 — leaving the gate FREE BETWEEN
+    // THEM. A reviewer weakened `!= 0` to `> 1` and all four cells survived,
+    // which leaks plaintext for endpoint id 1.
+    //
+    // **1 is not a boundary nobody hits.** `tunnel_endpoint_id` is a u16 whose
+    // only reserved value is 0 — ~54 sites use `== 0` / `!= 0` as the
+    // has-a-tunnel predicate — so 1 is a perfectly ordinary id and is the
+    // natural FIRST one to allocate. A single-tunnel deployment is plausibly
+    // exactly the case that would have leaked.
+    for id in [1u16, 2, 7, u16::MAX] {
     let mut tunnel_decision =
         icmp_test_decision(Nat64State::forward_decision(pool, server, 40001));
-    tunnel_decision.resolution.tunnel_endpoint_id = 7;
+    tunnel_decision.resolution.tunnel_endpoint_id = id;
 
     let subject = build_nat64_forwarded_frame(
         &frame,
@@ -1628,11 +1641,13 @@ fn nat64_8890_tunnel_marked_decision_is_not_emitted_plaintext() {
          was byte-identical to the control above ({} bytes, ethertype 0x0800) — \
          traffic an operator routed through WireGuard leaving as plaintext on the \
          underlay. #1873 R-E already drops rather than 'later TX PLAINTEXT' on the \
-         unresolved-neighbour route; this is the resolved route via NAT64. Got \
-         {:?} bytes.",
+         unresolved-neighbour route; this is the resolved route via NAT64. \
+         FAILING ID = {}. Got {:?} bytes.",
         control.len(),
+        id,
         subject.as_ref().map(|f| f.len()),
     );
+    }
 }
 
 /// #8890 — the gate must hold in the REVERSE (v4->v6) direction too.
@@ -1693,7 +1708,11 @@ fn nat64_8890_gate_holds_in_the_reverse_v4_to_v6_direction() {
 
     // SUBJECT: same reverse reply, tunnel-marked.
     let mut tunnel_decision = icmp_test_decision(rev);
-    tunnel_decision.resolution.tunnel_endpoint_id = 7;
+    // Deliberately 1, not 7: 1 is the natural FIRST endpoint id to allocate and
+    // the value a `> 1` off-by-one would let through. The forward cell sweeps
+    // {1, 2, 7, u16::MAX}; this arm pins the dangerous end of that range so the
+    // reverse direction cannot regress to a two-point fixture either.
+    tunnel_decision.resolution.tunnel_endpoint_id = 1;
     let subject = build_nat64_forwarded_frame(
         &reply,
         nat64_reverse_meta(),

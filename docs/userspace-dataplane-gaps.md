@@ -669,6 +669,13 @@ unsupported-configuration signal, not a capacity or fragmentation one.
 > working path for an outage, and for such an operator the pre-#8890 behaviour
 > was, in effect, the one they wanted.
 >
+> **If traffic stopped after an upgrade, the counter to look at is `NAT64
+> tunnel encap unsupported drops` in `show system buffers` (wire name
+> `nat64_tunnel_encap_unsupported`).** A non-zero value on a path that used to
+> work identifies this change as the cause. An operator diagnosing an outage
+> reaches for counters before documentation, so the two facts are joined here
+> and on the counter itself rather than only in prose.
+>
 > It is still the wrong default. The operator configured a tunnel route and the
 > dataplane silently did not honour it, with no counter to notice by — a
 > tunnel-policy violation whether or not the payload was independently
