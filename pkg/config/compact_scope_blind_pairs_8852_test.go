@@ -43,6 +43,32 @@ import (
 //
 // Registering a pair here is NOT a statement that its folding is correct. It
 // records that this arm does not measure it. Blind means unmeasured, not safe.
+//
+// AND TWO OF THESE ARE CONFIRMED BROKEN, so do not read the list as a benign
+// inventory. Measured braced-vs-elided, both compiling clean through the strict
+// path with the value simply gone:
+//
+//	security-zone address-book   braced addresses=1  -> elided 0
+//	policies from-zone           braced policies=1   -> elided 0
+//
+// The second is the product's primary enforcement surface: the elided
+// `security policies from-zone <a> to-zone <b> { ... }` spelling compiles to
+// ZERO zone-pair policies. Their fixes belong to #8850, not here — this cell
+// measures the GUARD's coverage, not the fold's correctness, and repairing a
+// fold does not remove its pair from this list (the pair leaves only when arm 2
+// starts generating a site for it).
+//
+// The `policies from-zone` measurement needs its zones DEFINED in the braced
+// arm; without `security-zone trust` / `untrust` present the braced control
+// fails an undefined-zone gate and the comparison is vacuous in the direction
+// that looks like a defect.
+//
+// A third pair, `security-zone host-inbound-traffic`, was reported broken and
+// did NOT reproduce here: `system-services` and `protocols` both survive the
+// elided spelling, and the both-leaves-packed form is correctly REJECTED with a
+// specific diagnostic. Recorded as unreproduced rather than omitted, because a
+// list of confirmed defects that quietly drops a member is how a claim outlives
+// its evidence.
 var knownBlindScopePairs8852 = map[string]string{
 	// Head is a plain container (args==0, no wildcard, has children).
 	"policies global":                    "plain-container",
