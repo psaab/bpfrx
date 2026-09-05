@@ -73,6 +73,38 @@ const inventoryNotes = `#
 # divergent). An earlier probe of this shape did NOT agree with the gate (97 vs
 # 60) because it varied two conditions at once; the disagreement is what caught
 # it. Where the two accountings differ, neither number is usable.
+#
+# #8690 unruled-fixture sweep, first increment: checked 677 -> 685, divergent
+# 186 -> 191, "no two distinct synthesizable values" 17 -> 7. NOTHING was
+# removed — every line of the change is a site that became RULABLE.
+#
+# The 10 that moved were a verdict about synthPair, not about the leaf:
+#
+#   - THREE declared value types the type switch never covered (ValueHostname,
+#     ValueDate, ValueUnixSocketPath), so six leaves fell through to the
+#     one-example bailout;
+#   - FIVE ValueEnumOf leaves declaring one example, whose accepted set lives
+#     in a ValidateEnum closure. The set does not have to be duplicated here:
+#     ValidateEnum NAMES it when it rejects, so a deliberately invalid probe
+#     makes the schema state its own answer, and every candidate extracted is
+#     re-verified against the same validator. See enumPairFromValidator.
+#
+# Where they landed: 5 DIVERGENT (` + "`schedulers scheduler <s> start-date`" + `,
+# ` + "`stop-date`" + `, ` + "`system dataplane control-socket`" + `, ` + "`system domain-name`" + `,
+# ` + "`system services ssh protocol-version`" + `), 3 EQUIVALENT, and 2 that moved to
+# the "not observable" bucket — still unruled, but now for the FIXTURE reason
+# a contextFor entry addresses rather than for a missing synthesiser.
+#
+# A blind-spot count that RISES after a fix is the fix working. The five new
+# divergent sites are not new defects; they are compact-blind readers this
+# census could not see, in ` + "`schedulers`" + ` and ` + "`system`" + `.
+#
+# Seven sites remain in the no-pair bucket and SIX of them are declared inert
+# by their own valueDesc — ` + "`authentication-type`" + ` ("not an OSPF leaf") and the
+# four ` + "`system login class`" + ` regexp leaves ("not implemented by xpf"). They are
+# not fixture failures and no synthesiser should invent a pair for them; the
+# seventh, ` + "`security nat source interface port-overloading`" + `, declares one
+# example and a validator whose message does not enumerate.
 #`
 
 func TestRegenerateCompactBlockInventory2419(t *testing.T) {

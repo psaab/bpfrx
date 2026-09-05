@@ -81,6 +81,12 @@ func synthPair(n *schemaNode) (string, string, bool) {
 			return "1", "2", true
 		}
 	}
+	// #8690: an ENUM leaf that declares only one example. The schema knows the
+	// rest of the set — it is inside the ValidateEnum closure — and the closure
+	// NAMES it when it rejects. See enumPairFromValidator.
+	if v1, v2, ok := enumPairFromValidator(n); ok {
+		return v1, v2, true
+	}
 	switch n.valueType {
 	case ValueInteger:
 		return "1", "2", true
@@ -98,9 +104,85 @@ func synthPair(n *schemaNode) (string, string, bool) {
 		return "02:00:00:00:00:01", "02:00:00:00:00:02", true
 	case ValuePCIAddr:
 		return "0000:09:00.0", "0000:0a:00.0", true
+	// #8690: three declared types the switch did not cover, so six leaves fell
+	// through to the one-example bailout below and were recorded "no two
+	// distinct synthesizable values" — a verdict about this function, not about
+	// the leaf. Each is synthesizable from its own declared type.
+	case ValueHostname:
+		return "xpfa.example.com", "xpfb.example.com", true
+	case ValueDate:
+		return "2026-03-01", "2026-03-31", true
+	case ValueUnixSocketPath:
+		return "/run/xpf/xpfa.sock", "/run/xpf/xpfb.sock", true
 	}
 	if len(n.valueExamples) == 1 {
 		return "", "", false // one example, cannot vary
+	}
+	return "", "", false
+}
+
+// enumPairFromValidator recovers an enum leaf's accepted set from the leaf's
+// OWN validator, for the #8690 unruled-fixture sweep.
+//
+// Five sites sat in "no two distinct synthesizable values" while their schema
+// plainly knew a second value: `system services {dhcp,dhcpv6}-local-server
+// dynamic-dns backend` (rfc2136 | kea-d2), `system services dynamic-dns
+// provider <p> backend` (six backends), `system services ssh protocol-version`
+// (v1 | v2). Each declares ONE valueExamples entry, and the accepted set lives
+// in a ValidateEnum closure that cannot be enumerated.
+//
+// It does not have to be. ValidateEnum's REJECTION names the whole set —
+// "invalid value %q (expected one of: a, b, c)" — so a deliberately invalid
+// probe makes the schema state its own answer. That is better than the two
+// alternatives:
+//
+//   - parsing valueDesc prose invents a grammar over free text ("rfc2136
+//     [live] | kea-d2 [reserved, not in image]") that would silently produce
+//     WRONG values as the wording drifts;
+//   - copying the sets into this file duplicates the schema, which is the
+//     failure mode every census note in this package is about.
+//
+// THE PARSE CANNOT PRODUCE A WRONG ANSWER, ONLY NO ANSWER: every candidate it
+// extracts is RE-VERIFIED by calling the same validator with it, so a
+// mis-parsed token is dropped rather than probed. A leaf whose validator is not
+// a ValidateEnum, or whose message shape differs, yields no pair and the site
+// stays in its skip bucket — the honest degradation.
+func enumPairFromValidator(n *schemaNode) (v1, v2 string, ok bool) {
+	if n.valueType != ValueEnumOf || n.validator == nil {
+		return "", "", false
+	}
+	// A validator is free to dereference the *Config it is handed; this probes
+	// with nil because the census has no config at this point. A panic means
+	// "this validator cannot answer the question", not a census failure.
+	defer func() {
+		if recover() != nil {
+			v1, v2, ok = "", "", false
+		}
+	}()
+	err := n.validator("\x00xpf-no-such-enum-value", nil)
+	if err == nil {
+		return "", "", false // accepts anything; not an enumerable set
+	}
+	const marker = "expected one of: "
+	i := strings.Index(err.Error(), marker)
+	if i < 0 {
+		return "", "", false
+	}
+	var accepted []string
+	for _, cand := range strings.Split(err.Error()[i+len(marker):], ",") {
+		cand = strings.TrimSpace(cand)
+		cand = strings.TrimSuffix(cand, ")")
+		cand = strings.TrimSpace(cand)
+		if cand == "" {
+			continue
+		}
+		if n.validator(cand, nil) != nil {
+			continue // the parse produced something the gate itself refuses
+		}
+		accepted = append(accepted, cand)
+		if len(accepted) == 2 {
+			return accepted[0], accepted[1], true
+		}
 	}
 	return "", "", false
 }
