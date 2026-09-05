@@ -212,7 +212,7 @@ func TestElidedInterfaceUnitKeepsItsAddressAndFilter8755(t *testing.T) {
 			if got := normalizeCompactStanzas(tree); got != c.wantFoldsAfter {
 				t.Errorf("folds = %d, want %d. The chain length changed: this pair's admission is "+
 					"either no longer needed or no longer sufficient, and either way the note in "+
-					"compact_normalize_8662.go is now describing something else (#8755).",
+					"compact_normalize_scope.go is now describing something else (#8755).",
 					got, c.wantFoldsAfter)
 			}
 		})

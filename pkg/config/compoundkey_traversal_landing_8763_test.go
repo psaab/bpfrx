@@ -296,7 +296,7 @@ func famOnlyCases8763() []famOnlyCase8763 {
 		{"inet6 address", "", ifUnit("   family inet6 {\n    address 2001:db8::1/64;\n   }"), ifUnit("   family inet6 address 2001:db8::1/64;"), ifUnit("   family inet6 {\n   }"), recover8763},
 		// Refused in both spellings by a live gate, so nothing the fold does can
 		// change the outcome. These two are also REMOVED from the scope list by
-		// this change -- see the note in compact_normalize_8662.go.
+		// this change -- see the note in compact_normalize_scope.go.
 		{"vrrp-group authentication-key", "", vrrp("{ authentication-key \"s3cr3t\"; }"), vrrp("authentication-key \"s3cr3t\";"), vrrp("{ }"), gated8763},
 		{"vrrp-group authentication-type", "", vrrp("{ authentication-type md5; }"), vrrp("authentication-type md5;"), vrrp("{ }"), gated8763},
 		// FORMERLY `reader-defect`, NOW A RECOVERY. When this table was written,

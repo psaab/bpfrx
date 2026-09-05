@@ -1378,7 +1378,7 @@ func TestNoPairIsAdmittedByTwoFamilySwitches8690(t *testing.T) {
 	// reads every shape by construction, and a future gofmt change cannot move
 	// a case expression out of its reach.
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "compact_normalize_8662.go", nil, 0)
+	file, err := parser.ParseFile(fset, "compact_normalize_scope.go", nil, 0)
 	if err != nil {
 		t.Fatalf("parse predicate source: %v", err)
 	}
@@ -1557,7 +1557,7 @@ func itoa8690(n int) string { return strconv.Itoa(n) }
 // inventory both look satisfied.
 func TestNoAdmittedPairIsUnfireable8690(t *testing.T) {
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "compact_normalize_8662.go", nil, 0)
+	file, err := parser.ParseFile(fset, "compact_normalize_scope.go", nil, 0)
 	if err != nil {
 		t.Fatalf("parse predicate source: %v", err)
 	}
