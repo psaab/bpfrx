@@ -103,17 +103,24 @@ var knownBlindScopePairs8852 = map[string]string{
 	// #8879 batch 2, same reasoning as batch 1: admitted after measuring the
 	// elided spelling SILENT, blind to arm 2 for the same structural reason, so
 	// their fold correctness rests on the per-pair cells rather than the census.
-	"chassis device-map":     "plain-container",
-	"protocols ospf":         "plain-container",
-	"security address-book":  "plain-container",
-	"system ntp":             "plain-container",
-	"security ike":           "plain-container",
-	"security nat":           "plain-container",
-	"system syslog":          "plain-container",
-	"policy then":            "plain-container",
-	"routing-options static": "plain-container",
-	"security alg":           "plain-container",
-	"security flow":          "plain-container",
+	// #8879 batch 3. Shapes DERIVED, not assumed — registered with a sentinel
+	// first and read back off this cell's own re-derivation, which is the only
+	// reading that cannot be my expectation echoed back at me.
+	"protocols isis":           "plain-container",
+	"routing-options generate": "plain-container",
+	"system license":           "plain-container",
+	"security log":             "plain-container",
+	"chassis device-map":       "plain-container",
+	"protocols ospf":           "plain-container",
+	"security address-book":    "plain-container",
+	"system ntp":               "plain-container",
+	"security ike":             "plain-container",
+	"security nat":             "plain-container",
+	"system syslog":            "plain-container",
+	"policy then":              "plain-container",
+	"routing-options static":   "plain-container",
+	"security alg":             "plain-container",
+	"security flow":            "plain-container",
 	// #8850 admitted ("firewall","family") so an elided `firewall family inet
 	// { filter ... }` compiles its filters instead of silently producing zero.
 	// `family` is args:0 with children and no wildcard, so blindShape8852
