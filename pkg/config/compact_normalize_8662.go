@@ -1182,6 +1182,7 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		"feed-server update-interval",
 		"flood threshold",
 		"flow multicast-session-lifetime",
+		"flow tcp-mss",
 		"flow route-change-timeout",
 		"friday start-time",
 		"friday stop-time",
