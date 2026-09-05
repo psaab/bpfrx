@@ -1329,6 +1329,21 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		// Doubly elided, `security nat source { pool p1 { address ...; } }`
 		// compiled to exactly what an EMPTY config produces: the source NAT
 		// pool silently vanished, both spellings accepted at strict commit.
+		// #8943: the rest of the `nat` family. `source` was admitted alone in
+		// #8929 and its five siblings behave identically -- all five drop their
+		// whole body when `nat <child> { ... }` elides the child's brace, with
+		// both spellings accepted at strict commit. #8921 collision check: each
+		// pair has exactly ONE schema site, so these admissions are effective
+		// only where they were adjudicated.
+		//
+		// `nat destination` is the consequential one -- a THIRD instance of the
+		// #8928 validation-suppression class. See
+		// TestElisionSuppressedAValidation8879.
+		"nat destination",
+		"nat nat64",
+		"nat natv6v4",
+		"nat proxy-arp",
+		"nat static",
 		"nat source",
 		// #8925. These four are NOT from #8879's population -- the sweep that
 		// built it enumerates sites by RUNNING the elision pass, so a pair the

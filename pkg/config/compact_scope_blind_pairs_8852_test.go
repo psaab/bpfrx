@@ -103,6 +103,12 @@ var knownBlindScopePairs8852 = map[string]string{
 	// #8879 batch 2, same reasoning as batch 1: admitted after measuring the
 	// elided spelling SILENT, blind to arm 2 for the same structural reason, so
 	// their fold correctness rests on the per-pair cells rather than the census.
+	// #8943, the nat family; shapes derived by the sentinel method.
+	"nat destination": "plain-container",
+	"nat nat64":       "plain-container",
+	"nat natv6v4":     "plain-container",
+	"nat proxy-arp":   "plain-container",
+	"nat static":      "plain-container",
 	// #8929, a DEPTH-2 pair; shape derived by the sentinel method.
 	"nat source": "plain-container",
 	// #8925. Shapes derived by the sentinel method, and this is the batch where

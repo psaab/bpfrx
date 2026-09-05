@@ -64,6 +64,39 @@ var admittedElisionCases8879 = []struct {
 		`security { nat { source { pool P { address 10.0.0.1/32; } } } }`,
 		`security nat { source { pool P { address 10.0.0.1/32; } } }`,
 		func(c *Config) string { return fmt.Sprintf("pools=%d", len(c.Security.NAT.SourcePools)) }},
+	// #8943 — the rest of the `nat` family, siblings of the #8929 `nat source`
+	// pair. All five drop their whole body when the child's brace is elided.
+	// #8921 collision check: one schema site each.
+	{"nat destination",
+		`security { nat { destination { pool dp1 { address 10.9.0.9/32; } } } }`,
+		`security { nat destination { pool dp1 { address 10.9.0.9/32; } } }`,
+		func(c *Config) string {
+			if c.Security.NAT.Destination == nil {
+				return "<nil>"
+			}
+			return fmt.Sprintf("dpools=%d", len(c.Security.NAT.Destination.Pools))
+		}},
+	{"nat static",
+		`security { nat { static { rule-set rs1 { from zone trust; rule r1 { match { destination-address 10.9.0.0/24; } then { static-nat prefix 10.8.0.0/24; } } } } } }`,
+		`security { nat static { rule-set rs1 { from zone trust; rule r1 { match { destination-address 10.9.0.0/24; } then { static-nat prefix 10.8.0.0/24; } } } } }`,
+		func(c *Config) string { return fmt.Sprintf("static=%d", len(c.Security.NAT.Static)) }},
+	{"nat nat64",
+		`security { nat { nat64 { rule-set rs1 { from zone untrust; rule r1 { match { destination-address 64:ff9b::/96; } then { translate; } } } } } }`,
+		`security { nat nat64 { rule-set rs1 { from zone untrust; rule r1 { match { destination-address 64:ff9b::/96; } then { translate; } } } } }`,
+		func(c *Config) string { return fmt.Sprintf("nat64=%d", len(c.Security.NAT.NAT64)) }},
+	{"nat natv6v4",
+		`security { nat { natv6v4 { prefix 2001:db8::/96; } } }`,
+		`security { nat natv6v4 { prefix 2001:db8::/96; } }`,
+		func(c *Config) string {
+			if c.Security.NAT.NATv6v4 == nil {
+				return "<nil>"
+			}
+			return "natv6v4=set"
+		}},
+	{"nat proxy-arp",
+		`security { nat { proxy-arp { interface ge-0/0/0.0 { address 10.9.0.9/32; } } } }`,
+		`security { nat proxy-arp { interface ge-0/0/0.0 { address 10.9.0.9/32; } } }`,
+		func(c *Config) string { return fmt.Sprintf("parp=%d", len(c.Security.NAT.ProxyARP)) }},
 	// #8929 — a DEPTH-2 pair. `braced` is the fully braced spelling and
 	// `elided` is the DOUBLY elided one: `security nat { ... }` folds because
 	// (security, nat) is admitted, but whether `nat source { ... }` folds is a
@@ -863,6 +896,14 @@ func TestElisionSuppressedAValidation8879(t *testing.T) {
 			`routing-options { forwarding-table { export no-such-policy-7717; } }`,
 			`routing-options forwarding-table { export no-such-policy-7717; }`,
 			"ECMP / consistent-hash load-balancing is silently disabled"},
+		// THIRD instance (#8943). Same shape, security-relevant: a
+		// destination-NAT rule naming a pool that does not exist.
+		{"security nat destination",
+			`security { nat { destination { rule-set rs1 { from zone untrust; rule r1 { ` +
+				`match { destination-address 10.9.0.0/24; } then { destination-nat pool no-such-pool-7717; } } } } } }`,
+			`security { nat destination { rule-set rs1 { from zone untrust; rule r1 { ` +
+				`match { destination-address 10.9.0.0/24; } then { destination-nat pool no-such-pool-7717; } } } } }`,
+			"destination NAT silently does not translate"},
 		{"services ip-monitoring",
 			`services { ip-monitoring { policy ipm1 { match { rpm-probe no-such-probe-7717; } ` +
 				`then { preferred-route { route 203.0.113.0/24 { next-hop 198.51.100.1; } } } } } }`,
@@ -1092,8 +1133,7 @@ func TestDepth2UnadmittedPopulation8929(t *testing.T) {
 		"flow traceoptions", "flow udp-session",
 		"flow-monitoring version-ipfix", "flow-monitoring version9",
 		"interface-routes rib-group", "license autoupdate",
-		"nat destination", "nat nat64", "nat natv6v4", "nat proxy-arp",
-		"nat static", "policies policy-rematch", "pre-id-default-policy then",
+		"policies policy-rematch", "pre-id-default-policy then",
 		"rib static", "syslog file", "syslog host", "syslog user",
 	}
 	// 50 UNIQUE pairs. #8929 said 51 by counting a slice that double-counted
@@ -1102,7 +1142,7 @@ func TestDepth2UnadmittedPopulation8929(t *testing.T) {
 	// stanza, so the same pair reached by two routes is ONE pair — counting
 	// sites where the population is pairs is the unit mismatch this campaign
 	// already hit once, on the 320-sites / 95-pairs reconciliation.
-	const wantPopulation = 50
+	const wantPopulation = 45
 
 	parentAdmitted := func(mid string) bool {
 		for stanza := range setSchema.children {
@@ -1144,9 +1184,10 @@ func TestDepth2UnadmittedPopulation8929(t *testing.T) {
 	// catches an entry that should have been REMOVED and is blind to one that
 	// was removed silently (a bad merge, a tidy-up). Measured: deleting an
 	// entry left this cell green until this assertion was added.
-	if len(knownDropping) != 26 {
-		t.Errorf("knownDropping has %d entries, want 26. #8938 measured 26 of "+
-			"the 50 dropping. Removing one is only correct if the pair was "+
+	if len(knownDropping) != 21 {
+		t.Errorf("knownDropping has %d entries, want 21. #8938 measured 26 of "+
+			"the 50 dropping; the five `nat` siblings were admitted in #8943, "+
+			"leaving 21. Removing one is only correct if the pair was "+
 			"ADMITTED — in which case the membership check below fires too and "+
 			"BOTH numbers move together. A count change on its own means the "+
 			"record was edited without a measurement.", len(knownDropping))
