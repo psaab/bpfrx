@@ -64,6 +64,39 @@ var admittedElisionCases8879 = []struct {
 		`security { nat { source { pool P { address 10.0.0.1/32; } } } }`,
 		`security nat { source { pool P { address 10.0.0.1/32; } } }`,
 		func(c *Config) string { return fmt.Sprintf("pools=%d", len(c.Security.NAT.SourcePools)) }},
+	// #8925 — found by SCHEMA WALK, not by the sweep. See
+	// TestUnadmittedTopLevelPairsAreAdjudicated8925 for the instrument and
+	// why the sweep could not see these.
+	{"class-of-service forwarding-classes",
+		`class-of-service { forwarding-classes { queue 3 my-ef; } }`,
+		`class-of-service forwarding-classes { queue 3 my-ef; }`,
+		func(c *Config) string {
+			return fmt.Sprintf("fc=%d", len(c.ClassOfService.ForwardingClasses))
+		}},
+	{"policy-options as-path",
+		`policy-options { as-path ap7717 ".* 65001"; }`,
+		`policy-options as-path ap7717 ".* 65001";`,
+		func(c *Config) string {
+			return fmt.Sprintf("asp=%d", len(c.PolicyOptions.ASPaths))
+		}},
+	// The elided spelling turned DPI application detection OFF. Same shape as
+	// `security policy-stats`: a feature disabled by the choice of spelling,
+	// with no diagnostic.
+	{"services application-identification",
+		`services { application-identification { no-application-system-cache; } }`,
+		`services application-identification { no-application-system-cache; }`,
+		func(c *Config) string {
+			return fmt.Sprintf("appid=%v", c.Services.ApplicationIdentification)
+		}},
+	{"system internet-options",
+		`system { internet-options { no-ipv6-reject-zero-hop-limit; } }`,
+		`system internet-options { no-ipv6-reject-zero-hop-limit; }`,
+		func(c *Config) string {
+			if c.System.InternetOptions == nil {
+				return "<nil>"
+			}
+			return fmt.Sprintf("iopt=%v", c.System.InternetOptions.NoIPv6RejectZeroHopLimit)
+		}},
 	// #8879 batch 9 — the last of the population.
 	//
 	// Two fixtures here had to be repaired before they could answer, and
@@ -901,4 +934,100 @@ func TestSystemServicesStaysUnadmitted8879(t *testing.T) {
 			"there, so it is dropped and the CLI runs with an empty class -- " +
 			"the operator must be told, not silently obeyed (#6966/#8879).")
 	}
+}
+
+// TestUnadmittedTopLevelPairsAreAdjudicated8925 is the instrument #8879's
+// population lacked, and it exists because of how that population was built.
+//
+// `TestSweepFull` enumerates sites by RUNNING the brace-elision pass
+// (`collectCompactSites`). A `(container, head)` pair the pass never asks
+// about produces no site, so it appears in no inventory and no census — and
+// its absence there is INDISTINGUISHABLE from having been adjudicated and
+// cleared. Four live silent drops sat outside that population for the whole
+// #8879 campaign for exactly that reason (#8925): `class-of-service
+// forwarding-classes`, `policy-options as-path`, `services
+// application-identification` and `system internet-options`, the third of
+// which silently turned DPI application detection OFF.
+//
+// This walks `setSchema` DIRECTLY instead — the declared grammar rather than
+// the pass's behaviour — and pins the top-level pairs that are NOT admitted.
+// Every one must be here with a reason, so a newly-added or newly-un-admitted
+// pair cannot slip in silently the way those four did.
+//
+// It is deliberately restricted to TOP-LEVEL pairs. A deeper pair is reachable
+// only through a parent that is itself either admitted (so the parent's body
+// is folded and the child is reached) or listed here. Top level is where a
+// whole stanza can vanish.
+func TestUnadmittedTopLevelPairsAreAdjudicated8925(t *testing.T) {
+	// Reasons are re-derived where they can be. `no-body` is checked against
+	// the schema every run rather than trusted: a pair that GAINS children
+	// becomes droppable, and that is precisely the transition that would
+	// re-open this class.
+	const (
+		reasonNoBody = "no-body: the head declares no children, so there is no body to strand"
+		reasonLoud   = "declined: the elided spelling is REFUSED at strict commit, so the drop is loud (#8868)"
+		reasonSame   = "declined: measured SAME — the elided spelling delivers what the braced one does"
+		reason6966   = "declined: folding it makes a packed `login` behind it strict-ACCEPT while dropped (#6966)"
+	)
+	want := map[string]string{
+		"forwarding-options allow-dataplane-sleep": reasonNoBody,
+		"system dataplane-type":                    reasonNoBody,
+		"system host-name":                         reasonNoBody,
+		"system no-redirects":                      reasonNoBody,
+		"system processes":                         reasonNoBody,
+		"system login":                             reasonLoud,
+		"system services":                          reason6966,
+		"chassis cluster":                          reasonSame,
+	}
+
+	got := map[string]string{}
+	for stanza, sn := range setSchema.children {
+		if sn == nil {
+			continue
+		}
+		for head, hn := range sn.children {
+			if compactNormalizeInScope(stanza, head) {
+				continue
+			}
+			pair := stanza + " " + head
+			// RE-DERIVED, not registered: does this head declare a body at all?
+			if hn == nil || (len(hn.children) == 0 && hn.wildcard == nil) {
+				got[pair] = reasonNoBody
+				continue
+			}
+			got[pair] = "" // has a body — must be registered with a real reason
+		}
+	}
+
+	for pair, derived := range got {
+		reg, ok := want[pair]
+		if !ok {
+			t.Errorf("`%s` is NOT admitted to compactNormalizeInScope and is not "+
+				"registered here. If its head declares a body, eliding the stanza "+
+				"can silently drop it — that is #8925, and four such pairs sat "+
+				"outside #8879's population undetected because the sweep only "+
+				"sees what the pass already visits. Measure it (braced vs elided, "+
+				"gate column FIRST, braced arm live against an EMPTY config) and "+
+				"either admit it or register the reason it is declined.", pair)
+			continue
+		}
+		if derived == reasonNoBody && reg != reasonNoBody {
+			t.Errorf("`%s` is registered as %q but its schema head declares NO "+
+				"children — the registration and the schema disagree.", pair, reg)
+		}
+		if derived == "" && reg == reasonNoBody {
+			t.Errorf("`%s` is registered as %q but its schema head now DECLARES "+
+				"A BODY. A pair that gains children becomes droppable, which is "+
+				"exactly the transition that re-opens #8925 — measure it and give "+
+				"it a real reason.", pair, reg)
+		}
+	}
+	for pair := range want {
+		if _, ok := got[pair]; !ok {
+			t.Errorf("`%s` is registered as un-admitted but is no longer in that "+
+				"set — it was admitted, or the schema no longer declares it. This "+
+				"list must not outlive its reason; remove the entry.", pair)
+		}
+	}
+	t.Logf("#8925: %d top-level pairs un-admitted, all adjudicated", len(got))
 }

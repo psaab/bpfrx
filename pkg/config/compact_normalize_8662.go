@@ -1258,6 +1258,18 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		// admitting `system login` would turn a loud #6662 rejection into a
 		// silent acceptance, which is a regression wearing the shape of a fix).
 		"protocols bgp",
+		// #8925. These four are NOT from #8879's population -- the sweep that
+		// built it enumerates sites by RUNNING the elision pass, so a pair the
+		// pass never asks about produces no site and appears in no census. They
+		// were found by walking setSchema directly instead. Their absence from
+		// the population was indistinguishable from having been adjudicated.
+		//
+		// `services application-identification` is the consequential one: the
+		// elided spelling silently turned DPI-based application detection OFF.
+		"class-of-service forwarding-classes",
+		"policy-options as-path",
+		"services application-identification",
+		"system internet-options",
 		// #8879 batch 9, the last of the population. `services ip-monitoring`
 		// is the SECOND validation-suppressing elision found (after
 		// `routing-options forwarding-table` in batch 6): its elided spelling

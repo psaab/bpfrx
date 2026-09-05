@@ -103,6 +103,14 @@ var knownBlindScopePairs8852 = map[string]string{
 	// #8879 batch 2, same reasoning as batch 1: admitted after measuring the
 	// elided spelling SILENT, blind to arm 2 for the same structural reason, so
 	// their fold correctness rests on the per-pair cells rather than the census.
+	// #8925. Shapes derived by the sentinel method, and this is the batch where
+	// that mattered: they are NOT all plain-container. Every earlier batch
+	// derived plain-container four times running -- exactly the run of
+	// confirmations that makes assuming the fifth feel safe.
+	"class-of-service forwarding-classes": "plain-container",
+	"policy-options as-path":              "multi-arg",
+	"services application-identification": "zero-arg-leaf",
+	"system internet-options":             "plain-container",
 	// #8879 batch 9, shapes derived by the sentinel method.
 	"forwarding-options port-mirroring": "plain-container",
 	"routing-options interface-routes":  "plain-container",
