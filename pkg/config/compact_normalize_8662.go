@@ -803,6 +803,8 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		"host-inbound-traffic system-services",
 		"address-set address",
 		"address-set address-set",
+		"address-book address",
+		"global address",
 		"address-book address-set",
 		"policies default-policy-log",
 		"policies from-zone",

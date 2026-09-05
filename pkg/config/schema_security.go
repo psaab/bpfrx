@@ -192,7 +192,7 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			// directly under the zone (no `global` wrapper). A policy in
 			// this zone resolves a name against the zone-local book first,
 			// then falls back to the global book.
-			"address-book": {desc: "Zone-local address book", children: map[string]*schemaNode{
+			"address-book": {desc: "Zone-local address book", packedStatements: true, children: map[string]*schemaNode{
 				"address": {desc: "Named address (name and prefix)", args: 2, multi: true, placeholder: "<address-name>", children: nil},
 				"address-set": {desc: "Address set name", args: 1, valueHint: ValueHintAddressName, placeholder: "<address-set-name>", children: map[string]*schemaNode{
 					"address":     {desc: "Address to include in this set", args: 1, multi: true, placeholder: "<address-name>", children: nil},
@@ -717,7 +717,7 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 		}},
 	}},
 	"address-book": {desc: "Address books", children: map[string]*schemaNode{
-		"global": {desc: "Global address book", children: map[string]*schemaNode{
+		"global": {desc: "Global address book", packedStatements: true, children: map[string]*schemaNode{
 			"address": {desc: "Named address (name and prefix)", args: 2, multi: true, placeholder: "<address-name>", children: nil},
 			"address-set": {desc: "Address set name", args: 1, valueHint: ValueHintAddressName, placeholder: "<address-set-name>", children: map[string]*schemaNode{
 				"address":     {desc: "Address to include in this set", args: 1, multi: true, placeholder: "<address-name>", children: nil},
