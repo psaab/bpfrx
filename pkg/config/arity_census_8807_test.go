@@ -348,8 +348,23 @@ type arityVerdict8807 struct {
 var arityAdjudicated8807 = map[string]arityVerdict8807{
 	// The four remaining false pairings are ALL sites whose container could not
 	// be recovered lexically, so they are still name-keyed. That is the residual
-	// blindness, and it is why this hand map still exists rather than the
-	// predicate being trusted on its own.
+	// blindness of the CONTAINER-keyed predicate and it belongs next to the
+	// ratchet, not in someone's notes.
+	//
+	// WHAT MAKES THEM UNLOCALISABLE: enclosingContainer8807 recovers a container
+	// only from an enclosing `range ... FindChildren("X")`. These four sites
+	// iterate something else --
+	//
+	//   - a bare `range node.Children` / `range prop.Children`, where the
+	//     container is whatever the caller passed and is not written at the site
+	//     at all (`count`, `reject`, `then`);
+	//   - a variable bound further up the function, so the literal container
+	//     name is nowhere in the enclosing range expression (`from-zone`,
+	//     `interface`, `pool`, `match`).
+	//
+	// Recovering those needs the call path, not a lexical walk -- which is
+	// exactly the positional predicate this issue exists to build, and the
+	// reason it is a separate piece of work rather than a bigger regex.
 	"count": {"false-pairing", "compiler_firewall.go reads Keys[1] on a firewall term `then count`, where the " +
 		"schema declares args:1 and is correct; the args:0 leaf matched is `security policies ... then count`."},
 	"from-zone": {"false-pairing", "the site is the top-level `security policies from-zone <z> to-zone <z>` " +
@@ -359,20 +374,30 @@ var arityAdjudicated8807 = map[string]arityVerdict8807{
 	"pool": {"false-pairing", "compiler_services.go reads Keys[4] on the DHCP-server pool; the matched leaves are " +
 		"NAT pools args:1. The NAT pools' real defect was existence, not arity (#8800)."},
 
-	"reject": {"genuine", "compiler_firewall.go:1337 reads an OPTIONAL Keys[1] message-type on `then reject <type>` " +
-		"while the leaf is args:0 -- possibly the #3332 trailing-token class. NOT MEASURED: needs braced-vs-packed."},
-	"then": {"genuine", "`/policy-options/policy-statement/then` is declared a true leaf args:0. The sites THIS " +
-		"predicate sees (compiler_routing.go:908, :1138) iterate its children -- a container declared as a leaf. " +
-		"lane-8015 found a THIRD site the predicate cannot see, parsePolicyTermInlineKeys at :1269, which consumes " +
-		"a FOLLOWING KEY via a variable index. Both descriptions are true of different sites, and they want " +
-		"different remedies, so measure before choosing one. NOT MEASURED: needs braced-vs-packed."},
+	"reject": {"measured-benign", "same path, real arity mismatch -- compiler_firewall.go:1337 reads an OPTIONAL " +
+		"Keys[1] message-type on `then reject <type>` while the leaf is args:0. MEASURED by lane-8015 with an absent " +
+		"baseline: every spelling delivers, and a bogus message-type is a LOUD commit rejection via the " +
+		"UnknownActions path rather than a silent drop. No defect. The residue is that COMPLETION under-offers, " +
+		"because the compiler is ahead of the schema -- the mirror of the #8773 rule."},
+	"then": {"measured-benign", "`/policy-options/policy-statement/then` is declared a true leaf args:0. The sites " +
+		"THIS predicate sees (compiler_routing.go:908, :1138) iterate its children; lane-8015 found a THIRD it " +
+		"cannot see, parsePolicyTermInlineKeys at :1269, consuming a FOLLOWING KEY via a variable index. MEASURED: " +
+		"every spelling delivers and the values reach real consumers. No defect. Same completion residue as " +
+		"`reject`."},
 }
 
 // arityGenuineFloor8807 is a RATCHET, not an equality. It fails in BOTH
 // directions on purpose: a rise means a new unadjudicated candidate, and a DROP
 // means candidates were resolved and this constant must be tightened so the
 // next regression has no slack to hide in (the #7484 shape).
-const arityGenuineFloor8807 = 2
+// Tightened 2 -> 0 the first time this ratchet fired for real: lane-8015
+// measured `reject` and `then` and both are benign, so the census stands at
+// 12 hits and ZERO defects. Do not read that as "the predicate found
+// nothing useful" -- it found that a whole predicate produced no defects,
+// which is a result, and it produced one real residue (completion
+// under-offers for both leaves, because the compiler is AHEAD of the
+// schema -- the mirror of the #8773 rule).
+const arityGenuineFloor8807 = 0
 
 func TestArityCensusIsRatcheted8807(t *testing.T) {
 	hits := arityCensusHits8807(t)
