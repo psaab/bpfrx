@@ -194,8 +194,11 @@ func TestCompactNormalizeScopePreservesCompiledResult8690(t *testing.T) {
 		// Distinguishing them automatically would need the gates themselves to
 		// declare which kind they are; until then this arm reports and a person
 		// classifies.
-		off := compileStrict8690(t, elidedText, true)
-		on := compileStrict8690(t, elidedText, false)
+		// Routed through gateVerdict8690 so the admission state is printed
+		// beside every per-site verdict this arm produces, and so the helper
+		// is exercised on every run rather than sitting inert for the hand
+		// probes it exists to discipline.
+		off, on, _ := gateVerdict8690(t, siteKey, elidedText)
 		switch {
 		case off != nil && on == nil:
 			disarmed = append(disarmed, siteKey)
@@ -294,7 +297,21 @@ func TestCompactNormalizeScopePreservesCompiledResult8690(t *testing.T) {
 			"as a clean scope. A NEW entry means a widening admitted a site "+
 			"whose reference spelling will not compile in isolation; give it a "+
 			"compilable fixture (a required sibling is usually missing) rather "+
-			"than adding it here. A REMOVED entry means one became examinable "+
+			"than adding it here.\n"+
+			"UNLESS the leaf under test is itself the stanza's VALIDITY "+
+			"CONDITION — then the control cannot be built at all, because any "+
+			"fixture that makes it compile must supply the very value the "+
+			"control exists to omit, and the site needs a hand measurement "+
+			"instead. `services rpm probe <p> test <t> target` is the worked "+
+			"case: the empty control is rejected with \"target is required\". "+
+			"`bgp group <g> neighbor <n> peer-as` and both "+
+			"`three-color-policer <p> {single,two}-rate "+
+			"committed-information-rate` are the same shape.\n"+
+			"This does NOT apply where an ALTERNATIVE leaf satisfies the "+
+			"stanza — `feed-server <s> {url,hostname}` and `device-map "+
+			"interface <i> {pci,mac}` are constructible by supplying the "+
+			"sibling, and the advice above is correct for them.\n"+
+			"A REMOVED entry means one became examinable "+
 			"and the list should shrink (#8690).", diff)
 	}
 	// The bucket is asserted for EQUALITY, not merely reported. lane-8526's
@@ -579,6 +596,70 @@ func TestCompactNormalizeDoesNotDisarmTheLoginPackedGate8690(t *testing.T) {
 // the compileOpts seam. It returns the compile error so a caller can compare
 // ACCEPTANCE against REJECTION, which is the distinction the compiled-result
 // comparison cannot make.
+// gateVerdict8690 prints a gate probe's result WITH the admission state of the
+// site it is about, and returns the two errors so a caller can assert on them.
+//
+// #8690: use this rather than a bare pair of compileStrict8690 calls whenever
+// the result will be read by a person. The tense trap caught three of us in one
+// day, and the reason is that a verdict line is IDENTICAL whether the pass was
+// in scope at that site or not:
+//
+//	passOFF=REJECTED passON=accepted
+//
+// With the site admitted that reads "the pass disarms a gate". With the site
+// NOT admitted the same two calls produce the same line and it means nothing of
+// the sort — the pass rewrote no node, so any difference came from elsewhere
+// and the line is evidence about the fixture, not about the pass. The reader
+// supplies the missing half from memory, and memory is what fails across a long
+// session.
+//
+// An author can be ASKED to state the scope, and an author can copy that
+// statement forward from a probe run under different conditions — which is
+// exactly how two fixture-limited sites got reported as live disarms. A PRINTED
+// value cannot be copied forward wrongly, because the instrument recomputes it
+// at the moment it prints.
+//
+// `touched` is the measured admission state and the one worth printing: the
+// number of nodes the pass actually rewrote in THIS text. It is strictly
+// stronger than the compactNormalizeInScope predicate, because a pair can be
+// admitted and still touch nothing here (the fold may simply not be present in
+// the fixture), and a verdict about a text the pass never rewrote is not a
+// verdict about the pass. touched=0 therefore voids the comparison below it,
+// whatever the predicate says.
+//
+// Pass the (container, head) pair as the optional trailing arguments to also
+// print the predicate. It is worth doing when touched=0 and you need to know
+// WHICH of the two reasons applies — pair not admitted, or admitted with no
+// fold present.
+func gateVerdict8690(t *testing.T, label, text string, pair ...string) (off, on error, touched int) {
+	t.Helper()
+	off = compileStrict8690(t, text, true)
+	on = compileStrict8690(t, text, false)
+
+	if tree, perrs := NewParser(text).Parse(); len(perrs) == 0 && tree != nil {
+		touched = normalizeCompactStanzas(tree)
+	}
+	scope := ""
+	if len(pair) == 2 {
+		scope = fmt.Sprintf(" admitted=%v", compactNormalizeInScope(pair[0], pair[1]))
+	}
+	render := func(e error) string {
+		if e == nil {
+			return "accepted"
+		}
+		return "REJECTED"
+	}
+	// The state is printed on the SAME line as the verdict, deliberately. A
+	// separate line is one a reader can skip and a quoter can drop.
+	note := ""
+	if touched == 0 {
+		note = "  [touched=0: the pass rewrote nothing here — this is NOT a verdict about the pass]"
+	}
+	t.Logf("%-40s touched=%d%s  passOFF=%-8s passON=%-8s%s",
+		label, touched, scope, render(off), render(on), note)
+	return off, on, touched
+}
+
 func compileStrict8690(t *testing.T, text string, skipNormalize bool) error {
 	t.Helper()
 	tree, perrs := NewParser(text).Parse()
@@ -1087,6 +1168,70 @@ const policyMatchNoDisarm8690 = "HAND-MEASURED: NOT A DISARM, and it cannot " +
 	"it the gate reports three missing criteria, with it two. The surviving " +
 	"criterion is the one that was folded."
 
+// TestGateVerdictReportsMeasuredAdmission8690 is the control on the control.
+//
+// gateVerdict8690 exists so no gate verdict can be read without its admission
+// state attached. That only works if the state is MEASURED. A helper that
+// hard-coded touched=1, or that computed it from a stale predicate, would print
+// a confident line on every call and be indistinguishable from a correct one —
+// the same shape of vacuous green the seamObserved guard was added to catch one
+// arm over.
+//
+// So: drive it from both sides. A site the pass rewrites must report touched>0,
+// and a site it leaves alone must report touched=0. A constant fails one of
+// them whichever constant it is.
+func TestGateVerdictReportsMeasuredAdmission8690(t *testing.T) {
+	// NEGATIVE control: `system host-name` is a plain leaf, not a packed
+	// hierarchical tail, so the pass has nothing to fold and must touch
+	// nothing. If this ever reports touched>0 the helper is not measuring.
+	untouched := "system { host-name xpfhost; }"
+	if tree, perrs := NewParser(untouched).Parse(); len(perrs) == 0 && tree != nil {
+		if n := normalizeCompactStanzas(tree); n != 0 {
+			t.Fatalf("negative control is not untouched: the pass rewrote %d node(s) in %q, "+
+				"so it can no longer distinguish a measured touched= from a constant "+
+				"(pick a different control) (#8690)", n, untouched)
+		}
+	} else {
+		t.Fatalf("negative control does not parse: %q (#8690)", untouched)
+	}
+
+	// POSITIVE control: a genuinely packed tail at an ADMITTED site. Drawn
+	// from the pass's own scope so the two controls differ in exactly the
+	// property under test.
+	touchedText := "applications { application xpfarg protocol tcp; }"
+	tree, perrs := NewParser(touchedText).Parse()
+	if len(perrs) > 0 || tree == nil {
+		t.Fatalf("positive control does not parse: %q (#8690)", touchedText)
+	}
+	if n := normalizeCompactStanzas(tree); n == 0 {
+		t.Fatalf("positive control is not touched: the pass rewrote nothing in %q, so a "+
+			"helper hard-coding touched=0 would pass this cell. The site was admitted "+
+			"when this control was written; if the scope narrowed, move the control to a "+
+			"site still in scope rather than deleting it (#8690)", touchedText)
+	}
+
+	// And now the part that actually binds the HELPER. The two checks above
+	// establish that the two fixtures genuinely differ in whether the pass
+	// touches them; these assert that gateVerdict8690 REPORTS that difference.
+	//
+	// It has to observe the helper's own return value, not a second
+	// computation of the same thing. An earlier draft of this cell re-derived
+	// the count beside the helper and compared the two derivations — which
+	// agree with each other by construction, and would both stay green if the
+	// helper hard-coded the value it prints. That is the exact vacuity this
+	// cell was written to prevent, reproduced inside it.
+	if _, _, got := gateVerdict8690(t, "control/untouched", untouched); got != 0 {
+		t.Errorf("gateVerdict8690 reported touched=%d for a site the pass leaves alone "+
+			"(want 0); the admission state printed beside every verdict is not measured, "+
+			"so a reader cannot trust it to void a comparison (#8690)", got)
+	}
+	if _, _, got := gateVerdict8690(t, "control/touched", touchedText); got == 0 {
+		t.Errorf("gateVerdict8690 reported touched=0 for a site the pass rewrites; every " +
+			"verdict line would carry the 'NOT a verdict about the pass' disclaimer and " +
+			"readers would learn to ignore it (#8690)")
+	}
+}
+
 // #8690: the normalizer preserves the folded tail, witnessed by a gate that was
 // not built to witness anything.
 //
@@ -1196,8 +1341,9 @@ func TestNoPairIsAdmittedByTwoFamilySwitches8690(t *testing.T) {
 	// of every clause: 11 first-pairs, 15 last-pairs, and 1 single-entry clause.
 	// Two of the 27 were real cross-switch duplicates the cell exists to catch.
 	//
-	// Adding a second regex would have closed the 11 and left the 16, and would
-	// still be a set of spellings somebody enumerated by looking. The parser
+	// A second regex for the case-line shape was landed first (it closed the 11
+	// and left the 16) and this supersedes it: two patterns is still a set of
+	// spellings somebody enumerated by looking. The parser
 	// reads every shape by construction, and a future gofmt change cannot move
 	// a case expression out of its reach.
 	fset := token.NewFileSet()
@@ -1243,6 +1389,21 @@ func TestNoPairIsAdmittedByTwoFamilySwitches8690(t *testing.T) {
 				"expressions are being read. Its absence means the walk has lost "+
 				"reach over a shape again — the exact defect this replaced (#8690)", must)
 		}
+	}
+	// TOTAL-AGAINST-SOURCE control, the shape-independent version of the
+	// pattern-specific one this replaced. That asserted the second REGEX matched
+	// something; with a parser there are no patterns to check, so the equivalent
+	// question is whether the walk read as many pairs as the file contains. A
+	// count well below the source's is a reach gap whatever caused it, including
+	// a shape nobody has thought of.
+	//
+	// The floor is deliberately loose: it catches losing a whole clause shape
+	// (the real defect was 27 of 548) without redding every time a family lands.
+	if total < 400 {
+		t.Fatalf("the walk read only %d case-string pairs from the predicate. "+
+			"The file has held ~550; a number this low means whole clauses are "+
+			"going unread, which is the defect this cell shipped with in regex "+
+			"form (#8690)", total)
 	}
 	var dup []string
 	for pair, n := range counts {
