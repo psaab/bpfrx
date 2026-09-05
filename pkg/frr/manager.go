@@ -378,6 +378,22 @@ type DHCPRoute struct {
 	Gateway     string // "10.0.2.1" or "fe80::1"
 	Interface   string // needed for IPv6 link-local gateways
 	IsIPv6      bool
+	// VRF is the routing instance the LEARNING interface belongs to, or "" for
+	// the default context (#8963).
+	//
+	// Without it a DHCP-learned route was emitted once, in the default FRR
+	// context, even when the interface that learned it sat inside a routing
+	// instance -- so the instance did not get the route it learned and the
+	// default context got one it should not have. Static routes in the same
+	// file have threaded a `vrf <name>` clause since #5557; DHCP-learned ones
+	// did not, which is the asymmetry that identifies this as a defect rather
+	// than a design choice.
+	//
+	// The combination is REACHABLE: `interfaces ge-0/0/1 unit 0 family inet
+	// dhcp` together with `routing-instances vrf1 interface ge-0/0/1.0`
+	// commits clean -- measured at CheckText, with both single-sided controls
+	// accepted, so the rejection is not what was keeping this latent.
+	VRF string
 }
 
 // FullConfig holds the complete routing config for a single FRR apply.
