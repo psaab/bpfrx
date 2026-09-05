@@ -172,7 +172,7 @@ func TestNormalizerLeavesAMultiValuePayloadAlone8662(t *testing.T) {
 	}}
 	// A tail whose head DOES name a child: split.
 	body := []*Node{{Keys: []string{"match", "source-address", "10.0.0.0/8"}, IsLeaf: true}}
-	if n := normalizeCompactNodes(body, matchSchema); n != 1 {
+	if n := normalizeCompactNodes(body, matchSchema, compactNormalizeInScope); n != 1 {
 		t.Errorf("an elided body must be split, got %d splits", n)
 	}
 	if len(body[0].Children) != 1 || body[0].IsLeaf {
@@ -182,7 +182,7 @@ func TestNormalizerLeavesAMultiValuePayloadAlone8662(t *testing.T) {
 	// A tail whose head does NOT name a child: leave it alone. This is the
 	// multi-value payload shape (#2419 bracketed lists collapse onto Keys).
 	payload := []*Node{{Keys: []string{"match", "notachild", "v1", "v2"}, IsLeaf: true}}
-	if n := normalizeCompactNodes(payload, matchSchema); n != 0 {
+	if n := normalizeCompactNodes(payload, matchSchema, compactNormalizeInScope); n != 0 {
 		t.Errorf("a tail whose head does not name a child is this node's own multi-value "+
 			"payload and must NOT be torn into a child; got %d splits -> %+v", n, payload[0])
 	}
