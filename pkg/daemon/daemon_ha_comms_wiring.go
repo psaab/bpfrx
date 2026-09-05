@@ -529,10 +529,13 @@ func (d *Daemon) wireUserspaceEventStreamForSync(commsCtx context.Context) *dpus
 // Order contract: called unconditionally after the ss.Start retry loop, exactly
 // as before — these loops still start even when every Start attempt failed.
 func (d *Daemon) startClusterSyncAuxLoops(commsCtx context.Context, cc *config.ClusterConfig) {
-	// Start periodic IPsec SA sync if enabled.
-	if cc.IPsecSASync && d.ipsec != nil {
-		go d.syncIPsecSAPeriodic(commsCtx)
-	}
+	// #8967: routed through the idempotent starter so a later
+	// `ipsec-sa-synchronization` knob toggle from the apply path shares this
+	// same launch/stop path -- the shape the DHCP lease-sync sibling below
+	// already uses (#4647). Before this, the knob was read ONCE here at comms
+	// start, so enabling it on a running cluster committed successfully and
+	// started nothing until an unrelated comms restart.
+	d.ensureIPsecSASyncLoop(cc.IPsecSASync)
 
 	// #5863: start the level-triggered config-sync reconcile loop.
 	// It is the low-frequency safety net that (a) fires the moment the
