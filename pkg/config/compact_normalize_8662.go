@@ -930,6 +930,7 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		return true
 	// firewall: 34 pairs.
 	case "filter term",
+		"firewall family",
 		"firewall policer",
 		"firewall three-color-policer",
 		"flexible-match-range range",
