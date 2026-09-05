@@ -1169,10 +1169,16 @@ Two spellings reached that state, both measured through `configstore.CheckText`:
 - `fabster` — an outright typo (no `-<fpc>/` to parse);
 - `ge-0-0-0` — the KERNEL name form. This one matters more than it looks: it is
   what networkd renames the NIC to and what several other surfaces in this tree
-  accept, so it is a plausible thing to type in a fabric stanza. It derives
-  nothing on EITHER node.
+  accept, so it is a plausible thing to type in a fabric stanza. It derived
+  nothing on EITHER node **until #8829**, which is no longer true: `InterfaceSlot`
+  now parses the operational dash spelling, so `ge-0-0-0`/`ge-7-0-0` derive
+  `fab0`/`fab1` exactly like the slash form, and both spellings reach the same
+  kernel netdev at bring-up because every consumer normalises through
+  `LinuxIfName` (which is idempotent on the dash form). It is therefore no
+  longer rejected, and no longer an outage.
 
-`validateFabricMemberDefinedStrict` now rejects both at commit / commit-check,
+`validateFabricMemberDefinedStrict` rejects the remaining case — a member that
+parses to no FPC slot at all, such as `fabster` — at commit / commit-check,
 naming the fab interface and the offending member. It checks slot-parseability,
 NOT existence under `interfaces` — a fabric member is a bare NIC and correctly
 has no `interfaces` stanza of its own (neither `ge-0/0/0` nor `ge-7/0/0` has one
