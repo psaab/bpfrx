@@ -3469,6 +3469,56 @@ site, its position ahead of the scheduler join, and compile-time assertions
 that both userspace types still satisfy the interface). Every behavioural cell
 is time-bounded, because the mutant fails by hanging.
 
+### What forces a helper restart, and what does not (#8899)
+
+Two predicates decide whether a config change needs the helper process
+restarted, and they answer **different questions**. Conflating them is what
+#8899 was.
+
+| predicate | question | covers |
+|---|---|---|
+| `snapshotBindingPlanKey` | did the AF_XDP **binding plan** change? | workers, ring entries, and the interface/fabric topology |
+| `configEqual` | did the helper's **process identity** change? | `Binary`, `ControlSocket`, `EventSocket`, `StateFile`, `Workers`, `RingEntries`, `PollMode` |
+
+`configEqual` is defined as equality of `helperSpawnIdentity` — the values
+`ensureProcessLocked` actually puts on the command line and binds its sockets
+to, **after every default is resolved**. Two of those fields have resolvers
+(`PollMode` "" → `busy-poll`, `EventSocket` "" → derived beside the control
+socket), and comparing either raw reports a difference that does not exist in
+the spawned process: an operator writing a default down explicitly would restart
+the dataplane on a commit that changes nothing. Both instances shipped — the
+second was found only because the first was fixed and someone checked its
+sibling. Defining the comparison *as* the resolution is what makes a third
+impossible rather than merely checked for.
+
+The plan key is deliberately **insensitive** to process identity, and must stay
+that way: it also gates the same-plan refresh exception that lets FIB-only
+updates through during XSK startup, and it must not churn when a tunnel appears
+or moves (see the four-call-site note in `ingress_exclusions.go`). Widening it
+to cover process identity would be the wrong fix.
+
+**The defect (#8899):** during the pending-XSK-startup window the restart
+trigger consulted only the plan key. A config changing solely the binary, a
+socket, the state file or the poll mode left the key unchanged, so the trigger
+could not fire — and the branch then recorded the **desired** config as running
+and returned apply-success while the child kept its original argv and socket.
+Recording the desired config is what made it non-self-repairing: a later
+**identical** apply compares against it, sees no change, and does not restart
+either, so *reapplying the same config* — the obvious operator recovery — is
+exactly the one that cannot work. `manager_compile.go` now also consults
+`processRestartRequiredDuringStartup`, which wraps the `configEqual` the normal
+apply path already used.
+
+**Every field of `config.UserspaceConfig` must be classified as one or the
+other**, and `process_identity_restart_8899_test.go` fails until a new one is.
+The classification is not "everything restarts": the ten fields outside
+`configEqual` are applied by the **daemon** out of band — CPU governor, netdev
+budget, RSS indirection and ethtool coalescence go to sysfs/ethtool in
+`daemon_apply_tail.go` — or travel inside the snapshot (`SharedUMEM`), or are
+diagnostic (`RetiredKnobsSeen`). Adding those to `configEqual` would restart the
+dataplane on a CPU-governor change, which is a worse defect than the one being
+fixed.
+
 ## Limitations and Mixed Boundaries
 
 This section is a high-level architecture note. The authoritative current gate

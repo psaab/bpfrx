@@ -367,13 +367,45 @@ func (m *Manager) applyCompiledSnapshot(
 	publishedPlanChangedDuringStartup := pendingXSKStartup &&
 		m.publishedPlanKey != "" &&
 		m.publishedPlanKey != newPlanKey
-	if publishedPlanChangedDuringStartup {
+	// #8899: the plan key cannot see the helper's PROCESS IDENTITY, so the
+	// check above misses a config that changes only which binary runs, which
+	// sockets it listens on, where it checkpoints, or how it polls. During the
+	// startup window that meant the restart trigger could not fire and the
+	// branch below returned apply-SUCCESS after recording the desired config as
+	// running -- while the child kept its original argv and socket.
+	//
+	// `configEqual` is the predicate that already answers this correctly and is
+	// what `ensureProcessLocked` consults on the normal path; this branch simply
+	// never asked it. Consulting it here rather than widening the plan key keeps
+	// each predicate answering the question it is named for: the plan key is
+	// about the BINDING plan (workers, rings, interface and fabric topology),
+	// and it is deliberately insensitive to things that must not churn it.
+	processIdentityChangedDuringStartup :=
+		processRestartRequiredDuringStartup(pendingXSKStartup, m.cfg, ucfg)
+	if publishedPlanChangedDuringStartup || processIdentityChangedDuringStartup {
 		slog.Info(
-			"userspace: restarting helper during XSK startup for binding plan change",
+			"userspace: restarting helper during XSK startup",
 			"generation", snap.Generation,
 			"fib_generation", snap.FIBGeneration,
+			"binding_plan_changed", publishedPlanChangedDuringStartup,
+			"process_identity_changed", processIdentityChangedDuringStartup,
 		)
-		m.stopLocked()
+		// #8899: go through the PREFLIGHT wrapper rather than calling
+		// stopLocked directly. `stopForNewGenerationLocked` validates the
+		// incoming binary/socket/state-file paths BEFORE tearing the current
+		// helper down and, on a bad path, returns
+		// "refusing to restart ... previous generation left running".
+		//
+		// This mattered little while the only trigger here was a BINDING PLAN
+		// change (workers, rings, topology — nothing the preflight inspects).
+		// The process-identity trigger fires on exactly the paths it does
+		// validate, so without the wrapper a mistyped `control-socket` would
+		// kill the running helper and only then fail to start its replacement,
+		// turning a rejected config into an outage. Keeping the old helper on a
+		// bad config is the whole point of the preflight.
+		if err := m.stopForNewGenerationLocked(ucfg); err != nil {
+			return result, err
+		}
 		pendingXSKStartup = false
 		samePlanRefresh = false
 	}
