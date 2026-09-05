@@ -110,9 +110,9 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 		// closed (one validator, one error message).
 		"encrypted-password": {desc: "Encrypted password", args: 1, placeholder: "<crypt-hash>",
 			valueType: ValueCryptHash, validator: ValidateCryptHash, children: nil},
-		"ssh-ed25519": {desc: "SSH ED25519 public key", args: 1, placeholder: "<key>", children: nil},
-		"ssh-rsa":     {desc: "SSH RSA public key", args: 1, placeholder: "<key>", children: nil},
-		"ssh-dsa":     {desc: "SSH DSA public key", args: 1, placeholder: "<key>", children: nil},
+		"ssh-ed25519": {desc: "SSH ED25519 public key", args: 1, multi: true, placeholder: "<key>", children: nil},
+		"ssh-rsa":     {desc: "SSH RSA public key", args: 1, multi: true, placeholder: "<key>", children: nil},
+		"ssh-dsa":     {desc: "SSH DSA public key", args: 1, multi: true, placeholder: "<key>", children: nil},
 	}},
 	"archival": {desc: "Configuration archival", children: map[string]*schemaNode{
 		"configuration": {desc: "Configuration archival", children: map[string]*schemaNode{
@@ -329,9 +329,9 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 				"authentication": {desc: "Authentication methods", children: map[string]*schemaNode{
 					"encrypted-password": {desc: "Encrypted password", args: 1, placeholder: "<crypt-hash>",
 						valueType: ValueCryptHash, validator: ValidateCryptHash, children: nil},
-					"ssh-ed25519": {desc: "SSH ED25519 public key", args: 1, placeholder: "<key>", children: nil},
-					"ssh-rsa":     {desc: "SSH RSA public key", args: 1, placeholder: "<key>", children: nil},
-					"ssh-dsa":     {desc: "SSH DSA public key", args: 1, placeholder: "<key>", children: nil},
+					"ssh-ed25519": {desc: "SSH ED25519 public key", args: 1, multi: true, placeholder: "<key>", children: nil},
+					"ssh-rsa":     {desc: "SSH RSA public key", args: 1, multi: true, placeholder: "<key>", children: nil},
+					"ssh-dsa":     {desc: "SSH DSA public key", args: 1, multi: true, placeholder: "<key>", children: nil},
 				}},
 			}},
 	}},

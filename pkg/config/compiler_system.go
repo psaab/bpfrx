@@ -304,11 +304,28 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 					sys.Login.Users = append(sys.Login.Users, user)
 				}
 				// A later block's `authentication` section replaces the earlier
-				// block's key set wholesale rather than appending to it. That is
-				// what the runtime already does — applySystemLogin rewrites
-				// authorized_keys per entry with WriteFileDurable, so the last
-				// entry's keys are the ones on disk — so the fold preserves the
-				// provisioned key set exactly and removes only the divergence.
+				// block's PASSWORD wholesale — a scalar, last-writer-wins, the
+				// same rule uid and class follow just below.
+				//
+				// #8863 CHANGED THE KEY HALF, and the distinction is the point:
+				// authorized keys are a SET, not a scalar. #6992 originally
+				// cleared SSHKeys here too, and it DERIVED that from what the
+				// flat spelling did at the time — the flat path then replaced on
+				// a repeated `set … ssh-rsa`, so matching it meant clearing.
+				//
+				// That flat behaviour was itself the #8863 defect: a second
+				// `set system root-authentication ssh-ed25519` REVOKED the first
+				// key, and applyRootAuth writes the compiled set as the whole of
+				// authorized_keys, so the first administrator lost access at the
+				// next apply. With the flat path corrected to accumulate, the
+				// derivation that produced this reset is stale — so the reset
+				// goes and the two spellings agree again on [FIRST, SECOND].
+				//
+				// #6992's own decision is untouched: uid, class and the password
+				// still take the LAST authored value, which is what its comment
+				// justified from applySystemLogin rewriting per entry. Only the
+				// key expectation moved, and it moved because the thing it was
+				// derived from moved.
 				authoredAuth := false
 				for _, prop := range userInst.node.Children {
 					if prop.Name() == "authentication" {
@@ -317,7 +334,6 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 					}
 				}
 				if authoredAuth {
-					user.SSHKeys = nil
 					user.EncryptedPassword = ""
 				}
 				for _, prop := range userInst.node.Children {
@@ -346,9 +362,8 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 							case "encrypted-password":
 								user.EncryptedPassword = Secret(nodeVal(authChild))
 							case "ssh-ed25519", "ssh-rsa", "ssh-dsa":
-								if v := nodeVal(authChild); v != "" {
-									user.SSHKeys = append(user.SSHKeys, v)
-								}
+								// #8863: read EVERY value; see sshKeyValues.
+								user.SSHKeys = append(user.SSHKeys, sshKeyValues(authChild)...)
 							}
 						}
 					}
@@ -384,9 +399,10 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 				case "encrypted-password":
 					sys.RootAuthentication.EncryptedPassword = Secret(nodeVal(prop))
 				case "ssh-ed25519", "ssh-rsa", "ssh-dsa":
-					if v := nodeVal(prop); v != "" {
-						sys.RootAuthentication.SSHKeys = append(sys.RootAuthentication.SSHKeys, v)
-					}
+					// #8863: read EVERY value, not slot 0. These leaves are
+					// multi:true, so repeated `set` lines for one key type
+					// accumulate onto this node instead of replacing.
+					sys.RootAuthentication.SSHKeys = append(sys.RootAuthentication.SSHKeys, sshKeyValues(prop)...)
 				}
 			}
 		case "archival":
@@ -3576,4 +3592,43 @@ func applyNTPServerModifier(opt *NTPServerOption, name, arg string) {
 	case "routing-instance":
 		opt.RoutingInstance = arg
 	}
+}
+
+// sshKeyValues returns EVERY authorized-key value carried by an `ssh-rsa` /
+// `ssh-dsa` / `ssh-ed25519` leaf (#8863).
+//
+// Those leaves are `multi: true`, so two `set` lines for the same key type
+// collapse onto ONE node and the second value lands on Keys[2:] rather than
+// replacing the first. A reader that takes only Keys[1] — which is what
+// nodeVal does — would then keep the FIRST key and silently drop every later
+// one, which is the #2419 multi-value defect pointed the other way: before the
+// schema change the second `set` REVOKED the first, and a Keys[1]-only reader
+// would make it revoke every key after the first instead.
+//
+// The bracketed spelling `ssh-ed25519 [ "K1" "K2" ]` collapses the same way
+// (the lexer strips the brackets), and the hierarchical spelling puts each key
+// on its own node, so both the Keys tail and the Children have to be read.
+// Same shape and same reason as firewallMatchValues.
+//
+// A key is a single token even when it contains spaces, because the value is
+// quoted (`"ssh-ed25519 AAAA... admin@host"`); the lexer keeps a quoted string
+// whole, so this never splits one key into several.
+func sshKeyValues(node *Node) []string {
+	if node == nil {
+		return nil
+	}
+	var out []string
+	for _, k := range node.Keys[1:] {
+		if k != "" {
+			out = append(out, k)
+		}
+	}
+	for _, child := range node.Children {
+		for _, k := range child.Keys {
+			if k != "" {
+				out = append(out, k)
+			}
+		}
+	}
+	return out
 }
