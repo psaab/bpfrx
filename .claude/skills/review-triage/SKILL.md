@@ -82,6 +82,11 @@ recorded reasoning; if only a coordinator self-check was possible, say so.
 - Validate test/artifact provenance and observation controls before trusting a
   reported pass or failure. An invalid run is VOID; retain any valid narrower
   evidence and state what remains unverified.
+- For kernel/NIC and performance claims, apply the shared host/mode and workload
+  evidence requirements. Do not generalize between drivers, execution modes or
+  workload classes; separate proven source cost/ownership defects from measured
+  bottlenecks. Preserve relevant expert-coverage gaps instead of treating an
+  area label as completed specialist review.
 - Review persistent history plus relevant open/closed issues and fixing PRs.
   Paginate needed results and record freshness/limits. Title matches and closed
   issue state are leads, not DUP/FIXED proofs.
@@ -109,7 +114,8 @@ publication. The result includes:
 - Specific refutation, duplicate ownership, or fixing evidence for every
   dropped/downgraded candidate; no bare "LOW", "stale", or "already fixed".
 - Actual coverage and verification gaps, unresolved high-impact questions with
-  next steps, and counts that reconcile to the original candidate IDs.
+  next steps, cross-cutting expert ownership/applicability, and counts that
+  reconcile to the original candidate IDs.
 - Remediation milestones with evidence: confirmed/assigned, fixed-in-source,
   regression-verified, and delivered to an in-scope release. A source merge
   alone is not delivery.
