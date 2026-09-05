@@ -1258,6 +1258,13 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		// admitting `system login` would turn a loud #6662 rejection into a
 		// silent acceptance, which is a regression wearing the shape of a fix).
 		"protocols bgp",
+		// #8879 batch 8. `forwarding-options family` uses mode `packet-based`
+		// deliberately: `flow-based` is the compiled DEFAULT, and a fixture
+		// carrying the default reads CLEAN WHILE BROKEN.
+		"forwarding-options family",
+		"protocols ospf3",
+		"security dynamic-address",
+		"system dataplane",
 		// #8879 batch 7. Two of these four are pairs I MYSELF cleared as
 		// "genuinely SAME" in batch 5, using a `dscp` fixture. They are not:
 		// via `inet-precedence` and `exp` they drop. I made the same
