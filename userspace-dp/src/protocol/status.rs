@@ -553,8 +553,13 @@ pub(crate) struct ProcessStatus {
     /// builder refuses to emit it. Surfaced as the Prometheus counter
     /// `xpf_userspace_gre_encap_df_oversize_drops_total`; nonzero flags
     /// inner flows whose encapped size exceeds the tunnel path MTU.
-    /// PMTUD/PTB signalling is deferred to #2330. Additive / defaulted
-    /// for backward compatibility.
+    /// PMTUD/PTB signalling for this path LANDED in #2330 (TX dispatcher,
+    /// tx/dispatch/mod.rs): where a PTB is owed the pre-build decision emits
+    /// it and skips the encap, so it is not counted here. This counter is
+    /// the no-PTB-owed residual, a non-DF IPv4 inner whose encapped outer
+    /// still exceeds the DF-set transport MTU (#8942 — this line used to say
+    /// "deferred to #2330", which read as outstanding after it shipped).
+    /// Additive / defaulted for backward compatibility.
     #[serde(rename = "gre_encap_df_oversize_drops_total", default)]
     pub gre_encap_df_oversize_drops_total: u64,
     /// #2782: native-GRE decap frames DROPPED because the Checksum-Present

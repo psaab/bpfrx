@@ -48,8 +48,10 @@ func (c *xpfCollector) initUserspaceDropsDescriptors() {
 			"value flags inner flows whose encapped size exceeds the "+
 			"tunnel path MTU (typically a missing or too-high inner "+
 			"MSS clamp, or a non-TCP inner with no segmentation "+
-			"lever). PMTUD/PTB signalling is deferred to #2330 "+
-			"(#2331).",
+			"lever). PTB signalling for this path is implemented in "+
+			"the TX dispatcher (#2330) and pre-empts the encap when a "+
+			"PTB is owed, so this counter is the residual case where "+
+			"none is owed: a non-DF IPv4 inner (#2331).",
 		nil, nil,
 	)
 	c.userspaceGreDecapChecksumInvalidDrops = prometheus.NewDesc(

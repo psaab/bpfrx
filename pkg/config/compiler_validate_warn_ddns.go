@@ -459,9 +459,18 @@ func validateSurfaceADDNSWarnings(cfg *Config) []string {
 			// redacted at all). The last two PARSE cleanly, so no
 			// "redact only once it parsed" gate helps. Mirrors the authoritative
 			// runtime gate, pkg/ddns validateCheckIPURL; the provider name and
-			// leaf name already identify the offending value. RedactURL's own
-			// weakness is tracked as #6609 and is deliberately not depended on
-			// here either way.
+			// leaf name already identify the offending value.
+			//
+			// #8942: the three RedactURL weaknesses described above were
+			// FIXED under #6609 and this comment outlived them. Measured on
+			// the current implementation: "https://user:s3cr3t.example/" ->
+			// "https://<redacted>/" (missing-'@' credential in the host
+			// slot), "//user:SECRET@host/" -> "//<redacted>@host/"
+			// (scheme-relative authority), and
+			// "https://host/p#token=SECRET" -> "https://host/p#<redacted>"
+			// (fragment with no query to swallow it). This gate still does
+			// not DEPEND on RedactURL either way, which is why the paragraph
+			// is kept — but it no longer describes a live gap.
 			warnings = append(warnings, fmt.Sprintf("system services dynamic-dns "+
 				"provider %q checkip-url is not a valid http(s) URL with a host; "+
 				"scopes using address-source checkip publish nothing", name))

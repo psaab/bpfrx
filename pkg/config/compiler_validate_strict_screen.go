@@ -134,12 +134,21 @@ func validateScreenNumericStrict(cfg *Config) error {
 // {threshold}}; udp {flood}; limit-session {source-ip-based,
 // destination-ip-based}. These are the leaves compileScreen ACCEPTS (records a
 // typed field for) — most also map to a field the userspace screen engine
-// (userspace-dp/src/screen) enforces, but a few are accepted-but-not-yet-
-// published to the snapshot: the syn-flood alarm-threshold / source-threshold /
-// destination-threshold / timeout subfields are compiled into SynFloodConfig and
-// not currently emitted to the dataplane (tracked in #3315). This gate's
-// contract is "rejects what compileScreen does NOT model", not "guarantees every
-// accepted leaf is enforced" — closing the publish gap is #3315's scope.
+// (userspace-dp/src/screen) enforces. This gate's contract is "rejects what
+// compileScreen does NOT model", not "guarantees every accepted leaf is
+// enforced" — those are different claims and the second is not made here.
+//
+// #8942: this comment used to illustrate that distinction with the syn-flood
+// alarm-threshold / source-threshold / destination-threshold / timeout
+// subfields, calling them compiled-but-not-emitted and deferring the publish
+// gap to #3315. That is no longer true of any of the four. The live userspace
+// publish path emits all of them (pkg/dataplane/userspace/screens.go, into
+// SYNFloodAlarmThreshold / SYNFloodSrcThreshold / SYNFloodDstThreshold /
+// SYNFloodTimeout on the zone snapshot), and `timeout` in particular is
+// enforced as a per-zone override of the half-open window under #3527. The
+// contract sentence above stands on its own; the example did not, and a
+// reader who trusted it would think four configurable screen controls were
+// inert.
 // compileScreen's default arms record every
 // other leaf — at the top-level family, per-family, and per-subtree depth — on
 // ScreenProfile.UnknownLeaves (the full `<family> <leaf>` path); this gate makes

@@ -31,7 +31,9 @@ import (
 // checkIPProbeWarned dedup key and the journal attribute — the same two
 // consumers the validator work was hardened for. This is a SECOND scrubber
 // (pkg/ddns.scrubURLError, distinct from config.RedactURL) with the same blind
-// spot; the parallel is tracked on #6609 for the other one.
+// spot; the parallel for the other one was FIXED under #6609 (#8942 — this
+// line used to defer it as outstanding, which stopped being true once
+// config.RedactURL gained its own fragment and scheme-relative handling).
 
 // transportFragmentSentinel sits where an operator's token would, in the
 // fragment of an otherwise entirely valid https checkip-url.
