@@ -71,12 +71,21 @@ import (
 // its evidence.
 var knownBlindScopePairs8852 = map[string]string{
 	// Head is a plain container (args==0, no wildcard, has children).
-	"policies global":                    "plain-container",
-	"policy then":                        "plain-container",
-	"routing-options static":             "plain-container",
-	"security alg":                       "plain-container",
-	"security flow":                      "plain-container",
-	"security-zone address-book":         "plain-container",
+	"policies global":            "plain-container",
+	"policy then":                "plain-container",
+	"routing-options static":     "plain-container",
+	"security alg":               "plain-container",
+	"security flow":              "plain-container",
+	"security-zone address-book": "plain-container",
+	// #8850 admitted ("firewall","family") so an elided `firewall family inet
+	// { filter ... }` compiles its filters instead of silently producing zero.
+	// `family` is args:0 with children and no wildcard, so blindShape8852
+	// classifies it plain-container like the rest of this group -- the census
+	// emits no site for it, which is why arm 2 adjudicates nothing. Registered
+	// rather than left to red: the pair is admitted deliberately and its
+	// behaviour is asserted directly by TestElidedFirewallFamily8850, which
+	// compares the WHOLE Firewall struct braced-vs-elided for inet and inet6.
+	"firewall family":                    "plain-container",
 	"security-zone host-inbound-traffic": "plain-container",
 	// Head takes two or more identity args.
 	"gateway local-identity":  "multi-arg",
