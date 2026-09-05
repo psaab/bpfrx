@@ -15,7 +15,8 @@ This skill is the successor to `paladin-review.txt` — it keeps the worktree-is
 - `/deep-review` — full coverage, default focus (core firewall behavior: zone policies, global policies, host-inbound, application matching, default deny/permit + VRRP/HA cold-boot, dataplane int-truncation, DDNS/observability resource safety)
 - `/deep-review focus on zone policies only` — extra focus context is appended as a bias line, does NOT reduce coverage — all areas still reviewed
 - `/deep-review --area A3 --focus "config compiler integer truncation"` — area filter (optional) + focus string
-- `/deep-review --batch-size 100` — override batch size (default 150)
+- `/deep-review --batch-size 100` — override batch size (default 150 prod files)
+- `/deep-review --since <sha>` — delta mode (highest ROI between full campaigns): review ONLY the `<sha>..base` diff plus fix-residuals of issues fixed in that range plus re-probes of previously dropped claims. No full-tree sweep; same bars, same merge.
 - Any free-form text after `/deep-review` is treated as extra context / focus and is passed to every subagent as bias.
 
 **How extra context is handled:** The coordinator takes `$ARGUMENTS` (everything after `/deep-review`), sanitizes it (no shell), and appends as:
@@ -34,7 +35,7 @@ Internal code-health and hardening review of our own repository, run by the main
 
 ## Setup (only permitted repo mutation)
 
-First, update the checkout with `git pull --rebase` (only permitted repo mutation). If it fails (e.g. proxy blocks github), audit existing checkout and record commit reviewed.
+First, update the checkout with `git pull --rebase`. Permitted repo mutations for the whole campaign: that rebase/pull plus detached-worktree add/remove (`git worktree add --detach`, `git worktree remove --force`) — never `checkout --`, never `reset`, never index/working-tree edits. If it fails (e.g. proxy blocks github), audit existing checkout and record commit reviewed.
 
 Record base commit SHA (`git rev-parse HEAD`) after rebase — immutable review target. Immediately after, fetch origin/master and record origin/master SHA: `git fetch origin master && git rev-parse origin/master`. All subagents MUST work from base SHA via detached git worktree, NOT mutable working tree. Discover repo root via `git rev-parse --show-toplevel`; never hardcode a repo path. Save base SHA + repo root + origin/master SHA + fetch timestamp for entire campaign.
 
@@ -51,66 +52,42 @@ Include any extra context from $ARGUMENTS in final header as Extra context: <arg
 
 ### Scratch work location rule (mandatory, repo-agnostic) — to avoid /tmp pollution:
 - Determine `<whoami>` DYNAMICALLY at runtime from environment — do NOT hardcode a model name, do NOT use Unix username `ps`. Must work across model changes (fable -> claude-spark -> muse-spark -> opus -> sonnet etc.) and across host families (Claude vs Muse):
+  Run the block below with `bash` (NOT `sh` — it uses `[[ ]]`; invoking with `sh` fails with `[[: not found`, observed in the wild). There is exactly ONE canonical detection block — no fallbacks, no second opinions.
   ```bash
-  # Dynamic model detection — handles changing models across runs AND across host families (Muse vs Claude)
-  # Sources checked in priority order: explicit host envs (ANTHROPIC_MODEL, MUSE_MODEL, CLAUDE_CODE_SUBAGENT_MODEL), then settings.json
-  # Do NOT blindly normalize muse- -> claude- — keep Muse family distinct (muse-spark) while still accepting legacy claude- alias
+  #!/usr/bin/env bash
+  # Canonical model-identity detection. Precedence: explicit model envs >
+  # host-marker envs > settings.json model > binary probe. Display aliases
+  # collapse to one family via the alias table — never by string surgery.
   MODEL_RAW="${MUSE_MODEL:-${ANTHROPIC_MODEL:-${CLAUDE_CODE_SUBAGENT_MODEL:-${ANTHROPIC_DEFAULT_OPUS_MODEL:-${ANTHROPIC_DEFAULT_SONNET_MODEL:-}}}}}"
-  [ -z "$MODEL_RAW" ] && MODEL_RAW=$(jq -r '.model // empty' ~/.claude/settings.json 2>/dev/null || echo "")
-  # Muse Spark identity: when running under Muse (check for muse marker), prefer muse-spark family even if settings.json says opus[1m]
-  # Detect Muse host via env or by checking if original MODEL_RAW was empty and settings.json is generic opus
-  if [ -z "${ANTHROPIC_MODEL:-}" ] && [ -z "${MUSE_MODEL:-}" ] && [ -z "${CLAUDE_CODE_SUBAGENT_MODEL:-}" ]; then
-    # No explicit env — check if we are on Muse host via available marker (Muse CLI leaves MUSE_* or the binary reports muse)
-    if command -v muse >/dev/null 2>&1 || [ -n "${MUSE_CLI:-}" ] || grep -qi muse ~/.claude/settings.json 2>/dev/null; then
-      # Heuristic: generic opus[1m] in settings.json on a Muse host likely means Muse Spark, not Claude Opus
-      if echo "$MODEL_RAW" | grep -qiE '^opus(\[.*\])?$'; then
-        MODEL_RAW="muse-spark-1.1"
-      fi
-    fi
+  MUSE_HOST=""
+  [ -n "${MUSE_RELEASE_INFO:-}${MUSE_CLI:-}${MUSE_MODEL:-}" ] && MUSE_HOST=1
+  command -v muse >/dev/null 2>&1 && MUSE_HOST=1
+  if [ -z "$MODEL_RAW" ]; then
+    MODEL_RAW=$(jq -r '.model // empty' ~/.claude/settings.json 2>/dev/null || echo "")
   fi
-  MODEL_LC=$(echo "$MODEL_RAW" | tr '[:upper:]' '[:lower:]')
-  # Extract family: muse-spark, claude-spark, claude-opus, claude-sonnet, claude-fable, claude-haiku, codex, gemini, fable, opus, etc.
-  # Keep muse- and claude- distinct — do NOT rewrite muse- -> claude-
-  # Handle bracket version like opus[1m] -> opus
-  MODEL_LC=$(echo "$MODEL_LC" | sed -E 's/\[.*\]$//')
-  if [[ "$MODEL_LC" == muse-* ]]; then
-    WHOAMI=$(echo "$MODEL_LC" | cut -d'-' -f1-2)
-  elif [[ "$MODEL_LC" == claude-* ]]; then
-    WHOAMI=$(echo "$MODEL_LC" | cut -d'-' -f1-2)
-  else
-    # For non-prefixed (fable, codex, gemini, opus, agy), first part is family
-    WHOAMI=$(echo "$MODEL_LC" | cut -d'-' -f1)
-  fi
-  # Strip any remaining version suffix that survived cut (e.g. claude-spark-1.1 -> cut gives claude-spark, good; but claude-3.5 -> claude)
-  WHOAMI=$(echo "$WHOAMI" | sed -E 's/-[0-9]+(\.[0-9]+)*$//; s/-[0-9]{8,}$//; s/-[0-9]+$//' | sed -E 's/\[.*\]$//')
-  [ -z "$WHOAMI" ] && WHOAMI="claude"
-  # Final normalization: ensure spark/opus/sonnet keep family prefix (handle bare spark/opus)
-  if [[ "$MODEL_LC" == *"muse"* && "$MODEL_LC" == *"spark"* && "$WHOAMI" == "spark" ]]; then WHOAMI="muse-spark"; fi
-  if [[ "$MODEL_LC" == *"spark"* && "$WHOAMI" == "spark" ]]; then WHOAMI="muse-spark"; fi
-  if [[ "$MODEL_LC" == *"opus"* && "$WHOAMI" == "opus" ]]; then
-    # Distinguish muse-spark host vs real opus
-    if [[ "$MODEL_LC" == muse-* ]]; then WHOAMI="muse-spark"; else WHOAMI="claude-opus"; fi
-  fi
-  if [[ "$MODEL_LC" == *"sonnet"* && "$WHOAMI" == "sonnet" ]]; then WHOAMI="claude-sonnet"; fi
+  MODEL_LC=$(echo "$MODEL_RAW" | tr '[:upper:]' '[:lower:]' | sed -E 's/\[.*\]$//')
+  case "$MODEL_LC" in
+    muse-spark*) WHOAMI="muse-spark" ;;
+    claude-spark*) # claude-spark-1.x is the Muse Spark display alias on Muse hosts, a real family elsewhere
+      if [ -n "$MUSE_HOST" ]; then WHOAMI="muse-spark"; else WHOAMI="claude-spark"; fi ;;
+    claude-opus*|claude-sonnet*|claude-haiku*|claude-fable*) WHOAMI=$(echo "$MODEL_LC" | cut -d'-' -f1-2) ;;
+    codex*|gemini*|agy*|antigravity*|fable*) WHOAMI=$(echo "$MODEL_LC" | cut -d'-' -f1) ;;
+    opus) # bare "opus" on a Muse host is the Spark display alias, not Claude Opus
+      if [ -n "$MUSE_HOST" ]; then WHOAMI="muse-spark"; else WHOAMI="claude-opus"; fi ;;
+    sonnet) WHOAMI="claude-sonnet" ;;
+    "") echo "WARNING: model identity undetectable; defaulting to muse-spark — override WHOAMI if wrong"; WHOAMI="muse-spark" ;;
+    *) WHOAMI=$(echo "$MODEL_LC" | cut -d'-' -f1) ;;
+  esac
   echo "Detected model: $MODEL_RAW -> family $WHOAMI (normalized from $MODEL_LC)"
   ```
+  Record both `MODEL_RAW` and `WHOAMI` in the final report header. `MODEL_RAW` is the audit trail; `WHOAMI` names files. A display-alias change must NEVER fork a new family universe — that is how parallel `fable-*`, `claude-spark-*`, `muse-spark-*` histories (and rotting enumerations) happen.
   This handles dynamic changing models across runs (you may be `muse-spark` now per MUSE_MODEL=muse-spark-1.1 which sometimes displays as `claude-spark-1.1` on Claude hosts, previously `fable` per fable-173.md, etc.). Prior `fable-173.md` etc were from older model run — new runs will be `muse-spark-review-NNN.md` if you are on Muse Spark, `claude-spark-review-NNN.md` if on Claude Spark, `claude-opus-review-NNN.md` if on opus, etc. Final file MUST use this detected family name: `/tmp/<whoami>-review-NNN.md` (e.g. `/tmp/muse-spark-review-042.md`, `/tmp/claude-spark-review-001.md`, `/tmp/fable-review-173.md`). The `muse-` and `claude-` families are now distinct — do NOT normalize `muse-`→`claude-`.
+  Choose NNN as max existing N for the detected family + 1 (never reuse, never hardcode):
   ```bash
-  # Prefer MUSE_MODEL / ANTHROPIC_MODEL (e.g. muse-spark-1.1, claude-spark-1.1, claude-opus-4-8, fable), fallback to CLAUDE_CODE_SUBAGENT_MODEL
-  # Keep muse- and claude- distinct — muse-spark stays muse-spark
-  MODEL_RAW="${MUSE_MODEL:-${ANTHROPIC_MODEL:-${CLAUDE_CODE_SUBAGENT_MODEL:-${ANTHROPIC_DEFAULT_OPUS_MODEL:-}}}}"
-  MODEL_LC=$(echo "$MODEL_RAW" | tr '[:upper:]' '[:lower:]' | sed -E 's/\[.*\]$//')
-  if [[ "$MODEL_LC" == muse-* ]]; then
-    WHOAMI=$(echo "$MODEL_LC" | cut -d'-' -f1-2)
-  elif [[ "$MODEL_LC" == claude-* ]]; then
-    WHOAMI=$(echo "$MODEL_LC" | cut -d'-' -f1-2)
-  else
-    WHOAMI=$(echo "$MODEL_LC" | cut -d'-' -f1)
-  fi
-  WHOAMI=$(echo "$WHOAMI" | sed -E 's/-[0-9]+(\.[0-9]+)*$//; s/-[0-9]{8,}$//; s/\[.*\]$//')
-  [ -z "$WHOAMI" ] && WHOAMI="muse-spark"
+  ls /tmp/<whoami>-review-*.md 2>/dev/null | sed -E 's/.*-review-0*([0-9]+)\.md/\1/' | sort -n | tail -1
   ```
-  This handles dynamic changing models across runs (you are currently `muse-spark` per MUSE_MODEL=muse-spark-1.1 -> family `muse-spark`, not `fable`). Prior `fable-173.md`/`claude-spark` etc were from older model runs — new runs will be `muse-spark-review-NNN.md` on Muse Spark. Final file MUST use this detected family name: `/tmp/<whoami>-review-NNN.md` (e.g. `/tmp/muse-spark-review-042.md`, `/tmp/claude-spark-review-001.md`, `/tmp/fable-review-173.md`).
+  If none exist, NNN=001. Re-check for collision immediately before the final copy — a concurrent campaign may have taken the number; on collision, increment.
+  Final file MUST use the detected family name: `/tmp/<whoami>-review-NNN.md` (e.g. `/tmp/muse-spark-review-042.md`).
 - NEVER write any .md file directly under /tmp/ during campaign. Not /tmp/<whoami>-review-NNN.md, not /tmp/<whoami>-review-NNN-<area>-b<batch>.md, not any other *.md directly under /tmp/. ALL scratch work MUST go under a subdirectory of /tmp/.
 - Create dedicated work directory (repo-agnostic, no repo name in path):
     /tmp/review-work-<whoami>-<NNN>/
@@ -123,7 +100,9 @@ Include any extra context from $ARGUMENTS in final header as Extra context: <arg
 - Subagents create/clean own worktrees; coordinator sweeps leftovers after merge.
 
 ### Duplicate suppression:
-Read all prior `/tmp/codex-review*.md`, `/tmp/agy-review*.md`, `/tmp/fable-review*.md`, `/tmp/opus-review*.md`, `/tmp/ps-review*.md`, `/tmp/avo-review*.md` files (ONLY final NNN files directly under /tmp/, NOT files under /tmp/review-work-*/ or /tmp/review-wt-*/). Build compact dedup index (title + file + root cause) and pass to EVERY subagent so none re-reports known issue. At merge time, refresh `gh issue list --state open --limit 200 --json number,title` — fresh issues can make finding DUP.
+Read ALL prior finals with a family-agnostic glob — NEVER an enumerated family list (enumerations rot every model rename and silently drop priors; a literal enumeration once missed the `muse-*`, `claude-*`, and `gemini-*` finals that held the most important history):
+  `ls /tmp/*-review-[0-9]*.md` (ONLY final NNN files directly under /tmp/, NOT files under /tmp/review-work-*/ or /tmp/review-wt-*/)
+Build compact dedup index (title + file + root cause) and pass to EVERY subagent so none re-reports known issue. At merge time, refresh `gh issue list --state open --limit 200 --json number,title` — fresh issues can make finding DUP. Also fold the previous campaign's per-finding table (K/L-series rows) into the index verbatim — titles alone dedup better than prose summaries.
 
 Read orientation docs so subagents inherit context, not just code: CLAUDE.md, docs/engineering-style.md, docs/* design/state/feature-gap docs, and any issue/backlog docs. Extract one-paragraph orientation blurb + dedup index to hand to subagents. Pass also: base-SHA, origin/master SHA, NNN, <whoami>, work-dir path (/tmp/review-work-<whoami>-<NNN>/), worktree naming convention (generic review-wt-...), and any extra context from $ARGUMENTS.
 
@@ -131,7 +110,11 @@ Build authoritative file list (repo-agnostic):
   git ls-files | grep -iE '\.(go|rs|c|h|hpp|cpp|cc|cxx|py)$'  (INCLUDE .go and .rs — ~95% of repo)
 Assign every file to exactly one EXPERTISE AREA using map below. Any file whose path not covered goes to nearest area by directory; log assignment so coverage provably complete.
 
-Batch within each area: if area >150 source files, split into consecutive batches <=150 files (keep package/subdir together where possible). Small areas single batch.
+Batch by PROD files, not all files: test files (`*_test.go`, `tests_*`, `testdata/`) almost never yield findings yet dominate batch counts (observed: 119 of 150 files in a batch). Put prod files first in every batch; tests travel as evidence the subagent reads but does not sweep for findings. Report coverage as prod-files-reviewed/total-prod-files; test files are supporting material, not coverage units.
+
+Effort is severity-weighted, not uniform: areas with historical High density (HA election/wire codecs, API dispatch surfaces, NAT/policy compilers) get the deepest personas and smallest effective batches; twice-reviewed-silent areas get a fresh-eyes re-verification pass, not a third full hunt. Maintain a crown-jewel file list (election + heartbeat/failover wire code, ShowText dispatch + shared renderers, NAT/policy match compilers, transfer-commit lifecycle) that EVERY campaign re-hunts regardless of batching — regressions hide in crown jewels first.
+
+Batch within each area: if area >150 prod files, split into consecutive batches <=150 prod files (keep package/subdir together where possible). Small areas single batch.
 
 For each (area, batch), launch ONE metacode subagent. Run areas in parallel; within area batches may run in parallel up to concurrency limit. Each subagent gets ONLY batch file list — keeps context small. Coordinator ensures /tmp/review-work-<whoami>-<NNN>/ exists before launching. Subagents create/clean own worktrees; coordinator sweeps leftover worktrees/work-dir after PHASE 2.
 
@@ -177,6 +160,16 @@ A10. Services (DHCP / DDNS / policy simulator) + CLI/show + build/deploy tooling
 Paths: pkg/dhcp/ ; pkg/dhcprelay/ ; pkg/dhcpserver/ ; pkg/ddns/ ; pkg/policymatch/ ; pkg/cli/ ; pkg/natshow/ ; cmd/ ; scripts/ ; bpf/
 Persona: protocol + tooling generalist — DHCPv4/v6 & relay correctness, DDNS backend ownership semantics (PrevAddr/foreign-record safety), simulator<->dataplane verdict parity, CLI dispatch & show-output correctness, Python signing/deploy/image TOCTOU & scheme enforcement. (~170 files ~2 batches; keep pkg/cli in own batch)
 
+## Phase 1.5 — Cross-cutting pattern censuses (run FIRST, before batch sweeps)
+
+Batch sweeps find file-local bugs; the highest-density majors live in repo-wide PATTERNS. Before fanning out batches, run 2–4 census hunts as dedicated subagents over the whole tree (each cheap: grep census + per-site bound analysis + probes only for survivors):
+- narrowing-cast census: `uint8(/uint16(/uint32(/byte(/int8(/int16(` applied to config-derived values — report only casts reachable out-of-range with silent wrap; bound-checked/saturated casts go to NEG with the bound cited.
+- missing-`default` census: `switch` statements on config-derived strings/ints with no `default` arm — report only arms whose missing case fails open.
+- present-but-nil census: map lookups / optional-pointer derefs on config-derived slots in daemon/API/CLI paths without recovery — report only probe-panicked sites.
+- unwarned-lenient-downgrade census: lenient-path `continue`/fallthrough that silently drops a validated dimension (match leaves, bounds, contradictions).
+- tip-residual review: read the base..tip diff of every recent fix commit and hunt what the fix missed (narrower shape, sibling function, second call site). Fixes are the best bug-finders: every guard has a scope boundary, and the boundary is the next bug.
+Batch agents then SKIP covered patterns (patterns named in their prompts) and spend depth on file-local logic. Census hits carry the same 13-label bar. Observed yield of this phase exceeds whole-area sweeps per unit effort — do not skip it.
+
 ## Phase 1 — Per-subagent contract
 
 You are a <persona for this area>. Review ONLY files in attached batch list (do not wander outside them, except to read a called function's contract to confirm/refute). You have been given: repo orientation blurb, dedup index, batch file list, base SHA, origin/master SHA, extra context from $ARGUMENTS (if any).
@@ -215,8 +208,13 @@ Gate verdict (FIXED / STALE / DUP / COHORT / NEG / MATERIAL — assign one; only
   - NEG = you proved it sound — MUST NOT appear in findings table, only in inspection log
   - MATERIAL = survives all gates, live enforcement, verified on origin/master, not dup, not cohort
 Evidence (file:line refs + quoted 5-10 line code snippet you actually read — from YOUR worktree path at base SHA, but you must also have checked origin/master tip for same lines if you claim MATERIAL)
+Probe (REQUIRED for every fail-open / availability / panic claim at any severity: an executed test/scenario in your worktree proving the behavior, with output quoted — probes deleted afterwards. Prose traces alone cap at Low: a High/Medium without a passing-then-quoted probe is a hypothesis, not a finding. Observed: probe-executed campaigns out-yield prose-trace campaigns severalfold.)
 Trace (step-by-step runtime execution trace; REQUIRED for High/Medium MATERIAL only — do not waste lines on COHORT)
 Refutation attempt (REQUIRED for High/Critical MATERIAL: describe how you TRIED to prove false positive — read validators/guards/callers/type defs that would make safe — and state why finding survived. If not survive, mark NEG and move to log. Do NOT report High/Critical you did not try to refute.)
+Severity rubric (grade against this, not gut feel — over-grading destroys triage trust):
+- High = remotely-triggerable fail-open (permitted what must be denied), daemon/worker crash, or dual-primary/split-brain — WITH an executed probe. No probe, no High.
+- Medium = fail-open requiring auth/lenient-path/legacy-load to reach, silent availability degradation, or fail-closed with wrong-surface consequences — with a probe or exact wire/line proof.
+- Low = defense-in-depth, display/telemetry dishonesty, test gaps, doc-only, client-DoS-only, defense-consistent residuals. A prose-only suspicion caps here.
 HPC/invariant check (where relevant: atomic wrapping, lock contention, cache-line alignment, endianness)
 Why it matters (if MATERIAL, must cite concrete production impact)
 Fix direction (concrete — remediation work-list)
@@ -236,11 +234,12 @@ Verify against origin/master tip and FRESH GH issues (hard):
 1. Re-fetch origin/master: `git fetch origin master && git rev-parse origin/master` Record origin/master SHA in report header alongside base SHA.
 2. Fresh GH issues: `gh issue list --state open --limit 200 --json number,title` This refreshes open issues at triage time.
 3. For every Critical and High (and any finding subagent marked MATERIAL) that survives merge, you MUST:
-   a. Open cited file on origin/master tip (NOT just base worktree): `git show origin/master:<path>` or `git -C <repo> show origin/master:<path> | grep -n ...` Confirm lines still exist and still vulnerable.
-   b. If file gone or fixed, mark FIXED and drop. Document origin/master line numbers that prove fix.
-   c. If file lives in retired path, mark STALE. Check live cap.
-   d. If DUP, cite issue number.
-   e. If low-materiality, mark COHORT.
+   a. Script-check EVERY cited evidence file base..tip (`git diff --quiet <base>..<tip> -- <path>` per file), not just Highs — tip routinely moves mid-campaign. For files the diff flags, re-read the cited hunk on tip; for the rest, base evidence stands. Log the script output in the report.
+   b. Independently re-verify every High on tip with your own `git show` read of the exact cited lines — never trust the subagent's tip line numbers sight unseen (observed: wrong-file and shifted-line citations). Close any tip-verification gap the subagent left (e.g. "could not fetch") yourself.
+   c. If file gone or fixed, mark FIXED and drop. Document origin/master line numbers that prove fix.
+   d. If file lives in retired path, mark STALE. Check live cap.
+   e. Apply the distinct-sink test for DUP: same root cause at a different sink (different wire, different compiler, different surface, opposite fail direction) is a SEPARATE fileable finding with the twin cited — observed false-DUP pressure in both directions (re-reports of open issues AND wrongly-merged distinct sinks). Same file + same lines + same consequence = DUP, no exceptions; log every DUP-drop with the twin (issue or prior finding ID) cited.
+   f. If low-materiality per the severity rubric, mark COHORT — including downgrading subagent-over-graded Mediums (observed: prose-only Mediums, display bugs graded Medium). Re-grading is a core coordinator duty, not an insult.
 4. After steps 2-3, produce triage sections:
    - Verified-against-origin/master highlights: 2-5 bullets explaining most interesting FIXED/STALE/DUP decisions, with origin/master file:line evidence.
    - Per-finding table with columns: | Finding | Area | Gate verdict (MATERIAL/FIXED/STALE/DUP/COHORT/NEG) | Reasoning | — this table is an INDEX ONLY, not a substitute for evidence.
@@ -251,7 +250,7 @@ Produce DRAFT final report at: /tmp/review-work-<whoami>-<NNN>/<whoami>-review-N
 
 Cleanup (mandatory) AFTER final copy verified: remove ALL worktrees created for this NNN: git worktree list | grep "review-wt-<whoami>-<NNN>-" -> git worktree remove --force; rm -rf /tmp/review-wt-<whoami>-<NNN>-* (Optionally keep /tmp/review-work-<whoami>-<NNN>/ for post-verification inspection, but per strictest interpretation: rm -rf /tmp/review-work-<whoami>-<NNN>/ after final exists in /tmp/. Draft final inside work dir is NOT published final — published final is copy in /tmp/.)
 
-Produce ONE final report at /tmp/<whoami>-review-NNN.md (via copy from work-dir draft) with: Base commit reviewed + origin/master SHA (both, with fetch timestamp). Output path. Duplicate suppression summary (including fresh GH open count at triage time). Triage result — MANDATORY top section (Review base SHA + verified-against origin/master SHA, Open GH issues at triage fresh count, Outcome: X individually-filed material issues, Y cohort issue (Z survivors), Why zero if zero). Verified-against-origin/master highlights. Per-finding table with Gate verdict (INDEX ONLY — see Full findings section for authoritative evidence). Explicit expertise-area + module checklist with per-area file counts and batch counts (proving full-tree coverage). Module-by-module inspection log (aggregated, incl. negatives — NEG belongs ONLY here). Full findings section (MANDATORY, self-contained) — inline COMPLETE 13-label evidence bar for every MATERIAL (and grouped COHORT) directly in the published final: Title, Severity, Confidence, Gate verdict, Evidence (file:line + 5-10 line quote), Trace (High/Medium MATERIAL), Refutation attempt (High/Critical MATERIAL), HPC/invariant check, Why it matters (concrete production impact — why load-bearing major needs deeper investigation), Fix direction, Labels, Dedup note, Verified against origin/master — with exact origin/master file:line. This section is authoritative and MUST NOT require opening /tmp/review-work-*/ intermediates. Then Coverage & verification summary: files reviewed/total, findings per area, how many Critical/High coordinator-verified vs dropped as FIXED/STALE/DUP/COHORT/NEG. Suggested issue split (with mapping to Gate verdicts). TARGET: aggregate across all areas, report material findings that survive freshness + retired-path + dedup + materiality gates. At least 20 is aspirational, NOT mandatory. If provably-complete sweep after origin/master verification yields 0 individually-fileable material issues and 1 cohort issue of 41 low-materiality survivors (as in claude-003), that IS correct outcome — report 0+cohort and let coverage log stand. Do NOT pad with NEG.
+Produce ONE final report at /tmp/<whoami>-review-NNN.md (via copy from work-dir draft) with: Base commit reviewed + origin/master SHA (both, with fetch timestamp). Output path. Duplicate suppression summary (including fresh GH open count at triage time). Triage result — MANDATORY top section (Review base SHA + verified-against origin/master SHA, Open GH issues at triage fresh count, Outcome: X individually-filed material issues, Y cohort issue (Z survivors), Why zero if zero). Verified-against-origin/master highlights. Per-finding table with Gate verdict (INDEX ONLY — see Full findings section for authoritative evidence). Explicit expertise-area + module checklist with per-area file counts and batch counts (proving full-tree coverage). Module-by-module inspection log (aggregated, incl. negatives — NEG belongs ONLY here). Full findings section (MANDATORY, self-contained) — inline COMPLETE 13-label evidence bar for every MATERIAL (and grouped COHORT) directly in the published final: Title, Severity, Confidence, Gate verdict, Evidence (file:line + 5-10 line quote), Trace (High/Medium MATERIAL), Refutation attempt (High/Critical MATERIAL), HPC/invariant check, Why it matters (concrete production impact — why load-bearing major needs deeper investigation), Fix direction, Labels, Dedup note, Verified against origin/master — with exact origin/master file:line. This section is authoritative and MUST NOT require opening /tmp/review-work-*/ intermediates. Then Coverage & verification summary: files reviewed/total, findings per area, how many Critical/High coordinator-verified vs dropped as FIXED/STALE/DUP/COHORT/NEG. Suggested issue split (with mapping to Gate verdicts). TARGET: severity-weighted, not counted. Optimize for High findings (remotely-triggerable fail-open/crash/dual-primary, probe-proven); a campaign yielding 5 verified Highs beats one yielding 100 Lows. Report honestly-graded material findings that survive freshness + retired-path + dedup + materiality gates. If a provably-complete sweep after origin/master verification yields 0 individually-fileable material issues and 1 cohort issue of low-materiality survivors, that IS correct outcome — report 0+cohort and let coverage log stand. Do NOT pad with NEG, and do NOT inflate severity to hit a number — the rubric (§Phase 1) governs.
 
 Focus line to append per run (biases persona emphasis, does NOT reduce coverage — all areas still reviewed):
 Focus this round on core firewall behavior: zone policies, global policies, host-inbound, application matching, default deny/permit — ensure packets that should be denied are denied and allowed packets are allowed — AND on areas prior campaigns under-covered: VRRP/HA failover & cold-boot, dataplane integer-truncation on config casts, and DDNS/observability resource safety.
