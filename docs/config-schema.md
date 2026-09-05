@@ -199,6 +199,17 @@ node-declared opt-in does not.** Deriving that per remedy is how the check gets
 skipped — the keying is not visible at the call site, and both remedies are
 spelled as one line in a schema file.
 
+**A third case, and it is the one that reads as a puzzle rather than a hazard.**
+For an **arg-named** container a pair-keyed admission is not merely
+collision-prone — it is **structurally unreachable**. `security log stream <s>`
+takes its instance name as an arg, so production asks the predicate
+`("s1", "category")` with the operator's actual stream name, never
+`("stream", "category")`. Every pair up that chain can be present in
+`compactNormalizeInScope` and every one of them inert, which presents as "the
+pair is admitted and the fold still does not fire" and sends the reader looking
+for a bug in the pass. There is none: the entry can never match. Such a
+container needs a node-declared opt-in, or a head-only rule — not another pair.
+
 The same distinction explains why the multi-site admission ratchet walks
 admitted *pairs* only: a node-declared opt-in is outside its population by
 construction, not by omission.
