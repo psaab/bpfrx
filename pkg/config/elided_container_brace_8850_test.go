@@ -126,3 +126,76 @@ func TestElidedBraceLeavesPayloadsAlone8850(t *testing.T) {
 		})
 	}
 }
+
+// #8850. The relaxation DECLINES one shape: a packed tail that splits into
+// several statements while the node also carries a braced body. Nothing in the
+// tree says which statement the body belongs to, and guessing "the last one"
+// is measurably worse than declining -- on
+// `address-book address-set s1 { address a1; } address a2 ...;` it produced
+// set:s1 with NO members, where master produces set:s1(a1).
+//
+// Declining must be a NO-OP, not an early exit. The decline sits inside the
+// per-node loop whose LAST statement recurses into the node's children:
+//
+//	n += normalizeCompactNodes(node.Children, childSub, inScope)
+//
+// so leaving the branch with `continue` skips it, and every elided container
+// inside the declined node's BODY stays unfolded. That is a change master does
+// not make, and it is invisible to every other cell in this package: the full
+// suite was GREEN with the `continue` in place.
+//
+// The fixture has to sit on a site that REALLY declines. The first one written
+// here did not -- an ipsec `gateway gw1 address ... { dead-peer-detection ... }`
+// never enters the branch at all, because ("gateway","address") is not in
+// scope, so the cell passed against the mutant and measured nothing. This one
+// is built on a CONFIRMED decline site: `address-book` is opted in to the
+// #8768 split, its two `address` statements make len(stmts)==2, and the braced
+// body makes len(body)>0 -- both decline conditions. The body then holds
+// `address-set s1 address a1;`, itself an elided container that only keeps its
+// member if the recursion still runs:
+//
+//	fall through   set:s1(a1)
+//	continue       set:s1()     <- member silently gone
+//
+// The declined node losing a1/a2 as ADDRESSES is not what this cell measures
+// and is not a regression: master loses them identically, because a
+// multi-statement run followed by a brace is not a spelling Junos produces.
+// What must hold is that declining changed nothing ELSE.
+func TestDeclinedFoldStillRecursesIntoBody8850(t *testing.T) {
+	const cfgText = "security { zones { security-zone trust { address-book " +
+		"address a1 10.0.0.1/32 address a2 10.0.0.2/32 " +
+		"{ address-set s1 address a1; } } } }"
+
+	tree, errs := NewParser(cfgText).Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse: %v", errs)
+	}
+	cfg, err := CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	var book *AddressBook
+	for _, z := range cfg.Security.Zones {
+		book = z.AddressBook
+	}
+	if book == nil {
+		t.Fatalf("no address book compiled, so this cell cannot see the body at "+
+			"all and the fixture no longer builds the declined shape: %s", cfgText)
+	}
+	set, ok := book.AddressSets["s1"]
+	if !ok {
+		t.Fatalf("address-set s1 absent; the fixture must reach the BODY of the "+
+			"declined node for this cell to mean anything: %s", cfgText)
+	}
+	// LIVENESS: `address-set s1 address a1;` is an ELIDED container inside the
+	// declined node's body. Skip the recursion and the set still exists -- it is
+	// just EMPTY, which is the silent direction.
+	if len(set.Addresses) != 1 || set.Addresses[0] != "a1" {
+		t.Errorf("address-set inside a DECLINED node's braced body lost its "+
+			"members: got %v, want [a1] (#8850)\n"+
+			"The decline branch must restore the node and fall THROUGH to "+
+			"normalizeCompactNodes(node.Children, ...). Leaving with `continue` "+
+			"keeps the set and drops its contents, and no other cell in this "+
+			"package sees it.", set.Addresses)
+	}
+}

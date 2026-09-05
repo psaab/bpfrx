@@ -1457,19 +1457,38 @@ func normalizeCompactNodes(nodes []*Node, schema *schemaNode, inScope func(conta
 				node.Children = nil
 				node.IsLeaf = false
 				stmts := splitPackedStatements8768(tail, childSub)
-				for i, stmt := range stmts {
-					child := &Node{Keys: stmt, IsLeaf: true}
-					// The braced body belongs to the LAST packed statement --
-					// the deepest node the run names. Attaching it to the
-					// container, or to every statement, invents structure the
-					// operator did not write.
-					if i == len(stmts)-1 && len(body) > 0 {
-						child.Children = body
-						child.IsLeaf = false
+				// #8850: a braced body plus a MULTI-statement run is ambiguous --
+				// nothing in the tree says which statement the body belongs to.
+				// Measured: `address-book address-set s1 { address a1; } address a2
+				// ...;` compiled to the SET ONLY, losing a2, because the body was
+				// attached to the last statement while it belongs to the first.
+				//
+				// Decline rather than guess, per the #8768 rule for a tail outside
+				// the modelled grammar. A single-statement run is unambiguous (the
+				// body can only belong to it) and is exactly the zones/screens/
+				// host-inbound shape this relaxation exists for.
+				//
+				// Restore and fall THROUGH to the recursion below rather than
+				// `continue`: skipping it would leave the declined node's braced
+				// body unvisited, which is a change master does not make.
+				if len(body) > 0 && len(stmts) > 1 {
+					node.Keys = append(node.Keys, tail...)
+					node.Children = body
+				} else {
+					for i, stmt := range stmts {
+						child := &Node{Keys: stmt, IsLeaf: true}
+						// The braced body belongs to the LAST packed statement --
+						// the deepest node the run names. Attaching it to the
+						// container, or to every statement, invents structure the
+						// operator did not write.
+						if i == len(stmts)-1 && len(body) > 0 {
+							child.Children = body
+							child.IsLeaf = false
+						}
+						node.Children = append(node.Children, child)
 					}
-					node.Children = append(node.Children, child)
+					n++
 				}
-				n++
 			}
 		}
 		n += normalizeCompactNodes(node.Children, childSub, inScope)

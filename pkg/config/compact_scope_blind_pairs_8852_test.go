@@ -88,6 +88,21 @@ var knownBlindScopePairs8852 = map[string]string{
 	"firewall family":                    "plain-container",
 	"security-zone host-inbound-traffic": "plain-container",
 	// Head takes two or more identity args.
+	//
+	// #8850 admitted ("address-book","address") and ("global","address") so that
+	// an elided `address-book address a1 10.0.0.1/32;` compiles its entries
+	// instead of silently producing an EMPTY book. `address` is args:2 (name and
+	// prefix), so blindShape8852 classifies both multi-arg and the census emits
+	// no site -- arm 2 adjudicates nothing for them.
+	//
+	// Registered rather than left to red, on the same terms as `firewall family`
+	// above: the pair is admitted deliberately and its behaviour is asserted
+	// DIRECTLY by TestElidedAddressBook8850, which compares the compiled address
+	// NAMES braced-vs-elided for both books at one and at TWO entries. The
+	// two-entry arm is the one that matters -- the scope entry alone folds a
+	// multi-statement run into one and silently keeps only the first.
+	"address-book address":    "multi-arg",
+	"global address":          "multi-arg",
 	"gateway local-identity":  "multi-arg",
 	"gateway remote-identity": "multi-arg",
 	"policies from-zone":      "multi-arg",
