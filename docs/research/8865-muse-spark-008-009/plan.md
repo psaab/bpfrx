@@ -1,9 +1,10 @@
 # Plan of action — muse-spark reviews 008 + 009 (#8865)
 
-- **Revision:** r1
+- **Revision:** r2 (revised after Claude SMR + Codex both returned PLAN-REVISE)
 - **Base:** `b24e26d3b` (master at drafting)
 - **Reports:** `muse-spark-review-008` (109 findings across 5 rounds), `muse-spark-review-009` (4 High). 009 excludes 007 and 008, so the three are disjoint.
-- **Status:** DRAFT — awaiting 3-way hostile review.
+- **Status:** revised. Reviewer verdicts r1: Claude SMR PLAN-REVISE, Codex PLAN-REVISE, AGY infra-blocked (2 documented retries, known `--print`/`--print-timeout` defect).
+- **Scope (r2, narrowed):** this plan covers the **9 Highs and the one enumerated class**. It is NOT a plan for 113 findings; the remaining ~104 are governed by the inventory process in §5b, which is a process, not a schedule.
 
 ## 1. Problem statement
 
@@ -72,8 +73,15 @@ Adjudicate all 113 in severity order, file per finding.
 
 ### Path B — class-first (RECOMMENDED)
 
-Group findings into **mechanism classes**, enumerate each class completely, fix
-the class, and let one change close many findings.
+Group findings into **mechanism classes**, enumerate each class completely, and
+fix the class.
+
+**Claim, narrowed to what is demonstrated:** the one worked example closes **two**
+findings (009 PHA-001, 008 M17). That is coordinated treatment of a pair, not an
+efficiency forecast for the unclassified remainder. **The stronger argument is
+prevention, not multiplication:** three independent reviews each found one member
+of this class, so the cost of not enumerating is a fourth report finding the
+fourth member.
 
 Known classes, with today's evidence:
 
@@ -99,33 +107,81 @@ Build a detector per class before fixing anything.
 - **For:** today's two instruments (positional predicate, blind-pair guard) each
   caught live defects, and the blind-pair guard caught one within an hour on
   another lane's change.
-- **Against:** #8830 showed an instrument can cost two corrections and return
-  1 defect from 32 candidate rows. **An instrument is worth building when the
-  class is large and the members are not enumerable by grep.** The wire-count
-  class was enumerable in four commands; a detector for it would be ceremony.
+- **Against:** instruments cost real iteration — #8830 needed two corrections to
+  itself. **But its 1-defect-from-32 is a YIELD measurement, not a value
+  measurement**, and the one defect was a live IPsec PFS silent-disable that
+  enumeration had missed. Cost is not an argument against a method that worked.
+- **Choose on effort x consequence x ADDITIONAL COVERAGE, never on candidate
+  ratio.** An apparently-enumerable class still warrants an instrument where
+  enumeration has been observed to miss members — which is exactly what happened
+  on #8830.
 
-**Recommendation: Path B, with Path C reserved for classes that resist
-enumeration.** Apply the #8859 gate column — *does an existing gate already
-handle this?* — to every candidate before calling it a defect. That column found
-two already-handled rows in a 45-row set today.
+**Recommendation: Path B as the default, decided PER CLASS by a stated test —
+not as a global preference.** The four-grep enumeration establishes that class
+enumeration *can* be cheap, not that it generally is; the brace-elision class is
+the counterexample, having needed two purpose-built instruments and remaining
+35-of-45 unverified.
+
+**The per-class test, applied before choosing:**
+
+1. **Can the class be enumerated by a mechanical predicate?** If no -> Path C.
+2. **Does the enumeration have a NEGATIVE CONTROL** — members it correctly
+   reports as sound? Without one it is a list, not a census. (#8859's 18 SAME
+   rows are the model.)
+3. **Has enumeration on a comparable class been observed to MISS members?** If
+   yes -> Path C regardless of (1), because apparent enumerability is what
+   #8830 disproved for its class.
+4. **A published sweep ratio establishes the yield of the predicate. It does NOT
+   establish that the candidate universe was complete** — that requires the
+   negative control in (2) plus a positive control that re-finds a known member.
+
+Apply the #8859 **gate column** — *does the strict path refuse, or the lenient
+path warn?* — to every candidate before calling it a defect. That column found
+two already-handled rows in a 45-row set today, and independently re-derived a
+third that had been disqualified by hand.
 
 ## 5. Proposed sequencing
 
-1. **Wire-count allocation class** — fix `sync_protocol.go:1231` and `:806`
+1. **008 H4 — BOUNDED VERIFICATION FIRST (time-boxed, 30 min).** It is the
+   highest-consequence finding in either report (an accepted commit that bricks
+   the next boot) and the only High still unverified. **Consequence sets
+   verification urgency; confidence does not.** Reproduce or refute, then
+   sequence remediation on the result. If it does not reproduce inside the box,
+   say so and move on rather than extending.
+2. **Wire-count allocation class** — fix `sync_protocol.go:1231` and `:806`
    to the reject-shape the sibling already uses. Closes 009 PHA-001 and 008 M17.
    Guard: assert **rejection**, not clamping, with the payload/element size ratio
    in the failure text.
-2. **008 H4** — reproduce the self-brick end to end first; it is the only
-   unverified High and it is the highest consequence (a node that will not boot).
 3. **Multi-statement packed fold (H1/H2/H3)** — this is live work already
    understood by the lane that landed #8856; the remaining question is which
    containers need `packedStatements` and whether the opt-in is the right shape
    or the fold should refuse.
 4. **H5 reserved names** — enumerate hardcoded infrastructure names before fixing
    `mgmt` alone.
-5. **The remaining ~104** — staleness-partition in batches, publishing the ratio,
-   per the #8791 method: measure at the report's base AND at master, because a
-   current quote settles nothing.
+5. **The remaining ~104** — governed by §5b, which defines the process. This
+   plan does not schedule them and does not claim to cover them.
+
+## 5b. Inventory process for the unclassified remainder
+
+The r1 defect was scheduling ~104 findings as one step. This replaces it with a
+**bounded process with completion criteria**, not a batch plan:
+
+- **Inventory before adjudication.** Extract every finding ID, its cited files,
+  and its claimed severity into one table — mechanically, from the report text.
+  **Derive counts; do not quote them** (008's own header says "109 findings, 11
+  High" while its method header says "37 not 100" and its HIGH section is headed
+  "(5)").
+- **Classify by CITED FILE, not by reading.** A finding whose files fall inside an
+  already-enumerated class joins that class and inherits its verdict. This is
+  cheap and it is how the remainder shrinks without per-finding judgement.
+- **Findings outside every known class are the residue**, and the residue size is
+  the reportable number. A class map derived from 8 findings cannot be assumed to
+  cover the rest — the residue is where new classes come from.
+- **Completion criterion:** every finding is either (a) in a class with a
+  published enumeration, (b) adjudicated individually with a measurement, or
+  (c) in the residue with its files named. **No finding is "batched".**
+- **Batch size is 3-4 findings with a posted verdict table**, per the #8791
+  triage, because an aggregate is not reviewable and the sample is.
 
 ## 6. Acceptance criteria (per class)
 
