@@ -1,5 +1,10 @@
 package config
 
+import (
+	"fmt"
+	"sort"
+)
+
 // NATPoolTotalPorts is the SINGLE source of truth for a source-NAT pool's
 // translation capacity: the size of its port window times its address count.
 //
@@ -30,4 +35,55 @@ func NATPoolTotalPorts(portLow, portHigh, addrCount int) int64 {
 		return 0
 	}
 	return int64(portHigh-portLow+1) * int64(addrCount)
+}
+
+// validateNATPoolAddressRangeStrict hard-rejects a NAT pool carrying an
+// `address <low> to <high>` range larger than the 256-address expansion cap
+// (#8814).
+//
+// The cap used to be raised as a compile error inside expandAddressRange, which
+// put it on the LENIENT path as well as the strict one -- the security compiler
+// chain (compileSecurity -> compileNATSource -> appendPoolAddresses) carries no
+// compileOpts, so nothing could downgrade it. A persisted config with an
+// oversized range failed to LOAD, which is precisely what CompileConfigLenient
+// exists to prevent.
+//
+// Now the compiler RECORDS the range and this gate rejects it, so:
+//
+//	strict (commit / commit-check)   REJECTS, with the size in the message
+//	tolerant (load / peer-sync)      warns; the pool loads without that range
+//
+// The pool keeps every OTHER address it was given -- an oversized range is
+// omitted, not fatal to the pool -- so a config that mixes a valid range with an
+// oversized one still boots with the valid one installed.
+func validateNATPoolAddressRangeStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	check := func(kind string, pools map[string]*NATPool) error {
+		names := make([]string, 0, len(pools))
+		for name := range pools {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			pool := pools[name]
+			if pool == nil || len(pool.OversizedAddressRanges) == 0 {
+				continue
+			}
+			return fmt.Errorf(
+				"security nat %s pool %q address range %s; a pool address range expands to one "+
+					"address per IP and is capped at 256 — narrow the range, or list the "+
+					"addresses individually",
+				kind, name, pool.OversizedAddressRanges[0])
+		}
+		return nil
+	}
+	if err := check("source", cfg.Security.NAT.SourcePools); err != nil {
+		return err
+	}
+	if dst := cfg.Security.NAT.Destination; dst != nil {
+		return check("destination", dst.Pools)
+	}
+	return nil
 }
