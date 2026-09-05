@@ -244,6 +244,47 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 	// family label is not a safety property, and this is the case that proves
 	// it. TestNormalizerScopeNeverCoversAPartialSite8690 binds it mechanically
 	// so the next widening cannot make the same mistake by inspection.
+	// #8690 family 5: applications, services, snmp, event-options. 30 sites,
+	// every one drop shape "empty" in the inventory.
+	//
+	// PROVISIONAL until the disarm arm has run over them: the drop shape
+	// answers a question about READERS and does not see commit gates. lane-8388
+	// established that `system login` sites measure "empty" while the #6662
+	// packed-login-body gate makes normalizing them unsafe, and flagged
+	// `snmp trap-group <t> targets` as one of the same class. I am not taking
+	// that on trust either way — the pairs go in, the disarm guard runs, and
+	// anything it flags gets classified by hand rather than assumed.
+	switch containerKeyword + " " + head {
+	case "applications application",
+		"applications application-set",
+		"application alg",
+		"application description",
+		"application destination-port",
+		"application icmp-code",
+		"application icmp-type",
+		"application inactivity-timeout",
+		"application protocol",
+		"application source-port",
+		"application term",
+		"application timeout",
+		"event-options policy",
+		"policy within",
+		"version-ipfix template",
+		"version9 template",
+		"template flow-active-timeout",
+		"template flow-inactive-timeout",
+		"template-refresh-rate seconds",
+		"rpm probe",
+		"snmp community",
+		"snmp trap-group",
+		"community clients",
+		"trap-group categories",
+		"trap-group targets",
+		"trap-group version",
+		"local-engine user":
+		return true
+	}
+
 	// #8690 family 4: interfaces. 15 sites, every one drop shape "empty".
 	//
 	// Measured, not taken from the brief: the family was described to me as
