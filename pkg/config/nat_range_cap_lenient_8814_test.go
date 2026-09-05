@@ -196,6 +196,19 @@ func TestTheRecordedFieldIsOnlySetWhenOverCap8814(t *testing.T) {
 // ParseSetCommand + SetPath, never NewParser: the parser treats newlines as
 // whitespace and merges every set line into one node, so a measurement taken
 // through it describes a tree nobody has (CLAUDE.md; #8808).
+// The phrases that identify the RANGE-CAP gate specifically, rather than any
+// rejection. Chosen from each gate's own message and deliberately narrower than
+// "capped at": a future unrelated cap would contain that, and the point of
+// #8822 is that a rejection from an unrelated cause must not satisfy this cell.
+//
+// If a gate's wording changes, this cell fails loudly and a human re-points it
+// at the new wording — which is the intended cost. It cannot silently start
+// accepting a different gate's rejection.
+const (
+	natPoolCapPhrase8822  = "a pool address range expands to one address per IP"
+	proxyARPCapPhrase8822 = "NTF_PROXY neighbour per address"
+)
+
 func TestFlatSetSpellingHitsTheSameRangeCap8814(t *testing.T) {
 	flat := func(t *testing.T, lines ...string) *ConfigTree {
 		t.Helper()
@@ -205,7 +218,14 @@ func TestFlatSetSpellingHitsTheSameRangeCap8814(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ParseSetCommand(%q): %v", l, err)
 			}
-			tree.SetPath(path)
+			// #8822: check SetPath too. This cell's own assertions (pool
+			// non-nil, address count, recorded count) would catch a partial
+			// tree today, so this is robustness rather than a live vacuity --
+			// but a helper of this shape gets copied into cells with weaker
+			// assertions, and there the positive control is gone.
+			if err := tree.SetPath(path); err != nil {
+				t.Fatalf("SetPath(%q): %v", l, err)
+			}
 		}
 		return tree
 	}
@@ -238,9 +258,24 @@ func TestFlatSetSpellingHitsTheSameRangeCap8814(t *testing.T) {
 					"guards only configs that arrive from a file", got, tc.wantRecord)
 			}
 			_, serr := compileConfigWithOpts(flat(t, tc.line), compileOpts{})
-			if tc.wantStrict && serr == nil {
-				t.Error("flat set: strict CompileConfig ACCEPTED an oversized range — an operator can " +
-					"author one interactively (#8814)")
+			if tc.wantStrict {
+				if serr == nil {
+					t.Error("flat set: strict CompileConfig ACCEPTED an oversized range — an operator can " +
+						"author one interactively (#8814)")
+				} else if !strings.Contains(serr.Error(), natPoolCapPhrase8822) {
+					// #8822: assert WHICH gate rejected, not that something did.
+					// `serr != nil` is a proxy: a later schema tightening on
+					// `to`, a new required sibling, or a validator reordering
+					// could reject this input for an unrelated reason, and then
+					// the CAP GATE COULD BE DELETED AND THIS CELL STAY GREEN --
+					// pinning "something rejects this line", which is not the
+					// property #8814 is about.
+					t.Errorf("flat set: strict rejected, but NOT with the range-cap gate.\n"+
+						"  got: %v\n"+
+						"  want a message containing %q\n"+
+						"A rejection from an unrelated cause satisfies `err != nil` while the cap "+
+						"gate is gone (#8822).", serr, natPoolCapPhrase8822)
+				}
 			}
 			if !tc.wantStrict && serr != nil {
 				t.Errorf("flat set: strict rejected a legal range: %v", serr)
@@ -264,5 +299,10 @@ func TestFlatSetSpellingHitsTheSameRangeCap8814(t *testing.T) {
 	}
 	if _, serr := compileConfigWithOpts(flat(t, line), compileOpts{}); serr == nil {
 		t.Error("flat set proxy-arp: strict CompileConfig accepted an oversized range (#8814)")
+	} else if !strings.Contains(serr.Error(), proxyARPCapPhrase8822) {
+		// #8822: the proxy-arp leg had the same `err != nil` proxy.
+		t.Errorf("flat set proxy-arp: strict rejected, but NOT with the range-cap gate.\n"+
+			"  got: %v\n"+
+			"  want a message containing %q (#8822)", serr, proxyARPCapPhrase8822)
 	}
 }
