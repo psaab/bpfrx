@@ -358,9 +358,37 @@ func TestStartupRestartConsultsProcessIdentity8899(t *testing.T) {
 		t.Fatal("no m.stopLocked() follows the process-identity check; the restart it " +
 			"is supposed to trigger is gone")
 	}
-	if !strings.Contains(tail[:end], "if publishedPlanChangedDuringStartup || processIdentityChangedDuringStartup") {
-		t.Errorf("the process-identity result is computed but does not gate the restart "+
-			"together with the binding-plan check. Between the two, the code is:\n%s",
-			tail[:end])
+	// ORDER-INDEPENDENT, deliberately. An earlier version asserted the exact
+	// string `if publishedPlanChangedDuringStartup || processIdentityChangedDuringStartup`
+	// and failed when the two operands were SWAPPED — a change with no
+	// behavioural effect at all. A guard that reds on a harmless refactor gets
+	// edited or worked around rather than obeyed, so it protects nothing; what
+	// matters is that BOTH terms gate the same restart, not which is written
+	// first.
+	cond := tail[:end]
+	gate := strings.Index(cond, "if ")
+	if gate < 0 {
+		t.Fatalf("no `if` between the process-identity check and m.stopLocked():\n%s", cond)
+	}
+	brace := strings.Index(cond[gate:], "{")
+	if brace < 0 {
+		t.Fatalf("the restart condition has no opening brace:\n%s", cond)
+	}
+	expr := cond[gate : gate+brace]
+	for _, term := range []string{
+		"publishedPlanChangedDuringStartup",
+		"processIdentityChangedDuringStartup",
+	} {
+		if !strings.Contains(expr, term) {
+			t.Errorf("the restart condition does not test %s. Both the binding-plan "+
+				"change and the process-identity change must gate this restart; with "+
+				"either missing, its class of config change is acked without one "+
+				"(#8899). Condition was: %s", term, expr)
+		}
+	}
+	if !strings.Contains(expr, "||") {
+		t.Errorf("the two triggers are no longer OR'd. Requiring BOTH to hold would "+
+			"mean a process-identity change with an unchanged binding plan — the exact "+
+			"#8899 case — is again acked without a restart. Condition was: %s", expr)
 	}
 }
