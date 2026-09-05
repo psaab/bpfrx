@@ -1,6 +1,64 @@
+OpenAI Codex v0.153.1
+--------
+workdir: /var/tmp/RES8869
+model: gpt-6-astra
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: xhigh
+reasoning summaries: none
+session id: 01a0719e-6d12-7f50-ad11-c6fbf2557b37
+--------
+user
+HOSTILE round-3 plan review. REASONING ONLY. Do NOT explore the repository, do
+NOT run commands, do NOT read files.
+
+Your round-2 verdict on r3 was PLAN-REVISE. r4 applies all of it:
+ - The sample-size claim ("a 15-finding sample would have established that") is
+   WITHDRAWN, with your interval figures quoted and the note that they do not
+   even apply to a purposive sample.
+ - The gate now has a DECISION RULE fixed before the sample is drawn, on live
+   rate L, unresolved rate U and median time T, with thresholds (L>=40% run;
+   L<15% and U<25% abandon; 15-40% one bounded second batch; U>=25% fix the
+   resolver first; T>20min unaffordable), an effort cap of two batches, and
+   escalation to the user if it fails to discriminate.
+ - "Consequence concentrated" now requires a named consequence, evidence it is
+   live at the pinned tip, and an argument the affected set cannot be bounded
+   short of the full population -- with the default being that concentration
+   justifies investigating THAT SUBSYSTEM (narrower than the census).
+ - The abandon branch now dispositions the High backlog on BOTH branches: ID,
+   provisional severity, assessment state, owner, priority, revisit condition.
+ - Your confirmation that the snapshot design is sound is recorded, including
+   that it refuted the author's own objection.
+
+Judge r4 on THREE things.
+
+FIRST: are your r2 findings resolved? Per item, RESOLVED or NOT RESOLVED,
+against specific r4 text. Be strict about whether a threshold table actually
+constrains the decision or merely looks like it does.
+
+SECOND, the sharpest question available: the thresholds (40%, 15%, 25%, 20min)
+are stated as fixed-in-advance, which is the right SHAPE -- but they were
+chosen by the author with no stated derivation. Is a decision rule with
+arbitrary-but-fixed thresholds actually better than explicit discretion, or is
+it discretion wearing a table's clothes? Does fixing them in advance buy
+anything real if the numbers themselves are unjustified, and if not, what
+WOULD justify them?
+
+THIRD: does anything in r4 now contradict anything else in it? The plan has
+been revised four times and each round has added text rather than replacing
+it. Look specifically for a place where an earlier section still asserts
+something a later one withdrew.
+
+Finish with exactly one of PLAN-READY, PLAN-REVISE, PLAN-KILL, then numbered
+dispositions. If the remaining disagreement is about how confidently evidence
+is described rather than about what someone DOES, say PLAN-READY -- this plan
+has had four rounds and the actions have not been in dispute since r2.
+
+=== PLAN r4 ===
 # Plan of action — gemini-review-049 (#8869)
 
-- **Revision:** r5 (after Codex r4: 3 of 4 resolved; the gate's combined triggers and the thresholds' standing are fixed here)
+- **Revision:** r4 (after Codex r2 PLAN-REVISE — the gate now has a DECISION RULE fixed in advance, and the sample-size claim is withdrawn)
 - **Base:** `f36be93c5` (origin/master at drafting)
 - **Report base:** `b0f3aba21`, which was master-identical when the review ran
 - **Status:** revised. Codex r1 `PLAN-REVISE` (8 findings). AGY infra-blocked (2-of-3 exception).
@@ -270,51 +328,8 @@ plan does not re-litigate that class.
    | **U >= 25%** at any L | **Routing is the bottleneck, not prevalence.** Fix the resolver, re-run the same batch. Do not decide on a sample whose targets are mostly unresolved. |
    | **T > 20 min/finding** at any L | **Census is unaffordable regardless of L.** Abandon it and work by consequence. |
 
-   **PRECEDENCE, when more than one row fires** *(r5, Codex r4: the table did not
-   say what happens when `U >= 25%` and `T > 20 min` trigger together, nor
-   whether the second decision pools the batches.)*
-
-   1. **`U >= 25%` wins over everything.** A sample whose targets are mostly
-      unresolved cannot support any decision, including "unaffordable" — fix the
-      resolver and re-run **the same batch** before reading `T` or `L` at all.
-   2. **`T > 20 min` wins over `L`.** If the census is unaffordable, a high live
-      rate does not make it affordable; it makes abandoning it more painful,
-      which is a different fact.
-   3. **`L` decides only when `U` and `T` are both clear.**
-
-   **The second batch POOLS with the first** — 24-30 findings read as one sample
-   against the same thresholds, not the second 12-15 read alone. **Reading the
-   second batch alone would discard half the evidence and double the noise**, and
-   it invites re-drawing until a batch lands on the wanted side.
-
-   **Effort limit: the calibration is capped at two batches (~30 findings).**
+   **Effort limit: the calibration itself is capped at two batches (~30 findings).**
    Exceeding it without a decision is a result — report it and escalate.
-
-   **WHAT THESE THRESHOLDS ARE, AND WHAT THEY ARE NOT** *(r5, Codex r4 — the
-   sharpest point in the review and the one I asked for.)* **They are operational
-   policy, precommitted. They carry no statistical authority and no derivation.**
-
-   > *"These are discretionary thresholds made explicit and precommitted. That
-   > improves consistency and limits retrospective rationalization; it does not
-   > establish that the resulting decisions are sensible."*
-
-   **Precommitment is the whole benefit and it is a real one** — it stops the
-   cutoff being chosen after the number is known, which is the failure a gate
-   exists to prevent. **It is NOT evidence the cutoffs are right.**
-
-   The operational basis, stated so it can be argued with rather than deferred to:
-
-   - **40%** — above this, classification is the cheapest route to the defects,
-     because most of what you classify is work you would have done anyway.
-   - **15%** — below this, ~7 judgements per defect, and the residue is better
-     served by consequence-ordered investigation than by exhaustive census.
-   - **25% unresolved** — a quarter of targets unresolved means the resolver, not
-     prevalence, is what the batch measured.
-   - **20 min/finding** — 100 findings x 20 min is ~33 hours, past what this
-     campaign can absorb against work that is already confirmed.
-
-   **Any of these may be wrong. They are fixed in advance so that being wrong is
-   visible rather than absorbed.**
 
    **CONSEQUENCE ESCALATION — a defined override, not a free one.** *(Codex r2:
    as r3 wrote it, "consequence concentrated" allowed every outcome to justify
@@ -442,3 +457,6 @@ plan does not re-litigate that class.
 - No new instrument beyond the Evidence-path parser, which is required by step 1
   rather than speculative — per #8865 §8, selection is effort x consequence x
   additional coverage.
+
+ERROR: Reconnecting... 2/5
+CODEX_EXIT=124
