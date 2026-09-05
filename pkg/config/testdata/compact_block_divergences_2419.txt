@@ -85,6 +85,46 @@
 # divergent sites are not new defects; they are compact-blind readers this
 # census could not see, in `schedulers` and `system`.
 #
+# #8690 unruled-fixture sweep, second increment: the UNCOMPILABLE bucket,
+# 45 -> 31. checked 685 -> 699, divergent +12, nothing removed.
+#
+# Every one was a fixture the compiler REJECTED, and the compiler said why:
+# `services rpm probe <p> test <t>: target is required`,
+# `services ip-monitoring policy <p>: match rpm-probe is required`,
+# `firewall three-color-policer <n> requires positive committed-information-rate`,
+# `security nat source pool <p>: deterministic host address required`, and two
+# policies naming an undefined scheduler. Each contextFor / preambleFor entry is
+# the smallest addition that turns that rejection into a compiled config; none
+# was guessed.
+#
+# TWO MECHANISMS, because the requirement is not always inside the parent:
+#
+#   - contextForStanza widens contextFor with the STANZA under test, because
+#     `three-color-policer` single-rate and two-rate are mutually exclusive, so
+#     the right scaffold depends on which one is being probed. contextFor keeps
+#     its old signature and its old answers -- every new entry is gated on a
+#     non-empty stanza -- so the six other censuses calling it are unaffected.
+#   - preambleFor is new: a top-level prefix for a requirement OUTSIDE the
+#     site's container tree. An ip-monitoring policy must name a probe under
+#     `services rpm`, a policy's scheduler-name must name one under the
+#     top-level `schedulers`, and a deterministic NAT pool needs an address
+#     range on the POOL. Top-level blocks re-open and merge exactly as inner
+#     ones do, which is what makes both mechanisms additive rather than
+#     replacing the site's own text -- measured before being relied on.
+#
+# The 31 that remain are three causes, none of them a missing scaffold:
+#   - 13 whose own leaf VALUE is synthesized as "xpfaaa" and rejected by the
+#     leaf (a burst size, a rate, an IP) -- the synthPair gap again, showing up
+#     in this bucket instead of the no-pair one because the fixture got far
+#     enough to be rejected for the value rather than for the shape;
+#   - 6 under `class-of-service fairness rss-expectation interface <i> queue <n>`,
+#     whose INSTANCE NAME must be 0..255 and is synthesized as "xpfarg" -- a
+#     site-model gap, the same shape #8662 fixed for the wildcard container;
+#   - `system services ssh ciphers` / `macs` (an example containing '@' that
+#     the parser needs quoted) and `system dataplane-type` (the validator
+#     accepts a value the compiler then rejects, which is a finding about those
+#     two disagreeing rather than about this census).
+#
 # Seven sites remain in the no-pair bucket and SIX of them are declared inert
 # by their own valueDesc — `authentication-type` ("not an OSPF leaf") and the
 # four `system login class` regexp leaves ("not implemented by xpf"). They are
@@ -92,10 +132,10 @@
 # seventh, `security nat source interface port-overloading`, declares one
 # example and a validator whose message does not enumerate.
 #
-# checked: 685
+# checked: 699
 #
 # skipped (leaf value not observable in the typed config): 236
-# skipped (a spelling did not parse or compile): 45
+# skipped (a spelling did not parse or compile): 31
 # skipped (no two distinct synthesizable values): 7
 # skipped (under groups (schema re-host, duplicate coverage)): 806
 #
@@ -120,6 +160,18 @@ policy-options policy-statement xpfarg term xpfarg then origin	partial
 protocols bgp group xpfarg neighbor xpfarg peer-as	empty
 security dynamic-address feed-server xpfarg hostname	empty
 security dynamic-address feed-server xpfarg url	empty
+security policies from-zone xpfarg xpfarg xpfarg policy xpfarg scheduler-name	empty
+security policies global policy xpfarg scheduler-name	empty
+services rpm probe xpfarg test xpfarg destination-interface	empty
+services rpm probe xpfarg test xpfarg destination-port	empty
+services rpm probe xpfarg test xpfarg probe-count	empty
+services rpm probe xpfarg test xpfarg probe-interval	empty
+services rpm probe xpfarg test xpfarg probe-limit	empty
+services rpm probe xpfarg test xpfarg probe-type	empty
+services rpm probe xpfarg test xpfarg routing-instance	empty
+services rpm probe xpfarg test xpfarg source-address	empty
+services rpm probe xpfarg test xpfarg target	empty
+services rpm probe xpfarg test xpfarg test-interval	empty
 system dataplane control-socket	empty
 system domain-name	empty
 system login class	partial

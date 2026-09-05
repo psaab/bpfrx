@@ -204,9 +204,116 @@ func enumPairFromValidator(n *schemaNode) (v1, v2 string, ok bool) {
 // worked through, and the remaining skip count is REPORTED so the census stays
 // an explicit floor rather than a silent one.
 func contextFor(parent []string) string {
+	return contextForStanza(parent, "")
+}
+
+// contextForStanza is contextFor plus the stanza under test, for the #8690
+// entries whose required sibling depends on WHICH stanza is being probed.
+//
+// contextFor keeps its original signature and its original answers: every entry
+// added below is gated on a NON-EMPTY stanza, so the six other censuses that
+// call contextFor(parent) get byte-identical fixtures to before. Widening a
+// shared helper under several in-flight guards is how a census starts measuring
+// something nobody asked it to.
+func contextForStanza(parent []string, stanza string) string {
+	if legacy := legacyContextFor(parent); legacy != "" || stanza == "" {
+		return legacy
+	}
+	switch strings.Join(parent, " ") {
+
+	// #8690 uncompilable-bucket sweep. Everything below was measured from the
+	// compiler's own rejection of the generated fixture, not guessed: each
+	// entry is the smallest addition that makes `compileText` return a config
+	// instead of nil, and the census then rules the site normally.
+	//
+	// A RE-OPENED BLOCK MERGES, which is what makes parent-level context
+	// sufficient for a requirement that lives INSIDE the stanza under test.
+	// `probe p1 { test t1 { target ...; } test t1 { destination-port 7; } }`
+	// compiles to one test carrying both -- measured before relying on it.
+
+	// `services rpm probe <p> test <t>: target is required` (12 sites).
+	case "services rpm probe xpfarg":
+		return "test xpfarg { target address 192.0.2.1; } "
+
+	// `services ip-monitoring policy <p>` needs a match, a preferred-route with
+	// a next-hop, AND a real rpm probe to reference -- the last one is a
+	// sibling of `ip-monitoring` under `services`, out of reach of any
+	// parent-level context, which is what preambleFor is for (10 sites).
+	case "services ip-monitoring", "services ip-monitoring policy xpfarg",
+		"services ip-monitoring policy xpfarg then",
+		"services ip-monitoring policy xpfarg then preferred-route",
+		"services ip-monitoring policy xpfarg then preferred-route routing-instance xpfarg":
+		return ipMonitoringContext8690
+
+	// `firewall three-color-policer <n>` requires a complete rate set, and
+	// single-rate / two-rate are MUTUALLY EXCLUSIVE -- so the context depends on
+	// which stanza is under test, which is why this function takes the stanza
+	// (9 sites).
+	case "firewall three-color-policer xpfarg":
+		if stanza == "two-rate" {
+			return "two-rate { committed-information-rate 1m; committed-burst-size 1k; " +
+				"peak-information-rate 2m; peak-burst-size 2k; } "
+		}
+		return "single-rate { committed-information-rate 1m; committed-burst-size 1k; " +
+			"excess-burst-size 1k; } "
+
+	// `security nat source pool <p> port deterministic` needs a host address, a
+	// block size, and (from the preamble) a pool address range to cut blocks
+	// out of (2 sites).
+	case "security nat source pool xpfarg port":
+		return "deterministic { host address 10.0.0.0/24; block-size 64; } "
+	case "security nat source pool xpfarg port deterministic":
+		return "host address 10.0.0.0/24; block-size 64; "
+	}
+	return ""
+}
+
+// legacyContextFor holds the entries that predate #8690, so both entry points
+// answer them identically.
+func legacyContextFor(parent []string) string {
 	switch strings.Join(parent, " ") {
 	case "security log stream xpfarg":
 		return "host 192.0.2.10; "
+	}
+	return ""
+}
+
+// ipMonitoringContext8690 is shared by every ip-monitoring site because the
+// policy's requirements are checked as a whole: a match, and at least one
+// then-preferred-route route carrying a next-hop.
+const ipMonitoringContext8690 = "match { rpm-probe r1; } then { preferred-route { " +
+	"route 10.9.9.0/24 { next-hop 192.0.2.254; } } } "
+
+// preambleFor returns top-level scaffolding placed BEFORE the site's own text,
+// for a requirement that lives outside the site's own container tree (#8690).
+//
+// contextFor can only reach inside the innermost parent. Two classes of
+// requirement are not there:
+//
+//   - `services ip-monitoring policy <p> match rpm-probe <r>` must name a probe
+//     configured under `services rpm`, a SIBLING of ip-monitoring;
+//   - `security policies ... policy <p> scheduler-name <s>` must name a
+//     scheduler configured under the top-level `schedulers` stanza;
+//   - `security nat source pool <p> port deterministic` needs the POOL to carry
+//     an address range, a sibling of `port`.
+//
+// Top-level blocks re-open and merge exactly as inner ones do, so a preamble
+// naming the same containers adds to the site's fixture rather than replacing
+// it.
+func preambleFor(parent []string, stanza string) string {
+	joined := strings.Join(parent, " ")
+	switch {
+	case strings.HasPrefix(joined, "services ip-monitoring"):
+		return "services { rpm { probe r1 { test t1 { target address 192.0.2.1; } } } } "
+	case strings.HasPrefix(joined, "security nat source pool xpfarg"):
+		return "security { nat { source { pool xpfarg { address 203.0.113.0/24; } } } } "
+	case joined == "security policies global" ||
+		strings.HasPrefix(joined, "security policies from-zone"):
+		if stanza == "policy xpfarg" {
+			return "schedulers { scheduler xpfaaa { start-time \"08:00:00\"; " +
+				"stop-time \"17:00:00\"; } scheduler xpfbbb { start-time \"08:00:00\"; " +
+				"stop-time \"17:00:00\"; } } "
+		}
 	}
 	return ""
 }
@@ -539,10 +646,11 @@ func runCompactBlockCensus(t *testing.T) censusResult {
 		}
 		parent := s.container[:len(s.container)-1]
 		stanza := s.container[len(s.container)-1]
-		ctx := contextFor(parent)
-		blockV1 := nest(parent, ctx+stanza+" { "+s.leaf+" "+v1+"; }")
-		blockV2 := nest(parent, ctx+stanza+" { "+s.leaf+" "+v2+"; }")
-		compact := nest(parent, ctx+stanza+" "+s.leaf+" "+v1+";")
+		ctx := contextForStanza(parent, stanza)
+		pre := preambleFor(parent, stanza)
+		blockV1 := pre + nest(parent, ctx+stanza+" { "+s.leaf+" "+v1+"; }")
+		blockV2 := pre + nest(parent, ctx+stanza+" { "+s.leaf+" "+v2+"; }")
+		compact := pre + nest(parent, ctx+stanza+" "+s.leaf+" "+v1+";")
 
 		cb1, cb2, cc := compileText(t, blockV1), compileText(t, blockV2), compileText(t, compact)
 		if cb1 == nil || cb2 == nil || cc == nil {
@@ -568,7 +676,7 @@ func runCompactBlockCensus(t *testing.T) censusResult {
 			// stanza is the reference for "the folded value contributed
 			// nothing"; anything else means a reader consumed part of it.
 			shape := "partial"
-			if skel := compileText(t, nest(parent, ctx+stanza+" { }")); skel != nil && cfgEqual(cc, skel) {
+			if skel := compileText(t, pre+nest(parent, ctx+stanza+" { }")); skel != nil && cfgEqual(cc, skel) {
 				shape = "empty"
 			}
 			res.dropShape[siteKey] = shape
