@@ -41,14 +41,31 @@ import (
 // would silently cover only the containers someone remembered — the same
 // accumulating-registry failure the #8690 buckets were built to avoid.
 type packedOptInCase8768 struct {
-	prefix string            // text before the container statement
-	open   string            // the container statement itself, e.g. `trap-group tg1`
-	closer string            // text after
-	stmts  map[string]string // admitted leaf -> a REAL statement for it
+	prefix string // text before the container statement
+	open   string // the container statement itself, e.g. `trap-group tg1`
+	closer string // text after
+	// stmts maps an ADMITTED leaf to a real statement for it. A fixture for a
+	// leaf that is not admitted to the compact-normalize scope is INERT -- it is
+	// never compared -- so writing one is a false claim of coverage. The reverse
+	// check at the end of the cell rejects them; `dead-peer-detection`,
+	// `dynamic` and `no-nat-traversal` were three such entries on both gateway
+	// containers, silently unused since they were written.
+	stmts map[string]string
+	// second holds a DIFFERENT instance of the same leaf, for the same-leaf
+	// comparison below. Required for every admitted leaf that is `multi: true`
+	// or `args >= 2`; see the same-leaf loop for why that is the population.
+	second map[string]string
 	read   func(*Config) string
 }
 
 func packedOptInCases8768() map[string]packedOptInCase8768 {
+	// A SECOND declared proposal, so `proposals pr2` in the same-leaf fixture
+	// references something real. Pointing the second instance at pr1 would make
+	// the two statements identical, and a same-leaf comparison built from two
+	// identical statements cannot tell a split from a swallow.
+	const ikeProp2 = "proposal pr2 { authentication-method pre-shared-keys; " +
+		"dh-group group14; authentication-algorithm sha1; " +
+		"encryption-algorithm aes-128-cbc; }"
 	const ikeProp = "proposal pr1 { authentication-method pre-shared-keys; dh-group group14; " +
 		"authentication-algorithm sha1; encryption-algorithm aes-128-cbc; }"
 	return map[string]packedOptInCase8768{
@@ -62,18 +79,26 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 			open:   "gateway gw1",
 			closer: " } }",
 			stmts: map[string]string{
-				"address":             "address 192.0.2.1",
-				"local-address":       "local-address 192.0.2.2",
-				"ike-policy":          "ike-policy pol1",
-				"external-interface":  "external-interface ge-0/0/0",
-				"local-certificate":   "local-certificate cert1",
-				"version":             "version v2-only",
-				"nat-traversal":       "nat-traversal disable",
-				"no-nat-traversal":    "no-nat-traversal",
-				"local-identity":      "local-identity hostname foo",
-				"remote-identity":     "remote-identity hostname bar",
-				"dead-peer-detection": "dead-peer-detection",
-				"dynamic":             "dynamic hostname peer.example",
+				"address":            "address 192.0.2.1",
+				"local-address":      "local-address 192.0.2.2",
+				"ike-policy":         "ike-policy pol1",
+				"external-interface": "external-interface ge-0/0/0",
+				"local-certificate":  "local-certificate cert1",
+				"version":            "version v2-only",
+				"nat-traversal":      "nat-traversal disable",
+				"local-identity":     "local-identity hostname foo",
+				"remote-identity":    "remote-identity hostname bar",
+			},
+			second: map[string]string{
+				"address":            "address 192.0.2.9",
+				"external-interface": "external-interface ge-0/0/1",
+				"ike-policy":         "ike-policy pol2",
+				"local-address":      "local-address 192.0.2.8",
+				"local-certificate":  "local-certificate cert2",
+				"local-identity":     "local-identity hostname foo2",
+				"nat-traversal":      "nat-traversal enable",
+				"remote-identity":    "remote-identity hostname bar2",
+				"version":            "version v1-only",
 			},
 			read: func(c *Config) string {
 				out := ""
@@ -94,18 +119,26 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 			open:   "gateway gw1",
 			closer: " } }",
 			stmts: map[string]string{
-				"address":             "address 192.0.2.1",
-				"local-address":       "local-address 192.0.2.2",
-				"ike-policy":          "ike-policy pol1",
-				"external-interface":  "external-interface ge-0/0/0",
-				"local-certificate":   "local-certificate cert1",
-				"version":             "version v2-only",
-				"nat-traversal":       "nat-traversal disable",
-				"no-nat-traversal":    "no-nat-traversal",
-				"local-identity":      "local-identity hostname foo",
-				"remote-identity":     "remote-identity hostname bar",
-				"dead-peer-detection": "dead-peer-detection",
-				"dynamic":             "dynamic hostname peer.example",
+				"address":            "address 192.0.2.1",
+				"local-address":      "local-address 192.0.2.2",
+				"ike-policy":         "ike-policy pol1",
+				"external-interface": "external-interface ge-0/0/0",
+				"local-certificate":  "local-certificate cert1",
+				"version":            "version v2-only",
+				"nat-traversal":      "nat-traversal disable",
+				"local-identity":     "local-identity hostname foo",
+				"remote-identity":    "remote-identity hostname bar",
+			},
+			second: map[string]string{
+				"address":            "address 192.0.2.9",
+				"external-interface": "external-interface ge-0/0/1",
+				"ike-policy":         "ike-policy pol2",
+				"local-address":      "local-address 192.0.2.8",
+				"local-certificate":  "local-certificate cert2",
+				"local-identity":     "local-identity hostname foo2",
+				"nat-traversal":      "nat-traversal enable",
+				"remote-identity":    "remote-identity hostname bar2",
+				"version":            "version v1-only",
 			},
 			read: func(c *Config) string {
 				out := ""
@@ -135,6 +168,12 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 				"ssh-rsa":            `ssh-rsa "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABrsa c@d"`,
 				"ssh-dsa":            `ssh-dsa "ssh-dss AAAAB3NzaC1kc3MAAACBAdsa e@f"`,
 			},
+			second: map[string]string{
+				"encrypted-password": `encrypted-password "$6$rounds=5000$xyz$uvw"`,
+				"ssh-ed25519":        `ssh-ed25519 "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKed2 g@h"`,
+				"ssh-rsa":            `ssh-rsa "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABrsa2 i@j"`,
+				"ssh-dsa":            `ssh-dsa "ssh-dss AAAAB3NzaC1kc3MAAACBAdsa2 k@l"`,
+			},
 			read: func(c *Config) string {
 				ra := c.System.RootAuthentication
 				if ra == nil {
@@ -151,6 +190,11 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 				"targets":    "targets 10.0.0.1",
 				"version":    "version v2",
 				"categories": "categories authentication",
+			},
+			second: map[string]string{
+				"categories": "categories link",
+				"targets":    "targets 10.0.0.2",
+				"version":    "version v1",
 			},
 			read: func(c *Config) string {
 				if c.System.SNMP == nil {
@@ -170,6 +214,10 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 			stmts: map[string]string{
 				"destination-ip":   "destination-ip 1.2.3.4",
 				"source-interface": "source-interface ge-0/0/0",
+			},
+			second: map[string]string{
+				"destination-ip":   "destination-ip 5.6.7.8",
+				"source-interface": "source-interface ge-0/0/1",
 			},
 			read: func(c *Config) string {
 				out := ""
@@ -191,6 +239,14 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 				"dh-group":                 "dh-group group14",
 				"encryption-algorithm":     "encryption-algorithm aes-128-cbc",
 				"lifetime-seconds":         "lifetime-seconds 3600",
+			},
+			second: map[string]string{
+				"authentication-algorithm": "authentication-algorithm sha-256",
+				"authentication-method":    "authentication-method rsa-signatures",
+				"description":              "description goodbye",
+				"dh-group":                 "dh-group group5",
+				"encryption-algorithm":     "encryption-algorithm aes-256-cbc",
+				"lifetime-seconds":         "lifetime-seconds 7200",
 			},
 			read: func(c *Config) string {
 				out := ""
@@ -214,11 +270,25 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 				"lifetime-seconds":         "lifetime-seconds 3600",
 				"protocol":                 "protocol esp",
 			},
+			second: map[string]string{
+				"authentication-algorithm": "authentication-algorithm hmac-sha1-96",
+				"description":              "description goodbye",
+				"dh-group":                 "dh-group group5",
+				"encryption-algorithm":     "encryption-algorithm aes-256-cbc",
+				"lifetime-kilobytes":       "lifetime-kilobytes 200000",
+				"lifetime-seconds":         "lifetime-seconds 7200",
+				"protocol":                 "protocol ah",
+			},
 			read: func(c *Config) string {
 				out := ""
 				for _, p := range c.Security.IPsec.Proposals {
-					out += fmt.Sprintf("proto=%q auth=%q dh=%d enc=%q life=%d",
-						p.Protocol, p.AuthAlg, p.DHGroup, p.EncryptionAlg, p.LifetimeSeconds)
+					// `lifekb` is reported because the same-leaf loop needs the
+					// reader to DISTINGUISH two instances of every value-bearing
+					// leaf; a leaf the reader drops makes its comparison
+					// degenerate, green whether the packed run splits or swallows.
+					out += fmt.Sprintf("proto=%q auth=%q dh=%d enc=%q life=%d lifekb=%d",
+						p.Protocol, p.AuthAlg, p.DHGroup, p.EncryptionAlg,
+						p.LifetimeSeconds, p.LifetimeKilobytes)
 				}
 				return out
 			},
@@ -230,6 +300,10 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 			stmts: map[string]string{
 				"interval":  "interval 10",
 				"threshold": "threshold 3",
+			},
+			second: map[string]string{
+				"interval":  "interval 20",
+				"threshold": "threshold 5",
 			},
 			read: func(c *Config) string {
 				out := ""
@@ -257,6 +331,10 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 				// reach the splitter at all; the braced one lands in the #8850
 				// decline branch.
 				"address-set": "address-set s1 address a1",
+			},
+			second: map[string]string{
+				"address":     "address a2 10.0.0.2/32",
+				"address-set": "address-set s2 address a1",
 			},
 			read: func(c *Config) string {
 				for _, z := range c.Security.Zones {
@@ -290,6 +368,10 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 				// decline branch.
 				"address-set": "address-set s1 address a1",
 			},
+			second: map[string]string{
+				"address":     "address a2 10.0.0.2/32",
+				"address-set": "address-set s2 address a1",
+			},
 			read: func(c *Config) string {
 				if c.Security.AddressBook == nil {
 					return "<no book>"
@@ -306,7 +388,7 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 			},
 		},
 		"security/ike/policy": {
-			prefix: "security { ike { " + ikeProp + " ",
+			prefix: "security { ike { " + ikeProp + " " + ikeProp2 + " ",
 			open:   "policy p1",
 			closer: " } }",
 			stmts: map[string]string{
@@ -315,11 +397,27 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 				"proposals":      "proposals pr1",
 				"proposal-set":   "proposal-set standard",
 			},
+			second: map[string]string{
+				"mode":           "mode aggressive",
+				"pre-shared-key": "pre-shared-key ascii-text SEKRIT2",
+				"proposal-set":   "proposal-set basic",
+				"proposals":      "proposals pr2",
+			},
 			read: func(c *Config) string {
 				out := ""
 				for _, p := range c.Security.IPsec.IKEPolicies {
-					out += fmt.Sprintf("mode=%q psk=%q props=%v pset=%q",
-						p.Mode, p.PSK, p.Proposals, p.ProposalSet)
+					// PSK BY LENGTH, NOT BY VALUE, and via Reveal() so the access
+					// stays greppable -- secret.go documents Reveal as
+					// "deliberately greppable so an audit can find every cleartext
+					// access", and len() on the Secret directly is the only such
+					// site in pkg/. The type redacts itself under
+					// %q (`<redacted>`), so `psk=%q` renders every distinct
+					// secret identically -- which made `pre-shared-key`
+					// unobservable in every comparison in this cell, not just
+					// the two-instance one. Length distinguishes the fixtures
+					// without printing the secret into a failure message.
+					out += fmt.Sprintf("mode=%q psklen=%d props=%v pset=%q",
+						p.Mode, len(p.PSK.Reveal()), p.Proposals, p.ProposalSet)
 				}
 				return out
 			},
@@ -463,6 +561,48 @@ func TestPackedOptInHoldsForEveryLeafPair8768(t *testing.T) {
 	}
 	sawDivergence := map[string]bool{}
 
+	// Two instances of one leaf that legitimately do NOT split, with the reason
+	// MEASURED rather than assumed. Same contract as the map above: an entry
+	// that stops diverging fails as stale, and an unadjudicated divergence still
+	// fails. Empty until a measurement puts something here.
+	sameLeafAdjudicated := map[string]string{
+		// Two instances of `address-set`, the divergence the round-1 review of
+		// #8873 found live at head. It is NESTED ELISION, not a same-leaf split
+		// failure: `address-set` is args:1 WITH children, so the run cannot be
+		// cut through it and the first set absorbs the rest.
+		//
+		//	packed  global address-set s1 address a1 address-set s2 address a1;
+		//	          -> set:s1(a1|address-set|s2|address)
+		//	braced  -> set:s1(a1), set:s2(a1)
+		//
+		// BYTE-IDENTICAL AT origin/master, so neither the opt-in nor the #8850
+		// container-head fix caused or closed it. It belongs to the d2 nested-
+		// elision work; when that lands these entries must be DELETED, not
+		// updated -- the stale check below is what forces that.
+		"security/zones/security-zone/address-book address-set+address-set": "nested elision: container head absorbs the run (identical at master)",
+		"security/address-book/global address-set+address-set":              "nested elision: container head absorbs the run (identical at master)",
+	}
+	sawSameLeaf := map[string]bool{}
+
+	// Leaves whose value the COMPILER DISCARDS, so no reader can distinguish two
+	// instances of them and the same-leaf comparison is degenerate by
+	// construction rather than by a narrow reader.
+	//
+	// `description` on both proposal types is declared in setSchema and admitted
+	// to the scope, but neither IKEProposal nor IPsecProposal has a Description
+	// field -- the value is parsed and dropped. This is the same shape
+	// schema_security.go already records for the address-set `description`
+	// (#3332): declared, accepted, unsupported at compile.
+	//
+	// NOT A WAIVER. An entry here must STILL be degenerate; if the field is ever
+	// wired the comparison becomes live and the stale check below fails, which
+	// is the signal to delete the entry and let the leaf be measured.
+	sameLeafUnobservable := map[string]string{
+		"security/ike/proposal description+description":   "IKEProposal has no Description field; value discarded at compile",
+		"security/ipsec/proposal description+description": "IPsecProposal has no Description field; value discarded at compile",
+	}
+	sawUnobservable := map[string]bool{}
+
 	checked := 0
 	for name, node := range optedIn {
 		c, ok := cases[name]
@@ -541,6 +681,314 @@ func TestPackedOptInHoldsForEveryLeafPair8768(t *testing.T) {
 			}
 		}
 	}
+	// SAME-LEAF PAIRS: two instances of ONE leaf.
+	//
+	// The loop above compares DISTINCT leaves and opens with `if a == b { continue }`,
+	// so a leaf was never compared against itself. That skip is exactly the
+	// defect class this guard exists for: one instance proves the statement is
+	// REACHABLE, and only two prove the RUN IS SPLIT. It is why this cell stayed
+	// green on both address books through the whole window in which they were
+	// folding a two-entry run into one and silently keeping only the first --
+	// it was measuring the axis that already worked.
+	//
+	// POPULATION: leaves that are `multi: true` or `args >= 2`. A leaf with
+	// args==1 and no multi consumes a fixed two tokens, so its boundary is not
+	// in question; the hazard is a multi leaf ABSORBING what follows it, or a
+	// wider arity making the boundary non-obvious to a one-instance fixture.
+	// Measured at the time of writing: 10 such leaves across 6 of the 10
+	// opted-in containers, out of 46 admitted leaves.
+	//
+	// A leaf in that population with no `second` fixture REDS, on the same terms
+	// as a missing `stmts` entry -- otherwise the population silently shrinks to
+	// whatever someone remembered.
+	sameChecked := 0
+	for name, node := range optedIn {
+		c, ok := cases[name]
+		if !ok {
+			continue
+		}
+		kw := containerKeywordOfPath8768(name)
+		var leaves []string
+		for leaf := range node.children {
+			if !compactNormalizeInScope(kw, leaf) {
+				continue
+			}
+			leaves = append(leaves, leaf)
+		}
+		sort.Strings(leaves)
+		for _, leaf := range leaves {
+			ln := node.children[leaf]
+			// POPULATION: every admitted leaf that CARRIES A VALUE.
+			//
+			// This was `multi || args >= 2`, on the argument that an args==1
+			// non-multi leaf consumes a fixed two tokens so "its boundary is not
+			// in question". That argument was WRONG, and wrong in the way this
+			// file's own header rejects for the distinct-pair loop: opting a
+			// container in is a claim about EVERY admitted leaf, and a claim
+			// needs no observed defect to require testing.
+			//
+			// It also hid a LIVE divergence. `address-set` is args==1, non-multi,
+			// and at the head that introduced this loop:
+			//
+			//	packed  global address-set s1 { address a1; } address-set s2 { ... }
+			//	          -> set:s1(a1)                     <- s2 SILENTLY LOST
+			//	braced  global { address-set s1 { ... } address-set s2 { ... } }
+			//	          -> set:s1(a1), set:s2(a1)
+			//
+			// which is verbatim the #8768 defect class. Reasoning about
+			// consumeNodeKeys' token accounting answered a narrower question than
+			// the comparison actually asks: the comparison runs packed-vs-braced
+			// end to end, through the splitter, the arity, the compiler's
+			// last-wins and the reader.
+			//
+			// args==0 flags are excluded because a second instance of a flag is
+			// TEXTUALLY IDENTICAL to the first -- degenerate by construction, and
+			// the liveness gate below would reject it anyway. That exclusion is
+			// about the fixture being expressible, not about the claim being
+			// uninteresting.
+			if ln == nil || (!ln.multi && ln.args < 1) {
+				continue
+			}
+			first, ok := c.stmts[leaf]
+			if !ok {
+				continue // already reported by the loop above
+			}
+			sec, ok := c.second[leaf]
+			if ok {
+				// The second statement must be an instance OF THIS LEAF. Nothing
+				// checked that, so a `second` naming a DIFFERENT leaf silently
+				// turned a same-leaf comparison into a duplicate of loop 1 while
+				// the summary line still counted it as same-leaf. Measured: two
+				// such entries dropped the merge-adjacent mutant's same-leaf
+				// kills from 10 to 8 with the printed count unchanged at 10.
+				if !strings.HasPrefix(sec, leaf+" ") && sec != leaf {
+					t.Errorf("container %q: second fixture for %q is %q, which is "+
+						"not an instance of that leaf -- this comparison is a "+
+						"DISTINCT-leaf pair wearing a same-leaf label, and the "+
+						"count cannot tell them apart (#8768)", name, leaf, sec)
+					sawSameLeaf[name+" "+leaf+"+"+leaf] = true
+					continue
+				}
+				if sec == first {
+					t.Errorf("container %q: second fixture for %q is IDENTICAL to "+
+						"the first (%q), so the run cannot distinguish a split "+
+						"from a swallow (#8768)", name, leaf, sec)
+					sawSameLeaf[name+" "+leaf+"+"+leaf] = true
+					continue
+				}
+			}
+			if !ok {
+				t.Errorf("container %q admits %q, which CARRIES A VALUE, but has "+
+					"no `second` fixture, so the packed spelling is only ever "+
+					"compared at ONE instance -- the spelling that cannot "+
+					"distinguish a split run from a swallowed one (#8768)",
+					name, leaf)
+				continue
+			}
+			packed := c.prefix + c.open + " " + first + " " + sec + ";" + c.closer
+			braced := c.prefix + c.open + " { " + first + "; " + sec + "; }" + c.closer
+			got, want := compile(packed, c.read), compile(braced, c.read)
+			sameChecked++
+
+			// LIVENESS, and it is not optional here. `got == want` is satisfied
+			// perfectly by BOTH arms failing, and by a second instance the
+			// reader never surfaces. Either makes this comparison green while
+			// measuring nothing -- the same both-arms-empty trap that makes a
+			// braced-vs-elided cell read as "no defect" or "value lost"
+			// depending only on how the assertion is phrased.
+			// Match the COMPILE sentinels specifically, not every "<...>" string:
+			// several readers legitimately return `<no gateway>` / `<no snmp>` /
+			// `<none>` when the object is absent. Treating those as "did not
+			// compile" would emit a diagnostic that sends the reader to the
+			// parser when the real answer is that the fixture built nothing --
+			// a wrong diagnostic being worse than a missing one.
+			// Screen BOTH arms. Screening only the braced one reports a packed
+			// fixture that failed to PARSE as `packed and braced DIFFER`, which
+			// sends the reader at the fold when the fault is in the fixture text
+			// -- a wrong diagnostic, which this file holds to be worse than a
+			// missing one. Reachable whenever a `second` value ends in `}`,
+			// because the builder appends an unconditional `;`.
+			if got == "<parse err>" || strings.HasPrefix(got, "<err ") {
+				sawSameLeaf[name+" "+leaf+"+"+leaf] = true
+				t.Errorf("container %q: the PACKED spelling for two instances of "+
+					"%q did not parse or compile (%s). That is a FIXTURE fault, "+
+					"not a fold divergence -- check the statement text before "+
+					"looking at the normalizer (#8768)", name, leaf, got)
+				continue
+			}
+			if want == "<parse err>" || strings.HasPrefix(want, "<err ") {
+				t.Errorf("container %q: the BRACED reference for two instances of "+
+					"%q did not compile (%s), so comparing it against the packed "+
+					"spelling proves nothing (#8768)", name, leaf, want)
+				sawSameLeaf[name+" "+leaf+"+"+leaf] = true
+				continue
+			}
+			// A reader that reports NOTHING is the other vacuous shape: both arms
+			// agree at "absent" and the comparison is satisfied without either
+			// spelling having produced an object.
+			if strings.HasPrefix(want, "<") {
+				t.Errorf("container %q: the BRACED reference for two instances of "+
+					"%q compiled but the reader reports %s, so both arms can agree "+
+					"at ABSENT and this comparison asserts nothing (#8768)",
+					name, leaf, want)
+				sawSameLeaf[name+" "+leaf+"+"+leaf] = true
+				continue
+			}
+			// The second instance must MOVE the reader's output. If one instance
+			// and two produce the same string, the fixture cannot distinguish a
+			// split run from a swallowed one no matter what the packed arm does.
+			bracedOne := c.prefix + c.open + " { " + first + "; }" + c.closer
+			if one := compile(bracedOne, c.read); one == want {
+				key := name + " " + leaf + "+" + leaf
+				if reason, ok := sameLeafUnobservable[key]; ok {
+					sawUnobservable[key] = true
+					sawSameLeaf[key] = true
+					t.Logf("#8768: %s is UNOBSERVABLE and not compared: %s", key, reason)
+					continue
+				}
+				t.Errorf("container %q: adding a SECOND instance of %q changes "+
+					"nothing the reader reports (%s), so this comparison is "+
+					"degenerate -- it would stay green if the packed spelling "+
+					"swallowed the second statement entirely. Give %q a second "+
+					"instance the reader distinguishes, or widen the reader "+
+					"(#8768)", name, leaf, one, leaf)
+				sawSameLeaf[name+" "+leaf+"+"+leaf] = true
+				continue
+			}
+			if got == want {
+				continue
+			}
+			key := name + " " + leaf + "+" + leaf
+			if reason, ok := sameLeafAdjudicated[key]; ok {
+				sawSameLeaf[key] = true
+				t.Logf("#8768: %s two-instance divergence is ADJUDICATED: %s", key, reason)
+				continue
+			}
+			t.Errorf("%s: packed and braced DIFFER for TWO INSTANCES of %q (#8768)\n"+
+				"  packed %s\n  braced %s\n"+
+				"A one-instance fixture cannot see this. If only the FIRST "+
+				"instance survives the packed spelling, the container folds a "+
+				"multi-statement run into one; if the two spellings disagree in "+
+				"some other way, establish WHICH before changing anything and "+
+				"record it in sameLeafAdjudicated with the measurement.",
+				name, leaf, got, want)
+		}
+	}
+	// A pair that was GATED OUT above (fixture fault, absent reader, degenerate
+	// second instance) was never compared, so it cannot be evidence that an
+	// adjudication is stale. Every bail-out marks sawSameLeaf for exactly that
+	// reason; without it the cell emitted TWO failures for one cause, the second
+	// asserting the spellings "now AGREE" when they had not been compared at all.
+	// RUNS OF THREE. Every comparison above builds a run of exactly TWO
+	// statements, and a splitter that handles two but not three passes all of
+	// them -- measured: `if len(out) > 2 { return [][]string{tail} }` at the tail
+	// of splitPackedStatements8768 leaves this cell AND the whole pkg/config
+	// suite green while `gateway g1 version v2-only local-address 192.0.2.2
+	// external-interface ge-0/0/0;` silently loses two of its three statements.
+	//
+	// Three is an ordinary operator spelling, and it needs no new fixture data:
+	// the containers that declare three or more admitted leaves already have
+	// statements for them.
+	runChecked := 0
+	for name, node := range optedIn {
+		c, ok := cases[name]
+		if !ok {
+			continue
+		}
+		kw := containerKeywordOfPath8768(name)
+		var leaves []string
+		for leaf := range node.children {
+			if !compactNormalizeInScope(kw, leaf) {
+				continue
+			}
+			if _, ok := c.stmts[leaf]; ok {
+				leaves = append(leaves, leaf)
+			}
+		}
+		sort.Strings(leaves)
+		if len(leaves) < 3 {
+			continue
+		}
+		for i := 0; i+2 < len(leaves); i++ {
+			a, b, d := leaves[i], leaves[i+1], leaves[i+2]
+			packed := c.prefix + c.open + " " + c.stmts[a] + " " + c.stmts[b] + " " + c.stmts[d] + ";" + c.closer
+			braced := c.prefix + c.open + " { " + c.stmts[a] + "; " + c.stmts[b] + "; " + c.stmts[d] + "; }" + c.closer
+			got, want := compile(packed, c.read), compile(braced, c.read)
+			runChecked++
+			if strings.HasPrefix(want, "<") || strings.HasPrefix(got, "<") {
+				continue // the two-statement loops already police fixture health
+			}
+			if got == want {
+				continue
+			}
+			if divergesByNestedElision[name+" "+a+"+"+b] ||
+				divergesByNestedElision[name+" "+b+"+"+d] ||
+				divergesByNestedElision[name+" "+a+"+"+d] {
+				continue // already registered at length two; not a new fact
+			}
+			t.Errorf("%s: a run of THREE statements diverges where the pairs do "+
+				"not: %q then %q then %q (#8768)\n  packed %s\n  braced %s\n"+
+				"A splitter that handles two statements and not three passes "+
+				"every other comparison in this cell.", name, a, b, d, got, want)
+		}
+	}
+	if runChecked == 0 {
+		t.Error("no three-statement run was built, so the N=3 axis is unmeasured " +
+			"even though this cell claims to cover it (#8768)")
+	}
+
+	// FIXTURE -> SCHEMA, the reverse direction. The container-level `cases` map
+	// is asserted against the schema in both directions; these leaf-level maps
+	// were not, so a `second` written for a leaf that is not admitted (or is
+	// misspelled) was silently ignored and the cell stayed green. That is the
+	// trap for whoever acts on a finding here: they add the fixture, it does
+	// nothing, and nothing says so.
+	for name, node := range optedIn {
+		c, ok := cases[name]
+		if !ok {
+			continue
+		}
+		kw := containerKeywordOfPath8768(name)
+		for _, m := range []struct {
+			which string
+			fx    map[string]string
+		}{{"stmts", c.stmts}, {"second", c.second}} {
+			var keys []string
+			for leaf := range m.fx {
+				keys = append(keys, leaf)
+			}
+			sort.Strings(keys)
+			for _, leaf := range keys {
+				if node.children[leaf] == nil {
+					t.Errorf("container %q has a %s fixture for %q, which is not a "+
+						"child of that container in the schema -- the fixture is "+
+						"silently unused (#8768)", name, m.which, leaf)
+					continue
+				}
+				if !compactNormalizeInScope(kw, leaf) {
+					t.Errorf("container %q has a %s fixture for %q, which is NOT "+
+						"admitted to the compact-normalize scope -- the fixture is "+
+						"silently unused (#8768)", name, m.which, leaf)
+				}
+			}
+		}
+	}
+
+	for key, reason := range sameLeafUnobservable {
+		if !sawUnobservable[key] {
+			t.Errorf("%q is registered as UNOBSERVABLE (%s) but its two instances "+
+				"are now distinguishable, so the leaf CAN be compared and the "+
+				"registration is hiding it. Delete the entry (#8768)", key, reason)
+		}
+	}
+	for key, reason := range sameLeafAdjudicated {
+		if !sawSameLeaf[key] {
+			t.Errorf("%q is adjudicated as a two-instance divergence (%s) but the "+
+				"two spellings now AGREE, so the entry is stale and is hiding a "+
+				"comparison nothing checks. Delete it (#8768)", key, reason)
+		}
+	}
+
 	for key := range divergesByNestedElision {
 		if !sawDivergence[key] {
 			t.Errorf("%q is registered as diverging by NESTED ELISION but the two "+
@@ -555,7 +1003,10 @@ func TestPackedOptInHoldsForEveryLeafPair8768(t *testing.T) {
 			"anything (#8768)")
 	}
 	t.Logf("#8768: %d opted-in container(s), %d ordered leaf pairs compared, "+
-		"%d registered as diverging by nested elision", len(optedIn), checked, len(divergesByNestedElision))
+		"%d registered as diverging by nested elision; %d same-leaf (two-instance) "+
+		"comparisons, %d adjudicated as correctly not splitting, %d unobservable; "+
+		"%d three-statement runs", len(optedIn), checked, len(divergesByNestedElision),
+		sameChecked, len(sameLeafAdjudicated), len(sameLeafUnobservable), runChecked)
 }
 
 // containerKeywordOfPath8768 returns the keyword the scope predicate is asked
