@@ -79,10 +79,35 @@ var dupConservationSkipped8436 = []string{
 	//
 	// REFUSED at commit — duplicate policy name in a zone pair is a hard reject
 	// (#3473: the duplicate shares a name-keyed hit counter).
+	//
+	// #8752: THAT REASON IS A STRICT-PATH FACT, AND THIS CENSUS GOVERNS BOTH
+	// PATHS. `Store.Load` and `Store.SyncApply` compile leniently — which is the
+	// entire point of them, since they read configurations the operator did not
+	// just author — and the lenient path does NOT refuse. Measured:
+	//
+	//	security policies from-zone <a> <b> <c> policy   strict REJECTED, lenient ACCEPTED -> 2 policies
+	//	security policies global policy                  strict REJECTED, lenient ACCEPTED -> 2 policies
+	//
+	// So both entries are exempted here on a rejection that does not happen on
+	// the path where the defect lives, and the duplicate WINS: the operator's
+	// policy keeps its match criteria while the spurious one contributes a
+	// match-less deny. #8752 tracks the fold itself.
+	//
+	// The entries STAY — the census genuinely cannot synthesize these, so
+	// skipping is right — but the REASON is annotated rather than left standing,
+	// because a skip with a stated reason reads as settled and nobody
+	// re-derives it. A census governing two compile paths cannot take an
+	// exception justified on only one; "REFUSED at commit" is unanswerable for
+	// the tolerant path by construction.
 	"security policies from-zone xpfname xpfname xpfname policy",
 	"security policies global policy",
 	// REFUSED at commit — "duplicate expectation \"any\" conflicts with
 	// \"balanced\"".
+	// #8752: re-checked on the LENIENT path too, and this one is correctly
+	// skipped — it is refused on BOTH paths (lenient rejects it as well), so the
+	// exemption does not rest on a strict-path-only fact. Recorded so the
+	// re-check is visible: two of the three entries in this group were wrong and
+	// this one was not, which is the difference a reader needs.
 	"class-of-service fairness rss-expectation interface xpfname queue",
 	// CONSERVES. The census fixture omits the required `match rpm-probe`; with a
 	// complete config the duplicate compiles identically to the merged form.
