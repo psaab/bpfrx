@@ -1,6 +1,6 @@
 # Plan of action — muse-spark reviews 008 + 009 (#8865)
 
-- **Revision:** r3 (revised after Codex r2 returned PLAN-REVISE: 2 of 5 resolved)
+- **Revision:** r4 (revised after Claude SMR r2 returned PLAN-REVISE on r3)
 - **Base:** `b24e26d3b` (master at drafting)
 - **Reports:** `muse-spark-review-008` (109 findings across 5 rounds), `muse-spark-review-009` (4 High). 009 excludes 007 and 008, so the three are disjoint.
 - **Status:** revised. Verdicts r1: Claude SMR PLAN-REVISE, Codex PLAN-REVISE. r2: Codex PLAN-REVISE (objections 3 and 4 RESOLVED; 1, 2, 5 carried here). AGY infra-blocked throughout (2 documented retries, known `--print`/`--print-timeout` defect) — 2-of-3 exception applies.
@@ -42,10 +42,20 @@ changes that closes them."**
 
 ### 2b. The 15 Highs, derived and dispositioned (r3)
 
-**Derivation.** 008: `## HIGH findings (5)` = H1-H5, plus round sections
-R2-D2 `+1`, R2-D3 `+2`, R2-D4 `+2`, R3-E6 `+1` = **11**, which is what 008's own
-header says. 009's Outcome table lists **4**. **Total 15.** Every High now has a
-row; nothing is "batched".
+**Derivation (r4, corrected — the r3 derivation was arithmetic over quoted
+headers).** r3 derived eleven as `5 + (1+2+2+1)`, every term of which is a
+**section-header count** — the same artifact class §7 warns against. It corrected
+a quoted count by quoting six more and adding them.
+
+**The sound derivation counts THINGS, not headers.** `H1` … `H11` exist as
+literal High-labelled IDs in 008's body (`**H6 (D2-F2, High)**`, `**H9 (D4-F1,
+High)**`, …). **Eleven distinct labelled IDs**, robust to every header being
+wrong. 009's Outcome table names its four by ID (`PHA-001`, `PHA-002`, `DBK-001`,
+`CSA-R-CONFIGSTORE-002`). **Total 15, all fifteen named in the table below.**
+
+The header arithmetic happens to agree, and it is kept only as the **weaker
+cross-check** — two readings of one authored summary layer are one channel, not
+two. Every High has a row; nothing is "batched".
 
 | # | finding | class | disposition |
 |---|---|---|---|
@@ -56,10 +66,10 @@ row; nothing is "batched".
 | 008 H7 | routing-instance tail with `routing-options`/`protocols` drops | packed fold | §5 step 3 |
 | 008 H8 | elided BGP group `peer-as`-first drops ENTIRE neighbor set | packed fold | §5 step 3 |
 | 008 H9 | REGRESSION from #8793: modifier-first `then` multi-tail | packed fold | §5 step 3 |
-| 008 H10 | multi-statement `from` headed by unadmitted `next-header` | packed fold | §5 step 3 |
+| 008 H10 | multi-statement `from` headed by unadmitted `next-header` | packed fold **+ admission (DUAL)** | §5 step 3 **and** step 3b |
 | 008 H11 | elided `family inet` tail keeps first statement only | packed fold | §5 step 3 |
 | 008 H4 | commit persists a config the boot loader refuses | commit/load asymmetry | §5 step 1 |
-| 009 CSA-R-CONFIGSTORE-002 | commit-confirmed writes a same-build-unreadable recovery record | commit/load asymmetry | §5 step 1 |
+| 009 CSA-R-CONFIGSTORE-002 | commit-confirmed writes a same-build-unreadable recovery record | commit/load asymmetry — **PROVISIONAL** | §5 step 1 (adjudicate first) |
 | 009 PHA-001 | DHCP `SyncLease` clamps a wire count and allocates it | wire-count allocation | §5 step 2 |
 | 008 M17 | `decodeIPsecSAPayload` unbounded `Split` (Medium, same class) | wire-count allocation | §5 step 2 |
 | 008 H5 | routing-instance `mgmt` collides with hardcoded mgmt VRF | reserved-name collision | §5 step 4 |
@@ -67,6 +77,38 @@ row; nothing is "batched".
 | 009 DBK-001 | peer-reboot classifiers retire the corpse, never re-prime | **residue** | §5 step 5 |
 
 **Two things this derivation changed, neither of which was visible at r2:**
+
+0. **(r4) The class assignment above was re-derived BY DISCRIMINATOR, because
+   r3 made it from the findings' section TITLES** — and a title is metadata about
+   a finding in exactly the way a file path is metadata about a defect. **r3
+   committed §5b's own defect inside the revision that fixed it.** H10 is the
+   counterexample: its title's load-bearing phrase is *declared-but-unadmitted*,
+   which reads as the **admission** class, and a title-router could reasonably
+   place it there.
+
+   Adjudicated against the stated discriminator — *does the tail fold to one
+   statement?* — the bodies decide it, and they decide it the same way:
+
+   | finding | body evidence |
+   |---|---|
+   | H9 | "folds to one child, `discard` buried, `Action=""`"; fix: "opt `then` into `packedStatements`" |
+   | H10 | "`packedBodyChildren` chains statements … whole body discarded"; fix: "harden `packedBodyChildren`" |
+   | H11 | "keeps the first statement only"; fix: "opt `inet`/`inet6` into `packedStatements`" |
+
+   **The claim was right and the evidence was the wrong kind** — the hardest
+   version to catch, because the conclusion survives verification and so never
+   asks to be re-derived. **Two facts the title pass could not have produced:**
+
+   - **H10 is DUAL-CLASS.** Its own fix line reads *"admit (`from`,`next-header`)
+     **AND** harden `packedBodyChildren`"*. **Fixing either alone leaves it
+     live**, so it is filed under two steps, not one. A finding needing two
+     remedies filed under one is precisely how a landed partial fix removes the
+     reason anyone looks again.
+   - **H9 and H10 are ORDER-DEPENDENT IN OPPOSITE DIRECTIONS.** H9: *"Reverse
+     order never folds."* H10: *"Reversed order strict-REJECTS — same leaf,
+     opposite verdicts by order."* A fixture at one statement order proves
+     nothing about the other, and an invariant assertion cannot see order at all.
+     **§6 now requires both orders per member.**
 
 1. **Nine of 008's eleven Highs are ONE class.** H6-H11 are all multi-statement
    packed-fold / brace-elision losses — ipsec gateway, routing-instance, BGP
@@ -76,13 +118,22 @@ row; nothing is "batched".
    campaign's own #8793**. This is the strongest available argument for Path B,
    and it is stronger than the argument r2 actually made — which was built on the
    wire-count pair because that was the class I had enumerated.
-2. **008 H4 and 009 CSA-R-CONFIGSTORE-002 are the same mechanism found
-   independently by two reviewers** — commit accepts a record that a subsequent
-   read refuses. That is the wire-count class's exact signature (§3: two
+2. **008 H4 and 009 CSA-R-CONFIGSTORE-002 are PROVISIONALLY the same mechanism,
+   found independently by two reviewers** — commit accepts a record that a
+   subsequent read refuses. *(r4: r3 stated this as established and spent it.
+   The evidence is a shared **shape**; the class discriminator has not been RUN
+   against CSA-R. H4's mechanism is a size ceiling on the read side
+   (`bounded_read.go`) with no gate in `commitWithDescriptionLocked`; CSA-R's is
+   a **same-build-unreadable** record, and "same-build" does not obviously reduce
+   to a size ceiling.* **By this plan's own §5b that makes CSA-R a routed
+   candidate, not an adjudicated member.** Step 1 adjudicates it before relying
+   on it, and **if it fails, the reported residue is 3 of 15, not 2** — which
+   matters because the residue is the number this plan nominates as its honest
+   output.)* That is the wire-count class's exact signature (§3: two
    reviewers, one member each, neither finding both), arriving in a second class
-   before this plan finished being written. **It also means H4's verification in
-   step 1 is not a single-instance check** — it has a sibling to check against,
-   which is a stronger instrument than either finding alone.
+   before this plan finished being written. **If it holds, H4's verification in step 1 gains a
+   sibling to check against** — a stronger instrument than either finding alone.
+   That benefit is contingent on the adjudication, and step 1 must not assume it.
 
 **Two Highs are residue, and are named as residue rather than absorbed.**
 009 PHA-002 (HA strict-validation origin gating) and DBK-001 (peer-reboot session
@@ -284,6 +335,12 @@ third that had been disqualified by hand.
      as cells.
 4. **H5 reserved names** — enumerate hardcoded infrastructure names before fixing
    `mgmt` alone.
+3b. **(r4) The admission half of H10** — `(from, next-header)` is *declared but
+   unadmitted*, and admitting it is a separate remedy from hardening
+   `packedBodyChildren`. **Both are required; neither alone closes H10.** This
+   step belongs to the same lane as step 3 but is a distinct cell, so that a
+   green on the fold does not read as a green on the admission.
+
 5. **The residue — 009 PHA-002 and 009 DBK-001 — and then the remaining ~98.**
    The two residue Highs are named in §2b with their mechanisms; they belong to no
    enumerated class and get individual adjudication under §5b(b), not batching.
@@ -354,6 +411,10 @@ The r1 defect was scheduling ~104 findings as one step. This replaces it with a
 - **Liveness** beside every equality assertion.
 - Both elision depths where the class is elision-shaped; two instances where the
   leaf is `multi:true`.
+- **(r4) BOTH STATEMENT ORDERS for every packed-fold member.** H9 and H10 are
+  order-dependent in opposite directions — one never folds reversed, the other
+  strict-REJECTS reversed. **A cell at one order passes against the other order's
+  defect**, and an invariant assertion cannot see order at all.
 - `Store.Load` must still accept everything it accepts today.
 
 ## 7. Risks
