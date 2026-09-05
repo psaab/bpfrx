@@ -13,9 +13,33 @@ import (
 //
 // Regenerate ONLY when you have classified the diff. Lines REMOVED mean sites
 // you fixed; lines ADDED mean compact-blind readers you introduced, and adding
-// them here instead of fixing them converts the gate into an allowlist. The
-// PR 2 normalizer should drive this file to zero data lines, and the diff is
-// the evidence for that claim.
+// them here instead of fixing them converts the gate into an allowlist.
+//
+// THE GOAL IS NO LONGER ZERO DATA LINES, and #8690 retired that target
+// deliberately rather than by giving up on it. The original plan of record said
+// "the PR 2 normalizer should drive this file to zero data lines, and the diff
+// is the evidence for that claim". It was right when every remaining line was a
+// compact-blind reader waiting to be fixed. It is now false, and dangerously so:
+// the large majority of what remains must NEVER be normalized —
+//
+//	partial      something already CONSUMES part of the tail, so truncating it
+//	             removes a value that is read. Forbidden to every scope by
+//	             TestNormalizerScopeNeverCoversAPartialSite8690.
+//	gate         normalizing makes a configuration the box REFUSES today start
+//	             committing clean.
+//	hazard       normalizing breaks documented shipped behaviour (the chassis
+//	             `packedTail` opt-in the HA config depends on).
+//
+// A target that cannot be met does not sit idle. It reads as unfinished work,
+// and the only way to "finish" it is to normalize the sites the guards exist to
+// protect — so the number would eventually argue against the guards.
+//
+// The goal is now the ARTIFACT, not the count:
+// testdata/compact_block_permanent_exclusions_8690.txt classifies every
+// remaining line with its class and the measurement behind it, and
+// permanent_exclusions_8690_test.go asserts set-equality with this file in both
+// directions. A remaining count that is entirely accounted for there is a
+// SUCCESS state, not a backlog.
 //
 //	XPF_GEN_2419=1 go test -run TestRegenerateCompactBlockInventory2419 ./pkg/config/
 //
@@ -28,6 +52,20 @@ import (
 const inventoryNotes = `#
 # NOTES (edit these in compact_block_inventory_regen_2419_test.go, not in the
 # generated file — the generator rewrites the header and would drop them).
+#
+# READ THIS BEFORE READING THE COUNT (#8690). A line here means the site
+# DIVERGES. It does NOT mean the site may be normalized, and by the end of the
+# #8690 sweep those are almost disjoint questions: the large majority of what
+# remains must NEVER be normalized — "partial" sites whose tail something
+# already consumes, sites where normalizing disarms a commit gate, and the
+# chassis pair that breaks the shipped HA config.
+#
+# So this count is NOT a backlog and the target is NOT zero. Every remaining
+# line is classified, with the measurement behind it, in
+# testdata/compact_block_permanent_exclusions_8690.txt; the register is asserted
+# for set-equality against this file in both directions, so neither can drift.
+# If you are looking for available work, read the register's "open" class rather
+# than this file's line count.
 #
 # #6940 raised the checked count 546 -> 547 and added
 # ` + "`interfaces xpfname aggregated-ether-options minimum-links`" + `. That site
