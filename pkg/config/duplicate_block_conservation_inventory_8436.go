@@ -89,9 +89,35 @@ var dupConservationSkipped8436 = []string{
 	//	security policies global policy                  strict REJECTED, lenient ACCEPTED -> 2 policies
 	//
 	// So both entries are exempted here on a rejection that does not happen on
-	// the path where the defect lives, and the duplicate WINS: the operator's
-	// policy keeps its match criteria while the spurious one contributes a
-	// match-less deny. #8752 tracks the fold itself.
+	// the path where the defect lives. The operator's policy keeps its match
+	// criteria and the spurious one is a match-less deny -- but the duplicate
+	// does NOT "win", and the harm is not the one that reading implies.
+	// Measured (TestTheDuplicatePolicyPoisonsTheSnapshot8752):
+	//
+	//	policy[0] src=[10.0.0.0/8] dst=[any] app=[any] permit  dropped=false
+	//	policy[1] src=[]           dst=[]    app=[]    deny    dropped=TRUE
+	//
+	// The spurious policy sits SECOND, so it never wins a first-match
+	// evaluation; an all-empty match reads as match-ANY, which puts a deny-all
+	// exactly where the zone pair already has an implicit default-deny. On its
+	// own that is close to inert.
+	//
+	// THE OPERATIVE HARM IS `LenientContentDropped`. compilePolicy sets it
+	// (compiler_security_policy.go:413) because the tolerant path accepted the
+	// policy only by dropping a required match dimension, and
+	// policies_lower.go:194 then poisons the rule with the `__unsupported__`
+	// application sentinel SO THAT the Rust integrity preflight rejects the
+	// WHOLE SNAPSHOT -- previous-good retained, fresh-boot default-deny. The
+	// consequence is therefore not an altered policy set that an operator could
+	// read in `show`: it is that the operator's ENTIRE configuration does not
+	// load. On a fresh boot that is a blackout.
+	//
+	// Stated exactly because the two readings prescribe different fixes. "The
+	// duplicate wins" invites making the FIRST occurrence authoritative, which
+	// would leave LenientContentDropped set and the snapshot still poisoned.
+	// Folding the occurrences into one policy carrying the operator's criteria
+	// is what clears the flag, and clearing the flag is what makes the config
+	// load at all. #8752 tracks the fold itself.
 	//
 	// The entries STAY — the census genuinely cannot synthesize these, so
 	// skipping is right — but the REASON is annotated rather than left standing,
