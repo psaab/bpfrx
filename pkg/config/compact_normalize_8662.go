@@ -1238,6 +1238,13 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		// admitting `system login` would turn a loud #6662 rejection into a
 		// silent acceptance, which is a regression wearing the shape of a fix).
 		"protocols bgp",
+		// #8879 batch 2. Same rule as batch 1: admitted only after measuring the
+		// elided spelling SILENT on both paths, with the braced arm asserted LIVE
+		// against an EMPTY config rather than merely non-nil.
+		"chassis device-map",
+		"protocols ospf",
+		"security address-book",
+		"system ntp",
 		"security ike",
 		"security nat",
 		"system syslog",

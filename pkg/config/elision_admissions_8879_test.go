@@ -58,6 +58,42 @@ func TestAdmittedPairsCompileLikeBraced8879(t *testing.T) {
 			`security { nat { source { pool P { address 10.0.0.1/32; } } } }`,
 			`security nat { source { pool P { address 10.0.0.1/32; } } }`,
 			func(c *Config) string { return fmt.Sprintf("pools=%d", len(c.Security.NAT.SourcePools)) }},
+		// #8879 batch 2. Values are chosen NOT to equal any compiled default:
+		// a fixture whose value IS the fallback reads CLEAN WHILE BROKEN, because
+		// losing the value and keeping it produce the same compiled result. That
+		// trap is invisible in exactly the way a dead reference arm is, and the
+		// braced arm is LIVE throughout it.
+		{"security address-book",
+			`security { address-book { global { address a1 203.0.113.0/24; } } }`,
+			`security address-book { global { address a1 203.0.113.0/24; } }`,
+			func(c *Config) string {
+				if c.Security.AddressBook == nil {
+					return "<nil>"
+				}
+				return fmt.Sprintf("addrs=%d", len(c.Security.AddressBook.Addresses))
+			}},
+		{"protocols ospf",
+			`protocols { ospf { area 0.0.0.7 { interface ge-0/0/0.0 { metric 42; } } } }`,
+			`protocols ospf { area 0.0.0.7 { interface ge-0/0/0.0 { metric 42; } } }`,
+			func(c *Config) string {
+				if c.Protocols.OSPF == nil {
+					return "<nil>"
+				}
+				return fmt.Sprintf("areas=%d", len(c.Protocols.OSPF.Areas))
+			}},
+		{"chassis device-map",
+			`chassis { device-map { interface ge-0/0/5 { pci 0000:07:00.3; } } }`,
+			`chassis device-map { interface ge-0/0/5 { pci 0000:07:00.3; } }`,
+			func(c *Config) string {
+				if c.Chassis.DeviceMap == nil {
+					return "<nil>"
+				}
+				return fmt.Sprintf("entries=%d", len(c.Chassis.DeviceMap.Entries))
+			}},
+		{"system ntp",
+			`system { ntp { server 198.51.100.23; } }`,
+			`system ntp { server 198.51.100.23; }`,
+			func(c *Config) string { return fmt.Sprintf("servers=%d", len(c.System.NTPServers)) }},
 		{"system syslog",
 			`system { syslog { host 10.0.0.9 { any any; } } }`,
 			`system syslog { host 10.0.0.9 { any any; } }`,
@@ -82,10 +118,26 @@ func TestAdmittedPairsCompileLikeBraced8879(t *testing.T) {
 			}
 			// LIVENESS, fatal: the braced reference must DELIVER something, or
 			// "elided == braced" is agreement between two empty results.
+			// LIVENESS, fatal — this is a FIXTURE check, not a property
+			// assertion, so a fatal is correct here: nothing below can mean
+			// anything if the reference delivered nothing.
+			//
+			// Asserted against an EMPTY config rather than merely non-nil. A
+			// fixture whose value equals the compiled DEFAULT is live, its
+			// comparison is real, and the row still reads clean while broken —
+			// losing the value produces the same result as keeping it. The
+			// values above are chosen so that cannot happen.
 			braced := read(c.braced)
 			if braced == "<nil>" || braced == "" {
 				t.Fatalf("braced reference delivered %q — the comparison below "+
 					"would be vacuous", braced)
+			}
+			if empty, _ := CompileConfigLenient(&ConfigTree{}); empty != nil && c.get(empty) == braced {
+				t.Fatalf("%s: the braced reference compiles to %q, which is what an "+
+					"EMPTY config produces. Losing the value would give the same "+
+					"answer as keeping it, so this row cannot detect the drop it "+
+					"exists to detect — pick a value that is not the default.",
+					c.pair, braced)
 			}
 			if elided := read(c.elided); elided != braced {
 				t.Errorf("%s: elided compiles to %q but braced compiles to %q. "+
