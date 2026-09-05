@@ -524,6 +524,7 @@ fn tx_counters() -> WorkerTxCounters {
     WorkerTxCounters {
         pending_direct_tx_packets: 0,
         pending_copy_tx_packets: 0,
+        neighbor_retry_cross_umem_copies: 0,
         pending_in_place_tx_packets: 0,
         pending_in_place_vlan_push_desc_packets: 0,
         pending_in_place_vlan_pop_desc_packets: 0,

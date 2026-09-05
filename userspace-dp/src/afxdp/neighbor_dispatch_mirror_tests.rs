@@ -544,6 +544,31 @@
             BindingWorker::new_for_mirror_test(1, 0, 22, 0),
             BindingWorker::new_for_mirror_test(2, 0, 33, 0),
         ];
+        // §8916 made this fixture's UMEM assumption LOAD-BEARING, so it is now
+        // stated instead of inherited.
+        //
+        // `new_for_mirror_test` gives each binding its own allocation. §8916
+        // made a cross-binding forward to a target that does NOT share the
+        // ingress UMEM fall back to a copy, because a `PreparedTxRequest`
+        // carries an offset into the ingress UMEM and that offset is
+        // meaningless in a different one. This cell is about MIRROR IDENTITY
+        // -- that the primary forward does not inherit `mirror_clone` -- and
+        // it reads that off the prepared queue, so it needs the shared-UMEM
+        // case to have a prepared request to read at all.
+        //
+        // Sharing the allocation keeps the cell measuring what it was written
+        // to measure. The cross-UMEM behaviour it no longer exercises is
+        // covered directly by
+        // `neighbor_retry_foreign_umem_falls_back_to_a_copy_8916` and its
+        // shared-UMEM control.
+        // ONLY the forward target (index 1) shares. The MIRROR target (index
+        // 2) must keep its own allocation: this cell reads the mirrored frame
+        // back out of `bindings[2].umem` and asserts it holds PRE-rewrite L2
+        // bytes. Sharing that one too makes the mirror read the same memory
+        // the in-place rewrite just mutated, and the pre-rewrite assertion
+        // fails against post-rewrite bytes -- measured, not reasoned: sharing
+        // all three reds this cell with the rewritten MACs in `left`.
+        bindings[1].umem = bindings[0].umem.clone();
         let original_frame = build_ipv4_test_packet(0);
         // SAFETY: single-threaded test over a UMEM created just above; no
         // other borrow into [0, len) exists and the mutable slice is
@@ -992,5 +1017,178 @@
             dwell.snapshot().count,
             0,
             "a timed-out (never-resolved) packet must NOT record a dwell sample",
+        );
+    }
+
+    // =======================================================================
+    // #8916: the deferred retry must not push an INGRESS-UMEM offset onto a
+    // binding that does not share that UMEM.
+    // =======================================================================
+
+    /// Two bindings: [0] is the ingress (ifindex 11), [1] is the cross-binding
+    /// egress target the decision's `tx_ifindex: 22` resolves to.
+    ///
+    /// `share_umem` decides whether [1] holds a CLONE of [0]'s `WorkerUmem`
+    /// (same `Rc`, so `shares_allocation_with` is true) or its own allocation.
+    /// That single variable is the whole subject of these cells, so nothing
+    /// else differs between the two arms.
+    fn cross_binding_fixture_8916(share_umem: bool) -> Vec<BindingWorker> {
+        let mut bindings = vec![
+            BindingWorker::new_for_mirror_test(0, 0, 11, 0),
+            BindingWorker::new_for_mirror_test(1, 0, 22, 0),
+        ];
+        if share_umem {
+            bindings[1].umem = bindings[0].umem.clone();
+        }
+        let frame = build_ipv4_test_packet(0);
+        let meta = pending_neighbor_meta(frame.len());
+        // The retry rewrites the frame IN PLACE, so the bytes have to actually
+        // be in the ingress UMEM -- `pending_neigh_fixture_7156` never needed
+        // this because its tests bail before the rewrite. Without it
+        // `rewrite_forwarded_frame_in_place` returns None and the packet is
+        // recycled to fill, which reads exactly like "the guard dropped it".
+        {
+            // SAFETY: `slice_mut_unchecked` takes `&self` by design -- it is the
+            // same seam the production sweep writes through, which also holds
+            // only a shared `&MmapArea`. Single-threaded test, no other borrow
+            // of this extent is live, and the length is bounds-checked inside.
+            let area = bindings[0].umem.area();
+            unsafe { area.slice_mut_unchecked(0, frame.len()) }
+                .expect("umem slice for the test frame")
+                .copy_from_slice(&frame);
+        }
+        let nh = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7));
+        push_pending(
+            &mut bindings[0],
+            PendingNeighPacket {
+                addr: 0,
+                desc: XdpDesc {
+                    addr: 0,
+                    len: frame.len() as u32,
+                    options: 0,
+                },
+                meta,
+                decision: resolved_neighbor_decision(nh),
+                flow_key: None,
+                queued_ns: 1_000_000_000,
+                probe_attempts: 0,
+            },
+        );
+        bindings
+    }
+
+    fn sweep_two_8916(bindings: &mut [BindingWorker], now_ns: u64) {
+        let forwarding = ForwardingState::default();
+        let lookup = WorkerBindingLookup::from_bindings(bindings);
+        let mirror_targets = MirrorTargetMap::default();
+        let mut shared_recycles = Vec::new();
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+        // The pending-neigh key is (egress_ifindex, next_hop) -- 80, not the
+        // tx_ifindex 22 the BINDING lookup uses. Getting this wrong leaves the
+        // packet pending and the sweep dispatches nothing, which is how the
+        // first version of these cells failed BOTH arms including the control.
+        dynamic_neighbors.insert(
+            (
+                resolved_neighbor_decision(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)))
+                    .resolution
+                    .egress_ifindex,
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)),
+            ),
+            NeighborEntry {
+                mac: [0x02, 0, 0, 0, 0, 0x22],
+            },
+        );
+        let area = bindings[0].umem.area() as *const MmapArea;
+        let (left, rest) = bindings.split_at_mut(0);
+        let (binding, right) = rest.split_first_mut().expect("binding");
+        retry_pending_neigh(
+            binding,
+            left,
+            0,
+            right,
+            &lookup,
+            &mirror_targets,
+            &forwarding,
+            &dynamic_neighbors,
+            None,
+            now_ns,
+            // SAFETY: same contract as sweep_7156 above.
+            unsafe { &*area },
+            &mut shared_recycles,
+            None,
+            &mut BatchCounters::default(),
+        );
+    }
+
+    /// The CONTROL. When the two bindings DO share a UMEM, the prepared
+    /// (zero-copy) path is still taken — the fix must not degrade the case it
+    /// is not about.
+    ///
+    /// Without this, "the guard fires" is satisfied by a guard that always
+    /// fires, which would turn every cross-binding retry into a copy and
+    /// silently cost the zero-copy path it exists to protect.
+    #[test]
+    fn neighbor_retry_shared_umem_still_uses_the_prepared_path_8916() {
+        let mut bindings = cross_binding_fixture_8916(true);
+        sweep_two_8916(&mut bindings, 1_300_000_000);
+
+        assert_eq!(
+            bindings[1].tx_pipeline.pending_tx_prepared.len(),
+            1,
+            "CONTROL FAILED: with a SHARED UMEM the cross-binding retry must still \
+                 submit a prepared offset. If this is 0 the #8916 guard is rejecting \
+                 the case it was never about, and the copy assertion in the sibling \
+                 cell proves nothing about UMEM ownership"
+        );
+        assert_eq!(
+            bindings[1].tx_pipeline.pending_tx_local.len(),
+            0,
+            "CONTROL: a shared-UMEM target must not take the copy fallback"
+        );
+        assert_eq!(
+            bindings[1].tx_counters.neighbor_retry_cross_umem_copies, 0,
+            "CONTROL: no cross-UMEM copy should be counted when the UMEM is shared"
+        );
+    }
+
+    /// The fix. With SEPARATE UMEMs — `shared_umem` mode `off`, a supported
+    /// configuration — the prepared offset must NOT be submitted.
+    #[test]
+    fn neighbor_retry_foreign_umem_falls_back_to_a_copy_8916() {
+        let mut bindings = cross_binding_fixture_8916(false);
+        assert!(
+            !bindings[1].umem.shares_allocation_with(&bindings[0].umem),
+            "NON-VACUITY: the two fixture bindings must NOT share a UMEM, or this \
+                 cell is measuring the shared case under a different name"
+        );
+
+        sweep_two_8916(&mut bindings, 1_300_000_000);
+
+        assert_eq!(
+            bindings[1].tx_pipeline.pending_tx_prepared.len(),
+            0,
+            "#8916: a PreparedTxRequest carrying an offset into binding 0's UMEM was \
+                 pushed onto binding 1, which does not share that allocation. \
+                 `WorkerBindingLookup::target_index` resolves purely by (egress_ifindex, \
+                 ingress_queue_id) with a first_by_if fallback — no UMEM or ownership \
+                 term — so a target on a different NIC is an ordinary result. Under \
+                 `shared_umem` mode `off` that offset does not address the same frame in \
+                 the target's UMEM, or any valid frame. The normal dispatcher guards \
+                 exactly this and falls back to the single-copy path; this deferred \
+                 retry path was the one exit that did not."
+        );
+        assert_eq!(
+            bindings[1].tx_pipeline.pending_tx_local.len(),
+            1,
+            "#8916: the frame must fall back to a COPY on the target rather than be \
+                 dropped. Its neighbor has just resolved and the frame is already \
+                 rewritten, so recycling it to fill would discard a deliverable packet \
+                 on a path that is already off the fast path"
+        );
+        assert_eq!(
+            bindings[1].tx_counters.neighbor_retry_cross_umem_copies, 1,
+            "#8916: the cross-UMEM copy must be counted. Without it, a deployment \
+                 crossing a UMEM boundary on every retry looks identical to one that \
+                 never does, and the fallback cannot be distinguished from dead code"
         );
     }
