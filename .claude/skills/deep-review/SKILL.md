@@ -1,261 +1,204 @@
 ---
 name: deep-review
-description: Run a full-coverage defensive security review with worktree-isolated subagents — Rust dataplane + Go control plane — single final file at /tmp/<model>-review-NNN.md, generic work-dirs, freshness gate against origin/master.
+description: Review firewall source and validation coverage, prioritize consequential defects, and produce a private evidence-backed report. Supports full, focused, and change-based reviews with isolated worktrees.
 user-invocable: true
 ---
 
-# Deep Review Skill — Paladin Coverage Campaign
+# Deep review
 
-Run this as a COVERAGE CAMPAIGN, not a best-findings pass. You are the COORDINATOR. Fan the review out across the whole codebase using metacode subagents — one subagent per (expertise-area, file-batch) — so that each subagent works with a SMALL context and DEEP domain focus, then merge into one report.
+Prioritize consequential defects in supported firewall behavior. Choose review
+work using impact, reachability, change history, and uncertainty. Distinguish
+inventory coverage, refuted hypotheses, and verified behavior. Preserve unresolved
+high-impact questions, and give every confirmed finding an acceptance criterion
+for its fix. File counts and finding counts are bookkeeping, not success targets.
 
-This skill is the successor to `paladin-review.txt` — it keeps the worktree-isolated, single-final-file contract (repo-agnostic) and adds argument support for extra context.
+Read [the shared review contract](references/review-contract.md) before discovery
+or triage. It owns severity, evidence, dispositions, report fields, and completion
+criteria for both this skill and `review-triage`.
 
-## Arguments
+## Scope and modes
 
-- `/deep-review` — full coverage, default focus (core firewall behavior: zone policies, global policies, host-inbound, application matching, default deny/permit + VRRP/HA cold-boot, dataplane int-truncation, DDNS/observability resource safety)
-- `/deep-review focus on zone policies only` — extra focus context is appended as a bias line, does NOT reduce coverage — all areas still reviewed
-- `/deep-review --area A3 --focus "config compiler integer truncation"` — area filter (optional) + focus string
-- `/deep-review --batch-size 100` — override batch size (default 150 prod files)
-- `/deep-review --since <sha>` — delta mode (highest ROI between full campaigns): review ONLY the `<sha>..base` diff plus fix-residuals of issues fixed in that range plus re-probes of previously dropped claims. No full-tree sweep; same bars, same merge.
-- Any free-form text after `/deep-review` is treated as extra context / focus and is passed to every subagent as bias.
+- `/deep-review`: inventory the full live product and prioritize review depth
+  across it. Report any inventory items or behaviors not actually inspected.
+- `/deep-review --area A3 --focus "config compiler"`: constrain discovery to the
+  selected area, reading dependencies needed to assess its contracts.
+- `/deep-review focus on zone policies only`: honor the explicit restriction.
+  A focus without a restriction changes priority within the selected scope.
+- `/deep-review --since <sha>`: review changes from that commit to the pinned
+  base, their relevant callers/consumers, and related fix residuals. Validate the
+  commit and range; an invalid or ambiguous range is not a full-tree request.
+- `--batch-size N`: maximum production files per batch (default 150), not a
+  depth target. Split further by contract, complexity, and available context.
 
-**How extra context is handled:** The coordinator takes `$ARGUMENTS` (everything after `/deep-review`), sanitizes it (no shell), and appends as:
+Parse arguments as data; never interpolate free-form context into shell code.
+Record the effective mode, scope, focus, exclusions, and any user time/effort
+limit in the report. Delta and area modes override full-tree instructions.
 
-> Focus this run: <extra context>
+This is a defensive source review and report workflow. It does not authorize
+exploitation, deployments, shared-cluster mutations, source fixes, issue filing,
+or messages. Carry forward actual session authorization for separately requested
+actions. Use existing tests and bounded local assertions with benign fixtures;
+temporary test-only changes belong in owned scratch worktrees and must be
+preserved as evidence before cleanup. A required live check without authorization
+or prerequisites becomes a named validation task, not an improvised probe.
 
-This line is added to every subagent prompt AND to the final report header as "Extra context: <...>" — it biases persona emphasis but does NOT reduce coverage (all areas still reviewed per contract). Use it to drive depth on a subsystem without losing breadth.
+## 1. Pin the target and allocate the run
 
-## Authorization
+1. Discover the repository with `git rev-parse --show-toplevel`. Read
+   `AGENTS.md`, `CLAUDE.md`, relevant engineering guidance, and the selected
+   modules' current architecture/operator docs. Give each worker the particular
+   documents its contracts require; a one-paragraph summary is not a substitute.
+2. Record repository identity (credential-free remote identity, or a local
+   identity), checkout path, and immutable base SHA. Use the requested revision
+   or current HEAD. Do not pull, rebase, or alter the control checkout for review.
+3. Resolve the comparison branch from the task or repository's remote default
+   branch. Use a branch upstream only when it matches that intended target;
+   record its repository, ref, SHA, and fetch time. Refresh remote refs when
+   available without moving the base. If comparison is unavailable, record that
+   limitation; never claim current-tip verification.
+4. Allocate a unique scratch directory with
+   `mktemp -d /tmp/review-work.XXXXXXXXXX`. Its unique basename is the run ID.
+   Record owned paths in its run manifest. Do not use the future report sequence
+   number to allocate shared scratch resources.
+5. Record runtime-provided model identity and its source when available.
+   Otherwise record `unknown`; installed binaries or another app's settings do
+   not identify the active model. Preserve distinct `muse-*` and `claude-*`
+   families. Use a filesystem-safe family name only for the final filename.
+6. The coordinator creates each detached worker worktree from the pinned base
+   under the unique run directory, following `AGENTS.md` ownership rules.
+   Before work starts, the worker reports its path, SHA, and assigned scope.
+   A pre-existing path is not evidence that it is stale: allocate a new owned
+   path rather than forcing removal. All source evidence names its revision.
 
-I am the owner and maintainer of this repository. This is an authorized internal defensive review of my own code, performed to find and FIX weaknesses before they ship. The output is a private triage report that feeds bug-fix issues in the normal fix/PR workflow. No third-party systems are targeted; no code is exploited, weaponized, or exfiltrated. The review exists to strengthen enforcement, not catalogue bypasses.
+## 2. Inventory the product and select high-value work
 
-## Context
+Start from `git ls-files -z`, not a source-extension allowlist. Classify runtime
+source, tests/harnesses, schemas, build inputs, package hooks, service units,
+deployment scripts, and relevant configuration. Account for generated outputs
+through their generators and consumers. Record exclusions with evidence.
 
-Internal code-health and hardening review of our own repository, run by the maintainer as routine quality work. The codebase is a firewall/router platform (Go control plane + Rust AF_XDP userspace dataplane), so the review looks for defects that could degrade its protections in production — input-validation gaps, policy-enforcement errors, resource-exhaustion risks, correctness bugs, memory-safety and concurrency bugs — triaged and patched. Do not modify any repository source files in this pass; findings are handed to normal fix/PR workflow, written report is deliverable.
+Do not infer retirement from a directory name or historical comment. Confirm
+current build inclusion, callers, and operational role. The retired eBPF/DPDK
+forwarders are historical; the AF_XDP shim, retained shared headers, Go shim
+loader, nftables host enforcement, and appliance lifecycle still need assessment.
 
-## Setup (only permitted repo mutation)
+Keep stable area IDs for ownership and `--area`; refresh actual paths/counts:
 
-First, update the checkout with `git pull --rebase`. Permitted repo mutations for the whole campaign: that rebase/pull plus detached-worktree add/remove (`git worktree add --detach`, `git worktree remove --force`) — never `checkout --`, never `reset`, never index/working-tree edits. If it fails (e.g. proxy blocks github), audit existing checkout and record commit reviewed.
+| Area | Source responsibility |
+| --- | --- |
+| A1 | Rust packet path, parser/frame/UMEM, worker/queues/CoS, sessions, policy/filter/screens, control protocol/server/event stream, WireGuard, and `userspace-xdp/` |
+| A2 | Rust NAT, NAT64, NPTv6, translation and allocation lifecycle |
+| A3 | Go `pkg/config/`, `pkg/cmdtree/`, `pkg/appid/`: schema, parser and compilation |
+| A4 | `pkg/configstore/`, `pkg/fsatomic/`: persistence, crypto-at-rest, commit/rollback |
+| A5 | `pkg/cluster/`, `pkg/vrrp/`, `pkg/ra/`, `pkg/conntrack/`: HA and synchronization |
+| A6 | `pkg/dataplane/` and `pkg/dataplane/userspace/`: shim loading, snapshots, control messages and apply |
+| A7 | `pkg/daemon/`, `pkg/nftables/`, `pkg/networkd/`, `pkg/devicemap/`, routing/FRR/IPsec: host enforcement and lifecycle |
+| A8 | `pkg/authz/`, `pkg/grpcapi/`, `pkg/api/`, `proto/`: identity, authorization, API contracts |
+| A9 | Telemetry, flow export, logging, SNMP, probes, feeds, event automation and monitoring |
+| A10 | DHCP/DDNS/services, policy simulator, CLI, `cmd/`, packaging, image/upgrade/deploy/build tooling |
 
-Record base commit SHA (`git rev-parse HEAD`) after rebase — immutable review target. Immediately after, fetch origin/master and record origin/master SHA: `git fetch origin master && git rev-parse origin/master`. All subagents MUST work from base SHA via detached git worktree, NOT mutable working tree. Discover repo root via `git rev-parse --show-toplevel`; never hardcode a repo path. Save base SHA + repo root + origin/master SHA + fetch timestamp for entire campaign.
+Assign unmapped files explicitly. Test files include Rust `tests.rs`,
+`*_tests.rs`, `tests_*`, Go `*_test.go`, Python tests, and shell harnesses;
+production and test code may also coexist in one file. Counts alone do not
+determine classification.
 
-Freshness gate (hard):
-- If base SHA is >20 commits behind origin/master, rebase again or abort and document staleness. Stale base causes already-fixed findings to be re-reported.
-- At COORDINATOR MERGE time, MUST re-fetch and re-verify every High/Critical (and any MATERIAL) against origin/master tip file content. If fixed on tip, mark FIXED and drop — do NOT file.
-- Also refresh `gh issue list --state open` at merge time. Open issues grow; dedup index at start can be stale.
+Build a short ranked worklist: documented behavior/invariant, reachable
+operational context, potential impact, recent change or residual, uncertainty,
+existing evidence, next useful check, and owner. History informs priority but
+does not prove twice-silent code is sound. Reserve review capacity for critical
+under-verified behavior and for independent checks of dispositions.
 
-Retired path exclusion (hard): eBPF dataplane retired (#1373, deleted #1476). DO NOT report findings in retired/dead code as material individually-fileable issues (bpf/ except headers, pkg/dataplane top-level legacy Manager, dpdk_worker/, etc.). If file contains RETIRED-eBPF comment or lives outside live paths (userspace-dp/, userspace-xdp/, pkg/dataplane/userspace/, pkg/config/, pkg/cluster/, pkg/vrrp/, etc.), treat as STALE unless proven still wired into live userspace-dp enforcement path. Any finding in retired path MUST be labeled Gate verdict: STALE (retired eBPF path, live caps at 32 pools) and MUST NOT count toward material individually-fileable count.
+Run a validation-assurance workstream alongside source review. Inspect whether
+the relevant tests/harnesses are invoked, exercise production code, have valid
+oracles, and can fail. Use `make harness-census` and
+`test/incus/HARNESSES.unreached` for registration evidence; neither proves a live
+test ran. Prioritize actual missing gates separately from intentional manual
+diagnostics. Keep test/harness coverage visible rather than declaring it
+low-value supporting material.
 
-Include any extra context from $ARGUMENTS in final header as Extra context: <args>.
+## 3. Review contracts, transitions, and specific sites
 
-## Phase 0 — Coordinator Setup (top-level context)
+Assign a reviewer the whole behavior chain even when its files span areas:
+configuration -> typed compilation -> wire representation -> runtime consumer ->
+cached state and kernel effects. File-batch owners still report inspection
+coverage. Contract owners can follow callers, shared types, consumers, and
+lifecycle dependencies beyond a batch; name overlap so it is coordinated.
 
-### Scratch work location rule (mandatory, repo-agnostic) — to avoid /tmp pollution:
-- Determine `<whoami>` DYNAMICALLY at runtime from environment — do NOT hardcode a model name, do NOT use Unix username `ps`. Must work across model changes (fable -> claude-spark -> muse-spark -> opus -> sonnet etc.) and across host families (Claude vs Muse):
-  Run the block below with `bash` (NOT `sh` — it uses `[[ ]]`; invoking with `sh` fails with `[[: not found`, observed in the wild). There is exactly ONE canonical detection block — no fallbacks, no second opinions.
-  ```bash
-  #!/usr/bin/env bash
-  # Canonical model-identity detection. Precedence: explicit model envs >
-  # host-marker envs > settings.json model > binary probe. Display aliases
-  # collapse to one family via the alias table — never by string surgery.
-  MODEL_RAW="${MUSE_MODEL:-${ANTHROPIC_MODEL:-${CLAUDE_CODE_SUBAGENT_MODEL:-${ANTHROPIC_DEFAULT_OPUS_MODEL:-${ANTHROPIC_DEFAULT_SONNET_MODEL:-}}}}}"
-  MUSE_HOST=""
-  [ -n "${MUSE_RELEASE_INFO:-}${MUSE_CLI:-}${MUSE_MODEL:-}" ] && MUSE_HOST=1
-  command -v muse >/dev/null 2>&1 && MUSE_HOST=1
-  if [ -z "$MODEL_RAW" ]; then
-    MODEL_RAW=$(jq -r '.model // empty' ~/.claude/settings.json 2>/dev/null || echo "")
-  fi
-  MODEL_LC=$(echo "$MODEL_RAW" | tr '[:upper:]' '[:lower:]' | sed -E 's/\[.*\]$//')
-  case "$MODEL_LC" in
-    muse-spark*) WHOAMI="muse-spark" ;;
-    claude-spark*) # claude-spark-1.x is the Muse Spark display alias on Muse hosts, a real family elsewhere
-      if [ -n "$MUSE_HOST" ]; then WHOAMI="muse-spark"; else WHOAMI="claude-spark"; fi ;;
-    claude-opus*|claude-sonnet*|claude-haiku*|claude-fable*) WHOAMI=$(echo "$MODEL_LC" | cut -d'-' -f1-2) ;;
-    codex*|gemini*|agy*|antigravity*|fable*) WHOAMI=$(echo "$MODEL_LC" | cut -d'-' -f1) ;;
-    opus) # bare "opus" on a Muse host is the Spark display alias, not Claude Opus
-      if [ -n "$MUSE_HOST" ]; then WHOAMI="muse-spark"; else WHOAMI="claude-opus"; fi ;;
-    sonnet) WHOAMI="claude-sonnet" ;;
-    "") echo "WARNING: model identity undetectable; defaulting to muse-spark — override WHOAMI if wrong"; WHOAMI="muse-spark" ;;
-    *) WHOAMI=$(echo "$MODEL_LC" | cut -d'-' -f1) ;;
-  esac
-  echo "Detected model: $MODEL_RAW -> family $WHOAMI (normalized from $MODEL_LC)"
-  ```
-  Record both `MODEL_RAW` and `WHOAMI` in the final report header. `MODEL_RAW` is the audit trail; `WHOAMI` names files. A display-alias change must NEVER fork a new family universe — that is how parallel `fable-*`, `claude-spark-*`, `muse-spark-*` histories (and rotting enumerations) happen.
-  This handles dynamic changing models across runs (you may be `muse-spark` now per MUSE_MODEL=muse-spark-1.1 which sometimes displays as `claude-spark-1.1` on Claude hosts, previously `fable` per fable-173.md, etc.). Prior `fable-173.md` etc were from older model run — new runs will be `muse-spark-review-NNN.md` if you are on Muse Spark, `claude-spark-review-NNN.md` if on Claude Spark, `claude-opus-review-NNN.md` if on opus, etc. Final file MUST use this detected family name: `/tmp/<whoami>-review-NNN.md` (e.g. `/tmp/muse-spark-review-042.md`, `/tmp/claude-spark-review-001.md`, `/tmp/fable-review-173.md`). The `muse-` and `claude-` families are now distinct — do NOT normalize `muse-`→`claude-`.
-  Choose NNN as max existing N for the detected family + 1 (never reuse, never hardcode):
-  ```bash
-  ls /tmp/<whoami>-review-*.md 2>/dev/null | sed -E 's/.*-review-0*([0-9]+)\.md/\1/' | sort -n | tail -1
-  ```
-  If none exist, NNN=001. Re-check for collision immediately before the final copy — a concurrent campaign may have taken the number; on collision, increment.
-  Final file MUST use the detected family name: `/tmp/<whoami>-review-NNN.md` (e.g. `/tmp/muse-spark-review-042.md`).
-- NEVER write any .md file directly under /tmp/ during campaign. Not /tmp/<whoami>-review-NNN.md, not /tmp/<whoami>-review-NNN-<area>-b<batch>.md, not any other *.md directly under /tmp/. ALL scratch work MUST go under a subdirectory of /tmp/.
-- Create dedicated work directory (repo-agnostic, no repo name in path):
-    /tmp/review-work-<whoami>-<NNN>/
-  (e.g. /tmp/review-work-claude-spark-039/ — NNN from "choose output file number", <whoami> full model name. No repo name. mkdir -p). All per-(area,batch) intermediate findings go there AND draft final goes there. No file matching /tmp/<whoami>-review-NNN*.md exists directly under /tmp/ during work — only prior campaign finals. `ls /tmp/<whoami>-review-NNN*.md` during work should show only old finals for other NNNs, never current NNN. `ls /tmp/review-work-<whoami>-<NNN>/*.md` shows intermediates.
-- Each subagent will create its OWN detached git worktree at:
-    /tmp/review-wt-<whoami>-<NNN>-<area>-b<batch>/
-  via: `git worktree add --detach <wt-path> <base-SHA>`
-  All source file reads happen from inside that worktree path (discover repo root via `git rev-parse --show-toplevel`).
-- Coordinator ensures /tmp/review-work-<whoami>-<NNN>/ exists before launching. Coordinator reads ONLY final files at /tmp/*-review-*.md directly under /tmp/ for dedup — it MUST NOT include /tmp/review-work-*/ or /tmp/review-wt-*/.
-- Subagents create/clean own worktrees; coordinator sweeps leftovers after merge.
+Select relevant cases from the shared contract's behavior and workload matrix.
+Use documented semantics as the oracle; surface ambiguity rather than silently
+changing product invariants. Compare independent implementations only alongside
+an assertion of the property each independently owes.
 
-### Duplicate suppression:
-Read ALL prior finals with a family-agnostic glob — NEVER an enumerated family list (enumerations rot every model rename and silently drop priors; a literal enumeration once missed the `muse-*`, `claude-*`, and `gemini-*` finals that held the most important history):
-  `ls /tmp/*-review-[0-9]*.md` (ONLY final NNN files directly under /tmp/, NOT files under /tmp/review-work-*/ or /tmp/review-wt-*/)
-Build compact dedup index (title + file + root cause) and pass to EVERY subagent so none re-reports known issue. At merge time, refresh `gh issue list --state open --limit 200 --json number,title` — fresh issues can make finding DUP. Also fold the previous campaign's per-finding table (K/L-series rows) into the index verbatim — titles alone dedup better than prose summaries.
+Pattern censuses are discovery aids, with a ledger of enumerated sites,
+languages/syntax covered, checks performed, exclusions, and unknowns. Useful
+examples are narrowing conversions, lost config dimensions, unchecked optional
+values, and incomplete error handling. Include Rust conversion/optional-value
+forms when that language is in scope. A grep with no hits does not discharge a
+bug class. Batch reviewers may reuse a specific verified site/invariant at the
+same revision, but must not skip an entire pattern by name.
 
-Read orientation docs so subagents inherit context, not just code: CLAUDE.md, docs/engineering-style.md, docs/* design/state/feature-gap docs, and any issue/backlog docs. Extract one-paragraph orientation blurb + dedup index to hand to subagents. Pass also: base-SHA, origin/master SHA, NNN, <whoami>, work-dir path (/tmp/review-work-<whoami>-<NNN>/), worktree naming convention (generic review-wt-...), and any extra context from $ARGUMENTS.
+For recent-fix review, record a historical window (previous reviewed SHA,
+`--since`, or an explicitly selected set of relevant fixes). Inspect each fix's
+own parent-to-fix change, affected contract, sibling consumers, and regression
+guard. Do not substitute `base..comparison-tip`: after a fresh checkout that
+range may be empty despite many recent fixes. Reassess related dismissed claims
+when their supporting assumptions or dependencies changed.
 
-Build authoritative file list (repo-agnostic):
-  git ls-files | grep -iE '\.(go|rs|c|h|hpp|cpp|cc|cxx|py)$'  (INCLUDE .go and .rs — ~95% of repo)
-Assign every file to exactly one EXPERTISE AREA using map below. Any file whose path not covered goes to nearest area by directory; log assignment so coverage provably complete.
+Use bounded assignments and the available concurrency; do not assume a named
+agent host/tool is installed. Follow `AGENTS.md` when delegating and give each
+worker the run manifest, contract, scope, relevant history, and report location.
+Limit simultaneous builds to available resources. Reallocate effort when the
+next useful step needs evidence a batch cannot supply. Preserve unfinished work
+and its next check; do not manufacture a negative result to complete a checklist.
 
-Batch by PROD files, not all files: test files (`*_test.go`, `tests_*`, `testdata/`) almost never yield findings yet dominate batch counts (observed: 119 of 150 files in a batch). Put prod files first in every batch; tests travel as evidence the subagent reads but does not sweep for findings. Report coverage as prod-files-reviewed/total-prod-files; test files are supporting material, not coverage units.
+## 4. Independently verify and reconcile
 
-Effort is severity-weighted, not uniform: areas with historical High density (HA election/wire codecs, API dispatch surfaces, NAT/policy compilers) get the deepest personas and smallest effective batches; twice-reviewed-silent areas get a fresh-eyes re-verification pass, not a third full hunt. Maintain a crown-jewel file list (election + heartbeat/failover wire code, ShowText dispatch + shared renderers, NAT/policy match compilers, transfer-commit lifecycle) that EVERY campaign re-hunts regardless of batching — regressions hide in crown jewels first.
+Refresh the selected comparison ref once for merge and pin that SHA for all
+decisions. Apply the shared contract to every candidate, including dependencies
+that establish reachability or safety; an unchanged evidence file alone is
+insufficient. Independently check high-impact material findings and a
+risk-selected sample of NEG/DUP/STALE/COHORT decisions. Log the checks and gaps.
 
-Batch within each area: if area >150 prod files, split into consecutive batches <=150 prod files (keep package/subdir together where possible). Small areas single batch.
+Use prior final reports, durable `docs/reviews/` records, and relevant issue/PR
+history as leads. Check repository identity before deduplication. Paginate needed
+history, include relevant closed issues and fixing PRs, record freshness/limits,
+and search candidate-specific bodies and acceptance criteria. A title match,
+a closed issue, or an old report disposition does not decide the new claim.
 
-For each (area, batch), launch ONE metacode subagent. Run areas in parallel; within area batches may run in parallel up to concurrency limit. Each subagent gets ONLY batch file list — keeps context small. Coordinator ensures /tmp/review-work-<whoami>-<NNN>/ exists before launching. Subagents create/clean own worktrees; coordinator sweeps leftover worktrees/work-dir after PHASE 2.
+## 5. Publish the report and hand off fixes
 
-### Expertise areas (area -> paths -> persona) — verify counts against git ls-files; batch any area >150
+Write one self-contained draft inside the run directory using the shared
+contract's header, per-finding fields (including Probe), inspection log, and
+counts. Clearly distinguish confirmed findings, unresolved high-impact questions,
+verification gaps, and suggested implementation work. A review report is not an
+issue filing: say "recommended for filing" unless actual issue IDs exist.
 
-A1. Rust dataplane — packet path & memory safety
-Paths: userspace-dp/src/{afxdp,frame,parser,checksum,ethernet,session,screen,cos,wg,io_uring,mpsc*,worker,coordinator,tx,umem,...} ; userspace-xdp/
-Persona: senior Rust systems engineer — memory safety in unsafe, packet parse/rewrite bounds, checksum correctness, integer overflow/truncation (as casts), byte-order, lock-free/atomic ordering, cache-line/HPC invariants, fail-closed parsing. (~360 files ~3 batches)
+The compatibility output is `/tmp/<family>-review-NNN.md`. Determine the next
+number from exact final basenames for that family at publication time. Publish
+the complete draft with an atomic create-if-absent operation, such as a hard link
+on the same filesystem (`ln -T -- <draft> <final>`), never a replacing copy. On
+collision, update the draft's output-path header and retry the next number.
+Freeze the draft after linking: a hard link shares its contents with the final.
+The target must be the exact final file, never a directory to follow into.
+Only complete, immutable finals belong directly under `/tmp/`; scratch and
+evidence stay under the unique run directory.
 
-A2. Rust dataplane — NAT / NAT64 / translation
-Paths: userspace-dp/src/{nat,nat64,nptv6,...}
-Persona: NAT/CGNAT specialist — port allocation lifecycle & exhaustion, twice-NAT ordering, translation correctness, embedded-ICMP reversal, HA port-reservation on synced sessions, fragment handling.
+Verify the published report is complete and the artifact references resolve.
+Preserve test-only diffs, outputs, manifest, and supporting evidence until
+archived or handed off; include the decisive evidence inline so the report does
+not depend on a worker checkout. Cleanup only recorded owned worktrees, using
+normal `git worktree remove` after preserving evidence. If removal would require
+force, retain the path and explain why. Never sweep other runs by glob.
 
-A3. Go config compiler, schema & CLI grammar
-Paths: pkg/config/ ; pkg/cmdtree/ ; pkg/appid/
-Persona: parser/compiler engineer — Junos AST dual-shape (#2419 bracket lists), strict-vs-lenient gates, typed-leaf schema validators, integer truncation on Atoi/len()->uint16/uint32, fail-closed on malformed config, recursion/DoS caps. (~400 files ~3 batches)
+For each actionable finding, provide the expected behavior, fix direction,
+regression acceptance criterion, affected consumers, and remaining validation.
+Release-oriented runs also track whether a verified source fix has reached the
+in-scope release. Further implementation/publication follows the authorized
+engineering workflow.
 
-A4. Go configstore, persistence & crypto-at-rest
-Paths: pkg/configstore/
-Persona: storage/crypto engineer — durable temp+fsync+rename ordering, AES-GCM/HKDF/nonce handling, commit/rollback + commit-confirmed timers, journal torn-tail recovery, envelope compatibility, secret redaction.
+## Maintaining this skill
 
-A5. HA — cluster, VRRP, RA, conntrack sync
-Paths: pkg/cluster/ ; pkg/vrrp/ ; pkg/ra/ ; pkg/conntrack/
-Persona: distributed-systems/HA engineer — failover timing, split-brain & dual-primary, VRID/priority math and uint8 wraps, session-sync wire codec & anti-replay, cold-boot ordering, lock discipline & data races, dual-stack tie-break.
-
-A6. Dataplane Go manager & control-plane->dataplane compilation
-Paths: pkg/dataplane/ ; pkg/dataplane/userspace/
-Persona: control-plane engineer — compilation of typed config into dataplane control messages/map writes, pool/binding index math & caps, eventstream framing & write serialization, HA glue, partial-apply safety. (~216 files ~2 batches)
-
-A7. Daemon lifecycle & host integration
-Paths: pkg/daemon/ ; pkg/networkd/ ; pkg/routing/ ; pkg/frr/ ; pkg/ipsec/
-Persona: Linux systems engineer — systemd/interface management, netlink, FRR/strongSwan config generation and command-execution surfaces (shell/vtysh -c/exec injection), IPsec apply/teardown ordering, route-leak correctness. (~220 files ~2 batches)
-
-A8. APIs (gRPC / REST) & surfaces
-Paths: pkg/grpcapi/ ; pkg/api/
-Persona: API-engineer — untrusted-input validation on every RPC/HTTP field, injection, authz/allowlist enforcement, integer/format handling, resource leaks, DoS amplification (unbounded scans/streams), graceful-shutdown correctness. (~230 files ~2 batches)
-
-A9. Observability & telemetry
-Paths: pkg/flowexport/ ; pkg/snmp/ ; pkg/logging/ ; pkg/rpm/ ; pkg/feeds/ ; pkg/eventengine/
-Persona: telemetry engineer — NetFlow/IPFIX/SNMP wire encoders & length fields, SNMPv3 crypto (IV/salt/RNG-error handling), goroutine/fd leaks, log-record field correctness, backoff/retry overflow.
-
-A10. Services (DHCP / DDNS / policy simulator) + CLI/show + build/deploy tooling
-Paths: pkg/dhcp/ ; pkg/dhcprelay/ ; pkg/dhcpserver/ ; pkg/ddns/ ; pkg/policymatch/ ; pkg/cli/ ; pkg/natshow/ ; cmd/ ; scripts/ ; bpf/
-Persona: protocol + tooling generalist — DHCPv4/v6 & relay correctness, DDNS backend ownership semantics (PrevAddr/foreign-record safety), simulator<->dataplane verdict parity, CLI dispatch & show-output correctness, Python signing/deploy/image TOCTOU & scheme enforcement. (~170 files ~2 batches; keep pkg/cli in own batch)
-
-## Phase 1.5 — Cross-cutting pattern censuses (run FIRST, before batch sweeps)
-
-Batch sweeps find file-local bugs; the highest-density majors live in repo-wide PATTERNS. Before fanning out batches, run 2–4 census hunts as dedicated subagents over the whole tree (each cheap: grep census + per-site bound analysis + probes only for survivors):
-- narrowing-cast census: `uint8(/uint16(/uint32(/byte(/int8(/int16(` applied to config-derived values — report only casts reachable out-of-range with silent wrap; bound-checked/saturated casts go to NEG with the bound cited.
-- missing-`default` census: `switch` statements on config-derived strings/ints with no `default` arm — report only arms whose missing case fails open.
-- present-but-nil census: map lookups / optional-pointer derefs on config-derived slots in daemon/API/CLI paths without recovery — report only probe-panicked sites.
-- unwarned-lenient-downgrade census: lenient-path `continue`/fallthrough that silently drops a validated dimension (match leaves, bounds, contradictions).
-- tip-residual review: read the base..tip diff of every recent fix commit and hunt what the fix missed (narrower shape, sibling function, second call site). Fixes are the best bug-finders: every guard has a scope boundary, and the boundary is the next bug.
-Batch agents then SKIP covered patterns (patterns named in their prompts) and spend depth on file-local logic. Census hits carry the same 13-label bar. Observed yield of this phase exceeds whole-area sweeps per unit effort — do not skip it.
-
-## Phase 1 — Per-subagent contract
-
-You are a <persona for this area>. Review ONLY files in attached batch list (do not wander outside them, except to read a called function's contract to confirm/refute). You have been given: repo orientation blurb, dedup index, batch file list, base SHA, origin/master SHA, extra context from $ARGUMENTS (if any).
-
-Extra context handling: If coordinator passes extra context (e.g. "focus on zone policies only"), treat it as focus bias: prioritize that subsystem in evidence search and confidence, but still cover ALL files in batch and report module-by-module log incl. negatives for full coverage. Do NOT drop coverage of other files because focus says otherwise. Mention in report header: Extra context: <text> and per-finding if focus-driven.
-
-Worktree isolation (mandatory, repo-agnostic):
-Before reading any source file, create a detached worktree for this exact review SHA:
-  git worktree add --detach /tmp/review-wt-<whoami>-<NNN>-<area>-b<batch> <base-SHA>
-All source file reads in your batch MUST use paths under that worktree:
-  /tmp/review-wt-<whoami>-<NNN>-<area>-b<batch>/pkg/config/foo.go
-  .../userspace-dp/src/...
-NOT the main working tree (discover via git rev-parse --show-toplevel; never hardcode repo path like /home/ps/git/avacado-xpf). This gives immutable isolated view and avoids races. If git worktree add fails (path exists), remove stale path with git worktree remove --force <wt-path>; rm -rf <wt-path> then retry. Batch file list is relative (pkg/..., userspace-dp/...); prepend wt-path to open.
-When your review fully written, clean up own worktree:
-  git worktree remove --force /tmp/review-wt-<whoami>-<NNN>-<area>-b<batch>
-  rm -rf /tmp/review-wt-<whoami>-<NNN>-<area>-b<batch>
-
-Module-by-module sweep: For each file/module explicitly cover:
-- correctness & bugs (policy-enforcement, input validation, fail-open/fail-closed)
-- memory safety / concurrency / integer truncation / resource leaks
-- feature-completeness gaps vs vSRX (where in scope)
-- performance/latency issues
-- test-coverage gaps
-If module has no finding, WRITE NEGATIVE RESULT and one line why (what invariant checked and found sound). Negative results required — prove coverage. Do NOT collapse to high-impact only — report EVERY credible candidate at ALL confidence tiers (High/Medium/Low). Including medium- and low-confidence findings is mandatory. Honesty: never fabricate, pad, or inflate.
-
-Evidence bar — every finding must include, using EXACTLY these field labels:
-
-Title
-Severity
-Confidence
-Gate verdict (FIXED / STALE / DUP / COHORT / NEG / MATERIAL — assign one; only MATERIAL counts as individually fileable)
-  - FIXED = already fixed on origin/master tip (cite origin/master line numbers)
-  - STALE = retired path, symbol gone, or eBPF legacy (cite retirement PR #1476 and live cap e.g. userspaceShimMaxNATPools=32)
-  - DUP = covered by open GH issue (cite issue number)
-  - COHORT = real but low-materiality / defense-in-depth / test-coverage / observability / lenient-HA-sync / display-only / client-DoS-only — aggregates to cohort issue
-  - NEG = you proved it sound — MUST NOT appear in findings table, only in inspection log
-  - MATERIAL = survives all gates, live enforcement, verified on origin/master, not dup, not cohort
-Evidence (file:line refs + quoted 5-10 line code snippet you actually read — from YOUR worktree path at base SHA, but you must also have checked origin/master tip for same lines if you claim MATERIAL)
-Probe (REQUIRED for every fail-open / availability / panic claim at any severity: an executed test/scenario in your worktree proving the behavior, with output quoted — probes deleted afterwards. Prose traces alone cap at Low: a High/Medium without a passing-then-quoted probe is a hypothesis, not a finding. Observed: probe-executed campaigns out-yield prose-trace campaigns severalfold.)
-Trace (step-by-step runtime execution trace; REQUIRED for High/Medium MATERIAL only — do not waste lines on COHORT)
-Refutation attempt (REQUIRED for High/Critical MATERIAL: describe how you TRIED to prove false positive — read validators/guards/callers/type defs that would make safe — and state why finding survived. If not survive, mark NEG and move to log. Do NOT report High/Critical you did not try to refute.)
-Severity rubric (grade against this, not gut feel — over-grading destroys triage trust):
-- High = remotely-triggerable fail-open (permitted what must be denied), daemon/worker crash, or dual-primary/split-brain — WITH an executed probe. No probe, no High.
-- Medium = fail-open requiring auth/lenient-path/legacy-load to reach, silent availability degradation, or fail-closed with wrong-surface consequences — with a probe or exact wire/line proof.
-- Low = defense-in-depth, display/telemetry dishonesty, test gaps, doc-only, client-DoS-only, defense-consistent residuals. A prose-only suspicion caps here.
-HPC/invariant check (where relevant: atomic wrapping, lock contention, cache-line alignment, endianness)
-Why it matters (if MATERIAL, must cite concrete production impact)
-Fix direction (concrete — remediation work-list)
-Labels (include vsrx-parity for parity issues)
-Dedup note (why not restatement of any entry in dedup index — cite specific issue numbers checked)
-Verified against origin/master (for MATERIAL: exact file:line on origin/master tip you checked, and result: still present / fixed)
-
-Write results to: /tmp/review-work-<whoami>-<NNN>/<whoami>-<area>-b<batch>.md (coordinator gives NNN, <whoami>, <area>, <batch> and ensures work dir exists), starting with: base commit, your worktree path, your batch file list, and your module-by-module log, then findings.
-IMPORTANT: Do NOT write ANY file directly under /tmp/ — not /tmp/<whoami>-review-NNN*.md, not /tmp/<whoami>-review-NNN-*.md, not any *.md. All intermediates MUST go under /tmp/review-work-<whoami>-<NNN>/. During work, `ls /tmp/*-review-*.md` should show only prior campaign finals, never this NNN. ONLY file that may ever appear directly under /tmp/ matching /tmp/<whoami>-review-NNN.md will be created by coordinator as VERY LAST STEP after verification, by copying verified draft final from work dir to /tmp/.
-
-## Phase 2 — Coordinator Merge, Verify & Report
-
-Collect all per-subagent files from /tmp/review-work-<whoami>-<NNN>/ (NOT from /tmp/<whoami>-review-NNN*.md — no such file should exist yet; during work no file matching /tmp/*-review-*.md for this NNN exists directly under /tmp/). Merge findings; dedup across areas and against prior-campaign dedup index (deeper restatement still duplicate unless changes root cause or severity — say explicitly).
-
-Verify against origin/master tip and FRESH GH issues (hard):
-
-1. Re-fetch origin/master: `git fetch origin master && git rev-parse origin/master` Record origin/master SHA in report header alongside base SHA.
-2. Fresh GH issues: `gh issue list --state open --limit 200 --json number,title` This refreshes open issues at triage time.
-3. For every Critical and High (and any finding subagent marked MATERIAL) that survives merge, you MUST:
-   a. Script-check EVERY cited evidence file base..tip (`git diff --quiet <base>..<tip> -- <path>` per file), not just Highs — tip routinely moves mid-campaign. For files the diff flags, re-read the cited hunk on tip; for the rest, base evidence stands. Log the script output in the report.
-   b. Independently re-verify every High on tip with your own `git show` read of the exact cited lines — never trust the subagent's tip line numbers sight unseen (observed: wrong-file and shifted-line citations). Close any tip-verification gap the subagent left (e.g. "could not fetch") yourself.
-   c. If file gone or fixed, mark FIXED and drop. Document origin/master line numbers that prove fix.
-   d. If file lives in retired path, mark STALE. Check live cap.
-   e. Apply the distinct-sink test for DUP: same root cause at a different sink (different wire, different compiler, different surface, opposite fail direction) is a SEPARATE fileable finding with the twin cited — observed false-DUP pressure in both directions (re-reports of open issues AND wrongly-merged distinct sinks). Same file + same lines + same consequence = DUP, no exceptions; log every DUP-drop with the twin (issue or prior finding ID) cited.
-   f. If low-materiality per the severity rubric, mark COHORT — including downgrading subagent-over-graded Mediums (observed: prose-only Mediums, display bugs graded Medium). Re-grading is a core coordinator duty, not an insult.
-4. After steps 2-3, produce triage sections:
-   - Verified-against-origin/master highlights: 2-5 bullets explaining most interesting FIXED/STALE/DUP decisions, with origin/master file:line evidence.
-   - Per-finding table with columns: | Finding | Area | Gate verdict (MATERIAL/FIXED/STALE/DUP/COHORT/NEG) | Reasoning | — this table is an INDEX ONLY, not a substitute for evidence.
-   - Full findings section (MANDATORY, self-contained): inline the COMPLETE 13-label evidence bar for EVERY individually-fileable MATERIAL (and the grouped COHORT issue, if any) directly in the published final — Title, Severity, Confidence, Gate verdict, Evidence (file:line + 5-10 line quote read from worktree at base SHA), Trace (required for High/Medium MATERIAL), Refutation attempt (required for High/Critical MATERIAL), HPC/invariant check, Why it matters (concrete production impact — why it is load-bearing major and needs deeper investigation), Fix direction (concrete remediation), Labels, Dedup note, Verified against origin/master (exact origin/master file:line and result). The published final MUST NOT require the reader to open per-batch intermediates under /tmp/review-work-*/ or /tmp/review-wt-*/ to get the rationale — those are retained only for audit. If the per-finding table and the full findings section disagree, the full findings section is authoritative.
-   - Count summary: total parsed, dropped-dup count, dropped-stale-or-fixed count, pure NEG count, cohort'd low-materiality count, filed individually count.
-
-Produce DRAFT final report at: /tmp/review-work-<whoami>-<NNN>/<whoami>-review-NNN.md (still inside work dir, NOT directly under /tmp/). Verify completeness, then as VERY LAST STEP, copy it to: /tmp/<whoami>-review-NNN.md This copy is ONLY file that may ever exist directly under /tmp/ matching /tmp/<whoami>-review-NNN*.md for this NNN. During work, no file matching /tmp/*-review-*.md for this NNN exists directly under /tmp/ — only prior campaign finals. After copy, verify `ls /tmp/<whoami>-review-NNN*.md` shows exactly ONE file (final) and `ls /tmp/<whoami>-review-NNN-*.md` shows none.
-
-Cleanup (mandatory) AFTER final copy verified: remove ALL worktrees created for this NNN: git worktree list | grep "review-wt-<whoami>-<NNN>-" -> git worktree remove --force; rm -rf /tmp/review-wt-<whoami>-<NNN>-* (Optionally keep /tmp/review-work-<whoami>-<NNN>/ for post-verification inspection, but per strictest interpretation: rm -rf /tmp/review-work-<whoami>-<NNN>/ after final exists in /tmp/. Draft final inside work dir is NOT published final — published final is copy in /tmp/.)
-
-Produce ONE final report at /tmp/<whoami>-review-NNN.md (via copy from work-dir draft) with: Base commit reviewed + origin/master SHA (both, with fetch timestamp). Output path. Duplicate suppression summary (including fresh GH open count at triage time). Triage result — MANDATORY top section (Review base SHA + verified-against origin/master SHA, Open GH issues at triage fresh count, Outcome: X individually-filed material issues, Y cohort issue (Z survivors), Why zero if zero). Verified-against-origin/master highlights. Per-finding table with Gate verdict (INDEX ONLY — see Full findings section for authoritative evidence). Explicit expertise-area + module checklist with per-area file counts and batch counts (proving full-tree coverage). Module-by-module inspection log (aggregated, incl. negatives — NEG belongs ONLY here). Full findings section (MANDATORY, self-contained) — inline COMPLETE 13-label evidence bar for every MATERIAL (and grouped COHORT) directly in the published final: Title, Severity, Confidence, Gate verdict, Evidence (file:line + 5-10 line quote), Trace (High/Medium MATERIAL), Refutation attempt (High/Critical MATERIAL), HPC/invariant check, Why it matters (concrete production impact — why load-bearing major needs deeper investigation), Fix direction, Labels, Dedup note, Verified against origin/master — with exact origin/master file:line. This section is authoritative and MUST NOT require opening /tmp/review-work-*/ intermediates. Then Coverage & verification summary: files reviewed/total, findings per area, how many Critical/High coordinator-verified vs dropped as FIXED/STALE/DUP/COHORT/NEG. Suggested issue split (with mapping to Gate verdicts). TARGET: severity-weighted, not counted. Optimize for High findings (remotely-triggerable fail-open/crash/dual-primary, probe-proven); a campaign yielding 5 verified Highs beats one yielding 100 Lows. Report honestly-graded material findings that survive freshness + retired-path + dedup + materiality gates. If a provably-complete sweep after origin/master verification yields 0 individually-fileable material issues and 1 cohort issue of low-materiality survivors, that IS correct outcome — report 0+cohort and let coverage log stand. Do NOT pad with NEG, and do NOT inflate severity to hit a number — the rubric (§Phase 1) governs.
-
-Focus line to append per run (biases persona emphasis, does NOT reduce coverage — all areas still reviewed):
-Focus this round on core firewall behavior: zone policies, global policies, host-inbound, application matching, default deny/permit — ensure packets that should be denied are denied and allowed packets are allowed — AND on areas prior campaigns under-covered: VRRP/HA failover & cold-boot, dataplane integer-truncation on config casts, and DDNS/observability resource safety.
-
-If extra context is passed via /deep-review <context>, append that as second focus line: Focus this run (extra): <extra context> — and ensure every subagent prompt includes it. It is a bias, not a scope reduction — all areas still reviewed.
-
-Use exact field labels so report parses programmatically. The extra context MUST NOT break the worktree isolation or single-final-file rules.
-
+When revising discovery or triage, use the shared contract's decision walkthrough.
+Use its held-out evaluation before claiming improved defect recall. Formatting
+validation alone does not establish that improvement. Report which behavioral
+checks ran and which claims remain unmeasured.
