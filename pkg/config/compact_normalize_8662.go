@@ -1566,6 +1566,7 @@ func normalizeCompactNodes(nodes []*Node, schema *schemaNode, inScope func(conta
 				}
 			}
 		}
+		n += splitBracedPackedChildren8886(node, childSub)
 		n += normalizeCompactNodes(node.Children, childSub, inScope)
 	}
 	return n
@@ -1681,4 +1682,55 @@ func declineStrandingFold8880(nodes []*Node, i int, container *schemaNode) bool 
 	}
 	_, isChild := container.children[next.Keys[0]]
 	return isChild
+}
+
+// splitBracedPackedChildren8886 splits a child statement whose Keys carry MORE
+// THAN ONE statement, inside an INTACT braced body.
+//
+//	security { flow { aging { early-ageout 10 high-watermark 90; } } }
+//	  parses to ONE leaf  [early-ageout 10 high-watermark 90]
+//	  compiles to         early-ageout=10, high-watermark=0
+//
+// The value of every statement after the first is silently discarded, on a
+// clean commit. This is NOT the brace-elision shape: the container's brace is
+// present and nothing is elided — the operator merely omitted a semicolon,
+// which is the commonest typo there is, and `show configuration` renders it back
+// exactly as written.
+//
+// It reuses splitPackedStatements8768 and is gated on the SAME opt-in, so one
+// flag governs both spellings of a packed run rather than a container being
+// fixed for the elided form and left broken for the braced one. A container that
+// has not opted in is untouched.
+//
+// Unlike the #8880 stranding case this split is reachable: here the CONTAINER is
+// the node being visited, so its Children slice is in hand and can be rewritten.
+// There it was the parent's slice, which the walk does not hold.
+func splitBracedPackedChildren8886(node *Node, container *schemaNode) int {
+	if node == nil || container == nil || !container.packedStatements {
+		return 0
+	}
+	var out []*Node
+	changed := 0
+	for _, ch := range node.Children {
+		// Only a childless leaf can be a packed RUN. A node with children is a
+		// braced body, and splitting it would have to decide which statement
+		// the body belongs to — the ambiguity #8850 declines rather than guess.
+		if ch == nil || len(ch.Children) > 0 || len(ch.Keys) < 2 {
+			out = append(out, ch)
+			continue
+		}
+		stmts := splitPackedStatements8768(ch.Keys, container)
+		if len(stmts) < 2 {
+			out = append(out, ch)
+			continue
+		}
+		for _, st := range stmts {
+			out = append(out, &Node{Keys: append([]string(nil), st...), IsLeaf: true})
+		}
+		changed++
+	}
+	if changed > 0 {
+		node.Children = out
+	}
+	return changed
 }
