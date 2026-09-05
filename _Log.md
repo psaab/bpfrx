@@ -107071,3 +107071,7 @@ prose edit above them added. No diff falls in the new test body.
   - **File(s)**: pkg/daemon/external_hostname_watch_6863.go, pkg/daemon/mgmt_listener_reassert.go, pkg/daemon/management.go, pkg/daemon/daemon.go
 
 <!-- LOG-CLOSED-SENTINEL-6874: nothing may be appended below this line. Write to docs/log/<issue>.md instead. -->
+
+- **Timestamp**: 2026-09-05
+  **Action**: Add the brace-elision container-pair sweep instrument (issue 8859) — measures the 64 un-admitted top-level pairs, classifies each SAME / CANDIDATE-DROP / NO-REFERENCE, and gate-checks every candidate against the strict path and lenient warnings
+  **File(s)**: pkg/config/compact_elision_sweep_test.go
