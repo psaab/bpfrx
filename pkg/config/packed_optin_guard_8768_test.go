@@ -257,6 +257,91 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 				return out
 			},
 		},
+		// issue 8904, second instance: `firewall policer <p> if-exceeding`.
+		// Same truncation mode as the tunnel rows -- a rate limiter configured
+		// with a burst allowance that silently becomes zero. `bandwidth-percent`
+		// is NOT admitted, so a fixture for it would be inert.
+		"firewall/policer/if-exceeding": {
+			prefix: "firewall { policer p1 { ",
+			open:   "if-exceeding",
+			closer: " then { discard; } } }",
+			stmts: map[string]string{
+				"bandwidth-limit":  "bandwidth-limit 10m",
+				"burst-size-limit": "burst-size-limit 100k",
+			},
+			second: map[string]string{
+				"bandwidth-limit":  "bandwidth-limit 20m",
+				"burst-size-limit": "burst-size-limit 200k",
+			},
+			read: func(c *Config) string {
+				out := ""
+				names := make([]string, 0, len(c.Firewall.Policers))
+				for n := range c.Firewall.Policers {
+					names = append(names, n)
+				}
+				sort.Strings(names)
+				for _, n := range names {
+					p := c.Firewall.Policers[n]
+					out += fmt.Sprintf("|%s bw=%d burst=%d", n, p.BandwidthLimit, p.BurstSizeLimit)
+				}
+				return out
+			},
+		},
+		// issue 8904: both `tunnel` containers opted in, so a packed run
+		// `tunnel source A destination B;` splits instead of keeping only the
+		// first statement. The schema declares `tunnel` TWICE -- directly under
+		// an interface and under a unit -- and this guard requires a case for
+		// each, which is the whole reason the opt-in cannot ship exercised on
+		// only one of them.
+		//
+		// `keepalive` and `routing-instance` are NOT admitted to the
+		// compact-normalize scope, so fixtures for them would be inert and the
+		// reverse check at the end of this cell rejects them. Six admitted
+		// leaves, all args:1 and non-multi, so no `second` is required.
+		"interfaces/*/tunnel": {
+			prefix: "interfaces { gr-0/0/0 { ",
+			open:   "tunnel",
+			closer: " } }",
+			stmts: map[string]string{
+				"source":          "source 10.0.0.1",
+				"destination":     "destination 10.0.0.2",
+				"mode":            "mode gre",
+				"key":             "key 42",
+				"ttl":             "ttl 64",
+				"keepalive-retry": "keepalive-retry 3",
+			},
+			second: map[string]string{
+				"source":          "source 10.0.0.9",
+				"destination":     "destination 10.0.0.8",
+				"mode":            "mode ipip",
+				"key":             "key 77",
+				"ttl":             "ttl 32",
+				"keepalive-retry": "keepalive-retry 5",
+			},
+			read: tunnelRead8904(false),
+		},
+		"interfaces/*/unit/tunnel": {
+			prefix: "interfaces { gr-0/0/0 { unit 0 { ",
+			open:   "tunnel",
+			closer: " } } }",
+			stmts: map[string]string{
+				"source":          "source 10.0.0.1",
+				"destination":     "destination 10.0.0.2",
+				"mode":            "mode gre",
+				"key":             "key 42",
+				"ttl":             "ttl 64",
+				"keepalive-retry": "keepalive-retry 3",
+			},
+			second: map[string]string{
+				"source":          "source 10.0.0.9",
+				"destination":     "destination 10.0.0.8",
+				"mode":            "mode ipip",
+				"key":             "key 77",
+				"ttl":             "ttl 32",
+				"keepalive-retry": "keepalive-retry 5",
+			},
+			read: tunnelRead8904(true),
+		},
 		"security/ipsec/proposal": {
 			prefix: "security { ipsec { ",
 			open:   "proposal ip1",
@@ -1035,4 +1120,34 @@ func containerKeywordOfPath8768(path string) string {
 		}
 	}
 	return ""
+}
+
+// tunnelRead8904 reports every tunnel field the #8904 opt-in claims to preserve.
+// EVERY admitted leaf is rendered, not just source/destination: a reader that
+// printed only the pair a fixture happened to use would let the other four
+// leaves diverge unobserved, which is the same single-leaf blindness that made
+// `policy-statement -> then` read as a non-defect for a day.
+func tunnelRead8904(perUnit bool) func(*Config) string {
+	return func(c *Config) string {
+		out := ""
+		for _, i := range c.Interfaces.Interfaces {
+			ts := []*TunnelConfig{}
+			if perUnit {
+				for _, u := range i.Units {
+					ts = append(ts, u.Tunnel)
+				}
+			} else {
+				ts = append(ts, i.Tunnel)
+			}
+			for _, tn := range ts {
+				if tn == nil {
+					out += "|<nil>"
+					continue
+				}
+				out += fmt.Sprintf("|src=%s dst=%s mode=%s key=%d ttl=%d kar=%d",
+					tn.Source, tn.Destination, tn.Mode, tn.Key, tn.TTL, tn.KeepaliveRetry)
+			}
+		}
+		return out
+	}
 }

@@ -954,7 +954,7 @@ fn nat64_4381_forward_frame_translates_l4_source_port() {
 
     let frame = build_ipv6_tcp_syn_with_mss(client, synthetic, orig_sport, 443, 1460);
     let decision = icmp_test_decision(Nat64State::forward_decision(pool, server, translated));
-    let out = build_nat64_forwarded_frame(&frame, nat64_forward_meta(), &decision, None, false)
+    let out = build_nat64_forwarded_frame(&frame, nat64_forward_meta(), &decision, None, false, &ForwardingState::default())
         .expect("forward NAT64 frame");
 
     // Output is IPv4 (eth 14 + ip 20 => L4 at 34); src IP @26..30, TCP src
@@ -1014,7 +1014,7 @@ fn nat64_2562_forward_nonfirst_fragment_frame_translates_l3_only() {
     frame[62..].copy_from_slice(payload);
 
     let decision = icmp_test_decision(Nat64State::forward_decision(pool, server, 40001));
-    let out = build_nat64_forwarded_frame(&frame, nat64_forward_meta(), &decision, None, false)
+    let out = build_nat64_forwarded_frame(&frame, nat64_forward_meta(), &decision, None, false, &ForwardingState::default())
         .expect("#2562: non-first v6 fragment L3-translates, not dropped");
 
     // Output is eth(14) + IPv4(20) + payload; NO L4 rewrite.
@@ -1071,6 +1071,7 @@ fn nat64_4381_reverse_frame_restores_each_clients_original_port() {
             &decision,
             Some(&info),
             false,
+            &ForwardingState::default(),
         )
         .expect("reverse NAT64 frame");
 
@@ -1140,7 +1141,7 @@ fn nat64_5606_reverse_frame_requires_reverse_info_or_drops() {
     // WITH reverse info: a correct IPv6 reply addressed to the original client.
     // Output is IPv6 (eth 14 + ip 40): ethertype @12..14, src IP @22..38,
     // dst IP @38..54.
-    let out = build_nat64_forwarded_frame(&reply, nat64_reverse_meta(), &decision, Some(&info), false)
+    let out = build_nat64_forwarded_frame(&reply, nat64_reverse_meta(), &decision, Some(&info), false, &ForwardingState::default())
         .expect("#5606: reverse info present -> IPv6 reply built");
     assert_eq!(
         u16::from_be_bytes([out[12], out[13]]),
@@ -1161,7 +1162,7 @@ fn nat64_5606_reverse_frame_requires_reverse_info_or_drops() {
     // WITHOUT reverse info: the builder cannot reconstruct the v6 tuple and
     // fails closed (None) — the pre-#5606 dropped-reply symptom.
     assert!(
-        build_nat64_forwarded_frame(&reply, nat64_reverse_meta(), &decision, None, false).is_none(),
+        build_nat64_forwarded_frame(&reply, nat64_reverse_meta(), &decision, None, false, &ForwardingState::default()).is_none(),
         "#5606: missing reverse info must fail closed (None) — the dropped-reply symptom"
     );
 }
@@ -1586,6 +1587,7 @@ fn nat64_8890_tunnel_marked_decision_is_not_emitted_plaintext() {
         &control_decision,
         None,
         false,
+        &ForwardingState::default(),
     )
     .expect(
         "NON-VACUITY: the untunnelled control MUST translate. If this fixture \
@@ -1630,18 +1632,20 @@ fn nat64_8890_tunnel_marked_decision_is_not_emitted_plaintext() {
         &tunnel_decision,
         None,
         false,
+        &ForwardingState::default(),
     );
 
     assert!(
         subject.is_none(),
-        "#8890: a NAT64 decision whose route resolved through a tunnel endpoint \
-         must FAIL CLOSED. This builder performs no encapsulation and the TX copy \
-         path selects it exclusively on `is_nat64`, so a returned frame is emitted \
-         on the physical NIC unencapsulated. Measured before the gate: the frame \
-         was byte-identical to the control above ({} bytes, ethertype 0x0800) — \
-         traffic an operator routed through WireGuard leaving as plaintext on the \
-         underlay. #1873 R-E already drops rather than 'later TX PLAINTEXT' on the \
-         unresolved-neighbour route; this is the resolved route via NAT64. \
+        "#8890/#2327: a NAT64 decision whose tunnel endpoint resolves to NO ROW \
+         must FAIL CLOSED. §8896 made a RESOLVED endpoint encapsulate, so this \
+         arm now measures the residue rather than the whole combination — note \
+         the empty `ForwardingState` passed above, which is what makes the id \
+         unresolvable. The original measurement still stands: before §8890 the \
+         frame was byte-identical to the control above ({} bytes, ethertype \
+         0x0800), traffic an operator routed through WireGuard leaving as \
+         plaintext on the underlay. The positive half is now \
+         `nat64_8896_tunnel_marked_decision_is_encapsulated_not_plaintext`. \
          FAILING ID = {}. Got {:?} bytes.",
         control.len(),
         id,
@@ -1696,6 +1700,7 @@ fn nat64_8890_gate_holds_in_the_reverse_v4_to_v6_direction() {
         &control_decision,
         Some(&info),
         false,
+        &ForwardingState::default(),
     )
     .expect(
         "NON-VACUITY: the untunnelled reverse control MUST build. The reverse arm          already fails closed without reverse info (#5606), so a broken fixture          here would satisfy the is_none() below for the wrong reason entirely",
@@ -1719,11 +1724,345 @@ fn nat64_8890_gate_holds_in_the_reverse_v4_to_v6_direction() {
         &tunnel_decision,
         Some(&info),
         false,
+        &ForwardingState::default(),
     );
 
     assert!(
         subject.is_none(),
         "#8890 must gate the REVERSE (v4->v6) direction as well as the forward          one. The reverse arm encapsulates nothing either, so a tunnel-marked          reply toward an IPv6 client would go out unencapsulated. A gate narrowed          to AF_INET6 survives every other #8890 cell — this is the one that          catches it. Got {:?} bytes.",
         subject.as_ref().map(|f| f.len()),
+    );
+}
+
+// ===========================================================================
+// #8896: NAT64 + native tunnel now COMPOSE. The cells below are the positive
+// half; the two #8890 cells above are retained as the fail-closed control for
+// the residue (#2327: no endpoint row / unknown mode).
+// ===========================================================================
+
+/// Build a ForwardingState carrying one native-GRE endpoint at `id`, plus the
+/// physical egress the outer path resolves through.
+fn gre_forwarding_8896(id: u16) -> ForwardingState {
+    let mut fwd = ForwardingState::default();
+    // The decision fixture resolves egress_ifindex=12 / tx_ifindex=11, and the
+    // GRE builder refuses a decision whose egress_ifindex disagrees with the
+    // endpoint's logical_ifindex. Populate both so the outer MTU resolves.
+    for ifx in [11, 12] {
+        fwd.egress.insert(
+            ifx,
+            EgressInterface {
+                bind_ifindex: 0,
+                vlan_id: 0,
+                mtu: 1500,
+                src_mac: [0x02, 0, 0, 0, 0, 0x01],
+                zone_id: 0,
+                redundancy_group: 0,
+                primary_v4: Some(Ipv4Addr::new(172, 16, 80, 8)),
+                primary_v6: None,
+            },
+        );
+    }
+    fwd.tunnel_endpoints.insert(
+        id,
+        TunnelEndpoint {
+            id,
+            logical_ifindex: 12,
+            interface_label: "gr-0/0/0".into(),
+            interface: "gr-0/0/0.0".into(),
+            redundancy_group: 0,
+            mode: "gre".into(),
+            outer_family: libc::AF_INET,
+            source: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
+            destination: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)),
+            key: 0,
+            ttl: 64,
+            transport_table: String::new(),
+            wg_listen_port: 0,
+            wg_local_privkey: zeroize::Zeroizing::new([0u8; 32]),
+            wg_peers: Vec::new(),
+        },
+    );
+    fwd
+}
+
+/// #8896: the composed output is ENCAPSULATED, and specifically it is not the
+/// plaintext frame #8890 measured.
+///
+/// **The control is the same load-bearing one #8890 used, and it is why this
+/// cell can tell composition from a no-op.** An `is_some()` assertion on the
+/// subject alone is satisfied by a builder that ignored the tunnel field
+/// entirely — which is exactly the `c2e0a9ecb` defect, where the tunnel-marked
+/// output was byte-identical to the untunnelled control. So the subject must
+/// differ from the control AND carry the tunnel's own outer header.
+#[test]
+fn nat64_8896_tunnel_marked_decision_is_encapsulated_not_plaintext() {
+    let client: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let synthetic: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let pool = Ipv4Addr::new(203, 0, 113, 1);
+    let server = Ipv4Addr::new(8, 8, 8, 8);
+    let frame = build_ipv6_tcp_syn_with_mss(client, synthetic, 5000, 443, 1460);
+
+    let control_decision = icmp_test_decision(Nat64State::forward_decision(pool, server, 40001));
+    assert_eq!(control_decision.resolution.tunnel_endpoint_id, 0);
+    let control = build_nat64_forwarded_frame(
+        &frame,
+        nat64_forward_meta(),
+        &control_decision,
+        None,
+        false,
+        &ForwardingState::default(),
+    )
+    .expect(
+        "NON-VACUITY: the untunnelled control MUST translate, or every comparison \
+         below is against an absent frame",
+    );
+
+    // Sweep the id space for the same reason #8890 does: a single pinned id
+    // leaves the predicate free between the pinned value and 0.
+    for id in [1u16, 2, 7, u16::MAX] {
+        let fwd = gre_forwarding_8896(id);
+        let mut tunnel_decision =
+            icmp_test_decision(Nat64State::forward_decision(pool, server, 40001));
+        tunnel_decision.resolution.tunnel_endpoint_id = id;
+
+        let subject = build_nat64_forwarded_frame(
+            &frame,
+            nat64_forward_meta(),
+            &tunnel_decision,
+            None,
+            false,
+            &fwd,
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "#8896: a NAT64 decision routed through a RESOLVED native-GRE \
+                 endpoint must now be encapsulated, not dropped. id={id}"
+            )
+        });
+
+        assert_ne!(
+            subject, control,
+            "#8896: the tunnel-marked output is BYTE-IDENTICAL to the untunnelled \
+             control — the tunnel field was ignored and the inner packet is \
+             leaving as plaintext on the underlay. That is the exact \
+             `c2e0a9ecb` measurement #8890 gated. id={id}"
+        );
+        // The outer header is the TUNNEL's: IPv4 outer, protocol 47 (GRE),
+        // source and destination from the endpoint row rather than the NAT64
+        // pool/server the inner packet carries.
+        assert_eq!(
+            &subject[12..14],
+            &0x0800u16.to_be_bytes(),
+            "#8896: outer ethertype must be IPv4 for an AF_INET GRE outer. id={id}"
+        );
+        assert_eq!(
+            subject[23], 47,
+            "#8896: outer IP protocol must be 47 (GRE). Got {}. id={id}",
+            subject[23]
+        );
+        assert_eq!(
+            &subject[26..30],
+            &Ipv4Addr::new(172, 16, 80, 8).octets(),
+            "#8896: outer source must be the tunnel endpoint's, not the NAT64 pool. id={id}"
+        );
+        assert_eq!(
+            &subject[30..34],
+            &Ipv4Addr::new(203, 0, 113, 9).octets(),
+            "#8896: outer destination must be the tunnel endpoint's. id={id}"
+        );
+    }
+}
+
+/// #8896 / #2327: the fail-closed posture is UNCHANGED for the genuine
+/// residue. An endpoint id resolving to no row, or to a row whose mode is
+/// neither GRE nor WireGuard, is still dropped rather than emitted.
+///
+/// This is what `nat64_tunnel_encap_unsupported` counts now that a known mode
+/// is no longer part of the unsupported set.
+#[test]
+fn nat64_8896_unknown_mode_and_missing_row_still_fail_closed() {
+    let client: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let synthetic: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let pool = Ipv4Addr::new(203, 0, 113, 1);
+    let server = Ipv4Addr::new(8, 8, 8, 8);
+    let frame = build_ipv6_tcp_syn_with_mss(client, synthetic, 5000, 443, 1460);
+
+    for id in [1u16, 2, 7, u16::MAX] {
+        let mut decision = icmp_test_decision(Nat64State::forward_decision(pool, server, 40001));
+        decision.resolution.tunnel_endpoint_id = id;
+
+        // (a) no endpoint row at all.
+        assert!(
+            build_nat64_forwarded_frame(
+                &frame,
+                nat64_forward_meta(),
+                &decision,
+                None,
+                false,
+                &ForwardingState::default(),
+            )
+            .is_none(),
+            "#2327: a tunnel id resolving to NO endpoint row must fail closed. id={id}"
+        );
+
+        // (b) a row whose mode is neither GRE nor WireGuard. A fail-OPEN
+        // default here would GRE-encapsulate an unrecognised or future mode.
+        let mut fwd = gre_forwarding_8896(id);
+        fwd.tunnel_endpoints.get_mut(&id).expect("row").mode = "ipsec-vti-future".into();
+        assert!(
+            build_nat64_forwarded_frame(
+                &frame,
+                nat64_forward_meta(),
+                &decision,
+                None,
+                false,
+                &fwd,
+            )
+            .is_none(),
+            "#2327: an UNKNOWN tunnel mode must fail closed, not fall back to GRE. id={id}"
+        );
+    }
+}
+
+/// #8896: the composition claims the encapsulators read exactly two meta
+/// fields — `addr_family` and `l3_offset`. This binds that claim.
+///
+/// Every OTHER field is poisoned with a value unlike the real one; the emitted
+/// bytes must not change. If a third field is ever read, this reds and the
+/// `nat64_translated_meta` doc comment stops being true silently.
+#[test]
+fn nat64_8896_encap_ignores_every_meta_field_but_family_and_l3() {
+    let client: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let synthetic: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let pool = Ipv4Addr::new(203, 0, 113, 1);
+    let server = Ipv4Addr::new(8, 8, 8, 8);
+    let frame = build_ipv6_tcp_syn_with_mss(client, synthetic, 5000, 443, 1460);
+    let fwd = gre_forwarding_8896(7);
+    let mut decision = icmp_test_decision(Nat64State::forward_decision(pool, server, 40001));
+    decision.resolution.tunnel_endpoint_id = 7;
+
+    let clean =
+        build_nat64_forwarded_frame(&frame, nat64_forward_meta(), &decision, None, false, &fwd)
+            .expect("NON-VACUITY: the clean arm must encapsulate or there is nothing to compare");
+
+    let mut poisoned = nat64_forward_meta();
+    poisoned.ingress_ifindex = 0xDEAD;
+    poisoned.ingress_vlan_id = 4094;
+    poisoned.ingress_pcp = 7;
+    poisoned.ingress_vlan_present = 1;
+    poisoned.l4_offset = 0xFFFF;
+    poisoned.payload_offset = 0xFFFF;
+    poisoned.pkt_len = 0xFFFF;
+    poisoned.tcp_flags = 0xFF;
+    poisoned.meta_flags = 0xFF;
+    poisoned.dscp = 0x3F;
+    poisoned.flow_src_port = 0xFFFF;
+    poisoned.flow_dst_port = 0xFFFF;
+
+    let out = build_nat64_forwarded_frame(&frame, poisoned, &decision, None, false, &fwd)
+        .expect("the poisoned arm must still encapsulate — only unread fields were changed");
+
+    assert_eq!(
+        out, clean,
+        "#8896: poisoning a meta field OTHER than addr_family/l3_offset changed the \
+         emitted frame, so the tunnel encapsulators read more of `meta` than \
+         `nat64_translated_meta` rebuilds. That function's claim — and the #8890 \
+         doc comment's list of three `addr_family` sites — is now incomplete"
+    );
+}
+
+/// #8896: the composition must hold in the REVERSE (v4->v6) direction too.
+///
+/// This cell exists for the reason the #8890 reverse cell exists, restated for
+/// the positive half: **a composition narrowed to the forward direction
+/// survives every other #8896 cell.** All three above drive v6->v4 ingress, so
+/// an `addr_family` rebuild that only handled `AF_INET6` — or a tunnel
+/// post-pass reached only from the forward arm — would pass them all and drop
+/// (or leak) every reply toward an IPv6 client.
+#[test]
+fn nat64_8896_encapsulates_the_reverse_v4_to_v6_direction() {
+    let client: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let synthetic: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let pool = Ipv4Addr::new(203, 0, 113, 1);
+    let server = Ipv4Addr::new(8, 8, 8, 8);
+    let orig_sport = 5000u16;
+    let translated = 40001u16;
+
+    let reply = build_ipv4_tcp_frame(
+        server,
+        pool,
+        443,
+        translated,
+        1,
+        1,
+        crate::tcp_flags::TCP_ACK,
+    );
+    let fwd_state = Nat64State::forward_decision(pool, server, translated);
+    let rev = fwd_state.reverse(IpAddr::V6(client), IpAddr::V6(synthetic), orig_sport, 443);
+    let info = Nat64ReverseInfo {
+        orig_src_v6: client,
+        orig_dst_v6: synthetic,
+    };
+
+    // CONTROL: the untunnelled reverse reply is a real, plain IPv6 frame.
+    let control = build_nat64_forwarded_frame(
+        &reply,
+        nat64_reverse_meta(),
+        &icmp_test_decision(rev.clone()),
+        Some(&info),
+        false,
+        &ForwardingState::default(),
+    )
+    .expect("NON-VACUITY: the untunnelled reverse control MUST build");
+    assert_eq!(
+        u16::from_be_bytes([control[12], control[13]]),
+        0x86dd,
+        "CONTROL: the reverse arm must produce a genuine IPv6 reply, or the \
+         comparison below is against a broken fixture"
+    );
+
+    // SUBJECT: id 1 — the natural first id and the value a `> 1` off-by-one
+    // lets through, matching the reverse #8890 cell's choice.
+    let tunnel_id = 1u16;
+    let gre = gre_forwarding_8896(tunnel_id);
+    let mut tunnel_decision = icmp_test_decision(rev);
+    tunnel_decision.resolution.tunnel_endpoint_id = tunnel_id;
+
+    let subject = build_nat64_forwarded_frame(
+        &reply,
+        nat64_reverse_meta(),
+        &tunnel_decision,
+        Some(&info),
+        false,
+        &gre,
+    )
+    .expect(
+        "#8896: the REVERSE (v4->v6) NAT64 direction through a resolved native-GRE \
+         endpoint must encapsulate. If this is None while the forward cells pass, \
+         the composition was wired into the forward arm only",
+    );
+
+    assert_ne!(
+        subject, control,
+        "#8896 reverse: the tunnel-marked reply is byte-identical to the \
+         untunnelled control — the reply is leaving as plaintext on the underlay"
+    );
+    // The outer header is the tunnel's IPv4 outer even though the INNER packet
+    // is now IPv6 — which is the whole point of rebuilding `addr_family`.
+    assert_eq!(
+        &subject[12..14],
+        &0x0800u16.to_be_bytes(),
+        "#8896 reverse: outer ethertype must be IPv4 (the GRE outer family), not \
+         the inner IPv6 family"
+    );
+    assert_eq!(
+        subject[23], 47,
+        "#8896 reverse: outer IP protocol must be 47 (GRE). Got {}",
+        subject[23]
+    );
+    assert_eq!(
+        &subject[30..34],
+        &Ipv4Addr::new(203, 0, 113, 9).octets(),
+        "#8896 reverse: outer destination must be the tunnel endpoint's"
     );
 }
