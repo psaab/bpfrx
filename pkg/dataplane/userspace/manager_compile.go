@@ -367,11 +367,28 @@ func (m *Manager) applyCompiledSnapshot(
 	publishedPlanChangedDuringStartup := pendingXSKStartup &&
 		m.publishedPlanKey != "" &&
 		m.publishedPlanKey != newPlanKey
-	if publishedPlanChangedDuringStartup {
+	// #8899: the plan key cannot see the helper's PROCESS IDENTITY, so the
+	// check above misses a config that changes only which binary runs, which
+	// sockets it listens on, where it checkpoints, or how it polls. During the
+	// startup window that meant the restart trigger could not fire and the
+	// branch below returned apply-SUCCESS after recording the desired config as
+	// running -- while the child kept its original argv and socket.
+	//
+	// `configEqual` is the predicate that already answers this correctly and is
+	// what `ensureProcessLocked` consults on the normal path; this branch simply
+	// never asked it. Consulting it here rather than widening the plan key keeps
+	// each predicate answering the question it is named for: the plan key is
+	// about the BINDING plan (workers, rings, interface and fabric topology),
+	// and it is deliberately insensitive to things that must not churn it.
+	processIdentityChangedDuringStartup :=
+		processRestartRequiredDuringStartup(pendingXSKStartup, m.cfg, ucfg)
+	if publishedPlanChangedDuringStartup || processIdentityChangedDuringStartup {
 		slog.Info(
-			"userspace: restarting helper during XSK startup for binding plan change",
+			"userspace: restarting helper during XSK startup",
 			"generation", snap.Generation,
 			"fib_generation", snap.FIBGeneration,
+			"binding_plan_changed", publishedPlanChangedDuringStartup,
+			"process_identity_changed", processIdentityChangedDuringStartup,
 		)
 		m.stopLocked()
 		pendingXSKStartup = false

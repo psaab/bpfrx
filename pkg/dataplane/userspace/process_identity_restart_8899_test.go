@@ -1,0 +1,366 @@
+package userspace
+
+import (
+	"os"
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/psaab/xpf/pkg/config"
+)
+
+// #8899: a config changing ONLY the helper's process identity — which binary
+// runs, which sockets it listens on, where it checkpoints, how it polls — was
+// acked during the pending-XSK-startup window WITHOUT restarting the helper.
+//
+// The restart trigger in that window compared binding PLAN KEYS.
+// `snapshotBindingPlanKey` covers workers, ring entries, and interface/fabric
+// topology; it is deliberately insensitive to everything else, because it must
+// not churn when a tunnel appears or moves (see the four-call-site note in
+// ingress_exclusions.go). Process identity is not in it and should not be.
+//
+// The branch then recorded the DESIRED config as running (`m.cfg = ucfg`) and
+// returned success, which is what makes the state non-self-repairing: a later
+// IDENTICAL apply compares against the desired config, sees no change, and does
+// not restart either. The obvious operator recovery — reapply the same config —
+// is exactly the one that cannot work.
+
+func baseUserspaceConfig8899() config.UserspaceConfig {
+	return config.UserspaceConfig{
+		Binary:        "/usr/sbin/xpf-userspace-dp",
+		ControlSocket: "/run/xpf/ctl.sock",
+		EventSocket:   "/run/xpf/evt.sock",
+		StateFile:     "/var/lib/xpf/state.json",
+		Workers:       4,
+		RingEntries:   2048,
+		PollMode:      "busy",
+	}
+}
+
+// bumpField8899 returns a copy of cfg with exactly one exported field changed to
+// a value different from its current one.
+func bumpField8899(t *testing.T, cfg config.UserspaceConfig, name string) config.UserspaceConfig {
+	t.Helper()
+	out := cfg
+	fv := reflect.ValueOf(&out).Elem().FieldByName(name)
+	if !fv.IsValid() || !fv.CanSet() {
+		t.Fatalf("field %q is not settable — this helper cannot exercise it", name)
+	}
+	switch fv.Kind() {
+	case reflect.String:
+		fv.SetString(fv.String() + "-changed-8899")
+	case reflect.Bool:
+		fv.SetBool(!fv.Bool())
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		fv.SetInt(fv.Int() + 8899)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		fv.SetUint(fv.Uint() + 8899)
+	case reflect.Ptr:
+		// nil -> non-nil is a change; a non-nil pointer becomes nil.
+		if fv.IsNil() {
+			fv.Set(reflect.New(fv.Type().Elem()))
+		} else {
+			fv.Set(reflect.Zero(fv.Type()))
+		}
+	case reflect.Slice:
+		fv.Set(reflect.Append(fv, reflect.Zero(fv.Type().Elem())))
+	default:
+		t.Fatalf("field %q has kind %s, which this helper cannot bump — extend the "+
+			"switch rather than skipping the field, or the completeness guard below "+
+			"silently stops covering it", name, fv.Kind())
+	}
+	return out
+}
+
+// THE COMPLETENESS GUARD, and it is the one that prevents the NEXT #8899
+// rather than only fixing this one.
+//
+// MY FIRST VERSION OF THIS ASSERTED THE WRONG POLICY, and running it is what
+// showed that. It required every exported field of config.UserspaceConfig to be
+// compared by `configEqual`. Seventeen fields exist and `configEqual` compares
+// seven, so it failed on ten — and had I "fixed" that by adding them, a change
+// to `cpu-governor` or an ethtool coalescence setting would RESTART THE
+// DATAPLANE. The blanket rule was more dangerous than the bug.
+//
+// The seven are exactly the helper's process identity: `Binary` is the
+// executable, and the other six are its argv or the socket it is dialled on
+// (`process.go` builds `--control-socket --state-file --workers --ring-entries
+// --poll-mode`, plus the derived event socket). Changing one of them cannot be
+// applied to a running child.
+//
+// The ten are applied by the DAEMON out of band -- `daemon_apply_tail.go` and
+// `daemon_run_naming.go` set the CPU governor, netdev budget, RSS indirection
+// and coalescence via sysfs/ethtool -- or reach the helper inside the SNAPSHOT
+// rather than argv (`SharedUMEM`), or are diagnostic (`RetiredKnobsSeen`). None
+// needs a restart, and forcing one would be a regression.
+//
+// So the guard asserts CLASSIFICATION, not membership: every field must be in
+// exactly one of the two sets. A field added to config.UserspaceDataplane fails
+// this cell until someone decides which it is — which is the decision that was
+// never made for the seven, and the reason #8899 existed.
+var processIdentityExempt8899 = map[string]string{
+	"SharedUMEM":                  "reaches the helper in the SNAPSHOT (protocol_binding.go), not argv — live-configurable",
+	"RSSIndirectionDisabled":      "applied by the daemon via ethtool (daemon_apply_tail.go)",
+	"ClaimHostTunables":           "gates the daemon's own sysfs/ethtool writes; the helper never sees it",
+	"CPUGovernor":                 "daemon writes it to sysfs; restarting the helper would not apply it",
+	"NetdevBudget":                "daemon sysfs tunable",
+	"CoalescenceAdaptiveDisabled": "daemon ethtool tunable",
+	"CoalescenceAdaptiveExplicit": "daemon ethtool tunable",
+	"CoalescenceRXUsecs":          "daemon ethtool tunable",
+	"CoalescenceTXUsecs":          "daemon ethtool tunable",
+	"RetiredKnobsSeen":            "diagnostic list of retired knobs for the commit warning; not runtime state",
+}
+
+func TestEveryUserspaceConfigFieldIsClassifiedForRestart8899(t *testing.T) {
+	base := baseUserspaceConfig8899()
+	rt := reflect.TypeOf(base)
+
+	// LIVENESS: reflection over the wrong type, or a struct that lost its
+	// fields, would make every assertion below vacuous.
+	if rt.NumField() == 0 {
+		t.Fatal("config.UserspaceConfig has no fields — this guard is reading the wrong type")
+	}
+	if !configEqual(base, base) {
+		t.Fatal("configEqual says a config differs from itself; the fixture or the " +
+			"predicate is broken and nothing below can mean anything")
+	}
+
+	seen := map[string]bool{}
+	identity, exempt := 0, 0
+	for i := 0; i < rt.NumField(); i++ {
+		f := rt.Field(i)
+		if f.PkgPath != "" {
+			continue // unexported
+		}
+		seen[f.Name] = true
+		t.Run(f.Name, func(t *testing.T) {
+			changed := bumpField8899(t, base, f.Name)
+			compared := !configEqual(base, changed)
+			reason, isExempt := processIdentityExempt8899[f.Name]
+
+			switch {
+			case compared && isExempt:
+				t.Errorf("config.UserspaceConfig.%s is BOTH compared by configEqual and "+
+					"listed exempt (%q). One of the two is wrong: if it is process "+
+					"identity, drop the exemption; if it is a daemon-applied tunable, "+
+					"drop it from configEqual or every change to it restarts the "+
+					"dataplane.", f.Name, reason)
+			case !compared && !isExempt:
+				t.Errorf("config.UserspaceConfig.%s is UNCLASSIFIED: configEqual ignores "+
+					"it and it is not listed exempt. Decide which it is.\n"+
+					"  If it changes the helper's argv, its binary, or a socket it is "+
+					"dialled on, add it to configEqual — otherwise a commit changing "+
+					"only that field is acked WITHOUT a restart, and during the "+
+					"XSK-startup window it is also recorded as running, so reapplying "+
+					"the same config cannot repair it either (#8899).\n"+
+					"  If the DAEMON applies it out of band (sysfs/ethtool, see "+
+					"daemon_apply_tail.go) or it travels in the snapshot, add it to "+
+					"processIdentityExempt8899 with the reason.", f.Name)
+			}
+			if compared {
+				identity++
+			} else {
+				exempt++
+			}
+		})
+	}
+
+	// The exempt list must not name fields that no longer exist — a stale
+	// entry silently excuses nothing and hides the next unclassified field
+	// behind a name that looks handled.
+	for name := range processIdentityExempt8899 {
+		if !seen[name] {
+			t.Errorf("processIdentityExempt8899 names %q, which is not a field of "+
+				"config.UserspaceConfig any more. Remove it.", name)
+		}
+	}
+	if identity == 0 || exempt == 0 {
+		t.Errorf("the classification collapsed to one side (identity=%d exempt=%d); "+
+			"a guard where every field lands in the same bucket is not discriminating",
+			identity, exempt)
+	}
+}
+
+// The blindness itself, measured, with the controls that make the negatives
+// mean something.
+//
+// lane-8367 measured FOUR fields on #8899 (Binary, ControlSocket, StateFile,
+// PollMode). The real population is FIVE: `EventSocket` is equally absent from
+// the plan key and equally a process-identity field. The table below is derived
+// from the two predicates rather than transcribed, so it cannot drift from them.
+func TestPlanKeyIsBlindToProcessIdentityFields8899(t *testing.T) {
+	base := baseUserspaceConfig8899()
+	snapFor := func(c config.UserspaceConfig) *ConfigSnapshot {
+		return &ConfigSnapshot{Version: ProtocolVersion, Generation: 1, Userspace: c}
+	}
+	baseKey := snapshotBindingPlanKey(snapFor(base))
+	if baseKey == "" {
+		t.Fatal("NON-VACUITY: the base plan key is empty, so 'unchanged' below would " +
+			"be comparing two empty strings and every row would pass")
+	}
+
+	// CONTROLS FIRST. A table of all-unchanged rows is indistinguishable from a
+	// key function that returns a constant — the shape that produced three wrong
+	// verdicts on #8791. These two prove the key discriminates what it covers.
+	for _, ctl := range []string{"Workers", "RingEntries"} {
+		changed := bumpField8899(t, base, ctl)
+		if snapshotBindingPlanKey(snapFor(changed)) == baseKey {
+			t.Fatalf("CONTROL FAILED: the plan key did not move when %s changed. The key "+
+				"is not discriminating at all, so the blindness rows below are a property "+
+				"of the fixture rather than of the key", ctl)
+		}
+	}
+
+	// Every field the plan key does NOT cover must be covered by configEqual,
+	// or the restart cannot be triggered by anything.
+	rt := reflect.TypeOf(base)
+	blind := 0
+	for i := 0; i < rt.NumField(); i++ {
+		f := rt.Field(i)
+		if f.PkgPath != "" {
+			continue
+		}
+		changed := bumpField8899(t, base, f.Name)
+		if snapshotBindingPlanKey(snapFor(changed)) != baseKey {
+			continue // the plan key sees it; not a #8899 field
+		}
+		if _, exempt := processIdentityExempt8899[f.Name]; exempt {
+			// Blind to the plan key by design, and it does not need a restart —
+			// the daemon applies it out of band, or it travels in the snapshot.
+			continue
+		}
+		blind++
+		if configEqual(base, changed) {
+			t.Errorf("config.UserspaceConfig.%s is invisible to BOTH the binding plan key "+
+				"AND configEqual, and is not listed exempt. Nothing can trigger a restart "+
+				"for it (#8899)", f.Name)
+		}
+	}
+	if blind == 0 {
+		t.Fatal("no field was found invisible to the plan key — either the key now covers " +
+			"everything (in which case this cell should be re-pointed) or the fixture is " +
+			"not exercising it")
+	}
+	// lane-8367 measured FOUR on the issue; the real process-identity population
+	// invisible to the plan key is FIVE — `EventSocket` is equally absent and
+	// equally argv-adjacent (it is derived from ControlSocket's directory when
+	// empty, and the event stream is dialled on it).
+	if blind != 5 {
+		t.Errorf("expected 5 process-identity fields invisible to the binding plan key "+
+			"(Binary, ControlSocket, EventSocket, StateFile, PollMode), got %d. If a "+
+			"field moved between the plan key and configEqual, this count is the thing "+
+			"that noticed — re-derive it deliberately rather than editing the number",
+			blind)
+	}
+	t.Logf("#8899: %d process-identity fields are invisible to the binding plan key "+
+		"and are covered by configEqual instead", blind)
+}
+
+// And the wiring: the production predicate, not a re-derivation of it.
+func TestProcessRestartRequiredDuringStartup8899(t *testing.T) {
+	base := baseUserspaceConfig8899()
+
+	if processRestartRequiredDuringStartup(true, base, base) {
+		t.Error("an unchanged config must NOT force a restart during the startup window; " +
+			"this would restart the helper on every same-config apply")
+	}
+	changed := bumpField8899(t, base, "ControlSocket")
+	if !processRestartRequiredDuringStartup(true, base, changed) {
+		t.Error("#8899: a control-socket change during the XSK-startup window MUST force a " +
+			"restart. Without it the apply is acked, the desired config is recorded as " +
+			"running, and every later snapshot and status RPC dials the new path while the " +
+			"helper still listens on the old one")
+	}
+	// SCOPE: outside the window this predicate must stay quiet — the normal path
+	// already reaches ensureProcessLocked, which consults configEqual itself.
+	if processRestartRequiredDuringStartup(false, base, changed) {
+		t.Error("outside the pending-XSK-startup window this predicate must not fire; the " +
+			"normal apply path already restarts via ensureProcessLocked, and a second " +
+			"trigger would stop the helper an extra time")
+	}
+}
+
+// THE WIRING, which the three cells above do NOT bind.
+//
+// Measured: removing the `|| processIdentityChangedDuringStartup` disjunct from
+// `manager_compile.go` left every other cell in this file GREEN. They exercise
+// `processRestartRequiredDuringStartup`, `configEqual` and the plan key — the
+// predicate is correct and the dispatcher simply would not consult it. That is
+// the same defect this session held another PR for, reproduced here in my own
+// work, which is why it gets its own guard rather than a note.
+//
+// This binds it TEXTUALLY, not by execution, and the distinction is worth
+// stating. Driving the real branch needs a live child process, and the existing
+// startup-window harness fakes it with `os.FindProcess(os.Getpid())` — so a cell
+// that actually reached `stopLocked` would signal the test runner. A source scan
+// is the weaker instrument and it is the one this codebase already uses for
+// exactly this problem (see `nat64_never_reaches_the_in_place_rewrite_path_6922`).
+// It cannot prove the branch behaves correctly; it can prove the call was not
+// deleted, which is the failure that actually happened.
+func TestStartupRestartConsultsProcessIdentity8899(t *testing.T) {
+	src, err := os.ReadFile("manager_compile.go")
+	if err != nil {
+		t.Fatalf("read manager_compile.go: %v", err)
+	}
+
+	// Strip comments first: this file discusses #8899 and
+	// processRestartRequiredDuringStartup at length in prose, and a scan a
+	// comment can satisfy is not a scan of the code.
+	var code strings.Builder
+	inBlock := false
+	for _, line := range strings.Split(string(src), "\n") {
+		l := line
+		if inBlock {
+			if i := strings.Index(l, "*/"); i >= 0 {
+				inBlock = false
+				l = l[i+2:]
+			} else {
+				continue
+			}
+		}
+		if i := strings.Index(l, "/*"); i >= 0 {
+			inBlock = true
+			l = l[:i]
+		}
+		if i := strings.Index(l, "//"); i >= 0 {
+			l = l[:i]
+		}
+		code.WriteString(l)
+		code.WriteString("\n")
+	}
+	stripped := code.String()
+
+	// NON-VACUITY: the stripper must not have eaten the code.
+	if !strings.Contains(stripped, "publishedPlanChangedDuringStartup") {
+		t.Fatal("the comment stripper or manager_compile.go changed shape — the " +
+			"binding-plan trigger is not in the stripped source, so this guard is not " +
+			"reading what it claims to read")
+	}
+
+	if !strings.Contains(stripped, "processRestartRequiredDuringStartup(") {
+		t.Fatal("manager_compile.go no longer CALLS processRestartRequiredDuringStartup. " +
+			"The predicate can be perfectly correct and every other cell in this file " +
+			"still passes — measured. Without this call, a config changing only the " +
+			"helper's binary, sockets, state file or poll mode is acked during the " +
+			"XSK-startup window without a restart, and `m.cfg = ucfg` then records it " +
+			"as running so reapplying the same config cannot repair it (#8899).")
+	}
+
+	// And it must gate the RESTART, not merely be computed and discarded — the
+	// exact shape the mutation used to prove these cells were blind.
+	idx := strings.Index(stripped, "processIdentityChangedDuringStartup")
+	if idx < 0 {
+		t.Fatal("the restart condition no longer names processIdentityChangedDuringStartup")
+	}
+	tail := stripped[idx:]
+	end := strings.Index(tail, "m.stopLocked()")
+	if end < 0 {
+		t.Fatal("no m.stopLocked() follows the process-identity check; the restart it " +
+			"is supposed to trigger is gone")
+	}
+	if !strings.Contains(tail[:end], "if publishedPlanChangedDuringStartup || processIdentityChangedDuringStartup") {
+		t.Errorf("the process-identity result is computed but does not gate the restart "+
+			"together with the binding-plan check. Between the two, the code is:\n%s",
+			tail[:end])
+	}
+}

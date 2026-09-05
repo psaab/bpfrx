@@ -447,6 +447,21 @@ func (m *Manager) resetAfterHelperGoneLocked() {
 	m.sessionMirrorErr = ""
 }
 
+// processRestartRequiredDuringStartup reports whether a config applied during
+// the pending-XSK-startup window changes the helper's PROCESS IDENTITY and
+// therefore needs a restart that the binding-plan key cannot ask for (#8899).
+//
+// It exists as a named function rather than an inline `&&` so the production
+// path and its guard call the SAME predicate. A cell that re-derives this
+// expression would verify the arithmetic and not the wiring.
+func processRestartRequiredDuringStartup(
+	pendingXSKStartup bool,
+	running config.UserspaceConfig,
+	desired config.UserspaceConfig,
+) bool {
+	return pendingXSKStartup && !configEqual(running, desired)
+}
+
 func configEqual(a, b config.UserspaceConfig) bool {
 	return a.Binary == b.Binary &&
 		a.ControlSocket == b.ControlSocket &&
