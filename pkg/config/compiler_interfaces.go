@@ -808,6 +808,25 @@ func selectMSSToken(node *Node) (string, bool) {
 			return mssChild.Keys[1], true
 		}
 	}
+	// #8824: the flat-set spelling of the hierarchical child.
+	// `set security flow tcp-mss all-tcp mss 1350` flattens the SAME hierarchy
+	// the braced form writes, so it packs as Keys=["all-tcp","mss","1350"].
+	//
+	// This used to select the literal "mss" and reject the command, on #6564's
+	// stated ground that "`mss` is the hierarchical keyword and is a typo when
+	// inline". THE DISCONFIRMING ROW WAS ALWAYS IN THE SAME INSTRUMENT: the
+	// braced `all-tcp { mss 1350; }` is ACCEPTED and compiles to 1350. If `mss`
+	// were a typo the braced form would reject it too. It does not, so `mss` is
+	// a real keyword in this grammar — and CLAUDE.md's contract is that the
+	// compiler handles both AST shapes. A keyword legitimate in the hierarchy is
+	// legitimate in its flattening, because that is what flat `set` IS.
+	//
+	// A genuine typo is still caught: `all-tcp msss 1350` selects "msss" and is
+	// refused, and `all-tcp mss` with no value selects "mss" and is refused.
+	// Only the exact keyword followed by a value token is consumed here.
+	if len(node.Keys) >= 3 && node.Keys[1] == "mss" {
+		return node.Keys[2], true
+	}
 	// Flat: ipsec-vpn 1360; (set syntax)
 	if len(node.Keys) >= 2 {
 		return node.Keys[1], true

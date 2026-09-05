@@ -77,21 +77,26 @@ func TestTCPMSSSurvivesEveryElisionDepth8824(t *testing.T) {
 		}
 	}
 
-	// THE `mss`-INLINE SPELLINGS MUST BE REFUSED AT EVERY DEPTH — consistently.
-	// Before this change the doubly-elided one was ACCEPTED and silently zeroed,
-	// which is the defect. Asserting rejection here is asserting that it fails
-	// the same way as its siblings, not that rejection is the right answer.
+	// THE `mss`-INLINE SPELLINGS DELIVER AT EVERY DEPTH.
+	//
+	// These rows asserted REJECTION when this cell was written, because the
+	// question was disputed: #6564 pinned the refusal, #8824 disputed it, and
+	// nothing in the tree appeared to settle it. It was settled by a row already
+	// in the same instrument — the braced `all-tcp { mss 1350; }` is accepted
+	// and compiles to 1350, so `mss` cannot be a typo — and the refusals were
+	// reversed. See TestCompactLeafTCPMSSKeywordIsAcceptedEverywhere6564 for the
+	// full reasoning; kept here as the depth axis of the same fact.
 	for _, c := range []struct{ name, text string }{
 		{"singly elided", `security { flow { tcp-mss { all-tcp mss 1350; } } }`},
 		{"flow braced", `security { flow { tcp-mss all-tcp mss 1350; } }`},
 		{"doubly elided", `security { flow tcp-mss all-tcp mss 1350; }`},
 	} {
 		g := compile(t, c.text)
-		if !g.rejected {
-			t.Errorf("%s `mss` inline: COMMITTED with all=%d. Whether this spelling should be "+
-				"accepted is disputed (#6564 vs #8824) and is not decided here — but it must "+
-				"not COMMIT while discarding the value, which is what the doubly-elided form "+
-				"did", c.name, g.all)
+		if g.rejected || g.all != 1350 {
+			t.Errorf("%s `mss` inline: all=%d rejected=%v, want 1350. Every depth must "+
+				"deliver the same value; the doubly-elided form previously COMMITTED while "+
+				"discarding it, which is why these rows assert the value and not acceptance",
+				c.name, g.all, g.rejected)
 		}
 	}
 
