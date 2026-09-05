@@ -350,6 +350,37 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		return true
 	}
 
+	// #8690: the three sites the two independent classifications agreed were
+	// the only available work left.
+	//
+	//	system dataplane control-socket
+	//	system domain-name
+	//	system services ssh protocol-version
+	//
+	// lane-8015 classified these `unclassified` — "in lane-8388's family and
+	// NOT measured by this lane", which was the correct record of its evidence:
+	// "nobody has checked" is a third state and calling them available would
+	// have asserted a measurement nobody took. I measured them, which is a
+	// different instrument reading rather than a correction, and they resolve
+	// to open:
+	//
+	//	admitted alone, arm 2 reports NO disarm, and the whole tree passes but
+	//	for TestNewlyVisibleSitesAreAccountedFor_8690 — a bookkeeping cell that
+	//	tracks sites made visible by synthesis and states in its own message
+	//	that normalization legitimately shrinks its list.
+	//
+	// Measured at 5c54f2f0f. The stamp matters here more than usual: whether a
+	// site disarms a gate depends on whether it was ADMITTED when the
+	// measurement was taken, so a gate verdict without a commit is not
+	// checkable. That is the provenance requirement applied to my own entry
+	// rather than to someone else's register.
+	switch containerKeyword + " " + head {
+	case "dataplane control-socket",
+		"system domain-name",
+		"ssh protocol-version":
+		return true
+	}
+
 	// #8690 family 5: applications, services, snmp, event-options. 30 sites,
 	// every one drop shape "empty" in the inventory.
 	//

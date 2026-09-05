@@ -34,6 +34,12 @@ var exclusionClasses8690 = map[string]bool{
 	"partial": true, "gate-confirmed": true, "gate-open-question": true,
 	"gate-collateral": true, "unmeasurable": true, "unreachable": true,
 	"hazard": true, "open": true, "unclassified": true,
+	// #8690: the fix is CORRECT but the vehicle is not a family sweep — it
+	// changes behaviour that owes its own change and a smoke. Deliberately
+	// neither `open` (sweeping it would be wrong) nor permanent (normalizing it
+	// is right). Without this class such a site can only be recorded as an
+	// exclusion, which is false, or as available, which invites the sweep.
+	"owed-own-change": true,
 }
 
 // Classes whose sites must never be normalized.
@@ -114,27 +120,83 @@ func TestPermanentExclusionsMatchTheInventory8690(t *testing.T) {
 	for _, s := range sites {
 		inInv[s] = true
 	}
-	// SPLIT BY CLASS. A site leaving the inventory means a widening normalized
-	// it, and what that MEANS depends entirely on the class it was filed under.
-	// For a permanent class it is a violation. For an open one it is the
-	// question being ANSWERED — `permanentClasses8690` deliberately excludes
-	// `open`, `gate-open-question`, `unmeasurable` and `unclassified`, because
-	// this register's own note says a red is available work until somebody
-	// answers it. Reporting both with "this register says must never be
-	// normalized" told the second group something false about themselves.
-	var becameAdmissible, answered, unclassifiedDrift []string
+	var becameAdmissible, unclassifiedDrift, completed, owedDeparture, measuredAway []string
 	for site, e := range reg {
 		if inInv[site] {
 			continue
 		}
-		row := site + " (" + e.class + ": " + e.reason + ")"
-		if permanentClasses8690[e.class] {
-			becameAdmissible = append(becameAdmissible, row)
-		} else {
-			answered = append(answered, row)
+		// #8690: an `open` site leaving the inventory is the SUCCESS case, not a
+		// violation. This register is named for permanent exclusions, and every
+		// other class means "must never be normalized" — but `open` means the
+		// opposite, so the failure below was written for classes that do not
+		// include it. The first time an `open` site was actually completed
+		// (lane-8526 normalizing the three `system` sites it had measured), the
+		// cell reported the work as though a gate had been disarmed.
+		//
+		// So `open` is separated rather than exempted: it still has to be
+		// noticed, because a stale `open` entry for work already done is a lane
+		// pointing at a site that no longer exists. It just is not an error.
+		if e.class == "open" {
+			completed = append(completed, site)
+			continue
 		}
+		// #8690: `owed-own-change` is a THIRD departure meaning, and neither of
+		// the two above fits it. That class says the fix is CORRECT but the
+		// vehicle is not a family sweep — for the `scheduler-name` sites,
+		// normalizing converts a permanently-active security policy into a
+		// time-limited one, which owes `make test-failover` v4+v6.
+		//
+		// So a departure here is legitimate ONLY IF that verification actually
+		// ran. Reporting it as a violation would be wrong when someone did the
+		// dedicated change properly; reporting it as completion would let a
+		// family sweep take it silently, which is the entire failure the class
+		// was created to prevent. The cell cannot tell those apart — a smoke
+		// leaves no trace in this tree — so it asks, and names what to check.
+		if e.class == "owed-own-change" {
+			owedDeparture = append(owedDeparture, site)
+			continue
+		}
+		// `unclassified` / `unmeasurable` departing is neither a violation nor a
+		// completion: it means somebody MEASURED a site this register recorded
+		// as unknown, and the measurement is the thing worth keeping. The line
+		// goes, but the verdict should not vanish with it.
+		if e.class == "unclassified" || e.class == "unmeasurable" {
+			measuredAway = append(measuredAway, site+" (was "+e.class+")")
+			continue
+		}
+		becameAdmissible = append(becameAdmissible, site+" ("+e.class+": "+e.reason+")")
 	}
-	sort.Strings(answered)
+	sort.Strings(completed)
+	if len(completed) > 0 {
+		t.Errorf("#8690: %d site(s) classed `open` have been normalized and their register "+
+			"lines are now stale:\n  %s\n\nThat is the work being DONE, not a violation — "+
+			"delete these lines. They are reported rather than ignored because a stale `open` "+
+			"entry sends the next lane looking for a site that is no longer there.",
+			len(completed), strings.Join(completed, "\n  "))
+	}
+	sort.Strings(owedDeparture)
+	if len(owedDeparture) > 0 {
+		t.Errorf("#8690: %d site(s) classed `owed-own-change` left the inventory:\n  %s\n\n"+
+			"That class means the fix is CORRECT and the VEHICLE is not a family sweep. So "+
+			"this is legitimate IF the owed verification ran, and a silent sweep if it did "+
+			"not — and this cell cannot tell, because a smoke leaves no trace in the tree. "+
+			"CHECK: did the change that normalized these run `make test-failover` v4+v6? "+
+			"For the scheduler-name sites the consequence is a forwarding one — a "+
+			"permanently-active security policy becomes time-limited — so a commit-check "+
+			"alone does not cover it. If the verification ran, delete the line and say where; "+
+			"if it did not, this is the sweep the class exists to stop.",
+			len(owedDeparture), strings.Join(owedDeparture, "\n  "))
+	}
+	sort.Strings(measuredAway)
+	if len(measuredAway) > 0 {
+		t.Errorf("#8690: %d site(s) recorded as UNKNOWN left the inventory:\n  %s\n\n"+
+			"Somebody measured a site this register said was unmeasured, and normalized it. "+
+			"That is fine — but the MEASUREMENT is the part worth keeping, and deleting the "+
+			"line drops it. Record what was measured (in the commit, or in the arm's own "+
+			"classification map) before removing the entry, so the next site in the same "+
+			"bucket inherits the answer rather than re-deriving it.",
+			len(measuredAway), strings.Join(measuredAway, "\n  "))
+	}
 	for _, s := range sites {
 		if _, ok := reg[s]; !ok {
 			unclassifiedDrift = append(unclassifiedDrift, s)
@@ -143,16 +205,6 @@ func TestPermanentExclusionsMatchTheInventory8690(t *testing.T) {
 	sort.Strings(becameAdmissible)
 	sort.Strings(unclassifiedDrift)
 
-	if len(answered) > 0 {
-		t.Errorf("#8690: %d site(s) left the inventory that were filed under a "+
-			"NON-permanent class:\n  %s\n\n"+
-			"This is the expected way an open question ends: somebody measured "+
-			"the site and normalized it. It still reds, because a register that "+
-			"keeps answered questions is the accumulating list this file exists "+
-			"not to be. REMOVE the entry and put the measurement in the widening's "+
-			"commit — do not reclassify it as permanent to silence this.",
-			len(answered), strings.Join(answered, "\n  "))
-	}
 	if len(becameAdmissible) > 0 {
 		t.Errorf("#8690: %d site(s) left the inventory while still listed in the "+
 			"permanent-exclusion register:\n  %s\n\n"+
@@ -218,6 +270,48 @@ func TestPermanentExclusionRegisterIsDiscriminating8690(t *testing.T) {
 			permanent++
 		}
 	}
+	// A class that asserts a MEASUREMENT must carry one. These three checks exist
+	// because a class label is cheap and a reason is not, and the whole failure
+	// this register had at birth was recording an unanswered question as an
+	// answer.
+	for site, e := range reg {
+		switch e.class {
+		case "gate-confirmed":
+			// Asserts a person determined the gate refuses the packed SPELLING
+			// rather than the consequence of the drop. Without the measurement
+			// that is a question wearing a verdict's label.
+			if len(e.reason) < 80 {
+				t.Errorf("%q is classed `gate-confirmed` with a %d-character reason. That "+
+					"class asserts a PERSON measured it; the measurement IS the claim",
+					site, len(e.reason))
+			}
+		case "owed-own-change":
+			// Says the fix is right and the VEHICLE is wrong. Without naming what
+			// the vehicle owes it is `open` with a caveat, and the next sweep
+			// takes it.
+			if !strings.Contains(e.reason, "test-failover") && !strings.Contains(e.reason, "smoke") {
+				t.Errorf("%q is classed `owed-own-change` but its reason names no owed "+
+					"verification. That class exists to say the vehicle is wrong; without "+
+					"naming what it owes, the next sweep takes the site", site)
+			}
+		case "unclassified", "unmeasurable":
+			// UNKNOWN must say WHY it cannot be measured. A placeholder reads as
+			// cleared, which is the opposite of what the class means — and "arm 2
+			// passed" is the absence of evidence for these, not evidence.
+			if len(e.reason) < 80 {
+				t.Errorf("%q is classed %q with a %d-character reason. An UNKNOWN entry must "+
+					"say WHY it cannot be measured; a placeholder reads as cleared, which "+
+					"inverts the class", site, e.class, len(e.reason))
+			}
+			if !strings.Contains(e.reason, "NOT measured") && !strings.Contains(e.reason, "cannot") &&
+				!strings.Contains(e.reason, "not known-safe") && !strings.Contains(e.reason, "ABSENCE OF EVIDENCE") {
+				t.Errorf("%q is classed %q but its reason never says the measurement was not "+
+					"taken or cannot be taken. Absence of evidence has to be stated as such "+
+					"or it reads as evidence of absence", site, e.class)
+			}
+		}
+	}
+
 	if permanent == 0 {
 		t.Error("the register classifies NO site as permanently excluded. Either the " +
 			"sweep genuinely finished — in which case this file and its cells should be " +

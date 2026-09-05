@@ -217,21 +217,62 @@ func TestTheNewValueTypesSynthesizeAcceptedPairs_8690(t *testing.T) {
 // The five sites this increment moved into the divergent set. They are listed
 // by name so a later change that quietly loses them is visible: an inventory
 // shrinking is normally progress, and these five shrinking would be regression.
-// TestNewlyVisibleSitesAreAccountedFor_8690 was DELETED here, not silenced.
+// Renamed from TestTheFiveNewlyVisibleSitesAreInTheInventory_8690: a count in
+// the name goes stale exactly when the list legitimately shrinks, and then the
+// name argues against the change instead of describing it.
 //
-// Its population is exhausted: every site that became visible through improved
-// value synthesis has since been normalized, so its `want` list was empty and
-// the cell asserted nothing — a vacuous green that would have stayed green
-// through any future regression.
-//
-// Deleting a guard needs proof that something else covers its ground, so:
-// TestPermanentExclusionsMatchTheInventory8690 asserts the register against the
-// inventory in BOTH directions. A newly-visible site that nobody classified
-// reds as `unclassifiedDrift`, which forces it into the register; a registered
-// site that leaves the inventory reds as `becameAdmissible` (permanent class,
-// a violation) or `answered` (open class, the question resolved). So the two
-// events this cell watched for are each caught, and by a cell whose population
-// cannot empty out.
+// `schedulers scheduler <s> {start-date,stop-date}` left this list when the
+// schedulers family was normalized. That is the first branch of the message
+// below — the line is correctly gone — and it was confirmed by the census
+// reporting both sites as now compiling equivalently, which is the normalizer
+// working rather than the synthesiser regressing.
+func TestNewlyVisibleSitesAreAccountedFor_8690(t *testing.T) {
+	// `want` is now EMPTY: the last three — `system dataplane control-socket`,
+	// `system domain-name`, `system services ssh protocol-version` — were
+	// normalized, so their lines are correctly gone. They follow
+	// `schedulers scheduler <s> {start,stop}-date` out of this list for the
+	// same reason and by the same confirmation.
+	//
+	// An empty membership list asserts NOTHING, so the sites change sides
+	// rather than leaving: `normalized` below carries them, and the cell now
+	// checks the opposite property — that each compiles IDENTICALLY in both
+	// spellings. A site that stops being equivalent has been un-normalized, and
+	// a site that never was would have failed here on arrival.
+	//
+	// Deleting them instead would stop them being checked in EITHER direction,
+	// which is the stale-allowlist failure the #2419 inventory exists to
+	// prevent.
+	want := []string{}
+	normalized := []string{
+		"system dataplane control-socket",
+		"system domain-name",
+		"system services ssh protocol-version",
+	}
+	inv := readInventory8690(t)
+	for _, w := range want {
+		if !inv[w] {
+			t.Errorf("%q is not in the inventory. It became visible only because "+
+				"synthPair learned to build a pair for it; if it has been NORMALIZED "+
+				"the line is correctly gone and this list should shrink with it — but "+
+				"if it went missing because the synthesiser regressed, the site is "+
+				"unruled again and nothing else says so (#8690)", w)
+		}
+	}
+	// DEGENERACY CONTROL. With `want` empty the loop above proves nothing, so
+	// the cell would pass on any tree at all unless something else carries the
+	// claim.
+	if len(want) == 0 && len(normalized) == 0 {
+		t.Fatal("both lists are empty — this cell asserts nothing and its silence means " +
+			"nothing. Re-derive it against whatever now needs watching (#8690)")
+	}
+	for _, n := range normalized {
+		if inv[n] {
+			t.Errorf("%q is recorded as NORMALIZED but is still in the inventory — either the "+
+				"normalization was reverted or it never took effect, and nothing else says so "+
+				"(#8690)", n)
+		}
+	}
+}
 
 // The seven that remain, and WHY, so the next lane does not re-derive it. Six
 // are declared inert by their own valueDesc; no synthesiser should invent a
