@@ -181,6 +181,40 @@ the other two and changes nothing in the shipped product.
 | `packedStatements: true` on the container | **how** the folded tail splits | the tail becomes a CHAIN — each statement nested under the previous — so everything after the first is lost |
 | `args: N` on each leaf | where each statement **ends** | the split cannot find the boundary and declines to guess |
 
+**Which of the three needs the same-keyword collision check, and which cannot.**
+`compactNormalizeInScope` is keyed on a **(container, head) PAIR**, so an
+admission reaches *every* container with that keyword — there are **fourteen**
+containers named `then` (firewall inet/inet6 filter terms, firewall policer,
+three-color-policer, policy-options term, security policies from-zone and
+global, pre-id-default-policy, plus their `groups` mirrors). Admitting
+`(then, metric)` for one admits it for all fourteen.
+
+`packedStatements` is a field on a **schemaNode**. It reaches that node and
+nothing else, so the collision hazard **cannot** apply to it: opting in the two
+filter-term `then` nodes leaves the other twelve untouched, by construction
+rather than by care.
+
+So the rule is: **a pair-keyed admission owes the collision check; a
+node-declared opt-in does not.** Deriving that per remedy is how the check gets
+skipped — the keying is not visible at the call site, and both remedies are
+spelled as one line in a schema file.
+
+**A third case, and it is the one that reads as a puzzle rather than a hazard.**
+For an **arg-named** container a pair-keyed admission is not merely
+collision-prone — it is **structurally unreachable**. `security log stream <s>`
+takes its instance name as an arg, so production asks the predicate
+`("s1", "category")` with the operator's actual stream name, never
+`("stream", "category")`. Every pair up that chain can be present in
+`compactNormalizeInScope` and every one of them inert, which presents as "the
+pair is admitted and the fold still does not fire" and sends the reader looking
+for a bug in the pass. There is none: the entry can never match. Such a
+container needs a node-declared opt-in, or a head-only rule — not another pair.
+
+The same distinction explains why the multi-site admission ratchet walks
+admitted *pairs* only: a node-declared opt-in is outside its population by
+construction, not by omission.
+
+
 **Issue 8904 is the same trio with only the middle decision missing.** `interfaces
 <i> [unit <n>] tunnel` and `firewall policer <p> if-exceeding` had the pair
 admitted and every leaf carrying `args: 1`, but no `packedStatements`, so a run

@@ -342,6 +342,64 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 			},
 			read: tunnelRead8904(true),
 		},
+		// issue 8939: both filter-term `then` containers. The schema declares
+		// `then` under family inet AND inet6, and this guard requires a case for
+		// each, so the opt-in cannot ship exercised on only one.
+		//
+		// `accept`, `discard`, `syslog` and `reject` are NOT admitted, so
+		// fixtures for them would be inert and the reverse check rejects them.
+		// `log` IS admitted but args:0, so it carries no value and needs no
+		// `second`.
+		"firewall/family/inet/filter/term/then": {
+			prefix: "firewall { family inet { filter f1 { term t1 { ",
+			open:   "then",
+			closer: " } } } }",
+			stmts: map[string]string{
+				"count":            "count c1",
+				"dscp":             "dscp af11",
+				"forwarding-class": "forwarding-class ef",
+				"log":              "log",
+				"loss-priority":    "loss-priority low",
+				"policer":          "policer pol1",
+				"routing-instance": "routing-instance ri1",
+				"traffic-class":    "traffic-class af12",
+			},
+			second: map[string]string{
+				"count":            "count c2",
+				"dscp":             "dscp af21",
+				"forwarding-class": "forwarding-class af1",
+				"loss-priority":    "loss-priority high",
+				"policer":          "policer pol2",
+				"routing-instance": "routing-instance ri2",
+				"traffic-class":    "traffic-class af22",
+			},
+			read: firewallThenRead8939(false),
+		},
+		"firewall/family/inet6/filter/term/then": {
+			prefix: "firewall { family inet6 { filter f1 { term t1 { ",
+			open:   "then",
+			closer: " } } } }",
+			stmts: map[string]string{
+				"count":            "count c1",
+				"dscp":             "dscp af11",
+				"forwarding-class": "forwarding-class ef",
+				"log":              "log",
+				"loss-priority":    "loss-priority low",
+				"policer":          "policer pol1",
+				"routing-instance": "routing-instance ri1",
+				"traffic-class":    "traffic-class af12",
+			},
+			second: map[string]string{
+				"count":            "count c2",
+				"dscp":             "dscp af21",
+				"forwarding-class": "forwarding-class af1",
+				"loss-priority":    "loss-priority high",
+				"policer":          "policer pol2",
+				"routing-instance": "routing-instance ri2",
+				"traffic-class":    "traffic-class af22",
+			},
+			read: firewallThenRead8939(true),
+		},
 		"security/ipsec/proposal": {
 			prefix: "security { ipsec { ",
 			open:   "proposal ip1",
@@ -1146,6 +1204,36 @@ func tunnelRead8904(perUnit bool) func(*Config) string {
 				}
 				out += fmt.Sprintf("|src=%s dst=%s mode=%s key=%d ttl=%d kar=%d",
 					tn.Source, tn.Destination, tn.Mode, tn.Key, tn.TTL, tn.KeepaliveRetry)
+			}
+		}
+		return out
+	}
+}
+
+// firewallThenRead8939 reports EVERY admitted `then` action, not just the pair a
+// fixture happens to use -- a reader printing two fields would let the other six
+// diverge unobserved, which is the single-leaf blindness that made
+// `policy-statement -> then` read as a non-defect for a day.
+func firewallThenRead8939(v6 bool) func(*Config) string {
+	return func(c *Config) string {
+		filters := c.Firewall.FiltersInet
+		if v6 {
+			filters = c.Firewall.FiltersInet6
+		}
+		names := make([]string, 0, len(filters))
+		for n := range filters {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		out := ""
+		for _, n := range names {
+			for _, tm := range filters[n].Terms {
+				// `traffic-class` compiles into DSCPRewrite as well
+				// (compiler_firewall.go: case "dscp", "traffic-class"), so it
+				// is observed through that field rather than a separate one.
+				out += fmt.Sprintf("|%s count=%s dscp=%s fc=%s log=%v lp=%s pol=%s ri=%s",
+					tm.Name, tm.Count, tm.DSCPRewrite, tm.ForwardingClass, tm.Log,
+					tm.LossPriority, tm.Policer, tm.RoutingInstance)
 			}
 		}
 		return out
