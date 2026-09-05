@@ -405,7 +405,25 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 				// offered it and (b) it was not a schema child, so the brace-elision
 				// pass was never even ASKED about (pool, address) and the packed
 				// spelling `pool p1 address <a>;` compiled to a ZERO-address pool.
-				"address": {desc: "Address or range in the source NAT pool", args: 1, multi: true, placeholder: "<address>", children: nil},
+				// groupReplace (#8804 follow-up): this leaf is the case that flag's
+				// own contract describes -- a multi leaf that packs a SEPARATOR onto
+				// its value list is NOT a set, so apply-groups token-level UNION
+				// corrupts it. This one packs `to` for a `<low> to <high>` range.
+				// Without the flag, an inline `address` UNIONED with a group's
+				// instead of overriding it, so a pool carried an address the
+				// operator believed they had replaced:
+				//   group  address 10.0.0.9/32;   inline  address 10.0.0.1/32;
+				//   before #8804  addresses=1 [10.0.0.1/32]   (OVERRIDE, correct)
+				//   with #8804    addresses=2 [both]          (UNION, regression)
+				//
+				// The fix is NOT to drop multi. multi governs FLAT-SET token
+				// absorption, not validation: `set ... address <low> to <high>` and
+				// the bracket list reach the compiler as one leaf only because of
+				// it. Dropping it leaves SchemaValidate green -- validation is not
+				// the property it governs -- while silently changing the compiled
+				// result, and reds 14 existing NAT cells (#4521, #4422, #5144,
+				// #6812, deterministic-NAT flat-set). Measured both ways on master.
+				"address": {desc: "Address or range in the source NAT pool", args: 1, multi: true, groupReplace: true, placeholder: "<address>", children: nil},
 				"port": {desc: "Source pool port block configuration", children: map[string]*schemaNode{
 					// #3906: `range <low> to <high>` (Junos) and the legacy
 					// `range low <lo> high <hi>` both collapse onto this multi
