@@ -972,7 +972,7 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 		// tolerant Store.Load / SyncApply path downgrades the reject to a warning
 		// (#1960, configstore compileTreeLenient), so a stored or peer-synced
 		// config is never bricked.
-		"proposal": {desc: "IKE proposal name", args: 1, placeholder: "<proposal-name>", closedWorld: true, children: map[string]*schemaNode{
+		"proposal": {desc: "IKE proposal name", args: 1, placeholder: "<proposal-name>", packedStatements: true, closedWorld: true, children: map[string]*schemaNode{
 			"authentication-method": {desc: "IKE authentication method", args: 1, placeholder: "<method>",
 				valueType: ValueEnumOf, valueDesc: "IKE phase 1 authentication method",
 				valueExamples: []string{"pre-shared-keys", "rsa-signatures", "ecdsa-signatures"},
@@ -1062,7 +1062,7 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			// bug — a fat-fingered interval/threshold would silently keep the
 			// Junos default); the tolerant Load/SyncApply path downgrades to a
 			// warning (#1960).
-			"dead-peer-detection": {desc: "Dead peer detection", closedWorld: true, children: map[string]*schemaNode{
+			"dead-peer-detection": {desc: "Dead peer detection", packedStatements: true, closedWorld: true, children: map[string]*schemaNode{
 				"always-send":       {desc: "Send DPD probes regardless of traffic", children: nil},
 				"optimized":         {desc: "Optimized DPD probing", children: nil},
 				"probe-idle-tunnel": {desc: "Probe idle tunnels", children: nil},
@@ -1116,7 +1116,7 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 		// tolerant Load/SyncApply path downgrades it to a warning (#1960).
 		// lifetime-kilobytes is captured but accepted-only (not enforced) — see
 		// the ValidateConfig advisory in compiler_validate_warn.go.
-		"proposal": {desc: "IPsec (Phase 2) proposal name", args: 1, placeholder: "<proposal-name>", closedWorld: true, children: map[string]*schemaNode{
+		"proposal": {desc: "IPsec (Phase 2) proposal name", args: 1, placeholder: "<proposal-name>", packedStatements: true, closedWorld: true, children: map[string]*schemaNode{
 			// #4298 (V-2): type the protocol so a typo fails closed. `ah`
 			// is an accepted value here (grammar-valid) but hard-rejected at
 			// commit by validateIPsecProposalProtocolStrict — xpf does not
