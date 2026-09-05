@@ -147,9 +147,43 @@ func TestUnsplittablePairRatchet8880(t *testing.T) {
 	//
 	// Both move together under an ordinary scope widening; they diverge when
 	// something changes the arity model.
+	// #8925 args2 95 -> 96 and args1 460 -> 461 (both move together, as this
+	// cell predicts for an ordinary widening -- `as-path` is args: 2 so it
+	// enters both populations). The GROWTH is deliberate, attributed and
+	// strictly an improvement -- read the measurement before treating it as a
+	// regression signal.
+	//
+	// `policy-options as-path` was admitted to the elision scope in the same
+	// change. Measured, for a config carrying TWO as-path entries:
+	//
+	//	braced                             before 2   after 2
+	//	elided, two separate statements    before 0   after 2   <- fixed
+	//	elided, both in ONE packed run     before 0   after 1   <- partial
+	//
+	// So the pair joins this population because it is now REACHABLE at all.
+	// Before the admission the whole stanza was dropped and the run yielded
+	// nothing; it now yields the first of two. That is a smaller loss than the
+	// one it replaced, not a new one.
+	//
+	// THE BETTER REMEDY WAS TRIED AND REJECTED ON EVIDENCE. Adding
+	// `packedStatements: true` to schemaPolicyOptions DOES fix the one-run case
+	// completely (1 -> 2) and shrank this population to 457 -- but
+	// TestPackedOptInHoldsForEveryLeafPair8768 then failed for every leaf pair
+	// involving `community` or `policy-statement`, because both declare
+	// children and the split cannot find their boundary. Opting the container
+	// in would have fixed `as-path` by breaking two other leaves. The opt-in
+	// was withdrawn; #8768 is the guard that caught it, and it caught a claim
+	// I had already convinced myself was safe on the strength of one leaf.
+	//
+	// That also NARROWS a claim in this cell's own failure message, which
+	// generalises from `system name-server` that a `multi` leaf makes
+	// packedStatements insufficient. `as-path` is `args: 2, multi: true` and
+	// packedStatements fixes it completely -- being `multi` is not by itself
+	// what makes the opt-in insufficient. Recorded rather than rewritten: the
+	// message's 89/373 split is lane-8388's measurement, not mine to re-derive.
 	const (
-		wantArgs2 = 95
-		wantArgs1 = 460
+		wantArgs2 = 96
+		wantArgs1 = 461
 	)
 	pairs2, _ := unsplittablePairs8880(2)
 	pairs1, conflict1 := unsplittablePairs8880(1)
