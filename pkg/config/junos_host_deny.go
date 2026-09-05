@@ -722,6 +722,10 @@ func junosHostSvcAdmitsIKE(svc []string) bool {
 // so a cross-zone-ambiguous parent excluded from the iifname scope is never
 // shielded.
 func junosHostZoneExemptNetdevs(cfg *Config, zoneName string, zone *ZoneConfig, netdevs []string) (ikeNetdevs, identNetdevs []string) {
+	// #8862: hoisted. junosHostLinuxName rebuilds the tunnel-name map on every
+	// call and that map walks every interface and every unit, so resolving one
+	// name per interface AND per unit here was quadratic. Same shape as #8854.
+	tunNames := tunnelNameMapFn(cfg)
 	if cfg == nil || zone == nil || len(netdevs) == 0 {
 		return nil, nil
 	}
@@ -801,7 +805,7 @@ func junosHostZoneExemptNetdevs(cfg *Config, zoneName string, zone *ZoneConfig, 
 		if iface == nil {
 			continue
 		}
-		addRow(ifName, junosHostLinuxName(cfg, ifName, nil), "", 0)
+		addRow(ifName, junosHostLinuxNameWith(cfg, ifName, nil, tunNames), "", 0)
 		unitNums := make([]int, 0, len(iface.Units))
 		for u := range iface.Units {
 			unitNums = append(unitNums, u)
@@ -813,8 +817,8 @@ func junosHostZoneExemptNetdevs(cfg *Config, zoneName string, zone *ZoneConfig, 
 				continue
 			}
 			unitName := fmt.Sprintf("%s.%d", ifName, un)
-			addRow(unitName, junosHostLinuxName(cfg, ifName, unit),
-				junosHostLinuxName(cfg, ifName, nil), unit.VlanID)
+			addRow(unitName, junosHostLinuxNameWith(cfg, ifName, unit, tunNames),
+				junosHostLinuxNameWith(cfg, ifName, nil, tunNames), unit.VlanID)
 		}
 	}
 	// Emit subsets in the sorted netdevs order for a deterministic iifname set.
@@ -962,6 +966,10 @@ func junosHostVRFEnslavedNetdevs(cfg *Config, netdevByRef map[string]string) map
 // what it could NOT use, so the projection can distinguish "nothing to enforce"
 // from "could not fully enforce".
 func junosHostZoneNetdevCoverageMap(cfg *Config) map[string]junosHostZoneNetdevCoverage {
+	// #8862: hoisted. junosHostLinuxName rebuilds the tunnel-name map on every
+	// call and that map walks every interface and every unit, so resolving one
+	// name per interface AND per unit here was quadratic. Same shape as #8854.
+	tunNames := tunnelNameMapFn(cfg)
 	if cfg == nil || len(cfg.Security.Zones) == 0 || len(cfg.Interfaces.Interfaces) == 0 {
 		return nil
 	}
@@ -1020,12 +1028,12 @@ func junosHostZoneNetdevCoverageMap(cfg *Config) map[string]junosHostZoneNetdevC
 		if iface == nil {
 			continue
 		}
-		netdevByRef[ifName] = junosHostLinuxName(cfg, ifName, nil)
+		netdevByRef[ifName] = junosHostLinuxNameWith(cfg, ifName, nil, tunNames)
 		for un, unit := range iface.Units {
 			if unit == nil {
 				continue
 			}
-			netdevByRef[fmt.Sprintf("%s.%d", ifName, un)] = junosHostLinuxName(cfg, ifName, unit)
+			netdevByRef[fmt.Sprintf("%s.%d", ifName, un)] = junosHostLinuxNameWith(cfg, ifName, unit, tunNames)
 		}
 	}
 	enslaved := junosHostVRFEnslavedNetdevs(cfg, netdevByRef)
@@ -1036,7 +1044,7 @@ func junosHostZoneNetdevCoverageMap(cfg *Config) map[string]junosHostZoneNetdevC
 		if iface == nil {
 			continue
 		}
-		addRow(ifName, junosHostLinuxName(cfg, ifName, nil), "", 0)
+		addRow(ifName, junosHostLinuxNameWith(cfg, ifName, nil, tunNames), "", 0)
 		unitNums := make([]int, 0, len(iface.Units))
 		for u := range iface.Units {
 			unitNums = append(unitNums, u)
@@ -1048,8 +1056,8 @@ func junosHostZoneNetdevCoverageMap(cfg *Config) map[string]junosHostZoneNetdevC
 				continue
 			}
 			unitName := fmt.Sprintf("%s.%d", ifName, un)
-			addRow(unitName, junosHostLinuxName(cfg, ifName, unit),
-				junosHostLinuxName(cfg, ifName, nil), unit.VlanID)
+			addRow(unitName, junosHostLinuxNameWith(cfg, ifName, unit, tunNames),
+				junosHostLinuxNameWith(cfg, ifName, nil, tunNames), unit.VlanID)
 		}
 	}
 	out := map[string]junosHostZoneNetdevCoverage{}
@@ -1102,7 +1110,22 @@ func junosHostZoneNetdevCoverageMap(cfg *Config) map[string]junosHostZoneNetdevC
 // IPsec config at all. A mirrored copy of it drifted once already and left a
 // junos-host deny scoped to a nonexistent netdev; the remaining arms are still
 // mirrors, held by the parity test, which now carries a secure-tunnel case.
+// junosHostLinuxName resolves one interface/unit to its Linux device name,
+// building the tunnel-name map itself. A caller resolving MANY names should
+// hoist the map once and use junosHostLinuxNameWith (#8862).
 func junosHostLinuxName(cfg *Config, ifName string, unit *InterfaceUnit) string {
+	return junosHostLinuxNameWith(cfg, ifName, unit, tunnelNameMapFn(cfg))
+}
+
+// junosHostLinuxNameWith is junosHostLinuxName with the tunnel-name map
+// supplied by the caller. The map walks every interface and every unit, so
+// rebuilding it per name made the enclosing per-interface/per-unit loops
+// quadratic — this was 49% cumulative in the profile taken after #8854.
+//
+// The map is REQUIRED rather than optionally nil: TunnelNameMap returns a
+// non-nil EMPTY map when no tunnels are configured, so nil would be a sentinel
+// colliding with a legitimate value.
+func junosHostLinuxNameWith(cfg *Config, ifName string, unit *InterfaceUnit, tunNames map[string]string) string {
 	if unit != nil {
 		// #6691: a secure-tunnel unit's netdev is resolved from the AUTHORED
 		// bind-interface, NOT by the unit-zero collapse below. Both this and
@@ -1115,7 +1138,7 @@ func junosHostLinuxName(cfg *Config, ifName string, unit *InterfaceUnit) string 
 		if dev, ok := cfg.SecureTunnelUnitNetdev(fmt.Sprintf("%s.%d", ifName, unit.Number)); ok {
 			return dev
 		}
-		if tunnelNames := cfg.TunnelNameMap(); len(tunnelNames) > 0 {
+		if tunnelNames := tunNames; len(tunnelNames) > 0 {
 			ref := fmt.Sprintf("%s.%d", ifName, unit.Number)
 			if linuxName, ok := tunnelNames[ref]; ok && linuxName != "" {
 				return linuxName
