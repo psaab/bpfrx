@@ -104,6 +104,35 @@ func ValidateMasterPasswordPRF(raw string, _ *Config) error {
 // "not an integer"). Preferred over ValidateInteger(min, math.MaxInt64)
 // so the operator error reads "must be at least N" instead of quoting a
 // 19-digit range bound.
+// ValidateVRRPGroupID (#8839) validates a VRRP group's IDENTITY token -- the
+// `<id>` in `vrrp-group <id>`, not a value under it.
+//
+// It checks ONLY that the token is an integer, deliberately, because that is
+// exactly what the compiler does: parseVRRPGroups calls strconv.Atoi on the
+// instance name and `continue`s on error, so a non-numeric id silently drops
+// the entire group. Measured before choosing the shape:
+//
+//	vrrp-group 1     strict accepts, 1 group compiled          correct
+//	vrrp-group foo   strict ACCEPTS, 0 groups compiled         SILENT DROP
+//	vrrp-group 300   strict REJECTS                            already gated
+//	vrrp-group -5    strict REJECTS                            already gated
+//
+// Range and sign are therefore ALREADY caught by an existing strict gate, and
+// duplicating them here would add a second source of truth for the same rule.
+// Only the non-numeric case was unguarded, and it is the one that fails
+// silently rather than loudly.
+func ValidateVRRPGroupID(raw string, _ *Config) error {
+	if strings.TrimSpace(raw) == "" {
+		return fmt.Errorf("missing VRRP group id (expected an integer)")
+	}
+	if _, err := strconv.Atoi(raw); err != nil {
+		return fmt.Errorf("VRRP group id %q is not an integer; the compiler parses "+
+			"this token with strconv.Atoi and silently discards the whole group when "+
+			"it fails, so the group would commit and then not exist", raw)
+	}
+	return nil
+}
+
 func ValidateIntegerMin(min int64) LeafValidator {
 	return func(raw string, _ *Config) error {
 		if strings.TrimSpace(raw) == "" {
