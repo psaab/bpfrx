@@ -124,6 +124,50 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 	if containerKeyword == "authentication" || containerKeyword == "user" {
 		return false
 	}
+	// #8690, the SCHEDULERS and CHASSIS surfaces. 23 sites, all shape `empty`,
+	// all measured safe: no gate disarms, nothing fixture-limited, nothing
+	// unsynthesizable, no collision with a `partial` site.
+	//
+	// The weekday containers are the reason this is 23 pairs and not two. The
+	// head `start-time` appears under nine different containers here -- `daily`
+	// and each weekday -- so `head == "start-time"` would be a shorter rule
+	// covering the same sites today. That is exactly the contingent-on-the-
+	// population shape #8727 removed from three older rules, and a schedule is
+	// a security control: `security policies ... scheduler <s>` decides WHEN a
+	// policy is in force, so a dropped `stop-time` leaves a permit active past
+	// the window the operator wrote, on a commit that reported success.
+	//
+	// `start-date` and `stop-date` were NOT in this family when it was first
+	// measured -- they entered the census between the measurement and the
+	// change, from another lane's fixture work. Re-deriving rather than reusing
+	// the earlier list is what caught them; the count moved 21 -> 23.
+	switch containerKeyword + " " + head {
+	case
+		"schedulers scheduler",
+		"scheduler start-date",
+		"scheduler start-time",
+		"scheduler stop-date",
+		"scheduler stop-time",
+		"daily start-time",
+		"daily stop-time",
+		"monday start-time",
+		"monday stop-time",
+		"tuesday start-time",
+		"tuesday stop-time",
+		"wednesday start-time",
+		"wednesday stop-time",
+		"thursday start-time",
+		"thursday stop-time",
+		"friday start-time",
+		"friday stop-time",
+		"saturday start-time",
+		"saturday stop-time",
+		"sunday start-time",
+		"sunday stop-time",
+		"device-map interface",
+		"device-map unmapped-interface-policy":
+		return true
+	}
 	// EVERY RULE HERE IS SCOPED BY (container, head) PAIR. None matches a head
 	// alone or a container alone, and that is a deliberate change from how the
 	// first two increments were written.
@@ -149,6 +193,15 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 	// `empty` and admissible while `term <t> then community <c>` is `partial`
 	// and must never be admitted. Same head, one token apart, opposite sides of
 	// the safety rule.
+	//
+	// SOME PAIRS BELOW TRIP A COMMIT GATE and are in scope anyway, because the
+	// gate objects to the DROP rather than to the spelling and the pass repairs
+	// the drop. `snmp trap-group <t> targets` is one. Those are classified,
+	// with their measurement, in `benign` in
+	// compact_normalize_scope_8690_test.go -- not here, because the
+	// classification gates a guard VERDICT and never makes a site in scope. A
+	// reader of this list would otherwise see an ordinary-looking pair with no
+	// sign that it was a deliberate call.
 	//
 	// These 32 pairs are exactly what the three former rules admitted, measured
 	// at the production call site rather than derived from the schema — so this

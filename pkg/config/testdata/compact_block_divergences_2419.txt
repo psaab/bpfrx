@@ -101,8 +101,6 @@
 #
 bridge-domains xpfname domain-type	partial
 bridge-domains xpfname routing-interface	partial
-chassis device-map interface	empty
-chassis device-map unmapped-interface-policy	empty
 interfaces xpfname description	partial
 interfaces xpfname duplex	partial
 interfaces xpfname encapsulation	partial
@@ -120,27 +118,6 @@ policy-options policy-statement xpfarg term xpfarg then metric-type	partial
 policy-options policy-statement xpfarg term xpfarg then next-hop	partial
 policy-options policy-statement xpfarg term xpfarg then origin	partial
 protocols bgp group xpfarg neighbor xpfarg peer-as	empty
-schedulers scheduler	empty
-schedulers scheduler xpfarg daily start-time	empty
-schedulers scheduler xpfarg daily stop-time	empty
-schedulers scheduler xpfarg friday start-time	empty
-schedulers scheduler xpfarg friday stop-time	empty
-schedulers scheduler xpfarg monday start-time	empty
-schedulers scheduler xpfarg monday stop-time	empty
-schedulers scheduler xpfarg saturday start-time	empty
-schedulers scheduler xpfarg saturday stop-time	empty
-schedulers scheduler xpfarg start-date	empty
-schedulers scheduler xpfarg start-time	empty
-schedulers scheduler xpfarg stop-date	empty
-schedulers scheduler xpfarg stop-time	empty
-schedulers scheduler xpfarg sunday start-time	empty
-schedulers scheduler xpfarg sunday stop-time	empty
-schedulers scheduler xpfarg thursday start-time	empty
-schedulers scheduler xpfarg thursday stop-time	empty
-schedulers scheduler xpfarg tuesday start-time	empty
-schedulers scheduler xpfarg tuesday stop-time	empty
-schedulers scheduler xpfarg wednesday start-time	empty
-schedulers scheduler xpfarg wednesday stop-time	empty
 security address-book global address-set	empty
 security dynamic-address address-name	empty
 security dynamic-address address-name xpfarg profile feed-name	empty
