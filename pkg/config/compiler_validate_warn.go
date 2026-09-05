@@ -1641,6 +1641,14 @@ func ValidateConfig(cfg *Config) []string {
 	// instances). WARN so the operator knows `show firewall` aggregates.
 	warnings = append(warnings, validateFirewallInterfaceSpecificWarnings(cfg)...)
 
+	// #8773: a `from` match written with the other address family's spelling of
+	// the DSCP / Traffic-Class field (`traffic-class` under family inet, `dscp`
+	// under family inet6). Accepted and applied — they are the same six bits —
+	// but named at commit, because the packed and braced spellings used to
+	// disagree here and making them agree on `accept` must not mean agreeing
+	// silently.
+	warnings = append(warnings, validateFilterCrossFamilyDSCPWarnings(cfg)...)
+
 	// #3445: an lo0 INPUT filter is mirrored onto a kernel nftables chain
 	// (the PRIMARY enforcement for host-bound traffic the XDP shim shunts to the
 	// kernel). That chain honors match predicates + `then log` + `then count`
