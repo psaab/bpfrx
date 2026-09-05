@@ -58,7 +58,9 @@ import (
 //
 // The SAME and NO-REFERENCE rows are the negative controls and are kept
 // deliberately: an instrument that flagged all 64 would be measuring itself.
-func TestSweepFull(t *testing.T) {
+// sweepPairVerdicts8859 is the MEASUREMENT: every site for every un-admitted
+// pair, keyed pair -> verdict -> an example leaf that produced it.
+func sweepPairVerdicts8859() (map[string]map[string]string, map[string]string, []string) {
 	dig := func(c *Config) string {
 		if c == nil {
 			return "<nil>"
@@ -101,10 +103,6 @@ func TestSweepFull(t *testing.T) {
 		}
 		return "<length only>"
 	}
-
-	type row struct{ pair, verdict, detail string }
-	var rows []row
-	counts := map[string]int{}
 
 	// EVERY SITE FOR A PAIR IS EVALUATED, not just the first.
 	//
@@ -213,12 +211,30 @@ func TestSweepFull(t *testing.T) {
 			pairDetail[pair] = d
 		}
 	}
+	return perPair, pairDetail, pairOrder
+}
+
+type sweepRow8859 struct{ Pair, Verdict, Detail string }
+
+// sweepPublishedRows8859 is the PUBLICATION: it turns the measurement into the
+// rows the table prints, collapsing a pair to one verdict only when all of its
+// sites agree and emitting LEAF-CONTINGENT otherwise.
+//
+// TestSweepFull and TestSweepVerdictsAreNotSingleSample8859 BOTH call this.
+// The guard used to re-derive the measurement itself, which meant it asserted a
+// property of the DATA and said nothing about what the sweep PUBLISHES --
+// reverting the publication to one-verdict-per-pair left it green. One
+// predicate, one site to get wrong.
+func sweepPublishedRows8859() ([]sweepRow8859, map[string]int) {
+	perPair, pairDetail, pairOrder := sweepPairVerdicts8859()
+	var rows []sweepRow8859
+	counts := map[string]int{}
 	for _, pair := range pairOrder {
 		vs := perPair[pair]
 		if len(vs) == 1 {
 			for v := range vs {
 				counts[v]++
-				rows = append(rows, row{pair, v, pairDetail[pair]})
+				rows = append(rows, sweepRow8859{pair, v, pairDetail[pair]})
 			}
 			continue
 		}
@@ -228,17 +244,22 @@ func TestSweepFull(t *testing.T) {
 		}
 		sort.Strings(parts)
 		counts["LEAF-CONTINGENT"]++
-		rows = append(rows, row{pair, "LEAF-CONTINGENT",
+		rows = append(rows, sweepRow8859{pair, "LEAF-CONTINGENT",
 			"verdict depends on which leaf is synthesized: " + strings.Join(parts, " | ")})
 	}
 	sort.Slice(rows, func(i, j int) bool {
-		if rows[i].verdict != rows[j].verdict {
-			return rows[i].verdict < rows[j].verdict
+		if rows[i].Verdict != rows[j].Verdict {
+			return rows[i].Verdict < rows[j].Verdict
 		}
-		return rows[i].pair < rows[j].pair
+		return rows[i].Pair < rows[j].Pair
 	})
+	return rows, counts
+}
+
+func TestSweepFull(t *testing.T) {
+	rows, counts := sweepPublishedRows8859()
 	for _, r := range rows {
-		t.Logf("SW %-38s %-32s %s", r.pair, r.verdict, r.detail)
+		t.Logf("SW %-38s %-32s %s", r.Pair, r.Verdict, r.Detail)
 	}
 	t.Logf("SW === %d pairs swept: %v", len(rows), counts)
 }
@@ -378,85 +399,58 @@ func sweepGateVerdict8859(bracedText, elidedText string) string {
 // that shape (`class-of-service classifiers` via inet-precedence vs dscp,
 // `class-of-service rewrite-rules` via exp vs dscp, and `system services`).
 func TestSweepVerdictsAreNotSingleSample8859(t *testing.T) {
-	perPair := map[string]map[string]bool{}
-	for _, s := range collectCompactSites() {
-		if len(s.container) < 2 || strings.HasPrefix(s.container[0], "groups") {
-			continue
-		}
-		stanza, child := s.container[0], s.container[1]
-		if compactNormalizeInScope(stanza, child) {
-			continue
-		}
-		v1, _, ok := synthPair(s.node)
-		if !ok {
-			continue
-		}
-		parent := s.container[:len(s.container)-1]
-		stanzaLeaf := s.container[len(s.container)-1]
-		inner := contextFor(parent) + stanzaLeaf + " " + s.leaf + " " + v1 + ";"
-		bracedText := nest(parent, inner)
-		var elidedText string
-		if len(parent) >= 2 {
-			elidedText = nest(append([]string{parent[0] + " " + parent[1]}, parent[2:]...), inner)
-		} else {
-			elidedText = parent[0] + " " + inner
-		}
-		bt, bperrs := NewParser(bracedText).Parse()
-		et, eperrs := NewParser(elidedText).Parse()
-		if len(bperrs) > 0 || len(eperrs) > 0 {
-			continue
-		}
-		bc, berr := CompileConfigLenient(bt)
-		ec, eerr := CompileConfigLenient(et)
-		v := "SAME"
-		switch {
-		case berr != nil || bc == nil:
-			v = "NO-REFERENCE"
-		case eerr != nil || ec == nil:
-			v = "ELIDED-REFUSED"
-		default:
-			// JSON, NOT %v. The Config graph is full of pointers and %v prints
-			// ADDRESSES, which differ on every compile by construction -- so
-			// every site would read CANDIDATE-DROP, every pair would agree, and
-			// this cell would report ZERO contingency while the sweep reports
-			// seven. Measured: that is exactly what the first draft did.
-			bc.Warnings, ec.Warnings = nil, nil
-			bj, _ := json.Marshal(bc)
-			ej, _ := json.Marshal(ec)
-			if string(bj) != string(ej) {
-				v = "CANDIDATE-DROP"
-			}
-		}
-		key := stanza + " " + child
-		if perPair[key] == nil {
-			perPair[key] = map[string]bool{}
-		}
-		perPair[key][v] = true
+	// ASSERT ON WHAT THE SWEEP PUBLISHES, not on a re-derivation of it.
+	//
+	// The first version of this cell walked collectCompactSites() itself and
+	// built its own per-pair map. That asserted a property of the DATA -- true,
+	// and worth knowing -- while saying NOTHING about whether the sweep
+	// publishes the disagreement. Measured: reverting the publication to one
+	// verdict per pair left this cell GREEN.
+	//
+	// It is the fourth instance of that shape on this board in a day: a cell
+	// that verifies the ALGORITHM and not the WIRING, written in a change whose
+	// subject was measurement soundness. Re-deriving is the natural way to write
+	// the assertion, and the derived version passes for the right reason on the
+	// day you write it.
+	rows, counts := sweepPublishedRows8859()
+	if len(rows) == 0 {
+		t.Fatal("the sweep published no rows at all (#8859)")
 	}
 
-	contingent, harmful := 0, 0
-	for _, vs := range perPair {
-		if len(vs) > 1 {
-			contingent++
-			if vs["SAME"] && vs["CANDIDATE-DROP"] {
-				harmful++
-			}
+	contingent := 0
+	harmful := 0
+	for _, r := range rows {
+		if r.Verdict != "LEAF-CONTINGENT" {
+			continue
+		}
+		contingent++
+		// THE HARMFUL SHAPE: a pair whose sites include both SAME and a
+		// CANDIDATE-DROP. Under one-verdict-per-pair such a row could publish
+		// SAME -- no defect -- while another leaf under it silently drops.
+		if strings.Contains(r.Detail, "SAME(") && strings.Contains(r.Detail, "CANDIDATE-DROP") {
+			harmful++
 		}
 	}
+
 	if contingent == 0 {
-		t.Error("no pair disagrees across its own sites, so LEAF-CONTINGENT can " +
-			"never be emitted and the sweep's per-pair verdicts are back to being " +
-			"single-sample claims that nothing checks (#8859)")
+		t.Error("the sweep published NO LEAF-CONTINGENT row. Either every pair " +
+			"now agrees across its own sites, or the publication has gone back " +
+			"to collapsing a pair to one verdict -- and those look identical " +
+			"from the table. Check that sweepPublishedRows8859 still emits the " +
+			"contingent case before assuming the population changed (#8859)")
 	}
-	// THE HARMFUL SHAPE SPECIFICALLY. A pair that says SAME on one leaf and
-	// CANDIDATE-DROP on another would, under first-site-wins, publish "no
-	// defect" while silently losing a value through the other leaf.
 	if harmful == 0 {
-		t.Error("no pair mixes SAME with CANDIDATE-DROP across its sites. Either " +
-			"the population changed or this cell stopped measuring the shape it " +
-			"exists for -- it is the SAME-hiding-a-drop case that makes " +
-			"first-site-wins dangerous rather than merely imprecise (#8859)")
+		t.Error("no published LEAF-CONTINGENT row mixes SAME with " +
+			"CANDIDATE-DROP. That is the shape this cell exists for: a pair " +
+			"that would otherwise publish SAME -- no defect -- while another " +
+			"leaf under it silently loses its value. Contingency alone is only " +
+			"imprecision; this is the part that misleads (#8859)")
 	}
-	t.Logf("#8859: %d pairs, %d leaf-contingent, %d of those mix SAME with "+
-		"CANDIDATE-DROP", len(perPair), contingent, harmful)
+	if counts["LEAF-CONTINGENT"] != contingent {
+		t.Errorf("the published counts disagree with the published rows: "+
+			"counts say %d LEAF-CONTINGENT, rows say %d (#8859)",
+			counts["LEAF-CONTINGENT"], contingent)
+	}
+	t.Logf("#8859: %d published rows, %d LEAF-CONTINGENT, %d of those mix SAME "+
+		"with CANDIDATE-DROP", len(rows), contingent, harmful)
 }
