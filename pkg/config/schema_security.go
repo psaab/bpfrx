@@ -1265,7 +1265,11 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			// vpn-monitor is now REJECTED at strict commit instead of silently
 			// dropped (the #4313 bug); the tolerant Load/SyncApply path
 			// downgrades to a warning (#1960).
-			"vpn-monitor": {desc: "Tunnel liveness monitoring (accepted-but-not-enforced advisory)", closedWorld: true, children: map[string]*schemaNode{
+			// packedStatements (#8768): compileIPsec reads destination-ip and
+			// source-interface as separate statements; the packed spelling
+			// collapsed both into one node. Measured across every admitted leaf
+			// pair, not the one pair it was first reported on.
+			"vpn-monitor": {desc: "Tunnel liveness monitoring (accepted-but-not-enforced advisory)", packedStatements: true, closedWorld: true, children: map[string]*schemaNode{
 				"source-interface": {desc: "Probe source interface", args: 1, placeholder: "<interface-name>", children: nil},
 				"destination-ip":   {desc: "Probe destination IP", args: 1, placeholder: "<address>", children: nil},
 				"optimized":        {desc: "Send probes only when there is no outbound traffic", children: nil},

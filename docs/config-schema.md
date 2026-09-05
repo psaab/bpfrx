@@ -6709,6 +6709,39 @@ The Phase-2 `security ipsec proposal` is now CLOSED (both `description` and
 its own follow-up gated on a Junos-leaf completeness audit for that subtree. Do
 NOT set `closedWorld` on a subtree without that audit.
 
+### `snmp community` — the PACKED spelling dropped `clients`, and empty means allow-all (#8778)
+
+`snmp community <c>` accepts its body in three spellings, and until #8778 only
+one of them compiled the `clients` source-IP allowlist:
+
+```
+set snmp community public authorization read-only clients 10.0.0.0/8   # ONE line  -> clients=[]  ALLOW-ALL
+set snmp community public authorization read-only                      # TWO lines -> ENFORCED
+set snmp community public clients 10.0.0.0/8
+```
+
+**The difference was a line break, and the failure was a fail-OPEN rather than a
+lost restriction.** `AllowsSource` documents `len(Clients) == 0` as allow-all
+(the Junos default), so dropping the allowlist did not narrow it — it INVERTED
+it. The community answered from every source while the config said otherwise and
+the commit reported success.
+
+**Two shapes, one defect, different causes.** Flat `set` builds a CHAIN — the
+tree is `community public` → `authorization read-only` → `clients 10.0.0.0/8`,
+with `clients` a CHILD of `authorization` — so a loop over one level of children
+never sees it. The brace-elided hierarchical spelling
+(`community public authorization read-only clients 10.0.0.0/8;`) instead packs
+every token onto one node's `Keys`, where the flat-form loop read `authorization`
+and not `clients`. A compiler for this stanza must handle both, and
+`TestPackedCommunityStillEnforcesClients8778` pins each.
+
+**Guard shape, worth copying for any allowlist-like leaf.** The obvious cell is
+"packed compiles to what braced compiles to" — and it is WRONG here, because it
+passes when both spellings are allow-all, which is exactly the regression it
+would exist to catch. Assert the ENFORCED OUTCOME instead: an address inside the
+allowlist is admitted and an address outside it is DENIED. That is false of an
+empty allowlist however the other spelling behaves.
+
 ### `firewall ... from tcp-flags` — semantic validation, not just a list (#3076)
 
 `from tcp-flags` is a `multi: true` leaf, so the dual-AST contract above
