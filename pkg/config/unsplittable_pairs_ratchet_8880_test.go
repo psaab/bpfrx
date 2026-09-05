@@ -263,9 +263,30 @@ func TestUnsplittablePairRatchet8880(t *testing.T) {
 	// not vindicated by having differed. It is the practice that is worth
 	// keeping, and a run where it agrees is the cheapest possible confirmation
 	// that nothing unmodelled happened.
+	// #8943 args1 463 -> 466: the three `syslog` destinations were admitted.
+	// GROWTH, deliberate, attributed, and a strict improvement -- measured for
+	// a config carrying TWO syslog hosts:
+	//
+	//	braced                            before 2   after 2
+	//	elided, two separate statements   before 0   after 1   <- improved, TRUNCATES
+	//	elided, both in ONE packed run    before 0   after 0   <- unchanged
+	//
+	// The pair joins this population because it is now reachable at all; the
+	// loss it leaves is smaller than the one it replaced.
+	//
+	// AND THE RESIDUAL IS NOT THIS CELL'S MECHANISM, which is worth recording
+	// because the population name says otherwise. `packedStatements` on
+	// `syslog` does NOT fix it (still 1 and 0) and #8768 objects to the opt-in
+	// besides. The two-separate-statements case loses its second host to a
+	// FOLDED-SIBLING MERGE -- two `syslog host X { ... }` statements each fold
+	// to a `syslog` node and the merge keeps one -- not to a packed run failing
+	// to split. So a pair can sit in this population for a reason the
+	// population does not model, and the opt-in is not a candidate remedy for
+	// it. Same shape as the as-path correction recorded above: the cell's
+	// remedy advice is narrower than its membership.
 	const (
 		wantArgs2 = 100
-		wantArgs1 = 463
+		wantArgs1 = 466
 	)
 	pairs2, _ := unsplittablePairs8880(2)
 	pairs1, conflict1 := unsplittablePairs8880(1)

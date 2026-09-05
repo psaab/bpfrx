@@ -103,6 +103,10 @@ var knownBlindScopePairs8852 = map[string]string{
 	// #8879 batch 2, same reasoning as batch 1: admitted after measuring the
 	// elided spelling SILENT, blind to arm 2 for the same structural reason, so
 	// their fold correctness rests on the per-pair cells rather than the census.
+	// #8943, the syslog destinations: named containers (see blindShape8852).
+	"syslog file": "named-container",
+	"syslog host": "named-container",
+	"syslog user": "named-container",
 	// #8943, the flow family; shapes derived by the sentinel method.
 	"flow aging":        "plain-container",
 	"flow icmp-session": "plain-container",
@@ -252,6 +256,21 @@ func blindShape8852(n *schemaNode) string {
 		return "not-found"
 	case n.args >= 2:
 		return "multi-arg"
+	// #8943: a NAMED container -- it takes an instance name AND declares a
+	// wildcard, so every site the census synthesises for it carries the
+	// instance name in the container element (`host xpfarg`, not `host`).
+	// A pair-keyed census cannot match that against the bare (syslog, host)
+	// the scope predicate is keyed on, so the pair is blind for the same
+	// permanent reason `interfaces <name>` is unreachable to the predicate.
+	//
+	// Added because admitting `syslog host` / `file` / `user` made three pairs
+	// blind with shape "" -- which this cell correctly refuses to let anyone
+	// register, since an unexplained blindness is a census bug rather than an
+	// exception. It was not a bug: the reason is structural and real, and the
+	// model simply had no branch for args>=1 WITH a wildcard (every other case
+	// requires wildcard == nil).
+	case n.args >= 1 && n.wildcard != nil:
+		return "named-container"
 	case n.args == 0 && n.wildcard == nil && n.children != nil:
 		return "plain-container"
 	case n.args == 0 && n.wildcard == nil && n.children == nil:
