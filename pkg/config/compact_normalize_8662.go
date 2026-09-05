@@ -1230,6 +1230,17 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		"flow multicast-session-lifetime",
 		"flow tcp-mss",
 		"routing-options static",
+		// #8879 batch 1. Each admitted only after measuring that the elided
+		// spelling is SILENT — strict accepts and lenient does not warn — so
+		// admission converts a silent drop into a correct compile rather than
+		// quieting a signal the operator already gets. A pair whose elided
+		// spelling is REJECTED or WARNED is deliberately NOT admitted (#8868:
+		// admitting `system login` would turn a loud #6662 rejection into a
+		// silent acceptance, which is a regression wearing the shape of a fix).
+		"protocols bgp",
+		"security ike",
+		"security nat",
+		"system syslog",
 		"security alg",
 		"security flow",
 		// issue 8875: the TOP-LEVEL security containers. `security` itself had
