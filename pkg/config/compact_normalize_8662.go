@@ -810,6 +810,26 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		// configured" and REVOKES the credentials xpf provisioned, D2-locking
 		// root (#5276). It fails closed -- an availability hazard, not a
 		// breach.
+		// issue 8898: the OUTER half of the master-password fold, and the same
+		// shape as root-authentication above. The inner pair
+		// `master-password pseudorandom-function` has been admitted all along
+		// and INERT the whole time, because the fold reaches a child only after
+		// `system -> master-password` has created the container:
+		//
+		//	system -> master-password                     (this entry, absent)
+		//	master-password -> pseudorandom-function      (admitted, unreachable)
+		//
+		// Measured empty-equivalent, and gate-checked: strict ACCEPTS the
+		// packed spelling and nothing warns today, so admitting it turns a
+		// silent DROP into a correct compile rather than a loud rejection into
+		// a quiet one -- the distinction that correctly excluded `system login`.
+		//
+		// Consequence if left out: effectiveMasterPasswordPRF (configstore/
+		// crypto.go) scans the RAW tree, finds no selector, and falls back to
+		// defaultMasterPasswordPRF -- so the config DB is encrypted with a KDF
+		// the operator did not choose while `show configuration` renders the
+		// one they did.
+		"system master-password",
 		"system root-authentication",
 		"system backup-router",
 		"system domain-search",
@@ -1751,4 +1771,27 @@ func splitBracedPackedChildren8886(node *Node, container *schemaNode) int {
 		node.Children = out
 	}
 	return changed
+}
+
+// NormalizeCompactForScan returns a tree with every admitted compact stanza
+// folded, for a reader that walks the RAW AST rather than the compiled config
+// (issue 8898).
+//
+// The normalizer runs inside the compiler, so anything reading the compiled
+// Config sees folded stanzas for free. A reader that scans the tree directly
+// does not -- it sees whatever the operator typed, and an admitted pair is
+// invisible to it. `configstore.effectiveMasterPasswordPRF` is one such reader:
+// it resolves the at-rest KDF selector by walking `system` blocks, so
+// admitting `system master-password` to the scope fixed the COMPILED config and
+// changed nothing for the consumer that actually decides the encryption.
+//
+// This is the same shape as #8867, where SchemaValidate walked the
+// un-normalized tree and validated nothing in the packed spelling. Same cause,
+// different consumer: the fold is a property of the compile path, and every
+// reader outside it has to opt in.
+//
+// It never mutates the argument -- callers hold trees that get persisted -- and
+// returns the original when nothing folds.
+func NormalizeCompactForScan(tree *ConfigTree) *ConfigTree {
+	return normalizeCompactForValidation(tree)
 }
