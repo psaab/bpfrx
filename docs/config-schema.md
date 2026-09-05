@@ -181,6 +181,28 @@ the other two and changes nothing in the shipped product.
 | `packedStatements: true` on the container | **how** the folded tail splits | the tail becomes a CHAIN — each statement nested under the previous — so everything after the first is lost |
 | `args: N` on each leaf | where each statement **ends** | the split cannot find the boundary and declines to guess |
 
+**Issue 8904 is the same trio with only the middle decision missing.** `interfaces
+<i> [unit <n>] tunnel` and `firewall policer <p> if-exceeding` had the pair
+admitted and every leaf carrying `args: 1`, but no `packedStatements`, so a run
+of two split into a chain and everything after the first statement was lost:
+
+```
+tunnel { source 10.0.0.1; destination 10.0.0.2; }   src=10.0.0.1 dst=10.0.0.2
+tunnel source 10.0.0.1 destination 10.0.0.2;        src=10.0.0.1 dst=""
+```
+
+A GRE tunnel that keeps its source and loses its destination is worse than one
+that fails to compile: the interface exists, `show configuration` renders both
+endpoints because the config is stored as authored, and the tunnel points
+nowhere — `warnings=0`, no strict rejection. **Missing becomes WRONG rather than
+missing becomes absent.** The single-statement spelling was never affected,
+which is what makes this specifically a run-of-two defect.
+
+Note the boundary: the flat-set CLI reaches the same symptom by a **different**
+mechanism — `SetPath` nests the tokens into a chain before any pass runs, so
+there is no packed tail to split and `normalizeCompactStanzas` correctly folds
+nothing. That is a grammar-side question, tracked separately as issue 8939.
+
 The IKE gateway had all three wrong at once, which is why the symptom moved
 depending on statement ORDER: `gateway gw1 external-interface ge-0/0/0
 local-identity hostname foo;` compiled the external-interface and silently

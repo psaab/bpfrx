@@ -378,7 +378,7 @@ func cosPriorityLowMinShareSchema() *schemaNode {
 
 var schemaFirewall = &schemaNode{desc: "Firewall filters and policers", children: map[string]*schemaNode{
 	"policer": {desc: "Traffic policer", args: 1, multi: true, placeholder: "<name>", children: map[string]*schemaNode{
-		"if-exceeding": {desc: "Rate limits for the policer", children: map[string]*schemaNode{
+		"if-exceeding": {desc: "Rate limits for the policer", packedStatements: true, children: map[string]*schemaNode{
 			// #5299: both leaves were untyped (ValueAny), so the legacy
 			// parsers (parseBandwidthLimit / parseBurstSizeLimit) silently
 			// coerced garbage / zero / overflow to 0 bps/bytes. A typo like
