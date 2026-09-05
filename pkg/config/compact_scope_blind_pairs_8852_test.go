@@ -103,6 +103,12 @@ var knownBlindScopePairs8852 = map[string]string{
 	// #8879 batch 2, same reasoning as batch 1: admitted after measuring the
 	// elided spelling SILENT, blind to arm 2 for the same structural reason, so
 	// their fold correctness rests on the per-pair cells rather than the census.
+	// #8943, the flow family; shapes derived by the sentinel method.
+	"flow aging":        "plain-container",
+	"flow icmp-session": "plain-container",
+	"flow tcp-session":  "plain-container",
+	"flow traceoptions": "plain-container",
+	"flow udp-session":  "plain-container",
 	// #8943, the nat family; shapes derived by the sentinel method.
 	"nat destination": "plain-container",
 	"nat nat64":       "plain-container",

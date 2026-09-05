@@ -64,6 +64,53 @@ var admittedElisionCases8879 = []struct {
 		`security { nat { source { pool P { address 10.0.0.1/32; } } } }`,
 		`security nat { source { pool P { address 10.0.0.1/32; } } }`,
 		func(c *Config) string { return fmt.Sprintf("pools=%d", len(c.Security.NAT.SourcePools)) }},
+	// #8943 — the `flow` family. Values chosen NOT to equal the compiled
+	// defaults: udp-session and icmp-session both default to 60, so a fixture
+	// using 60 would read clean while broken.
+	//
+	// The readers print the FIELD rather than a fingerprint, because a
+	// difference tells you something was lost and not what the loss did --
+	// and here that distinction reversed a verdict. `flow aging` LOOKS like
+	// the worst row (its leaves compile to 0 and the schema says
+	// `0 = disabled`), but the braced arm warns that pressure-based shedding
+	// is accepted-only in the AF_XDP dataplane, so the feature is inert either
+	// way and the elision costs the ADVISORY rather than behaviour. It is
+	// registered in TestAdmittedDropsAreReadSomewhere8879's not-read set for
+	// that reason. The other four lose live values.
+	{"flow aging",
+		`security { flow { aging { early-ageout 37; high-watermark 91; low-watermark 71; } } }`,
+		`security { flow aging { early-ageout 37; high-watermark 91; low-watermark 71; } }`,
+		func(c *Config) string {
+			f := c.Security.Flow
+			return fmt.Sprintf("early=%d hi=%d lo=%d",
+				f.AgingEarlyAgeout, f.AgingHighWatermark, f.AgingLowWatermark)
+		}},
+	{"flow tcp-session",
+		`security { flow { tcp-session { established-timeout 1777; } } }`,
+		`security { flow tcp-session { established-timeout 1777; } }`,
+		func(c *Config) string {
+			if c.Security.Flow.TCPSession == nil {
+				return "<nil>"
+			}
+			return fmt.Sprintf("est=%d", c.Security.Flow.TCPSession.EstablishedTimeout)
+		}},
+	{"flow udp-session",
+		`security { flow { udp-session { timeout 77; } } }`,
+		`security { flow udp-session { timeout 77; } }`,
+		func(c *Config) string { return fmt.Sprintf("udp=%d", c.Security.Flow.UDPSessionTimeout) }},
+	{"flow icmp-session",
+		`security { flow { icmp-session { timeout 47; } } }`,
+		`security { flow icmp-session { timeout 47; } }`,
+		func(c *Config) string { return fmt.Sprintf("icmp=%d", c.Security.Flow.ICMPSessionTimeout) }},
+	{"flow traceoptions",
+		`security { flow { traceoptions { file ftrace7717.log; } } }`,
+		`security { flow traceoptions { file ftrace7717.log; } }`,
+		func(c *Config) string {
+			if c.Security.Flow.Traceoptions == nil {
+				return "<nil>"
+			}
+			return "trace=" + c.Security.Flow.Traceoptions.File
+		}},
 	// #8943 — the rest of the `nat` family, siblings of the #8929 `nat source`
 	// pair. All five drop their whole body when the child's brace is elided.
 	// #8921 collision check: one schema site each.
@@ -623,6 +670,7 @@ func TestAdmittedDropsAreReadSomewhere8879(t *testing.T) {
 	// them means a MEMBERSHIP change reds this cell even when the total holds.
 	knownNotRead := map[string]string{
 		"forwarding-options family":      "inet6 mode packet-based is accepted-only; the dataplane is flow-based",
+		"flow aging":                     "pressure-based shedding is accepted-only; the AF_XDP dataplane ages on per-session idle timeout only",
 		"class-of-service rewrite-rules": "exp rewrite is inert; the dataplane rewrites dscp on egress only",
 		"security pre-id-default-policy": "pre-id session logging is inert; no pre-identification admit path exists",
 	}
@@ -1129,8 +1177,6 @@ func TestDepth2UnadmittedPopulation8929(t *testing.T) {
 	knownDropping := []string{
 		"address-book global", "archival configuration", "bgp damping",
 		"bgp multipath", "dataplane coalescence", "dataplane shared-umem",
-		"flow aging", "flow icmp-session", "flow tcp-session",
-		"flow traceoptions", "flow udp-session",
 		"flow-monitoring version-ipfix", "flow-monitoring version9",
 		"interface-routes rib-group", "license autoupdate",
 		"policies policy-rematch", "pre-id-default-policy then",
@@ -1142,7 +1188,7 @@ func TestDepth2UnadmittedPopulation8929(t *testing.T) {
 	// stanza, so the same pair reached by two routes is ONE pair — counting
 	// sites where the population is pairs is the unit mismatch this campaign
 	// already hit once, on the 320-sites / 95-pairs reconciliation.
-	const wantPopulation = 45
+	const wantPopulation = 40
 
 	parentAdmitted := func(mid string) bool {
 		for stanza := range setSchema.children {
@@ -1184,10 +1230,10 @@ func TestDepth2UnadmittedPopulation8929(t *testing.T) {
 	// catches an entry that should have been REMOVED and is blind to one that
 	// was removed silently (a bad merge, a tidy-up). Measured: deleting an
 	// entry left this cell green until this assertion was added.
-	if len(knownDropping) != 21 {
-		t.Errorf("knownDropping has %d entries, want 21. #8938 measured 26 of "+
-			"the 50 dropping; the five `nat` siblings were admitted in #8943, "+
-			"leaving 21. Removing one is only correct if the pair was "+
+	if len(knownDropping) != 16 {
+		t.Errorf("knownDropping has %d entries, want 16. #8938 measured 26 of "+
+			"the 50 dropping; the `nat` and `flow` families were admitted in "+
+			"#8943, leaving 16. Removing one is only correct if the pair was "+
 			"ADMITTED — in which case the membership check below fires too and "+
 			"BOTH numbers move together. A count change on its own means the "+
 			"record was edited without a measurement.", len(knownDropping))

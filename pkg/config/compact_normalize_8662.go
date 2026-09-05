@@ -1329,6 +1329,28 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		// Doubly elided, `security nat source { pool p1 { address ...; } }`
 		// compiled to exactly what an EMPTY config produces: the source NAT
 		// pool silently vanished, both spellings accepted at strict commit.
+		// #8943: the `flow` family. All five drop their whole body when the
+		// child's brace is elided, both spellings accepted at strict commit.
+		// #8921 collision check: one schema site each.
+		//
+		// SEVERITY IS NOT UNIFORM, and the obvious reading of `flow aging` is
+		// wrong. Its leaves compile to 0 and the schema says `0 = disabled`,
+		// which looks like the elision silently disabling session aging. It does
+		// not: the braced arm raises "security flow aging configured but
+		// accepted-only -- the userspace AF_XDP dataplane ages sessions on their
+		// per-session idle timeout only", so the feature is INERT either way and
+		// what the elision costs is the ADVISORY, not behaviour. The
+		// #8879 read/not-read guard caught that overstatement before it shipped.
+		//
+		// The other four DO lose live values: `udp-session` 77 -> 0 and
+		// `icmp-session` 47 -> 0 mean an operator's tuning silently reverts to
+		// the 60s default, `tcp-session` loses the whole struct, and
+		// `traceoptions` loses the trace file.
+		"flow aging",
+		"flow tcp-session",
+		"flow udp-session",
+		"flow icmp-session",
+		"flow traceoptions",
 		// #8943: the rest of the `nat` family. `source` was admitted alone in
 		// #8929 and its five siblings behave identically -- all five drop their
 		// whole body when `nat <child> { ... }` elides the child's brace, with
