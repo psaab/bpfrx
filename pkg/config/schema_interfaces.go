@@ -355,7 +355,11 @@ func vrrpGroupSchemaNode(v6 bool) *schemaNode {
 		vaExamples = []string{"2001:db8::1/64"}
 		vaValidator = ValidateIPv6CIDR
 	}
-	return &schemaNode{desc: "VRRP group", args: 1, placeholder: "<group-id>", children: map[string]*schemaNode{
+	// #8839: keyValidator on the IDENTITY slot. Without it a non-numeric id is
+	// accepted at commit and the group silently vanishes -- parseVRRPGroups does
+	// strconv.Atoi(name) and `continue`s on error. Range and sign are already
+	// caught by an existing strict gate; this closes only the silent case.
+	return &schemaNode{desc: "VRRP group", args: 1, placeholder: "<group-id>", keyValidator: ValidateVRRPGroupID, children: map[string]*schemaNode{
 		"virtual-address": {
 			desc:          "Virtual IP address",
 			args:          1,
