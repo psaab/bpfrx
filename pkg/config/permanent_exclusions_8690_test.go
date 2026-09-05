@@ -53,6 +53,20 @@ var exclusionClasses8690 = map[string]bool{
 	// clause is false — the argument was built on a hierarchical spelling nobody
 	// writes, instead of the flat `set` form operators actually use.
 	"no-drop-measured": true,
+	// #8690: `no-drop-measured` was itself superseded for the scheduler-name
+	// sites. Its strict-path measurement is correct and insufficient — the
+	// strict path REJECTS the elided spelling, so cfg is nil and there is
+	// nothing to inspect, and a gate firing is the ABSENCE of a compiled result
+	// rather than evidence about one. On the LENIENT path (Store.Load /
+	// SyncApply) the schedule IS dropped, and normalizing restores it onto the
+	// spurious duplicate rather than the operator's policy.
+	//
+	// So this class is for a site the normalizer would CHANGE, onto the wrong
+	// object: not forbidden like `partial`, not a no-op like
+	// `no-drop-measured`, not inert at the boundary like `sibling-blocked`. A
+	// FALSE FIX — the most dangerous kind to leave unlabelled, because admitting
+	// it removes inventory lines and looks like progress.
+	"wrong-remedy": true,
 }
 
 // Classes whose sites must never be normalized.
@@ -76,6 +90,7 @@ var permanentClasses8690 = map[string]bool{
 	"partial": true, "gate-confirmed": true, "gate-collateral": true,
 	"unreachable": true, "hazard": true, "no-drop-measured": true,
 	"sibling-blocked": true,
+	"wrong-remedy":    true,
 }
 
 func readPermanentExclusions8690(t *testing.T) map[string]exclusion8690 {
@@ -170,7 +185,7 @@ func TestPermanentExclusionsMatchTheInventory8690(t *testing.T) {
 		// measurement. That is not necessarily wrong, but the measurement is now
 		// unverified, and it is the measurement — not the line — that the next
 		// reader will rely on.
-		if e.class == "no-drop-measured" {
+		if e.class == "no-drop-measured" || e.class == "wrong-remedy" {
 			noDropDeparture = append(noDropDeparture, site)
 			continue
 		}
@@ -302,6 +317,15 @@ func TestPermanentExclusionRegisterIsDiscriminating8690(t *testing.T) {
 				t.Errorf("%q is classed `gate-confirmed` with a %d-character reason. That "+
 					"class asserts a PERSON measured it; the measurement IS the claim",
 					site, len(e.reason))
+			}
+		case "wrong-remedy":
+			// Must name the real defect and cite the cell showing the remedy
+			// missing its target; otherwise it is indistinguishable from an
+			// ordinary exclusion and the actual bug goes unrecorded.
+			if !strings.Contains(e.reason, "_test.go") {
+				t.Errorf("%q is classed `wrong-remedy` with no runnable cite. That class "+
+					"asserts a remedy was measured MISSING ITS TARGET; without a cell the "+
+					"claim is prose, which is how this entry was wrong three times", site)
 			}
 		case "sibling-blocked":
 			// Asserts a measurement taken with the pair ADMITTED. That
