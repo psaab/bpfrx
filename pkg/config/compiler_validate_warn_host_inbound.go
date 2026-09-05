@@ -960,6 +960,30 @@ func validateHostInboundStanzaWarnings(cfg *Config) []string {
 		hiZoneNames = append(hiZoneNames, name)
 	}
 	sort.Strings(hiZoneNames)
+	// #8854: LOOP-INVARIANT. ResolveInterfaceHostInbound takes only cfg and
+	// nothing in this loop mutates what it reads, so calling it per zone made
+	// the tolerant compile O(Z^2 log Z) — it sorts every zone name on each
+	// call. Measured on CompileConfigLenient before the hoist: 0.15s at 500
+	// zones, 4.0s at 2000, 8.5s at 3000, 76s at 8000, with the resolver 86.7%
+	// cumulative and slices.pdqsortOrdered 67.7% at Z=3000.
+	//
+	// This path is the TOLERANT one — boot and HA peer-sync — so the cost lands
+	// where an operator cannot see it: a node taking 76 seconds to come up, or
+	// a peer sync stalling, on a config that commits clean.
+	//
+	// The hoist is only safe because the resolved map does not change during
+	// the loop. That was verified by instrumenting the loop to recompute the
+	// map every iteration and compare against the first, then running
+	// pkg/config, pkg/configstore and pkg/dataplane: zero divergences, with the
+	// probe proved live by a positive control that mutated
+	// zone.InterfaceHostInbound and did fire.
+	//
+	// Called through resolveInterfaceHostInboundFn so the ONCE-per-invocation
+	// property is assertable — see
+	// TestHostInboundResolverCalledOncePerValidate8854. A correctness cell
+	// cannot see this: moving the call back inside the loop leaves every
+	// existing test green and only the cost changes.
+	resolvedHI := resolveInterfaceHostInboundFn(cfg)
 	for _, name := range hiZoneNames {
 		zone := cfg.Security.Zones[name]
 		if zone == nil { // #3494: tolerant/HA-sync path may carry a nil zone value
@@ -1011,7 +1035,6 @@ func validateHostInboundStanzaWarnings(cfg *Config) []string {
 		// unit, or a bare physical for a unit-less interface — and its value is
 		// the physical-inherited override UNIONED with the unit-level one
 		// (#3720), cross-zone quarantined (#3720 M01 / #5489).
-		resolvedHI := ResolveInterfaceHostInbound(cfg)
 		// hiKeysFor returns the enforcement keys a raw zone-interface REF
 		// governs. It is deliberately not "the ref itself": a physical ref with
 		// units never reaches the dataplane as a key — the per-unit snapshot
@@ -1144,3 +1167,11 @@ func validateHostInboundStanzaWarnings(cfg *Config) []string {
 	}
 	return warnings
 }
+
+// resolveInterfaceHostInboundFn is the seam through which the host-inbound
+// advisory pass reaches the resolver (#8854). Production always holds
+// ResolveInterfaceHostInbound; the guard swaps it to COUNT calls, because the
+// property being protected is "called once per invocation, not once per zone"
+// and no correctness assertion can observe that. Same shape as the
+// deriveKernelNameFn / directARPProbeFn seams in pkg/daemon.
+var resolveInterfaceHostInboundFn = ResolveInterfaceHostInbound
