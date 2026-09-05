@@ -1293,6 +1293,22 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		// Doubly elided, `security nat source { pool p1 { address ...; } }`
 		// compiled to exactly what an EMPTY config produces: the source NAT
 		// pool silently vanished, both spellings accepted at strict commit.
+		// #8943 final: the remaining depth-2 drops. All measured DROPS with both
+		// spellings strict-accepted; per-row evidence, collision counts and the
+		// dataplane-vs-compiler severity axis in docs/log/8943-final.md.
+		"address-book global",
+		"archival configuration",
+		"bgp damping",
+		"bgp multipath",
+		"dataplane coalescence",
+		"dataplane shared-umem",
+		"flow-monitoring version9",
+		"flow-monitoring version-ipfix",
+		"interface-routes rib-group",
+		"license autoupdate",
+		"policies policy-rematch",
+		"pre-id-default-policy then",
+		"rib static",
 		// #8943: syslog destinations. One site each; no cross-reference
 		// validator names them so #8928 does not apply; the loss reaches the
 		// RUNTIME (applySyslogConfig builds the clients). docs/log/8943-syslog.md.

@@ -42,12 +42,14 @@
 # narrowed. Both directions must move deliberately.
 #
 address-set address	2
+address-set address	2
 address-set address-set	2
 address-set description	2
 area interface	4
 area virtual-link	2
 bfd-liveness-detection minimum-interval	8
 bfd-liveness-detection multiplier	8
+bgp damping	2
 bgp group	2
 classifiers dscp	3
 classifiers ieee-802.1	3
@@ -113,6 +115,7 @@ interface level	2
 interface metric	2
 interface priority	4
 interface retransmit-interval	4
+interface-routes rib-group	2
 interfaces unit	2
 isis authentication-key	2
 isis authentication-type	2
@@ -167,6 +170,7 @@ qualified-next-hop metric	4
 qualified-next-hop preference	4
 rewrite-rules dscp	3
 rewrite-rules ieee-802.1	3
+rib static	2
 rib-group inet	2
 rib-group inet6	2
 route next-hop	6
