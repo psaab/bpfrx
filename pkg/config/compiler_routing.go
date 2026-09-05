@@ -485,6 +485,19 @@ func parseNextTableInstance(table string) string {
 	return table
 }
 
+// isRoutingInstanceKeyword8787 names the property keywords a packed
+// routing-instance tail can contain, so a multi-value run knows where to stop.
+// Kept beside the switch it mirrors; a keyword added to one and not the other
+// is exactly the drift that made the packed spelling lose its whole instance.
+func isRoutingInstanceKeyword8787(tok string) bool {
+	switch tok {
+	case "instance-type", "description", "interface", "routing-options",
+		"protocols", "vrf-target", "vrf-table-label", "route-distinguisher":
+		return true
+	}
+	return false
+}
+
 func compileRoutingInstances(node *Node, cfg *Config) error {
 	// Assign each routing-instance a STABLE kernel routing table id derived from
 	// its NAME (#3855), never a positional counter. Positional assignment
@@ -494,13 +507,66 @@ func compileRoutingInstances(node *Node, cfg *Config) error {
 	// on an unrelated VRF, on both HA nodes. A name-hashed id is invariant under
 	// add/remove/reorder of siblings. See StableRoutingInstanceTableID.
 	for _, child := range node.Children {
-		if child.IsLeaf || len(child.Keys) == 0 {
+		if len(child.Keys) == 0 {
+			continue
+		}
+		// #8787: a brace-elided instance is a LEAF, and skipping it dropped
+		// the ENTIRE routing instance rather than one property:
+		//
+		//	routing-instances { ri1 { instance-type forwarding; } }  -> 1 instance
+		//	routing-instances { ri1 instance-type forwarding; }      -> 0 instances
+		//
+		// on a commit reporting success. The harmful direction is `forwarding`:
+		// InstanceType == "forwarding" is what makes the daemon SKIP VRF
+		// creation, so a dropped value creates a VRF the operator asked NOT to
+		// have and moves interfaces into it.
+		//
+		// NOT FIXABLE BY THE #8690 NORMALIZER, which is why this is handled
+		// here. That pass is scoped per (container, head) pair, and the pair it
+		// asks for this site is ("ri1", "instance-type") -- the operator's
+		// INSTANCE NAME, not a keyword. No scope entry can name it. Measured:
+		// admit-all folds the node, the real predicate cannot be made to.
+		//
+		// A bare `routing-instances { ri1; }` carries no properties and is
+		// still skipped.
+		if child.IsLeaf && len(child.Keys) < 2 {
 			continue
 		}
 		instanceName := child.Keys[0]
 		ri := &RoutingInstanceConfig{
 			Name:    instanceName,
 			TableID: StableRoutingInstanceTableID(instanceName),
+		}
+
+		// The elided spelling packs the body onto this node's Keys tail. Read
+		// it with the SAME keyword set the switch below handles, so the two
+		// spellings cannot drift: a keyword added there and not here would
+		// silently work braced and not packed, which is how this defect
+		// started.
+		for i := 1; i < len(child.Keys); i++ {
+			switch child.Keys[i] {
+			case "instance-type":
+				if i+1 < len(child.Keys) {
+					ri.InstanceType = child.Keys[i+1]
+					i++
+				}
+			case "description":
+				if i+1 < len(child.Keys) {
+					ri.Description = child.Keys[i+1]
+					i++
+				}
+			case "interface":
+				// Multi-value (#3904): consume the whole run, or a packed
+				// `interface a b` would strand every port after the first
+				// OUTSIDE the instance -- the VRF isolation break that note
+				// records.
+				j := i + 1
+				for j < len(child.Keys) && !isRoutingInstanceKeyword8787(child.Keys[j]) {
+					ri.Interfaces = append(ri.Interfaces, child.Keys[j])
+					j++
+				}
+				i = j - 1
+			}
 		}
 
 		for _, prop := range child.Children {

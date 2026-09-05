@@ -161,7 +161,7 @@ func classifyGateBlindLeaf(g gateLeaf) gateBlindClass {
 // +2 here. The gate itself asked for this: it reports a floor it can now beat
 // as "COVERAGE IMPROVED — TIGHTEN THE RATCHET (this is a good failure)", and
 // leaving it slack would let a later regression drop back to 689 unnoticed.
-const gateCoverageFloor = 703
+const gateCoverageFloor = 705
 
 var gateBlindCeiling = map[gateBlindClass]int{
 	// #7492 moved leaves out of `unreachable` in two rounds. The parent
