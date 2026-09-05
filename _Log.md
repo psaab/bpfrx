@@ -107071,7 +107071,3 @@ prose edit above them added. No diff falls in the new test body.
   - **File(s)**: pkg/daemon/external_hostname_watch_6863.go, pkg/daemon/mgmt_listener_reassert.go, pkg/daemon/management.go, pkg/daemon/daemon.go
 
 <!-- LOG-CLOSED-SENTINEL-6874: nothing may be appended below this line. Write to docs/log/<issue>.md instead. -->
-
-- **Timestamp**: 2026-09-05
-  **Action**: Fix issue 8867 — normalize compact stanzas on a CLONE before the typed-leaf walk so the packed spelling of a typed leaf is validated; generalises the #6672 chassis-cluster un-packing to the whole admitted population (146 of 161 leaves were bypassable)
-  **File(s)**: pkg/config/schema_walk.go, pkg/config/compact_normalize_8662.go, pkg/config/packed_validation_8867_test.go, pkg/config/schema_validate_test.go
