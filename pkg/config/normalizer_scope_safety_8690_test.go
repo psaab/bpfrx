@@ -117,8 +117,14 @@ func TestNormalizerScopeNeverCoversAPartialSite8690(t *testing.T) {
 }
 
 // The consequential member of family 2, asserted on the compiled config with a
-// positive half. A zone's screen binding decides which IDS profile is applied
-// to traffic entering that zone; brace-elided it used to compile to nothing.
+// positive half.
+//
+// OBSERVATION BOUNDARY: this reads `ZoneConfig.ScreenProfile`. That a zone's
+// screen binding decides which IDS profile is applied to traffic entering the
+// zone is evidence about what the field MEANS, checked by reading the
+// consumers — it is not something this assertion can see. A guard that names a
+// mechanism while observing only an outcome passes for the wrong reason the
+// moment that mechanism moves.
 func TestElidedZoneScreenBindingReachesTheZone8690(t *testing.T) {
 	const braced = `security { screen { ids-option sc1 { icmp { ping-death; } } } zones { security-zone z1 { screen sc1; host-inbound-traffic { system-services ping; } } } }`
 	const elided = `security { screen { ids-option sc1 { icmp { ping-death; } } } zones { security-zone z1 screen sc1; } }`
