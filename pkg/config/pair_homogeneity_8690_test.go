@@ -6,9 +6,8 @@ import (
 	"testing"
 )
 
-// withRecordedScopeKeys8690 runs fn with the scope predicate replaced by an
-// ADMIT-ALL recorder, and returns every (container, head) key the pass
-// consulted. It restores the real predicate before returning.
+// recordScopeKeys8690 runs the pass over `text` with an ADMIT-ALL recorder
+// injected, and returns every (container, head) key the pass consulted.
 //
 // This is the only method that has produced a correct attribution of sites to
 // pairs. Three separate attempts to DERIVE the pair from a site's path each
@@ -17,34 +16,23 @@ import (
 // property of the SPELLING rather than of the site. Asking the pass removes the
 // derivation entirely -- there is no model left to drift.
 //
-// Admit-all is deliberate. With the real predicate the pass stops walking as
-// soon as a link is refused, so it would report only the keys that happen to be
-// admitted TODAY and the guard would go quiet exactly as the scope widened.
-func withRecordedScopeKeys8690(fn func()) map[[2]string]bool {
+// The predicate is INJECTED, not swapped into a package var. A mutable global
+// would be reassignable by anything in the package, would poison every later
+// test if a restore were forgotten, and would make t.Parallel() a data race --
+// none of which announce themselves. An argument has no rule to remember.
+func recordScopeKeys8690(text string, admitAll bool) map[[2]string]bool {
 	seen := map[[2]string]bool{}
-	saved := compactNormalizeInScope
-	defer func() { compactNormalizeInScope = saved }()
-	compactNormalizeInScope = func(containerKeyword, head string) bool {
-		seen[[2]string{containerKeyword, head}] = true
-		return true
+	tree, perrs := NewParser(text).Parse()
+	if len(perrs) > 0 || tree == nil {
+		return seen
 	}
-	fn()
-	return seen
-}
-
-// withRealScopeKeys8690 records the keys consulted under the REAL predicate. It
-// exists only as the denominator for the admit-all recorder's non-vacuity
-// control below.
-func withRealScopeKeys8690(fn func()) map[[2]string]bool {
-	seen := map[[2]string]bool{}
-	saved := compactNormalizeInScope
-	defer func() { compactNormalizeInScope = saved }()
-	compactNormalizeInScope = func(containerKeyword, head string) bool {
-		ok := compactNormalizeInScopeDefault(containerKeyword, head)
+	normalizeCompactStanzasWithScope(tree, func(containerKeyword, head string) bool {
 		seen[[2]string{containerKeyword, head}] = true
-		return ok
-	}
-	fn()
+		if admitAll {
+			return true
+		}
+		return compactNormalizeInScope(containerKeyword, head)
+	})
 	return seen
 }
 
@@ -92,19 +80,11 @@ func TestSitesThatCannotBeSeparatedShareAClass8690(t *testing.T) {
 			continue // only register sites carry a class to compare
 		}
 		text := nest(parent, contextFor(parent)+stanza+" "+s.leaf+" "+v1+";")
-		keys := withRecordedScopeKeys8690(func() {
-			if tree, perrs := NewParser(text).Parse(); len(perrs) == 0 && tree != nil {
-				normalizeCompactStanzas(tree)
-			}
-		})
+		keys := recordScopeKeys8690(text, true)
 		if len(keys) > 0 {
 			keysBySite[siteKey] = keys
 		}
-		for k := range withRealScopeKeys8690(func() {
-			if tree, perrs := NewParser(text).Parse(); len(perrs) == 0 && tree != nil {
-				normalizeCompactStanzas(tree)
-			}
-		}) {
+		for k := range recordScopeKeys8690(text, false) {
 			realKeys[k] = true
 		}
 		for k := range keys {

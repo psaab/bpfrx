@@ -43,7 +43,7 @@ func normalizeCompactStanzas(tree *ConfigTree) int {
 	if tree == nil {
 		return 0
 	}
-	return normalizeCompactNodes(tree.Children, setSchema)
+	return normalizeCompactStanzasWithScope(tree, compactNormalizeInScope)
 }
 
 // compactNormalizeInScope reports whether a packed tail at `container` whose
@@ -54,31 +54,24 @@ func normalizeCompactStanzas(tree *ConfigTree) int {
 // because that is where a silent drop is a SECURITY outcome rather than a
 // cosmetic one — a dropped match criterion silently changes what a rule
 // matches, and a dropped authentication key silently changes what authenticates.
-// compactNormalizeInScope is a VAR, not a plain func, solely so tests can
-// observe which (container, head) keys the pass actually consults for a given
-// spelling. It is never reassigned in production and the default below is the
-// only implementation that ships.
+// compactNormalizeInScope reports whether a packed tail at `container` whose
+// first token is `head` is in the pass's scope. It is a plain function with no
+// mutable state; tests that need to observe or vary the decision inject their
+// own via normalizeCompactStanzasWithScope rather than reassigning anything.
 //
-// WHY THE SEAM EXISTS. The scope of this pass is decided per (container, head)
-// PAIR while the register classifies per SITE, so a guard has to know which
-// pair governs which site. Every attempt to DERIVE that from a site's path has
-// been wrong -- the container path carries the schema arg placeholder where
-// production passes node.Keys[0], and a site's key chain turns out to be a
-// property of the SPELLING rather than of the site (the same dhcp site is one
-// link when minimally packed and five when written flat). Three separate
-// derivations produced three different wrong answers.
+// WHY AN INJECTION POINT EXISTS AT ALL. Scope is decided per (container, head)
+// PAIR while the permanent-exclusion register classifies per SITE, so a guard
+// has to know which pair governs which site. Every attempt to DERIVE that from
+// a site's path has been wrong: the container path carries the schema arg
+// placeholder where production passes node.Keys[0], and a site's key chain
+// turns out to be a property of the SPELLING rather than of the site. THREE
+// SEPARATE DERIVATIONS PRODUCED THREE DIFFERENT WRONG ANSWERS. The only method
+// that has been right is to ask the pass which keys it consults.
 //
-// The only method that has been right is to ask the pass: admit everything,
-// run the real spelling, and record what fires. That works as a throwaway
-// mutation; it cannot work as a permanent guard, because a guard may not edit
-// production to take its measurement. Hence one level of indirection, which is
-// the smallest change that makes the measurement possible at all.
-//
-// Callers must not reassign this outside a test, and a test that does must
-// restore it with defer -- see withRecordedScopeKeys8690.
-var compactNormalizeInScope = compactNormalizeInScopeDefault
-
-func compactNormalizeInScopeDefault(containerKeyword, head string) bool {
+// Do not delete the seam as unnecessary without reading that history — it looks
+// like indirection for its own sake precisely until you try to re-derive the
+// attribution, which is the thing that keeps failing.
+func compactNormalizeInScope(containerKeyword, head string) bool {
 	// #8690, second increment: the CREDENTIAL family. Chosen on consequence
 	// rather than on count — each of these is a token whose silent drop leaves
 	// something authenticating (or authorizing) with NOTHING, on a commit that
@@ -1234,7 +1227,24 @@ func compactNormalizeInScopeDefault(containerKeyword, head string) bool {
 	return false
 }
 
-func normalizeCompactNodes(nodes []*Node, schema *schemaNode) int {
+// normalizeCompactStanzasWithScope is normalizeCompactStanzas with the scope
+// decision supplied by the caller. Production has exactly one caller and passes
+// compactNormalizeInScope; tests pass a recorder to observe which keys the pass
+// consults, or a widened predicate to explore past a refusal.
+//
+// An injection point rather than a reassignable package var, deliberately: a
+// mutable global is reassignable by anything in the package, a test that
+// forgets to restore it poisons every later test, and it makes t.Parallel() a
+// data race. None of those failure modes announce themselves. This shape has no
+// rule to remember. (Design: team-lead, reviewing the var form.)
+func normalizeCompactStanzasWithScope(tree *ConfigTree, inScope func(containerKeyword, head string) bool) int {
+	if tree == nil {
+		return 0
+	}
+	return normalizeCompactNodes(tree.Children, setSchema, inScope)
+}
+
+func normalizeCompactNodes(nodes []*Node, schema *schemaNode, inScope func(containerKeyword, head string) bool) int {
 	if schema == nil {
 		return 0
 	}
@@ -1259,7 +1269,7 @@ func normalizeCompactNodes(nodes []*Node, schema *schemaNode) int {
 			// child of this container. Otherwise it is this node's own
 			// multi-value payload (a bracketed list, a multi: true leaf) and
 			// must be left alone.
-			if _, isBody := child.children[head]; isBody && compactNormalizeInScope(kw, head) {
+			if _, isBody := child.children[head]; isBody && inScope(kw, head) {
 				tail := append([]string(nil), node.Keys[identity:]...)
 				node.Keys = append([]string(nil), node.Keys[:identity]...)
 				node.IsLeaf = false
@@ -1267,7 +1277,7 @@ func normalizeCompactNodes(nodes []*Node, schema *schemaNode) int {
 				n++
 			}
 		}
-		n += normalizeCompactNodes(node.Children, child)
+		n += normalizeCompactNodes(node.Children, child, inScope)
 	}
 	return n
 }
