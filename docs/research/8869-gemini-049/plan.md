@@ -1,9 +1,10 @@
 # Plan of action — gemini-review-049 (#8869)
 
-- **Revision:** r2 (after Codex r1 PLAN-REVISE — 8 findings, all applied)
+- **Revision:** r3 (after Claude SMR r1 PLAN-REVISE — the census is now GATED on a calibration, not entered directly)
 - **Base:** `f36be93c5` (origin/master at drafting)
 - **Report base:** `b0f3aba21`, which was master-identical when the review ran
 - **Status:** revised. Codex r1 `PLAN-REVISE` (8 findings). AGY infra-blocked (2-of-3 exception).
+- **THE CENSUS IS A HISTORICAL SNAPSHOT, not a statement about current master.** *(r3, Claude SMR S3.)* r2 pinned a tip *and* said confirmed defects are worked as they are found — those are in tension, because working defects during the census changes the tree it describes. And at 142 commits/6h15m the pin is stale before the census finishes; "revalidate if relevant changes land" is **continuous revalidation, which is not a procedure**. So: the census describes `f36be93c5` **and says so**; a row is revalidated **only when someone acts on it**, at that moment, against the then-current master. **No row is ever presented as a claim about current master without that revalidation.** Fixing defects during the census is therefore fine and expected — it does not invalidate a snapshot that never claimed to be current.
 - **PINNED COMPARISON SHA: `f36be93c5`.** *(Codex r1 #8.)* The census is a snapshot of **one** commit. The procedure says "the pinned tip", never "master" — master moved **142 commits in 6h15m** during this campaign, so a distribution assembled against a moving tip would be built from different repository states. Every cell records **both** SHAs: report base `b0f3aba21` and pinned tip `f36be93c5`. **If relevant changes land, affected conclusions are revalidated before implementation or closure — an older snapshot is never silently presented as current.**
 
 ## 1. What is actually in this report — derived, not quoted
@@ -101,9 +102,16 @@ relevant files.
 **And the 6 agreements are NOT independent negative controls — both fields can
 agree on the wrong target.**
 
-So the artifact is a **resolved-target record** per finding: the implicated
-**symbol**, the relevant **paths**, and each path's **role** (defect site /
-caller / comparison / test). **Ambiguous and multi-target cases are preserved as
+So the artifact is a **resolved-target record** per finding — **split into two
+steps with different costs**, *(r3, Claude SMR S4: assigning a role is a judgement
+about the finding's content, so r2 had moved the expensive step earlier and
+renamed it, while still claiming routing was mechanical)*:
+
+- **(i) MECHANICAL — every path the finding mentions, extracted, with NO roles.**
+  This is what the parser produces and it is genuinely cheap.
+- **(ii) ADJUDICATION — the implicated symbol and each path's role** (defect site /
+  caller / comparison / test). **This is judgement and it is counted in §2b's
+  timing**, not in routing. **Ambiguous and multi-target cases are preserved as
 such, never collapsed to one path.** Validate the parser against manually
 resolved examples that deliberately include a misleading comparison path.
 **Publish disagreement rate and resolution coverage separately; neither is an
@@ -206,7 +214,41 @@ plan does not re-litigate that class.
    have existed *and* the current behaviour to address it. **Naming an apparent
    fix commit is evidence, not proof.**
 
-2b. **First batch is an EFFORT CALIBRATION, not just a classification.**
+2b. **CALIBRATION GATE — this runs FIRST and the full census is CONDITIONAL on it.**
+   *(r3, Claude SMR S1. r2 treated this as a measurement taken en route to a census
+   already decided on. It is now the decision point.)*
+
+   **r2 dismissed the sample-first path by saying the liveness column "is this, run
+   over the whole population, for not much more cost". That argues B SUBSUMES C,
+   not that C is wrong to do first** — and the two differ exactly when B is
+   expensive, which §2b itself concedes it may be. The estimate was made against
+   the *extraction* step, which is automated; the *judgment* step is the one that
+   may cost as much as adjudication.
+
+   **The unasked question is prevalence, and it decides the shape of the work:**
+
+   | live rate | defects found | judgments spent |
+   |---|---|---|
+   | 60% | 60 | 100 |
+   | 10% | **10** | **100** |
+
+   **At the low end the census costs ten judgments per defect**, and a 15-finding
+   sample would have established that for 15. Two prior samples (`-004` credible,
+   `-051` stale) are a coin, not a calibration — which is an argument for measuring
+   prevalence, not for skipping to a census.
+
+   **Gate output — publish all four before proceeding:** live rate, time per
+   defensible verdict (**counting BOTH judgments A and B, plus role assignment per
+   §2.3**), manual routing effort, unresolved rate.
+
+   **Then choose, explicitly and in writing:**
+   - **prevalence high or consequence concentrated** -> run the full census;
+   - **prevalence low** -> abandon the census, work the confirmed Highs, and state
+     that the remainder is **unclassified** rather than clean;
+   - **either way**, if the census is run for **completeness** rather than
+     efficiency, say so — that is defensible, and it is not what r2 said.
+
+2c. **What the calibration batch IS.**
    *(Codex r1 #4.)* r1 asserted the column is cheap because extraction is
    automated. **Extraction is cheap; deciding whether a claimed defect existed,
    remained reachable, and was fully corrected can cost as much as adjudication
