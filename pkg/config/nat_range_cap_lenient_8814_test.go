@@ -178,3 +178,91 @@ func TestTheRecordedFieldIsOnlySetWhenOverCap8814(t *testing.T) {
 		t.Errorf("the recorded spec does not carry the size: %q", pool2.OversizedAddressRanges[0])
 	}
 }
+
+// The FLAT `set` spelling, which decides whether this is operator-facing or
+// config-file-only.
+//
+// The cells above compile hierarchical text through NewParser. That leaves the
+// spelling an operator actually TYPES unpinned, and the distinction matters
+// here: if the cap were reachable only from a persisted file, an operator could
+// not author an oversized range interactively and the strict gate would be
+// guarding a population of one. It is reachable, so the gate is doing
+// operator-facing work and both halves have to hold in this spelling too.
+//
+// Raised by lane-8526 as a gap in the original coverage. It came out green,
+// which is luck rather than diligence until something asserts it -- an
+// unmeasured spelling is exactly how #8778's first fix looked complete.
+//
+// ParseSetCommand + SetPath, never NewParser: the parser treats newlines as
+// whitespace and merges every set line into one node, so a measurement taken
+// through it describes a tree nobody has (CLAUDE.md; #8808).
+func TestFlatSetSpellingHitsTheSameRangeCap8814(t *testing.T) {
+	flat := func(t *testing.T, lines ...string) *ConfigTree {
+		t.Helper()
+		tree := &ConfigTree{}
+		for _, l := range lines {
+			path, err := ParseSetCommand(l)
+			if err != nil {
+				t.Fatalf("ParseSetCommand(%q): %v", l, err)
+			}
+			tree.SetPath(path)
+		}
+		return tree
+	}
+	for _, tc := range []struct {
+		name       string
+		line       string
+		wantAddrs  int
+		wantRecord int
+		wantStrict bool
+	}{
+		{"257 IPs — one over the cap", "set security nat source pool p1 address 10.0.0.1/32 to 10.0.1.1/32", 0, 1, true},
+		{"256 IPs — the boundary", "set security nat source pool p1 address 10.0.0.1/32 to 10.0.1.0/32", 256, 0, false},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, lerr := compileConfigWithOpts(flat(t, tc.line), lenientCompileOpts())
+			if lerr != nil {
+				t.Fatalf("CompileConfigLenient FAILED on the flat spelling: %v (#8814)", lerr)
+			}
+			pool := cfg.Security.NAT.SourcePools["p1"]
+			if pool == nil {
+				t.Fatal("pool p1 absent from the leniently compiled flat-set config")
+			}
+			if got := len(pool.Addresses); got != tc.wantAddrs {
+				t.Errorf("flat set: pool has %d address(es), want %d", got, tc.wantAddrs)
+			}
+			if got := len(pool.OversizedAddressRanges); got != tc.wantRecord {
+				t.Errorf("flat set: %d recorded oversized range(s), want %d — the flat spelling must "+
+					"reach the same record-and-gate path as the hierarchical one, or the strict gate "+
+					"guards only configs that arrive from a file", got, tc.wantRecord)
+			}
+			_, serr := compileConfigWithOpts(flat(t, tc.line), compileOpts{})
+			if tc.wantStrict && serr == nil {
+				t.Error("flat set: strict CompileConfig ACCEPTED an oversized range — an operator can " +
+					"author one interactively (#8814)")
+			}
+			if !tc.wantStrict && serr != nil {
+				t.Errorf("flat set: strict rejected a legal range: %v", serr)
+			}
+		})
+	}
+	// proxy-arp, the second caller, in the same spelling.
+	line := "set security nat proxy-arp interface ge-0-0-0 address 10.0.0.1/32 to 10.0.1.1/32"
+	cfg, lerr := compileConfigWithOpts(flat(t, line), lenientCompileOpts())
+	if lerr != nil {
+		t.Fatalf("flat set proxy-arp: CompileConfigLenient FAILED: %v", lerr)
+	}
+	recorded := 0
+	for _, e := range cfg.Security.NAT.ProxyARP {
+		if e != nil {
+			recorded += len(e.OversizedRangeSpecs)
+		}
+	}
+	if recorded != 1 {
+		t.Errorf("flat set proxy-arp: %d recorded oversized range(s), want 1", recorded)
+	}
+	if _, serr := compileConfigWithOpts(flat(t, line), compileOpts{}); serr == nil {
+		t.Error("flat set proxy-arp: strict CompileConfig accepted an oversized range (#8814)")
+	}
+}
