@@ -1427,7 +1427,7 @@ func normalizeCompactNodes(nodes []*Node, schema *schemaNode, inScope func(conta
 		return 0
 	}
 	n := 0
-	for _, node := range nodes {
+	for i, node := range nodes {
 		if node == nil || len(node.Keys) == 0 {
 			continue
 		}
@@ -1497,6 +1497,35 @@ func normalizeCompactNodes(nodes []*Node, schema *schemaNode, inScope func(conta
 				ckw = node.Keys[identity-1]
 			}
 			if _, isBody := childSub.children[head]; isBody && inScope(ckw, head) {
+				// #8880: DECLINE rather than STRAND. The parser splits a run of
+				// statements packed onto an elided container's line into
+				// SIBLINGS, and only the first carries the container keyword:
+				//
+				//	security { policies from-zone a to-zone b {…} from-zone c to-zone d {…} }
+				//	  -> [policies from-zone a to-zone b]{…}   and   [from-zone c to-zone d]{…}
+				//
+				// Folding only the first builds `policies { from-zone a … }` and
+				// leaves the second as a sibling of `policies` — a `from-zone`
+				// node directly under `security`, a position the schema does not
+				// model and the compiler silently ignores. Measured: a whole
+				// zone-pair policy set discarded on a clean commit.
+				//
+				// So if the NEXT sibling is a continuation of the container this
+				// fold would create, take neither half: leave the tree exactly as
+				// authored. Declining is the established response (#8866) and it
+				// is the only one available here — absorbing the sibling would
+				// mean rewriting the PARENT's child slice, which this walk does
+				// not hold.
+				//
+				// The check is deliberately "is a declared child of the
+				// container", not "is unambiguous". 348 of 384 (parent,
+				// container) pairs share no child name, but 36 do — e.g.
+				// `class-of-service > interfaces` shares `classifiers` with its
+				// own parent — and for those a continuation cannot be told from
+				// a sibling at all. Declining covers both.
+				if declineStrandingFold8880(nodes, i, childSub) {
+					continue
+				}
 				tail := append([]string(nil), node.Keys[identity:]...)
 				body := node.Children
 				node.Keys = append([]string(nil), node.Keys[:identity]...)
@@ -1632,4 +1661,24 @@ func normalizeCompactForValidation(tree *ConfigTree) *ConfigTree {
 		return tree
 	}
 	return clone
+}
+
+// declineStrandingFold8880 reports whether the node at index i must NOT be
+// folded because the sibling that follows it is a continuation of the container
+// the fold would create.
+//
+// A continuation is a following sibling whose head names a declared child of
+// that container. Such a sibling can only have come from the same packed run —
+// the schema does not model it in the parent's position — so folding the first
+// half while leaving it behind produces a tree the compiler cannot represent.
+func declineStrandingFold8880(nodes []*Node, i int, container *schemaNode) bool {
+	if container == nil || i+1 >= len(nodes) {
+		return false
+	}
+	next := nodes[i+1]
+	if next == nil || len(next.Keys) == 0 {
+		return false
+	}
+	_, isChild := container.children[next.Keys[0]]
+	return isChild
 }
