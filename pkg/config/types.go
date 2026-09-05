@@ -29,21 +29,55 @@ func DHCPLeaseIfName(ifName string, unit *InterfaceUnit) string {
 	return base
 }
 
-// InterfaceSlot extracts the FPC slot number from a Junos interface name.
-// "ge-0/0/7" → 0, "ge-7/0/7" → 7, "xe-3/1/2" → 3.
-// Returns -1 if the name doesn't match the <type>-N/N/N pattern.
+// InterfaceSlot extracts the FPC slot number from an interface name, in BOTH
+// spellings this codebase uses:
+//
+//	"ge-0/0/7" → 0   "ge-7/0/7" → 7   "xe-3/1/2" → 3   (Junos config spelling)
+//	"ge-0-0-7" → 0   "ge-7-0-7" → 7                    (operational spelling)
+//
+// Returns -1 for a name carrying no FPC slot at all ("fab0", "em0", "reth0",
+// "st0.1"), which is what every caller's `>= 0` guard is testing for.
+//
+// #8829: THE DASH SPELLING IS NOT AN ALIAS, IT IS THE ONE OPERATORS SEE.
+// linksetup.go emits `ge-%d-0-%d`, so `show interfaces`, the `.link` files and
+// the topology tables all render dashes, while config and this function spoke
+// only slashes. An operator copying a name out of an operational surface wrote
+// the spelling that did not resolve. Two conventions both exist deliberately;
+// what was wrong was that only one of them was parseable here.
+//
+// TWO DEFECTS FOLLOWED, and the second is the dangerous one:
+//
+//   - RethToPhysical scores members 2=local, 0=peer, 1=slot-unknown. A dash
+//     name returned -1, so BOTH members scored 1 and the tie broke
+//     ALPHABETICALLY: on node 1, `reth0` resolved to `ge-0-0-0` — node 0's
+//     member. Measured before this change.
+//   - Every alignment gate is `InterfaceSlot(...) >= 0` (compiler_chassis.go,
+//     and the #8444 fabric-member validator), so THE SPELLING THAT NEEDED
+//     VALIDATION WAS THE ONE THAT SKIPPED IT. A wrong-node dash name committed
+//     clean while its slash twin was rejected. Normalising the parse without
+//     that gate firing would have left the fail-open in place.
+//
+// Measured after: the dash form now behaves IDENTICALLY to the slash form on
+// both paths — strict commit rejects a wrong-node name, the tolerant load path
+// warns and continues — so a persisted config still boots (#1319) and nothing
+// that committed before is newly unbootable.
 func InterfaceSlot(name string) int {
-	// Find the first "-" separator, then parse the FPC number before the first "/".
+	// Find the first "-" separator, then parse the FPC number up to the next
+	// separator, which is "/" in the config spelling and "-" in the
+	// operational one.
 	dashIdx := strings.Index(name, "-")
 	if dashIdx < 0 || dashIdx+1 >= len(name) {
 		return -1
 	}
 	rest := name[dashIdx+1:]
-	slashIdx := strings.Index(rest, "/")
-	if slashIdx < 0 {
+	sepIdx := strings.Index(rest, "/")
+	if sepIdx < 0 {
+		sepIdx = strings.Index(rest, "-")
+	}
+	if sepIdx < 0 {
 		return -1
 	}
-	slot, err := strconv.Atoi(rest[:slashIdx])
+	slot, err := strconv.Atoi(rest[:sepIdx])
 	if err != nil {
 		return -1
 	}
