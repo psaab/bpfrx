@@ -1032,7 +1032,12 @@ pub(super) fn encapsulate_native_gre_frame(
     // already folded into `gre_len`, so a key-present endpoint's extra
     // 4 bytes are counted. Drop + bump rather than emit; PMTUD/PTB
     // signalling from this site is deferred to #2330 (see the
-    // GRE_ENCAP_DF_OVERSIZE_DROPS doc comment).
+    // GRE_ENCAP_DF_OVERSIZE_DROPS doc comment, which is the authority on
+    // the ordering: #2330 LANDED the signalling in the TX dispatcher, whose
+    // pre-build post_transform_inner_mtu decision fires first and skips this
+    // build whenever a PTB is owed. What reaches this drop is the residual
+    // where none is owed -- a non-DF IPv4 inner, downstream-fragmentable by
+    // design (#8942: "deferred" alone read as an outstanding gap).
     let outer_l3_len = gre_encapped_outer_len(outer_ip_len, gre_len, inner_packet.len());
     let outer_mtu = tunnel_outer_mtu(forwarding, decision, endpoint);
     if outer_l3_len > outer_mtu {

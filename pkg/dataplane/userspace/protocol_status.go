@@ -542,8 +542,11 @@ type ProcessStatus struct {
 	// cannot be fragmented downstream and would silently blackhole every
 	// inner flow with no PMTUD signal — so the builder refuses to emit it.
 	// Surfaced as xpf_userspace_gre_encap_df_oversize_drops_total. PMTUD /
-	// PTB signalling is deferred to #2330. Omitempty for wire compat with
-	// older helpers (defaults to 0).
+	// PTB signalling for this path landed in #2330 (TX dispatcher): when a
+	// PTB is owed the pre-build decision emits it and skips the encap, so
+	// this counts only the residual where none is owed -- a non-DF IPv4
+	// inner (#8942: the old "deferred to #2330" read as an open gap).
+	// Omitempty for wire compat with older helpers (defaults to 0).
 	GreEncapDfOversizeDropsTotal uint64 `json:"gre_encap_df_oversize_drops_total,omitempty"`
 	// #2782: native-GRE decap frames dropped because the GRE
 	// Checksum-Present (C) bit was set but the GRE checksum failed to

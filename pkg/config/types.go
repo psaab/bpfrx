@@ -210,8 +210,12 @@ func (c *Config) ResolveFab(ref string) string {
 //
 // NOTE: Keep in sync with snapshotLinuxName in
 // pkg/dataplane/userspace/interfaces.go and resolveJunosIfName in
-// pkg/daemon/daemon_dhcp.go. Migration to centralize all callers is
-// tracked as a follow-up to #1565.
+// pkg/daemon/daemon_dhcp.go. Migration to centralize all callers was
+// tracked as a follow-up to #1565, which is CLOSED while the three
+// resolvers are still kept in step by this note rather than by
+// construction — #8942 tracks the residual. Keeping them in sync is
+// therefore a live obligation on anyone editing any of the three, not
+// something a pending migration is about to remove.
 // resolveBareKernelIfName is the BARE-ref arm of ResolveKernelIfName, split out
 // so callers that already know structurally that they hold an interface name —
 // not a unit ref — can reach it without round-tripping through the dotted

@@ -349,7 +349,9 @@ func validateIpipTunnelDeadWarning(cfg *Config) []string {
 // gate's subject: the same orphan appears with `mode gre`, where #4785 is
 // deliberately silent, so #4785 is not its cause. It is the routing-vs-dataplane
 // name divergence tracked in #6941 (routing keys its desired set by
-// TunnelConfig.Name; the dataplane binds via snapshotLinuxName).
+// TunnelConfig.Name -- pkg/routing/tunnel.go `desired[tc.Name]`; the dataplane
+// binds via snapshotLinuxName, pkg/dataplane/userspace/interfaces.go). #6941 is
+// CLOSED and both halves still key differently, so #8942 tracks the residual.
 //
 // Why the DEVICE clause has to exist at all: the advisory's claim is about a
 // Linux device — "an interface an operator can see that carries no traffic" —
