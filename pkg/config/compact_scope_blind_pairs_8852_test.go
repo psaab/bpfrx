@@ -71,11 +71,17 @@ import (
 // its evidence.
 var knownBlindScopePairs8852 = map[string]string{
 	// Head is a plain container (args==0, no wildcard, has children).
-	"policies global":                    "plain-container",
-	"policy then":                        "plain-container",
-	"routing-options static":             "plain-container",
-	"security alg":                       "plain-container",
-	"security flow":                      "plain-container",
+	"policies global":        "plain-container",
+	"policy then":            "plain-container",
+	"routing-options static": "plain-container",
+	"security alg":           "plain-container",
+	"security flow":          "plain-container",
+	// issue 8858. Unlike the two confirmed-broken entries above, this pair's
+	// fold IS repaired and measured -- but by its own cells, not by arm 2, and
+	// a pair leaves this list only when arm 2 starts generating a site for it.
+	// The four `root-authentication <leaf>` pairs are NOT here: their heads are
+	// single-arg valued leaves, so arm 2 does adjudicate them.
+	"system root-authentication":         "plain-container",
 	"security-zone address-book":         "plain-container",
 	"security-zone host-inbound-traffic": "plain-container",
 	// Head takes two or more identity args.

@@ -98,7 +98,13 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 	"backup-router": {desc: "Backup router", args: 1, placeholder: "<address>", children: map[string]*schemaNode{
 		"destination": {desc: "Destination network", args: 1, placeholder: "<network>", children: nil},
 	}},
-	"root-authentication": {desc: "Root authentication", children: map[string]*schemaNode{
+	// packedStatements (issue 8858): SSHKeys is a []string, so a packed
+	// `root-authentication ssh-ed25519 <k1> ssh-ed25519 <k2>` run must split
+	// into one child per statement or the second key is silently lost. The
+	// scope admission alone compiles the FIRST key and looks complete; only a
+	// two-key fixture shows the fold. Every child here is a modelled args:1
+	// leaf, so the tail splits cleanly.
+	"root-authentication": {desc: "Root authentication", packedStatements: true, children: map[string]*schemaNode{
 		// #1944 E1: share ValidateCryptHash with per-user
 		// authentication so root's identical plaintext footgun is
 		// closed (one validator, one error message).
