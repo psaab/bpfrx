@@ -99,8 +99,8 @@ var knownBlindScopePairs8852 = map[string]string{
 	"routing-options static": "plain-container",
 	"security alg":           "plain-container",
 	"security flow":          "plain-container",
-	// issue 8873. Their folds ARE measured -- by
-	// TestSecurityTopLevelElisionKeepsContents8873, across all three depths and
+	// issue 8875. Their folds ARE measured -- by
+	// TestSecurityTopLevelElisionKeepsContents8875, across all three depths and
 	// on compiled CONTENTS -- but not by arm 2, and a pair leaves this list
 	// only when arm 2 generates a site for it. Registration records that this
 	// arm does not measure them; it is not a claim that they are unfixed.

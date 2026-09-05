@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// Issue 8873: the top-level `security` containers admitted NO children, so the
+// Issue 8875: the top-level `security` containers admitted NO children, so the
 // fully-elided spelling lost the whole stanza while the braced and once-elided
 // spellings delivered it:
 //
@@ -25,14 +25,14 @@ import (
 // already worked and must keep working. A cell testing one depth is green
 // before and after the fix.
 
-type securityElision8873 struct {
+type securityElision8875 struct {
 	name string
 	d1   string // fully braced          security { C { body } }
 	d2   string // container brace elided security { C <inst> { body } }
 	d3   string // top-level elided       security C <inst> { body }
 }
 
-func securityElisionCases8873() []securityElision8873 {
+func securityElisionCases8875() []securityElision8875 {
 	// TWO policies, so a fold that re-attaches the body as a SIBLING of the
 	// deepest packed node -- producing a zone-pair that EXISTS but is empty,
 	// which reads as configured and is worse than the pair being absent --
@@ -46,7 +46,7 @@ func securityElisionCases8873() []securityElision8873 {
 	// to elision. Added identically to all three depths, so the comparison is
 	// unaffected.
 	zdef := "security { zones { security-zone trust { } security-zone untrust { } } } "
-	return []securityElision8873{
+	return []securityElision8875{
 		{
 			name: "zone-pair policies",
 			d1:   zdef + "security { policies { from-zone trust to-zone untrust { " + twoPol + " } } }",
@@ -74,7 +74,7 @@ func securityElisionCases8873() []securityElision8873 {
 	}
 }
 
-func compileSecurity8873(t *testing.T, text string) (*Config, string) {
+func compileSecurity8875(t *testing.T, text string) (*Config, string) {
 	t.Helper()
 	tree, perrs := NewParser(text).Parse()
 	if len(perrs) > 0 {
@@ -99,12 +99,12 @@ func compileSecurity8873(t *testing.T, text string) (*Config, string) {
 	return cfg, string(b)
 }
 
-// securityLiveness8873 fails when a braced reference carries nothing, so an
+// securityLiveness8875 fails when a braced reference carries nothing, so an
 // equality against it cannot pass vacuously. This is not decoration: reading
 // Security.Policies for GLOBAL policies made both arms return 0 during the
 // investigation, which is indistinguishable from "dropped in both spellings".
 // A control that fails the same way as the subject cannot distinguish them.
-func securityLiveness8873(t *testing.T, name string, cfg *Config) {
+func securityLiveness8875(t *testing.T, name string, cfg *Config) {
 	t.Helper()
 	inner := 0
 	for _, zp := range cfg.Security.Policies {
@@ -121,17 +121,17 @@ func securityLiveness8873(t *testing.T, name string, cfg *Config) {
 	}
 }
 
-func TestSecurityTopLevelElisionKeepsContents8873(t *testing.T) {
-	for _, c := range securityElisionCases8873() {
+func TestSecurityTopLevelElisionKeepsContents8875(t *testing.T) {
+	for _, c := range securityElisionCases8875() {
 		t.Run(c.name, func(t *testing.T) {
-			ref, refDigest := compileSecurity8873(t, c.d1)
-			securityLiveness8873(t, c.name, ref)
+			ref, refDigest := compileSecurity8875(t, c.d1)
+			securityLiveness8875(t, c.name, ref)
 
 			for _, arm := range []struct{ depth, text string }{
 				{"d2", c.d2},
 				{"d3", c.d3},
 			} {
-				_, got := compileSecurity8873(t, arm.text)
+				_, got := compileSecurity8875(t, arm.text)
 				if got != refDigest {
 					t.Errorf("%s %s does not match the braced spelling.\n braced: %s\n %s:     %s",
 						c.name, arm.depth, refDigest, arm.depth, got)
@@ -144,11 +144,11 @@ func TestSecurityTopLevelElisionKeepsContents8873(t *testing.T) {
 // The zone-pair must not arrive EMPTY. A fold that re-attaches the braced body
 // as a sibling of the deepest packed node yields a pair that exists with no
 // policies in it — which renders as configured and is worse than absent.
-func TestZonePairIsNotEmptyAtDepth3_8873(t *testing.T) {
+func TestZonePairIsNotEmptyAtDepth3_8875(t *testing.T) {
 	text := "security { zones { security-zone trust { } security-zone untrust { } } } " +
 		"security policies from-zone trust to-zone untrust { " +
 		"policy p1 { match { source-address any; destination-address any; application any; } then { permit; } } }"
-	cfg, _ := compileSecurity8873(t, text)
+	cfg, _ := compileSecurity8875(t, text)
 	if len(cfg.Security.Policies) != 1 {
 		t.Fatalf("got %d zone pairs, want 1", len(cfg.Security.Policies))
 	}

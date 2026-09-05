@@ -107074,4 +107074,4 @@ prose edit above them added. No diff falls in the new test body.
 
 - **Timestamp**: 2026-09-05
   **Action**: Admit the top-level security containers (policies, screen, zones) so the fully-elided spelling keeps its contents — one missing admission was dropping the entire zone-pair policy set, the global policies, the zones and the screen profiles
-  **File(s)**: pkg/config/compact_normalize_8662.go, pkg/config/security_toplevel_elision_8873_test.go, pkg/config/compact_scope_blind_pairs_8852_test.go
+  **File(s)**: pkg/config/compact_normalize_8662.go, pkg/config/security_toplevel_elision_8875_test.go, pkg/config/compact_scope_blind_pairs_8852_test.go

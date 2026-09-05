@@ -1204,7 +1204,7 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		"routing-options static",
 		"security alg",
 		"security flow",
-		// issue 8873: the TOP-LEVEL security containers. `security` itself had
+		// issue 8875: the TOP-LEVEL security containers. `security` itself had
 		// no admitted children at all, while the children's own pairs
 		// (`policies from-zone`, `policies global`, `zones security-zone`) were
 		// admitted -- which is exactly why the braced and once-elided spellings
