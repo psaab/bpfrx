@@ -255,7 +255,30 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		"isis authentication-key",
 		"neighbor authentication-key",
 		"rip authentication-key",
-		"vrrp-group authentication-key",
+		// REMOVED BY #8763: `vrrp-group authentication-key` and
+		// `vrrp-group authentication-type`. Both sit ONLY below a `family`, so
+		// before the traversal fix above they folded nothing; and once it
+		// reaches them the fold moves the whole remaining key run into one
+		// child, so `vrrp-group 1 authentication-key <s> track-interface X
+		// track-interface Y` puts both track-interfaces inside the
+		// authentication-key node and validateVRRPTrackInterfaceAST stops
+		// seeing the duplicate (the two #5195 secret-leak cells red).
+		//
+		// Removing them costs nothing, and that is MEASURED rather than
+		// inferred from "folds nothing today". In every spelling the pass can
+		// reach, the value is refused at commit either way:
+		//
+		//	family { inet { address a { vrrp-group 1 authentication-key s; } } }
+		//	    folds=1, pass OFF and ON compile IDENTICALLY -- both REJECTED:
+		//	    "VRRP authentication-key is configured but NOT enforced -- the
+		//	     dataplane is RFC 5798 VRRPv3, which removed authentication"
+		//
+		// So the fold was never delivering anything here and the #5195 reds
+		// would be pure loss. Re-admitting them needs `vrrp-group` to opt into
+		// packedStatements, which in turn needs #8768's registry keyed by
+		// schema PATH -- `vrrpGroupSchemaNode(false)` and `(true)` are two
+		// nodes and the name-keyed registry refuses the opt-in.
+		//
 		// #8689: the security match family, formerly `containerKeyword ==
 		// "match"` unqualified. `match rpm-probe` is the ip-monitoring site
 		// noted above.
@@ -286,7 +309,6 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		"root-authentication ssh-rsa",
 		"policy pre-shared-key",
 		"vpn pre-shared-key",
-		"vrrp-group authentication-type",
 		"wireguard private-key",
 		// #8708: `key`, already container-scoped, restated in the same form.
 		"tunnel key",
@@ -1293,23 +1315,55 @@ func normalizeCompactNodes(nodes []*Node, schema *schemaNode, inScope func(conta
 		}
 		// The node's own identity is its keyword plus its declared args.
 		identity := 1 + child.args
+		// #8763: a compoundKey container carries its second key as an
+		// enumerated CHILD rather than an `args` token, so `identity` does not
+		// count it. `family inet` is one node whose schema is
+		// family.children["inet"]; without this the recursion below would hand
+		// that node's children the schema for `family`, advancing the schema
+		// one level where the node advanced two, and NOTHING beneath a braced
+		// `family inet { … }` would ever be visited -- not "declined to fold",
+		// never asked.
+		//
+		// It bites exactly where the second token is a child keyword. `unit 0`
+		// is unaffected because there the second token is an instance arg and
+		// `args` is precisely what `identity` counts. Every compoundKey
+		// declaration in the schema is named `family`
+		// (TestCompoundKeyNodesAreExactlyTheFamilyNodes8763), so this is a
+		// bounded surface rather than an open-ended one.
+		childSub := child
+		if child.compoundKey && len(node.Keys) > identity {
+			if sub, ok := child.children[node.Keys[identity]]; ok && sub != nil {
+				identity++
+				childSub = sub
+			}
+		}
 		if len(node.Keys) > identity && len(node.Children) == 0 {
 			head := node.Keys[identity]
 			// The tail only reads as an elided BODY if its first token names a
 			// child of this container. Otherwise it is this node's own
 			// multi-value payload (a bracketed list, a multi: true leaf) and
 			// must be left alone.
-			if _, isBody := child.children[head]; isBody && inScope(kw, head) {
+			// The container the scope predicate is asked about is the one that
+			// actually HOLDS the head. After a compoundKey descent that is the
+			// sub-key (`inet`), not the compound keyword (`family`) -- which is
+			// the same pair production already asks for the separately-braced
+			// spelling `family { inet filter …; }`, so the two spellings resolve
+			// to one scope entry instead of two.
+			ckw := kw
+			if childSub != child && identity >= 2 {
+				ckw = node.Keys[identity-1]
+			}
+			if _, isBody := childSub.children[head]; isBody && inScope(ckw, head) {
 				tail := append([]string(nil), node.Keys[identity:]...)
 				node.Keys = append([]string(nil), node.Keys[:identity]...)
 				node.IsLeaf = false
-				for _, stmt := range splitPackedStatements8768(tail, child) {
+				for _, stmt := range splitPackedStatements8768(tail, childSub) {
 					node.Children = append(node.Children, &Node{Keys: stmt, IsLeaf: true})
 				}
 				n++
 			}
 		}
-		n += normalizeCompactNodes(node.Children, child, inScope)
+		n += normalizeCompactNodes(node.Children, childSub, inScope)
 	}
 	return n
 }
