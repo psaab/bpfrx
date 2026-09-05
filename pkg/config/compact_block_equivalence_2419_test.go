@@ -668,6 +668,86 @@ const (
 	unobservedOther = "registered, but the value did not vary"
 )
 
+// renderInstanceNames fills a container path's INSTANCE-NAME slots from each
+// container's own schema declaration, for FIXTURE TEXT ONLY (#8690).
+//
+// THE CENSUS NAMES EVERY INSTANCE "xpfarg", whatever the container declares its
+// name must look like. `unit xpfarg` is not a unit number, so the compiler
+// drops the whole unit — and then the leaf under test, its siblings and any
+// scaffold inside it are all invisible, which the census records as "leaf value
+// not observable". The verdict is about the site MODEL, not the leaf.
+//
+// Measured: 69 of the 236 not-observable sites become observable with
+// schema-derived instance names, and 24 of those are DIVERGENT — sites this
+// census could not see at all. They include
+// `interfaces <if> unit <u> family inet filter input`, where the brace-elided
+// spelling binds NO FILTER, commits clean on the strict path, and emits fewer
+// warnings than the correct spelling because there is no binding left to warn
+// about.
+//
+// The site KEY keeps "xpfarg". The key is an identity — the inventory, every
+// per-site verdict and three lanes' family lists are keyed on it — and
+// re-rendering identities to fix a fixture would rewrite the whole inventory
+// for a reason that has nothing to do with what it records.
+//
+// A slot is only filled when the container's own declaration yields something
+// OTHER than the generic identifier, so a container that declares nothing keeps
+// the old name and the old behaviour.
+func renderInstanceNames(container []string) []string {
+	n := setSchema
+	out := make([]string, 0, len(container))
+	for _, elem := range container {
+		fields := strings.Fields(elem)
+		if len(fields) == 0 {
+			return container
+		}
+		name := fields[0]
+		node := n.children[name]
+		if name == "xpfname" || node == nil {
+			node = n.wildcard
+		}
+		if node == nil {
+			return container // cannot resolve; leave the path exactly as it was
+		}
+		rendered := name
+		for range fields[1:] {
+			v := "xpfarg"
+			if iv, _, ok := synthPair(node); ok && iv != "xpfaaa" {
+				v = iv
+			}
+			rendered += " " + v
+		}
+		out = append(out, rendered)
+		n = node
+	}
+	return out
+}
+
+// renderScaffold rewrites a contextForStanza / preambleFor string so its
+// instance names match the rendered fixture (#8690).
+//
+// The scaffolds are written against the CANONICAL path and say things like
+// `pool xpfarg { address 203.0.113.0/24; }`. Once the fixture renders that pool
+// as `pool xpfpoola`, the scaffold names a DIFFERENT pool and its content lands
+// on the wrong object — the site under test goes back to uncompilable, which is
+// how TestTheScaffoldedFamiliesAreRuled_8690 caught this.
+//
+// The substitution is element-wise ("pool xpfarg" -> "pool xpfpoola"), not a
+// bare "xpfarg" -> name replacement: a scaffold may mention several containers
+// and only the matching one may move.
+func renderScaffold(text string, canonical, rendered []string) string {
+	if text == "" {
+		return text
+	}
+	for i := range canonical {
+		if i >= len(rendered) || canonical[i] == rendered[i] {
+			continue
+		}
+		text = strings.ReplaceAll(text, canonical[i], rendered[i])
+	}
+	return text
+}
+
 func runCompactBlockCensus(t *testing.T) censusResult {
 	t.Helper()
 	res := censusResult{
@@ -688,10 +768,18 @@ func runCompactBlockCensus(t *testing.T) censusResult {
 			res.state[siteKey] = "skipped: no two distinct synthesizable values"
 			continue
 		}
+		// contextForStanza / preambleFor are keyed on the CANONICAL path (the
+		// one carrying "xpfarg"), so existing scaffold entries keep matching;
+		// only the fixture TEXT uses the rendered names.
 		parent := s.container[:len(s.container)-1]
 		stanza := s.container[len(s.container)-1]
 		ctx := contextForStanza(parent, stanza)
 		pre := preambleFor(parent, stanza)
+		rendered := renderInstanceNames(s.container)
+		ctx = renderScaffold(ctx, s.container, rendered)
+		pre = renderScaffold(pre, s.container, rendered)
+		parent = rendered[:len(rendered)-1]
+		stanza = rendered[len(rendered)-1]
 		blockV1 := pre + nest(parent, ctx+stanza+" { "+s.leaf+" "+v1+"; }")
 		blockV2 := pre + nest(parent, ctx+stanza+" { "+s.leaf+" "+v2+"; }")
 		compact := pre + nest(parent, ctx+stanza+" "+s.leaf+" "+v1+";")

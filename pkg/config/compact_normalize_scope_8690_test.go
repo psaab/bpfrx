@@ -2,9 +2,11 @@ package config
 
 import (
 	"fmt"
-	"os"
-	"regexp"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -1329,43 +1331,79 @@ func TestTheGateCountsTheSurvivingCriterion8690(t *testing.T) {
 // resolved one also reds, so the list shrinks as families are tidied and cannot
 // outlive its reason.
 func TestNoPairIsAdmittedByTwoFamilySwitches8690(t *testing.T) {
-	src, err := os.ReadFile("compact_normalize_8662.go")
-	if err != nil {
-		t.Fatalf("read predicate source: %v", err)
-	}
-	// TWO patterns, because gofmt puts the FIRST pair of a `case` clause on the
-	// `case` line itself and the rest on their own indented lines. A single
-	// `^\t\t"..."` pattern therefore misses exactly one pair per clause — and
-	// this cell shipped with that gap, blind to 11 pairs and to 2 genuine
-	// duplicates among them (`address-book address-set` and `dataplane
-	// control-socket`), each of which is precisely the silent-non-exclusion the
-	// cell exists to catch.
+	// PARSED, NOT PATTERN-MATCHED. This walked the source with a regex and read
+	// 521 of 548 case strings — a plausible-looking number with no sign that a
+	// whole SHAPE of entry was invisible.
 	//
-	// The gap was invisible in the obvious direction: the cell reported 52
-	// duplicates and 52 is a plausible-looking number, so nothing about its
-	// output suggested it was reading 521 of 532 pairs. Only counting the
-	// SOURCE's pairs independently and comparing showed it.
-	indented := regexp.MustCompile(`(?m)^\t\t"([a-z][^"]*)",?$`)
-	firstOfClause := regexp.MustCompile(`(?m)^\tcase "([a-z][^"]*)",?$`)
+	// gofmt writes a multi-entry clause as `case "a",` / `\t\t"b",` / `\t\t"c":`,
+	// so the FIRST pair sits on the `case` line and the LAST ends in a colon.
+	// A pattern anchored to `\t\t"..."` with an optional comma missed both ends
+	// of every clause: 11 first-pairs, 15 last-pairs, and 1 single-entry clause.
+	// Two of the 27 were real cross-switch duplicates the cell exists to catch.
+	//
+	// A second regex for the case-line shape was landed first (it closed the 11
+	// and left the 16) and this supersedes it: two patterns is still a set of
+	// spellings somebody enumerated by looking. The parser
+	// reads every shape by construction, and a future gofmt change cannot move
+	// a case expression out of its reach.
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "compact_normalize_8662.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse predicate source: %v", err)
+	}
 	counts := map[string]int{}
-	for _, re := range []*regexp.Regexp{indented, firstOfClause} {
-		for _, m := range re.FindAllStringSubmatch(string(src), -1) {
-			counts[m[1]]++
+	total := 0
+	ast.Inspect(file, func(n ast.Node) bool {
+		cc, ok := n.(*ast.CaseClause)
+		if !ok {
+			return true
+		}
+		for _, expr := range cc.List {
+			lit, ok := expr.(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING {
+				continue
+			}
+			v, err := strconv.Unquote(lit.Value)
+			if err != nil || v == "" || !strings.Contains(v, " ") {
+				continue // not a "container head" pair
+			}
+			total++
+			counts[v]++
+		}
+		return true
+	})
+
+	// REACH CONTROL, not merely a non-emptiness check. The version this replaced
+	// had `len(counts) == 0` and it could never have fired: a pattern matching
+	// 500+ entries masks one matching zero, so the cell reported a healthy total
+	// while a whole shape was invisible. A degeneracy check on the TOTAL cannot
+	// see a gap in the SHAPES.
+	//
+	// So the control is specific: two pairs that are only reachable through the
+	// `case`-line shape must be present. They were the two real duplicates the
+	// regex version missed, which makes them evidence rather than decoration.
+	for _, must := range []string{"address-book address-set", "dataplane control-socket"} {
+		if counts[must] == 0 {
+			t.Fatalf("the walk did not find %q, which is written as the FIRST pair "+
+				"of its case clause and is therefore only reachable if case-line "+
+				"expressions are being read. Its absence means the walk has lost "+
+				"reach over a shape again — the exact defect this replaced (#8690)", must)
 		}
 	}
-	if len(counts) == 0 {
-		t.Fatal("no case strings found in compact_normalize_8662.go — this cell " +
-			"scans source text, so a formatting change can make it silently " +
-			"measure nothing (#8690)")
-	}
-	// Positive control for the second pattern specifically. The first pattern
-	// matching 500+ pairs would mask the second matching zero, which is how the
-	// original gap survived: a healthy-looking total says nothing about whether
-	// every SHAPE of entry is being read.
-	if n := len(firstOfClause.FindAllStringSubmatch(string(src), -1)); n == 0 {
-		t.Fatal("the `case`-line pattern matched nothing, so the first pair of " +
-			"every clause is unread — that is the gap this cell shipped with, " +
-			"and a formatting change can reintroduce it silently (#8690)")
+	// TOTAL-AGAINST-SOURCE control, the shape-independent version of the
+	// pattern-specific one this replaced. That asserted the second REGEX matched
+	// something; with a parser there are no patterns to check, so the equivalent
+	// question is whether the walk read as many pairs as the file contains. A
+	// count well below the source's is a reach gap whatever caused it, including
+	// a shape nobody has thought of.
+	//
+	// The floor is deliberately loose: it catches losing a whole clause shape
+	// (the real defect was 27 of 548) without redding every time a family lands.
+	if total < 400 {
+		t.Fatalf("the walk read only %d case-string pairs from the predicate. "+
+			"The file has held ~550; a number this low means whole clauses are "+
+			"going unread, which is the defect this cell shipped with in regex "+
+			"form (#8690)", total)
 	}
 	var dup []string
 	for pair, n := range counts {
@@ -1383,25 +1421,25 @@ func TestNoPairIsAdmittedByTwoFamilySwitches8690(t *testing.T) {
 			"this list should shrink with it. Prefer resolving the duplicate to "+
 			"adding it here (#8690).", diff)
 	}
-	t.Logf("#8690: %d distinct pairs across the family switches, %d of them listed twice",
-		len(counts), len(dup))
+	// Both totals, deliberately. A future reach gap shows up as a TOTAL that
+	// disagrees with the source rather than as a plausible duplicate count.
+	t.Logf("#8690: %d case-string pairs read from the predicate, %d distinct, %d listed twice",
+		total, len(counts), len(dup))
 }
 
 // knownDuplicatePairs8690 are the pairs currently listed by two family
 // switches. Each is a latent silent-non-exclusion; see the cell above. They are
 // pinned, not endorsed.
 var knownDuplicatePairs8690 = []string{
-	// These two became visible only when the cell learned to read the first
-	// pair of a `case` clause. They are the same hazard as the rest and are
-	// pinned on the same terms.
 	"address-book address-set",
-	"dataplane control-socket",
 	"address-set address",
 	"address-set address-set",
 	"daily start-time",
 	"daily stop-time",
+	"dataplane control-socket",
 	"friday start-time",
 	"friday stop-time",
+	"global policy",
 	"group authentication-key",
 	"group interface",
 	"host-inbound-traffic protocols",
@@ -1420,6 +1458,7 @@ var knownDuplicatePairs8690 = []string{
 	"match source-address",
 	"match source-address-name",
 	"match to-zone",
+	"md5 key",
 	"monday start-time",
 	"monday stop-time",
 	"neighbor authentication-key",
@@ -1431,12 +1470,13 @@ var knownDuplicatePairs8690 = []string{
 	"rip authentication-type",
 	"saturday start-time",
 	"saturday stop-time",
-	"schedulers scheduler",
 	"scheduler start-time",
 	"scheduler stop-time",
+	"schedulers scheduler",
 	"security-zone description",
 	"security-zone interfaces",
 	"security-zone screen",
+	"ssh protocol-version",
 	"sunday start-time",
 	"sunday stop-time",
 	"system domain-name",
@@ -1448,4 +1488,5 @@ var knownDuplicatePairs8690 = []string{
 	"vpn pre-shared-key",
 	"wednesday start-time",
 	"wednesday stop-time",
+	"zones security-zone",
 }
