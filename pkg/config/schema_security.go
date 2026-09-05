@@ -1216,7 +1216,18 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			// #8844 as a separate question from the silent-disable-by-SPELLING
 			// route this fixes.
 			"perfect-forward-secrecy": {desc: "Perfect forward secrecy (keys group<N>)", children: map[string]*schemaNode{
-				"keys": {desc: "Diffie-Hellman group for phase-2 PFS (e.g. group14)", args: 1, placeholder: "<group>", children: nil},
+				// #8845: valueType is REQUIRED for the validator to run. walkSchemaNode
+				// gates on isTypedLeaf() && validator != nil, so a validator on an
+				// untyped leaf is SILENTLY INERT -- it compiles, it reads as wired, and
+				// it never executes. Measured: with the validator alone,
+				// SchemaValidate returned nil for group99 AND nonsense.
+				//
+				// ValidateDHGroup is the SINGLE SOURCE OF TRUTH, shared with the
+				// proposal-level dh-group leaf and with ipsec.formatDHGroup via
+				// config.DHGroupKeyword (#8597). Not a second list.
+				"keys": {desc: "Diffie-Hellman group for phase-2 PFS (e.g. group14)", args: 1, placeholder: "<group>",
+					valueType: ValueDHGroup, valueDesc: "Diffie-Hellman group",
+					valueExamples: []string{"14", "group19"}, validator: ValidateDHGroup, children: nil},
 			}},
 			// multi (#3904): mirror of the IKE proposals leaf — offer every
 			// listed ESP proposal for phase-2 negotiation.
