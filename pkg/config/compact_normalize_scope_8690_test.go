@@ -2,6 +2,8 @@ package config
 
 import (
 	"fmt"
+	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -190,8 +192,11 @@ func TestCompactNormalizeScopePreservesCompiledResult8690(t *testing.T) {
 		// Distinguishing them automatically would need the gates themselves to
 		// declare which kind they are; until then this arm reports and a person
 		// classifies.
-		off := compileStrict8690(t, elidedText, true)
-		on := compileStrict8690(t, elidedText, false)
+		// Routed through gateVerdict8690 so the admission state is printed
+		// beside every per-site verdict this arm produces, and so the helper
+		// is exercised on every run rather than sitting inert for the hand
+		// probes it exists to discipline.
+		off, on, _ := gateVerdict8690(t, siteKey, elidedText)
 		switch {
 		case off != nil && on == nil:
 			disarmed = append(disarmed, siteKey)
@@ -290,7 +295,21 @@ func TestCompactNormalizeScopePreservesCompiledResult8690(t *testing.T) {
 			"as a clean scope. A NEW entry means a widening admitted a site "+
 			"whose reference spelling will not compile in isolation; give it a "+
 			"compilable fixture (a required sibling is usually missing) rather "+
-			"than adding it here. A REMOVED entry means one became examinable "+
+			"than adding it here.\n"+
+			"UNLESS the leaf under test is itself the stanza's VALIDITY "+
+			"CONDITION — then the control cannot be built at all, because any "+
+			"fixture that makes it compile must supply the very value the "+
+			"control exists to omit, and the site needs a hand measurement "+
+			"instead. `services rpm probe <p> test <t> target` is the worked "+
+			"case: the empty control is rejected with \"target is required\". "+
+			"`bgp group <g> neighbor <n> peer-as` and both "+
+			"`three-color-policer <p> {single,two}-rate "+
+			"committed-information-rate` are the same shape.\n"+
+			"This does NOT apply where an ALTERNATIVE leaf satisfies the "+
+			"stanza — `feed-server <s> {url,hostname}` and `device-map "+
+			"interface <i> {pci,mac}` are constructible by supplying the "+
+			"sibling, and the advice above is correct for them.\n"+
+			"A REMOVED entry means one became examinable "+
 			"and the list should shrink (#8690).", diff)
 	}
 	// The bucket is asserted for EQUALITY, not merely reported. lane-8526's
@@ -348,28 +367,41 @@ func TestCompactNormalizeScopePreservesCompiledResult8690(t *testing.T) {
 			"stanza's own validator. Not a defect list; see the note above "+
 			"before treating a change in this number as one.", n)
 	}
-	// How much of the bucket is actually MEASURED. It reached zero unmeasured
-	// entries once; anything above zero is a widening that added an
-	// undecidable site without following the instruction in the message below.
-	// Reported rather than failed, because whether an unmeasured entry may land
-	// at all is a policy call across lanes rather than this cell's to make --
-	// but it is reported, because "recorded" and "measured" were previously
-	// indistinguishable here and that is what let a real disarm sit unnoticed.
-	if unmeasured := 0; true {
-		for _, v := range knownFixtureLimited8690 {
-			if v == notHandMeasured8690 {
-				unmeasured++
-			}
+	// EVERY BUCKET ENTRY MUST CARRY A HAND-MEASURED VERDICT. This is a hard
+	// failure, and it is enforceable only because the backlog was driven to
+	// zero first -- with entries outstanding it would have had to grandfather
+	// them and would have been born weak.
+	//
+	// The reason it is not a reported count: a count starts at zero and grows
+	// one entry at a time, each addition individually defensible, and the whole
+	// history of this bucket is that visible-but-unmeasured reads as clean. A
+	// category that only accumulates stops being a measurement and becomes a
+	// registration. lane-8015 measured three entries here by hand and one was a
+	// would-be gate disarm that no other guard in the tree would have caught.
+	//
+	// The escape hatch is not a threshold, it is a person: write the site out
+	// with a type-valid value and the siblings its validator needs, and record
+	// what you found. That is the same shape as `benign` -- adding an entry is
+	// recording a verdict, never a number going up.
+	var unmeasured []string
+	for site, verdict := range knownFixtureLimited8690 {
+		if verdict == notHandMeasured8690 {
+			unmeasured = append(unmeasured, site)
 		}
-		if unmeasured > 0 {
-			t.Logf("#8690: %d of %d entries in the gate-status-unknown bucket have "+
-				"NOT been hand-measured. This bucket held a real disarm before it "+
-				"was measured out; an entry here is a question, not a verdict.",
-				unmeasured, len(knownFixtureLimited8690))
-		} else {
-			t.Logf("#8690: all %d entries in the gate-status-unknown bucket carry a "+
-				"hand-measured verdict.", len(knownFixtureLimited8690))
-		}
+	}
+	sort.Strings(unmeasured)
+	if len(unmeasured) > 0 {
+		t.Errorf("%d of %d entries in the gate-status-unknown bucket have NO "+
+			"hand-measured verdict: %v.\n"+
+			"An entry here is a QUESTION, not a finding: the census fixture could "+
+			"not decide whether the pass disarms a gate at that site, and arm 2 "+
+			"passing is the absence of evidence rather than evidence. Write the "+
+			"site out with a type-valid value and the siblings its validator "+
+			"needs, compare strict compiles with the pass disabled and enabled, "+
+			"and record what you found. If it is still undecidable, say so and "+
+			"say why -- but check the FIXTURE first, because one that is wrong in "+
+			"a new way reports the same word as a site that genuinely cannot be "+
+			"decided (#8690).", len(unmeasured), len(knownFixtureLimited8690), unmeasured)
 	}
 	if len(fixtureLimited) > 0 {
 		t.Logf("#8690: %d admitted site(s) could not have their gate status "+
@@ -562,6 +594,70 @@ func TestCompactNormalizeDoesNotDisarmTheLoginPackedGate8690(t *testing.T) {
 // the compileOpts seam. It returns the compile error so a caller can compare
 // ACCEPTANCE against REJECTION, which is the distinction the compiled-result
 // comparison cannot make.
+// gateVerdict8690 prints a gate probe's result WITH the admission state of the
+// site it is about, and returns the two errors so a caller can assert on them.
+//
+// #8690: use this rather than a bare pair of compileStrict8690 calls whenever
+// the result will be read by a person. The tense trap caught three of us in one
+// day, and the reason is that a verdict line is IDENTICAL whether the pass was
+// in scope at that site or not:
+//
+//	passOFF=REJECTED passON=accepted
+//
+// With the site admitted that reads "the pass disarms a gate". With the site
+// NOT admitted the same two calls produce the same line and it means nothing of
+// the sort — the pass rewrote no node, so any difference came from elsewhere
+// and the line is evidence about the fixture, not about the pass. The reader
+// supplies the missing half from memory, and memory is what fails across a long
+// session.
+//
+// An author can be ASKED to state the scope, and an author can copy that
+// statement forward from a probe run under different conditions — which is
+// exactly how two fixture-limited sites got reported as live disarms. A PRINTED
+// value cannot be copied forward wrongly, because the instrument recomputes it
+// at the moment it prints.
+//
+// `touched` is the measured admission state and the one worth printing: the
+// number of nodes the pass actually rewrote in THIS text. It is strictly
+// stronger than the compactNormalizeInScope predicate, because a pair can be
+// admitted and still touch nothing here (the fold may simply not be present in
+// the fixture), and a verdict about a text the pass never rewrote is not a
+// verdict about the pass. touched=0 therefore voids the comparison below it,
+// whatever the predicate says.
+//
+// Pass the (container, head) pair as the optional trailing arguments to also
+// print the predicate. It is worth doing when touched=0 and you need to know
+// WHICH of the two reasons applies — pair not admitted, or admitted with no
+// fold present.
+func gateVerdict8690(t *testing.T, label, text string, pair ...string) (off, on error, touched int) {
+	t.Helper()
+	off = compileStrict8690(t, text, true)
+	on = compileStrict8690(t, text, false)
+
+	if tree, perrs := NewParser(text).Parse(); len(perrs) == 0 && tree != nil {
+		touched = normalizeCompactStanzas(tree)
+	}
+	scope := ""
+	if len(pair) == 2 {
+		scope = fmt.Sprintf(" admitted=%v", compactNormalizeInScope(pair[0], pair[1]))
+	}
+	render := func(e error) string {
+		if e == nil {
+			return "accepted"
+		}
+		return "REJECTED"
+	}
+	// The state is printed on the SAME line as the verdict, deliberately. A
+	// separate line is one a reader can skip and a quoter can drop.
+	note := ""
+	if touched == 0 {
+		note = "  [touched=0: the pass rewrote nothing here — this is NOT a verdict about the pass]"
+	}
+	t.Logf("%-40s touched=%d%s  passOFF=%-8s passON=%-8s%s",
+		label, touched, scope, render(off), render(on), note)
+	return off, on, touched
+}
+
 func compileStrict8690(t *testing.T, text string, skipNormalize bool) error {
 	t.Helper()
 	tree, perrs := NewParser(text).Parse()
@@ -1069,3 +1165,287 @@ const policyMatchNoDisarm8690 = "HAND-MEASURED: NOT A DISARM, and it cannot " +
 	"nonetheless demonstrably working, visible in the error shrinking: without " +
 	"it the gate reports three missing criteria, with it two. The surviving " +
 	"criterion is the one that was folded."
+
+// TestGateVerdictReportsMeasuredAdmission8690 is the control on the control.
+//
+// gateVerdict8690 exists so no gate verdict can be read without its admission
+// state attached. That only works if the state is MEASURED. A helper that
+// hard-coded touched=1, or that computed it from a stale predicate, would print
+// a confident line on every call and be indistinguishable from a correct one —
+// the same shape of vacuous green the seamObserved guard was added to catch one
+// arm over.
+//
+// So: drive it from both sides. A site the pass rewrites must report touched>0,
+// and a site it leaves alone must report touched=0. A constant fails one of
+// them whichever constant it is.
+func TestGateVerdictReportsMeasuredAdmission8690(t *testing.T) {
+	// NEGATIVE control: `system host-name` is a plain leaf, not a packed
+	// hierarchical tail, so the pass has nothing to fold and must touch
+	// nothing. If this ever reports touched>0 the helper is not measuring.
+	untouched := "system { host-name xpfhost; }"
+	if tree, perrs := NewParser(untouched).Parse(); len(perrs) == 0 && tree != nil {
+		if n := normalizeCompactStanzas(tree); n != 0 {
+			t.Fatalf("negative control is not untouched: the pass rewrote %d node(s) in %q, "+
+				"so it can no longer distinguish a measured touched= from a constant "+
+				"(pick a different control) (#8690)", n, untouched)
+		}
+	} else {
+		t.Fatalf("negative control does not parse: %q (#8690)", untouched)
+	}
+
+	// POSITIVE control: a genuinely packed tail at an ADMITTED site. Drawn
+	// from the pass's own scope so the two controls differ in exactly the
+	// property under test.
+	touchedText := "applications { application xpfarg protocol tcp; }"
+	tree, perrs := NewParser(touchedText).Parse()
+	if len(perrs) > 0 || tree == nil {
+		t.Fatalf("positive control does not parse: %q (#8690)", touchedText)
+	}
+	if n := normalizeCompactStanzas(tree); n == 0 {
+		t.Fatalf("positive control is not touched: the pass rewrote nothing in %q, so a "+
+			"helper hard-coding touched=0 would pass this cell. The site was admitted "+
+			"when this control was written; if the scope narrowed, move the control to a "+
+			"site still in scope rather than deleting it (#8690)", touchedText)
+	}
+
+	// And now the part that actually binds the HELPER. The two checks above
+	// establish that the two fixtures genuinely differ in whether the pass
+	// touches them; these assert that gateVerdict8690 REPORTS that difference.
+	//
+	// It has to observe the helper's own return value, not a second
+	// computation of the same thing. An earlier draft of this cell re-derived
+	// the count beside the helper and compared the two derivations — which
+	// agree with each other by construction, and would both stay green if the
+	// helper hard-coded the value it prints. That is the exact vacuity this
+	// cell was written to prevent, reproduced inside it.
+	if _, _, got := gateVerdict8690(t, "control/untouched", untouched); got != 0 {
+		t.Errorf("gateVerdict8690 reported touched=%d for a site the pass leaves alone "+
+			"(want 0); the admission state printed beside every verdict is not measured, "+
+			"so a reader cannot trust it to void a comparison (#8690)", got)
+	}
+	if _, _, got := gateVerdict8690(t, "control/touched", touchedText); got == 0 {
+		t.Errorf("gateVerdict8690 reported touched=0 for a site the pass rewrites; every " +
+			"verdict line would carry the 'NOT a verdict about the pass' disclaimer and " +
+			"readers would learn to ignore it (#8690)")
+	}
+}
+
+// #8690: the normalizer preserves the folded tail, witnessed by a gate that was
+// not built to witness anything.
+//
+// Most evidence for this pass is an equality: elided-with-pass compiles to what
+// braced compiles to. That is sound, but both sides are produced by the same
+// compiler and an equality can hold because two things are equally wrong.
+//
+// The #3044 policy gate gives an independent reading. It requires all three of
+// source-address, destination-address and application, and NAMES THE ONES IT
+// CANNOT FIND. The compact spelling can carry exactly one criterion, so the
+// policy is refused either way — but the refusal COUNTS:
+//
+//	`policies global policy p1 match source-address any;`
+//	  pass DISABLED -> missing "source-address", "destination-address", "application"
+//	  pass ENABLED  -> missing "destination-address", "application"
+//
+// The criterion that stops being missing is the one that was folded. That is a
+// direct observation of the tail surviving, from an instrument with no stake in
+// the question and no knowledge that it is being used as one — which is a
+// different kind of evidence from an assertion this lane wrote about its own
+// pass.
+//
+// It also holds on sites that can NEVER be disarms, since neither spelling is
+// ever accepted, so the reading is not entangled with the acceptance flip.
+func TestTheGateCountsTheSurvivingCriterion8690(t *testing.T) {
+	const elided = `security {
+  zones { security-zone trust { host-inbound-traffic { system-services ping; } } }
+  policies { global { policy p1 { match source-address any; then { permit; } } } }
+}`
+	compile := func(skipPass bool) string {
+		tree, perrs := NewParser(elided).Parse()
+		if len(perrs) > 0 {
+			t.Fatalf("parse: %v", perrs)
+		}
+		_, err := compileConfigWithOpts(tree, compileOpts{skipCompactNormalize: skipPass})
+		if err == nil {
+			return ""
+		}
+		return err.Error()
+	}
+	without, with := compile(true), compile(false)
+	if without == "" || with == "" {
+		t.Fatalf("both spellings must be REJECTED for this reading to mean "+
+			"anything — the evidence is which criteria the gate names, not "+
+			"whether it fires (without=%q with=%q)", without, with)
+	}
+
+	// The folded criterion must be named as missing WITHOUT the pass and not
+	// named WITH it. Asserted as a difference between the two readings rather
+	// than against literal error text, so a reworded #3044 message does not
+	// red this for the wrong reason.
+	const folded = `"source-address"`
+	if !strings.Contains(without, folded) {
+		t.Errorf("with the pass DISABLED the gate does not report %s as missing, "+
+			"so the fixture is not exercising the drop this cell is built on. "+
+			"Either the elided spelling stopped dropping the criterion or #3044 "+
+			"stopped naming it: %s", folded, without)
+	}
+	if strings.Contains(with, folded) {
+		t.Errorf("with the pass ENABLED the gate STILL reports %s as missing, so "+
+			"the folded criterion did not survive normalization. The pass is not "+
+			"preserving the tail at this site (#8690): %s", folded, with)
+	}
+	if without == with {
+		t.Error("the gate reports the SAME missing criteria with and without the " +
+			"pass, so this cell is observing nothing. It reads the DIFFERENCE " +
+			"between the two, and an identical pair means either the seam stopped " +
+			"working or the site left the normalizer's scope (#8690)")
+	}
+}
+
+// #8690: no (container, head) pair may be admitted by more than one family
+// switch, and this is a SAFETY property rather than tidiness.
+//
+// compactNormalizeInScope is a series of per-family `switch containerKeyword +
+// " " + head` blocks. Nothing stops two families listing the same pair, and 52
+// currently do.
+//
+// THE COMPILER ALREADY COVERS THE EASY HALF, which is why this cell is scoped
+// the way it is: a duplicate case WITHIN one switch is a build error ("duplicate
+// case ... in expression switch"). Only the cross-switch case is invisible, and
+// that is exactly the case that arises here, because each family was added as
+// its own switch by a different lane. So this cell is not re-checking something
+// the toolchain does; it covers the half the toolchain cannot see. Each duplicate is harmless while the answer is "admit" — but
+// the moment somebody needs to REMOVE a pair, because a measurement showed it
+// disarms a gate or truncates a read tail, they delete it from the family they
+// are working in and the OTHER switch still returns true. The exclusion looks
+// applied, the diff looks right, and the site is still normalized.
+//
+// That is not hypothetical: a mutation that deleted `"match source-address"`
+// from one switch left the pass admitting it from the other, and the mutation
+// read as a clean escape rather than as an incomplete edit.
+//
+// The existing 52 are PINNED rather than red, because they were introduced
+// across several lanes' landed families and redding them would block work for a
+// hazard this assertion exists to stop growing. A new duplicate reds; a
+// resolved one also reds, so the list shrinks as families are tidied and cannot
+// outlive its reason.
+func TestNoPairIsAdmittedByTwoFamilySwitches8690(t *testing.T) {
+	src, err := os.ReadFile("compact_normalize_8662.go")
+	if err != nil {
+		t.Fatalf("read predicate source: %v", err)
+	}
+	// TWO patterns, because gofmt puts the FIRST pair of a `case` clause on the
+	// `case` line itself and the rest on their own indented lines. A single
+	// `^\t\t"..."` pattern therefore misses exactly one pair per clause — and
+	// this cell shipped with that gap, blind to 11 pairs and to 2 genuine
+	// duplicates among them (`address-book address-set` and `dataplane
+	// control-socket`), each of which is precisely the silent-non-exclusion the
+	// cell exists to catch.
+	//
+	// The gap was invisible in the obvious direction: the cell reported 52
+	// duplicates and 52 is a plausible-looking number, so nothing about its
+	// output suggested it was reading 521 of 532 pairs. Only counting the
+	// SOURCE's pairs independently and comparing showed it.
+	indented := regexp.MustCompile(`(?m)^\t\t"([a-z][^"]*)",?$`)
+	firstOfClause := regexp.MustCompile(`(?m)^\tcase "([a-z][^"]*)",?$`)
+	counts := map[string]int{}
+	for _, re := range []*regexp.Regexp{indented, firstOfClause} {
+		for _, m := range re.FindAllStringSubmatch(string(src), -1) {
+			counts[m[1]]++
+		}
+	}
+	if len(counts) == 0 {
+		t.Fatal("no case strings found in compact_normalize_8662.go — this cell " +
+			"scans source text, so a formatting change can make it silently " +
+			"measure nothing (#8690)")
+	}
+	// Positive control for the second pattern specifically. The first pattern
+	// matching 500+ pairs would mask the second matching zero, which is how the
+	// original gap survived: a healthy-looking total says nothing about whether
+	// every SHAPE of entry is being read.
+	if n := len(firstOfClause.FindAllStringSubmatch(string(src), -1)); n == 0 {
+		t.Fatal("the `case`-line pattern matched nothing, so the first pair of " +
+			"every clause is unread — that is the gap this cell shipped with, " +
+			"and a formatting change can reintroduce it silently (#8690)")
+	}
+	var dup []string
+	for pair, n := range counts {
+		if n > 1 {
+			dup = append(dup, pair)
+		}
+	}
+	sort.Strings(dup)
+	if diff := diffSiteSets8690(dup, knownDuplicatePairs8690); diff != "" {
+		t.Errorf("the set of (container, head) pairs listed by MORE THAN ONE "+
+			"family switch has changed:\n%s\n"+
+			"A NEW entry means two families now admit the same pair, and removing "+
+			"it from one will not remove it from the scope — an exclusion that "+
+			"silently does not exclude. A REMOVED entry means one was tidied and "+
+			"this list should shrink with it. Prefer resolving the duplicate to "+
+			"adding it here (#8690).", diff)
+	}
+	t.Logf("#8690: %d distinct pairs across the family switches, %d of them listed twice",
+		len(counts), len(dup))
+}
+
+// knownDuplicatePairs8690 are the pairs currently listed by two family
+// switches. Each is a latent silent-non-exclusion; see the cell above. They are
+// pinned, not endorsed.
+var knownDuplicatePairs8690 = []string{
+	// These two became visible only when the cell learned to read the first
+	// pair of a `case` clause. They are the same hazard as the rest and are
+	// pinned on the same terms.
+	"address-book address-set",
+	"dataplane control-socket",
+	"address-set address",
+	"address-set address-set",
+	"daily start-time",
+	"daily stop-time",
+	"friday start-time",
+	"friday stop-time",
+	"group authentication-key",
+	"group interface",
+	"host-inbound-traffic protocols",
+	"host-inbound-traffic system-services",
+	"interface authentication-key",
+	"interface authentication-type",
+	"isis authentication-key",
+	"isis authentication-type",
+	"manual authentication-algorithm",
+	"match application",
+	"match destination-address",
+	"match destination-address-name",
+	"match destination-port",
+	"match from-zone",
+	"match protocol",
+	"match source-address",
+	"match source-address-name",
+	"match to-zone",
+	"monday start-time",
+	"monday stop-time",
+	"neighbor authentication-key",
+	"policies default-policy-log",
+	"policy description",
+	"proposal authentication-algorithm",
+	"proposal authentication-method",
+	"rip authentication-key",
+	"rip authentication-type",
+	"saturday start-time",
+	"saturday stop-time",
+	"schedulers scheduler",
+	"scheduler start-time",
+	"scheduler stop-time",
+	"security-zone description",
+	"security-zone interfaces",
+	"security-zone screen",
+	"sunday start-time",
+	"sunday stop-time",
+	"system domain-name",
+	"then log",
+	"thursday start-time",
+	"thursday stop-time",
+	"tuesday start-time",
+	"tuesday stop-time",
+	"vpn pre-shared-key",
+	"wednesday start-time",
+	"wednesday stop-time",
+}
