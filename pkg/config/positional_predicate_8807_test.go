@@ -1,0 +1,437 @@
+package config
+
+import (
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"testing"
+)
+
+// #8807, the POSITIONAL predicate: a head the compiler READS at container P
+// that the schema does not declare AT P, while declaring it somewhere else.
+//
+// That last clause is the whole point. A head declared NOWHERE is #8787's
+// predicate B and was already enumerated by it. A head declared somewhere but
+// missing at the path the compiler reads it is what every keyword-anywhere
+// check passes silently -- and it is the #8800 shape, where `address` was
+// unread-at-path under `nat source pool` while declared under `proxy-arp
+// interface` and others. #8825 was found by this predicate.
+//
+// WHAT IT CANNOT SEE, repeated in the failure text because a landed census
+// guard reads as coverage:
+//
+//   CONTAINER RECOVERY IS PARTIAL. A site is localised only when its immediate
+//   enclosing range iterates the DIRECT children of a FindChildren("X") loop
+//   variable. Roughly a third of clauses qualify; the rest are invisible, not
+//   clean.
+//
+//   CONTAINERS ARE MATCHED BY NAME, NOT PATH. Two schema nodes sharing a
+//   container name are pooled, so a head declared under either satisfies both.
+//   `pool` happens to be unambiguous; `family` and `group` are not.
+//
+//   IT IS AN EXISTENCE PREDICATE ONLY. It says nothing about arity, and
+//   nothing about whether a declared-and-read head is actually HELD by a
+//   struct field -- that is #8785's shape and it defeated predicate C five
+//   times.
+
+// rangeInfo8807 is one range statement: the FindChildren container it iterates
+// (empty if none) and its value variable.
+type rangeInfo8807 struct {
+	node *ast.RangeStmt
+	fc   string
+	val  string
+}
+
+type posSite8807 struct {
+	container string
+	head      string
+	file      string
+}
+
+// positionalSites8807 collects every case clause of every switch whose tag is a
+// call to .Name() -- i.e. dispatching on a config node's keyword rather than on
+// a value.
+//
+// It deliberately does NOT reuse the arity census's collector: that one records
+// only clauses containing a constant Keys[i], which is the arity-shaped subset.
+// The #8800 site reads `prop.Keys[1:]`, a SLICE, so the arity collector never
+// saw it and the first version of this predicate FAILED its own #8800 control
+// while looking like it worked.
+func positionalSites8807(t *testing.T) []posSite8807 {
+	t.Helper()
+	var out []posSite8807
+	fset := token.NewFileSet()
+	files, err := filepath.Glob("*.go")
+	if err != nil || len(files) == 0 {
+		t.Fatalf("no compiler sources found (glob err %v): this cell measures "+
+			"nothing if it cannot read them, which is indistinguishable from a "+
+			"clean result", err)
+	}
+	parsed := 0
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") || strings.HasPrefix(f, "schema") {
+			continue
+		}
+		src, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		af, err := parser.ParseFile(fset, f, src, 0)
+		if err != nil {
+			continue
+		}
+		parsed++
+
+		// Index every range statement with the FindChildren container it
+		// iterates (if any) and its value variable.
+		var ranges []rangeInfo8807
+		ast.Inspect(af, func(nd ast.Node) bool {
+			rs, ok := nd.(*ast.RangeStmt)
+			if !ok {
+				return true
+			}
+			var fc string
+			ast.Inspect(rs.X, func(m ast.Node) bool {
+				ce, ok := m.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				se, ok := ce.Fun.(*ast.SelectorExpr)
+				if !ok || se.Sel.Name != "FindChildren" || len(ce.Args) != 1 {
+					return true
+				}
+				if bl, ok := ce.Args[0].(*ast.BasicLit); ok && bl.Kind == token.STRING {
+					if v, err := strconv.Unquote(bl.Value); err == nil {
+						fc = v
+					}
+				}
+				return true
+			})
+			val := ""
+			if id, ok := rs.Value.(*ast.Ident); ok {
+				val = id.Name
+			}
+			ranges = append(ranges, rangeInfo8807{rs, fc, val})
+			return true
+		})
+
+		ast.Inspect(af, func(nd ast.Node) bool {
+			sw, ok := nd.(*ast.SwitchStmt)
+			if !ok || sw.Tag == nil {
+				return true
+			}
+			ce, ok := sw.Tag.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			if se, ok := ce.Fun.(*ast.SelectorExpr); !ok || se.Sel.Name != "Name" {
+				return true
+			}
+			cont := containerForSwitch8807(ranges, sw)
+			for _, st := range sw.Body.List {
+				cc, ok := st.(*ast.CaseClause)
+				if !ok {
+					continue
+				}
+				for _, e := range cc.List {
+					bl, ok := e.(*ast.BasicLit)
+					if !ok || bl.Kind != token.STRING {
+						continue
+					}
+					if v, err := strconv.Unquote(bl.Value); err == nil && v != "" {
+						out = append(out, posSite8807{cont, v, f})
+					}
+				}
+			}
+			return true
+		})
+	}
+	if parsed < 50 {
+		t.Fatalf("only %d compiler files parsed: too few for this census to mean "+
+			"anything, and a shrinking corpus makes the predicate go quiet, which "+
+			"looks identical to a clean result", parsed)
+	}
+	return out
+}
+
+// containerForSwitch8807 requires the switch's IMMEDIATE enclosing range to
+// iterate the DIRECT children of a FindChildren loop variable. Accepting the
+// nearest enclosing FindChildren instead names an ANCESTOR whenever the switch
+// operates on a deeper node, which produced 104 hits with obvious noise
+// (`ids-option / ping-death`) before this was tightened to 5.
+func containerForSwitch8807(ranges []rangeInfo8807, sw *ast.SwitchStmt) string {
+	var imm *rangeInfo8807
+	for i := range ranges {
+		r := &ranges[i]
+		if r.node.Body == nil || r.node.Body.Pos() > sw.Pos() || r.node.Body.End() < sw.End() {
+			continue
+		}
+		if imm == nil || r.node.Body.Pos() > imm.node.Body.Pos() {
+			imm = r
+		}
+	}
+	if imm == nil {
+		return ""
+	}
+	// `range <v>.Children` or `range <v>.node.Children`
+	base := ""
+	if sel, ok := imm.node.X.(*ast.SelectorExpr); ok && sel.Sel.Name == "Children" {
+		switch b := sel.X.(type) {
+		case *ast.Ident:
+			base = b.Name
+		case *ast.SelectorExpr:
+			if id, ok := b.X.(*ast.Ident); ok {
+				base = id.Name
+			}
+		}
+	}
+	if base == "" {
+		return imm.fc // the range itself is the FindChildren loop
+	}
+	for i := range ranges {
+		r := &ranges[i]
+		if r.fc == "" || r.val != base {
+			continue
+		}
+		if r.node.Body != nil && r.node.Body.Pos() <= sw.Pos() && r.node.Body.End() >= sw.End() {
+			return r.fc
+		}
+	}
+	return ""
+}
+
+// containerDeclares8807 maps a schema node NAME to the set of child keywords
+// declared under any node of that name.
+//
+// seen is keyed by (node, NAME): a node reached under two different container
+// names must record its children under BOTH. Keying on the node alone made
+// `application-set` report zero children and produced three false hits.
+func containerDeclares8807() map[string]map[string]bool {
+	out := map[string]map[string]bool{}
+	type nk struct {
+		n    *schemaNode
+		name string
+	}
+	seen := map[nk]bool{}
+	var walk func(n *schemaNode, name string)
+	walk = func(n *schemaNode, name string) {
+		if n == nil || seen[nk{n, name}] {
+			return
+		}
+		seen[nk{n, name}] = true
+		if out[name] == nil {
+			out[name] = map[string]bool{}
+		}
+		for k, c := range n.children {
+			out[name][k] = true
+			walk(c, k)
+		}
+		if n.wildcard != nil {
+			walk(n.wildcard, name)
+		}
+	}
+	walk(setSchema, "<root>")
+	return out
+}
+
+// positionalHits8807 returns "container / head" for every site read at a
+// container that does not declare the head, where the head IS declared
+// elsewhere.
+func positionalHits8807(t *testing.T) []string {
+	t.Helper()
+	decl := containerDeclares8807()
+	anywhere := map[string]bool{}
+	for _, heads := range decl {
+		for h := range heads {
+			anywhere[h] = true
+		}
+	}
+	set := map[string]bool{}
+	for _, s := range positionalSites8807(t) {
+		if s.container == "" {
+			continue
+		}
+		if heads, ok := decl[s.container]; ok && heads[s.head] {
+			continue
+		}
+		if !anywhere[s.head] {
+			continue // declared nowhere: #8787 predicate B, already enumerated
+		}
+		set[s.container+" / "+s.head] = true
+	}
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// posVerdict8807 is the hand adjudication. The predicate cannot produce these:
+// deciding whether an undeclared-at-path head actually LOSES a value requires
+// compiling both spellings, and #8787's `tcp-mss` rows proved the distinction
+// matters -- two of its first six looked like drops and were LOUD rejections.
+type posVerdict8807 struct {
+	state string // "defect" | "benign" | "known"
+	why   string
+}
+
+var posAdjudicated8807 = map[string]posVerdict8807{
+	"application-set / application": {"defect", "#8825. Packed `application-set as1 application a1;` compiles to " +
+		"members=[] while the braced form gives [a1], and it is not even recorded in UnknownMembers. Strict REJECTS " +
+		"via the #3146 empty-application-set gate, so the commit path is safe; CompileConfigLenient ACCEPTS, and that " +
+		"is Store.Load, so the exposure is a config arriving by file or peer sync. Config-file-only, like #8800."},
+	"application-set / application-set": {"defect", "#8825, same node: nested set membership is lost in the packed spelling."},
+	"application-set / description":     {"defect", "#8825, same node: the description is lost in the packed spelling. Cosmetic half of the same declaration gap."},
+
+	"vpn / gateway": {"benign", "MEASURED: `security ipsec vpn <v> { gateway g; }` and the `ike { gateway g; }` " +
+		"nesting compile IDENTICALLY (gateway=\"gw1\" both ways, strict accepts both). The compiler accepts the head " +
+		"at vpn level as well as under `ike`, and the schema declares only the nested form. Nothing is lost, so this " +
+		"is a declaration gap with no behavioural consequence."},
+	"vpn / ipsec-policy": {"benign", "MEASURED alongside `vpn / gateway`, identical in both spellings."},
+}
+
+// posDefectFloor8807 is a RATCHET. It fails in BOTH directions: a rise means an
+// unadjudicated positional hit, and a DROP means one was fixed and this must be
+// tightened so the next regression has no slack to hide in (#7484's shape).
+const posDefectFloor8807 = 3
+
+const posBlindness8807 = "\n\nWHAT THIS PREDICATE CANNOT SEE:\n" +
+	"  (1) CONTAINER RECOVERY IS PARTIAL. A site is localised only when its immediate " +
+	"enclosing range iterates the DIRECT children of a FindChildren(\"X\") loop variable. " +
+	"About a third of clauses qualify; the rest are INVISIBLE, not clean.\n" +
+	"  (2) CONTAINERS ARE MATCHED BY NAME, NOT PATH. Two schema nodes sharing a container " +
+	"name are pooled, so a head declared under either satisfies both. `pool` is " +
+	"unambiguous; `family` and `group` are not.\n" +
+	"  (3) EXISTENCE ONLY. It says nothing about arity (that is the #8807 arity census), " +
+	"and nothing about whether a declared-and-read head is actually HELD by a struct " +
+	"field -- #8785's shape, which defeated predicate C five times.\n" +
+	"  (4) A head declared NOWHERE is excluded by design: that is #8787's predicate B, " +
+	"already enumerated there.\n" +
+	"So GREEN MEANS \"no new positional gap this predicate can localise\", NEVER \"the class " +
+	"is covered\"."
+
+func TestPositionalPredicateIsRatcheted8807(t *testing.T) {
+	hits := positionalHits8807(t)
+	live := map[string]bool{}
+	for _, h := range hits {
+		live[h] = true
+	}
+	var added, removed []string
+	for h := range live {
+		if _, ok := posAdjudicated8807[h]; !ok {
+			added = append(added, h)
+		}
+	}
+	for h := range posAdjudicated8807 {
+		if !live[h] {
+			removed = append(removed, h)
+		}
+	}
+	sort.Strings(added)
+	sort.Strings(removed)
+
+	if len(added) > 0 {
+		t.Errorf("UNADJUDICATED positional hit(s): %v\n"+
+			"A hit is a CANDIDATE, not a defect. COMPILE BOTH SPELLINGS before "+
+			"assigning a verdict -- of the first five hits here, two were benign "+
+			"(the compiler accepted the head at both nestings and nothing was "+
+			"lost), so trusting the predicate would have over-reported by 40%%. "+
+			"Add it to posAdjudicated8807 with the measurement.%s", added, posBlindness8807)
+	}
+	if len(removed) > 0 {
+		t.Errorf("positional hit(s) GONE: %v\n"+
+			"If the declaration was added, delete the row here and TIGHTEN "+
+			"posDefectFloor8807. If they vanished because the instrument stopped "+
+			"seeing them, that is a broken instrument reading as progress -- check "+
+			"the compiler-file glob and the container recovery before believing "+
+			"it.%s", removed, posBlindness8807)
+	}
+
+	defects := []string{}
+	for h, v := range posAdjudicated8807 {
+		if v.state == "defect" && live[h] {
+			defects = append(defects, h)
+		}
+	}
+	sort.Strings(defects)
+	if len(defects) > posDefectFloor8807 {
+		t.Errorf("positional DEFECTS rose to %d (%v), floor %d.%s",
+			len(defects), defects, posDefectFloor8807, posBlindness8807)
+	}
+	if len(defects) < posDefectFloor8807 {
+		t.Errorf("positional defects FELL to %d (%v) -- THIS IS A GOOD FAILURE.\n"+
+			"Set posDefectFloor8807 = %d. Leaving it at %d gives the next "+
+			"regression that much room to hide.%s",
+			len(defects), defects, len(defects), posDefectFloor8807, posBlindness8807)
+	}
+}
+
+// TestPositionalPredicateControl8807 is the acceptance criterion from #8807:
+// the instrument must RE-FIND #8800, the case that distinguishes a positional
+// predicate from a keyword-anywhere one. `address` is declared under
+// `proxy-arp interface` and elsewhere, so a keyword-anywhere check passes it
+// silently.
+//
+// BOTH HALVES RUN HERE, and either alone is satisfiable by a dead instrument:
+// "reports it when broken" by something that always reports, "quiet when whole"
+// by something that never does.
+func TestPositionalPredicateControl8807(t *testing.T) {
+	has := func(want string) bool {
+		for _, h := range positionalHits8807(t) {
+			if h == want {
+				return true
+			}
+		}
+		return false
+	}
+
+	// DECLINE half.
+	if has("pool / address") {
+		t.Fatalf("`pool / address` reported on an UNMUTATED tree: either #8800 has " +
+			"regressed -- `address` should be declared under both `security nat " +
+			"source pool` and `security nat destination pool` -- or this control " +
+			"measures something else and every count in this file is unfalsifiable.")
+	}
+
+	// ACCEPT half: reproduce #8800 by removing the declarations.
+	nat := setSchema.children["security"].children["nat"]
+	if nat == nil {
+		t.Fatal("security/nat not found: the control is anchored to a path that has moved")
+	}
+	src := nat.children["source"].children["pool"]
+	dst := nat.children["destination"].children["pool"]
+	if src == nil || dst == nil {
+		t.Fatal("NAT pool nodes not found: re-derive this control, do not adjust it")
+	}
+	sa, da := src.children["address"], dst.children["address"]
+	if sa == nil || da == nil {
+		t.Fatalf("expected `address` declared under both NAT pools (source=%v destination=%v); "+
+			"#8800 and its follow-up landed both and this control depends on them",
+			sa != nil, da != nil)
+	}
+	delete(src.children, "address")
+	delete(dst.children, "address")
+	found := has("pool / address")
+	src.children["address"], dst.children["address"] = sa, da
+
+	if !found {
+		t.Errorf("MUTATION SURVIVED: removing the `address` declaration from both NAT " +
+			"pools -- exactly the #8800 defect -- did not make the predicate report " +
+			"`pool / address`. It is not detecting the thing it claims to detect, so " +
+			"every count in this file is a number generator.\n" +
+			"The first version of this predicate failed here for a specific reason " +
+			"worth checking first: it reused the ARITY census's site collector, which " +
+			"records only clauses containing a constant Keys[i]. The #8800 site reads " +
+			"`prop.Keys[1:]`, a SLICE, so that collector never saw it.")
+	}
+	// The restore must restore, or every later cell runs against a broken tree.
+	if has("pool / address") {
+		t.Fatal("the control did NOT restore the schema; subsequent tests in this package are compromised")
+	}
+}
