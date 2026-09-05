@@ -1,6 +1,73 @@
+OpenAI Codex v0.153.1
+--------
+workdir: /var/tmp/RES8865
+model: gpt-6-astra
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: xhigh
+reasoning summaries: none
+session id: 01a07164-10ba-7762-b037-4d02174934d7
+--------
+user
+HOSTILE round-4 plan review. REASONING ONLY. Do NOT explore the repository,
+do NOT run commands, do NOT read files. Everything needed is in the text below.
+
+IMPORTANT CONTEXT: your round-3 review judged plan revision r3. The author had
+already written r4 (from an independent hostile self-review) before your r3
+verdict arrived, so your r3 objections about the High count and the H4/CSA-R
+pairing were fixed in parallel, not in response to you. The text below is r5.
+
+Your r3 verdict was PLAN-REVISE with objection 1 RESOLVED, objection 5 RESOLVED,
+objection 2 NOT RESOLVED:
+
+(2) The wire-count class is declared complete because it is "package bounded".
+    A package supplies an outer search boundary, not an independently
+    established inventory, nor an argument that four commands cover it.
+    Publish the coverage argument or mark that class's completeness unknown.
+
+You also made two remarks outside the numbered objections:
+  (a) observed enumeration misses trigger Path C under the plan's own section 4
+      test; nine noticed examples do not independently strengthen Path B.
+  (b) section 4's class table was stale -- still listing packed fold as three
+      findings and commit/load asymmetry as a single instance.
+
+JUDGE r5 ON EXACTLY THREE THINGS.
+
+FIRST: is objection 2 now resolved, and is remark (b) fixed? Answer each
+RESOLVED or NOT RESOLVED with reasons grounded in specific r5 text.
+
+SECOND -- and this is the one that matters most. In response to remark (a) the
+author REVERSED the plan's central recommendation, from Path B (class-first
+enumeration) to Path C (instrument-first) for both classes. ATTACK THAT
+REVERSAL FROM BOTH SIDES:
+
+  - Is it correct? Does the section 4 test genuinely return Path C for these two
+    classes on the evidence given, or has the author over-applied a reviewer's
+    aside into a flip the evidence does not support?
+  - Is it a CAPITULATION? A reviewer remark is not a finding. Reversing a
+    recommendation because a reviewer gestured at it, rather than because the
+    evidence moved, is a worse failure than the original error -- it spends a
+    real conclusion to buy agreement, and the plan then carries a recommendation
+    nobody actually derived. Say plainly if that is what happened.
+  - If Path C is right, is the plan's carve-out coherent -- "Path C for the
+    class, but fix the two live wire-count sites in parallel because the remedy
+    is known"? Or does that carve-out quietly restore Path B under another name?
+
+THIRD: the author claims a general failure -- "a rule stated in a document does
+not run itself" -- citing two instances in this plan (the section 7 count rule
+missing the scope line one screen above it, and the section 4 class test never
+being run on its own classes). Is that diagnosis right, or is it a flattering
+abstraction that converts two concrete errors into a maxim and thereby stops
+anyone looking for a third?
+
+Finish with exactly one of PLAN-READY, PLAN-REVISE, PLAN-KILL, then numbered
+dispositions.
+
+=== PLAN r5 ===
 # Plan of action — muse-spark reviews 008 + 009 (#8865)
 
-- **Revision:** r6 (after Codex r4: the r5 Path C flip was a capitulation for wire-count and is withdrawn)
+- **Revision:** r5 (revised after Codex r3 — its objection 2 and the unrun §4 test both hold against r4)
 - **Base:** `b24e26d3b` (master at drafting)
 - **Reports:** `muse-spark-review-008` (109 findings across 5 rounds), `muse-spark-review-009` (4 High). 009 excludes 007 and 008, so the three are disjoint.
 - **Status:** revised. Verdicts r1: Claude SMR PLAN-REVISE, Codex PLAN-REVISE. r2: Codex PLAN-REVISE (objections 3 and 4 RESOLVED; 1, 2, 5 carried here). AGY infra-blocked throughout (2 documented retries, known `--print`/`--print-timeout` defect) — 2-of-3 exception applies.
@@ -115,10 +182,9 @@ two. Every High has a row; nothing is "batched".
    group, firewall `then`, firewall `from`, `family inet`. At r2 the class held
    three members drawn from the round-1 section; it holds **nine**, spread across
    six unrelated containers, and one of them (H9) is a **regression from this
-   campaign's own #8793**. *(r6: r3-r5 called this "the strongest available argument for Path B". It is not
-   an argument for either path — see §4's corrected test. Nine members establish
-   that the class keeps yielding; the path choice turns on whether a mechanical
-   predicate exists, and for packed fold it does not. Codex r4, correct.)*
+   campaign's own #8793**. This is the strongest available argument for Path B,
+   and it is stronger than the argument r2 actually made — which was built on the
+   wire-count pair because that was the class I had enumerated.
 2. **008 H4 and 009 CSA-R-CONFIGSTORE-002 are PROVISIONALLY the same mechanism,
    found independently by two reviewers** — commit accepts a record that a
    subsequent read refuses. *(r4: r3 stated this as established and spent it.
@@ -149,10 +215,8 @@ in `commitWithDescriptionLocked` — but has not been reproduced end-to-end here
 
 ## 3. The finding that reframes the work: both reports found ONE member each of ONE class
 
-Four commands over `pkg/cluster` found the sites below and **partition what they
-found** completely. *(r6: r2-r4 said "enumerating **every** wire-count-driven
-allocation"; §4 withdrew that completeness claim and this sentence was left
-asserting it. Codex r4, correct.)*
+Enumerating every wire-count-driven allocation in `pkg/cluster` — four commands —
+partitions completely:
 
 ```
 sync.go:1365, :1397                    SAFE   length check -> REJECT, count <= 255
@@ -178,7 +242,7 @@ Three independent facts follow:
 
 ## 4. Path options
 
-### Path A — finding-first triage (NOT recommended for either class)
+### Path A — finding-first triage (the default, NOT recommended)
 
 Adjudicate all 113 in severity order, file per finding.
 
@@ -189,7 +253,7 @@ Adjudicate all 113 in severity order, file per finding.
   finding 03 was fixed as one instance, and its siblings are 008 M17 and 009
   PHA-001.
 
-### Path B — class-first *(recommended for wire-count only — see the r6 test below)*
+### Path B — class-first (RECOMMENDED)
 
 Group findings into **mechanism classes**, enumerate each class completely, and
 fix the class.
@@ -220,11 +284,7 @@ Known classes, with today's evidence:
 
 ### Path C — instrument-first
 
-Build a detector for the class before **closing** it. *(r6: this previously read
-"before fixing anything", which the r5 carve-out silently contradicted — Codex
-r4, correct. Remediating known members and establishing class coverage are
-**separate obligations**, and fixing the known members discharges neither the
-instrument nor the coverage claim. C blocks the CLASS CLOSING, not the fixes.)*
+Build a detector per class before fixing anything.
 
 - **For:** today's two instruments (positional predicate, blind-pair guard) each
   caught live defects, and the blind-pair guard caught one within an hour on
@@ -238,109 +298,43 @@ instrument nor the coverage claim. C blocks the CLASS CLOSING, not the fixes.)*
   enumeration has been observed to miss members — which is exactly what happened
   on #8830.
 
-### (r5, corrected at r6) Running the §4 test on this plan's OWN classes
+### (r5) Running the §4 test on this plan's OWN classes — which r3 never did
 
-*(r2-r4 stated a per-class test and never applied it to either class. r5 applied
-it and **fed it an input it had already conceded was unknown**. Codex r4 caught
-that; the correction is below and it changes one of the two answers back.)*
+*(Codex r3: "observed enumeration misses trigger Path C under §4's own test; nine
+noticed examples do not independently strengthen the case for Path B." Correct,
+and it changes the recommendation.)*
+
+r2 through r4 stated a **per-class test** and then a **global recommendation**,
+without running the test on either class. Running it:
 
 | | wire-count | packed fold |
 |---|---|---|
-| **(1) mechanical predicate?** | yes | **no** — universe discovered by probing |
-| **(2) negative control?** | yes — 2 SAFE sites correctly not flagged | partial (#8859's 18 SAME rows) |
-| **(3) comparable class observed to MISS?** | **NO — measured** (r6 step 2a: P3 found 3 further sites, all safe) | yes — instruments found what enumeration missed on brace-elision |
-| **(4) coverage** | **UNKNOWN** | **UNKNOWN** |
+| **(1) mechanical predicate?** | yes — but see (3) | no; universe discovered by probing |
+| **(2) negative control?** | yes — 2 SAFE sites correctly not flagged | partial; #8859's 18 SAME rows |
+| **(3) comparable class observed to MISS?** | **YES** — the live member is `Split`, which a sized-allocation predicate does not match | **YES** — new members in all three review rounds |
+| **(4) coverage** | **UNKNOWN** (r5) | **UNKNOWN** |
 
-**Packed fold -> Path C, and r5 gave the right answer for a wrong reason.**
-r5 argued from "nine members across three review rounds". **Recurrence is not an
-enumeration failure**: successive discoveries with no census between them, or
-defects introduced as the tree moved, produce the same nine. Nine examples
-establish that the class keeps yielding; they establish nothing about whether a
-census would have found them. *(Codex r4, correct — and this is the same
-over-reach as* [[not sufficient is not not the mechanism]] *, run forwards.)*
-**Test (1) already selects C on its own**: there is no mechanical predicate for
-"containers whose packed tail folds lossily". That is the derivation, and it does
-not need the nine.
+**Test (3) fires for BOTH classes, and test (3) says Path C regardless of (1).**
+So the plan's own rule returns:
 
-**Wire-count -> Path B, with completeness UNKNOWN. r5's Path C was a
-capitulation and is withdrawn.**
+- **packed fold -> Path C (instrument-first).** Nine members across three rounds
+  with a moving boundary is the strongest possible trigger. **The nine were being
+  used as an argument FOR Path B; under the stated test they are an argument
+  AGAINST it** — noticing nine members of an unbounded class is evidence the
+  class resists enumeration, not evidence enumeration works.
+- **wire-count -> Path C as well**, on the `Split` miss — though here the fix
+  itself is trivial and known, so the instrument is owed *for the class*, not as
+  a precondition for fixing the two live sites. **Fix them; do not close the
+  class on them.**
 
-r5 scored test (3) **YES** on the `strings.Split` site, in a sentence that
-**concedes the fact it needs**: *"Whether the Split grep was among the original
-four or added after M17 was noticed…"*. **A predicate that would miss `Split` is
-a possible blind spot; it is an observed miss only if the enumeration actually
-ran without a Split search.** r5 promoted the hypothetical to an observation
-because a reviewer gestured at it — **which is worse than the original error,
-because the plan then carries a recommendation nobody derived.** The reviewer's
-aside cannot supply the missing observation, and withdrawing it does not
-automatically restore B either: B has to be derived, and it is, from tests (1)
-and (2) passing and (3) not established.
+**This is what "decided per class by a stated test" is for**, and it took an
+external reviewer to point out that the plan had not once applied its own test to
+its own classes. **A rule stated in a document does not run itself** — the second
+instance of that in this plan, after §7's derive-don't-quote rule failed to catch
+the scope line one screen above it.
 
-### (r6) Step 2a WAS RUN. Here is the measurement.
-
-Rather than schedule the decisive input, I measured it at `f36be93c5`. Three
-differently-shaped predicates over non-test `pkg/cluster`:
-
-| predicate | sites | result |
-|---|---|---|
-| **P1** — `make([]T, 0, count)` sized by a decoded count | `sync.go:1365`, `sync.go:1397`, `sync_persistent_nat_lease_8121.go:152`, `sync_protocol.go:1231` | the class table's four |
-| **P2** — `strings.Split(string(payload)…)`, **not an allocation call** | `sync_protocol.go:806` | the live 008 M17 site |
-| **P3** — any `binary.*Endian.Uint*` read feeding a `make([]…)` within 12 lines | `heartbeat.go:376`, `sync_auth.go:416`, `sync_conn_read.go:66`, `sync.go:1376` | **3 new sites, all SAFE** |
-
-**P1 provably cannot reach the P2 site** — `Split` is not an allocation call — so
-the class spans **at least two syntactic forms**, and any single-shape predicate
-misses one of them. That much r5 asserted and it is now measured.
-
-**But the conclusion r5 drew from it does not survive the third predicate.** P3
-approaches the class from a different direction (the *count read* rather than the
-*allocation*) and reaches a wider population: 120 `binary.*Uint` reads narrowed
-to 4 allocation-adjacent sites. **Three are new to this plan and all three are
-safe:**
-
-```
-sync_conn_read.go:66   if hdr.Length > 16*1024*1024 { return }   payload = make([]byte, hdr.Length)
-sync_auth.go:416       if length   > 16*1024*1024 { return err } payload = make([]byte, length)
-heartbeat.go:376       numGroups := int(data[8])   // <= 255
-                       if len(data) < need { return err }        make([]HeartbeatGroup, numGroups)
-```
-
-Each bounds **before** allocating, and `heartbeat.go` uses the same
-single-byte-count plus rejecting-length-check pattern as the safe `sync.go`
-sites.
-
-**So: a second, differently-shaped predicate found no missed defect, and supplied
-the NEGATIVE CONTROL the class did not have** — three sites it correctly does not
-flag. **§4 test (3) is NO on measurement: no enumeration miss has been observed.**
-Wire-count is **Path B**, derived rather than conceded, and its coverage claim is
-stronger than at any prior revision.
-
-**What is still UNKNOWN, precisely.** The class provably spans two syntactic
-forms; nothing establishes it spans only two. A third form nobody has thought of
-stays possible, so coverage remains **§4(b) UNKNOWN** — but that is now a bounded
-residual doubt with two cross-checking predicates behind it, not the open-ended
-unknown of r5.
-
-> **The method note worth keeping.** r5 argued this question from a sentence that
-> conceded its own missing fact, and then reversed a recommendation on it. The
-> measurement cost three greps and returned the **opposite** answer. **When the
-> decisive input to a stated test is unmeasured, measure it — do not reason about
-> which way it probably goes, and do not let a reviewer's plausible aside stand
-> in for it.**
-
-**(superseded) The original scheduling of this unknown Re-run the four commands as recorded and ask whether they
-re-find `sync_protocol.go:806`. If they do, test (3) is NO and B stands
-outright. If they do not, test (3) becomes a genuine observed miss and the class
-moves to C **on evidence**. **This is the only claim in the plan whose decisive
-input is a measurement nobody has taken**, and it takes one command.
-
-**Revised recommendation (r6): Path C for packed fold, Path B for wire-count**,
-each derived above rather than inherited, with §5 step 2a able to move wire-count
-to C on measurement.
-
-**On instruments under either path:** unknown completeness is, per §8, a reason
-to **consider** an instrument — it is not evidence that test (3) passed, and a
-retained instrument track owes a **named coverage gap** and an acceptance
-condition (§6), not merely a slot in the recommendation.
+**Revised recommendation: Path C for both enumerated classes, with Path B's fixes
+proceeding in parallel for the two live wire-count sites.**
 
 **On the residual preference between B and C:** The four-grep enumeration establishes that class
 enumeration *can* be cheap, not that it generally is; the brace-elision class is
@@ -437,14 +431,6 @@ third that had been disqualified by hand.
    If it does not reproduce inside the box, record non-reproduction with what was
    tried and move on rather than extending. *(Codex r2 objection 4, RESOLVED,
    restated here because the distinction is the whole value of the time box.)*
-2a. **(r6) DONE — the decisive input was measured, not scheduled.** Three
-   predicates (P1 allocation-shaped, P2 `Split`-shaped, P3 count-read-shaped)
-   run over non-test `pkg/cluster` at `f36be93c5`; full result in §4. **P3 found
-   3 sites new to this plan and all 3 are SAFE**, supplying the negative control
-   the class lacked. **§4 test (3) resolves NO on measurement; wire-count is
-   Path B.** The three predicates are recorded verbatim in §4 so this is
-   re-runnable rather than trusted.
-
 2. **Wire-count allocation class** — fix `sync_protocol.go:1231` and `:806`
    to the reject-shape the sibling already uses. Closes 009 PHA-001 and 008 M17.
    Guard: assert **rejection**, not clamping, with the payload/element size ratio
@@ -477,17 +463,6 @@ third that had been disqualified by hand.
    `packedBodyChildren`. **Both are required; neither alone closes H10.** This
    step belongs to the same lane as step 3 but is a distinct cell, so that a
    green on the fold does not read as a green on the admission.
-
-4b. **(r6) INSTRUMENT TRACK — packed fold (Path C), and wire-count only if
-   step 2a says so.** Codex r4: the parallel instrument existed only in the
-   recommendation, in no step, with no acceptance condition. Each retained
-   instrument owes, before the class may be **closed**:
-   - a **named coverage gap** — which variants the enumeration provably does not
-     reach, stated before the instrument is built, not after;
-   - a **negative control** — members it correctly does not flag;
-   - **and the standing bar: success on the known members does NOT upgrade
-     completeness from UNKNOWN.** An instrument that re-finds the nine has
-     re-found the nine.
 
 5. **The residue — 009 PHA-002 and 009 DBK-001 — and then the remaining ~98.**
    The two residue Highs are named in §2b with their mechanisms; they belong to no
@@ -564,11 +539,6 @@ The r1 defect was scheduling ~104 findings as one step. This replaces it with a
   strict-REJECTS reversed. **A cell at one order passes against the other order's
   defect**, and an invariant assertion cannot see order at all.
 - `Store.Load` must still accept everything it accepts today.
-- **(r6) A class may be CLOSED only with: its enumeration, its negative control,
-  its coverage form declared ((a) bounded universe or (b) UNKNOWN), and — where
-  Path C applies — its instrument's named coverage gap.** Fixing every known
-  member closes the members, not the class. **Remediation and coverage are
-  separate obligations and neither discharges the other.**
 
 ## 7. Risks
 
@@ -595,3 +565,86 @@ The r1 defect was scheduling ~104 findings as one step. This replaces it with a
   #8830 case — and a class published under §4(b) with completeness UNKNOWN is
   itself a standing argument for one. What this plan excludes is an instrument
   built *speculatively*, with no class and no named coverage gap behind it.
+
+codex
+I’ll review only the supplied r5 text, testing whether the reversal follows from the evidence and whether it reaches the sequencing and acceptance criteria.
+codex
+The wire-count argument has a gap: showing that `Split` escapes a predicate limited to sized allocations does not show that the actual four-command enumeration missed it. Packed fold has a stronger basis for Path C, but repeated discoveries alone do not establish enumeration failure.
+codex
+PLAN-REVISE
+
+1. **Objection 2 — RESOLVED.** §4 explicitly rejects “package bounded” as an inventory argument, selects form (b), and marks wire-count completeness **UNKNOWN**. It also distinguishes “partitions what it found” from “found them all.” That supplies exactly the alternative the objection requested.
+
+   The opening of §3—“Enumerating every wire-count-driven allocation … partitions completely”—still needs reconciliation with that withdrawal. This is stale contradictory wording, not a reason to demand another coverage proof after completeness has been disclaimed.
+
+   **Remark (b) — RESOLVED.** The §4 table now lists **nine packed-fold Highs, H1–H3 and H6–H11**, and **H4 plus CSA-R, explicitly PROVISIONAL**. Both requested table corrections are present.
+
+2. **The reversal is justified for packed fold; it has not been derived for wire-count.**
+
+   **Packed fold:** On the plan’s stated assessment that no usable mechanical enumeration predicate is available, §4 test (1) already selects C. The text also explicitly reports that instruments found defects brace-elision enumeration missed. Those are defensible grounds for the change.
+
+   The replacement argument about nine discoveries is nevertheless wrong. “New members in all three review rounds” does not establish that an enumeration omitted members present within its scope when it ran. These could be successive discoveries without an intervening census, or defects introduced as the tree changed. Nine examples establish recurrence; they independently establish neither successful nor failed enumeration. Calling them “the strongest possible trigger” overstates the evidence.
+
+   **Wire-count:** The decisive **YES** in test (3) is unsupported. A predicate restricted to explicit sized allocations would miss `Split`. But r5 expressly leaves unknown whether the actual four commands included a `Split` search from the beginning. Its sentence beginning **“Whether the Split grep was among the original four…”** concedes the missing fact.
+
+   That establishes a possible blind spot and an inadequate completeness argument. It does **not** establish an observed enumeration miss. A search covering multiple syntactic forms does not become a demonstrated failure merely because someone had to identify those forms. This distinction resolves objection 2 without automatically selecting C.
+
+   An argument from a *comparable* class remains possible, but r5 must establish the relevant comparability and explain what additional coverage the proposed instrument supplies. Otherwise almost any search failure anywhere becomes an unconditional instruction to instrument everything. §8’s “standing argument” from unknown completeness is a reason to consider an instrument, not evidence that test (3) passed.
+
+   **Capitulation:** The packed-fold reversal is a legitimate correction. New observations are unnecessary when an existing rule was previously misapplied. For wire-count, **yes, the written argument makes an unsupported concession to the reviewer**: it accepts the reviewer’s conclusion by promoting a hypothetical miss into an observed one. That is the substantive failure you warned about; it does not establish the author’s private motive. My earlier aside cannot supply the missing observation. Removing this justification also does not automatically establish B: the wire-count choice needs an actual derivation.
+
+   **The carve-out is coherent in principle but incomplete in this plan.** Fixing two confirmed sites while developing class-level detection does not restore B. Known-member remediation and establishing class coverage are separate obligations.
+
+   However, C currently means **“Build a detector per class before fixing anything,”** so the exception changes its definition. More consequentially, §5 step 2 schedules only the fixes, and §6 requires neither a wire-count instrument nor evaluation of its additional coverage. The parallel instrument track exists only in the recommendation.
+
+   Revise C’s definition, put each retained instrument track into §5, and give it a named coverage gap and acceptance condition in §6. Successful fixes must not discharge that obligation. Nor should an instrument’s success on known examples silently upgrade UNKNOWN completeness to complete coverage.
+
+3. **The diagnosis is true as a symptom and inadequate as an explanation.**
+
+   “A rule stated in a document does not run itself” accurately describes an omitted check. It does not distinguish **failing to run a check, running it on unsupported premises, and failing to propagate its result into operative instructions**. Those require different corrections.
+
+   R5 supplies a concrete third failure immediately: it now runs the class test, but feeds it an unestablished “observed miss.” Execution alone did not protect the conclusion. The document also already records another example in §2b(0): assigning classes from titles despite §5b’s mechanism requirement.
+
+   Recommendation propagation remains broken too: §4 still labels B **RECOMMENDED**, §2b still calls the nine findings the strongest argument for B, and the new C recommendation lacks its corresponding delivery requirements.
+
+   The maxim becomes a flattering abstraction if these confessions substitute for checking the revised document. The required repair is concrete: substantiate each decisive test input, derive the recommendation, and reconcile that result across the active recommendation, sequencing, and acceptance criteria. R5 has not completed that chain.
+tokens used
+17,313
+PLAN-REVISE
+
+1. **Objection 2 — RESOLVED.** §4 explicitly rejects “package bounded” as an inventory argument, selects form (b), and marks wire-count completeness **UNKNOWN**. It also distinguishes “partitions what it found” from “found them all.” That supplies exactly the alternative the objection requested.
+
+   The opening of §3—“Enumerating every wire-count-driven allocation … partitions completely”—still needs reconciliation with that withdrawal. This is stale contradictory wording, not a reason to demand another coverage proof after completeness has been disclaimed.
+
+   **Remark (b) — RESOLVED.** The §4 table now lists **nine packed-fold Highs, H1–H3 and H6–H11**, and **H4 plus CSA-R, explicitly PROVISIONAL**. Both requested table corrections are present.
+
+2. **The reversal is justified for packed fold; it has not been derived for wire-count.**
+
+   **Packed fold:** On the plan’s stated assessment that no usable mechanical enumeration predicate is available, §4 test (1) already selects C. The text also explicitly reports that instruments found defects brace-elision enumeration missed. Those are defensible grounds for the change.
+
+   The replacement argument about nine discoveries is nevertheless wrong. “New members in all three review rounds” does not establish that an enumeration omitted members present within its scope when it ran. These could be successive discoveries without an intervening census, or defects introduced as the tree changed. Nine examples establish recurrence; they independently establish neither successful nor failed enumeration. Calling them “the strongest possible trigger” overstates the evidence.
+
+   **Wire-count:** The decisive **YES** in test (3) is unsupported. A predicate restricted to explicit sized allocations would miss `Split`. But r5 expressly leaves unknown whether the actual four commands included a `Split` search from the beginning. Its sentence beginning **“Whether the Split grep was among the original four…”** concedes the missing fact.
+
+   That establishes a possible blind spot and an inadequate completeness argument. It does **not** establish an observed enumeration miss. A search covering multiple syntactic forms does not become a demonstrated failure merely because someone had to identify those forms. This distinction resolves objection 2 without automatically selecting C.
+
+   An argument from a *comparable* class remains possible, but r5 must establish the relevant comparability and explain what additional coverage the proposed instrument supplies. Otherwise almost any search failure anywhere becomes an unconditional instruction to instrument everything. §8’s “standing argument” from unknown completeness is a reason to consider an instrument, not evidence that test (3) passed.
+
+   **Capitulation:** The packed-fold reversal is a legitimate correction. New observations are unnecessary when an existing rule was previously misapplied. For wire-count, **yes, the written argument makes an unsupported concession to the reviewer**: it accepts the reviewer’s conclusion by promoting a hypothetical miss into an observed one. That is the substantive failure you warned about; it does not establish the author’s private motive. My earlier aside cannot supply the missing observation. Removing this justification also does not automatically establish B: the wire-count choice needs an actual derivation.
+
+   **The carve-out is coherent in principle but incomplete in this plan.** Fixing two confirmed sites while developing class-level detection does not restore B. Known-member remediation and establishing class coverage are separate obligations.
+
+   However, C currently means **“Build a detector per class before fixing anything,”** so the exception changes its definition. More consequentially, §5 step 2 schedules only the fixes, and §6 requires neither a wire-count instrument nor evaluation of its additional coverage. The parallel instrument track exists only in the recommendation.
+
+   Revise C’s definition, put each retained instrument track into §5, and give it a named coverage gap and acceptance condition in §6. Successful fixes must not discharge that obligation. Nor should an instrument’s success on known examples silently upgrade UNKNOWN completeness to complete coverage.
+
+3. **The diagnosis is true as a symptom and inadequate as an explanation.**
+
+   “A rule stated in a document does not run itself” accurately describes an omitted check. It does not distinguish **failing to run a check, running it on unsupported premises, and failing to propagate its result into operative instructions**. Those require different corrections.
+
+   R5 supplies a concrete third failure immediately: it now runs the class test, but feeds it an unestablished “observed miss.” Execution alone did not protect the conclusion. The document also already records another example in §2b(0): assigning classes from titles despite §5b’s mechanism requirement.
+
+   Recommendation propagation remains broken too: §4 still labels B **RECOMMENDED**, §2b still calls the nine findings the strongest argument for B, and the new C recommendation lacks its corresponding delivery requirements.
+
+   The maxim becomes a flattering abstraction if these confessions substitute for checking the revised document. The required repair is concrete: substantiate each decisive test input, derive the recommendation, and reconcile that result across the active recommendation, sequencing, and acceptance criteria. R5 has not completed that chain.
+CODEX_EXIT=0
