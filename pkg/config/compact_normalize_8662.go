@@ -1258,6 +1258,13 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		// admitting `system login` would turn a loud #6662 rejection into a
 		// silent acceptance, which is a regression wearing the shape of a fix).
 		"protocols bgp",
+		// #8879 batch 4. Mode-spanning again: a struct behind a pointer
+		// (`sampling`), a slice (`router-advertisement`), a map (`snmp v3`)
+		// and a struct whose OTHER fields are all defaults (`archival`).
+		"forwarding-options sampling",
+		"protocols router-advertisement",
+		"snmp v3",
+		"system archival",
 		// #8879 batch 3. Selected to SPAN MODES rather than to top the list:
 		// four subsystems and four different compiled shapes (pointer struct,
 		// slice, scalar string, struct-of-scalars). A consequence-weighted
