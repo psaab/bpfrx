@@ -439,9 +439,19 @@ func ValidateLoginUsername(raw string, _ *Config) error {
 // every mode the dataplane cannot carry, which is the general rule #4785's
 // ipip case is one instance of.
 //
-// The leaf validator runs only on the STRICT commit/commit-check path
-// (compileTreeStrict -> schemaValidateExpandedTreeForNode). compileTreeLenient,
-// which Store.Load and Store.SyncApply use, does not schema-validate at all, so
-// a config already persisted with an unrecognised mode still BOOTS (#1960
+// The leaf validator is STRICT only on the commit/commit-check path
+// (compileTreeStrict -> schemaValidateExpandedTreeForNode). Store.Load and
+// Store.SyncApply go through compileTreeLenient, which DOES schema-validate and
+// then downgrades the violation to a warning (#1319 PR 2, store.go), so a
+// config already persisted with an unrecognised mode still BOOTS (#1960
 // no-brick doctrine, the same split #4785 half 1 arranged).
+//
+// This paragraph previously said compileTreeLenient "does not schema-validate
+// at all". That was true when written, hollowed by a later change, and nothing
+// re-checked it -- and it was then cited as authority by two agents in one day
+// to argue that a new gate could not affect the load path. It can: the load
+// path validates, and the no-blackout property rests entirely on the downgrade
+// continuing to exist, not on the validation being absent. That distinction is
+// pinned by TestLoadDowngradesUnknownTopLevelStanza8882 rather than by this
+// comment.
 var TunnelModeNames = []string{"gre", "ip6gre", "wireguard"}

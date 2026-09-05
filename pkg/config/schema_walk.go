@@ -132,6 +132,23 @@ func SchemaValidateWithDefinitions(tree, defsSource *ConfigTree, cfg *Config) er
 			refs.loginClasses[name] = struct{}{}
 		}
 	}
+	// issue 8882: reject an unmodeled TOP-LEVEL stanza. A typo'd root keyword
+	// (`securty { ... }`) resolves to no schema node, so the walk below simply
+	// does not descend, and everything under it is silently discarded on a
+	// clean commit -- the whole stanza, not one leaf.
+	//
+	// This is deliberately NOT setSchema.closedWorld. The closed-world flag
+	// INHERITS (`childClosed := closed || childSchema.closedWorld`), so arming
+	// it at the root closes every subtree beneath it, and the schema does not
+	// model the tree exhaustively. Measured: that rejects 9 of the 10 shipped
+	// and example configs -- `chassis cluster redundancy-group interface-monitor`,
+	// `system services dhcp-local-server ... pool`, `family inet6 dhcpv6`,
+	// `security flow tcp-mss all-tcp`. It would be an operational blackout on
+	// the commit path, which is why the gate below closes ONE level and
+	// inherits nothing.
+	if err := checkUnknownTopLevelStanza(tree); err != nil {
+		return err
+	}
 	vc := &walkContext{cfg: cfg, refs: refs}
 	// closed=false: the top-level walk is open-world. The per-subtree
 	// closed-world flag (#4313) is inherited from schemaNode.closedWorld as
@@ -1197,4 +1214,35 @@ func typedLeafInvalidErrorf(path []string, tok string, err error) error {
 		return fmt.Errorf("%s: invalid value <redacted>: %s", joined, reason)
 	}
 	return fmt.Errorf("%s: invalid value %q: %v", joined, tok, err)
+}
+
+// checkUnknownTopLevelStanza rejects a root keyword the schema does not model
+// (issue 8882).
+//
+// It closes exactly one level and inherits nothing: a keyword is checked
+// against setSchema's own children, and every subtree keeps whatever
+// closed-world posture it already had. That is the difference between this and
+// setting setSchema.closedWorld, which would close the entire tree.
+//
+// Scope, stated because the asymmetry is deliberate: a typo at the ROOT
+// discards an entire stanza, while a typo deeper down discards one subtree of
+// whatever already-modeled parent it sits under. The root case is both the
+// worst consequence and the one the schema can adjudicate with certainty --
+// the 19 top-level stanzas are exhaustively modeled, which is not true at
+// every depth.
+func checkUnknownTopLevelStanza(tree *ConfigTree) error {
+	if tree == nil {
+		return nil
+	}
+	for _, child := range tree.Children {
+		if child == nil || len(child.Keys) == 0 {
+			continue
+		}
+		kw := child.Keys[0]
+		if resolveSchemaChild(setSchema, kw) == nil {
+			return fmt.Errorf("unknown configuration stanza %q: it is not a recognised top-level keyword, "+
+				"so everything configured under it would be silently discarded", kw)
+		}
+	}
+	return nil
 }
