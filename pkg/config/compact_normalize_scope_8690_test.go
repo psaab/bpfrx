@@ -2,9 +2,11 @@ package config
 
 import (
 	"fmt"
-	"os"
-	"regexp"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -1184,19 +1186,63 @@ func TestTheGateCountsTheSurvivingCriterion8690(t *testing.T) {
 // resolved one also reds, so the list shrinks as families are tidied and cannot
 // outlive its reason.
 func TestNoPairIsAdmittedByTwoFamilySwitches8690(t *testing.T) {
-	src, err := os.ReadFile("compact_normalize_8662.go")
+	// PARSED, NOT PATTERN-MATCHED. This walked the source with a regex and read
+	// 521 of 548 case strings — a plausible-looking number with no sign that a
+	// whole SHAPE of entry was invisible.
+	//
+	// gofmt writes a multi-entry clause as `case "a",` / `\t\t"b",` / `\t\t"c":`,
+	// so the FIRST pair sits on the `case` line and the LAST ends in a colon.
+	// A pattern anchored to `\t\t"..."` with an optional comma missed both ends
+	// of every clause: 11 first-pairs, 15 last-pairs, and 1 single-entry clause.
+	// Two of the 27 were real cross-switch duplicates the cell exists to catch.
+	//
+	// Adding a second regex would have closed the 11 and left the 16, and would
+	// still be a set of spellings somebody enumerated by looking. The parser
+	// reads every shape by construction, and a future gofmt change cannot move
+	// a case expression out of its reach.
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "compact_normalize_8662.go", nil, 0)
 	if err != nil {
-		t.Fatalf("read predicate source: %v", err)
+		t.Fatalf("parse predicate source: %v", err)
 	}
-	caseLine := regexp.MustCompile(`(?m)^\t\t"([a-z][^"]*)",?$`)
 	counts := map[string]int{}
-	for _, m := range caseLine.FindAllStringSubmatch(string(src), -1) {
-		counts[m[1]]++
-	}
-	if len(counts) == 0 {
-		t.Fatal("no case strings found in compact_normalize_8662.go — this cell " +
-			"scans source text, so a formatting change can make it silently " +
-			"measure nothing (#8690)")
+	total := 0
+	ast.Inspect(file, func(n ast.Node) bool {
+		cc, ok := n.(*ast.CaseClause)
+		if !ok {
+			return true
+		}
+		for _, expr := range cc.List {
+			lit, ok := expr.(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING {
+				continue
+			}
+			v, err := strconv.Unquote(lit.Value)
+			if err != nil || v == "" || !strings.Contains(v, " ") {
+				continue // not a "container head" pair
+			}
+			total++
+			counts[v]++
+		}
+		return true
+	})
+
+	// REACH CONTROL, not merely a non-emptiness check. The version this replaced
+	// had `len(counts) == 0` and it could never have fired: a pattern matching
+	// 500+ entries masks one matching zero, so the cell reported a healthy total
+	// while a whole shape was invisible. A degeneracy check on the TOTAL cannot
+	// see a gap in the SHAPES.
+	//
+	// So the control is specific: two pairs that are only reachable through the
+	// `case`-line shape must be present. They were the two real duplicates the
+	// regex version missed, which makes them evidence rather than decoration.
+	for _, must := range []string{"address-book address-set", "dataplane control-socket"} {
+		if counts[must] == 0 {
+			t.Fatalf("the walk did not find %q, which is written as the FIRST pair "+
+				"of its case clause and is therefore only reachable if case-line "+
+				"expressions are being read. Its absence means the walk has lost "+
+				"reach over a shape again — the exact defect this replaced (#8690)", must)
+		}
 	}
 	var dup []string
 	for pair, n := range counts {
@@ -1214,20 +1260,25 @@ func TestNoPairIsAdmittedByTwoFamilySwitches8690(t *testing.T) {
 			"this list should shrink with it. Prefer resolving the duplicate to "+
 			"adding it here (#8690).", diff)
 	}
-	t.Logf("#8690: %d distinct pairs across the family switches, %d of them listed twice",
-		len(counts), len(dup))
+	// Both totals, deliberately. A future reach gap shows up as a TOTAL that
+	// disagrees with the source rather than as a plausible duplicate count.
+	t.Logf("#8690: %d case-string pairs read from the predicate, %d distinct, %d listed twice",
+		total, len(counts), len(dup))
 }
 
 // knownDuplicatePairs8690 are the pairs currently listed by two family
 // switches. Each is a latent silent-non-exclusion; see the cell above. They are
 // pinned, not endorsed.
 var knownDuplicatePairs8690 = []string{
+	"address-book address-set",
 	"address-set address",
 	"address-set address-set",
 	"daily start-time",
 	"daily stop-time",
+	"dataplane control-socket",
 	"friday start-time",
 	"friday stop-time",
+	"global policy",
 	"group authentication-key",
 	"group interface",
 	"host-inbound-traffic protocols",
@@ -1246,6 +1297,7 @@ var knownDuplicatePairs8690 = []string{
 	"match source-address",
 	"match source-address-name",
 	"match to-zone",
+	"md5 key",
 	"monday start-time",
 	"monday stop-time",
 	"neighbor authentication-key",
@@ -1257,12 +1309,13 @@ var knownDuplicatePairs8690 = []string{
 	"rip authentication-type",
 	"saturday start-time",
 	"saturday stop-time",
-	"schedulers scheduler",
 	"scheduler start-time",
 	"scheduler stop-time",
+	"schedulers scheduler",
 	"security-zone description",
 	"security-zone interfaces",
 	"security-zone screen",
+	"ssh protocol-version",
 	"sunday start-time",
 	"sunday stop-time",
 	"system domain-name",
@@ -1274,4 +1327,5 @@ var knownDuplicatePairs8690 = []string{
 	"vpn pre-shared-key",
 	"wednesday start-time",
 	"wednesday stop-time",
+	"zones security-zone",
 }
