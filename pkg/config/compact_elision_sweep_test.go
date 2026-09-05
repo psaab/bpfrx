@@ -104,8 +104,37 @@ func TestSweepFull(t *testing.T) {
 
 	type row struct{ pair, verdict, detail string }
 	var rows []row
-	seen := map[string]bool{}
 	counts := map[string]int{}
+
+	// EVERY SITE FOR A PAIR IS EVALUATED, not just the first.
+	//
+	// This loop used to `seen[pair]`-skip after the first site, so the published
+	// verdict was a property of WHICHEVER LEAF the enumeration reached first --
+	// and `collectCompactSites` order is not something a reader of the table can
+	// see. The gate column then claimed "this PAIR's elided spelling is refused
+	// / warned / silent" while the measurement supported only "the elided
+	// spelling OF THAT ONE LEAF was".
+	//
+	// They come apart whenever the strictness lives on the LEAF rather than on
+	// the container: a typed or validated leaf under an otherwise permissive
+	// container makes the whole pair read STRICT-REJECTS.
+	//
+	// MEASURED: 22 of 46 pairs disagree across their own sites. `interfaces
+	// <name>` alone yields SILENT (via link-speed), STRICT-REJECTS (via address)
+	// and WARNS (via periodic).
+	//
+	// THE DIRECTION OF THE ERROR IS THE HARMFUL ONE. This column is what decides
+	// admit-vs-decline, so a genuinely SILENT pair that happened to draw a strict
+	// leaf reads STRICT-REJECTS and gets skipped as "already loud" -- a silent
+	// drop, filed as handled. That is the `system login` trap inverted: there a
+	// handled row looked like a defect; here a defect row looks handled.
+	//
+	// So disagreement is published as its own verdict rather than resolved.
+	// Picking one would be choosing an answer from a sample of one and printing
+	// it with the authority of a measurement.
+	perPair := map[string]map[string]string{} // pair -> verdict -> example leaf
+	pairDetail := map[string]string{}
+	var pairOrder []string
 
 	for _, s := range collectCompactSites() {
 		if len(s.container) < 2 || strings.HasPrefix(s.container[0], "groups") {
@@ -113,14 +142,13 @@ func TestSweepFull(t *testing.T) {
 		}
 		stanza, child := s.container[0], s.container[1]
 		pair := stanza + " " + child
-		if seen[pair] || compactNormalizeInScope(stanza, child) {
+		if compactNormalizeInScope(stanza, child) {
 			continue
 		}
 		v1, _, ok := synthPair(s.node)
 		if !ok {
 			continue
 		}
-		seen[pair] = true
 		parent := s.container[:len(s.container)-1]
 		stanzaLeaf := s.container[len(s.container)-1]
 		inner := contextFor(parent) + stanzaLeaf + " " + s.leaf + " " + v1 + ";"
@@ -174,8 +202,34 @@ func TestSweepFull(t *testing.T) {
 			v = "CANDIDATE-DROP/" + g
 			d = firstDiff(dig(bc), dig(ec))
 		}
-		counts[v]++
-		rows = append(rows, row{pair, v, d})
+		if perPair[pair] == nil {
+			perPair[pair] = map[string]string{}
+			pairOrder = append(pairOrder, pair)
+		}
+		if _, dup := perPair[pair][v]; !dup {
+			perPair[pair][v] = s.leaf
+		}
+		if pairDetail[pair] == "" {
+			pairDetail[pair] = d
+		}
+	}
+	for _, pair := range pairOrder {
+		vs := perPair[pair]
+		if len(vs) == 1 {
+			for v := range vs {
+				counts[v]++
+				rows = append(rows, row{pair, v, pairDetail[pair]})
+			}
+			continue
+		}
+		var parts []string
+		for v, lf := range vs {
+			parts = append(parts, v+"(via "+lf+")")
+		}
+		sort.Strings(parts)
+		counts["LEAF-CONTINGENT"]++
+		rows = append(rows, row{pair, "LEAF-CONTINGENT",
+			"verdict depends on which leaf is synthesized: " + strings.Join(parts, " | ")})
 	}
 	sort.Slice(rows, func(i, j int) bool {
 		if rows[i].verdict != rows[j].verdict {
@@ -304,4 +358,105 @@ func sweepGateVerdict8859(bracedText, elidedText string) string {
 		}
 	}
 	return "SILENT"
+}
+
+// #8859. A published sweep verdict must not be a single-sample claim.
+//
+// The sweep evaluates every site for a pair and publishes LEAF-CONTINGENT where
+// they disagree. This cell asserts the property that makes that worth doing:
+// the disagreement is REAL and the instrument can see it.
+//
+// Without it the fix is unfalsifiable — a sweep that never emits
+// LEAF-CONTINGENT looks identical whether the class is empty or the detection
+// is broken, which is the third state this file already documents for the WARNS
+// arm.
+//
+// THE SHAPE THAT MATTERS is a pair where one leaf says SAME and another says
+// CANDIDATE-DROP. That is the harmful direction: under first-site-wins the pair
+// could publish SAME — no defect — while a different leaf under it silently
+// loses its value. Measured at the time of writing, three pairs have exactly
+// that shape (`class-of-service classifiers` via inet-precedence vs dscp,
+// `class-of-service rewrite-rules` via exp vs dscp, and `system services`).
+func TestSweepVerdictsAreNotSingleSample8859(t *testing.T) {
+	perPair := map[string]map[string]bool{}
+	for _, s := range collectCompactSites() {
+		if len(s.container) < 2 || strings.HasPrefix(s.container[0], "groups") {
+			continue
+		}
+		stanza, child := s.container[0], s.container[1]
+		if compactNormalizeInScope(stanza, child) {
+			continue
+		}
+		v1, _, ok := synthPair(s.node)
+		if !ok {
+			continue
+		}
+		parent := s.container[:len(s.container)-1]
+		stanzaLeaf := s.container[len(s.container)-1]
+		inner := contextFor(parent) + stanzaLeaf + " " + s.leaf + " " + v1 + ";"
+		bracedText := nest(parent, inner)
+		var elidedText string
+		if len(parent) >= 2 {
+			elidedText = nest(append([]string{parent[0] + " " + parent[1]}, parent[2:]...), inner)
+		} else {
+			elidedText = parent[0] + " " + inner
+		}
+		bt, bperrs := NewParser(bracedText).Parse()
+		et, eperrs := NewParser(elidedText).Parse()
+		if len(bperrs) > 0 || len(eperrs) > 0 {
+			continue
+		}
+		bc, berr := CompileConfigLenient(bt)
+		ec, eerr := CompileConfigLenient(et)
+		v := "SAME"
+		switch {
+		case berr != nil || bc == nil:
+			v = "NO-REFERENCE"
+		case eerr != nil || ec == nil:
+			v = "ELIDED-REFUSED"
+		default:
+			// JSON, NOT %v. The Config graph is full of pointers and %v prints
+			// ADDRESSES, which differ on every compile by construction -- so
+			// every site would read CANDIDATE-DROP, every pair would agree, and
+			// this cell would report ZERO contingency while the sweep reports
+			// seven. Measured: that is exactly what the first draft did.
+			bc.Warnings, ec.Warnings = nil, nil
+			bj, _ := json.Marshal(bc)
+			ej, _ := json.Marshal(ec)
+			if string(bj) != string(ej) {
+				v = "CANDIDATE-DROP"
+			}
+		}
+		key := stanza + " " + child
+		if perPair[key] == nil {
+			perPair[key] = map[string]bool{}
+		}
+		perPair[key][v] = true
+	}
+
+	contingent, harmful := 0, 0
+	for _, vs := range perPair {
+		if len(vs) > 1 {
+			contingent++
+			if vs["SAME"] && vs["CANDIDATE-DROP"] {
+				harmful++
+			}
+		}
+	}
+	if contingent == 0 {
+		t.Error("no pair disagrees across its own sites, so LEAF-CONTINGENT can " +
+			"never be emitted and the sweep's per-pair verdicts are back to being " +
+			"single-sample claims that nothing checks (#8859)")
+	}
+	// THE HARMFUL SHAPE SPECIFICALLY. A pair that says SAME on one leaf and
+	// CANDIDATE-DROP on another would, under first-site-wins, publish "no
+	// defect" while silently losing a value through the other leaf.
+	if harmful == 0 {
+		t.Error("no pair mixes SAME with CANDIDATE-DROP across its sites. Either " +
+			"the population changed or this cell stopped measuring the shape it " +
+			"exists for -- it is the SAME-hiding-a-drop case that makes " +
+			"first-site-wins dangerous rather than merely imprecise (#8859)")
+	}
+	t.Logf("#8859: %d pairs, %d leaf-contingent, %d of those mix SAME with "+
+		"CANDIDATE-DROP", len(perPair), contingent, harmful)
 }
