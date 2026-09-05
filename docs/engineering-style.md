@@ -879,6 +879,32 @@ that change's rationale is rewritten.
   has already happened, recover by filtering: for each modified `.go`,
   if its diff adds none of your change's identifiers,
   `git checkout HEAD -- <file>`.
+- **In `userspace-dp`, do not run a formatter at all — not `cargo fmt`,
+  and not `rustfmt <file>` (#8945).** The Rust tree is NOT
+  rustfmt-managed and the per-file workaround above does not rescue it:
+  - `cargo fmt` on the crate rewrites **~380 files** and **fails the
+    suite** — the #6592 runtime-view canary counts `RuntimeView`
+    constructions by scanning source lines, and rewrapping one changes
+    the count. The failure lands in `worker/loop_body/mod.rs`, a file
+    you did not touch, so the two obvious next moves (debug the canary,
+    debug your change) are both dead ends.
+  - `rustfmt <file>` walks the module SUBTREE, so formatting
+    `worker/mod.rs` also formats `worker/loop_body/*` and
+    `worker/cos/*`. Five files in, sixteen files out.
+  - Worst: a **`#[path]`-included file that lives inside a `mod` block
+    in its parent** is indented four spaces by convention while its
+    braces live in the parent. rustfmt sees a standalone module,
+    concludes the file is over-indented, and **de-indents every line** —
+    `neighbor_dispatch_mirror_tests.rs` is ~48KB rewritten end to end
+    with the real edit invisible inside it. That file cannot be
+    simultaneously rustfmt-clean and correct in its parent's context.
+
+  Match the surrounding style by hand, and **check `git status
+  --porcelain` before you trust a suite failure**: a modified-file count
+  larger than what you edited means a formatter ran wide and the failure
+  you are about to debug is probably not yours. This cost two separate
+  hours in one day, the second time while applying the per-file
+  workaround that this bullet's Go half recommends.
 - **Two independent review surfaces.** Codex (hostile, design-level)
   and Copilot (inline, mechanical-detail) catch different classes of
   bugs. Treat them as separate passes; do not skip either. Codex
