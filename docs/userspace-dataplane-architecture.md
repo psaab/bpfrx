@@ -3480,6 +3480,17 @@ restarted, and they answer **different questions**. Conflating them is what
 | `snapshotBindingPlanKey` | did the AF_XDP **binding plan** change? | workers, ring entries, and the interface/fabric topology |
 | `configEqual` | did the helper's **process identity** change? | `Binary`, `ControlSocket`, `EventSocket`, `StateFile`, `Workers`, `RingEntries`, `PollMode` |
 
+`configEqual` is defined as equality of `helperSpawnIdentity` — the values
+`ensureProcessLocked` actually puts on the command line and binds its sockets
+to, **after every default is resolved**. Two of those fields have resolvers
+(`PollMode` "" → `busy-poll`, `EventSocket` "" → derived beside the control
+socket), and comparing either raw reports a difference that does not exist in
+the spawned process: an operator writing a default down explicitly would restart
+the dataplane on a commit that changes nothing. Both instances shipped — the
+second was found only because the first was fixed and someone checked its
+sibling. Defining the comparison *as* the resolution is what makes a third
+impossible rather than merely checked for.
+
 The plan key is deliberately **insensitive** to process identity, and must stay
 that way: it also gates the same-plan refresh exception that lets FIB-only
 updates through during XSK startup, and it must not churn when a tunnel appears

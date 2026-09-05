@@ -482,14 +482,46 @@ func effectivePollMode(c config.UserspaceConfig) string {
 	return c.PollMode
 }
 
+// helperSpawnIdentity is what the helper process IS: the exact set of values
+// `ensureProcessLocked` puts on its command line and binds its sockets to,
+// AFTER every default has been resolved.
+//
+// #8899: two of these fields have resolvers and the comparison used the RAW
+// value for both, so writing a default down explicitly compared unequal while
+// producing an identical child. `PollMode` was found by review and fixed;
+// `EventSocket` was the same defect one field over and the fix did not
+// generalise to it, because nothing tied the comparison to the resolution.
+//
+// This type is that tie. `configEqual` is defined AS identity equality, so a
+// field can no longer be compared by a different rule than the one the spawn
+// path applies — the two cannot drift, rather than being checked for drift.
+// A new argv field is added here once and both sides follow.
+type helperSpawnIdentity struct {
+	binary        string
+	controlSocket string
+	eventSocket   string
+	stateFile     string
+	pollMode      string
+	workers       int
+	ringEntries   int
+}
+
+// helperSpawnIdentityOf resolves a config to the process it would spawn.
+// Every field here is read from the same helper the spawn path uses.
+func helperSpawnIdentityOf(c config.UserspaceConfig) helperSpawnIdentity {
+	return helperSpawnIdentity{
+		binary:        c.Binary,
+		controlSocket: c.ControlSocket,
+		eventSocket:   helperEventSocketPath(c),
+		stateFile:     c.StateFile,
+		pollMode:      effectivePollMode(c),
+		workers:       c.Workers,
+		ringEntries:   c.RingEntries,
+	}
+}
+
 func configEqual(a, b config.UserspaceConfig) bool {
-	return a.Binary == b.Binary &&
-		a.ControlSocket == b.ControlSocket &&
-		a.EventSocket == b.EventSocket &&
-		a.StateFile == b.StateFile &&
-		a.Workers == b.Workers &&
-		a.RingEntries == b.RingEntries &&
-		effectivePollMode(a) == effectivePollMode(b)
+	return helperSpawnIdentityOf(a) == helperSpawnIdentityOf(b)
 }
 
 func (m *Manager) StartFIBSync(ctx context.Context) {

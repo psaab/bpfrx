@@ -448,3 +448,99 @@ func TestPollModeDefaultIsNotAProcessIdentityChange8899(t *testing.T) {
 			"acked without a restart")
 	}
 }
+
+// #8899, from review: WRITING A DEFAULT DOWN EXPLICITLY MUST BE A NO-OP.
+//
+// Two fields of the spawn identity are resolved rather than used raw —
+// `PollMode` ("" -> busy-poll) and `EventSocket` ("" -> derived beside the
+// control socket). Comparing either RAW reports a difference that does not
+// exist in the spawned process, and under the startup-window trigger that
+// difference becomes a spurious RESTART of the dataplane on a commit that
+// changes nothing.
+//
+// THE CLASSIFICATION GUARD CANNOT CATCH THIS, and that is the reason this cell
+// is separate rather than another subtest there. That guard asks *is every
+// field classified* — and `EventSocket` was classified correctly the whole
+// time: it is process identity, it is in `configEqual`, and every mutation of
+// the guard passes. **"Is every field classified" and "is every field compared
+// correctly" are different questions**, and a guard that enumerates fields is
+// blind to HOW each is compared. That blindness is exactly why fixing
+// `PollMode` did not generalise to its sibling and nothing noticed.
+//
+// The structural fix is `helperSpawnIdentity`: `configEqual` is defined AS
+// identity equality, so a field cannot be compared by a rule different from
+// the one the spawn path applies. This cell pins the two resolvers that exist
+// today; the type is what stops a third from drifting.
+func TestWritingADefaultExplicitlyIsNotAChange8899(t *testing.T) {
+	for _, c := range []struct {
+		field   string
+		explicit func(config.UserspaceConfig) config.UserspaceConfig
+		resolved func(config.UserspaceConfig) string
+	}{
+		{
+			field:    "PollMode",
+			explicit: func(c config.UserspaceConfig) config.UserspaceConfig { c.PollMode = defaultPollMode; return c },
+			resolved: effectivePollMode,
+		},
+		{
+			field: "EventSocket",
+			explicit: func(c config.UserspaceConfig) config.UserspaceConfig {
+				c.EventSocket = helperEventSocketPath(c)
+				return c
+			},
+			resolved: helperEventSocketPath,
+		},
+	} {
+		t.Run(c.field, func(t *testing.T) {
+			base := baseUserspaceConfig8899()
+			// Start from the UNSET spelling for this field.
+			switch c.field {
+			case "PollMode":
+				base.PollMode = ""
+			case "EventSocket":
+				base.EventSocket = ""
+			}
+			explicit := c.explicit(base)
+
+			// LIVENESS: the two spellings must differ as raw values, or this
+			// asserts that identical things are identical.
+			if reflect.DeepEqual(base, explicit) {
+				t.Fatalf("fixture: the explicit spelling of %s is byte-identical to the "+
+					"unset one, so nothing is being resolved", c.field)
+			}
+			// And they must resolve to the SAME effective value, or the premise
+			// of the cell is wrong rather than the code.
+			if c.resolved(base) != c.resolved(explicit) {
+				t.Fatalf("fixture: %s resolves differently (%q vs %q); the explicit "+
+					"spelling is not the default after all",
+					c.field, c.resolved(base), c.resolved(explicit))
+			}
+
+			if !configEqual(base, explicit) {
+				t.Errorf("configEqual reports a difference for %s between the unset "+
+					"spelling and its explicit default, but both spawn the identical "+
+					"helper (%s resolves to %q either way). Under the startup-window "+
+					"trigger this RESTARTS THE DATAPLANE for a commit that changes "+
+					"nothing (#8899).", c.field, c.field, c.resolved(base))
+			}
+			if processRestartRequiredDuringStartup(true, base, explicit) {
+				t.Errorf("writing %s explicitly at its default must not force a restart "+
+					"during the XSK-startup window", c.field)
+			}
+
+			// The other direction: the resolver must not swallow a REAL change.
+			real := base
+			switch c.field {
+			case "PollMode":
+				real.PollMode = "interrupt"
+			case "EventSocket":
+				real.EventSocket = "/run/xpf/some-other-events.sock"
+			}
+			if configEqual(base, real) {
+				t.Errorf("configEqual now treats a genuinely different %s as equal — the "+
+					"resolution is too broad and a real process-identity change would be "+
+					"acked without a restart", c.field)
+			}
+		})
+	}
+}
