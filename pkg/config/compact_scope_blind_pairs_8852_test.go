@@ -103,6 +103,12 @@ var knownBlindScopePairs8852 = map[string]string{
 	// #8879 batch 2, same reasoning as batch 1: admitted after measuring the
 	// elided spelling SILENT, blind to arm 2 for the same structural reason, so
 	// their fold correctness rests on the per-pair cells rather than the census.
+	// #8879 batch 4. Shapes derived the same way as batch 3 — sentinel first,
+	// then read back off this cell's own re-derivation.
+	"forwarding-options sampling":    "plain-container",
+	"protocols router-advertisement": "plain-container",
+	"snmp v3":                        "plain-container",
+	"system archival":                "plain-container",
 	// #8879 batch 3. Shapes DERIVED, not assumed — registered with a sentinel
 	// first and read back off this cell's own re-derivation, which is the only
 	// reading that cannot be my expectation echoed back at me.

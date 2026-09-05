@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"testing"
 )
@@ -58,6 +59,50 @@ func TestAdmittedPairsCompileLikeBraced8879(t *testing.T) {
 			`security { nat { source { pool P { address 10.0.0.1/32; } } } }`,
 			`security nat { source { pool P { address 10.0.0.1/32; } } }`,
 			func(c *Config) string { return fmt.Sprintf("pools=%d", len(c.Security.NAT.SourcePools)) }},
+		// #8879 batch 4. Mode-spanning again — a pointer struct reached
+		// through a keyed sub-map (`sampling`), a slice
+		// (`router-advertisement`), a map (`snmp v3`), and a struct whose
+		// every OTHER field is a default (`archival`).
+		//
+		// `system archival` is the reason the liveness check compares against
+		// an empty config rather than against nil: TransferOnCommit,
+		// ArchiveDir and MaxArchives all come back at their defaults here, so
+		// only TransferInterval carries the fixture's signal. Reading the
+		// whole struct and asking "is it non-empty" would have been satisfied
+		// entirely by defaults.
+		{"forwarding-options sampling",
+			`forwarding-options { sampling { instance si1 { input { rate 7717; } } } }`,
+			`forwarding-options sampling { instance si1 { input { rate 7717; } } }`,
+			func(c *Config) string {
+				if c.ForwardingOptions.Sampling == nil {
+					return "<nil>"
+				}
+				return fmt.Sprintf("inst=%d", len(c.ForwardingOptions.Sampling.Instances))
+			}},
+		{"protocols router-advertisement",
+			`protocols { router-advertisement { interface ge-0/0/7.0 { link-mtu 1444; } } }`,
+			`protocols router-advertisement { interface ge-0/0/7.0 { link-mtu 1444; } }`,
+			func(c *Config) string {
+				return fmt.Sprintf("ra=%d", len(c.Protocols.RouterAdvertisement))
+			}},
+		{"snmp v3",
+			`snmp { v3 { usm { local-engine { user u7717 { authentication-sha { authentication-password sekritpw; } } } } } }`,
+			`snmp v3 { usm { local-engine { user u7717 { authentication-sha { authentication-password sekritpw; } } } } }`,
+			func(c *Config) string {
+				if c.System.SNMP == nil {
+					return "<no-snmp>"
+				}
+				return fmt.Sprintf("v3users=%d", len(c.System.SNMP.V3Users))
+			}},
+		{"system archival",
+			`system { archival { configuration { transfer-interval 77; } } }`,
+			`system archival { configuration { transfer-interval 77; } }`,
+			func(c *Config) string {
+				if c.System.Archival == nil {
+					return "<nil>"
+				}
+				return fmt.Sprintf("interval=%d", c.System.Archival.TransferInterval)
+			}},
 		// #8879 batch 3, chosen to SPAN MODES: four subsystems and four
 		// different compiled shapes — a pointer struct (`isis`), a slice
 		// (`generate`), a scalar string (`license`) and a struct-of-scalars
@@ -264,18 +309,28 @@ func TestInstanceNamePairCannotBeAdmitted8879(t *testing.T) {
 	// treated identically by the predicate — if they ever differ, the
 	// predicate has started keying on instance names and this whole cell,
 	// plus the reasoning above, needs revisiting.
-	a := compactNormalizeInScope("interfaces", "ge-0/0/0")
-	b := compactNormalizeInScope("interfaces", "xe-7/1/3")
-	if a != b {
-		t.Errorf("compactNormalizeInScope treats `interfaces ge-0/0/0` (%v) "+
-			"differently from `interfaces xe-7/1/3` (%v). The predicate is "+
-			"keyed on literal keyword pairs, so an instance-named head must "+
-			"be indistinguishable from any other (#8879).", a, b)
-	}
-	if a {
-		t.Errorf("`interfaces <name>` is reported IN SCOPE. An instance name " +
-			"cannot be a literal admission key, so this can only mean the " +
-			"predicate matched something it should not have (#8879).")
+	// Two containers, not one: `interfaces <name>` and `routing-instances
+	// <name>` are BOTH instance-named heads in the #8879 population, and a
+	// bound demonstrated on a single container is a claim about that
+	// container. Asserting both makes it a claim about the shape.
+	for _, ct := range []struct{ container, n1, n2 string }{
+		{"interfaces", "ge-0/0/0", "xe-7/1/3"},
+		{"routing-instances", "vrf-blue", "vrf-green"},
+	} {
+		a := compactNormalizeInScope(ct.container, ct.n1)
+		b := compactNormalizeInScope(ct.container, ct.n2)
+		if a != b {
+			t.Errorf("compactNormalizeInScope treats `%s %s` (%v) differently "+
+				"from `%s %s` (%v). The predicate is keyed on literal keyword "+
+				"pairs, so an instance-named head must be indistinguishable "+
+				"from any other (#8879).", ct.container, ct.n1, a, ct.container, ct.n2, b)
+		}
+		if a {
+			t.Errorf("`%s <name>` is reported IN SCOPE. An instance name "+
+				"cannot be a literal admission key, so this can only mean the "+
+				"predicate matched something it should not have (#8879).",
+				ct.container)
+		}
 	}
 	// And the property the sweep's verdict was mistaken about: with a real
 	// leaf, the elided spelling is NOT refused. Asserting this keeps the
@@ -292,5 +347,84 @@ func TestInstanceNamePairCannotBeAdmitted8879(t *testing.T) {
 			"this cell should move to the gate; as measured for #8879 it was "+
 			"accepted, and the decline rests on the instance-name bound "+
 			"instead.", err)
+	}
+}
+
+// TestSweepUnanswerableRowIsNotADefect8879 adjudicates the #8879 population's
+// one NO-REFERENCE row, `firewall three-color-policer <name>`.
+//
+// The sweep reports it as "braced form does not compile — fixture cannot
+// answer", which is an honest THIRD STATE rather than a verdict: the
+// instrument is saying it did not measure, not that there is nothing to
+// measure. That distinction is easy to lose, and a row parked in it is
+// indistinguishable from an adjudicated one on any count of remaining work.
+//
+// Re-asked with a hand-written fixture the row answers cleanly. The
+// synthesized fixture failed a COMPILER VALIDATION, not the elision:
+// `three-color-policer requires positive excess-burst-size`. Supply one and
+// both spellings compile strictly clean AND produce byte-identical configs.
+//
+// The reason they agree is NOT that the pair is naturally equivalent. It is
+// that `firewall three-color-policer` is ALREADY ADMITTED to
+// compactNormalizeInScope — this is the FOLD DOING THE WORK, which is a
+// different label from "no defect here" and must not be recorded as the
+// latter. Verified two-sided on sibling pairs: removing the admission for
+// `firewall policer` and `snmp community` makes their two spellings DIFFER,
+// so agreement in this family is caused by the admission rather than by the
+// shape.
+//
+// The pair therefore needs no NEW admission, which is why it is a decline —
+// but a reader must not conclude the elision is harmless here. The assertion
+// below pins the actual cause, so the reason cannot rot into the wrong one.
+func TestSweepUnanswerableRowIsNotADefect8879(t *testing.T) {
+	const body = `single-rate { committed-information-rate 40m; ` +
+		`committed-burst-size 100k; excess-burst-size 200k; } ` +
+		`then { loss-priority high; }`
+	braced := "firewall { three-color-policer tcp1 { " + body + " } }"
+	elided := "firewall three-color-policer tcp1 { " + body + " }"
+
+	dig := func(txt string) string {
+		tr, perrs := NewParser(txt).Parse()
+		if len(perrs) > 0 {
+			t.Fatalf("fixture must parse: %v", perrs[0])
+		}
+		// LIVENESS, fatal: if the reference stops compiling, this cell has
+		// fallen back into exactly the unanswerable state it exists to
+		// resolve, and every comparison below would be vacuous.
+		if _, err := CompileConfig(tr); err != nil {
+			t.Fatalf("fixture no longer compiles at STRICT commit (%v). This "+
+				"cell adjudicates a row the sweep could not answer because "+
+				"its fixture did not compile; if this one stops compiling "+
+				"too, the row is unadjudicated again rather than clean.", err)
+		}
+		c, err := CompileConfigLenient(tr)
+		if err != nil || c == nil {
+			t.Fatalf("lenient compile failed: %v", err)
+		}
+		c.Warnings = nil
+		b, _ := json.Marshal(c)
+		return string(b)
+	}
+
+	// The CAUSE, pinned. If this pair ever leaves the admission list, the
+	// identity asserted below would break for a reason the comment above
+	// would no longer explain.
+	if !compactNormalizeInScope("firewall", "three-color-policer") {
+		t.Errorf("`firewall three-color-policer` is no longer admitted to " +
+			"compactNormalizeInScope. This cell records the pair as declined " +
+			"BECAUSE the fold already handles it; with the admission gone " +
+			"that reason is false and the row needs re-adjudicating rather " +
+			"than staying declined (#8879).")
+	}
+	if len(dig(braced)) == 0 {
+		t.Fatal("braced reference produced nothing to compare")
+	}
+	if got, want := dig(elided), dig(braced); got != want {
+		t.Errorf("`firewall three-color-policer <name>` was adjudicated NOT A "+
+			"DEFECT for #8879 on the strength of the two spellings compiling "+
+			"IDENTICALLY, and they no longer do (%d vs %d bytes). Either a "+
+			"real drop has appeared here, or the decline recorded in this "+
+			"cell is now wrong -- it must not stay declined by inertia.",
+			len(got), len(want))
 	}
 }
