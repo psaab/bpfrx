@@ -35,7 +35,7 @@ import (
 // priority 200` failure. Empty-equivalence is reported alongside, because it is
 // still the cheapest evidence when it holds.
 func TestCompactNormalizeScopePreservesCompiledResult8690(t *testing.T) {
-	var admitted, violating, disarmed, fixtureLimited []string
+	var admitted, violating, disarmed, fixtureLimited, introducedRejection []string
 	emptyEquivalent := 0
 	seamObserved := 0
 	// SKIP ACCOUNTING. Making admission behavioural gave this loop a failure
@@ -190,13 +190,31 @@ func TestCompactNormalizeScopePreservesCompiledResult8690(t *testing.T) {
 		// Distinguishing them automatically would need the gates themselves to
 		// declare which kind they are; until then this arm reports and a person
 		// classifies.
-		if off := compileStrict8690(t, elidedText, true); off != nil {
-			switch on := compileStrict8690(t, elidedText, false); {
-			case on == nil:
-				disarmed = append(disarmed, siteKey)
-			case on.Error() != off.Error():
-				fixtureLimited = append(fixtureLimited, siteKey)
-			}
+		off := compileStrict8690(t, elidedText, true)
+		on := compileStrict8690(t, elidedText, false)
+		switch {
+		case off != nil && on == nil:
+			disarmed = append(disarmed, siteKey)
+		case off != nil && on != nil && on.Error() != off.Error():
+			fixtureLimited = append(fixtureLimited, siteKey)
+		case off == nil && on != nil:
+			// THE OTHER DIRECTION, which this arm did not look at until a hand
+			// measurement turned one up. The pass can also turn an ACCEPTANCE
+			// into a REJECTION, and that is usually the gate working rather
+			// than breaking: elided `from-zone <a> to-zone <b> policy p1;` is
+			// accepted without the pass because the tail is dropped and no
+			// policy is created for anything to object to, and is refused with
+			// it by the #3044 missing-criterion gate because the policy now
+			// exists. A silent loss became a loud rejection.
+			//
+			// Reported rather than failed, for that reason — but reported,
+			// because the same signature would appear if the pass MANGLED a
+			// stanza into something invalid, and nothing else in this cell
+			// would notice. It is also a commit-compatibility fact: a config
+			// that committed clean stops committing. (The tolerant load path
+			// is what governs whether that strands a node, and for the known
+			// instance it accepts both spellings.)
+			introducedRejection = append(introducedRejection, siteKey)
 		}
 		// SEAM LIVENESS. The check above reads "rejected without the pass,
 		// accepted with it". If skipCompactNormalize stopped being honoured,
@@ -221,6 +239,7 @@ func TestCompactNormalizeScopePreservesCompiledResult8690(t *testing.T) {
 	sort.Strings(violating)
 	sort.Strings(disarmed)
 	sort.Strings(fixtureLimited)
+	sort.Strings(introducedRejection)
 
 	// DEGENERACY GUARD: a walk that admitted nothing would report a clean scope
 	// for the same reason a correct one does.
@@ -282,7 +301,7 @@ func TestCompactNormalizeScopePreservesCompiledResult8690(t *testing.T) {
 	// widening admitting fifty sites whose gate status cannot be determined
 	// logged a bigger number and passed. A category that only accumulates stops
 	// being a measurement and becomes a registration.
-	if diff := diffSiteSets8690(fixtureLimited, knownFixtureLimited8690); diff != "" {
+	if diff := diffSiteSets8690(fixtureLimited, sortedKeys8690(knownFixtureLimited8690)); diff != "" {
 		t.Errorf("the set of admitted sites whose GATE STATUS cannot be "+
 			"measured has changed:\n%s\n"+
 			"A NEW entry means a widening admitted a site where the census "+
@@ -299,6 +318,35 @@ func TestCompactNormalizeScopePreservesCompiledResult8690(t *testing.T) {
 			"as merely unmeasured, and hand-measurement with a real URL showed "+
 			"it rejected without the pass and accepted with it. Visibility is "+
 			"not a verdict (#8690).", diff)
+	}
+	if n := len(introducedRejection); n > 0 {
+		// COUNT, not the list. Measured at 64 sites, and spot-checking showed
+		// they are the pass DOING ITS JOB rather than a hazard: the elided
+		// spelling drops its tail, so without the pass nothing is created and
+		// no validator has anything to object to; with the pass the stanza
+		// exists and its own validator says what is missing.
+		//
+		//	chassis device-map interface ge-0-0-0;
+		//	  pass OFF -> accepted (no device-map entry exists)
+		//	  pass ON  -> "interface ge-0-0-0 has neither a pci nor a mac
+		//	              identity key" -- correct, and previously silent
+		//
+		// The complete spelling (`interface ge-0-0-0 { pci ...; }`) is accepted
+		// both ways, so this is not a regression on real configs. Printing all
+		// 64 every run would read as a warning list and be ignored, which is
+		// worse than a number with its meaning attached.
+		//
+		// It is still counted, because the SAME signature would appear if the
+		// pass mangled a stanza into something invalid. A jump here after a
+		// widening is worth a look; a steady number is the pass converting
+		// silent losses into diagnostics. And before assuming any instance is
+		// harmless, check the TOLERANT path -- a persisted config that stops
+		// loading strands a node (#1960); for the instance measured by hand,
+		// load/peer-sync accepts both spellings.
+		t.Logf("#8690: %d admitted site(s) are accepted WITHOUT the pass and "+
+			"rejected WITH it -- the pass making a dropped tail visible to the "+
+			"stanza's own validator. Not a defect list; see the note above "+
+			"before treating a change in this number as one.", n)
 	}
 	if len(fixtureLimited) > 0 {
 		t.Logf("#8690: %d admitted site(s) could not have their gate status "+
@@ -749,37 +797,63 @@ func dedupe8690(in []string) []string {
 // clean and prove to be a real disarm. Listed rather than counted so that
 // admitting a new one is a decision someone makes rather than a number that
 // moves.
-var knownFixtureLimited8690 = []string{
-	// Added when the schedulers/chassis merge brought in other lanes' families.
-	// Both were admitted by increments that landed while this assertion did not
-	// yet exist, so they are recorded rather than treated as regressions --
-	// the same call as the unexaminable list. Their gate status is UNKNOWN, not
-	// safe, and reported to the lanes that own them.
-	"security ipsec policy xpfarg proposals",
-	"security policies from-zone xpfarg xpfarg xpfarg policy",
-	"protocols bgp group xpfarg neighbor xpfarg export",
-	"protocols bgp group xpfarg neighbor xpfarg import",
-	"security nat destination rule-set xpfarg rule xpfarg match application",
-	"security nat destination rule-set xpfarg rule xpfarg match destination-address",
-	"security nat destination rule-set xpfarg rule xpfarg match destination-address-name",
-	"security nat destination rule-set xpfarg rule xpfarg match destination-port",
-	"security nat destination rule-set xpfarg rule xpfarg match protocol",
-	"security nat destination rule-set xpfarg rule xpfarg match source-address",
-	"security nat destination rule-set xpfarg rule xpfarg match source-address-name",
-	"security nat source rule-set xpfarg rule xpfarg match application",
-	"security nat source rule-set xpfarg rule xpfarg match destination-address",
-	"security nat source rule-set xpfarg rule xpfarg match destination-address-name",
-	"security nat source rule-set xpfarg rule xpfarg match destination-port",
-	"security nat source rule-set xpfarg rule xpfarg match source-address",
-	"security nat source rule-set xpfarg rule xpfarg match source-address-name",
-	"security nat static rule-set xpfarg rule xpfarg match source-address",
-	"security policies from-zone xpfarg xpfarg xpfarg policy xpfarg match application",
-	"security policies from-zone xpfarg xpfarg xpfarg policy xpfarg match destination-address",
-	"security policies from-zone xpfarg xpfarg xpfarg policy xpfarg match source-address",
-	"security policies global policy xpfarg match application",
-	"security policies global policy xpfarg match destination-address",
-	"security policies global policy xpfarg match source-address",
+var knownFixtureLimited8690 = map[string]string{
+	// HAND-MEASURED. lane-8015 showed this bucket hides live disarms — it
+	// hand-measured the three its scope added and `security dynamic-address
+	// feed-server <n> url` proved to be a real one. So an entry carries the
+	// verdict a person reached with a type-VALID value and the siblings the
+	// validator needs, not merely the fact that the census fixture could not
+	// decide. A visible unmeasured bucket is still unmeasured.
+	"security ipsec policy xpfarg proposals": "HAND-MEASURED: BENIGN. Elided " +
+		"`ipsec policy pol1 proposals pr1;` is refused without the pass (\"has no " +
+		"resolvable ipsec proposal ... the configured perfect-forward-secrecy group " +
+		"would be silently dropped\") and compiles with it. The gate objects to the " +
+		"DROP, not the spelling: with the pass the compiled config is IDENTICAL to " +
+		"the braced spelling's, which is the decisive test. Same class as the #8430 " +
+		"empty-match gate and `snmp trap-group targets`.",
+
+	"security policies from-zone xpfarg xpfarg xpfarg policy": "HAND-MEASURED: " +
+		"NOT A DISARM — it runs the OTHER WAY, which this arm does not check at " +
+		"all. With zones defined, elided `from-zone trust to-zone untrust policy " +
+		"p1;` is ACCEPTED without the pass (the tail is dropped, so no policy is " +
+		"created and nothing objects) and REJECTED with it by the #3044 " +
+		"missing-criterion gate (the policy now exists and has no match " +
+		"dimensions). The pass converts a SILENT LOSS into a LOUD REJECTION, which " +
+		"is the gate working. No upgrade hazard: the tolerant load/peer-sync path " +
+		"accepts both spellings, so a persisted config still loads and only a fresh " +
+		"commit is refused.",
+
+	// NOT YET HAND-MEASURED. Listed with an explicit marker rather than left
+	// bare, so the difference between "a person checked and it is fine" and
+	// "nobody has looked" is visible in the file. Every one is a candidate for
+	// the treatment above.
+	"protocols bgp group xpfarg neighbor xpfarg export":                                        notHandMeasured8690,
+	"protocols bgp group xpfarg neighbor xpfarg import":                                        notHandMeasured8690,
+	"security nat destination rule-set xpfarg rule xpfarg match application":                   notHandMeasured8690,
+	"security nat destination rule-set xpfarg rule xpfarg match destination-address":           notHandMeasured8690,
+	"security nat destination rule-set xpfarg rule xpfarg match destination-address-name":      notHandMeasured8690,
+	"security nat destination rule-set xpfarg rule xpfarg match destination-port":              notHandMeasured8690,
+	"security nat destination rule-set xpfarg rule xpfarg match protocol":                      notHandMeasured8690,
+	"security nat destination rule-set xpfarg rule xpfarg match source-address":                notHandMeasured8690,
+	"security nat destination rule-set xpfarg rule xpfarg match source-address-name":           notHandMeasured8690,
+	"security nat source rule-set xpfarg rule xpfarg match application":                        notHandMeasured8690,
+	"security nat source rule-set xpfarg rule xpfarg match destination-address":                notHandMeasured8690,
+	"security nat source rule-set xpfarg rule xpfarg match destination-address-name":           notHandMeasured8690,
+	"security nat source rule-set xpfarg rule xpfarg match destination-port":                   notHandMeasured8690,
+	"security nat source rule-set xpfarg rule xpfarg match source-address":                     notHandMeasured8690,
+	"security nat source rule-set xpfarg rule xpfarg match source-address-name":                notHandMeasured8690,
+	"security nat static rule-set xpfarg rule xpfarg match source-address":                     notHandMeasured8690,
+	"security policies from-zone xpfarg xpfarg xpfarg policy xpfarg match application":         notHandMeasured8690,
+	"security policies from-zone xpfarg xpfarg xpfarg policy xpfarg match destination-address": notHandMeasured8690,
+	"security policies from-zone xpfarg xpfarg xpfarg policy xpfarg match source-address":      notHandMeasured8690,
+	"security policies global policy xpfarg match application":                                 notHandMeasured8690,
+	"security policies global policy xpfarg match destination-address":                         notHandMeasured8690,
+	"security policies global policy xpfarg match source-address":                              notHandMeasured8690,
 }
+
+// notHandMeasured8690 marks a bucket entry nobody has measured by hand yet.
+// It is not a verdict; it is the absence of one.
+const notHandMeasured8690 = "NOT YET HAND-MEASURED: the census fixture could not decide, and no one has written this site out with a type-valid value to find out"
 
 // #8690: a DEMONSTRATION that arm 2's reach is narrower than its name suggests,
 // kept executable so the limitation note above cannot quietly stop being true.
@@ -832,4 +906,15 @@ func TestArm2CannotSeeATrailingTokenGate8690(t *testing.T) {
 			"shrink the limitation note above, rather than leaving a claim with " +
 			"no evidence under it (#8690)")
 	}
+}
+
+// sortedKeys8690 returns a map's keys, so an equality assertion can be made
+// against a map that carries per-entry evidence.
+func sortedKeys8690(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
