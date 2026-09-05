@@ -448,3 +448,175 @@ func TestPositionalPredicateControl8807(t *testing.T) {
 		t.Fatal("the control did NOT restore the schema; subsequent tests in this package are compromised")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// #8807 direction 2, the CONVERSE: declared at position P and UNREAD at P.
+//
+// This is the predicate that defeated #8787's predicate C five times, and the
+// reason is #8785: `description` is DECLARED under `security ike proposal`, and
+// the defect is that nothing holds it -- no compiler clause reads it there and
+// IKEProposal has no field for it. So "unread" cannot be answered by asking
+// whether the keyword appears anywhere; it has to be asked AT THE PATH.
+//
+// THE COVERAGE GATE, and why it is not tuned to save the control. Container
+// recovery is partial, so a container whose clauses are mostly unlocalised has
+// an under-populated read-set and every declared child looks unread. Containers
+// are therefore only considered when the compiler is observed to read at least
+// converseCoverage8807 of what is declared there -- evidence that the read-set
+// is reasonably complete. The #8785 control passes at 50%, 60%, 70% AND 80%,
+// so the threshold is not doing the work of the control; it was chosen for
+// signal-to-noise (26 hits at 50%, 9 at 70%).
+//
+// An UNAMBIGUOUS-container filter was tried first and REJECTED: it cuts the set
+// to 2, but `proposal` has two schema paths, so it excludes the #8785 control
+// itself. A filter that kills its own control invalidates everything downstream
+// of it -- #8787 recorded that lesson about predicate A and it applies here.
+const converseCoverage8807 = 0.7
+
+type converseVerdict8807 struct {
+	state string // "known-defect" | "unmeasured" | "benign"
+	why   string
+}
+
+// UNMEASURED IS A THIRD STATE, not a quiet pass. Every row below except #8785
+// needs both spellings compiled before it can be called anything -- of the five
+// hits in direction 1, two were benign, so assuming would over-report by 40%.
+var converseAdjudicated8807 = map[string]converseVerdict8807{
+	"proposal / description": {"known-defect", "#8785. Declared under `security ike proposal` (and `security " +
+		"ipsec proposal`), no compiler clause reads it there, and IKEProposal has no Description field. The " +
+		"three-part remedy is declare / add the field / read it, and only the first is visible to a schema test."},
+
+	"policy / description":    {"unmeasured", "declared under a policy container; no localised read clause. NOT MEASURED."},
+	"policy / scheduler-name": {"unmeasured", "NOT MEASURED."},
+	"pool / dns-server":       {"unmeasured", "DHCP pool; NOT MEASURED."},
+	"pool / static-binding":   {"unmeasured", "DHCP pool; NOT MEASURED."},
+	"profile / feed-name":     {"unmeasured", "NOT MEASURED."},
+	"route / policy":          {"unmeasured", "NOT MEASURED."},
+	"schedulers / scheduler":  {"unmeasured", "NOT MEASURED."},
+	"vpn / traffic-selector":  {"unmeasured", "IPsec VPN; the compiler may read it through a helper rather than a .Name() clause. NOT MEASURED."},
+}
+
+// converseHits8807 returns "container / head" for every head declared at a
+// container the compiler demonstrably reads, that has no read clause there.
+func converseHits8807(t *testing.T) []string {
+	t.Helper()
+	read := map[string]map[string]bool{}
+	for _, s := range positionalSites8807(t) {
+		if s.container == "" {
+			continue
+		}
+		if read[s.container] == nil {
+			read[s.container] = map[string]bool{}
+		}
+		read[s.container][s.head] = true
+	}
+	decl := containerDeclares8807()
+	var out []string
+	for cont, heads := range decl {
+		r, ok := read[cont]
+		if !ok || len(heads) == 0 {
+			continue
+		}
+		hit := 0
+		for h := range heads {
+			if r[h] {
+				hit++
+			}
+		}
+		if float64(hit)/float64(len(heads)) < converseCoverage8807 {
+			continue
+		}
+		for h := range heads {
+			if !r[h] {
+				out = append(out, cont+" / "+h)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func TestConversePredicateIsPinned8807(t *testing.T) {
+	hits := converseHits8807(t)
+	live := map[string]bool{}
+	for _, h := range hits {
+		live[h] = true
+	}
+	var added, removed []string
+	for h := range live {
+		if _, ok := converseAdjudicated8807[h]; !ok {
+			added = append(added, h)
+		}
+	}
+	for h := range converseAdjudicated8807 {
+		if !live[h] {
+			removed = append(removed, h)
+		}
+	}
+	sort.Strings(added)
+	sort.Strings(removed)
+	if len(added) > 0 {
+		t.Errorf("UNPINNED converse hit(s): %v\n"+
+			"Declared at this container and no clause reads it there. That is a "+
+			"CANDIDATE: it may be read through a helper rather than a .Name() "+
+			"switch, which this predicate cannot see. Compile both spellings and "+
+			"check the typed struct actually HOLDS the value -- #8785's defect was "+
+			"a missing struct field behind a correct declaration.%s", added, posBlindness8807)
+	}
+	if len(removed) > 0 {
+		t.Errorf("converse hit(s) GONE: %v\n"+
+			"If a read clause was added, delete the row. If they vanished because "+
+			"container recovery or the coverage gate changed, the instrument moved "+
+			"and not the code -- check before believing it.%s", removed, posBlindness8807)
+	}
+
+	unmeasured := 0
+	for h, v := range converseAdjudicated8807 {
+		if v.state == "unmeasured" && live[h] {
+			unmeasured++
+		}
+	}
+	if unmeasured > converseUnmeasured8807 {
+		t.Errorf("unmeasured converse rows ROSE to %d (ceiling %d). "+
+			"\"Not measured\" is a THIRD STATE, not a pass, and it must not "+
+			"accumulate.%s", unmeasured, converseUnmeasured8807, posBlindness8807)
+	}
+	if unmeasured < converseUnmeasured8807 {
+		t.Errorf("unmeasured converse rows FELL to %d -- GOOD FAILURE. Set "+
+			"converseUnmeasured8807 = %d so the count cannot drift back up.%s",
+			unmeasured, unmeasured, posBlindness8807)
+	}
+}
+
+// converseUnmeasured8807 is a CEILING on rows whose consequence nobody has
+// established. It ratchets down as they are measured; it must never rise.
+const converseUnmeasured8807 = 8
+
+// TestConversePredicateControl8807 is #8807's second acceptance control: the
+// instrument must report #8785. Both halves run, because "reports it" alone is
+// satisfiable by something that reports everything.
+func TestConversePredicateControl8807(t *testing.T) {
+	has := func(want string) bool {
+		for _, h := range converseHits8807(t) {
+			if h == want {
+				return true
+			}
+		}
+		return false
+	}
+	if !has("proposal / description") {
+		t.Fatalf("#8785 CONTROL FAILED: `proposal / description` is not reported. " +
+			"It is declared under `security ike proposal` with no clause reading it " +
+			"there and no Description field on IKEProposal, so a working converse " +
+			"predicate must surface it. Check container recovery for `proposal` and " +
+			"the coverage gate before trusting any other row -- and note that an " +
+			"unambiguous-container filter WILL break this control, because " +
+			"`proposal` has two schema paths.")
+	}
+	// DECLINE half: a head that IS read at its container must not be reported.
+	if has("proposal / dh-group") {
+		t.Fatalf("`proposal / dh-group` reported, but the IKE proposal compiler " +
+			"reads it -- the predicate is reporting reads as non-reads, so every " +
+			"row is suspect.")
+	}
+}
