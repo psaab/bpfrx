@@ -601,6 +601,13 @@ func TestConversePredicateIsPinned8807(t *testing.T) {
 
 // converseUnmeasured8807 is a CEILING on rows whose consequence nobody has
 // established. It ratchets down as they are measured; it must never rise.
+//
+// "NOT MEASURED" IS NOT A PASS. The justification is direction 1 of this same
+// predicate: of its five hits, TWO were benign -- `vpn / gateway` and
+// `vpn / ipsec-policy` compile identically in both nestings -- so treating hits
+// as findings would have over-reported by 40%. A category that only accumulates
+// stops being a measurement and becomes a registration, which is why this is a
+// ratcheting ceiling and not a logged number.
 const converseUnmeasured8807 = 8
 
 // TestConversePredicateControl8807 is #8807's second acceptance control: the
