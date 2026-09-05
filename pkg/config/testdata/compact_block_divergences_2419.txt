@@ -210,7 +210,6 @@ services rpm probe xpfarg test xpfarg probe-limit	empty
 services rpm probe xpfarg test xpfarg probe-type	empty
 services rpm probe xpfarg test xpfarg routing-instance	empty
 services rpm probe xpfarg test xpfarg source-address	empty
-services rpm probe xpfarg test xpfarg target	empty
 services rpm probe xpfarg test xpfarg test-interval	empty
 system login class	partial
 system login class xpfarg allow-commands	empty

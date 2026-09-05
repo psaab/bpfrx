@@ -429,6 +429,44 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		return true
 	}
 
+	// #8690 family 7: the ONE measurable member of the rpm-test bucket.
+	//
+	// lane-8526 classified all ten `services rpm probe <p> test <t> <leaf>`
+	// sites and only `target` behaves as a benign disarm; re-derived here
+	// rather than relayed, with the pair ADMITTED, because a measurement of an
+	// excluded pair is a restatement of the exclusion:
+	//
+	//	leaf                    pass OFF   pass ON
+	//	target                  rejects    ACCEPTED, test registers
+	//	probe-count             rejects    still rejects
+	//	probe-type              rejects    still rejects
+	//	source-address          rejects    still rejects
+	//	(and the other five)    rejects    still rejects
+	//
+	// `target` is the benign pattern: the gate refuses the CONSEQUENCE of the
+	// drop ("target is required") and the pass repairs it. THE OTHER NINE ARE
+	// NOT — the pass splits their tail correctly and the test still has no
+	// target, so the same gate still fires and nothing changes at the commit
+	// boundary. They need a required sibling the compact spelling cannot carry,
+	// which makes them unreachable by construction rather than merely
+	// unmeasured, and is the same wall #8725 turns on.
+	//
+	// NINE OF TEN WOULD HAVE INHERITED `target`'s VERDICT under any family-level
+	// judgement. That is the v4/v6 static-binding lesson reached from the
+	// opposite direction: there the twins differed in whether the INSTRUMENT
+	// could see them, here they differ in whether the PASS changes anything. A
+	// shape is not a verdict in either direction.
+	//
+	// Pair scoping: `source-address` has 16 definitions in setSchema and
+	// `routing-instance` 14, which looks alarming on the head alone — but
+	// exactly ONE container named `test` exists (schema_system.go:627), so
+	// ("test", <head>) cannot reach any of them. Checking the head raises a
+	// false alarm; checking the inventory answers a different question.
+	switch containerKeyword + " " + head {
+	case "test target":
+		return true
+	}
+
 	// #8690 family 5: applications, services, snmp, event-options. 30 sites,
 	// every one drop shape "empty" in the inventory.
 	//
