@@ -1188,15 +1188,39 @@ func TestNoPairIsAdmittedByTwoFamilySwitches8690(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read predicate source: %v", err)
 	}
-	caseLine := regexp.MustCompile(`(?m)^\t\t"([a-z][^"]*)",?$`)
+	// TWO patterns, because gofmt puts the FIRST pair of a `case` clause on the
+	// `case` line itself and the rest on their own indented lines. A single
+	// `^\t\t"..."` pattern therefore misses exactly one pair per clause — and
+	// this cell shipped with that gap, blind to 11 pairs and to 2 genuine
+	// duplicates among them (`address-book address-set` and `dataplane
+	// control-socket`), each of which is precisely the silent-non-exclusion the
+	// cell exists to catch.
+	//
+	// The gap was invisible in the obvious direction: the cell reported 52
+	// duplicates and 52 is a plausible-looking number, so nothing about its
+	// output suggested it was reading 521 of 532 pairs. Only counting the
+	// SOURCE's pairs independently and comparing showed it.
+	indented := regexp.MustCompile(`(?m)^\t\t"([a-z][^"]*)",?$`)
+	firstOfClause := regexp.MustCompile(`(?m)^\tcase "([a-z][^"]*)",?$`)
 	counts := map[string]int{}
-	for _, m := range caseLine.FindAllStringSubmatch(string(src), -1) {
-		counts[m[1]]++
+	for _, re := range []*regexp.Regexp{indented, firstOfClause} {
+		for _, m := range re.FindAllStringSubmatch(string(src), -1) {
+			counts[m[1]]++
+		}
 	}
 	if len(counts) == 0 {
 		t.Fatal("no case strings found in compact_normalize_8662.go — this cell " +
 			"scans source text, so a formatting change can make it silently " +
 			"measure nothing (#8690)")
+	}
+	// Positive control for the second pattern specifically. The first pattern
+	// matching 500+ pairs would mask the second matching zero, which is how the
+	// original gap survived: a healthy-looking total says nothing about whether
+	// every SHAPE of entry is being read.
+	if n := len(firstOfClause.FindAllStringSubmatch(string(src), -1)); n == 0 {
+		t.Fatal("the `case`-line pattern matched nothing, so the first pair of " +
+			"every clause is unread — that is the gap this cell shipped with, " +
+			"and a formatting change can reintroduce it silently (#8690)")
 	}
 	var dup []string
 	for pair, n := range counts {
@@ -1222,6 +1246,11 @@ func TestNoPairIsAdmittedByTwoFamilySwitches8690(t *testing.T) {
 // switches. Each is a latent silent-non-exclusion; see the cell above. They are
 // pinned, not endorsed.
 var knownDuplicatePairs8690 = []string{
+	// These two became visible only when the cell learned to read the first
+	// pair of a `case` clause. They are the same hazard as the rest and are
+	// pinned on the same terms.
+	"address-book address-set",
+	"dataplane control-socket",
 	"address-set address",
 	"address-set address-set",
 	"daily start-time",
