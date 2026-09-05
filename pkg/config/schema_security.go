@@ -1079,8 +1079,8 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 				"interval":          {desc: "DPD probe interval in seconds (default 10)", args: 1, valueType: ValueInteger, valueDesc: "Probe interval in seconds (1..3600)", valueExamples: []string{"10", "30"}, validator: ValidateInteger(1, 3600), placeholder: "<seconds>", children: nil},
 				"threshold":         {desc: "Failed-probe count before peer is dead (default 5)", args: 1, valueType: ValueInteger, valueDesc: "Failed-probe count (1..100)", valueExamples: []string{"5", "3"}, validator: ValidateInteger(1, 100), placeholder: "<count>", children: nil},
 			}},
-			"local-identity":  {desc: "Local IKE identity (type and value)", children: nil},
-			"remote-identity": {desc: "Remote IKE identity (type and value)", children: nil},
+			"local-identity":  {desc: "Local IKE identity (type and value)", args: 2, children: nil},
+			"remote-identity": {desc: "Remote IKE identity (type and value)", args: 2, children: nil},
 			"dynamic": {desc: "Dynamic peer (peer has a dynamic IP). With `hostname <fqdn>` the peer is DNS-resolved; a bare `dynamic` block marks a responder-only peer (remote_addrs = %any, #2404)", children: map[string]*schemaNode{
 				"hostname": {desc: "Dynamic peer FQDN (DNS-resolved)", args: 1, scalar: true, placeholder: "<fqdn>", children: nil},
 			}},
@@ -1171,7 +1171,11 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 				valueExamples: []string{"standard", "suiteb-gcm-128"},
 				validator:     ValidateEnum(ProposalSetNames()), children: nil},
 		}},
-		"gateway": {desc: "IKE gateway (VPN peer) name", args: 1, placeholder: "<gateway-name>", children: map[string]*schemaNode{
+		// #8796: the `security ipsec` gateway is the same container as the
+		// `security ike` one above — same children, same compiler path — and it
+		// needs the same opt-in. Fixing one and not the other leaves the defect
+		// live at a spelling an operator reaches the same way.
+		"gateway": {desc: "IKE gateway (VPN peer) name", args: 1, packedStatements: true, placeholder: "<gateway-name>", children: map[string]*schemaNode{
 			"address":            {desc: "Remote gateway address", args: 1, placeholder: "<address>", children: nil},
 			"local-address":      {desc: "Local IKE address", args: 1, placeholder: "<address>", children: nil},
 			"ike-policy":         {desc: "IKE policy reference", args: 1, placeholder: "<policy-name>", children: nil},
@@ -1208,8 +1212,8 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 				"interval":          {desc: "DPD probe interval in seconds (default 10)", args: 1, valueType: ValueInteger, valueDesc: "Probe interval in seconds (1..3600)", valueExamples: []string{"10", "30"}, validator: ValidateInteger(1, 3600), placeholder: "<seconds>", children: nil},
 				"threshold":         {desc: "Failed-probe count before peer is dead (default 5)", args: 1, valueType: ValueInteger, valueDesc: "Failed-probe count (1..100)", valueExamples: []string{"5", "3"}, validator: ValidateInteger(1, 100), placeholder: "<count>", children: nil},
 			}},
-			"local-identity":  {desc: "Local IKE identity (type and value)", children: nil},
-			"remote-identity": {desc: "Remote IKE identity (type and value)", children: nil},
+			"local-identity":  {desc: "Local IKE identity (type and value)", args: 2, children: nil},
+			"remote-identity": {desc: "Remote IKE identity (type and value)", args: 2, children: nil},
 			"dynamic": {desc: "Dynamic peer (peer has a dynamic IP). With `hostname <fqdn>` the peer is DNS-resolved; a bare `dynamic` block marks a responder-only peer (remote_addrs = %any, #2404)", children: map[string]*schemaNode{
 				"hostname": {desc: "Dynamic peer FQDN (DNS-resolved)", args: 1, scalar: true, placeholder: "<fqdn>", children: nil},
 			}},

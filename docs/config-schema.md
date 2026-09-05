@@ -79,6 +79,26 @@ Two things that census taught, worth keeping:
   the `then` arms included `sample` and `port-mirror`, which are not compiler
   arms at all, and reported both as defects.
 
+**#8800 is the same class reached through the BRACE-ELISION PASS rather than
+through `packedBodyChildren`, and that route has an extra consequence.** The
+pass asks `compactNormalizeInScope(container, head)` only for a head that is a
+declared schema child — `isBody` is false otherwise — so an undeclared head is
+not merely refused, it is never ASKED ABOUT. No scope entry can name it, and it
+appears in no inventory, because the inventory is built by running the pass.
+`security nat source pool <p> address <a>;` compiled to a pool with ZERO
+addresses for that reason: the compiler has read `address` since #4521, and
+`pool port-overloading-factor` and `pool routing-instance` were already in
+scope, but `address` itself was never declared, so it was the one sibling of an
+otherwise in-scope container that the pass could not see.
+
+The practical rule: **for a normalizer-route site the remedy is two parts and a
+scope entry alone is not one of them.** Declare the leaf (so the pass asks) AND
+admit the pair (so it says yes) — declaring alone was measured to leave the
+packed spelling still compiling to zero addresses. It also means the census
+methods above cannot find this sub-class at all: a census that enumerates what
+the pass asked about is blind by construction to what it never asked. Only the
+compiler-arm-versus-schema census (#8781's method) reaches it.
+
 Two further instances were fixed this way (#6818, #6822), both failing in the
 security-relevant direction with **zero warnings on the strict commit path**:
 
@@ -148,6 +168,31 @@ RBAC across an HA sync between nodes on different binaries. The #2419 inventory
 records this in a `filedByDesign` category so the entry is not mistaken for one
 awaiting a fix. #6821's two leaves USED to sit in the same category; they moved
 to `filedFixed` once `packedTail` removed their blocker.
+
+**Making a packed container body work is THREE decisions, and they have an
+order.** Declaring arity on a leaf is the last of them and is INERT on its own —
+a fix that changes only the arity measures as correct on any harness that forces
+the other two and changes nothing in the shipped product.
+
+| decision | what it controls | symptom when missing |
+|---|---|---|
+| the pair is admitted to `compactNormalizeInScope` | **whether** the tail folds at all | the tail stays on the node's `Keys`; a compiler looping `node.Children` sees an empty body |
+| `packedStatements: true` on the container | **how** the folded tail splits | the tail becomes a CHAIN — each statement nested under the previous — so everything after the first is lost |
+| `args: N` on each leaf | where each statement **ends** | the split cannot find the boundary and declines to guess |
+
+The IKE gateway had all three wrong at once, which is why the symptom moved
+depending on statement ORDER: `gateway gw1 external-interface ge-0/0/0
+local-identity hostname foo;` compiled the external-interface and silently
+dropped the identity, while the same statements in the other order dropped
+everything — because the *first* leaf decides whether the pass fires. An
+order-dependent symptom is the signature of this trio rather than of any one of
+them.
+
+**Diagnose it with a control that varies the SUSPECTED-INNOCENT leaf.** Two
+`args`-declared siblings in one packed tail (`external-interface ge-0/0/0
+ike-policy pol1`) lost the second one too — which refuted "the leaf with no
+arity is the problem" in one measurement, since neither of those leaves lacks
+arity.
 
 A group applying a stanza in the compact spelling over an existing same-name
 peer drops the group's value (#7648). That is a property of the group merge
