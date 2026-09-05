@@ -34,6 +34,12 @@ var exclusionClasses8690 = map[string]bool{
 	"partial": true, "gate-confirmed": true, "gate-open-question": true,
 	"gate-collateral": true, "unmeasurable": true, "unreachable": true,
 	"hazard": true, "open": true, "unclassified": true,
+	// #8690: the fix is CORRECT but the vehicle is not a family sweep — it
+	// changes behaviour that owes its own change and a smoke. Deliberately
+	// neither `open` (sweeping it would be wrong) nor permanent (normalizing it
+	// is right). Without this class such a site can only be recorded as an
+	// exclusion, which is false, or as available, which invites the sweep.
+	"owed-own-change": true,
 }
 
 // Classes whose sites must never be normalized.
@@ -193,6 +199,48 @@ func TestPermanentExclusionRegisterIsDiscriminating8690(t *testing.T) {
 			permanent++
 		}
 	}
+	// A class that asserts a MEASUREMENT must carry one. These three checks exist
+	// because a class label is cheap and a reason is not, and the whole failure
+	// this register had at birth was recording an unanswered question as an
+	// answer.
+	for site, e := range reg {
+		switch e.class {
+		case "gate-confirmed":
+			// Asserts a person determined the gate refuses the packed SPELLING
+			// rather than the consequence of the drop. Without the measurement
+			// that is a question wearing a verdict's label.
+			if len(e.reason) < 80 {
+				t.Errorf("%q is classed `gate-confirmed` with a %d-character reason. That "+
+					"class asserts a PERSON measured it; the measurement IS the claim",
+					site, len(e.reason))
+			}
+		case "owed-own-change":
+			// Says the fix is right and the VEHICLE is wrong. Without naming what
+			// the vehicle owes it is `open` with a caveat, and the next sweep
+			// takes it.
+			if !strings.Contains(e.reason, "test-failover") && !strings.Contains(e.reason, "smoke") {
+				t.Errorf("%q is classed `owed-own-change` but its reason names no owed "+
+					"verification. That class exists to say the vehicle is wrong; without "+
+					"naming what it owes, the next sweep takes the site", site)
+			}
+		case "unclassified", "unmeasurable":
+			// UNKNOWN must say WHY it cannot be measured. A placeholder reads as
+			// cleared, which is the opposite of what the class means — and "arm 2
+			// passed" is the absence of evidence for these, not evidence.
+			if len(e.reason) < 80 {
+				t.Errorf("%q is classed %q with a %d-character reason. An UNKNOWN entry must "+
+					"say WHY it cannot be measured; a placeholder reads as cleared, which "+
+					"inverts the class", site, e.class, len(e.reason))
+			}
+			if !strings.Contains(e.reason, "NOT measured") && !strings.Contains(e.reason, "cannot") &&
+				!strings.Contains(e.reason, "not known-safe") && !strings.Contains(e.reason, "ABSENCE OF EVIDENCE") {
+				t.Errorf("%q is classed %q but its reason never says the measurement was not "+
+					"taken or cannot be taken. Absence of evidence has to be stated as such "+
+					"or it reads as evidence of absence", site, e.class)
+			}
+		}
+	}
+
 	if permanent == 0 {
 		t.Error("the register classifies NO site as permanently excluded. Either the " +
 			"sweep genuinely finished — in which case this file and its cells should be " +
