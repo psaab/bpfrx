@@ -205,7 +205,14 @@ func classifyGateBlindLeaf(g gateLeaf) gateBlindClass {
 // `flag` ceiling going 179 -> 209 for the #8807 `then` fix, not this one, and
 // all three buckets sit exactly at their ceilings (141 + 209 + 43 = 393).
 // Re-measured at this head rather than derived by adding two.
-const gateCoverageFloor = 705
+//
+// 705 -> 706 for #8844. Declaring `keys` under `perfect-forward-secrecy`
+// made that spelling COMPARE, and the parent left the enumeration in the
+// same move: it was a childless leaf and now has a child, so `unreachable`
+// drops 141 -> 140 (see the ceiling below). Both deltas are from this one
+// change -- ATTRIBUTED, not assumed: the only schema edit on this branch is
+// the #8844 declaration, and enumerated is unchanged at 1098.
+const gateCoverageFloor = 706
 
 var gateBlindCeiling = map[gateBlindClass]int{
 	// #7492 moved leaves out of `unreachable` in two rounds. The parent
@@ -308,7 +315,12 @@ var gateBlindCeiling = map[gateBlindClass]int{
 	// `pre-shared-key` leaf — the shape its description and compileIPsec always
 	// stated — moved it out of the unreachable class. The ratchet is tightened
 	// here rather than left loose, per this cell's own instruction.
-	gateBlindUnreachable: 141,
+	// #8844: 141 -> 140. `perfect-forward-secrecy` was a childless leaf that
+	// changed nothing (its value lands nowhere -- the compiler reads a `keys`
+	// CHILD). Declaring that child moved the parent out of the leaf
+	// enumeration entirely and put `keys` in as COMPARED. A ceiling that
+	// SHRINKS is the fix working.
+	gateBlindUnreachable: 140,
 	// #7132 raised this 175 -> 176 for `system ntp server ... prefer`.
 	//
 	// Raised deliberately, and it is the one kind of raise that is not a
