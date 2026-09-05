@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -60,6 +61,13 @@ const (
 	gateBlindUnreachable gateBlindClass = "unreachable (leaf changed nothing)"
 	gateBlindErr         gateBlindClass = "err (parent stanza does not compile)"
 	gateBlindValueMoves  gateBlindClass = "valueMoves (value moves output, gate still lost it)"
+	// #8830: the leaf IS read and its value is DELIBERATELY ignored, with an
+	// advisory saying so -- `system dataplane cores` compiles to "retired
+	// DPDK-era knob (#1525), accepted for config compatibility but ignored".
+	// That is the LOUD form of dropping a value and it is #8785's documented
+	// remedy shape ("read it AND say it does nothing"), so it must not sit in
+	// `unreachable`, which asserts the leaf changed NOTHING.
+	gateBlindAdvisory gateBlindClass = "advisory (read, value ignored, warning says so)"
 )
 
 // gateLeafCompared reports whether the differential got at least two usable
@@ -133,7 +141,62 @@ func classifyGateBlindLeaf(g gateLeaf) gateBlindClass {
 	if noLeaf != bare {
 		return gateBlindFlag
 	}
+	// #8830: everything above compared through gateMarshal, which NULLS
+	// cfg.Warnings. That normalisation is correct for the DIFFERENTIAL -- an
+	// advisory about a rejected value would make it look installed when
+	// comparing two spellings -- but this classifier asks a different question,
+	// "did the leaf reach the compiler at all", and for THAT an advisory is
+	// evidence that it did. The same channel is signal for one question and
+	// noise for the other, so the helper's normalisation encodes the
+	// differential's question and inheriting it here answered the wrong one.
+	//
+	// Re-scored with warnings included, 7 of the 141 leaves this branch used to
+	// return DO change output. They are read and deliberately ignored.
+	if gateLeafChangesWarnings(g, pre, epath) {
+		return gateBlindAdvisory
+	}
 	return gateBlindUnreachable
+}
+
+// gateLeafChangesWarnings repeats the classifier's probe with cfg.Warnings
+// KEPT, and reports whether naming the leaf (bare or with a value) changes the
+// advisory output. It is deliberately separate from gateMarshal rather than a
+// flag on it: the differential must keep nulling warnings, and a shared helper
+// that sometimes does and sometimes does not is how this mismatch happened.
+func gateLeafChangesWarnings(g gateLeaf, pre string, epath []string) bool {
+	compile := func(stmt string) (string, bool) {
+		if pre != "" && stmt != "" {
+			stmt = pre + " " + stmt
+		} else if pre != "" {
+			stmt = pre
+		}
+		tree, errs := NewParser(gateBraceConfig(epath, stmt)).Parse()
+		if len(errs) > 0 {
+			return "", false
+		}
+		cfg, err := CompileConfigLenient(tree)
+		if err != nil {
+			return "", false
+		}
+		j, merr := json.Marshal(cfg.Warnings)
+		if merr != nil {
+			return "", false
+		}
+		return string(j), true
+	}
+	base, ok := compile("")
+	if !ok {
+		return false
+	}
+	if w, ok := compile(g.leaf + ";"); ok && w != base {
+		return true
+	}
+	for _, vp := range gateValuePairs {
+		if w, ok := compile(g.leaf + " " + vp.v1 + ";"); ok && w != base {
+			return true
+		}
+	}
+	return false
 }
 
 // ---------------------------------------------------------------------------
@@ -315,12 +378,31 @@ var gateBlindCeiling = map[gateBlindClass]int{
 	// `pre-shared-key` leaf — the shape its description and compileIPsec always
 	// stated — moved it out of the unreachable class. The ratchet is tightened
 	// here rather than left loose, per this cell's own instruction.
-	// #8844: 141 -> 140. `perfect-forward-secrecy` was a childless leaf that
-	// changed nothing (its value lands nowhere -- the compiler reads a `keys`
-	// CHILD). Declaring that child moved the parent out of the leaf
-	// enumeration entirely and put `keys` in as COMPARED. A ceiling that
-	// SHRINKS is the fix working.
-	gateBlindUnreachable: 140,
+	// Both #8844 and #8830 moved this bucket, in DIFFERENT ways, and the value
+	// below is RE-MEASURED at the merge rather than reconciled from the two.
+	//
+	//   #8844 (already on master) 141 -> 140. A real SHRINK, not a
+	//   reclassification: `perfect-forward-secrecy` was a CHILDLESS leaf
+	//   whose value genuinely landed nowhere, because the compiler reads a
+	//   `keys` CHILD. Declaring that child moved the parent out of the leaf
+	//   enumeration and put `keys` in as COMPARED. The tree got less blind.
+	//
+	//   #8830 (this branch) moves SEVEN leaves to `advisory` -- they DO
+	//   change output, via a warning the classifier could not see while it
+	//   compared through gateMarshal. A pure reclassification: nothing about
+	//   those leaves changed, the measurement did.
+	//
+	// PREDICTED BEFORE MEASURING, so the number is falsifiable rather than
+	// confirmatory: `perfect-forward-secrecy` is NOT one of the seven, so
+	// the two changes are disjoint and 140 - 7 = 133 was expected.
+	gateBlindUnreachable: 133,
+	// #8830: read, value deliberately ignored, advisory says so. Measured at
+	// this head: vrrp-group track-interface priority-cost (inet and inet6),
+	// security log stream transport tls-profile, system dataplane
+	// cores/memory/socket-mem, system services ssh rate-limit. This is a
+	// CEILING like the others -- it may shrink freely, and it shrinks when a
+	// knob stops being ignored, which is a real implementation landing.
+	gateBlindAdvisory: 7,
 	// #7132 raised this 175 -> 176 for `system ntp server ... prefer`.
 	//
 	// Raised deliberately, and it is the one kind of raise that is not a
@@ -430,7 +512,12 @@ func TestSchemaSpellingGateCoverageIsGated_7484(t *testing.T) {
 		}
 	}
 
-	classes := []gateBlindClass{gateBlindUnreachable, gateBlindFlag, gateBlindErr, gateBlindValueMoves}
+	// gateBlindAdvisory must be in this list. A class that is classified but not
+	// ENUMERATED vanishes from the blind total and from the per-class report,
+	// which is strictly worse than sitting in the wrong bucket: seven leaves
+	// simply stopped being counted, and the test still passed because every
+	// remaining bucket was at its ceiling.
+	classes := []gateBlindClass{gateBlindUnreachable, gateBlindAdvisory, gateBlindFlag, gateBlindErr, gateBlindValueMoves}
 	total := 0
 	for _, c := range classes {
 		total += blind[c]

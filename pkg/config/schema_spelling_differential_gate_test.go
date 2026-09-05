@@ -685,8 +685,32 @@ func wordInert(g gateLeaf, path []string) bool {
 // `any any`, `interfaces <*> unit <*> tunnel` with source+destination,
 // `vrrp-group` with a virtual-address, and `dhcp-local-server ... interface`
 // with an `upto` sibling all still lose the value. Only rows verified end to end
-// belong here; the rest of the 228 is not a parent-path problem and is tracked
-// on #7492 rather than guessed at.
+// belong here.
+//
+// CORRECTION (#8830). The `vrrp-group` observation above is right and its
+// ATTRIBUTION is wrong, and the attribution is the harmful half: read as
+// written it says "no prerequisite can help here, stop looking", which is what
+// a reader will do. The prerequisite is FINE. What defeats it is the synthetic
+// INSTANCE NAME. Isolated:
+//
+//	synthetic names + virtual-address    priority moves output = FALSE
+//	real names      + virtual-address    priority moves output = TRUE
+//	real iface + SYNTHETIC vrrp id       priority moves output = FALSE
+//
+// A VRRP group id must be numeric. The gate synthesises `xa60`, the compiler
+// discards the group, and every leaf under it reads as inert no matter what
+// prerequisite is supplied. The third row isolates it to the group id rather
+// than the interface name.
+//
+// Root cause: `vrrp-group` is declared `args: 1, placeholder: "<group-id>"`
+// with no keyValidator, so nothing tells the gate what a valid identity value
+// looks like — and nothing rejects an operator typing a non-numeric group id
+// either. #7492's typed path-identifier fallback already does exactly this for
+// `interfaces <if> unit <n>` (a NUMERIC unit, which moved 72 leaves); it does
+// not cover `args: 1` identity slots. Tracked as the typed-identity-slot issue.
+//
+// So an unknown fraction of the 228 attributed to "not a parent-path problem"
+// is this instead, and it is fixable. Do not inherit that count as settled.
 //
 // Keyed by parentKey() (synthetic names normalised to <*>). Values are brace
 // statements; the set-spelling equivalent is derived by stripping the ";".
