@@ -706,6 +706,13 @@ func dedupe8690(in []string) []string {
 // admitting a new one is a decision someone makes rather than a number that
 // moves.
 var knownFixtureLimited8690 = []string{
+	// Added when the schedulers/chassis merge brought in other lanes' families.
+	// Both were admitted by increments that landed while this assertion did not
+	// yet exist, so they are recorded rather than treated as regressions --
+	// the same call as the unexaminable list. Their gate status is UNKNOWN, not
+	// safe, and reported to the lanes that own them.
+	"security ipsec policy xpfarg proposals",
+	"security policies from-zone xpfarg xpfarg xpfarg policy",
 	"protocols bgp group xpfarg neighbor xpfarg export",
 	"protocols bgp group xpfarg neighbor xpfarg import",
 	"security nat destination rule-set xpfarg rule xpfarg match application",
