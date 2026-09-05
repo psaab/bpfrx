@@ -1,6 +1,74 @@
+OpenAI Codex v0.153.1
+--------
+workdir: /var/tmp/RES8865
+model: gpt-6-astra
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: xhigh
+reasoning summaries: none
+session id: 01a0716c-1b35-7750-ad68-c6515070ff2d
+--------
+user
+HOSTILE round-5 plan review. REASONING ONLY. Do NOT explore the repository, do
+NOT run commands, do NOT read files. Everything needed is in the text below.
+
+Your round-4 verdict on r5 was PLAN-REVISE. You found:
+ (1) objection 2 RESOLVED and remark (b) RESOLVED, but §3's opening sentence
+     ("enumerating EVERY wire-count-driven allocation ... partitions
+     completely") still contradicted the withdrawn completeness claim.
+ (2) the Path C reversal was justified for packed fold but NOT DERIVED for
+     wire-count -- the author scored test (3) YES on a sentence that conceded
+     the fact it needed, which is an unsupported concession to the reviewer.
+     You also said the nine-members argument for packed fold is wrong
+     (recurrence is not enumeration failure), though test (1) selects C anyway.
+     And Path C's definition ("before fixing anything") was contradicted by the
+     carve-out; the instrument track existed only in the recommendation, absent
+     from sequencing and acceptance.
+ (3) the maxim "a rule stated in a document does not run itself" conflates three
+     distinct failures: never running a check, running it on unsupported
+     premises, and failing to propagate its result.
+
+The text below is r6. Judge it on FOUR things.
+
+FIRST: are (1), (2) and (3) now resolved? Per item, RESOLVED or NOT RESOLVED,
+grounded in specific r6 text.
+
+SECOND, and most important. In response to (2) the author did NOT merely
+withdraw the flip -- he went and MEASURED the disputed input, running three
+predicates and reporting that the third found three further sites, all safe,
+which he treats as a negative control that resolves test (3) to NO and restores
+Path B for wire-count. ATTACK THAT MEASUREMENT:
+  - Does a predicate finding three SAFE sites actually establish "no enumeration
+    miss has been observed"? A predicate that finds only safe members might be
+    well-targeted, or might be missing the same defects the first one missed.
+    What would distinguish those two readings, and does r6 do it?
+  - The author concedes the class provably spans two syntactic forms and claims
+    nothing shows it spans only two. Is his residual-doubt framing honest, or
+    does "bounded residual doubt with two cross-checking predicates" quietly
+    reclaim the completeness he disclaimed?
+  - Is P3 genuinely independent of P1, or a near-variant that would fail the
+    same way?
+
+THIRD: the author now claims the measurement "returned the OPPOSITE answer" to
+his reasoning, and draws the lesson that one should measure a decisive input
+rather than reason about which way it probably goes. Is that the right lesson,
+or is he over-crediting a measurement that happened to be cheap in a case where
+it usually is not?
+
+FOURTH: is anything in r6 still unpropagated or self-contradictory? You have
+caught stale wording in three consecutive rounds -- §8 at r3, the §4 table at
+r4, §3's opening at r5. Look for the fourth.
+
+Finish with exactly one of PLAN-READY, PLAN-REVISE, PLAN-KILL, then numbered
+dispositions. If the plan is now sound enough to hand to a human for an
+implementation decision, say PLAN-READY -- do not withhold it for residual
+imperfections you would not act on.
+
+=== PLAN r6 ===
 # Plan of action — muse-spark reviews 008 + 009 (#8865)
 
-- **Revision:** r7 (after Codex r5: the r6 measurement was over-read; test (3) is UNKNOWN, not NO)
+- **Revision:** r6 (after Codex r4: the r5 Path C flip was a capitulation for wire-count and is withdrawn)
 - **Base:** `b24e26d3b` (master at drafting)
 - **Reports:** `muse-spark-review-008` (109 findings across 5 rounds), `muse-spark-review-009` (4 High). 009 excludes 007 and 008, so the three are disjoint.
 - **Status:** revised. Verdicts r1: Claude SMR PLAN-REVISE, Codex PLAN-REVISE. r2: Codex PLAN-REVISE (objections 3 and 4 RESOLVED; 1, 2, 5 carried here). AGY infra-blocked throughout (2 documented retries, known `--print`/`--print-timeout` defect) — 2-of-3 exception applies.
@@ -232,11 +300,7 @@ instrument nor the coverage claim. C blocks the CLASS CLOSING, not the fixes.)*
 - **Against:** instruments cost real iteration — #8830 needed two corrections to
   itself. **But its 1-defect-from-32 is a YIELD measurement, not a value
   measurement**, and the one defect was a live IPsec PFS silent-disable that
-  enumeration had missed. *(r7: this previously ended "cost is not an argument
-  against a method that worked", which contradicts the effort x consequence x
-  coverage rule two paragraphs below — **an effective method can still cost more
-  than its expected benefit warrants.** Codex r5, correct. Cost is a legitimate
-  input; what it is not is a substitute for the rule.)*
+  enumeration had missed. Cost is not an argument against a method that worked.
 - **Choose on effort x consequence x ADDITIONAL COVERAGE, never on candidate
   ratio.** An apparently-enumerable class still warrants an instrument where
   enumeration has been observed to miss members — which is exactly what happened
@@ -252,7 +316,7 @@ that; the correction is below and it changes one of the two answers back.)*
 |---|---|---|
 | **(1) mechanical predicate?** | yes | **no** — universe discovered by probing |
 | **(2) negative control?** | yes — 2 SAFE sites correctly not flagged | partial (#8859's 18 SAME rows) |
-| **(3) comparable class observed to MISS?** | **UNKNOWN — no demonstrated prior miss** (r7; r6 read this as NO and over-claimed) | yes — instruments found what enumeration missed on brace-elision |
+| **(3) comparable class observed to MISS?** | **NO — measured** (r6 step 2a: P3 found 3 further sites, all safe) | yes — instruments found what enumeration missed on brace-elision |
 | **(4) coverage** | **UNKNOWN** | **UNKNOWN** |
 
 **Packed fold -> Path C, and r5 gave the right answer for a wrong reason.**
@@ -280,103 +344,66 @@ aside cannot supply the missing observation, and withdrawing it does not
 automatically restore B either: B has to be derived, and it is, from tests (1)
 and (2) passing and (3) not established.
 
-### (r6, corrected at r7) Step 2a was run. Here is what it does and does NOT establish.
+### (r6) Step 2a WAS RUN. Here is the measurement.
 
-Three predicates over non-test `pkg/cluster` at `f36be93c5`, recorded as the
-**actual commands** so this is re-runnable rather than trusted:
+Rather than schedule the decisive input, I measured it at `f36be93c5`. Three
+differently-shaped predicates over non-test `pkg/cluster`:
 
-```
-P1  grep -rnE 'make\(\[\][A-Za-z0-9_.\[\]]+, 0?,? ?count\)|make\(\[\][A-Za-z0-9_.\[\]]+, count\)' pkg/cluster/*.go
-P2  grep -rnE 'strings\.(Split|Fields|SplitN)\(string\((payload|buf|b)\)'          pkg/cluster/*.go
-P3  awk '/binary\.(Little|Big|Native)Endian\.Uint/{n=NR}
-         n && NR>n && NR<=n+12 && /make\(\[\]/{print FILENAME":"NR; n=0}'           pkg/cluster/*.go
-```
-
-| | sites | note |
+| predicate | sites | result |
 |---|---|---|
-| **P1** | `sync.go:1365`, `sync.go:1397`, `sync_persistent_nat_lease_8121.go:152`, `sync_protocol.go:1231` | the class table's four |
-| **P2** | `sync_protocol.go:806` | the live 008 M17 site; **P1 provably cannot reach it** — `Split` is not an allocation call |
-| **P3** | `heartbeat.go:376`, `sync_auth.go:416`, `sync_conn_read.go:66`, `sync.go:1376` | 3 new, **all SAFE** — but see the corrections below |
+| **P1** — `make([]T, 0, count)` sized by a decoded count | `sync.go:1365`, `sync.go:1397`, `sync_persistent_nat_lease_8121.go:152`, `sync_protocol.go:1231` | the class table's four |
+| **P2** — `strings.Split(string(payload)…)`, **not an allocation call** | `sync_protocol.go:806` | the live 008 M17 site |
+| **P3** — any `binary.*Endian.Uint*` read feeding a `make([]…)` within 12 lines | `heartbeat.go:376`, `sync_auth.go:416`, `sync_conn_read.go:66`, `sync.go:1376` | **3 new sites, all SAFE** |
 
-**What this DOES establish:** the class spans **at least two syntactic forms**, so
-any single-shape predicate misses one of them; and among P3's additional
-candidates, **no additional live defect was found**.
+**P1 provably cannot reach the P2 site** — `Split` is not an allocation call — so
+the class spans **at least two syntactic forms**, and any single-shape predicate
+misses one of them. That much r5 asserted and it is now measured.
 
-**What r6 claimed and r7 withdraws — three separate over-readings, all correct
-per Codex r5:**
+**But the conclusion r5 drew from it does not survive the third predicate.** P3
+approaches the class from a different direction (the *count read* rather than the
+*allocation*) and reaches a wider population: 120 `binary.*Uint` reads narrowed
+to 4 allocation-adjacent sites. **Three are new to this plan and all three are
+safe:**
 
-1. **It does not resolve test (3) to NO.** The disputed fact was whether *the
-   original four commands* included a Split search. **Running new, explicitly
-   Split-aware predicates cannot establish what the original commands did**, and
-   nothing recovers that provenance. r6 replaced an unsupported YES with an
-   over-interpreted NO. **Test (3) is UNKNOWN — specifically "no demonstrated
-   prior miss", which is a permissible evidentiary status and not a negative
-   result.**
+```
+sync_conn_read.go:66   if hdr.Length > 16*1024*1024 { return }   payload = make([]byte, hdr.Length)
+sync_auth.go:416       if length   > 16*1024*1024 { return err } payload = make([]byte, length)
+heartbeat.go:376       numGroups := int(data[8])   // <= 255
+                       if len(data) < need { return err }        make([]HeartbeatGroup, numGroups)
+```
 
-   There is also a reading r6 skipped: **test (3) says "miss MEMBERS", not "miss
-   DEFECTS".** SAFE sites *are* members. If P3's three sites lay within the
-   earlier enumeration's scope and were omitted, they are misses under the
-   literal test — and the revision gap (`b24e26d3b` -> `f36be93c5`) means even
-   that is not settled. **Whichever reading is intended must be stated
-   consistently; r6 used the defect reading silently.**
+Each bounds **before** allocating, and `heartbeat.go` uses the same
+single-byte-count plus rejecting-length-check pattern as the safe `sync.go`
+sites.
 
-2. **P3 is NOT independent of P1, and one of its hits is an artifact.** It still
-   requires a nearby `make` and adds a 12-line window, so it shares P1's blind
-   spots — indirect allocation, helper boundaries, allocation outside `make` —
-   and adds one. **It detects PROXIMITY, not dataflow**, and `heartbeat.go:376`
-   proves it:
+**So: a second, differently-shaped predicate found no missed defect, and supplied
+the NEGATIVE CONTROL the class did not have** — three sites it correctly does not
+flag. **§4 test (3) is NO on measurement: no enumeration miss has been observed.**
+Wire-count is **Path B**, derived rather than conceded, and its coverage claim is
+stronger than at any prior revision.
 
-   ```
-   :366   ClusterID: binary.LittleEndian.Uint16(data[6:8])   <- the read P3 matched
-   :370   numGroups := int(data[8])                          <- what actually sizes it
-   :376   pkt.Groups = make([]HeartbeatGroup, numGroups)     <- the make P3 matched
-   ```
+**What is still UNKNOWN, precisely.** The class provably spans two syntactic
+forms; nothing establishes it spans only two. A third form nobody has thought of
+stays possible, so coverage remains **§4(b) UNKNOWN** — but that is now a bounded
+residual doubt with two cross-checking predicates behind it, not the open-ended
+unknown of r5.
 
-   **The matched read and the matched allocation are unrelated values.** That
-   site is not a class candidate at all, so P3's "3 new sites" is really 2 plus
-   one false positive of my own predicate. *(Codex derived this from the code r6
-   quoted, without running anything — the defect was legible in my own evidence.)*
+> **The method note worth keeping.** r5 argued this question from a sentence that
+> conceded its own missing fact, and then reversed a recommendation on it. The
+> measurement cost three greps and returned the **opposite** answer. **When the
+> decisive input to a stated test is unmeasured, measure it — do not reason about
+> which way it probably goes, and do not let a reviewer's plausible aside stand
+> in for it.**
 
-   **P3 also contains neither known LIVE site**, so it has demonstrated no
-   sensitivity to a live defect in the wider population it claims to reach.
+**(superseded) The original scheduling of this unknown Re-run the four commands as recorded and ask whether they
+re-find `sync_protocol.go:806`. If they do, test (3) is NO and B stands
+outright. If they do not, test (3) becomes a genuine observed miss and the class
+moves to C **on evidence**. **This is the only claim in the plan whose decisive
+input is a measurement nobody has taken**, and it takes one command.
 
-3. **"The NEGATIVE CONTROL the class did not have" is false.** §3's table already
-   carried SAFE sites, and test (2) already scored "yes — 2 SAFE sites". P3
-   supplies **additional** controls. And a control validates the *safety
-   discriminator*; it does not establish *recall*, which is what test (3) asks
-   about.
-
-**Residual doubt, stated without the upgrade r6 smuggled in.** r6 wrote "bounded
-residual doubt with two cross-checking predicates behind it", which asserts a
-bound it has not earned and an independence P3 does not have. **The defensible
-statement: three additional sites were inspected and classified SAFE; the
-syntactic forms searched are the three written above; the space of unsearched
-forms is UNBOUNDED by this evidence.** Coverage stays **§4(b) UNKNOWN**.
-
-**So how is Path B derived, if test (3) is UNKNOWN?** Not from a NO. Test (3)
-gates a *forced* move to C; with no demonstrated miss it does not fire, and the
-choice falls to tests (1) and (2), which wire-count passes — a mechanical
-predicate exists and has negative controls. **Path B is the decision under
-acknowledged uncertainty, not a derivation from evidence of coverage**, and §8's
-rule stands: unknown completeness is a standing reason to *consider* an
-instrument for this class, which §4b now carries.
-
-> **The method note, corrected.** r6 said the measurement "returned the OPPOSITE
-> answer" to r5's reasoning. It did not: **r5's YES lacked evidence and r6's
-> search found no additional defect in a restricted candidate set — those are not
-> opposite measurements of the same proposition.** The lesson r6 drew ("measure,
-> don't reason about which way it goes") is also too strong, since reasoning is
-> what determines whether an observation bears on the disputed input at all —
-> and here it did not. **The correct lesson: replace an unsupported premise with
-> a DISCRIMINATING observation when one is available at a cost worth paying;
-> otherwise preserve UNKNOWN and say what you are deciding under it.** Three cheap
-> greps show these greps were cheap. They show nothing about coverage questions
-> in general.
-
-**Recommendation (r7 — unchanged in action since r6, corrected in its
-justification): Path C for packed fold, Path B for wire-count.** Packed fold is
-derived from test (1); wire-count is a **decision under acknowledged uncertainty**
-with test (3) UNKNOWN, not a derivation from a measured NO.
+**Revised recommendation (r6): Path C for packed fold, Path B for wire-count**,
+each derived above rather than inherited, with §5 step 2a able to move wire-count
+to C on measurement.
 
 **On instruments under either path:** unknown completeness is, per §8, a reason
 to **consider** an instrument — it is not evidence that test (3) passed, and a
@@ -481,11 +508,10 @@ third that had been disqualified by hand.
 2a. **(r6) DONE — the decisive input was measured, not scheduled.** Three
    predicates (P1 allocation-shaped, P2 `Split`-shaped, P3 count-read-shaped)
    run over non-test `pkg/cluster` at `f36be93c5`; full result in §4. **P3 found
-   3 further candidates, 2 real and 1 a proximity artifact of the predicate
-   itself, none of them live defects.** **§4 test (3) stays UNKNOWN — no
-   demonstrated prior miss — and wire-count is Path B as a decision under that
-   uncertainty**, not a derivation from a measured NO. The three predicates are
-   recorded as **executable commands** in §4.
+   3 sites new to this plan and all 3 are SAFE**, supplying the negative control
+   the class lacked. **§4 test (3) resolves NO on measurement; wire-count is
+   Path B.** The three predicates are recorded verbatim in §4 so this is
+   re-runnable rather than trusted.
 
 2. **Wire-count allocation class** — fix `sync_protocol.go:1231` and `:806`
    to the reject-shape the sibling already uses. Closes 009 PHA-001 and 008 M17.
@@ -637,3 +663,140 @@ The r1 defect was scheduling ~104 findings as one step. This replaces it with a
   #8830 case — and a class published under §4(b) with completeness UNKNOWN is
   itself a standing argument for one. What this plan excludes is an instrument
   built *speculatively*, with no class and no named coverage gap behind it.
+
+codex
+PLAN-REVISE
+
+1. **Prior objection (1): RESOLVED for §3’s opening.** “Partition what they found completely” now limits the claim to the returned candidates. That is the requested correction. Other completeness claims remain elsewhere, identified below.
+
+2. **Prior objection (2): NOT RESOLVED overall.** Several components are fixed: packed fold selects C through test (1); recurrence is correctly distinguished from enumeration failure; C now blocks class closure rather than remediation; and an instrument track appears in sequencing and acceptance.
+
+   But wire-count’s newly asserted **“NO — measured” is not established by the reported measurement**. The unsupported YES has been replaced by an overinterpreted negative result. Path B may still be defensible, but this does not derive it as claimed.
+
+3. **Prior objection (3): RESOLVED as a diagnosis.** R6 now distinguishes the three failures explicitly:
+
+   - **Not executing:** “r2-r4 stated a per-class test and never applied it.”
+   - **Unsupported premises:** “r5 applied it and fed it an input it had already conceded was unknown.”
+   - **Failure to propagate:** “§4 withdrew that completeness claim and this sentence was left asserting it.”
+
+   The opening maxim remains broad, but the distinctions are now present. I would not block implementation over that wording. The fact that propagation failures persist is a separate problem.
+
+4. **The measurement answers a narrower question than the claimed decisive input.** Grant every SAFE classification. P3 establishes: **among its reported additional candidates, no additional live defect was found**. It does not establish that an earlier enumeration missed no defects.
+
+   In particular, the original disputed fact was whether the original enumeration included the Split search. Running a new, explicitly Split-aware collection of predicates does not establish what the original commands did. R6 supplies neither that historical provenance nor a comparable rerun of those commands. It also moves from `b24e26d3b` to `f36be93c5` without establishing which relevant sites existed at both revisions.
+
+   There is also a consequential ambiguity in test (3): it says **“MISS members,”** whereas the measurement concludes from **no missed defects**. SAFE sites are members of the published inventory. If these three sites existed within the earlier enumeration’s scope and were omitted, they are enumeration misses under the literal test. If the intended trigger is specifically a missed *live defect*, say so consistently. Without revision comparability, even that historical determination remains open.
+
+   **“No demonstrated prior defect miss” is a permissible evidentiary status. It is not a negative result established by these three SAFE sites.**
+
+5. **P3 provides additional coverage, but its independence and sensitivity are unestablished.** It approaches candidates from count reads, yet still requires a nearby `make`. It therefore shares substantial blind spots with P1: indirect allocation, helper boundaries, and allocation mechanisms outside `make`. The twelve-line restriction adds another blind spot. Changing the search direction does not remove the shared restriction.
+
+   P3’s reported results contain neither known LIVE site. That does not disqualify a complementary search, but it means the results provide no demonstrated sensitivity to a live defect in the supposedly broader population.
+
+   To distinguish a useful complementary predicate from one that shares the original blindness, r6 would need evidence such as independently selected positive cases exercising the claimed additional coverage, or an assessment of relevant candidates excluded by its restrictions. SAFE cases alone cannot distinguish those explanations. They help validate the safety discriminator; they do not establish enumeration recall.
+
+   The measurement also needs a reproducibility correction. §5 says the predicates are recorded **“verbatim,”** but §4 gives descriptions, not executable commands or an exact matching procedure. P3 supposedly requires a `binary.*Endian.Uint*` read **feeding** an allocation, yet the displayed heartbeat count is `int(data[8])`. Explain the actual matching read and dependency, or acknowledge that the predicate detects proximity rather than demonstrated dataflow.
+
+6. **The residual-doubt statement starts honestly and ends with an unsupported confidence upgrade.** “Nothing establishes it spans only two” accurately preserves UNKNOWN. But **“bounded residual doubt with two cross-checking predicates”** supplies neither a bound nor evidence that their failure modes sufficiently differ.
+
+   This is not literally a renewed assertion of completeness. It does, however, suggest a justified limit on the remaining uncertainty that the measurement has not established. The defensible improvement is concrete: **three additional sites were inspected and classified SAFE; specified syntactic forms were searched.** The space of unsearched forms remains unbounded by the presented evidence.
+
+   R6 already had negative controls: §3’s SAFE pair and test (2)’s “yes — 2 SAFE sites.” P3 supplies *additional* controls, not “the NEGATIVE CONTROL the class did not have.” Moreover, the predicates returned these SAFE sites; distinguish candidate selection from the subsequent decision not to flag them as defects.
+
+7. **The measurement did not return the “OPPOSITE answer,” and the methodological lesson is overstated.** R5’s YES lacked evidence. R6’s search found no additional defect in a restricted candidate set. Those are not opposite measurements of the same proposition.
+
+   The useful lesson is: **replace an unsupported premise with a discriminating observation when obtaining that observation is worth its cost; otherwise preserve UNKNOWN and explain the decision under uncertainty.** Reasoning remains necessary to determine whether the observation measures the disputed input at all.
+
+   Three cheap searches demonstrate that these searches were cheap. They do not establish that resolving coverage uncertainty generally is. Nor must an expensive measurement always precede remediation. R6’s own effort/consequence/additional-coverage rule provides the appropriate decision framework.
+
+   The sentence **“Cost is not an argument against a method that worked”** contradicts that framework. An effective method can still cost more than its expected additional benefit warrants.
+
+8. **The fourth stale passage is explicit—and repeats the exact withdrawn argument.** Inside the operative per-class test, under §4(a), r6 still says:
+
+   > “And the class carries an observed miss, visible in its own §3 table.”
+
+   It then retains:
+
+   > “Whether the Split grep was among the original four or added after M17 was noticed…”
+
+   This is precisely the unsupported inference the new discussion rejects. Unlike the separately marked “superseded” scheduling paragraph, this passage remains inside the current rule’s explanation. A reader following it would select C while the recommendation selects B.
+
+   Other consequential propagation failures remain:
+
+   - Path B still instructs **“enumerate each class completely,”** and its supporting argument says wire-count is **“already enumerated and partitioned.”** Reconcile those statements with its UNKNOWN coverage.
+   - The class inventory still reports the original four groups/five locations without incorporating the three newly reported sites.
+   - §5 step 1 still calls H4 and CSA-R **“TWO members”** of **“the same mechanism,”** despite §2b explicitly withholding that adjudication. The unconditional residue count of 2 likewise needs to distinguish established nonmembers from the pending candidate.
+   - Step 2a is DONE, yet the recommendation and instrument track still describe it as a prospective decision point capable of moving wire-count to C. Specify a future rerun condition or remove that obsolete branch.
+
+9. **The remaining acceptance gap is actionable; unknown completeness itself is not a blocker.** For Path C, §6 requires the instrument’s **named coverage gap**, but does not specify evidence that the delivered instrument actually addresses that gap. Require a working detector and demonstrated detection of the targeted variant, with suitable controls. Naming the gap is design work, not validation.
+
+   Keep packed fold on C. Wire-count may remain on B as an explicit implementation choice under UNKNOWN coverage and no established historical defect miss; the three additional SAFE sites are useful supporting inventory work. Correct the inflated measurement claims, reconcile the operative rules and inventory, and make instrument acceptance demonstrable. Those changes—not proof of exhaustive coverage—are what this plan still needs before handoff.
+tokens used
+20,242
+PLAN-REVISE
+
+1. **Prior objection (1): RESOLVED for §3’s opening.** “Partition what they found completely” now limits the claim to the returned candidates. That is the requested correction. Other completeness claims remain elsewhere, identified below.
+
+2. **Prior objection (2): NOT RESOLVED overall.** Several components are fixed: packed fold selects C through test (1); recurrence is correctly distinguished from enumeration failure; C now blocks class closure rather than remediation; and an instrument track appears in sequencing and acceptance.
+
+   But wire-count’s newly asserted **“NO — measured” is not established by the reported measurement**. The unsupported YES has been replaced by an overinterpreted negative result. Path B may still be defensible, but this does not derive it as claimed.
+
+3. **Prior objection (3): RESOLVED as a diagnosis.** R6 now distinguishes the three failures explicitly:
+
+   - **Not executing:** “r2-r4 stated a per-class test and never applied it.”
+   - **Unsupported premises:** “r5 applied it and fed it an input it had already conceded was unknown.”
+   - **Failure to propagate:** “§4 withdrew that completeness claim and this sentence was left asserting it.”
+
+   The opening maxim remains broad, but the distinctions are now present. I would not block implementation over that wording. The fact that propagation failures persist is a separate problem.
+
+4. **The measurement answers a narrower question than the claimed decisive input.** Grant every SAFE classification. P3 establishes: **among its reported additional candidates, no additional live defect was found**. It does not establish that an earlier enumeration missed no defects.
+
+   In particular, the original disputed fact was whether the original enumeration included the Split search. Running a new, explicitly Split-aware collection of predicates does not establish what the original commands did. R6 supplies neither that historical provenance nor a comparable rerun of those commands. It also moves from `b24e26d3b` to `f36be93c5` without establishing which relevant sites existed at both revisions.
+
+   There is also a consequential ambiguity in test (3): it says **“MISS members,”** whereas the measurement concludes from **no missed defects**. SAFE sites are members of the published inventory. If these three sites existed within the earlier enumeration’s scope and were omitted, they are enumeration misses under the literal test. If the intended trigger is specifically a missed *live defect*, say so consistently. Without revision comparability, even that historical determination remains open.
+
+   **“No demonstrated prior defect miss” is a permissible evidentiary status. It is not a negative result established by these three SAFE sites.**
+
+5. **P3 provides additional coverage, but its independence and sensitivity are unestablished.** It approaches candidates from count reads, yet still requires a nearby `make`. It therefore shares substantial blind spots with P1: indirect allocation, helper boundaries, and allocation mechanisms outside `make`. The twelve-line restriction adds another blind spot. Changing the search direction does not remove the shared restriction.
+
+   P3’s reported results contain neither known LIVE site. That does not disqualify a complementary search, but it means the results provide no demonstrated sensitivity to a live defect in the supposedly broader population.
+
+   To distinguish a useful complementary predicate from one that shares the original blindness, r6 would need evidence such as independently selected positive cases exercising the claimed additional coverage, or an assessment of relevant candidates excluded by its restrictions. SAFE cases alone cannot distinguish those explanations. They help validate the safety discriminator; they do not establish enumeration recall.
+
+   The measurement also needs a reproducibility correction. §5 says the predicates are recorded **“verbatim,”** but §4 gives descriptions, not executable commands or an exact matching procedure. P3 supposedly requires a `binary.*Endian.Uint*` read **feeding** an allocation, yet the displayed heartbeat count is `int(data[8])`. Explain the actual matching read and dependency, or acknowledge that the predicate detects proximity rather than demonstrated dataflow.
+
+6. **The residual-doubt statement starts honestly and ends with an unsupported confidence upgrade.** “Nothing establishes it spans only two” accurately preserves UNKNOWN. But **“bounded residual doubt with two cross-checking predicates”** supplies neither a bound nor evidence that their failure modes sufficiently differ.
+
+   This is not literally a renewed assertion of completeness. It does, however, suggest a justified limit on the remaining uncertainty that the measurement has not established. The defensible improvement is concrete: **three additional sites were inspected and classified SAFE; specified syntactic forms were searched.** The space of unsearched forms remains unbounded by the presented evidence.
+
+   R6 already had negative controls: §3’s SAFE pair and test (2)’s “yes — 2 SAFE sites.” P3 supplies *additional* controls, not “the NEGATIVE CONTROL the class did not have.” Moreover, the predicates returned these SAFE sites; distinguish candidate selection from the subsequent decision not to flag them as defects.
+
+7. **The measurement did not return the “OPPOSITE answer,” and the methodological lesson is overstated.** R5’s YES lacked evidence. R6’s search found no additional defect in a restricted candidate set. Those are not opposite measurements of the same proposition.
+
+   The useful lesson is: **replace an unsupported premise with a discriminating observation when obtaining that observation is worth its cost; otherwise preserve UNKNOWN and explain the decision under uncertainty.** Reasoning remains necessary to determine whether the observation measures the disputed input at all.
+
+   Three cheap searches demonstrate that these searches were cheap. They do not establish that resolving coverage uncertainty generally is. Nor must an expensive measurement always precede remediation. R6’s own effort/consequence/additional-coverage rule provides the appropriate decision framework.
+
+   The sentence **“Cost is not an argument against a method that worked”** contradicts that framework. An effective method can still cost more than its expected additional benefit warrants.
+
+8. **The fourth stale passage is explicit—and repeats the exact withdrawn argument.** Inside the operative per-class test, under §4(a), r6 still says:
+
+   > “And the class carries an observed miss, visible in its own §3 table.”
+
+   It then retains:
+
+   > “Whether the Split grep was among the original four or added after M17 was noticed…”
+
+   This is precisely the unsupported inference the new discussion rejects. Unlike the separately marked “superseded” scheduling paragraph, this passage remains inside the current rule’s explanation. A reader following it would select C while the recommendation selects B.
+
+   Other consequential propagation failures remain:
+
+   - Path B still instructs **“enumerate each class completely,”** and its supporting argument says wire-count is **“already enumerated and partitioned.”** Reconcile those statements with its UNKNOWN coverage.
+   - The class inventory still reports the original four groups/five locations without incorporating the three newly reported sites.
+   - §5 step 1 still calls H4 and CSA-R **“TWO members”** of **“the same mechanism,”** despite §2b explicitly withholding that adjudication. The unconditional residue count of 2 likewise needs to distinguish established nonmembers from the pending candidate.
+   - Step 2a is DONE, yet the recommendation and instrument track still describe it as a prospective decision point capable of moving wire-count to C. Specify a future rerun condition or remove that obsolete branch.
+
+9. **The remaining acceptance gap is actionable; unknown completeness itself is not a blocker.** For Path C, §6 requires the instrument’s **named coverage gap**, but does not specify evidence that the delivered instrument actually addresses that gap. Require a working detector and demonstrated detection of the targeted variant, with suitable controls. Naming the gap is design work, not validation.
+
+   Keep packed fold on C. Wire-count may remain on B as an explicit implementation choice under UNKNOWN coverage and no established historical defect miss; the three additional SAFE sites are useful supporting inventory work. Correct the inflated measurement claims, reconcile the operative rules and inventory, and make instrument acceptance demonstrable. Those changes—not proof of exhaustive coverage—are what this plan still needs before handoff.
+CODEX_EXIT=0
