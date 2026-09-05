@@ -782,8 +782,32 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		"shared-umem phase0-artifact-file",
 		"ssh client-alive-count-max",
 		"ssh client-alive-interval",
+		// issue 8922: `ciphers` and `macs` join `key-exchange`, which was
+		// admitted without them. The three are SCHEMA-IDENTICAL -- args:1,
+		// multi:true, validator ValidateSSHAlgorithm, children nil -- they are
+		// read by the same loop over firewallMatchValues into three parallel
+		// fields, and each renders one line of the same sshd drop-in
+		// (daemon_hostauth_apply.go:831-842). Admitting one of three left a
+		// config that hardens all three applying KexAlgorithms and silently
+		// ignoring Ciphers/MACs: an empty list writes NO line, so sshd keeps
+		// its permissive built-in default. PARTIAL APPLICATION READS AS
+		// SUCCESS, which is worse than all three failing.
+		//
+		// Empty-equivalence measured, as this pass's admission rule requires:
+		// the elided spelling yields Ciphers=[] / MACs=[], identical to the
+		// stanza being absent, so nothing consumes the packed tail today and
+		// folding it can only ADD the operator's value, never change an
+		// existing behaviour.
+		//
+		// #8921 check done before landing, because this predicate is keyed
+		// (containerKeyword, head) with NO parent context: `ssh` names exactly
+		// one container (reached directly and through the `groups` mirror of
+		// the same node), and `ciphers`/`macs` are declared by no other
+		// container. The admission cannot leak to a same-named neighbour.
+		"ssh ciphers",
 		"ssh connection-limit",
 		"ssh key-exchange",
+		"ssh macs",
 		"ssh root-login",
 		"static-binding host-name",
 		// issue 8858: the OUTER half of the root-authentication fold, and the
