@@ -11,6 +11,29 @@ Read this file in full before:
 - reviewing a PR
 - opening a PR that claims a performance improvement
 
+### Before every push: read the diffstat against master, in BOTH forms
+
+```
+git diff --stat origin/master HEAD      # catches a real DELETION
+git diff --stat origin/master...HEAD    # says whether the change is YOURS
+```
+
+**Neither alone is the check — the pair is.** Two-dot compares the trees, so it
+shows files your branch would remove *including* ones it never touched, when
+master has moved underneath you. Three-dot compares from the merge base, so it
+shows only what you actually changed and would hide a deletion that is real.
+
+Both halves cost real work today. A branch was about to merge with a 413-line
+guard file and its testdata deleted — a stale base, and **the full suite was
+green precisely because those files were absent from the branch. A deleted
+guard cannot fail.** Later the same day, two-dot alone reported eighteen files
+including a `pkg/daemon` test nobody had opened; three-dot showed nine, all
+genuinely the branch's.
+
+A test suite tells you what your change does to the code that is present. It
+cannot tell you what your change removes.
+
+
 ## First principles
 
 1. **Latency is sacred.** Memory is cheap. Microseconds on the packet
