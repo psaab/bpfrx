@@ -54,7 +54,31 @@ func normalizeCompactStanzas(tree *ConfigTree) int {
 // because that is where a silent drop is a SECURITY outcome rather than a
 // cosmetic one — a dropped match criterion silently changes what a rule
 // matches, and a dropped authentication key silently changes what authenticates.
-func compactNormalizeInScope(containerKeyword, head string) bool {
+// compactNormalizeInScope is a VAR, not a plain func, solely so tests can
+// observe which (container, head) keys the pass actually consults for a given
+// spelling. It is never reassigned in production and the default below is the
+// only implementation that ships.
+//
+// WHY THE SEAM EXISTS. The scope of this pass is decided per (container, head)
+// PAIR while the register classifies per SITE, so a guard has to know which
+// pair governs which site. Every attempt to DERIVE that from a site's path has
+// been wrong -- the container path carries the schema arg placeholder where
+// production passes node.Keys[0], and a site's key chain turns out to be a
+// property of the SPELLING rather than of the site (the same dhcp site is one
+// link when minimally packed and five when written flat). Three separate
+// derivations produced three different wrong answers.
+//
+// The only method that has been right is to ask the pass: admit everything,
+// run the real spelling, and record what fires. That works as a throwaway
+// mutation; it cannot work as a permanent guard, because a guard may not edit
+// production to take its measurement. Hence one level of indirection, which is
+// the smallest change that makes the measurement possible at all.
+//
+// Callers must not reassign this outside a test, and a test that does must
+// restore it with defer -- see withRecordedScopeKeys8690.
+var compactNormalizeInScope = compactNormalizeInScopeDefault
+
+func compactNormalizeInScopeDefault(containerKeyword, head string) bool {
 	// #8690, second increment: the CREDENTIAL family. Chosen on consequence
 	// rather than on count — each of these is a token whose silent drop leaves
 	// something authenticating (or authorizing) with NOTHING, on a commit that
