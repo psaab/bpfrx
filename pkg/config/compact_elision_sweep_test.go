@@ -1,7 +1,6 @@
 package config
 
 import (
-	"encoding/json"
 	"sort"
 	"strings"
 	"testing"
@@ -61,14 +60,9 @@ import (
 // sweepPairVerdicts8859 is the MEASUREMENT: every site for every un-admitted
 // pair, keyed pair -> verdict -> an example leaf that produced it.
 func sweepPairVerdicts8859() (map[string]map[string]string, map[string]string, []string) {
-	dig := func(c *Config) string {
-		if c == nil {
-			return "<nil>"
-		}
-		c.Warnings = nil
-		b, _ := json.Marshal(c)
-		return string(b)
-	}
+	// ConfigFingerprint, not a local renderer and never %v -- see
+	// config_compare_8908.go for why the obvious alternative is wrong.
+	dig := ConfigFingerprint
 	compile := func(text string) (*Config, bool) {
 		tr, perrs := NewParser(text).Parse()
 		if len(perrs) > 0 || tr == nil {
@@ -138,7 +132,28 @@ func sweepPairVerdicts8859() (map[string]map[string]string, map[string]string, [
 		if len(s.container) < 2 || strings.HasPrefix(s.container[0], "groups") {
 			continue
 		}
-		stanza, child := s.container[0], s.container[1]
+		// RE-SPLIT BEFORE KEYING. A container ELEMENT can hold two tokens --
+		// `"policer xpfarg"`, `"community xpfarg"`, `"three-color-policer
+		// xpfarg"` -- because a named-instance container carries its placeholder
+		// in the same element. `compactNormalizeInScope` is keyed on the bare
+		// keyword, so `("firewall", "policer xpfarg")` never matches and the
+		// admitted pair stays in the un-admitted population.
+		//
+		// MEASURED: 16 admitted pairs across 108 sites were in the swept
+		// population, and all 16 reached the published table -- 15 as SAME, 1 as
+		// NO-REFERENCE. Those rows read SAME because THE FOLD ALREADY HANDLES
+		// THEM, not because the two spellings are naturally equivalent, so the
+		// SAME column was conflating "no defect here" with "already fixed".
+		//
+		// Found by lane-8526, who had the identical bug in #8852's census and
+		// fixed it the same way. It is silent in both directions: a slice of two
+		// elements one of which contains a space prints exactly like a slice of
+		// three.
+		fields := strings.Fields(strings.Join(s.container, " "))
+		if len(fields) < 2 {
+			continue
+		}
+		stanza, child := fields[0], fields[1]
 		pair := stanza + " " + child
 		if compactNormalizeInScope(stanza, child) {
 			continue
