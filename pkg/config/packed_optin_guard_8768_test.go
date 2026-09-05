@@ -296,11 +296,12 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 			closer: " } } }",
 			stmts: map[string]string{
 				"address": "address a1 10.0.0.1/32",
-				// FLAT, not braced. A braced statement cannot be composed by
-				// these builders -- they join statements with ";", so a value
-				// ending in "}" produces "};" and fails to parse. It also has to
-				// be the ELIDED spelling for the same-leaf comparison to reach
-				// the splitter at all.
+				// FLAT, not braced. These builders join statements with ";", so a
+				// statement ending in "}" yields "};" and the arm fails to PARSE
+				// -- which compared <parse err> to <parse err>, green and
+				// measuring nothing. It also has to be the ELIDED spelling to
+				// reach the splitter at all; the braced one lands in the #8850
+				// decline branch.
 				"address-set": "address-set s1 address a1",
 			},
 			second: map[string]string{
@@ -331,11 +332,12 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 			closer: " } }",
 			stmts: map[string]string{
 				"address": "address a1 10.0.0.1/32",
-				// FLAT, not braced. A braced statement cannot be composed by
-				// these builders -- they join statements with ";", so a value
-				// ending in "}" produces "};" and fails to parse. It also has to
-				// be the ELIDED spelling for the same-leaf comparison to reach
-				// the splitter at all.
+				// FLAT, not braced. These builders join statements with ";", so a
+				// statement ending in "}" yields "};" and the arm fails to PARSE
+				// -- which compared <parse err> to <parse err>, green and
+				// measuring nothing. It also has to be the ELIDED spelling to
+				// reach the splitter at all; the braced one lands in the #8850
+				// decline branch.
 				"address-set": "address-set s1 address a1",
 			},
 			second: map[string]string{
@@ -515,18 +517,16 @@ func TestPackedOptInHoldsForEveryLeafPair8768(t *testing.T) {
 	divergesByNestedElision := map[string]bool{
 		"security/zones/security-zone/address-book address-set+address": true,
 		"security/address-book/global address-set+address":              true,
-		// The reverse order diverges too, and it surfaced only once the
-		// `address-set` fixture was written FLAT -- the braced spelling lands in
-		// the #8850 decline branch and never reaches the splitter, so the
-		// elided spelling is a different path through the same container.
+		// The reverse order, which surfaced only once the fixture was written
+		// FLAT and the parse guard above stopped the arm failing silently.
+		// Re-derived against origin/master rather than carried over:
 		//
-		// Measured, master vs this head:
 		//	packed  global address a1 10.0.0.1/32 address-set s1 address a1;
 		//	  master  <nothing at all>
-		//	  head    addr:a1                      (set still lost)
-		//	braced    addr:a1, set:s1(a1)
+		//	  head    addr:a1=10.0.0.1/32        (the set is still lost)
+		//	braced    addr:a1=10.0.0.1/32, set:s1(a1)
 		//
-		// So this head is strictly BETTER than master here and still not equal.
+		// So this head is strictly BETTER than master here and still unequal.
 		// Recorded as diverging, not as fixed.
 		"security/zones/security-zone/address-book address+address-set": true,
 		"security/address-book/global address+address-set":              true,
@@ -612,6 +612,26 @@ func TestPackedOptInHoldsForEveryLeafPair8768(t *testing.T) {
 				braced := c.prefix + c.open + " { " + c.stmts[a] + "; " + c.stmts[b] + "; }" + c.closer
 				got, want := compile(packed, c.read), compile(braced, c.read)
 				checked++
+				// NEITHER ARM MAY BE A COMPILE FAILURE. Without this the loop
+				// compared <parse err> to <parse err> -- equal, green, measuring
+				// nothing -- and worse, a pair whose reference arm merely FAILED
+				// TO PARSE registered as a divergence, pinning a
+				// divergesByNestedElision entry to an unparsable string so no
+				// change to the fold could ever free it. A registry entry that
+				// can never be discharged is worse than a vacuous cell, because
+				// the registry's whole contract is that entries are DELETED when
+				// the divergence is repaired.
+				//
+				// The same-leaf loop below has carried this guard since it was
+				// written; this is the older loop being given it.
+				if bad := firstCompileFailure8768(got, want); bad != "" {
+					t.Errorf("%s: the %s spelling for %q + %q did not parse or "+
+						"compile (%s), so this pair asserts nothing -- and if it "+
+						"is registered as diverging, the registration is pinned to "+
+						"a fixture fault rather than to a fold (#8768)",
+						name, bad, a, b, map[string]string{"packed": got, "braced": want}[bad])
+					continue
+				}
 				if got != want {
 					key := name + " " + a + "+" + b
 					if divergesByNestedElision[key] {
@@ -963,6 +983,22 @@ func TestPackedOptInHoldsForEveryLeafPair8768(t *testing.T) {
 
 // containerKeywordOfPath8768 returns the keyword the scope predicate is asked
 // about for a schema path: the last segment that is not a wildcard.
+// firstCompileFailure8768 names which arm failed to parse or compile, or "" if
+// both produced a real reading. `<no gateway>`-style reader sentinels are NOT
+// compile failures and are deliberately not matched here.
+func firstCompileFailure8768(packed, braced string) string {
+	isFail := func(v string) bool {
+		return v == "<parse err>" || strings.HasPrefix(v, "<err ")
+	}
+	switch {
+	case isFail(packed):
+		return "packed"
+	case isFail(braced):
+		return "braced"
+	}
+	return ""
+}
+
 func containerKeywordOfPath8768(path string) string {
 	segs := strings.Split(path, "/")
 	for i := len(segs) - 1; i >= 0; i-- {
