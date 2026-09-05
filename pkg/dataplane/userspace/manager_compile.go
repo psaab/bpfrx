@@ -390,7 +390,22 @@ func (m *Manager) applyCompiledSnapshot(
 			"binding_plan_changed", publishedPlanChangedDuringStartup,
 			"process_identity_changed", processIdentityChangedDuringStartup,
 		)
-		m.stopLocked()
+		// #8899: go through the PREFLIGHT wrapper rather than calling
+		// stopLocked directly. `stopForNewGenerationLocked` validates the
+		// incoming binary/socket/state-file paths BEFORE tearing the current
+		// helper down and, on a bad path, returns
+		// "refusing to restart ... previous generation left running".
+		//
+		// This mattered little while the only trigger here was a BINDING PLAN
+		// change (workers, rings, topology — nothing the preflight inspects).
+		// The process-identity trigger fires on exactly the paths it does
+		// validate, so without the wrapper a mistyped `control-socket` would
+		// kill the running helper and only then fail to start its replacement,
+		// turning a rejected config into an outage. Keeping the old helper on a
+		// bad config is the whole point of the preflight.
+		if err := m.stopForNewGenerationLocked(ucfg); err != nil {
+			return result, err
+		}
 		pendingXSKStartup = false
 		samePlanRefresh = false
 	}

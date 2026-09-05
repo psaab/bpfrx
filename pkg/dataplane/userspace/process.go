@@ -83,6 +83,11 @@ func preflightHelperPaths(cfg config.UserspaceConfig) error {
 // running helper down only once that preflight passes, so a config that cannot
 // bring up a new generation leaves the previous one — and its forwarding —
 // running (#5839).
+// defaultPollMode is the `--poll-mode` value used when none is configured.
+// SINGLE SOURCE: both the spawn path and configEqual read it through
+// effectivePollMode, so the comparison cannot drift from the argv (#8899).
+const defaultPollMode = "busy-poll"
+
 func (m *Manager) stopForNewGenerationLocked(cfg config.UserspaceConfig) error {
 	if err := preflightHelperPaths(cfg); err != nil {
 		return fmt.Errorf("refusing to restart userspace dataplane helper, "+
@@ -158,10 +163,7 @@ func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) error {
 		}
 		slog.Debug("userspace: cleared stale XSKMAP entries")
 	}
-	pollMode := cfg.PollMode
-	if pollMode == "" {
-		pollMode = "busy-poll"
-	}
+	pollMode := effectivePollMode(cfg)
 	cmd := exec.Command(binary,
 		"--control-socket", cfg.ControlSocket,
 		"--state-file", cfg.StateFile,
@@ -462,6 +464,24 @@ func processRestartRequiredDuringStartup(
 	return pendingXSKStartup && !configEqual(running, desired)
 }
 
+// effectivePollMode is the value that actually reaches the helper's argv.
+// `--poll-mode` is passed unconditionally and an empty configured value is
+// defaulted at spawn (see ensureProcessLocked), so "" and "busy-poll" produce
+// the IDENTICAL child process.
+//
+// #8899: comparing the raw strings therefore reports a difference where none
+// exists on the wire — an operator explicitly writing the default they were
+// already running would be told the process identity changed. That was
+// harmless while the comparison only guarded the normal apply path, which
+// re-execs anyway; the startup-window trigger makes it a spurious RESTART, so
+// the two spellings are normalised at the one place both paths consult.
+func effectivePollMode(c config.UserspaceConfig) string {
+	if c.PollMode == "" {
+		return defaultPollMode
+	}
+	return c.PollMode
+}
+
 func configEqual(a, b config.UserspaceConfig) bool {
 	return a.Binary == b.Binary &&
 		a.ControlSocket == b.ControlSocket &&
@@ -469,7 +489,7 @@ func configEqual(a, b config.UserspaceConfig) bool {
 		a.StateFile == b.StateFile &&
 		a.Workers == b.Workers &&
 		a.RingEntries == b.RingEntries &&
-		a.PollMode == b.PollMode
+		effectivePollMode(a) == effectivePollMode(b)
 }
 
 func (m *Manager) StartFIBSync(ctx context.Context) {

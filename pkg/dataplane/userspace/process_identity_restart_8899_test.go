@@ -353,10 +353,28 @@ func TestStartupRestartConsultsProcessIdentity8899(t *testing.T) {
 		t.Fatal("the restart condition no longer names processIdentityChangedDuringStartup")
 	}
 	tail := stripped[idx:]
-	end := strings.Index(tail, "m.stopLocked()")
+	// The teardown must go through the PREFLIGHT wrapper, not a bare
+	// stopLocked(). `stopForNewGenerationLocked` validates the incoming
+	// binary/socket/state-file paths BEFORE killing the current helper and
+	// refuses with "previous generation left running" on a bad one.
+	//
+	// This trigger fires on exactly those paths, so a bare stopLocked() turns a
+	// mistyped `control-socket` into an outage: the running helper dies and its
+	// replacement then fails to start. The binding-plan trigger it shares this
+	// branch with does not touch paths, which is why the bare call was
+	// tolerable before and is not now.
+	end := strings.Index(tail, "m.stopForNewGenerationLocked(")
 	if end < 0 {
-		t.Fatal("no m.stopLocked() follows the process-identity check; the restart it " +
-			"is supposed to trigger is gone")
+		bare := strings.Index(tail, "m.stopLocked()")
+		if bare >= 0 {
+			t.Fatalf("the process-identity restart tears the helper down with a BARE " +
+				"m.stopLocked(), bypassing preflightHelperPaths. A bad binary/socket/" +
+				"state-file path will kill the running helper and only then fail to " +
+				"start its replacement. Use stopForNewGenerationLocked and propagate " +
+				"its error (#8899).")
+		}
+		t.Fatal("no teardown follows the process-identity check; the restart it is " +
+			"supposed to trigger is gone")
 	}
 	// ORDER-INDEPENDENT, deliberately. An earlier version asserted the exact
 	// string `if publishedPlanChangedDuringStartup || processIdentityChangedDuringStartup`
@@ -390,5 +408,43 @@ func TestStartupRestartConsultsProcessIdentity8899(t *testing.T) {
 		t.Errorf("the two triggers are no longer OR'd. Requiring BOTH to hold would "+
 			"mean a process-identity change with an unchanged binding plan — the exact "+
 			"#8899 case — is again acked without a restart. Condition was: %s", expr)
+	}
+}
+
+// #8899, from review: `--poll-mode` is passed unconditionally and an empty
+// configured value is defaulted at spawn, so "" and the default produce the
+// IDENTICAL child process. Comparing the raw strings reported a difference that
+// does not exist on the wire — and under the new startup-window trigger that
+// difference became a spurious RESTART for an operator who merely wrote down
+// the default they were already running.
+func TestPollModeDefaultIsNotAProcessIdentityChange8899(t *testing.T) {
+	running := baseUserspaceConfig8899()
+	running.PollMode = ""
+	desired := baseUserspaceConfig8899()
+	desired.PollMode = defaultPollMode
+
+	// LIVENESS: the two values must actually differ as strings, or this cell
+	// asserts that equal things are equal.
+	if running.PollMode == desired.PollMode {
+		t.Fatal("fixture: the two spellings are identical, so nothing is being normalised")
+	}
+	if !configEqual(running, desired) {
+		t.Errorf("configEqual reports a difference between PollMode %q and %q, but both "+
+			"spawn the helper with --poll-mode %s — identical argv. Under the "+
+			"startup-window trigger that restarts the dataplane for a config change "+
+			"that changes nothing (#8899).", running.PollMode, desired.PollMode, defaultPollMode)
+	}
+	if processRestartRequiredDuringStartup(true, running, desired) {
+		t.Error("writing the default poll-mode explicitly must NOT force a restart " +
+			"during the XSK-startup window")
+	}
+
+	// And the normalisation must not swallow a REAL change.
+	other := baseUserspaceConfig8899()
+	other.PollMode = "interrupt"
+	if configEqual(running, other) {
+		t.Error("configEqual now treats a genuinely different poll-mode as equal; the " +
+			"normalisation is too broad and a real process-identity change would be " +
+			"acked without a restart")
 	}
 }
