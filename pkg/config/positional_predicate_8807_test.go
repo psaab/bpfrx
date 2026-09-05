@@ -287,7 +287,21 @@ var posAdjudicated8807 = map[string]posVerdict8807{
 		"via the #3146 empty-application-set gate, so the commit path is safe; CompileConfigLenient ACCEPTS, and that " +
 		"is Store.Load, so the exposure is a config arriving by file or peer sync. Config-file-only, like #8800."},
 	"application-set / application-set": {"defect", "#8825, same node: nested set membership is lost in the packed spelling."},
-	"application-set / description":     {"defect", "#8825, same node: the description is lost in the packed spelling. Cosmetic half of the same declaration gap."},
+	// MEASURED SEPARATELY, and it is NOT a defect -- which is why the three
+	// heads under this one node had to be measured one at a time rather than
+	// inherited from `application`. compileApplications accepts `description`
+	// deliberately, "without adding a member and without flagging it", and
+	// ApplicationSet has NO Description field: the value lands NOWHERE by
+	// design. Both spellings compile to members=[] -- identical. Declaring it
+	// would move completion and validation and change no compiled result.
+	//
+	// This is #8830's distinction applied to a fix rather than to an
+	// instrument: "a clause exists" and "the value lands somewhere" are
+	// different questions, and here the clause exists and the value lands
+	// nowhere ON PURPOSE.
+	"application-set / description": {"benign", "MEASURED: both spellings compile to members=[], identical. " +
+		"compileApplications accepts `description` deliberately without recording it, and ApplicationSet has no " +
+		"Description field -- the value lands nowhere by design, so no spelling can lose it."},
 
 	"vpn / gateway": {"benign", "MEASURED: `security ipsec vpn <v> { gateway g; }` and the `ike { gateway g; }` " +
 		"nesting compile IDENTICALLY (gateway=\"gw1\" both ways, strict accepts both). The compiler accepts the head " +
@@ -299,7 +313,7 @@ var posAdjudicated8807 = map[string]posVerdict8807{
 // posDefectFloor8807 is a RATCHET. It fails in BOTH directions: a rise means an
 // unadjudicated positional hit, and a DROP means one was fixed and this must be
 // tightened so the next regression has no slack to hide in (#7484's shape).
-const posDefectFloor8807 = 3
+const posDefectFloor8807 = 2
 
 const posBlindness8807 = "\n\nWHAT THIS PREDICATE CANNOT SEE:\n" +
 	"  (1) CONTAINER RECOVERY IS PARTIAL. A site is localised only when its immediate " +
