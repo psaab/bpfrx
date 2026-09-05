@@ -299,10 +299,19 @@ func famOnlyCases8763() []famOnlyCase8763 {
 		// this change -- see the note in compact_normalize_8662.go.
 		{"vrrp-group authentication-key", "", vrrp("{ authentication-key \"s3cr3t\"; }"), vrrp("authentication-key \"s3cr3t\";"), vrrp("{ }"), gated8763},
 		{"vrrp-group authentication-type", "", vrrp("{ authentication-type md5; }"), vrrp("authentication-type md5;"), vrrp("{ }"), gated8763},
-		// Nothing reads it in ANY spelling: braced compiles the same as absent,
-		// and `packet-based` compiles the same as `flow-based`. Pre-existing and
-		// untouched by the traversal; recorded so it is not mistaken for one.
-		{"inet6 mode", "", "forwarding-options {\n family inet6 {\n  mode packet-based;\n }\n}\n", "forwarding-options {\n family inet6 mode packet-based;\n}\n", "forwarding-options {\n family inet6 {\n }\n}\n", readerBug},
+		// FORMERLY `reader-defect`, NOW A RECOVERY. When this table was written,
+		// braced compiled the same as ABSENT and `packet-based` compiled the
+		// same as `flow-based` -- nothing read the leaf in any spelling. The
+		// baseline leg is what surfaced that; a packed-vs-braced check calls it
+		// a clean pass, because both spellings deliver the same nothing.
+		//
+		// #8797 found the cause and it was not "unread": compileForwardingOptions
+		// descended FindChild("family") -> FindChild("inet6"), a TWO-LEVEL
+		// lookup, while `family` is compoundKey and both the parser and SetPath
+		// produce ONE node. The only shape that matched was the split
+		// `family { inet6 { … } }` that the census synthesizes. Same defect as
+		// this issue's traversal bug, in a compiler.
+		{"inet6 mode", "", "forwarding-options {\n family inet6 {\n  mode packet-based;\n }\n}\n", "forwarding-options {\n family inet6 mode packet-based;\n}\n", "forwarding-options {\n family inet6 {\n }\n}\n", recover8763},
 	}
 }
 
