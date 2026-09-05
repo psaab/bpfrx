@@ -14095,7 +14095,7 @@
           "TCPSession": null,
           "UDPSessionTimeout": 0,
           "ICMPSessionTimeout": 0,
-          "TCPMSSAllTCP": 0,
+          "TCPMSSAllTCP": 70000,
           "TCPMSSIPsecVPN": 0,
           "TCPMSSGreIn": 0,
           "TCPMSSGreOut": 0,
@@ -14335,7 +14335,7 @@
       "EventOptions": null,
       "BridgeDomains": null,
       "Warnings": [
-        "security flow tcp-mss all-tcp: invalid tcp-mss value: not an integer: \"mss\" (treated as unset/0 by the compiler — a strict commit would reject this)",
+        "security flow tcp-mss all-tcp: invalid tcp-mss value: integer out of range [0..65535] (got 70000) (kept; the dataplane coerces it — a strict commit would reject this)",
         "security flow traceoptions file: trace filename \"/etc/passwd\" must be a bare name, not a path (the file is written under /var/log) (ignored: tracing disabled, not written outside /var/log)",
         "application structure (downgraded to warning on tolerant path): application \"appA\": conflicting duplicate \"protocol\"; a single-valued application leaf (protocol / destination-port / source-port / inactivity-timeout / timeout / icmp-type / icmp-code / alg) may be set only once — a repeat with a different value is last-writer-wins and silently keeps only the LAST value by definition order, so a deny referencing this application covers fewer protocol/port combinations than authored and can fall through to a permit (split conflicting values into separate `term` sub-blocks or separate applications)"
       ],
@@ -14377,7 +14377,7 @@
           "TCPSession": null,
           "UDPSessionTimeout": 0,
           "ICMPSessionTimeout": 0,
-          "TCPMSSAllTCP": 0,
+          "TCPMSSAllTCP": 70000,
           "TCPMSSIPsecVPN": 0,
           "TCPMSSGreIn": 0,
           "TCPMSSGreOut": 0,
@@ -14617,7 +14617,7 @@
       "EventOptions": null,
       "BridgeDomains": null,
       "Warnings": [
-        "security flow tcp-mss all-tcp: invalid tcp-mss value: not an integer: \"mss\" (treated as unset/0 by the compiler — a strict commit would reject this)",
+        "security flow tcp-mss all-tcp: invalid tcp-mss value: integer out of range [0..65535] (got 70000) (kept; the dataplane coerces it — a strict commit would reject this)",
         "security flow traceoptions file: trace filename \"/etc/passwd\" must be a bare name, not a path (the file is written under /var/log) (ignored: tracing disabled, not written outside /var/log)",
         "application structure (downgraded to warning on tolerant path): application \"appA\": conflicting duplicate \"protocol\"; a single-valued application leaf (protocol / destination-port / source-port / inactivity-timeout / timeout / icmp-type / icmp-code / alg) may be set only once — a repeat with a different value is last-writer-wins and silently keeps only the LAST value by definition order, so a deny referencing this application covers fewer protocol/port combinations than authored and can fall through to a permit (split conflicting values into separate `term` sub-blocks or separate applications)"
       ],
@@ -14659,7 +14659,7 @@
           "TCPSession": null,
           "UDPSessionTimeout": 0,
           "ICMPSessionTimeout": 0,
-          "TCPMSSAllTCP": 0,
+          "TCPMSSAllTCP": 70000,
           "TCPMSSIPsecVPN": 0,
           "TCPMSSGreIn": 0,
           "TCPMSSGreOut": 0,
@@ -14899,7 +14899,7 @@
       "EventOptions": null,
       "BridgeDomains": null,
       "Warnings": [
-        "security flow tcp-mss all-tcp: invalid tcp-mss value: not an integer: \"mss\" (treated as unset/0 by the compiler — a strict commit would reject this)",
+        "security flow tcp-mss all-tcp: invalid tcp-mss value: integer out of range [0..65535] (got 70000) (kept; the dataplane coerces it — a strict commit would reject this)",
         "security flow traceoptions file: trace filename \"/etc/passwd\" must be a bare name, not a path (the file is written under /var/log) (ignored: tracing disabled, not written outside /var/log)",
         "application structure (downgraded to warning on tolerant path): application \"appA\": conflicting duplicate \"protocol\"; a single-valued application leaf (protocol / destination-port / source-port / inactivity-timeout / timeout / icmp-type / icmp-code / alg) may be set only once — a repeat with a different value is last-writer-wins and silently keeps only the LAST value by definition order, so a deny referencing this application covers fewer protocol/port combinations than authored and can fall through to a permit (split conflicting values into separate `term` sub-blocks or separate applications)"
       ],
@@ -14910,17 +14910,17 @@
   {
     "key": "lenient-downgrades/strict/generic",
     "config": null,
-    "error": "security flow tcp-mss all-tcp: invalid tcp-mss value: not an integer: \"mss\""
+    "error": "security flow tcp-mss all-tcp: invalid tcp-mss value: integer out of range [0..65535] (got 70000)"
   },
   {
     "key": "lenient-downgrades/strict/node0",
     "config": null,
-    "error": "security flow tcp-mss all-tcp: invalid tcp-mss value: not an integer: \"mss\""
+    "error": "security flow tcp-mss all-tcp: invalid tcp-mss value: integer out of range [0..65535] (got 70000)"
   },
   {
     "key": "lenient-downgrades/strict/node1",
     "config": null,
-    "error": "security flow tcp-mss all-tcp: invalid tcp-mss value: not an integer: \"mss\""
+    "error": "security flow tcp-mss all-tcp: invalid tcp-mss value: integer out of range [0..65535] (got 70000)"
   },
   {
     "key": "strict-violations/lenient/generic",

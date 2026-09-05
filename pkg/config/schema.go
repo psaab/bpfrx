@@ -134,6 +134,27 @@ type schemaNode struct {
 	// as-path `<name> <regex>`, CoS `queue`) are multi-token by nature and are
 	// excluded by the args<=1 gate in isLeafListSchema without a flag.
 	groupReplace bool
+	//
+	// THE DECIDING QUESTION, stated because it is now load-bearing in two
+	// places and the next person will not re-derive it: is this leaf a PURE
+	// SINGLE-TOKEN VALUE LIST, or does it PACK A SEPARATOR onto its values?
+	//
+	//   pure list  -- `application-set <s> application [ a b c ]` (#8825).
+	//                 Every token is a member and order carries no meaning, so
+	//                 group+inline UNION is exactly right and this flag must
+	//                 NOT be set. Setting it would silently drop an inherited
+	//                 member.
+	//   packs one  -- `nat source pool <p> address <lo> to <hi>` and the
+	//                 destination pool address, which carries `port <n>` on the
+	//                 same statement (#8816, #8817). Token-level union splices
+	//                 two statements and corrupts the value: inheriting
+	//                 `address 10.0.0.2/32 port 8080;` over an inline
+	//                 `address 10.0.0.1/32 port 80;` compiled the ADDRESS as
+	//                 "8080". This flag is required there.
+	//
+	// Both were measured rather than reasoned about, and getting it backwards
+	// is silent in both directions -- a dropped inherited member, or a spliced
+	// value that still looks like a value.
 
 	// rangeSeparator opts a `multi && children == nil` typed leaf in to
 	// treating the fixed mid-token `to` as a RANGE separator in

@@ -1413,5 +1413,28 @@ var schemaApplications = &schemaNode{desc: "Applications", children: map[string]
 		"icmp-code": {desc: "ICMP/ICMPv6 message code", args: 1, valueType: ValueInteger, valueDesc: "ICMP code", valueExamples: []string{"0"}, validator: ValidateInteger(0, 255), placeholder: "<code>", children: nil},
 		"term":      {desc: "Term", args: 1, placeholder: "<term>", children: nil},
 	}},
-	"application-set": {desc: "Application set", args: 1, valueHint: ValueHintAppSetName, placeholder: "<name>", children: nil},
+	// #8825: the members were undeclared, so the brace-elision pass was never
+	// ASKED about them and `application-set as1 application a1;` compiled to a
+	// set with ZERO members while the braced form carried them. Same shape as
+	// #8800, and the same two-part remedy: declare so the pass asks, and admit
+	// ("application-set","application") / ("application-set","application-set")
+	// in compactNormalizeInScope so it says yes.
+	//
+	// `description` is deliberately NOT declared here. It was measured
+	// separately and is BENIGN: compileApplications accepts it "without adding
+	// a member and without flagging it", and ApplicationSet has no Description
+	// field, so the value lands nowhere by design and no spelling can lose it.
+	// Declaring it would move completion and validation and change no compiled
+	// result, which is a different change from this one.
+	//
+	// multi:true on both members because a bracketed list collapses onto one
+	// leaf (`application [ a b c ]`, #2419/#5181) and applicationSetMemberValues
+	// reads the whole token run. groupReplace is NOT set: these are pure
+	// single-token value lists with no separator or operation keyword, which is
+	// exactly the leaf-list UNION case apply-groups is meant to handle (#4070),
+	// unlike the NAT pool address leaf that packs `to`/`port` (#8816).
+	"application-set": {desc: "Application set", args: 1, valueHint: ValueHintAppSetName, placeholder: "<name>", children: map[string]*schemaNode{
+		"application":     {desc: "Application member of this set", args: 1, multi: true, valueHint: ValueHintAppName, placeholder: "<application>", children: nil},
+		"application-set": {desc: "Nested application-set member", args: 1, multi: true, valueHint: ValueHintAppSetName, placeholder: "<application-set>", children: nil},
+	}},
 }}

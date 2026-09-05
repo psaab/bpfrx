@@ -600,6 +600,8 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 	switch containerKeyword + " " + head {
 	case "applications application",
 		"applications application-set",
+		"application-set application",
+		"application-set application-set",
 		"application alg",
 		"application description",
 		"application destination-port",
