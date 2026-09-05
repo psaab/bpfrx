@@ -991,7 +991,7 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 }
 
 func compileRouterAdvertisement(node *Node, proto *ProtocolsConfig) error {
-	for _, inst := range namedInstances(node.FindChildren("interface")) {
+	for _, inst := range bracketedGroupInstances8794(node.FindChildren("interface")) {
 		// #8436: FIND-OR-CREATE, keyed on the interface name — see the OSPF
 		// loops above for why the different-names case is preserved. The store
 		// here is `proto.RouterAdvertisement`, a slice, and the name lives on

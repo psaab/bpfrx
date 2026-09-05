@@ -192,7 +192,13 @@ func classifyGateBlindLeaf(g gateLeaf) gateBlindClass {
 // gate-covered rather than having moved into a blind class. The value below
 // was RE-MEASURED on the merge of the two changes, not obtained by adding one
 // to either side's number.
-const gateCoverageFloor = 702
+//
+// 702 -> 703 for the destination-pool half of #8800. Declaring `address`
+// under the destination NAT pool made that spelling COMPARE as well; blind
+// held at 364, so the leaf is genuinely gate-covered rather than having
+// moved into a blind class. Re-MEASURED at this head, not derived by adding
+// one to the source-pool number.
+const gateCoverageFloor = 703
 
 var gateBlindCeiling = map[gateBlindClass]int{
 	// #7492 moved leaves out of `unreachable` in two rounds. The parent
