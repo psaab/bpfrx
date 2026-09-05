@@ -212,34 +212,100 @@ func TestCompactLeafTCPMSS6564(t *testing.T) {
 	}
 }
 
-// TestCompactLeafTCPMSSKeywordStillRejected6564 pins the OTHER half of the
-// acceptance criterion: a member must "compile identically in both AST shapes
-// OR be rejected at commit".
+// TestCompactLeafTCPMSSKeywordIsAcceptedEverywhere6564 REPLACES
+// TestCompactLeafTCPMSSKeywordStillRejected6564, which asserted the opposite.
 //
-// `mss` is the HIERARCHICAL keyword — it is legitimate only as a child
-// (`all-tcp { mss 1350; }`). Carried inline it is a typo, and the half-packed
-// form `tcp-mss { all-tcp mss 1350; }` already hard-rejects it (selectMSSToken
-// picks the literal "mss", checkTCPMSSKind refuses). Teaching the fully-packed
-// leaf to ACCEPT that spelling would have made the two forms disagree in the
-// opposite direction, so the fix routes the packed leaf through the same
-// reader and it inherits the same rejection.
+// The old cell pinned `tcp-mss <kind> mss <n>` as REJECTED, on the premise that
+// `mss` is the hierarchical keyword and "legitimate only as a child", so inline
+// it is a typo. THE DISCONFIRMING ROW WAS ALWAYS IN THE SAME INSTRUMENT and was
+// never put beside the others:
 //
-// FAIL-ON-REVERT: make the packed-leaf arm strip a leading "mss" token.
-func TestCompactLeafTCPMSSKeywordStillRejected6564(t *testing.T) {
-	reject := func(t *testing.T, label, src string) {
+//	all-tcp { mss 1350; }             ACCEPTED, compiles to 1350
+//	tcp-mss { all-tcp mss 1350; }     was REJECTED
+//	tcp-mss all-tcp mss 1350;         was REJECTED
+//	set … all-tcp mss 1350            was REJECTED
+//
+// If `mss` were a typo the braced form would refuse it too. It does not, so
+// `mss` is a real keyword in this grammar — and CLAUDE.md's contract is that a
+// hierarchical form and its flat-set flattening compile the same, because flat
+// `set` IS the hierarchy written inline. The old premise was half right: `mss`
+// is legitimate as a child, and that is exactly why it is legitimate flattened.
+//
+// HOW A CORRECT-LOOKING CRITERION PRODUCED IT, worth keeping because the
+// criterion is still in use. #6564's acceptance was "compile identically in
+// both AST shapes OR be rejected at commit". It found the half-packed form
+// rejecting and satisfied the criterion through the OR branch — propagating the
+// rejection so the two shapes would agree — without checking the third shape,
+// which already ACCEPTED. That is consistency by LEVELLING DOWN: two forms made
+// to agree by matching the broken one, with a working form a single spelling
+// away. An "identical OR rejected" criterion is satisfiable by making
+// everything wrong.
+//
+// Adjudicated by team-lead on the measurement above; the reversal is recorded
+// here rather than left to read as drift.
+func TestCompactLeafTCPMSSKeywordIsAcceptedEverywhere6564(t *testing.T) {
+	allTCP := func(t *testing.T, label, src string) (int, bool) {
 		t.Helper()
 		tree, perrs := NewParser(src).Parse()
 		if len(perrs) != 0 {
 			t.Fatalf("parse %s: %v", label, perrs)
 		}
-		if _, err := CompileConfig(tree); err == nil {
-			t.Fatalf("#6564: %s must be REJECTED at commit — `mss` is the hierarchical "+
-				"keyword and the half-packed form already refuses it; accepting it here "+
-				"would make the two shapes disagree", label)
+		cfg, err := CompileConfig(tree)
+		if err != nil || cfg == nil {
+			return 0, true
+		}
+		return cfg.Security.Flow.TCPMSSAllTCP, false
+	}
+
+	// Every spelling of the SAME statement delivers the same value. Asserted on
+	// the value, never on acceptance: the doubly-elided form used to COMMIT
+	// while discarding the value, so an acceptance check passes on that defect.
+	for _, c := range []struct{ label, src string }{
+		{"braced `all-tcp { mss 1350; }`",
+			"security {\n flow {\n  tcp-mss {\n   all-tcp {\n    mss 1350;\n   }\n  }\n }\n}\n"},
+		{"half-packed `tcp-mss { all-tcp mss 1350; }`",
+			"security {\n flow {\n  tcp-mss {\n   all-tcp mss 1350;\n  }\n }\n}\n"},
+		{"fully-packed `tcp-mss all-tcp mss 1350;`",
+			"security {\n flow {\n  tcp-mss all-tcp mss 1350;\n }\n}\n"},
+		{"doubly-elided `flow tcp-mss all-tcp mss 1350;`",
+			"security {\n flow tcp-mss all-tcp mss 1350;\n}\n"},
+	} {
+		got, rejected := allTCP(t, c.label, c.src)
+		if rejected || got != 1350 {
+			t.Errorf("%s: TCPMSSAllTCP=%d rejected=%v, want 1350. `mss` is accepted as a "+
+				"child, so its flattening must compile the same — that is the dual-AST "+
+				"contract, and refusing it rejects the flattening of a config this same "+
+				"compiler accepts", c.label, got, rejected)
 		}
 	}
-	reject(t, "half-packed `tcp-mss { all-tcp mss 1350; }`",
-		"security {\n flow {\n  tcp-mss {\n   all-tcp mss 1350;\n  }\n }\n}\n")
-	reject(t, "fully-packed `tcp-mss all-tcp mss 1350;`",
-		"security {\n flow {\n  tcp-mss all-tcp mss 1350;\n }\n}\n")
+
+	// THE SHIPPED SHORT FORM MUST KEEP WORKING. docs/ha-cluster.conf:140 writes
+	// `tcp-mss { all-tcp 1396; }`, so widening acceptance for the `mss` keyword
+	// must not cost the spelling the project itself ships.
+	for _, c := range []struct{ label, src string }{
+		{"shipped `tcp-mss { all-tcp 1396; }`",
+			"security {\n flow {\n  tcp-mss {\n   all-tcp 1396;\n  }\n }\n}\n"},
+		{"doubly-elided short `flow tcp-mss all-tcp 1396;`",
+			"security {\n flow tcp-mss all-tcp 1396;\n}\n"},
+	} {
+		got, rejected := allTCP(t, c.label, c.src)
+		if rejected || got != 1396 {
+			t.Errorf("%s: TCPMSSAllTCP=%d rejected=%v, want 1396", c.label, got, rejected)
+		}
+	}
+
+	// A GENUINE TYPO IS STILL REFUSED. Without these the change above would be
+	// indistinguishable from "consume whatever follows the kind", which is the
+	// over-fix: it would accept `all-tcp msss 1350` and silently clamp nothing.
+	for _, c := range []struct{ label, src string }{
+		{"typo `all-tcp msss 1350`",
+			"security {\n flow {\n  tcp-mss {\n   all-tcp msss 1350;\n  }\n }\n}\n"},
+		{"`mss` with no value",
+			"security {\n flow {\n  tcp-mss {\n   all-tcp mss;\n  }\n }\n}\n"},
+	} {
+		if _, rejected := allTCP(t, c.label, c.src); !rejected {
+			t.Errorf("%s was ACCEPTED; only the exact keyword `mss` followed by a value may "+
+				"be consumed", c.label)
+		}
+	}
 }
