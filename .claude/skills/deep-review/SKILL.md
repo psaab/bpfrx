@@ -32,10 +32,17 @@ criteria for both this skill and `review-triage`.
   commit and range; an invalid or ambiguous range is not a full-tree request.
 - `--batch-size N`: maximum production files per batch (default 150), not a
   depth target. Split further by contract, complexity, and available context.
+- `--name "HA failover"`: human-readable review name for the report and issue
+  provenance. If omitted, derive a short descriptive name from effective scope
+  and focus (`full-firewall` for an unfocused full run). Record its safe
+  `REVIEW_SLUG` using the shared naming rules; the name never changes scope.
 
 Parse arguments as data; never interpolate free-form context into shell code.
 Record the effective mode, scope, focus, exclusions, and any user time/effort
 limit in the report. Delta and area modes override full-tree instructions.
+Every run writes a findings report under `/tmp`, including runs with no confirmed
+findings or no issues filed. The report records coverage and unresolved work;
+an empty findings list is not a reason to skip it.
 
 This is a defensive source review and report workflow. It does not authorize
 exploitation, deployments, shared-cluster mutations, source fixes, issue filing,
@@ -63,10 +70,13 @@ or prerequisites becomes a named validation task, not an improvised probe.
    `mktemp -d /tmp/review-work.XXXXXXXXXX`. Its unique basename is the run ID.
    Record owned paths in its run manifest. Do not use the future report sequence
    number to allocate shared scratch resources.
-5. Record runtime-provided model identity and its source when available.
-   Otherwise record `unknown`; installed binaries or another app's settings do
-   not identify the active model. Preserve distinct `muse-*` and `claude-*`
-   families. Use a filesystem-safe family name only for the final filename.
+5. Establish the coordinator's identity using the shared contract's model
+   identity and naming rules. Record `MODEL_RAW`, `MODEL_SOURCE`, `MODEL_HOST`
+   and `WHOAMI` in the manifest and report header before assigning work.
+   `WHOAMI` is derived from the evidenced model, not a historical report family
+   or the Unix username. Preserve full GPT model/version names when exposed;
+   GPT must never become `muse-spark` for "compatibility". Unknown identity is
+   explicit, not a reason to reuse a previous run's prefix.
 6. The coordinator creates each detached worker worktree from the pinned base
    under the unique run directory, following `AGENTS.md` ownership rules.
    Before work starts, the worker reports its path, SHA, and assigned scope.
@@ -315,14 +325,32 @@ a closed issue, or an old report disposition does not decide the new claim.
 
 Write one self-contained draft inside the run directory using the shared
 contract's header, per-finding fields (including Adversarial analysis and Probe),
-inspection log, and counts. Clearly distinguish confirmed findings, unresolved
-high-impact questions, verification gaps, and suggested implementation work.
+inspection log, filing ledger, and counts. Clearly distinguish confirmed findings,
+unresolved high-impact questions, verification gaps, and suggested implementation
+work.
 A review report is not an issue filing: say "recommended for filing" unless
 actual issue IDs exist.
 
-The compatibility output is `/tmp/<family>-review-NNN.md`. Determine the next
-number from exact final basenames for that family at publication time. Publish
-the complete draft with an atomic create-if-absent operation, such as a hard link
+Write `/tmp/<WHOAMI>-review-<REVIEW_SLUG>-NNN.md`, for example
+`/tmp/gpt-5.6-sol-review-ha-failover-001.md` only when that model is evidenced.
+Use the shared filing/provenance contract to mark each finding's actual issue
+status, originating model, issue URL and verified origin tags. When filing is
+authorized during the run, reconcile that ledger before freezing the report;
+when filing happens later, return the self-contained triage result with the
+updated ledger alongside the unchanged original. Never label drafts or existing
+issues as newly opened.
+
+The filename shape remains recognizable as a review; it does not justify
+another model's prefix. Use the identity established for this run, never an
+inherited shell `WHOAMI` or a prior report's family.
+Before publication, independently re-derive `WHOAMI` from the recorded identity
+and `REVIEW_SLUG` from the review name. Check that the manifest, report header
+and final basename agree. A mismatch blocks publication until reconciled;
+no "compatibility family" override exists.
+Determine the next number from exact final basenames for that `WHOAMI` and
+`REVIEW_SLUG` at publication time. A new model/review pair can begin at 001;
+deduplication still reads named and legacy reports across all model prefixes.
+Publish the complete draft with an atomic create-if-absent operation, such as a hard link
 on the same filesystem (`ln -T -- <draft> <final>`), never a replacing copy. On
 collision, update the draft's output-path header and retry the next number.
 Freeze the draft after linking: a hard link shares its contents with the final.

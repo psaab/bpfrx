@@ -1,6 +1,6 @@
 # Shared review contract
 
-Contract version: `xpf-review-v3`. Both `deep-review` and `review-triage`
+Contract version: `xpf-review-v4`. Both `deep-review` and `review-triage`
 read this file. Changes to this contract must be reflected in both workflows.
 Repository guidance and actual user scope/authorization still apply.
 
@@ -194,6 +194,76 @@ known limitations, not proof that their checks have run for this review.
 
 ## Freshness and provenance
 
+### Model identity and report naming
+
+The model, the agent application, and the report filename are different things.
+Record these exact header labels in both the run manifest and final report:
+
+- `MODEL_RAW`: the coordinator's model identifier as reported for the current
+  run/turn, including version and suffix, or `unknown` if no exact identifier is
+  exposed. Do not turn a broad "based on GPT-5" statement into an exact serving
+  model or snapshot. Preserve a reported alias literally and identify it as an
+  alias rather than guessing the model behind it.
+- `MODEL_SOURCE`: where the identity was actually observed, scoped to this
+  run/turn. Distinguish a runtime-reported model, a selected/requested model,
+  a known family only, and unavailable/conflicting evidence. A model picker or
+  launch selection is not proof of a hidden backend snapshot.
+- `MODEL_HOST`: the application running the coordinator (for example `codex`),
+  or `unknown`. The host is not the model: GPT can run through another host.
+- `WHOAMI`: the filesystem-safe report prefix derived below. It is not the
+  output of Unix `whoami`, a free-form alias or a compatibility override.
+
+Use current-run metadata exposed by the active runtime or its run-scoped
+configuration. Do not start another agent or change models to discover identity.
+Global settings, inherited `MUSE_MODEL`/`ANTHROPIC_MODEL`/`OPENAI_MODEL` values,
+installed binaries, old transcripts and existing filenames do not establish the
+current model unless independently tied to this run. Codex permits per-turn model
+overrides ([official documentation](https://learn.chatgpt.com/docs/app-server#turns));
+a saved default alone cannot settle the current identity. Read only relevant
+metadata, not credentials, environment dumps or unrelated conversation history.
+
+Derive `WHOAMI` in this order:
+
+1. If `MODEL_RAW` is known, use the full identifier: lowercase it, replace runs
+   of characters outside ASCII `a-z`, `0-9`, `.`, `_`, `-` with `-`, and strip
+   leading/trailing `.`, `_`, `-`. Preserve version numbers and model suffixes;
+   do not apply `cut -d- -f1`, strip GPT versions, or translate provider families.
+   Keep the unsanitized identifier in `MODEL_RAW`. If nothing remains after
+   sanitization, treat the identity as unresolved instead of inventing a label.
+2. If only the model family is established, keep `MODEL_RAW: unknown`, state
+   that family and its source in `MODEL_SOURCE`, and use `<family>-unknown`.
+   Apply the same safe-name normalization to the family. Known GPT with no exact
+   model identifier yields `gpt-unknown`, never `muse-spark` or a guessed GPT ID.
+3. If only the host is established, use `<host>-unknown` with the same
+   normalization and `MODEL_RAW: unknown`. With neither, use `unknown`.
+   An empty normalized family/host is unavailable, not a valid prefix.
+   Conflicting evidence must be reported; use only the level actually established.
+
+Naming examples, not defaults or model-selection instructions:
+
+| Observed coordinator identity | `MODEL_RAW` | `WHOAMI` |
+| --- | --- | --- |
+| Exact runtime identifier `gpt-5.6-sol` | `gpt-5.6-sol` | `gpt-5.6-sol` |
+| Exact runtime identifier `gpt-daybreak-blue-latest` | `gpt-daybreak-blue-latest` | `gpt-daybreak-blue-latest` |
+| Exact runtime identifier `muse-spark-1.1` | `muse-spark-1.1` | `muse-spark-1.1` |
+| GPT family only, running in Codex | `unknown` | `gpt-unknown` |
+| Codex host only, model family unavailable | `unknown` | `codex-unknown` |
+| No usable identity evidence | `unknown` | `unknown` |
+
+The final prefix identifies the coordinator, not an arbitrarily selected worker.
+Record each worker's model/source separately in its assignment evidence; do not
+copy the coordinator's identity onto workers or use one worker's model to label
+the entire campaign. Record model changes during the campaign with their work
+scope and derive the final prefix from the coordinator's identity at publication.
+
+The publication gate compares the derived prefix with `WHOAMI` in the manifest,
+header and final basename. An existing report sequence is never evidence of the
+current model. Preserve legacy filenames during triage; record identity conflicts
+as provenance corrections without rewriting history or discarding valid findings
+solely because their original author used the wrong prefix.
+
+### Repository and revision identity
+
 Reports identify the repository independently of checkout names or model names.
 Use the credential-free remote identity plus base SHA; local-only reviews use
 an explicit local identity. Never publish embedded credentials or raw environment
@@ -213,13 +283,89 @@ limits. Historic indexes are leads; refresh the specific issue bodies, fixing
 changes, and acceptance criteria that carry a DUP/FIXED decision. A closed issue
 is not proof of a complete fix. Offline/partial history is explicitly incomplete.
 
+## Named reports, issue filing and origin tags
+
+Record `Review name` as human-readable text and `REVIEW_SLUG` as its filename
+component. Lowercase the name, replace runs outside ASCII `a-z` and `0-9` with
+`-`, and strip leading/trailing `-`. If empty, use the effective mode name and
+record that fallback. Choose a short descriptive name at setup; no shell
+evaluation of review names or issue titles is permitted.
+
+New reports use `/tmp/<WHOAMI>-review-<REVIEW_SLUG>-NNN.md`. The immutable run ID,
+repository and finding IDs establish provenance; the filename alone does not.
+Legacy `/tmp/<WHOAMI>-review-NNN.md` reports remain readable and participate in
+deduplication. Never publish a second compatibility alias of the same report:
+watchers could treat it as new work and file twice.
+
+Every report includes a filing ledger, even in report-only mode:
+
+| Finding ID | Title | Originating model(s) | Gate verdict | Filing status | Issue URL(s) | Origin tags | Notes / last verified |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+
+Use `NOT_FILED`, `DRAFTED`, `OPENED_THIS_RUN`, `LINKED_EXISTING`, `FAILED`, or
+`CREATE_UNCERTAIN` for filing status. Missing authorization is NOT_FILED with a
+reason, not a failed request. OPENED_THIS_RUN requires a confirmed issue number/
+URL and readback from the intended repository. Count unique issues opened and
+findings covered separately: a cohort issue can cover several Finding IDs.
+LINKED_EXISTING is not a new filing. Keep origin-tag verification separate from
+issue creation, so a created issue with missing tags is visible as incomplete.
+
+For each finding, record the discovering agent and its evidenced model/source
+using the identity rules above. The issue's `model:` label identifies the
+discoverer, not the coordinator or independent verifier by default. Unknown
+worker identity remains unknown; do not copy the coordinator's model into it.
+If one issue groups findings from multiple evidenced models, retain each model
+label and the per-finding attribution in its body.
+
+In an authorized issue-filing run:
+
+- Apply `source:deep-review` and `model:<originating-WHOAMI>` to each new issue,
+  plus the repository's existing `audit` label where available and relevant
+  severity/component labels. The model suffix uses the same safe normalization
+  and explicit unknown handling as report identity, but for the discoverer.
+  Inspect repository labels first; create missing required origin labels only
+  within authorized filing/tagging scope. Do not overwrite unrelated labels or
+  silently truncate/substitute a model if label policy or permissions prevent it.
+- Include a visible **Review origin** section in the initial issue body:
+  source `deep-review`, review name/slug, immutable run ID, repository, base and
+  verification SHAs, Finding ID(s), discovering model(s) and evidence sources,
+  and coordinator model/source separately. Include the published report basename
+  and durable report URL if available; a local `/tmp` path is a locator, not a
+  GitHub-accessible evidence link. Include decisive evidence and fix acceptance
+  criteria in the issue itself rather than relying on a temporary report.
+- Persist the create result in the run ledger immediately, then read back the
+  issue body and labels. Record actual URLs and confirmed tag names, or the
+  exact pending/failed provenance action. Do not claim labeling succeeded from
+  an intended label list. No issue or label mutations occur in report-only mode.
+- If creation times out or its result is lost, mark CREATE_UNCERTAIN and search
+  the intended repository for the exact run ID and Finding ID(s), checking the
+  issue body before retrying. Hold the existing per-report filing lock through
+  this reconciliation; an ambiguous response must not produce duplicate issues.
+  An empty search result alone does not prove creation failed; unresolved or
+  unavailable readback stays CREATE_UNCERTAIN instead of triggering a blind retry.
+- For a pre-existing duplicate, link its owner without claiming this review or
+  model originated it. Any authorized corroboration/update must preserve the
+  original provenance and clearly distinguish rediscovery from initial discovery.
+
+If triage files issues after the original report was published, leave that
+report immutable. `/tmp/result-<report-stem>.md` contains the findings,
+reasoned dispositions and updated filing ledger as a self-contained filing-status
+report, where `report-stem` is the original filename without its final `.md`.
+For example, `gpt-5.6-sol-review-ha-failover-001.md` produces
+`/tmp/result-gpt-5.6-sol-review-ha-failover-001.md`, not a `.md.md` suffix.
+Return both paths and identify the result as the later status snapshot.
+Pending filing/tagging actions remain explicit; neither an issue-creation count
+nor the triaged marker means provenance tagging or remediation is complete.
+
 ## Report schema and completion
 
 The final header contains:
 
-- `Review contract: xpf-review-v3`, run ID, repository identity, checkout path.
+- `Review contract: xpf-review-v4`, run ID, repository identity, checkout path.
+- `Review name`, `REVIEW_SLUG`, and filing-status snapshot timestamp.
 - Base SHA; comparison repository/ref/SHA and fetch time, or unavailable reason.
-- Model identity/family and identity source (or unknown).
+- `MODEL_RAW`, `MODEL_SOURCE`, `MODEL_HOST`, `WHOAMI` as defined above;
+  worker identities and any coordinator model changes remain separately visible.
 - Mode, requested/effective scope, focus, exclusions, review/validation limits.
 - Output path and retained evidence location; release target only when in scope.
 
@@ -228,6 +374,8 @@ Use "not applicable" with a reason where a field is not relevant:
 
 - `Finding ID`: stable within this run, carried into triage and fix tracking.
 - `Title`
+- `Discovery origin`: discovering agent, model identifier/source and derived
+  originating-WHOAMI; retain distinct contributors when grouping findings.
 - `Severity`: include impact justification and whether it is potential.
 - `Confidence`
 - `Verification`
@@ -254,6 +402,8 @@ Use "not applicable" with a reason where a field is not relevant:
   rechecked, and result; unavailable verification is not a successful check.
 - `Remediation status`: confirmed, assigned, fixed-in-source,
   regression-verified, delivered, or pending validation, with evidence/IDs.
+- `Issue tracking`: filing status, actual issue URL(s), whether opened this run
+  or linked, verified origin labels and remaining filing/tagging work.
 
 A final report includes ranked findings and unresolved high-impact questions,
 the inspection/disposition log (including area and cross-cutting expert
@@ -262,15 +412,17 @@ questions checked and unresolved assumptions), risk worklist, actual coverage,
 verification gaps, and counts that reconcile to stable finding IDs. Include
 reasons for every drop/downgrade. Do not put NEG in the findings table or count it as a defect.
 Report confirmed, unresolved, fixed, duplicate, stale, and cohort counts
-separately; count actual issue filings only when IDs exist.
+separately; reconcile the filing ledger to actual issue URLs and verified origin
+tags. Never infer issue creation from a planned title, draft or recommendation.
 
 Do not declare all bugs fixed from an empty findings list. Report the behaviors
 and conditions checked and those still unknown. Implementation handoff includes
 the acceptance criterion and all affected consumers. Source fixes, verified
 regression guards, and delivery to an in-scope release are separate milestones.
 
-V2 and older reports remain readable: derive their metadata and map
-`Verified against origin/master` to the named comparison revision where
+Reports predating these fields, including earlier v3 identity headers, remain
+readable: derive their metadata and map `Verified against origin/master` to the
+named comparison revision where
 supported. Reconstruct missing adversarial analysis only from evidence actually
 checked; do not fabricate it or missing Probe/provenance fields. Mark substantively
 incomplete claims NEEDS_VALIDATION; an old format or absent new label is not by
@@ -292,6 +444,14 @@ a network transformation spanning area boundaries, a throughput-only result used
 to claim new-flow capacity, and a focused review where an expert is not relevant.
 Verify that missing host evidence bounds the claim without erasing valid static
 reasoning, and that expert assignments do not silently expand user scope.
+For identity changes, check full GPT identifiers and versions, a GPT coordinator
+with a differently named worker, inherited Muse settings, family-only and wholly
+unknown identity, and a conflicting filename/header. A model-prefix mismatch
+must not pass publication merely because that prefix has historical reports.
+For filing changes, check a report-only run, a new issue, a linked duplicate,
+multi-model findings grouped into one issue, a lost create response, missing
+label permissions, and triage after immutable report publication. Named and
+legacy filenames must both be consumed exactly once without inventing origin.
 
 For an empirical quality claim, compare old and revised instructions on held-out
 historical review cases using matched scope, model settings, context, and effort.

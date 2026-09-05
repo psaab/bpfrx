@@ -44,31 +44,54 @@ import (
 // Registering a pair here is NOT a statement that its folding is correct. It
 // records that this arm does not measure it. Blind means unmeasured, not safe.
 //
-// AND TWO OF THESE ARE CONFIRMED BROKEN, so do not read the list as a benign
-// inventory. Measured braced-vs-elided, both compiling clean through the strict
-// path with the value simply gone:
+// DO NOT READ THIS LIST AS A BENIGN INVENTORY, and do not read it as a defect
+// list either. Those are different properties with different lifetimes, and the
+// first version of this comment mixed them and rotted within hours.
 //
-//	security-zone address-book   braced addresses=1  -> elided 0
-//	policies from-zone           braced policies=1   -> elided 0
+// BLINDNESS IS DURABLE: a pair is here because arm 2's census emits no site for
+// its head, which is a property of the census and changes only when the census
+// changes. WHETHER THE FOLD IS BROKEN IS VOLATILE: it changes the moment
+// someone lands a fold fix, and #8850 landed three while this comment was being
+// written.
 //
-// The second is the product's primary enforcement surface: the elided
-// `security policies from-zone <a> to-zone <b> { ... }` spelling compiles to
-// ZERO zone-pair policies. Their fixes belong to #8850, not here — this cell
-// measures the GUARD's coverage, not the fold's correctness, and repairing a
-// fold does not remove its pair from this list (the pair leaves only when arm 2
-// starts generating a site for it).
+// So defect status lives in #8850, not here. What follows is a dated SNAPSHOT,
+// kept because it shows the list has real defects in it and is not decorative —
+// not as a register anyone should trust to be current.
 //
-// The `policies from-zone` measurement needs its zones DEFINED in the braced
-// arm; without `security-zone trust` / `untrust` present the braced control
-// fails an undefined-zone gate and the comparison is vacuous in the direction
-// that looks like a defect.
+//	measured at 887400000        measured at b24e26d3b (after #8850)
+//	 address-book   1 -> 0        address-book   1 -> 0   still broken
+//	 policies       1 -> 0        policies       1 -> 1   FIXED
+//	 host-inbound   1 -> 0        host-inbound   1 -> 1   FIXED
 //
-// A third pair, `security-zone host-inbound-traffic`, was reported broken and
-// did NOT reproduce here: `system-services` and `protocols` both survive the
-// elided spelling, and the both-leaves-packed form is correctly REJECTED with a
-// specific diagnostic. Recorded as unreproduced rather than omitted, because a
-// list of confirmed defects that quietly drops a member is how a claim outlives
-// its evidence.
+// The `host-inbound` row is the one worth understanding, because two people
+// measured it and got opposite answers WITHOUT either being wrong. Elision has
+// DEPTH, and only one depth lost:
+//
+//	host-inbound-traffic { system-services { ping; } }   braced   -> 1
+//	host-inbound-traffic system-services { ping; }       PARTIAL  -> 0   lost
+//	host-inbound-traffic system-services ping;           PACKED   -> 1   fine
+//
+// The fully-packed form has no children, so the fold handled it; the partially
+// elided form carries a packed tail AND a braced body, and the gate
+// `len(node.Keys) > identity && len(node.Children) == 0` declined it silently.
+// A fixture on the packed side of that boundary shows no defect by a completely
+// sound method. Fixed by 648ff4690 ("fold a packed tail even when the node has
+// a braced body").
+//
+// TWO FIXTURE TRAPS, recorded because each produced a confident wrong answer:
+//
+//   - The `policies` comparison needs its zones DEFINED in the braced arm.
+//     Without `security-zone trust` / `untrust` the braced arm fails an
+//     undefined-zone gate and yields NOTHING, so braced and elided agree at
+//     zero. Which conclusion that supports depends only on how the assertion is
+//     phrased — it reads as "no defect" or as "value lost" with equal ease.
+//   - Elision depth, above: test the packed spelling only and a real defect is
+//     invisible.
+//
+// AND REPAIRING A FOLD DOES NOT REMOVE ITS PAIR FROM THIS LIST. `policies` and
+// `host-inbound` are fixed and still registered here, correctly: they remain
+// pairs arm 2 adjudicates nothing for. A pair leaves only when the census
+// starts generating a site for it.
 var knownBlindScopePairs8852 = map[string]string{
 	// Head is a plain container (args==0, no wildcard, has children).
 	"policies global":            "plain-container",
@@ -81,10 +104,14 @@ var knownBlindScopePairs8852 = map[string]string{
 	// { filter ... }` compiles its filters instead of silently producing zero.
 	// `family` is args:0 with children and no wildcard, so blindShape8852
 	// classifies it plain-container like the rest of this group -- the census
-	// emits no site for it, which is why arm 2 adjudicates nothing. Registered
-	// rather than left to red: the pair is admitted deliberately and its
-	// behaviour is asserted directly by TestElidedFirewallFamily8850, which
-	// compares the WHOLE Firewall struct braced-vs-elided for inet and inet6.
+	// emits no site for it, which is why arm 2 adjudicates nothing.
+	//
+	// COVERED THERE IS NOT ADJUDICATED HERE. TestElidedFirewallFamily8850
+	// compares the WHOLE Firewall struct braced-vs-elided for inet and inet6,
+	// so the pair's BEHAVIOUR is asserted -- but this entry records that arm 2
+	// is BLIND to it, and that stays true however the fold behaves. Fixing or
+	// breaking the fold does not remove this pair from the map; only the census
+	// gaining a site for it does. Read this as a boundary, not as a clearance.
 	"firewall family":                    "plain-container",
 	"security-zone host-inbound-traffic": "plain-container",
 	// Head takes two or more identity args.
@@ -95,12 +122,18 @@ var knownBlindScopePairs8852 = map[string]string{
 	// prefix), so blindShape8852 classifies both multi-arg and the census emits
 	// no site -- arm 2 adjudicates nothing for them.
 	//
-	// Registered rather than left to red, on the same terms as `firewall family`
-	// above: the pair is admitted deliberately and its behaviour is asserted
-	// DIRECTLY by TestElidedAddressBook8850, which compares the compiled address
-	// NAMES braced-vs-elided for both books at one and at TWO entries. The
-	// two-entry arm is the one that matters -- the scope entry alone folds a
-	// multi-statement run into one and silently keeps only the first.
+	// Same boundary as `firewall family` above. TestElidedAddressBook8850
+	// asserts the BEHAVIOUR -- compiled address NAMES braced-vs-elided, for both
+	// books, at one AND at two entries, the two-entry arm being the one that
+	// matters because the scope entry alone folds a multi-statement run into one
+	// and silently keeps only the first. That cell existing is why these pairs
+	// are registered instead of red; it is NOT why they are in the map. They are
+	// in the map because arm 2 emits no site for them, which no amount of
+	// behavioural coverage changes.
+	//
+	// So: if TestElidedAddressBook8850 is ever deleted, this comment becomes
+	// false and should break loudly. If the fold is repaired, broken, or
+	// rewritten, these entries stay exactly as they are.
 	"address-book address":    "multi-arg",
 	"global address":          "multi-arg",
 	"gateway local-identity":  "multi-arg",

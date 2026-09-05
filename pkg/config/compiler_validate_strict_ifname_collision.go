@@ -247,6 +247,11 @@ func validateInterfaceNameCollisionStrict(cfg *Config) error {
 	//     it again here would report one collision twice, with two different
 	//     messages naming two different derivations for one device.
 	subOwner := make(map[string]string)
+	// #8862: hoisted. cfg.ResolveKernelIfName rebuilds the tunnel-name map on
+	// every call, and that map walks every interface and every unit — so
+	// resolving one ref per unit inside this loop was quadratic. Same shape as
+	// #8854, at the site that dominated the profile after it.
+	tunMapCollision := tunnelNameMapFn(cfg)
 	for _, name := range names {
 		ifc := cfg.Interfaces.Interfaces[name]
 		if ifc == nil {
@@ -291,7 +296,7 @@ func validateInterfaceNameCollisionStrict(cfg *Config) error {
 				continue
 			}
 			ref := fmt.Sprintf("%s.%d", name, unitNum)
-			dev := cfg.ResolveKernelIfName(ref)
+			dev := cfg.resolveKernelIfNameWith(ref, tunMapCollision)
 			if dev == "" || dev == base {
 				// unit 0 with no vlan-id: shares the base device by design.
 				continue
