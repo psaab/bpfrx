@@ -15,6 +15,20 @@
 # NOTES (edit these in compact_block_inventory_regen_2419_test.go, not in the
 # generated file — the generator rewrites the header and would drop them).
 #
+# READ THIS BEFORE READING THE COUNT (#8690). A line here means the site
+# DIVERGES. It does NOT mean the site may be normalized, and by the end of the
+# #8690 sweep those are almost disjoint questions: the large majority of what
+# remains must NEVER be normalized — "partial" sites whose tail something
+# already consumes, sites where normalizing disarms a commit gate, and the
+# chassis pair that breaks the shipped HA config.
+#
+# So this count is NOT a backlog and the target is NOT zero. Every remaining
+# line is classified, with the measurement behind it, in
+# testdata/compact_block_permanent_exclusions_8690.txt; the register is asserted
+# for set-equality against this file in both directions, so neither can drift.
+# If you are looking for available work, read the register's "open" class rather
+# than this file's line count.
+#
 # #6940 raised the checked count 546 -> 547 and added
 # `interfaces xpfname aggregated-ether-options minimum-links`. That site
 # is NOT a new compiler defect — it is a pre-existing compact-blind reader that

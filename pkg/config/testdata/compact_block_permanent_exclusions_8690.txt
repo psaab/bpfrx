@@ -1,0 +1,89 @@
+# #8690 PERMANENT-EXCLUSION REGISTER — the classification of every line still in
+# compact_block_divergences_2419.txt.
+#
+# WHY THIS FILE EXISTS. The inventory counts sites that DIVERGE. It says nothing
+# about whether a site MAY be normalized, and by the end of the sweep those are
+# almost disjoint questions: 47 lines remain and ~43 of them must never be
+# normalized. A bare count of 47 reads as 47 units of work, and the only way to
+# "finish" it is to normalize sites the guards exist to protect. This file is
+# what the inventory's remainder actually means.
+#
+# FORMAT: <site>\t<class>\t<reason>
+#
+# CLASSES
+#   partial          something already consumes part of the tail. Truncating it
+#                    removes a value that is READ, on a config that commits
+#                    clean. Forbidden to every scope by
+#                    TestNormalizerScopeNeverCoversAPartialSite8690.
+#   gate             normalizing makes a configuration the box REFUSES today
+#                    start committing clean. Measured: rejected at strict commit
+#                    with the pass disabled, accepted with it enabled.
+#   gate-collateral  not itself gate-disarming, but shares a (container, head)
+#                    pair with a `gate` site, and the predicate's two arguments
+#                    cannot express the difference. Lost with the pair.
+#   unmeasurable     the census fixture cannot produce a type-valid value, so
+#                    gate status cannot be measured. NOT known-safe.
+#   unreachable      no (container, head) rule can express it — the container is
+#                    wildcard-named, so production passes an arbitrary instance
+#                    name where a rule would need a keyword.
+#   hazard           normalizing breaks documented, shipped behaviour that no
+#                    disarm measurement detects.
+#   open             genuinely available work. The ONLY class that should shrink.
+#   unclassified     in another lane's family and NOT measured here. Deliberately
+#                    distinct from `open`: "nobody has checked" is a third state,
+#                    and recording it as available asserts a measurement that was
+#                    not taken.
+#
+# THIS FILE IS A GATE, NOT A REGISTRY. The guard asserts set-equality with the
+# inventory in BOTH directions, and drives every non-`open` site through the
+# real normalizer to confirm the pass still leaves it alone. A listed site that
+# becomes admissible reds; an inventory site missing from this file reds. An
+# exclusion list that only accumulates is a place to hide defects.
+
+bridge-domains xpfname domain-type	partial	drop shape "partial" in the inventory
+bridge-domains xpfname routing-interface	partial	drop shape "partial" in the inventory
+chassis device-map interface	hazard	adjacent to the packedTail opt-in the shipped HA config depends on; admitting the chassis family reds three redundancy-group cells incl. "lost `preempt` from a multi-statement packed body". Arm 2 PASSES it — only per-family bisection finds it
+chassis device-map unmapped-interface-policy	hazard	same as chassis device-map interface
+interfaces xpfname description	partial	drop shape "partial" in the inventory
+interfaces xpfname duplex	partial	drop shape "partial" in the inventory
+interfaces xpfname encapsulation	partial	drop shape "partial" in the inventory
+interfaces xpfname mtu	partial	drop shape "partial" in the inventory
+interfaces xpfname native-vlan-id	partial	drop shape "partial" in the inventory
+interfaces xpfname speed	partial	drop shape "partial" in the inventory
+interfaces xpfname tunnel routing-instance destination	partial	drop shape "partial" in the inventory
+interfaces xpfname unit	partial	drop shape "partial" in the inventory
+policy-options policy-statement xpfarg term xpfarg then as-path-prepend	partial	drop shape "partial"; the eight `then` actions family 2 nearly swallowed by scoping on the container keyword
+policy-options policy-statement xpfarg term xpfarg then community	partial	drop shape "partial"; same head as the safe `from community`, one token apart
+policy-options policy-statement xpfarg term xpfarg then load-balance	partial	drop shape "partial"
+policy-options policy-statement xpfarg term xpfarg then local-preference	partial	drop shape "partial"; also the #2419 positive-control anchor, chosen BECAUSE a partial site is immune to the sweep
+policy-options policy-statement xpfarg term xpfarg then metric	partial	drop shape "partial"
+policy-options policy-statement xpfarg term xpfarg then metric-type	partial	drop shape "partial"
+policy-options policy-statement xpfarg term xpfarg then next-hop	partial	drop shape "partial"
+policy-options policy-statement xpfarg term xpfarg then origin	partial	drop shape "partial"
+protocols bgp group xpfarg neighbor xpfarg peer-as	gate	arm 2: REJECTED at strict commit with the pass disabled, ACCEPTED with it enabled. Pair ("neighbor","peer-as") excluded in #8720
+schedulers scheduler xpfarg start-date	open	not reached by the #8729 scope; genuinely available
+schedulers scheduler xpfarg stop-date	open	not reached by the #8729 scope; genuinely available
+security dynamic-address feed-server xpfarg hostname	gate	arm 2 named it. Pair ("feed-server","hostname") excluded in #8729
+security dynamic-address feed-server xpfarg url	gate	NOT found by arm 2 — it sat in the fixture-limited bucket because the census could not synthesize a valid URL. Measured BY HAND with a real URL: a live disarm. Pair ("feed-server","url") excluded in #8729
+security ike policy xpfarg proposal-set	gate-collateral	not in the census itself, but shares ("policy","proposal-set") with the ipsec site below; the predicate cannot distinguish the ike and ipsec subtrees
+security ipsec policy xpfarg proposal-set	gate	arm 2 named it. Pair excluded in #8729, taking the ike site with it
+system dataplane control-socket	unclassified	in lane-8388's family and NOT measured by this lane. Recorded as unknown rather than open: "nobody has checked" is a third state, and calling it available asserts a measurement that was not taken
+system domain-name	unclassified	in lane-8388's family and NOT measured by this lane. Recorded as unknown rather than open: "nobody has checked" is a third state, and calling it available asserts a measurement that was not taken
+system login class	partial	drop shape "partial" in the inventory
+system login class xpfarg allow-commands	gate	lane-8388: widening the login subtree disarms the #6662 packed-login commit gate
+system login class xpfarg allow-configuration	gate	lane-8388: #6662 packed-login gate
+system login class xpfarg deny-commands	gate	lane-8388: #6662 packed-login gate
+system login class xpfarg deny-configuration	gate	lane-8388: #6662 packed-login gate
+system login class xpfarg idle-timeout	gate	lane-8388: #6662 packed-login gate
+system login class xpfarg permissions	gate	lane-8388: #6662 packed-login gate
+system login user	partial	drop shape "partial" in the inventory
+system login user xpfarg authentication encrypted-password	gate	lane-8388: #6662 packed-login gate; also filedByDesign
+system login user xpfarg authentication ssh-dsa	gate	lane-8388: #6662 packed-login gate; also filedByDesign
+system login user xpfarg authentication ssh-ed25519	gate	lane-8388: #6662 packed-login gate; also filedByDesign
+system login user xpfarg authentication ssh-rsa	gate	lane-8388: #6662 packed-login gate; also filedByDesign
+system login user xpfarg class	gate	lane-8388: the ("user","class") widening that compiles a fail-closed `unauthorized` class clean
+system login user xpfarg uid	gate	lane-8388: entered the gate census via #8697
+system services dhcp-local-server group xpfarg pool xpfarg static-binding xpfarg fixed-address	gate	lane-8388: ("static-binding","fixed-address") collides across dhcp v4/v6
+system services dhcpv6-local-server group xpfarg pool xpfarg static-binding xpfarg fixed-address	unmeasurable	lane-8388: the census fixture supplies an IPv4 literal to a v6 leaf, so the pass-enabled compile fails for an unrelated reason
+system services ssh protocol-version	unclassified	in lane-8388's family and NOT measured by this lane. Recorded as unknown rather than open: "nobody has checked" is a third state, and calling it available asserts a measurement that was not taken
+system services web-management api-auth user xpfname password	unreachable	lane-8388: wildcard-named container, so production passes an arbitrary instance name where a pair rule needs a keyword
