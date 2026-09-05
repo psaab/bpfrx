@@ -413,6 +413,7 @@ fn enqueue_copy_fallback_frame(
             &request.decision,
             request.nat64_reverse.as_ref(),
             forwarding.nat64.no_v6_frag_header,
+            forwarding,
         )
     } else {
         build_forwarded_frame_from_frame(
@@ -530,7 +531,24 @@ fn enqueue_copy_fallback_frame(
                 // is. Attributing it to an ext-header or fragment reason would
                 // send an operator chasing a translation problem when the real
                 // signal is "this NAT64 + tunnel route is not forwarded at all".
-                if request.decision.resolution.tunnel_endpoint_id != 0 {
+                if request.decision.resolution.tunnel_endpoint_id != 0
+                    && !nat64_tunnel_is_encapsulable(
+                        forwarding,
+                        request.decision.resolution.tunnel_endpoint_id,
+                    )
+                {
+                    // §8896 NARROWED THIS. `tunnel_endpoint_id != 0` used to be
+                    // the whole condition, because §8890 refused the entire
+                    // combination. A known mode is now encapsulated, so
+                    // attributing every tunnel-marked NAT64 `None` here would
+                    // report "unsupported" for a route that IS supported and
+                    // failed for an ordinary reason -- sending an operator to
+                    // look for a missing capability instead of at the
+                    // ext-header / fragment signal the next arms carry.
+                    //
+                    // What remains is the genuine §2327 residue: an endpoint id
+                    // resolving to NO row, or to a row whose mode is neither
+                    // GRE nor WireGuard.
                     counters.record_nat64_tunnel_encap_unsupported();
                 } else if crate::nat64::frame_is_nat64_exthdr_ineligible(
                     source_frame,
@@ -1507,6 +1525,24 @@ fn record_forwarded_tcp_segmentation_miss(
 /// egress entry is known, which the MTU decision treats as "no MTU known →
 /// forward unchanged".
 #[inline(always)]
+/// §8896: can this tunnel endpoint actually be encapsulated by the NAT64
+/// builder? True only for a row that EXISTS and whose mode is one the frame
+/// builders handle. Mirrors the §2327 dispatch in
+/// `build_nat64_forwarded_frame` so the counter and the builder cannot
+/// disagree about what "unsupported" means.
+fn nat64_tunnel_is_encapsulable(forwarding: &ForwardingState, tunnel_endpoint_id: u16) -> bool {
+    forwarding
+        .tunnel_endpoints
+        .get(&tunnel_endpoint_id)
+        .is_some_and(|e| {
+            matches!(
+                crate::afxdp::forwarding_build::tunnel_mode_kind(&e.mode),
+                crate::afxdp::forwarding_build::TunnelKind::Gre
+                    | crate::afxdp::forwarding_build::TunnelKind::WireGuard
+            )
+        })
+}
+
 fn forwarded_egress_mtu(decision: &SessionDecision, forwarding: &ForwardingState) -> usize {
     forwarding
         .egress

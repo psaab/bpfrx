@@ -251,58 +251,109 @@ pub(super) fn build_injected_packet(
 /// family so the frame size changes (IPv6→IPv4 shrinks by 20, IPv4→IPv6 grows
 /// by 20). This always uses a copy path — in-place rewrite is not possible.
 ///
-/// # §8890: a tunnel-marked decision FAILS CLOSED here
+/// # §8896: a tunnel-marked NAT64 decision is now ENCAPSULATED
 ///
-/// This builder performs no encapsulation of any kind, and the TX copy path
-/// selects between it and `build_forwarded_frame_from_frame` **exclusively**
-/// on `is_nat64` — while only the branch it skips carries the tunnel post-pass
-/// (`frame/mod.rs`, `tunnel_endpoint_id != 0` → WireGuard / native GRE).
-/// `enqueue_pending_forwards` refuses direct TX when `is_nat64 ||
-/// uses_native_tunnel`, so the combination is routed *into* this builder rather
-/// than away from it. Measured at `c2e0a9ecb` before this gate existed: with a
-/// tunnel endpoint set on the decision, the emitted frame was **byte-identical
-/// to the no-tunnel control** — plain IPv4, no encapsulation, no drop. Traffic
-/// an operator routed through WireGuard left as plaintext on the underlay.
+/// §8890 made this combination fail closed. Before that gate, measured at
+/// `c2e0a9ecb`, a tunnel-marked NAT64 decision emitted a frame **byte-identical
+/// to the no-tunnel control** — plain IPv4 on the underlay for traffic an
+/// operator had routed through WireGuard. The gate replaced that with a drop
+/// and a `nat64_tunnel_encap_unsupported` counter: correct, but a black hole.
 ///
-/// The codebase already recognises that outcome as a must-not-happen and has
-/// already chosen its posture for the sibling case: `tests_nat64_tunnel.rs`
-/// (§1873 R-E) drops a tunnel-marked decision whose OUTER next-hop is
-/// unresolved rather than let the retry path's in-place rewrite "later TX
-/// PLAINTEXT". That closed the *unresolved-neighbour* route; this is the
-/// *resolved* route reached through NAT64, and it was ungated. §2327 settled
-/// the same question one function over, for an unknown tunnel mode: drop, do
-/// not emit, because a fail-OPEN default in a security appliance is the defect.
+/// `build_nat64_forwarded_frame` below now composes the two transforms. The
+/// two things §8890 recorded as unresolved were measured before this landed:
 ///
-/// Encapsulating instead would be better for the operator and is deliberately
-/// NOT done here. The tunnel post-pass is a wrapper over a finished inner
-/// frame, so it *looks* composable — but `wg_encap_frame` parses that inner
-/// frame using `inner_meta.addr_family`, in three places
-/// (`packet_trimmed_len`, `inner_dst_ip` for AllowedIPs peer selection, and
-/// `inner_tos_byte`). After NAT64 the frame is IPv4 while `meta` still
-/// describes the IPv6 *ingress*, so passing `meta` through would parse an IPv4
-/// packet as IPv6: a wrong length, a destination read past the header into the
-/// TCP payload, and therefore the wrong peer or none. Composing the two needs
-/// a corrected meta AND a re-derivation of the outer identity
-/// (§2680/§3992/§5292) for a family-translated inner packet. That is a larger,
-/// separately reviewable change — tracked as its own issue — and shipping it
-/// wrongly reintroduces exactly the confidentiality failure this gate closes.
+/// **What the encapsulators read from `meta`.** Exactly two fields, and both
+/// encapsulators read the same two: `addr_family` at three sites each
+/// (`packet_trimmed_len`, `inner_dst_ip` for WG AllowedIPs peer selection, and
+/// `inner_tos_byte` for the §2303 DSCP copy) and `l3_offset` as a single
+/// fallback. `l3_offset` is self-correcting — `frame_l3_offset(inner_frame)` is
+/// consulted first and only falls back to meta — so `addr_family` is the field
+/// that must be rebuilt. `nat64_translated_meta` rebuilds both anyway, and
+/// `nat64_8896_encap_ignores_every_meta_field_but_family_and_l3` poisons every
+/// OTHER field and asserts the emitted bytes do not change, so this claim reds
+/// if a third field is ever read.
 ///
-/// The caller attributes this `None` to `nat64_tunnel_encap_unsupported`, and
-/// checks that reason FIRST, mirroring the order below.
+/// **Whether the outer identity survives a family change.** It does, and the
+/// reason is that neither encapsulator derives the outer from the inner family.
+/// Native GRE takes `endpoint.outer_family` and `endpoint.destination` for the
+/// outer L3 and `decision.resolution.{neighbor_mac, src_mac, tx_vlan_id}` for
+/// the outer L2. WireGuard selects the peer from `inner_dst` and then takes the
+/// outer family from `peer_endpoint.is_ipv6()` and the outer MTU from the
+/// PHYSICAL underlay egress (§2680/§3992/§5292 SSOT). The only inner-dependent
+/// input in either is `inner_dst`/`inner_tos`, and both are correct once
+/// `addr_family` is.
+///
+/// The §2327 fail-closed posture is preserved verbatim: an endpoint id that
+/// resolves to no row, or to a row whose mode is neither GRE nor WireGuard, is
+/// DROPPED rather than emitted. A fail-OPEN default in a security appliance is
+/// the defect, and that has not changed — what changed is that a KNOWN mode is
+/// no longer part of the unsupported set.
+///
+/// `nat64_tunnel_encap_unsupported` now counts only that genuine residue.
 pub(super) fn build_nat64_forwarded_frame(
     frame: &[u8],
     meta: impl Into<ForwardPacketMeta>,
     decision: &SessionDecision,
     nat64_reverse: Option<&Nat64ReverseInfo>,
     no_v6_frag_header: bool,
+    forwarding: &ForwardingState,
 ) -> Option<Vec<u8>> {
     let meta = meta.into();
-    // §8890 fail-closed: this builder cannot encapsulate, so a tunnel-marked
-    // decision must NOT be emitted. See the doc comment above for why the
-    // encapsulating alternative is not a drop-in.
-    if decision.resolution.tunnel_endpoint_id != 0 {
-        return None;
+    let inner = build_nat64_inner_frame(frame, meta, decision, nat64_reverse, no_v6_frag_header)?;
+    if decision.resolution.tunnel_endpoint_id == 0 {
+        return Some(inner);
     }
+    // §8896: the inner frame's family is the TRANSLATED one, not the ingress
+    // family `meta` still describes. Passing `meta` through unchanged is the
+    // defect §8890 refused to ship: an IPv4 frame parsed as IPv6 yields a wrong
+    // length, a destination read past the header into the TCP payload, and
+    // therefore the wrong WireGuard peer or none.
+    let inner_meta = nat64_translated_meta(meta, decision)?;
+    // §2327 preserved: dispatch on the TYPED kind and FAIL CLOSED on an
+    // unknown or missing mode.
+    let kind = forwarding
+        .tunnel_endpoints
+        .get(&decision.resolution.tunnel_endpoint_id)
+        .map(|e| tunnel_mode_kind(&e.mode));
+    match kind {
+        Some(TunnelKind::WireGuard) => wg::wg_encap_frame(&inner, inner_meta, decision, forwarding),
+        Some(TunnelKind::Gre) => {
+            encapsulate_native_gre_frame(&inner, inner_meta, decision, forwarding)
+        }
+        Some(TunnelKind::Unknown) | None => None,
+    }
+}
+
+/// §8896: rebuild the two `ForwardPacketMeta` fields the tunnel encapsulators
+/// read, for a frame whose IP family NAT64 has just changed.
+///
+/// Returns `None` for an ingress family that is neither v4 nor v6 — the same
+/// arm `build_nat64_inner_frame` rejects, so a frame that reached here always
+/// has one of the two.
+fn nat64_translated_meta(
+    meta: ForwardPacketMeta,
+    decision: &SessionDecision,
+) -> Option<ForwardPacketMeta> {
+    let translated_family = match meta.addr_family as i32 {
+        libc::AF_INET6 => libc::AF_INET as u8,
+        libc::AF_INET => libc::AF_INET6 as u8,
+        _ => return None,
+    };
+    let mut out = meta;
+    out.addr_family = translated_family;
+    // The built frame carries its own ethernet header, sized by the egress
+    // VLAN rather than by the ingress one `meta.l3_offset` describes.
+    out.l3_offset = if decision.resolution.tx_vlan_id > 0 { 18 } else { 14 };
+    Some(out)
+}
+
+fn build_nat64_inner_frame(
+    frame: &[u8],
+    meta: ForwardPacketMeta,
+    decision: &SessionDecision,
+    nat64_reverse: Option<&Nat64ReverseInfo>,
+    no_v6_frag_header: bool,
+) -> Option<Vec<u8>> {
     let dst_mac = decision.resolution.neighbor_mac?;
     let src_mac = decision.resolution.src_mac?;
     let vlan_id = decision.resolution.tx_vlan_id;

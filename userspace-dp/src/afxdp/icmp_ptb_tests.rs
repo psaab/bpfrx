@@ -1450,3 +1450,73 @@ fn post_transform_wg_inner_mtu_is_per_peer_underlay() {
         "per-peer underlay MTUs must differ for asymmetric peers"
     );
 }
+
+/// #8896: a NAT64 packet routed through a tunnel must have BOTH budgets
+/// applied — the tunnel's encapsulation overhead AND the RFC 7915 header
+/// delta. Before #8896 this function selected rather than composed: the
+/// `is_nat64` arm returned first, so the encap overhead was never subtracted.
+///
+/// **The control is the tunnel-only value at the same MTU.** Asserting the
+/// composed number alone would be satisfied by any arithmetic that happens to
+/// land there; asserting that it differs from the tunnel-only value by exactly
+/// the RFC 7915 delta, in the right direction, pins the composition.
+#[test]
+fn post_transform_inner_mtu_8896_nat64_through_gre_applies_both_budgets() {
+    let mut fwd = forwarding_with_egress(1400);
+    insert_tunnel_endpoint(&mut fwd, "gre", libc::AF_INET, 0);
+    let decision = tunnel_decision();
+
+    // CONTROL: tunnel only, no NAT64. 1400 - 20 (IPv4 outer) - 4 (GRE) = 1376.
+    let tunnel_only =
+        post_transform_inner_mtu(&decision, &fwd, false, libc::AF_INET6 as u8, 1400, None);
+    assert_eq!(
+        tunnel_only, 1376,
+        "CONTROL: the tunnel-only inner MTU must be the underlay less the GRE \
+         encapsulation. If this is not 1376 the fixture changed and every \
+         comparison below is against the wrong baseline"
+    );
+
+    // SUBJECT v6->v4: the inner is IPv6, the translated IPv4 is 20 bytes
+    // SMALLER, so an IPv6 inner up to tunnel_inner + 20 still fits.
+    let composed_v6 =
+        post_transform_inner_mtu(&decision, &fwd, true, libc::AF_INET6 as u8, 1400, None);
+    assert_eq!(
+        composed_v6,
+        tunnel_only + 20,
+        "#8896: NAT64(v6->v4) through GRE must apply the RFC 7915 delta ON TOP \
+         of the tunnel budget. Got {composed_v6}, want {} (tunnel {tunnel_only} + 20). \
+         Before #8896 this returned 1420 — the raw egress MTU + 20, with the GRE \
+         overhead never subtracted, advertising an inner MTU 24 bytes too large.",
+        tunnel_only + 20
+    );
+
+    // SUBJECT v4->v6: the translated IPv6 is 20 bytes LARGER, so the IPv4
+    // inner must be 20 bytes smaller than the tunnel budget.
+    let composed_v4 =
+        post_transform_inner_mtu(&decision, &fwd, true, libc::AF_INET as u8, 1400, None);
+    assert_eq!(
+        composed_v4,
+        tunnel_only - 20,
+        "#8896: NAT64(v4->v6) through GRE must SUBTRACT the header delta from \
+         the tunnel budget. Got {composed_v4}, want {}",
+        tunnel_only - 20
+    );
+
+    // The two directions must not be equal — if they were, the direction arm
+    // is not being read and both would pass a single-sided assertion.
+    assert_ne!(
+        composed_v6, composed_v4,
+        "#8896: the two translation directions produced the same inner MTU, so \
+         the family arm is not being consulted"
+    );
+
+    // FAIL CLOSED: an unknown mode yields 0 here exactly as the frame builders
+    // drop it, rather than silently falling back to the un-composed budget.
+    let mut unknown = forwarding_with_egress(1400);
+    insert_tunnel_endpoint(&mut unknown, "ipsec-vti-future", libc::AF_INET, 0);
+    assert_eq!(
+        post_transform_inner_mtu(&decision, &unknown, true, libc::AF_INET6 as u8, 1400, None),
+        0,
+        "#2327: an unknown tunnel mode must yield no budget, not the NAT64-only one"
+    );
+}

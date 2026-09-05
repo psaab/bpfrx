@@ -176,6 +176,39 @@ pub(in crate::afxdp) fn post_transform_inner_mtu(
     egress_mtu: usize,
     inner_dst: Option<std::net::IpAddr>,
 ) -> usize {
+    // §8896: NAT64 THROUGH A TUNNEL COMPOSES BOTH BUDGETS.
+    //
+    // Before #8896 the two transforms could not co-occur (§8890 dropped the
+    // combination), and this function SELECTED rather than composed: the
+    // `is_nat64` arm below returns before any tunnel arm can run, and the
+    // `egress_mtu` it adjusts comes from `forwarded_egress_mtu`, which resolves
+    // `decision.resolution.egress_ifindex` -- the tunnel LOGICAL ifindex, not
+    // the physical underlay the outer header actually egresses.
+    //
+    // So a composed packet clamped by the `is_nat64` arm alone would advertise
+    // an inner MTU too large by the whole GRE/WG encapsulation overhead:
+    // packets that satisfy the clamp, encapsulate, and then exceed the
+    // underlay. Measured: 1420 where 1396 is correct for an IPv4-outer GRE at
+    // a 1400 transport MTU -- 24 bytes over, exactly the outer IP + GRE header.
+    // That failure is worse than the black hole §8890 left, because it is
+    // intermittent and looks like a path problem rather than a configuration
+    // one.
+    //
+    // Resolve the TUNNEL inner budget first -- it already subtracts the encap
+    // overhead from the physical underlay MTU via the §2680 SSOT -- then apply
+    // the RFC 7915 header delta on top of that, in the same direction the
+    // NAT64-only arm uses.
+    if is_nat64 && decision.resolution.tunnel_endpoint_id != 0 {
+        let tunnel_inner = tunnel_inner_mtu(decision, forwarding, inner_dst);
+        if tunnel_inner == 0 {
+            return 0;
+        }
+        return match inner_addr_family as i32 {
+            libc::AF_INET6 => tunnel_inner.saturating_add(20),
+            libc::AF_INET => tunnel_inner.saturating_sub(20),
+            _ => 0,
+        };
+    }
     if is_nat64 {
         if egress_mtu == 0 {
             return 0;
@@ -199,6 +232,21 @@ pub(in crate::afxdp) fn post_transform_inner_mtu(
     if decision.resolution.tunnel_endpoint_id == 0 {
         return 0;
     }
+    tunnel_inner_mtu(decision, forwarding, inner_dst)
+}
+
+/// The tunnel-only inner MTU: the physical underlay MTU less this tunnel
+/// mode's encapsulation overhead.
+///
+/// Extracted from `post_transform_inner_mtu` by §8896 so the NAT64+tunnel arm
+/// can compose the RFC 7915 header delta ON TOP of it rather than replacing
+/// it. Returns 0 for a missing endpoint row or an unknown mode, matching the
+/// §2327 fail-closed posture the frame builders use.
+fn tunnel_inner_mtu(
+    decision: &SessionDecision,
+    forwarding: &ForwardingState,
+    inner_dst: Option<std::net::IpAddr>,
+) -> usize {
     let Some(endpoint) = forwarding
         .tunnel_endpoints
         .get(&decision.resolution.tunnel_endpoint_id)
