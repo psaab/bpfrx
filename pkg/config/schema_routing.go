@@ -786,8 +786,36 @@ var schemaBridgeDomains = &schemaNode{desc: "Bridge domain configuration", wildc
 }}}
 
 var schemaRoutingInstances = &schemaNode{desc: "Routing instance configuration", wildcard: &schemaNode{desc: "Routing instance name", placeholder: "<instance-name>", children: map[string]*schemaNode{
-	// instance-type and interface are NOT listed here → they become leaf nodes
-	// e.g. "instance-type virtual-router;" and "interface enp7s0;"
+	// #8787: instance-type and interface ARE declared here, and the rationale
+	// that used to sit in this spot -- "NOT listed here -> they become leaf
+	// nodes" -- was true when written and stopped being true when packed-tail
+	// resolution landed.
+	//
+	// An undeclared keyword still becomes a leaf in the BRACED spelling, which
+	// is what that note observed. But the packed reader resolves a stanza's
+	// tail THROUGH THE SCHEMA, so an undeclared keyword there terminates the
+	// walk and the whole stanza is dropped. Measured before this change:
+	//
+	//	routing-instances { ri1 { instance-type forwarding; } }   1 instance, type=forwarding
+	//	routing-instances { ri1 instance-type forwarding; }       0 instances
+	//	routing-instances { ri1 interface ge-0/0/0.0; }           0 instances
+	//
+	// Not a lost leaf -- the entire routing instance vanishes, on a commit
+	// that reports success. The harmful direction is `forwarding`:
+	// InstanceType == "forwarding" is what makes the daemon SKIP VRF creation
+	// (daemon_apply_interfaces.go), so a dropped value creates a VRF the
+	// operator asked NOT to have and moves interfaces into it.
+	//
+	// Reachable from a loaded or peer-synced config FILE, not from flat `set`
+	// (which builds a chain and compiles correctly) -- so the boot and HA-sync
+	// paths, not the CLI.
+	//
+	// `interface` is multi: the compiler reads it with firewallMatchValues,
+	// and the #3904 note there records that reading only the first value
+	// stranded the remaining ports outside the instance -- a VRF isolation
+	// break. Declaring it single-valued would reintroduce that.
+	"instance-type": {desc: "Routing instance type", args: 1, placeholder: "<type>", children: nil},
+	"interface":     {desc: "Interfaces bound to this routing instance", args: 1, multi: true, placeholder: "<interface>", children: nil},
 	"routing-options": {desc: "Routing options", children: map[string]*schemaNode{
 		"static": {desc: "Static routes", children: map[string]*schemaNode{
 			"route": staticRouteNode(),

@@ -161,7 +161,11 @@ func classifyGateBlindLeaf(g gateLeaf) gateBlindClass {
 // +2 here. The gate itself asked for this: it reports a floor it can now beat
 // as "COVERAGE IMPROVED — TIGHTEN THE RATCHET (this is a good failure)", and
 // leaving it slack would let a later regression drop back to 689 unnoticed.
-// LOWERED 703 -> 699 for the #8781-follow-up IKE identity fix, and the cause was
+// LOWERED 705 -> 701 for the #8781-follow-up IKE identity fix. The value was
+// RE-MEASURED after merging another lane's increase to 705, not arithmetically
+// adjusted from the pre-merge number — the two happen to agree here (705 minus
+// exactly these four leaves), and agreeing is the evidence rather than the
+// method., and the cause was
 // found rather than the floor moved to make a red go away — which is what the
 // failure message demands.
 //
@@ -179,7 +183,7 @@ func classifyGateBlindLeaf(g gateLeaf) gateBlindClass {
 // directly instead, asserting the compiled struct rather than a spelling
 // comparison — a narrower guard on a specific pair, not a replacement for this
 // one's breadth.
-const gateCoverageFloor = 699
+const gateCoverageFloor = 701
 
 var gateBlindCeiling = map[gateBlindClass]int{
 	// #7492 moved leaves out of `unreachable` in two rounds. The parent
