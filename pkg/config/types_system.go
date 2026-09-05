@@ -1498,6 +1498,21 @@ type FirewallFilterTerm struct {
 	// is exactly the compileFilterFrom switch cases (every one maps to a wire
 	// field the snapshot builder emits and the Rust matcher evaluates).
 	UnknownFrom []string
+
+	// CrossFamilyDSCPSpelling records a `from` match written with the OTHER
+	// address family's spelling of the DSCP/Traffic-Class field: `traffic-class`
+	// inside a `family inet` filter, or `dscp` inside `family inet6`. Junos
+	// spells the field `dscp` for IPv4 and `traffic-class` for IPv6; they are
+	// the same six bits in different headers, so xpf compiles either into
+	// term.DSCPs rather than refusing a configuration that commits today.
+	//
+	// It is recorded because accepting it silently is the half of #8773 that a
+	// spelling-alignment fix would otherwise leave in place: before this, the
+	// BRACED spelling accepted the cross-family criterion while the PACKED
+	// spelling dropped it without a word, and making them agree on `accept`
+	// without saying so would trade one silent behaviour for another.
+	// Read by validateFilterCrossFamilyDSCPWarnings (advisory at commit).
+	CrossFamilyDSCPSpelling []string
 }
 
 // FlexMatchConfig defines a flexible byte-offset match condition.

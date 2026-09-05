@@ -982,6 +982,15 @@ func compileFilterFrom(node *Node, term *FirewallFilterTerm, family string) {
 			// carries values as child.Keys[1:] and/or child nodes, while a
 			// hierarchical leaf carries a single value via nodeVal.
 			term.DSCPs = append(term.DSCPs, firewallMatchValues(child)...)
+			// #8773: Junos spells this field `dscp` under family inet and
+			// `traffic-class` under family inet6. This arm is deliberately
+			// family-blind — the two name the same six bits — but the
+			// cross-family spelling is recorded so the commit can say so
+			// instead of accepting it silently.
+			if (family == "inet" && child.Name() == "traffic-class") ||
+				(family == "inet6" && child.Name() == "dscp") {
+				term.CrossFamilyDSCPSpelling = append(term.CrossFamilyDSCPSpelling, child.Name())
+			}
 		case "protocol", "next-header":
 			// `next-header` is the IPv6 spelling of `protocol` (Junos family
 			// inet6). It matches the IPv6 Next Header / L4 protocol number, which

@@ -452,6 +452,16 @@ var schemaFirewall = &schemaNode{desc: "Firewall filters and policers", children
 						"destination-prefix-list": {desc: "Match destination addresses from a prefix list", children: nil},
 						"protocol":                {desc: "Match IP protocol", args: 1, multi: true, placeholder: "<protocol>", children: nil},
 						"dscp":                    {desc: "Match DSCP value (name or number)", args: 1, multi: true, placeholder: "<dscp>", children: nil},
+						// #8773: Junos spells this field `dscp` for IPv4; `traffic-class`
+						// is the IPv6 spelling of the same six bits. It is declared here
+						// because the compiler already ACCEPTS it in a braced `from`
+						// block, and the packed spelling (`from traffic-class 0;`) is
+						// read through this schema -- so without the declaration the two
+						// spellings disagreed: braced accepted, packed dropped the
+						// criterion silently. Accepted with a commit advisory rather than
+						// refused, because refusing would break configurations that
+						// commit today for a pure parity gain.
+						"traffic-class":           {desc: "Match traffic class (IPv6 spelling of dscp; accepted in family inet — advisory at commit)", args: 1, multi: true, placeholder: "<traffic-class>", children: nil},
 						"destination-port":        {desc: "Match destination port", args: 1, multi: true, groupReplace: true, placeholder: "<port>", children: nil},
 						"source-port":             {desc: "Match source port", args: 1, multi: true, groupReplace: true, placeholder: "<port>", children: nil},
 						"destination-port-except": {desc: "Match all destination ports EXCEPT these", args: 1, multi: true, groupReplace: true, placeholder: "<port>", children: nil},
@@ -518,6 +528,10 @@ var schemaFirewall = &schemaNode{desc: "Firewall filters and policers", children
 						"destination-prefix-list": {desc: "Match destination addresses from a prefix list", children: nil},
 						"protocol":                {desc: "Match IP protocol", args: 1, multi: true, placeholder: "<protocol>", children: nil},
 						"traffic-class":           {desc: "Match traffic class (DSCP name or number)", args: 1, multi: true, placeholder: "<traffic-class>", children: nil},
+						// #8773: the IPv4 spelling of the same six bits, declared for the
+						// same reason `traffic-class` is declared under family inet --
+						// see the note there. Accepted with a commit advisory.
+						"dscp":                    {desc: "Match DSCP value (IPv4 spelling of traffic-class; accepted in family inet6 — advisory at commit)", args: 1, multi: true, placeholder: "<dscp>", children: nil},
 						"destination-port":        {desc: "Match destination port", args: 1, multi: true, groupReplace: true, placeholder: "<port>", children: nil},
 						"source-port":             {desc: "Match source port", args: 1, multi: true, groupReplace: true, placeholder: "<port>", children: nil},
 						"destination-port-except": {desc: "Match all destination ports EXCEPT these", args: 1, multi: true, groupReplace: true, placeholder: "<port>", children: nil},

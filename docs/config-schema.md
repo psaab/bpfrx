@@ -35,6 +35,32 @@ discard (#6685), and a filter term whose `from` was dropped matches EVERYTHING
 **Use `packedBodyChildren` / `packedBody` (`compact_tail.go`) instead of reading
 `node.Children` directly** when compiling a stanza that accepts a packed body.
 
+**The packed reader resolves its tail THROUGH THE SCHEMA, so a leaf the compiler
+accepts but the schema does not declare is dropped — silently, and only in the
+packed spelling.** `packedBodyChildren` calls `resolveSchemaChild` for each tail
+token and returns the node's (empty) children when the lookup fails, on the
+deliberate principle of not guessing outside the modelled grammar. The cost is
+that the two spellings can disagree without anything saying so:
+
+| | braced | packed |
+|---|---|---|
+| compiler reads it | from `node.Children` — no schema needed | via `resolveSchemaChild` — schema REQUIRED |
+| leaf missing from schema | accepted and applied | dropped, no warning |
+
+#8773 is the worked example. `compileFilterFrom` handles `dscp` and
+`traffic-class` in one family-blind switch arm, but the schema declared `dscp`
+only under `family inet` and `traffic-class` only under `family inet6` — which is
+correct Junos, since they are the same six bits in the IPv4 and IPv6 headers. So
+a cross-family spelling was **accepted and applied** when braced and **dropped in
+silence** when packed. The fix declares each as an alias in the other family (so
+the spellings agree) AND warns at commit (so agreeing on *accept* does not just
+trade a silent drop for a silent acceptance).
+
+**Adding a schema leaf is therefore a compiler-behaviour change, not only a
+completion change.** If a compiler switch arm names a keyword, the schema has to
+declare it everywhere that arm can run, or the packed spelling of that keyword is
+quietly inert.
+
 Two further instances were fixed this way (#6818, #6822), both failing in the
 security-relevant direction with **zero warnings on the strict commit path**:
 
