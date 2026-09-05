@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -136,6 +137,25 @@ func readPermanentExclusions8690(t *testing.T) map[string]exclusion8690 {
 //
 // An inventory site NOT listed is unclassified drift: the next reader counts it
 // as remaining work with no way to learn it is not.
+// touchedRe8690 matches a PASTED gateVerdict8690 line in a register reason. The
+// capture is the touched count, because the two classes requiring it care about
+// different things: `sibling-blocked` needs it NON-ZERO (at master those pairs
+// are excluded, so only an admitted run can produce one), while
+// `no-drop-measured` needs it non-zero to show the pass acted at all.
+//
+// IT MATCHES THE INSTRUMENT'S FIELD SEQUENCE, NOT A BARE `touched=N`. The first
+// draft matched `touched=(\d+)` anywhere in the reason, and the nine entries
+// this rule binds all contain the sentence "the same probe reports touched=0"
+// explaining why a non-zero count is meaningful. So the guard read the count
+// out of its own explanatory PROSE rather than out of the pasted evidence: it
+// passed only because `touched=1 ...` happened to appear earlier in the string
+// than `touched=0`, and a reordered sentence would have flipped it. It was
+// caught by a mutation that stripped the pasted line and was still "caught" --
+// by the wrong branch, with the wrong message. Requiring the following
+// `passOFF=` field makes prose unable to satisfy it, because prose does not
+// carry the rest of the line.
+var touchedRe8690 = regexp.MustCompile(`touched=(\d+)(?: admitted=(?:true|false))?\s+passOFF=`)
+
 func TestPermanentExclusionsMatchTheInventory8690(t *testing.T) {
 	reg := readPermanentExclusions8690(t)
 	sites, _ := readInventory(t)
@@ -333,11 +353,37 @@ func TestPermanentExclusionRegisterIsDiscriminating8690(t *testing.T) {
 			// the pass touches 0 nodes, so "the pass changes nothing here" is
 			// true by construction and says nothing about the site. An entry
 			// that does not state it is indistinguishable from that null.
-			if !strings.Contains(e.reason, "ADMITTED") {
-				t.Errorf("%q is classed `sibling-blocked` but its reason does not say the "+
-					"measurement was taken with the pair ADMITTED. For an excluded pair "+
-					"the pass touches no nodes, so \"nothing changes\" is guaranteed and "+
-					"measures nothing — the qualifier IS the claim", site)
+			//
+			// THE CHECK IS FOR A PASTED INSTRUMENT LINE, NOT FOR THE WORD
+			// "ADMITTED". Requiring the word asks the author to assert what
+			// they already believe, and a belief can be carried forward from a
+			// probe run under different conditions -- which is exactly how two
+			// fixture-limited sites were once reported here as live disarms.
+			// Requiring a non-zero `touched=N` from gateVerdict8690 asks for
+			// evidence the author CANNOT PRODUCE WITHOUT RUNNING THE
+			// INSTRUMENT, because at master every pair in this class is
+			// excluded and the probe reports touched=0 for all of them
+			// (measured both ways before this rule was written). A non-zero
+			// count is therefore not a restatement of the admission -- it is
+			// the admission's only obtainable signature.
+			//
+			// This is one mechanism with an enforcement clause, not two
+			// mechanisms for one property: the printed state in
+			// compact_normalize_scope_8690_test.go removes the error at the
+			// point a verdict is READ, and this rule keeps the prose channel
+			// from publishing a verdict that was never read off the instrument
+			// at all.
+			if m := touchedRe8690.FindStringSubmatch(e.reason); m == nil {
+				t.Errorf("%q is classed `sibling-blocked` but its reason pastes no "+
+					"`touched=N` line from gateVerdict8690. For an excluded pair the pass "+
+					"touches no nodes, so \"nothing changes\" is guaranteed and measures "+
+					"nothing — the qualifier IS the claim, and a pasted count is the only "+
+					"form of it that cannot be restated from memory", site)
+			} else if m[1] == "0" {
+				t.Errorf("%q is classed `sibling-blocked` and pastes `touched=0`, which is "+
+					"what this pair reports at master BECAUSE IT IS EXCLUDED. That is the "+
+					"null the class exists to exclude: it measures the exclusion, not the "+
+					"site. Re-run the probe with the pair admitted", site)
 			}
 			if !strings.Contains(e.reason, "ENABLED") || !strings.Contains(e.reason, "DISABLED") {
 				t.Errorf("%q is classed `sibling-blocked` but its reason does not say the "+
@@ -357,6 +403,29 @@ func TestPermanentExclusionRegisterIsDiscriminating8690(t *testing.T) {
 				t.Errorf("%q is classed `no-drop-measured` but its reason does not say the "+
 					"site was measured with the pass BOTH enabled and disabled. A result "+
 					"from one side cannot show the pass is not load-bearing", site)
+			}
+			// Same enforcement clause as `sibling-blocked`, for the same
+			// reason: this class asserts the pass is not load-bearing at the
+			// site, and a comparison taken where the pass rewrote nothing is
+			// vacuous whatever it concluded. touched=0 does not disprove the
+			// claim here the way it does above -- an admitted pair can legally
+			// report 0 when the fold is absent from the fixture -- but it does
+			// mean the pasted run cannot be the evidence, so it is refused with
+			// its own message rather than folded into "missing".
+			//
+			// NOTE: this class currently holds ZERO entries, so the rule guards
+			// future ones only. It is written now because the class is where
+			// the next measured exclusion will land, and a rule added after the
+			// first entry has to argue with an entry instead of a blank sheet.
+			if m := touchedRe8690.FindStringSubmatch(e.reason); m == nil {
+				t.Errorf("%q is classed `no-drop-measured` but its reason pastes no "+
+					"`touched=N` line from gateVerdict8690. The class asserts the pass "+
+					"changes nothing consumed here; without the count, a reader cannot "+
+					"tell that from a run where the pass changed nothing at all", site)
+			} else if m[1] == "0" {
+				t.Errorf("%q is classed `no-drop-measured` and pastes `touched=0`: the pass "+
+					"rewrote nothing in that run, so the comparison beside it is not a "+
+					"measurement of the pass. Re-run on a text where the fold is present", site)
 			}
 		case "unclassified", "unmeasurable":
 			// UNKNOWN must say WHY it cannot be measured. A placeholder reads as
