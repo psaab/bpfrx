@@ -124,6 +124,8 @@ behavioral source or independent observation.
 | Behavior | Boundaries and transitions to account for |
 | --- | --- |
 | Enforcement | Config syntax/schema -> typed Go -> control wire -> Rust policy/filter/session behavior and kernel host-inbound enforcement; allowed and denied cases |
+| Kernel/NIC integration | Actual attach/bind modes, kernel/driver/library interfaces, ring and UMEM ownership, wakeup/progress, offloads, host-stack handoff and device lifecycle |
+| Network semantics | Bidirectional protocol/state behavior, fragments, MTU/PMTUD, generated errors, encapsulation and preservation of identity/policy through transformations |
 | Apply and persistence | Meaning of commit success, generation publication, partial failure, rollback, cold boot, restart, and retained state |
 | Identity and state | Zone/VRF/interface identity through routing, session lookup, translation, cached decisions, and expiry |
 | HA | Ownership/fencing, synchronization completeness, failover/rejoin, stale generations, and explicitly supported mixed-version behavior |
@@ -137,6 +139,24 @@ latency, or recovery after pressure. Record the offered/achieved load, packet/
 flow mix, active workers/queues, configuration, baseline, and relevant resource
 accounting. Do not generalize a bulk-throughput result to connection rate, or
 quote a generator limit as a measured firewall ceiling.
+
+For kernel/NIC-dependent claims, record the relevant kernel release/configuration,
+NIC/driver/firmware and library identity, attach/bind modes, offloads and queue
+configuration. Separate observed settings from documented requirements and
+unknowns; a result from one mode or driver does not verify another.
+
+For performance claims, identify the operation and cost unit (per packet, flow,
+update, worker or peer), relevant cardinalities and contention scope. Execution
+evidence includes build/profile settings, CPU/NUMA/queue placement, measurement
+window and variability, and relevant work counters or profiles. Use cycles,
+allocations, copies, syscalls, cache misses or contention observations where they
+can distinguish the proposed cause. Check traffic distribution and generator/
+receiver limits before attributing a ceiling to the firewall. Keep established
+throughput, new-flow rate, tail latency, update latency and recovery separate;
+aggregate throughput does not discharge fairness or per-queue progress. Missing
+host/profiling evidence limits a performance claim, not a separately established
+correctness defect. Do not require a benchmark to report a proven cost bound,
+or present that bound as a measured bottleneck or speedup.
 
 Use deterministic local assertions and existing property/regression tests where
 they can establish the contract. A live-system validation plan is not authority
@@ -221,7 +241,9 @@ Use "not applicable" with a reason where a field is not relevant:
   and limitations, or the reason no execution evidence exists.
 - `Trace`: the relevant behavior/dependency chain.
 - `Refutation attempt`: candidate guards/callers/assumptions checked and result.
-- `HPC/invariant check`: relevant accounting, concurrency, layout, or cost.
+- `HPC/invariant check`: relevant ownership/accounting, concurrency, layout,
+  cost unit and scaling dimensions; distinguish source bounds from measured
+  cost and retain workload/host evidence or limitations in Probe.
 - `Why it matters`: concrete production impact and its bounding factors.
 - `Fix direction`: corrective work, affected consumers, regression acceptance
   criterion, and remaining validation.
@@ -234,7 +256,8 @@ Use "not applicable" with a reason where a field is not relevant:
   regression-verified, delivered, or pending validation, with evidence/IDs.
 
 A final report includes ranked findings and unresolved high-impact questions,
-the inspection/disposition log (including assigned expertise, adversarial
+the inspection/disposition log (including area and cross-cutting expert
+ownership, applicability and coverage gaps, adversarial
 questions checked and unresolved assumptions), risk worklist, actual coverage,
 verification gaps, and counts that reconcile to stable finding IDs. Include
 reasons for every drop/downgrade. Do not put NEG in the findings table or count it as a defect.
@@ -264,6 +287,11 @@ contract, a guard covering only one relevant path or lifecycle state, and a
 reliability fault with no adversarial actor. Verify that a no-finding assignment
 retains the important questions checked and its unresolved assumptions. Include
 a v2 report with sufficient evidence but no new adversarial-analysis label.
+For expert-coverage changes, also walk through a kernel-mode-dependent claim,
+a network transformation spanning area boundaries, a throughput-only result used
+to claim new-flow capacity, and a focused review where an expert is not relevant.
+Verify that missing host evidence bounds the claim without erasing valid static
+reasoning, and that expert assignments do not silently expand user scope.
 
 For an empirical quality claim, compare old and revised instructions on held-out
 historical review cases using matched scope, model settings, context, and effort.

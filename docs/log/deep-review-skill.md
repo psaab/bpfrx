@@ -35,3 +35,21 @@
 | Source reasoning assumes control of internal state or a compromised peer | Make that assumption and its support explicit; do not present it as ordinary network-participant reachability |
 | An assignment produces no finding but leaves an important assumption unchecked | Retain assigned expertise, questions actually checked and the unresolved assumption; do not convert incomplete coverage into verified behavior |
 | A v2 report has sufficient checked evidence but lacks the new label | Reconstruct analysis from that evidence, independently assess the claim, and preserve rationale and contrary evidence; do not reject it solely for format |
+
+- **Timestamp**: 2026-09-05 04:16 UTC
+  - **Action**: Added explicit Linux kernel/NIC datapath, network protocols/firewall architecture, and high-performance systems coding experts after the maintainer identified that A1/A7 and the original ten profiles did not provide sufficient ownership. Each has technical checks, adversarial questions and evidence expectations across file-area boundaries.
+  - **File(s)**: `.claude/skills/deep-review/SKILL.md`, `.claude/skills/deep-review/references/review-contract.md`, `.claude/skills/review-triage/SKILL.md`, `docs/log/deep-review-skill.md`.
+  - **Action**: Full reviews assign all three experts; focused/delta reviews assign relevant roles within scope and record non-applicability or coverage gaps. Worklists, worker briefs and reports retain explicit ownership. A1–A10 remain the file-area IDs; these roles do not introduce new CLI flags or require additional agents.
+  - **Action**: Extended the shared evidence requirements for kernel/driver/library identity, execution modes, queue/offload configuration, workload-specific cost and scaling, measurement conditions and bottleneck attribution. Triage preserves these limits and does not confuse a static cost bound with a measured speedup or bulk throughput with new-flow capacity.
+  - **Documentation**: Skill-creator guidance kept this an additive, scoped correction. The v3 field labels and report/watcher compatibility remain intact. No firewall source, product invariants, runtime settings or live environment changed.
+  - **Validation**: `git diff --check`, native metadata validation, two relative Markdown links and ten repository reference paths passed. Existing metadata/invocation settings and all 19 report field labels were checked against HEAD and remain unchanged. The stock Codex validator passed triage directly and deep-review on an exact temporary copy omitting only the preserved Claude-specific `user-invocable` field; `diff -u` confirmed no other normalization.
+  - **Validation**: Coordinator instruction walkthrough covered the cases below. This checks assignment, scope and disposition reasoning, not independent forward-testing, live networking behavior or measured defect recall/performance.
+
+| Expert-coverage case | Required result |
+| --- | --- |
+| Full product review | All three cross-cutting experts have named ownership, scoped contracts and evidence expectations alongside A1–A10 and validation assurance |
+| Focused persistence-format review with no kernel/network dependency | Record kernel/network non-applicability; do not expand into a full dataplane campaign, and retain any actually relevant cost/reliability questions |
+| Copy-mode evidence is offered for a zero-copy-dependent claim | Retain valid narrower observations; leave the mode-dependent question unresolved until its source/dependency or execution evidence is established |
+| Packet transformation crosses NAT, tunnel, routing and policy areas | Assign networking expertise across the whole relevant chain and retain the independent protocol/property oracle, not merely per-file inspection |
+| Established-flow throughput is used to claim new-flow capacity or queue fairness | Reject the unsupported generalization while retaining the valid throughput result; require evidence for the distinct workload/property |
+| Source establishes a scaling cost but no profiling environment is available | Preserve the bounded static claim and consequential impact reasoning; do not claim a measured bottleneck or speedup |
