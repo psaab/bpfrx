@@ -273,6 +273,4 @@ system login user xpfarg authentication ssh-ed25519	empty
 system login user xpfarg authentication ssh-rsa	empty
 system login user xpfarg class	empty
 system login user xpfarg uid	empty
-system services ssh ciphers	empty
-system services ssh macs	empty
 system services web-management api-auth user xpfname password	empty
