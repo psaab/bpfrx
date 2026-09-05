@@ -103,6 +103,8 @@ var knownBlindScopePairs8852 = map[string]string{
 	// #8879 batch 2, same reasoning as batch 1: admitted after measuring the
 	// elided spelling SILENT, blind to arm 2 for the same structural reason, so
 	// their fold correctness rests on the per-pair cells rather than the census.
+	// #8929, a DEPTH-2 pair; shape derived by the sentinel method.
+	"nat source": "plain-container",
 	// #8925. Shapes derived by the sentinel method, and this is the batch where
 	// that mattered: they are NOT all plain-container. Every earlier batch
 	// derived plain-container four times running -- exactly the run of

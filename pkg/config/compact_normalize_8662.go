@@ -1258,6 +1258,15 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		// admitting `system login` would turn a loud #6662 rejection into a
 		// silent acceptance, which is a regression wearing the shape of a fix).
 		"protocols bgp",
+		// #8929. A DEPTH-2 pair, and the first evidence that the #8925 census's
+		// stated bound was wrong. `security nat { ... }` folds because
+		// (security, nat) is admitted, but whether `nat source { ... }` folds is
+		// a SEPARATE decision answered by (nat, source) -- an admitted parent
+		// gets you to the child's brace, it does not fold the child's brace.
+		// Doubly elided, `security nat source { pool p1 { address ...; } }`
+		// compiled to exactly what an EMPTY config produces: the source NAT
+		// pool silently vanished, both spellings accepted at strict commit.
+		"nat source",
 		// #8925. These four are NOT from #8879's population -- the sweep that
 		// built it enumerates sites by RUNNING the elision pass, so a pair the
 		// pass never asks about produces no site and appears in no census. They
