@@ -79,6 +79,26 @@ Two things that census taught, worth keeping:
   the `then` arms included `sample` and `port-mirror`, which are not compiler
   arms at all, and reported both as defects.
 
+**#8800 is the same class reached through the BRACE-ELISION PASS rather than
+through `packedBodyChildren`, and that route has an extra consequence.** The
+pass asks `compactNormalizeInScope(container, head)` only for a head that is a
+declared schema child — `isBody` is false otherwise — so an undeclared head is
+not merely refused, it is never ASKED ABOUT. No scope entry can name it, and it
+appears in no inventory, because the inventory is built by running the pass.
+`security nat source pool <p> address <a>;` compiled to a pool with ZERO
+addresses for that reason: the compiler has read `address` since #4521, and
+`pool port-overloading-factor` and `pool routing-instance` were already in
+scope, but `address` itself was never declared, so it was the one sibling of an
+otherwise in-scope container that the pass could not see.
+
+The practical rule: **for a normalizer-route site the remedy is two parts and a
+scope entry alone is not one of them.** Declare the leaf (so the pass asks) AND
+admit the pair (so it says yes) — declaring alone was measured to leave the
+packed spelling still compiling to zero addresses. It also means the census
+methods above cannot find this sub-class at all: a census that enumerates what
+the pass asked about is blind by construction to what it never asked. Only the
+compiler-arm-versus-schema census (#8781's method) reaches it.
+
 Two further instances were fixed this way (#6818, #6822), both failing in the
 security-relevant direction with **zero warnings on the strict commit path**:
 

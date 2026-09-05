@@ -1442,34 +1442,52 @@ func compileForwardingOptions(node *Node, fo *ForwardingOptionsConfig) error {
 		}
 	}
 
-	// Parse `family inet6 { mode <flow-based|packet-based> }`.
+	// Parse `family inet6 { mode <flow-based|packet-based> }` (#8797).
 	//
-	// #8797: `family` is a compoundKey container, so the address family is the
-	// SECOND KEY OF THE SAME NODE — `Keys=["family","inet6"]` — and not a child.
-	// The original walk was FindChild("family").FindChild("inet6"), which finds
-	// nothing at that shape, so the mode was dropped for every spelling an
-	// operator actually produces INCLUDING flat `set`:
+	// `family` is declared compoundKey, so the parser and SetPath BOTH produce
+	// ONE node with Keys=["family","inet6"] -- the address family is part of
+	// the node's key, not a child of it. The previous lookup was
+	// FindChild("family").FindChild("inet6"), a two-level descent that only
+	// matches the SPLIT shape `family { inet6 { … } }`, which nothing an
+	// operator can type produces:
 	//
-	//	set forwarding-options family inet6 mode packet-based   -> ""
-	//	family inet6 { mode packet-based; }                     -> ""
-	//	family { inet6 { mode packet-based; } }                 -> "packet-based"
+	//	family inet6 { mode packet-based; }   compound   -> was ""
+	//	family { inet6 { mode … } }           split      -> was "packet-based"
+	//	set forwarding-options family inet6 mode …       -> was ""
 	//
-	// Only the last is the shape the old walk expected, and it is the one
-	// nothing produces. Both shapes are accepted here rather than picking one,
-	// because the parser genuinely emits both (CLAUDE.md, dual AST shape).
+	// So the leaf completed, validated, committed clean and rendered back,
+	// while the compiled value stayed empty for every spelling that can
+	// actually reach it. The one shape that worked is the one the #2419 census
+	// synthesizes, which is why it read as "declared but unread" rather than as
+	// a shape mismatch.
+	//
+	// This is the same defect as #8763's traversal bug -- a two-level lookup
+	// against a one-node compound key -- in a compiler instead of the
+	// normalizer. The both-shapes walk mirrors compiler_interfaces.go's
+	// documented family handling; Name() rather than Keys[0] for the same
+	// reason recorded there (#7522: a persisted AST need not have non-empty
+	// Keys, and a bad persisted state must error rather than panic).
 	for _, famNode := range node.FindChildren("family") {
-		var inet6Node *Node
-		switch {
-		case len(famNode.Keys) >= 2 && famNode.Keys[1] == "inet6":
-			inet6Node = famNode
-		default:
-			inet6Node = famNode.FindChild("inet6")
+		var afNodes []*Node
+		if len(famNode.Keys) >= 2 {
+			afNodes = append(afNodes, famNode)
+		} else {
+			afNodes = append(afNodes, famNode.Children...)
 		}
-		if inet6Node == nil {
-			continue
-		}
-		if modeNode := inet6Node.FindChild("mode"); modeNode != nil {
-			fo.FamilyInet6Mode = nodeVal(modeNode)
+		for _, afNode := range afNodes {
+			if afNode == nil {
+				continue
+			}
+			afName := afNode.Name()
+			if len(afNode.Keys) >= 2 {
+				afName = afNode.Keys[1]
+			}
+			if afName != "inet6" {
+				continue
+			}
+			if modeNode := afNode.FindChild("mode"); modeNode != nil {
+				fo.FamilyInet6Mode = nodeVal(modeNode)
+			}
 		}
 	}
 
