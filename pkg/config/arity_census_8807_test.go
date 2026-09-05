@@ -74,9 +74,9 @@ func schemaLeafIndex8807() map[string][]arityDecl8807 {
 
 // compilerCaseIndices8807 returns, per `case "K":` label, the highest constant
 // index read from a Keys-like slice inside that clause.
-func compilerCaseIndices8807(t *testing.T) map[string]int {
+func compilerCaseIndices8807(t *testing.T) map[string][]aritySite8807 {
 	t.Helper()
-	res := map[string]int{}
+	res := map[string][]aritySite8807{}
 	fset := token.NewFileSet()
 	files, err := filepath.Glob("*.go")
 	if err != nil || len(files) == 0 {
@@ -140,10 +140,9 @@ func compilerCaseIndices8807(t *testing.T) map[string]int {
 			if max < 0 {
 				return true
 			}
+			cont := enclosingContainer8807(af, cc)
 			for _, kw := range kws {
-				if res[kw] < max {
-					res[kw] = max
-				}
+				res[kw] = append(res[kw], aritySite8807{container: cont, maxIdx: max})
 			}
 			return true
 		})
@@ -154,6 +153,59 @@ func compilerCaseIndices8807(t *testing.T) map[string]int {
 			"looks identical to a clean result", scanned)
 	}
 	return res
+}
+
+// aritySite8807 is ONE compiler case clause: the container whose children it
+// iterates, and the highest constant Keys[i] it reads.
+//
+// The container is the cheapest available LOCALISATION and it is exactly what a
+// name-keyed predicate lacks. It is recovered lexically -- the innermost
+// enclosing range over FindChildren("X") -- so it is PARTIAL: a loop over a
+// variable bound earlier, or over node.Children directly, yields no container
+// and that site stays name-keyed. Adding it took the census from 12 hits to 6,
+// and every row it removed was one this file had adjudicated as a false pairing
+// or an already-fixed row.
+type aritySite8807 struct {
+	container string // "" when it could not be recovered
+	maxIdx    int
+}
+
+// enclosingContainer8807 returns X from the innermost `range ... FindChildren("X")`
+// enclosing cc, or "" if there is none.
+func enclosingContainer8807(af *ast.File, cc *ast.CaseClause) string {
+	var best string
+	var bestPos token.Pos
+	ast.Inspect(af, func(n ast.Node) bool {
+		rs, ok := n.(*ast.RangeStmt)
+		if !ok || rs.Body == nil {
+			return true
+		}
+		if rs.Body.Pos() > cc.Pos() || rs.Body.End() < cc.End() {
+			return true
+		}
+		var found string
+		ast.Inspect(rs.X, func(m ast.Node) bool {
+			ce, ok := m.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := ce.Fun.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "FindChildren" || len(ce.Args) != 1 {
+				return true
+			}
+			if bl, ok := ce.Args[0].(*ast.BasicLit); ok && bl.Kind == token.STRING {
+				if v, err := strconv.Unquote(bl.Value); err == nil {
+					found = v
+				}
+			}
+			return true
+		})
+		if found != "" && rs.Body.Pos() >= bestPos {
+			best, bestPos = found, rs.Body.Pos()
+		}
+		return true
+	})
+	return best
 }
 
 type arityHit8807 struct {
@@ -185,10 +237,44 @@ func arityCensusHits8807(t *testing.T) []arityHit8807 {
 	idx := schemaLeafIndex8807()
 	cases := compilerCaseIndices8807(t)
 	var hits []arityHit8807
-	for kw, maxIdx := range cases {
+	for kw, sites := range cases {
 		decls, ok := idx[kw]
 		if !ok {
 			continue // predicate B (existence) territory, not A
+		}
+		// CONTAINER-KEYED FILTER. A site whose container is recoverable is
+		// compared only against declarations under a node of that name. This is
+		// what stops a compiler site at one path being paired with a schema leaf
+		// at another, and it is what makes the control trustworthy again:
+		// `pre-shared-key` kept firing after #8777 fixed it because a CORRECT
+		// args:1 sibling at `security ipsec vpn` matched by name, and a control
+		// that still fires after its own fix cannot distinguish fixed from
+		// broken. Sites with no recoverable container stay name-keyed.
+		maxIdx := 0
+		conts := map[string]bool{}
+		anyUnlocalised := false
+		for _, st := range sites {
+			if st.container == "" {
+				anyUnlocalised = true
+				if st.maxIdx > maxIdx {
+					maxIdx = st.maxIdx
+				}
+				continue
+			}
+			conts[st.container] = true
+			relevant := false
+			for _, d := range decls {
+				if strings.Contains(d.path, "/"+st.container+"/") && strings.HasSuffix(d.path, "/"+kw) {
+					relevant = true
+					break
+				}
+			}
+			if relevant && st.maxIdx > maxIdx {
+				maxIdx = st.maxIdx
+			}
+		}
+		if maxIdx == 0 {
+			continue
 		}
 		// TRUE LEAVES only. A container's next token is a child keyword, so
 		// args:0 plus reading Keys[1] is legitimate packed handling, not a
@@ -198,6 +284,18 @@ func arityCensusHits8807(t *testing.T) []arityHit8807 {
 		for _, d := range decls {
 			if d.children != 0 || d.wildcard {
 				continue
+			}
+			if !anyUnlocalised && len(conts) > 0 {
+				match := false
+				for c := range conts {
+					if strings.Contains(d.path, "/"+c+"/") {
+						match = true
+						break
+					}
+				}
+				if !match {
+					continue
+				}
 			}
 			anyLeaf = true
 			paths = append(paths, d.path+" args="+strconv.Itoa(d.args))
@@ -248,28 +346,18 @@ type arityVerdict8807 struct {
 // reliable output this census produced. Order candidates by what a measurement
 // finds, not by how convincing their evidence reads.
 var arityAdjudicated8807 = map[string]arityVerdict8807{
-	"count": {"false-pairing", "compiler_firewall.go reads Keys[1] on a firewall term `then count`, " +
-		"where the schema declares args:1 and is correct; the args:0 leaf matched is " +
-		"`security policies ... then count`, a different path."},
+	// The four remaining false pairings are ALL sites whose container could not
+	// be recovered lexically, so they are still name-keyed. That is the residual
+	// blindness, and it is why this hand map still exists rather than the
+	// predicate being trusted on its own.
+	"count": {"false-pairing", "compiler_firewall.go reads Keys[1] on a firewall term `then count`, where the " +
+		"schema declares args:1 and is correct; the args:0 leaf matched is `security policies ... then count`."},
 	"from-zone": {"false-pairing", "the site is the top-level `security policies from-zone <z> to-zone <z>` " +
 		"container reading Keys[3]; the matched leaf is `global/policy/match/from-zone` args:1, correct there."},
-	"inet6": {"false-pairing", "the site is `interfaces <if> unit <u> family inet6`; the matched leaf is " +
-		"`routing-options ... rib-group/inet6` args:1, an unrelated path."},
-	"interface": {"false-pairing", "compiler_protocols.go reads Keys[1] on a protocols interface; the args:0 " +
-		"leaf matched is `nat source rule-set rule then source-nat interface`."},
-	"match": {"false-pairing", "compiler_services.go reads `match rpm-probe X` for ip-monitoring; the matched " +
-		"leaves are `system syslog {file,host,user} match` args:1."},
-	"pool": {"false-pairing", "compiler_services.go reads Keys[4] on the DHCP-server pool; the matched leaves " +
-		"are NAT pools args:1. The NAT pools' real defect was existence, not arity (#8800)."},
-	"preempt": {"false-pairing", "two self-consistent paths share the name: schema_chassis.go declares " +
-		"`preempt` children:nil and compileRGPreempt reads no hold-time, while schema_interfaces.go declares " +
-		"`hold-time` and compiler_interfaces.go reads it in BOTH shapes. Measured by lane-8015: braced, packed, " +
-		"bare and flat-set all deliver, with an absent baseline separating `delivers` from `both empty`; the " +
-		"chassis half is a LOUD rejection (`preempt: takes no argument`), not a silent drop."},
-
-	"local-identity":  {"already-fixed", "#8796 set args:2 on both gateway paths; `security ipsec vpn local-identity` is args:1 and correct, its compiler loop reading a single value."},
-	"remote-identity": {"already-fixed", "same as local-identity (#8796)."},
-	"pre-shared-key":  {"already-fixed", "#8777 set args:2 on `security ike policy`; `security ipsec vpn pre-shared-key` is args:1 and correct."},
+	"interface": {"false-pairing", "compiler_protocols.go reads Keys[1] on a protocols interface; the args:0 leaf " +
+		"matched is `nat source rule-set rule then source-nat interface`."},
+	"pool": {"false-pairing", "compiler_services.go reads Keys[4] on the DHCP-server pool; the matched leaves are " +
+		"NAT pools args:1. The NAT pools' real defect was existence, not arity (#8800)."},
 
 	"reject": {"genuine", "compiler_firewall.go:1337 reads an OPTIONAL Keys[1] message-type on `then reject <type>` " +
 		"while the leaf is args:0 -- possibly the #3332 trailing-token class. NOT MEASURED: needs braced-vs-packed."},
@@ -291,14 +379,17 @@ func TestArityCensusIsRatcheted8807(t *testing.T) {
 	}
 
 	const blindness = "\n\nWHAT THIS PREDICATE CANNOT SEE: it is NAME-KEYED. It pairs a " +
-		"compiler `case` label with schema declarations sharing that NAME at ANY path, " +
-		"so it cannot tell you the site and the declaration are the same path. A leaf " +
-		"undeclared at its OWN position while declared elsewhere is INVISIBLE to it -- " +
-		"that is the #8800 shape (`address` unread-at-path under `nat source pool`, " +
-		"declared under `proxy-arp interface`). It also mis-attributes the other way: " +
-		"7 of 12 hits here are two self-consistent paths sharing a name. So GREEN MEANS " +
-		"\"no new name-keyed arity contradiction\", NEVER \"the class is covered\". The " +
-		"positional predicate that would cover it is not built (#8807)."
+		"compiler `case` label with schema declarations that share that NAME, and it " +
+		"localises a site ONLY when the enclosing FindChildren container can be " +
+		"recovered lexically. Sites iterating a variable, or node.Children directly, " +
+		"yield no container and stay fully name-keyed -- all four false pairings still " +
+		"listed here are of that kind. And in EITHER mode it is blind to a leaf that is " +
+		"undeclared at its OWN position while declared elsewhere, because it can only " +
+		"pair with declarations that EXIST: that is the #8800 shape (`address` " +
+		"unread-at-path under `nat source pool`, declared under `proxy-arp interface`), " +
+		"and no arity predicate can see it because it is an EXISTENCE question. So " +
+		"GREEN MEANS \"no new arity contradiction this predicate can localise\", NEVER " +
+		"\"the class is covered\". The positional predicate is not built (#8807)."
 
 	// 1. The hit SET must match the adjudication. A new hit is unadjudicated and
 	//    nobody can tell from the number whether it is a defect.
