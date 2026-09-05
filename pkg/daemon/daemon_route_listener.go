@@ -100,10 +100,8 @@ func (d *Daemon) runOneRouteSubscription(ctx context.Context, loop *coalesce.Loo
 	defer close(done)
 
 	if err := netlink.RouteSubscribeWithOptions(updates, done, netlink.RouteSubscribeOptions{
-		ListExisting: false,
-		ErrorCallback: func(err error) {
-			slog.Debug("route listener: netlink error", "err", err)
-		},
+		ListExisting:  false,
+		ErrorCallback: d.routeListenerErrorCallback(loop),
 	}); err != nil {
 		return err
 	}
@@ -124,6 +122,47 @@ func (d *Daemon) runOneRouteSubscription(ctx context.Context, loop *coalesce.Loo
 			d.routeListenerMarks.Add(1)
 			loop.Mark()
 		}
+	}
+}
+
+// routeListenerErrorCallback is the subscription's ErrorCallback, named rather
+// than inlined so a cell can drive the function PRODUCTION installs (#8915).
+//
+// A hand-rolled `func(err error)` in a test would pass whatever production
+// does, which is the failure this extraction exists to prevent: the guard has
+// to bind the wiring, not a re-implementation of it.
+func (d *Daemon) routeListenerErrorCallback(loop *coalesce.Loop) func(error) {
+	return func(err error) {
+		// #8915: AN OVERFLOW DROPS THE ONLY REFRESH EDGE THERE IS.
+		//
+		// `updates` is bounded at 256. When the kernel outruns this
+		// goroutine it drops route messages and reports ENOBUFS here --
+		// and `loop.Mark()` has exactly ONE call site, the `case upd :=
+		// <-updates` arm below. So the dropped messages ARE the refresh
+		// edges: nothing else in the daemon can produce one.
+		//
+		// The coalescer's 100ms ticker is a SWEEP, not a periodic
+		// actuate -- `Tick` fires only `if !l.dirtySince.IsZero()`, so an
+		// unmarked loop sweeps forever and actuates never. Measured in
+		// #8915: 0 actuations across 50 sweeps with no mark, 1 after a
+		// single mark. There is no periodic recovery to fall back on.
+		//
+		// Logging at Debug therefore left the helper FIB stale until the
+		// next route event that happened NOT to be dropped -- which on a
+		// churning box is exactly when it is least likely to arrive
+		// promptly, because the same churn is what overflowed the queue.
+		//
+		// MARK ON ERROR. The mark is unconditional rather than
+		// ENOBUFS-only: this callback's contract is "something went wrong
+		// with the subscription", every such condition means the update
+		// stream may have gaps, and a refresh is idempotent -- the
+		// coalescer decides whether to actuate. Discriminating on the
+		// errno would make recovery depend on matching a string the
+		// netlink library does not promise.
+		d.routeListenerErrors.Add(1)
+		slog.Warn("route listener: netlink error, forcing FIB refresh",
+			"err", err, "errors_total", d.routeListenerErrors.Load())
+		loop.Mark()
 	}
 }
 
@@ -196,6 +235,18 @@ func (d *Daemon) actuateLearnedRouteRefresh(ctx context.Context) bool {
 // from "the listener is dead", and marks without republishes cannot show the
 // coalescing that keeps the control socket safe.
 func (d *Daemon) RouteListenerMarks() uint64 { return d.routeListenerMarks.Load() }
+
+// RouteListenerErrors counts netlink subscription errors, each of which now
+// forces a FIB refresh (#8915).
+//
+// Surfaced because a recovery nobody can see is its own problem: before #8915
+// the overflow was a Debug line, so the ONLY externally visible symptom of a
+// dropped refresh edge was a stale helper FIB with no counter pointing at it.
+// A non-zero value here means the update stream had a gap and the daemon
+// re-synced past it -- not that routing is broken, but that the 256-deep
+// queue is being outrun and the marks below are partly recovery rather than
+// route churn.
+func (d *Daemon) RouteListenerErrors() uint64 { return d.routeListenerErrors.Load() }
 
 func (d *Daemon) RouteListenerRepublishes() uint64 {
 	if l := d.routeListenerLoop.Load(); l != nil {
