@@ -136,7 +136,7 @@ func unsplittablePairs8880(minArgs int) (map[string]bool, map[string]bool) {
 }
 
 func TestUnsplittablePairRatchet8880(t *testing.T) {
-	// Measured at master e2018595f, twice, with the counts asserted equal.
+	// Measured at master 2a4796a72, twice, with the counts asserted equal.
 	//
 	// TWO THRESHOLDS, BOTH ASSERTED, because picking one silently would hide the
 	// judgement. `args >= 2` was the original predicate. `args >= 1` is the one
@@ -231,7 +231,7 @@ func TestUnsplittablePairRatchet8880(t *testing.T) {
 	// -- so at master it is absent from the population for a reason that has
 	// nothing to do with the clause under test, and the check could never fire.
 	// A control that cannot fail is not a control. Both below are admitted AND
-	// their container declares packedStatements at e2018595f; there are 32 such
+	// their container declares packedStatements at 2a4796a72; there are 32 such
 	// pairs, so this is a sample of a real set rather than a lucky pick.
 	for _, optedIn := range []string{"gateway local-identity", "dead-peer-detection interval"} {
 		if set2[optedIn] {
@@ -245,10 +245,32 @@ func TestUnsplittablePairRatchet8880(t *testing.T) {
 	// These two are adjudicated: the packed spelling does not merely lose the
 	// second statement, it absorbs that statement's KEYWORD as a value.
 	// TRUNCATION MODE, kept beside the injection ones so a reader does not
-	// generalise from a single mode. This is issue #8880: with the `policies`
-	// brace elided (issue #8880), the SECOND from-zone/to-zone block is discarded entirely,
-	// on a clean commit with zero warnings -- the product's primary enforcement
-	// surface losing a whole zone-pair policy set silently.
+	// generalise from a single mode. This is issue #8880.
+	//
+	// ZERO IS THE DELIBERATE POST-FIX OUTCOME -- DO NOT "FIX" IT BACK TO ONE.
+	// Before #8884 the packed spelling compiled ONE of the two zone pairs; the
+	// fold consumed the first block and stranded the rest of the run. #8884
+	// makes the fold DECLINE instead, so the packed spelling now compiles NONE:
+	//
+	//	braced          [a->b c->d]
+	//	before #8884    [a->b]        one of two -- a silently WRONG policy set
+	//	after  #8884    []            none -- fail-closed, default-deny applies
+	//
+	// That is a deliberate judgement and the right one: half a policy set reads
+	// as correct and permits the wrong traffic, where an empty one denies and is
+	// noticed. A future change that makes this return ONE again would look like
+	// progress on this cell's numbers and would be a regression.
+	//
+	// It is still a MEMBER of this population, and still silent at commit: zero
+	// warnings, no strict rejection. Declining is a better failure, not the
+	// absence of one.
+	//
+	// AND IT IS THE ONLY ONE. Measured: the `args >= 2 && !multi` clause -- the
+	// truncation clause -- has exactly ONE member in the narrow population,
+	// `policies from-zone` (args=3), and it is this one. A ratchet landing on
+	// `args >= 2` alone would therefore carry a mode with a single, already
+	// handled member, which is most of the argument for asserting the wide
+	// threshold beside it.
 	t.Run("member/policies from-zone (truncation)", func(t *testing.T) {
 		const rule = "policy p1 { match { source-address any; destination-address " +
 			"any; application any; } then { permit; } }"
@@ -291,6 +313,16 @@ func TestUnsplittablePairRatchet8880(t *testing.T) {
 				"block (packed %v, braced %v). This member is the TRUNCATION "+
 				"mode; if it has become injection the mode split above is wrong "+
 				"and must be re-derived, not edited (#8880)", packed, braced)
+		}
+		// Guard the DIRECTION of any future change here. Going from none back to
+		// one is the shape #8884 deliberately moved away from, and it would read
+		// as an improvement against a count.
+		if len(packed) == 1 {
+			t.Errorf("policies/from-zone compiles ONE of %d zone pairs again "+
+				"(%v). #8884 moved this from one to NONE on purpose: a partial "+
+				"policy set reads as correct and permits the wrong traffic, "+
+				"where an empty one denies and is noticed. This is a regression "+
+				"wearing the shape of progress (#8880)", len(braced), packed)
 		}
 	})
 
@@ -382,6 +414,6 @@ func TestUnsplittablePairRatchet8880(t *testing.T) {
 			"them: %v", len(conflict1), c)
 	}
 	t.Logf("#8880: %d pairs at args>=2, %d at args>=1 (of %d whose remedy "+
-		"resolves: %d multi, %d not), wildcard-traversing, master e2018595f; "+
+		"resolves: %d multi, %d not), wildcard-traversing, master 2a4796a72; "+
 		"e.g. %v", got2, got1, resolved, multi, resolved-multi, sample)
 }
