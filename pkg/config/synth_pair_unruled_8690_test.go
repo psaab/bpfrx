@@ -217,10 +217,17 @@ func TestTheNewValueTypesSynthesizeAcceptedPairs_8690(t *testing.T) {
 // The five sites this increment moved into the divergent set. They are listed
 // by name so a later change that quietly loses them is visible: an inventory
 // shrinking is normally progress, and these five shrinking would be regression.
-func TestTheFiveNewlyVisibleSitesAreInTheInventory_8690(t *testing.T) {
+// Renamed from TestTheFiveNewlyVisibleSitesAreInTheInventory_8690: a count in
+// the name goes stale exactly when the list legitimately shrinks, and then the
+// name argues against the change instead of describing it.
+//
+// `schedulers scheduler <s> {start-date,stop-date}` left this list when the
+// schedulers family was normalized. That is the first branch of the message
+// below — the line is correctly gone — and it was confirmed by the census
+// reporting both sites as now compiling equivalently, which is the normalizer
+// working rather than the synthesiser regressing.
+func TestNewlyVisibleSitesAreAccountedFor_8690(t *testing.T) {
 	want := []string{
-		"schedulers scheduler xpfarg start-date",
-		"schedulers scheduler xpfarg stop-date",
 		"system dataplane control-socket",
 		"system domain-name",
 		"system services ssh protocol-version",

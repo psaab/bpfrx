@@ -124,6 +124,50 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 	if containerKeyword == "authentication" || containerKeyword == "user" {
 		return false
 	}
+	// #8690, the SCHEDULERS and CHASSIS surfaces. 23 sites, all shape `empty`,
+	// all measured safe: no gate disarms, nothing fixture-limited, nothing
+	// unsynthesizable, no collision with a `partial` site.
+	//
+	// The weekday containers are the reason this is 23 pairs and not two. The
+	// head `start-time` appears under nine different containers here -- `daily`
+	// and each weekday -- so `head == "start-time"` would be a shorter rule
+	// covering the same sites today. That is exactly the contingent-on-the-
+	// population shape #8727 removed from three older rules, and a schedule is
+	// a security control: `security policies ... scheduler <s>` decides WHEN a
+	// policy is in force, so a dropped `stop-time` leaves a permit active past
+	// the window the operator wrote, on a commit that reported success.
+	//
+	// `start-date` and `stop-date` were NOT in this family when it was first
+	// measured -- they entered the census between the measurement and the
+	// change, from another lane's fixture work. Re-deriving rather than reusing
+	// the earlier list is what caught them; the count moved 21 -> 23.
+	switch containerKeyword + " " + head {
+	case
+		"schedulers scheduler",
+		"scheduler start-date",
+		"scheduler start-time",
+		"scheduler stop-date",
+		"scheduler stop-time",
+		"daily start-time",
+		"daily stop-time",
+		"monday start-time",
+		"monday stop-time",
+		"tuesday start-time",
+		"tuesday stop-time",
+		"wednesday start-time",
+		"wednesday stop-time",
+		"thursday start-time",
+		"thursday stop-time",
+		"friday start-time",
+		"friday stop-time",
+		"saturday start-time",
+		"saturday stop-time",
+		"sunday start-time",
+		"sunday stop-time",
+		"device-map interface",
+		"device-map unmapped-interface-policy":
+		return true
+	}
 	// EVERY RULE HERE IS SCOPED BY (container, head) PAIR. None matches a head
 	// alone or a container alone, and that is a deliberate change from how the
 	// first two increments were written.
@@ -149,6 +193,15 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 	// `empty` and admissible while `term <t> then community <c>` is `partial`
 	// and must never be admitted. Same head, one token apart, opposite sides of
 	// the safety rule.
+	//
+	// SOME PAIRS BELOW TRIP A COMMIT GATE and are in scope anyway, because the
+	// gate objects to the DROP rather than to the spelling and the pass repairs
+	// the drop. `snmp trap-group <t> targets` is one. Those are classified,
+	// with their measurement, in `benign` in
+	// compact_normalize_scope_8690_test.go -- not here, because the
+	// classification gates a guard VERDICT and never makes a site in scope. A
+	// reader of this list would otherwise see an ordinary-looking pair with no
+	// sign that it was a deliberate call.
 	//
 	// These 32 pairs are exactly what the three former rules admitted, measured
 	// at the production call site rather than derived from the schema — so this
@@ -244,6 +297,38 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 	// family label is not a safety property, and this is the case that proves
 	// it. TestNormalizerScopeNeverCoversAPartialSite8690 binds it mechanically
 	// so the next widening cannot make the same mistake by inspection.
+	// #8690: `policy proposal-set`, the two sites lane-8015's security family
+	// could not take.
+	//
+	// It landed the rest of security in 950df1331 while I was measuring the
+	// same family — so 45 of the 47 sites I had scoped were already done, and
+	// my pair list for them is dropped rather than landed redundantly. These
+	// two are what remained:
+	//
+	//	security ike   policy <p> proposal-set
+	//	security ipsec policy <p> proposal-set
+	//
+	// They share one pair, and they were blocked by a commit gate rather than
+	// by anything about the fold. The disarm arm flags
+	// `security ipsec policy xpfarg proposal-set` as REJECTED without the pass
+	// and ACCEPTED with it, which is a red until a person classifies it.
+	//
+	// Classified benign, with the measurement in the guard's `benign` map: the
+	// gate refuses the CONSEQUENCE of the drop and says so itself — the elided
+	// spelling loses the proposal-set, and the gate rejects with "has no
+	// resolvable ipsec proposal ... the configured perfect-forward-secrecy
+	// group would be SILENTLY DROPPED". With the pass the proposal-set survives
+	// and the same gate accepts. The braced spelling is accepted either way, so
+	// the config was always legitimate and only the elided form lost it.
+	//
+	// That gate exists to catch this exact drop, so the pass repairing the drop
+	// and the gate then passing is the intended interaction. Without the
+	// classification these two sites are unreachable by any widening — which is
+	// why they were still here.
+	if containerKeyword == "policy" && head == "proposal-set" {
+		return true
+	}
+
 	// #8690 family 5: applications, services, snmp, event-options. 30 sites,
 	// every one drop shape "empty" in the inventory.
 	//
@@ -776,6 +861,212 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		"routing-options rib-groups",
 		"static route",
 		"virtual-link transit-area":
+		return true
+	}
+
+	// #8690 family 7: the SECURITY remainder and schedulers. 114 inventory
+	// sites, every one drop shape "empty"; schedulers goes to zero and security
+	// 99 -> 4.
+	//
+	// SEVEN PAIRS ARE EXCLUDED and each exclusion has a different provenance,
+	// which is the reason to list them here rather than to say "measured":
+	//
+	//   arm 2 named three — ("feed-server","hostname"), ("policy",
+	//   "proposal-set") and, in another lane's family, ("trap-group","targets").
+	//   Excluding ("policy","proposal-set") also holds `security ike policy <p>
+	//   proposal-set`, which shares the pair.
+	//
+	//   ("feed-server","url") was found BY HAND. Arm 2 reports a third state —
+	//   sites whose gate status it could not measure because the census
+	//   fixture's value fails a different validator — and says they are NOT
+	//   known-safe. Measured with a type-valid URL, that site is a real
+	//   gate disarm: rejected at strict commit without the pass, accepted with
+	//   it. No guard in the tree would have caught it.
+	//
+	//   ("dynamic","hostname") disarms a TRAILING-TOKEN gate (`security ike
+	//   gateway <g> dynamic hostname <fqdn> <extra>`). Arm 2's fixture emits one
+	//   clean value, so it cannot build the input that trips that gate.
+	//
+	//   ("deterministic","block-size"), ("host","address") and ("policy",
+	//   "scheduler-name") are excluded because the scope guard cannot EXAMINE
+	//   them: their reference spelling does not compile in isolation. Its
+	//   instruction is to give them a compilable fixture instead, which does not
+	//   work here — `contextFor` injects siblings INSIDE the parent path, while
+	//   these need context ABOVE it (the policy needs its zones declared under
+	//   `security zones`; the pool needs an address at pool level). None is an
+	//   inventory site, so excluding them costs no coverage.
+	//
+	// Pairs measured by running the pass with an instrumented gate, not derived
+	// from inventory paths, and checked for over-reach against every site
+	// outside the two families: NONE, which is why this scope carries no
+	// "neighbours come along" note where the earlier families did.
+	switch containerKeyword + " " + head {
+	case "address-book address-set",
+		"address-set address",
+		"address-set address-set",
+		"address-set description",
+		"aging early-ageout",
+		"aging high-watermark",
+		"aging low-watermark",
+		"daily start-time",
+		"daily stop-time",
+		"dead-peer-detection interval",
+		"dead-peer-detection threshold",
+		"deny log",
+		"destination pool",
+		"destination rule-set",
+		"destination-nat pool",
+		"dynamic-address address-name",
+		"dynamic-address feed-server",
+		"feed-name path",
+		"feed-server feed-name",
+		"feed-server hold-interval",
+		"feed-server update-interval",
+		"flood threshold",
+		"flow multicast-session-lifetime",
+		"flow route-change-timeout",
+		"friday start-time",
+		"friday stop-time",
+		"from interface",
+		"from routing-instance",
+		"from zone",
+		"from-zone policy",
+		"gateway address",
+		"gateway external-interface",
+		"gateway ike-policy",
+		"gateway local-address",
+		"gateway local-certificate",
+		"gateway nat-traversal",
+		"gateway version",
+		"global address-set",
+		"global policy",
+		"host-inbound-traffic protocols",
+		"host-inbound-traffic system-services",
+		"icmp-session timeout",
+		"ike gateway",
+		"ike ipsec-policy",
+		"ike policy",
+		"ike proposal",
+		"interface address",
+		"ip-sweep threshold",
+		"ipsec gateway",
+		"ipsec policy",
+		"ipsec proposal",
+		"ipsec vpn",
+		"limit-session destination-ip-based",
+		"limit-session source-ip-based",
+		"log format",
+		"log mode",
+		"log profile",
+		"log source-interface",
+		"log stream",
+		"manual authentication-algorithm",
+		"manual encryption-algorithm",
+		"manual protocol",
+		"manual spi",
+		"match application",
+		"match destination-address",
+		"match destination-address-name",
+		"match destination-port",
+		"match from-zone",
+		"match protocol",
+		"match source-address",
+		"match source-address-name",
+		"match to-zone",
+		"monday start-time",
+		"monday stop-time",
+		"nat64 rule-set",
+		"packet-filter destination-prefix",
+		"packet-filter protocol",
+		"packet-filter source-prefix",
+		"persistent-nat inactivity-timeout",
+		"persistent-nat permit",
+		"policies default-policy",
+		"policies default-policy-log",
+		"policy description",
+		"policy mode",
+		"policy proposals",
+		"policy-stats system-wide",
+		"pool port-overloading-factor",
+		"pool routing-instance",
+		"port-scan threshold",
+		"profile feed-name",
+		"profile stream-name",
+		"proposal authentication-algorithm",
+		"proposal authentication-method",
+		"proposal description",
+		"proposal dh-group",
+		"proposal encryption-algorithm",
+		"proposal lifetime-kilobytes",
+		"proposal lifetime-seconds",
+		"proposal protocol",
+		"proxy-arp interface",
+		"rule-set prefix",
+		"rule-set rule",
+		"rule-set source-pool",
+		"saturday start-time",
+		"saturday stop-time",
+		"scheduler start-time",
+		"scheduler stop-time",
+		"schedulers scheduler",
+		"screen ids-option",
+		"security-zone description",
+		"security-zone interfaces",
+		"security-zone screen",
+		"session field-extra-name",
+		"source pool",
+		"source rule-set",
+		"source-nat pool",
+		"ssh-known-hosts host",
+		"static rule-set",
+		"stream category",
+		"stream facility",
+		"stream format",
+		"stream host",
+		"stream port",
+		"stream severity",
+		"stream source-address",
+		"stream source-interface",
+		"sunday start-time",
+		"sunday stop-time",
+		"syn-flood alarm-threshold",
+		"syn-flood attack-threshold",
+		"syn-flood destination-threshold",
+		"syn-flood source-threshold",
+		"syn-flood timeout",
+		"tcp-session closing-timeout",
+		"tcp-session established-timeout",
+		"tcp-session initial-timeout",
+		"tcp-session time-wait-timeout",
+		"then log",
+		"thursday start-time",
+		"thursday stop-time",
+		"to interface",
+		"to routing-instance",
+		"to zone",
+		"traceoptions file",
+		"traceoptions flag",
+		"traceoptions packet-filter",
+		"traffic-selector local-ip",
+		"traffic-selector remote-ip",
+		"transport protocol",
+		"transport tls-profile",
+		"tuesday start-time",
+		"tuesday stop-time",
+		"udp-session timeout",
+		"vpn bind-interface",
+		"vpn df-bit",
+		"vpn establish-tunnels",
+		"vpn local-address",
+		"vpn local-identity",
+		"vpn pre-shared-key",
+		"vpn remote-identity",
+		"vpn traffic-selector",
+		"vpn-monitor destination-ip",
+		"vpn-monitor source-interface",
+		"wednesday start-time",
+		"wednesday stop-time",
+		"zones security-zone":
 		return true
 	}
 	return false

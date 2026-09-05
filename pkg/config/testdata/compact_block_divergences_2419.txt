@@ -141,8 +141,6 @@
 #
 bridge-domains xpfname domain-type	partial
 bridge-domains xpfname routing-interface	partial
-chassis device-map interface	empty
-chassis device-map unmapped-interface-policy	empty
 interfaces xpfname description	partial
 interfaces xpfname duplex	partial
 interfaces xpfname encapsulation	partial
@@ -160,128 +158,10 @@ policy-options policy-statement xpfarg term xpfarg then metric-type	partial
 policy-options policy-statement xpfarg term xpfarg then next-hop	partial
 policy-options policy-statement xpfarg term xpfarg then origin	partial
 protocols bgp group xpfarg neighbor xpfarg peer-as	empty
-schedulers scheduler	empty
-schedulers scheduler xpfarg daily start-time	empty
-schedulers scheduler xpfarg daily stop-time	empty
-schedulers scheduler xpfarg friday start-time	empty
-schedulers scheduler xpfarg friday stop-time	empty
-schedulers scheduler xpfarg monday start-time	empty
-schedulers scheduler xpfarg monday stop-time	empty
-schedulers scheduler xpfarg saturday start-time	empty
-schedulers scheduler xpfarg saturday stop-time	empty
-schedulers scheduler xpfarg start-date	empty
-schedulers scheduler xpfarg start-time	empty
-schedulers scheduler xpfarg stop-date	empty
-schedulers scheduler xpfarg stop-time	empty
-schedulers scheduler xpfarg sunday start-time	empty
-schedulers scheduler xpfarg sunday stop-time	empty
-schedulers scheduler xpfarg thursday start-time	empty
-schedulers scheduler xpfarg thursday stop-time	empty
-schedulers scheduler xpfarg tuesday start-time	empty
-schedulers scheduler xpfarg tuesday stop-time	empty
-schedulers scheduler xpfarg wednesday start-time	empty
-schedulers scheduler xpfarg wednesday stop-time	empty
-security address-book global address-set	empty
-security dynamic-address address-name	empty
-security dynamic-address address-name xpfarg profile feed-name	empty
-security dynamic-address feed-server	empty
-security dynamic-address feed-server xpfarg feed-name	empty
-security dynamic-address feed-server xpfarg feed-name xpfarg path	empty
-security dynamic-address feed-server xpfarg hold-interval	empty
 security dynamic-address feed-server xpfarg hostname	empty
-security dynamic-address feed-server xpfarg update-interval	empty
 security dynamic-address feed-server xpfarg url	empty
-security flow aging early-ageout	empty
-security flow aging high-watermark	empty
-security flow aging low-watermark	empty
-security flow icmp-session timeout	empty
-security flow multicast-session-lifetime	empty
-security flow route-change-timeout	empty
-security flow tcp-session closing-timeout	empty
-security flow tcp-session established-timeout	empty
-security flow tcp-session initial-timeout	empty
-security flow tcp-session time-wait-timeout	empty
-security flow traceoptions file	empty
-security flow traceoptions flag	empty
-security flow traceoptions packet-filter	empty
-security flow traceoptions packet-filter xpfarg destination-prefix	empty
-security flow traceoptions packet-filter xpfarg protocol	empty
-security flow traceoptions packet-filter xpfarg source-prefix	empty
-security flow udp-session timeout	empty
-security ike gateway	empty
-security ike gateway xpfarg address	empty
-security ike gateway xpfarg external-interface	empty
-security ike gateway xpfarg ike-policy	empty
-security ike gateway xpfarg local-address	empty
-security ike gateway xpfarg local-certificate	empty
-security ike gateway xpfarg nat-traversal	empty
-security ike gateway xpfarg version	empty
-security ike policy	empty
-security ike policy xpfarg mode	empty
-security ike policy xpfarg proposal-set	empty
-security ike policy xpfarg proposals	empty
-security ike proposal	empty
-security ike proposal xpfarg dh-group	empty
-security ike proposal xpfarg encryption-algorithm	empty
-security ike proposal xpfarg lifetime-seconds	empty
-security ipsec gateway	empty
-security ipsec gateway xpfarg address	empty
-security ipsec gateway xpfarg external-interface	empty
-security ipsec gateway xpfarg ike-policy	empty
-security ipsec gateway xpfarg local-address	empty
-security ipsec gateway xpfarg local-certificate	empty
-security ipsec gateway xpfarg nat-traversal	empty
-security ipsec gateway xpfarg version	empty
-security ipsec policy	empty
-security ipsec policy xpfarg proposal-set	empty
-security ipsec policy xpfarg proposals	empty
-security ipsec proposal	empty
-security ipsec proposal xpfarg dh-group	empty
-security ipsec proposal xpfarg encryption-algorithm	empty
-security ipsec proposal xpfarg lifetime-kilobytes	empty
-security ipsec proposal xpfarg lifetime-seconds	empty
-security ipsec proposal xpfarg protocol	empty
-security ipsec vpn	empty
-security ipsec vpn xpfarg bind-interface	empty
-security ipsec vpn xpfarg df-bit	empty
-security ipsec vpn xpfarg establish-tunnels	empty
-security ipsec vpn xpfarg ike gateway	empty
-security ipsec vpn xpfarg ike ipsec-policy	empty
-security ipsec vpn xpfarg local-address	empty
-security ipsec vpn xpfarg local-identity	empty
-security ipsec vpn xpfarg remote-identity	empty
-security ipsec vpn xpfarg traffic-selector	empty
-security ipsec vpn xpfarg traffic-selector xpfarg local-ip	empty
-security ipsec vpn xpfarg traffic-selector xpfarg remote-ip	empty
-security ipsec vpn xpfarg vpn-monitor destination-ip	empty
-security ipsec vpn xpfarg vpn-monitor source-interface	empty
-security log format	empty
-security log mode	empty
-security log profile	empty
-security log profile xpfarg stream-name	empty
-security log source-interface	empty
-security log stream xpfarg host	empty
-security nat destination pool	empty
-security nat destination rule-set	empty
-security nat destination rule-set xpfarg rule	empty
-security nat nat64 rule-set	empty
-security nat nat64 rule-set xpfarg prefix	empty
-security nat nat64 rule-set xpfarg source-pool	empty
-security nat proxy-arp interface	empty
-security nat proxy-arp interface xpfarg address	empty
-security nat source pool	empty
-security nat source pool xpfarg port-overloading-factor	empty
-security nat source pool xpfarg routing-instance	empty
-security nat source rule-set	empty
-security nat source rule-set xpfarg rule	empty
-security nat static rule-set	empty
-security nat static rule-set xpfarg rule	empty
-security policies from-zone xpfarg xpfarg xpfarg policy	empty
 security policies from-zone xpfarg xpfarg xpfarg policy xpfarg scheduler-name	empty
 security policies global policy xpfarg scheduler-name	empty
-security screen ids-option	empty
-security screen ids-option xpfarg limit-session destination-ip-based	empty
-security screen ids-option xpfarg limit-session source-ip-based	empty
 services rpm probe xpfarg test xpfarg destination-interface	empty
 services rpm probe xpfarg test xpfarg destination-port	empty
 services rpm probe xpfarg test xpfarg probe-count	empty

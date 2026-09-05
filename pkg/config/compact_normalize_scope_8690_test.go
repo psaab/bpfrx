@@ -246,6 +246,25 @@ func TestCompactNormalizeScopePreservesCompiledResult8690(t *testing.T) {
 			"than adding it here. A REMOVED entry means one became examinable "+
 			"and the list should shrink (#8690).", diff)
 	}
+	// The bucket is asserted for EQUALITY, not merely reported. lane-8526's
+	// point, one axis over from where it was raised: a site cannot silently
+	// become HARMFUL here, because the classification is recomputed from a live
+	// switch every run and a site whose fixture becomes type-valid falls into
+	// the disarm branch and reds. But the bucket could silently GROW — a
+	// widening admitting fifty sites whose gate status cannot be determined
+	// logged a bigger number and passed. A category that only accumulates stops
+	// being a measurement and becomes a registration.
+	if diff := diffSiteSets8690(fixtureLimited, knownFixtureLimited8690); diff != "" {
+		t.Errorf("the set of admitted sites whose GATE STATUS cannot be "+
+			"measured has changed:\n%s\n"+
+			"A NEW entry means a widening admitted a site where the census "+
+			"fixture's value fails a different validator with the pass enabled, "+
+			"so nothing was learned about whether a gate was disarmed — that is "+
+			"unmeasured, not safe, and it needs a deliberate decision rather "+
+			"than a bigger number in a log line. A REMOVED entry means one "+
+			"became measurable (usually improved value synthesis) and the list "+
+			"should shrink (#8690).", diff)
+	}
 	if len(fixtureLimited) > 0 {
 		t.Logf("#8690: %d admitted site(s) could not have their gate status "+
 			"measured, because the census fixture's value fails a different "+
@@ -269,6 +288,15 @@ func TestCompactNormalizeScopePreservesCompiledResult8690(t *testing.T) {
 	// reds instead of quietly excusing the next real disarm that lands on the
 	// same key.
 	benign := map[string]string{
+		"security ipsec policy xpfarg proposal-set": "the gate refuses the CONSEQUENCE of the " +
+			"drop, and says so in its own message. Measured: with the pass disabled the elided " +
+			"`policy p1 proposal-set standard;` loses the proposal-set and the gate rejects with " +
+			"\"has no resolvable ipsec proposal ... the configured perfect-forward-secrecy group " +
+			"would be SILENTLY DROPPED\"; with the pass enabled the proposal-set survives and the " +
+			"same gate accepts. The braced spelling — the reference behaviour — is accepted " +
+			"either way, so the config is legitimate and only the elided form was losing it. " +
+			"This gate was written to catch exactly this drop class, so the pass repairing the " +
+			"drop and the gate then passing is the intended interaction, not a disarm.",
 		"snmp trap-group xpfarg targets": "the gate refuses the CONSEQUENCE of the drop, not " +
 			"the spelling. Measured: with the pass disabled the elided " +
 			"`trap-group tg1 targets 10.0.0.1;` loses its targets and snmp rejects with " +
@@ -559,6 +587,11 @@ var knownUnexaminable8690 = []string{
 // diffSiteSets8690 returns a human-readable difference between a measured set and an
 // expected one, or "" when they match.
 func diffSiteSets8690(got, want []string) string {
+	// Wording is deliberately NEUTRAL about why a site is in the set: this
+	// helper serves two buckets with different meanings (unexaminable, and
+	// gate-status-unmeasurable), and the caller's Errorf supplies the meaning.
+	// It previously described only the first, so a diff in the second was
+	// reported with a sentence that did not apply to it.
 	w := map[string]bool{}
 	for _, x := range want {
 		w[x] = true
@@ -570,12 +603,12 @@ func diffSiteSets8690(got, want []string) string {
 	var b strings.Builder
 	for _, x := range got {
 		if !w[x] {
-			b.WriteString("  NEW (pass normalizes it, cell cannot see it): " + x + "\n")
+			b.WriteString("  NEW (measured now, not in the checked-in set): " + x + "\n")
 		}
 	}
 	for _, x := range want {
 		if !g[x] {
-			b.WriteString("  GONE (now examinable, drop from the list): " + x + "\n")
+			b.WriteString("  GONE (in the checked-in set, no longer measured): " + x + "\n")
 		}
 	}
 	return b.String()
@@ -669,4 +702,46 @@ func dedupe8690(in []string) []string {
 		}
 	}
 	return out
+}
+
+// knownFixtureLimited8690 are admitted sites whose gate status could not be
+// determined: with the pass enabled they fail a DIFFERENT validator than they
+// fail with it disabled, because the census supplies one synthesized value per
+// leaf and it is not always type-valid for that leaf (`dhcpv6 ...
+// fixed-address` receives an IPv4 literal).
+//
+// They are NOT known-safe. Under a type-valid value any of them could compile
+// clean and prove to be a real disarm. Listed rather than counted so that
+// admitting a new one is a decision someone makes rather than a number that
+// moves.
+var knownFixtureLimited8690 = []string{
+	// Added when the schedulers/chassis merge brought in other lanes' families.
+	// Both were admitted by increments that landed while this assertion did not
+	// yet exist, so they are recorded rather than treated as regressions --
+	// the same call as the unexaminable list. Their gate status is UNKNOWN, not
+	// safe, and reported to the lanes that own them.
+	"security ipsec policy xpfarg proposals",
+	"security policies from-zone xpfarg xpfarg xpfarg policy",
+	"protocols bgp group xpfarg neighbor xpfarg export",
+	"protocols bgp group xpfarg neighbor xpfarg import",
+	"security nat destination rule-set xpfarg rule xpfarg match application",
+	"security nat destination rule-set xpfarg rule xpfarg match destination-address",
+	"security nat destination rule-set xpfarg rule xpfarg match destination-address-name",
+	"security nat destination rule-set xpfarg rule xpfarg match destination-port",
+	"security nat destination rule-set xpfarg rule xpfarg match protocol",
+	"security nat destination rule-set xpfarg rule xpfarg match source-address",
+	"security nat destination rule-set xpfarg rule xpfarg match source-address-name",
+	"security nat source rule-set xpfarg rule xpfarg match application",
+	"security nat source rule-set xpfarg rule xpfarg match destination-address",
+	"security nat source rule-set xpfarg rule xpfarg match destination-address-name",
+	"security nat source rule-set xpfarg rule xpfarg match destination-port",
+	"security nat source rule-set xpfarg rule xpfarg match source-address",
+	"security nat source rule-set xpfarg rule xpfarg match source-address-name",
+	"security nat static rule-set xpfarg rule xpfarg match source-address",
+	"security policies from-zone xpfarg xpfarg xpfarg policy xpfarg match application",
+	"security policies from-zone xpfarg xpfarg xpfarg policy xpfarg match destination-address",
+	"security policies from-zone xpfarg xpfarg xpfarg policy xpfarg match source-address",
+	"security policies global policy xpfarg match application",
+	"security policies global policy xpfarg match destination-address",
+	"security policies global policy xpfarg match source-address",
 }
