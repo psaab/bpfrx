@@ -584,10 +584,26 @@ func TestPackedOptInHoldsForEveryLeafPair8768(t *testing.T) {
 			// measuring nothing -- the same both-arms-empty trap that makes a
 			// braced-vs-elided cell read as "no defect" or "value lost"
 			// depending only on how the assertion is phrased.
-			if strings.HasPrefix(want, "<") {
+			// Match the COMPILE sentinels specifically, not every "<...>" string:
+			// several readers legitimately return `<no gateway>` / `<no snmp>` /
+			// `<none>` when the object is absent. Treating those as "did not
+			// compile" would emit a diagnostic that sends the reader to the
+			// parser when the real answer is that the fixture built nothing --
+			// a wrong diagnostic being worse than a missing one.
+			if want == "<parse err>" || strings.HasPrefix(want, "<err ") {
 				t.Errorf("container %q: the BRACED reference for two instances of "+
 					"%q did not compile (%s), so comparing it against the packed "+
 					"spelling proves nothing (#8768)", name, leaf, want)
+				continue
+			}
+			// A reader that reports NOTHING is the other vacuous shape: both arms
+			// agree at "absent" and the comparison is satisfied without either
+			// spelling having produced an object.
+			if strings.HasPrefix(want, "<") {
+				t.Errorf("container %q: the BRACED reference for two instances of "+
+					"%q compiled but the reader reports %s, so both arms can agree "+
+					"at ABSENT and this comparison asserts nothing (#8768)",
+					name, leaf, want)
 				continue
 			}
 			// The second instance must MOVE the reader's output. If one instance
