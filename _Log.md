@@ -107071,7 +107071,3 @@ prose edit above them added. No diff falls in the new test body.
   - **File(s)**: pkg/daemon/external_hostname_watch_6863.go, pkg/daemon/mgmt_listener_reassert.go, pkg/daemon/management.go, pkg/daemon/daemon.go
 
 <!-- LOG-CLOSED-SENTINEL-6874: nothing may be appended below this line. Write to docs/log/<issue>.md instead. -->
-
-- **Timestamp**: 2026-09-05
-  **Action**: Admit the top-level security containers (policies, screen, zones) so the fully-elided spelling keeps its contents — one missing admission was dropping the entire zone-pair policy set, the global policies, the zones and the screen profiles
-  **File(s)**: pkg/config/compact_normalize_8662.go, pkg/config/security_toplevel_elision_8875_test.go, pkg/config/compact_scope_blind_pairs_8852_test.go
