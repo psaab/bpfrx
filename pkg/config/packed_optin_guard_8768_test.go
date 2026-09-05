@@ -809,6 +809,62 @@ func TestPackedOptInHoldsForEveryLeafPair8768(t *testing.T) {
 	sawUnobservable := map[string]bool{}
 
 	checked := 0
+	// `always` EXEMPTS ITS LEAF FROM THE PER-LEAF FIXTURE DEMAND, so the field
+	// is an escape hatch: the demand is the expensive part of this guard, and
+	// the cheapest way past a future refusal is to move the demanded leaf into
+	// `always` and call it an existence requirement. That would be a guard
+	// satisfiable by writing something false, and the false thing is one word.
+	//
+	// So the contents are VERIFIED rather than trusted: WITHOUT the `always`
+	// statement, the container must contribute NOTHING OBSERVABLE. That is the
+	// exact property the exemption rests on -- it is what makes a same-leaf
+	// comparison for any other leaf a comparison of two nothings, which the
+	// vacuity check below correctly refuses and which no better fixture can
+	// repair.
+	//
+	// THE FIRST VERSION OF THIS CHECK ASSERTED THE BRACED ARM FAILS TO COMPILE,
+	// AND IT WAS WRONG -- it fired on the only case using the field. Measured:
+	// `security log stream s1 { category policy; }` COMPILES CLEANLY, with no
+	// error and no strict rejection, and produces ZERO streams. The stream is
+	// silently discarded rather than the config refused. Same vacuity, but a
+	// different mechanism, and asserting the wrong one would have made the
+	// field unusable for the container it was built for.
+	//
+	// Same principle as the reverse check on `stmts`, in the other direction:
+	// that one rejects a fixture for a leaf which is NOT admitted, because
+	// writing one is a false claim of coverage; this one rejects an existence
+	// claim the container does not actually make.
+	for name, c := range cases {
+		if c.always == "" || c.read == nil {
+			continue
+		}
+		var probe string
+		for _, st := range c.stmts {
+			probe = st
+			break
+		}
+		if probe == "" {
+			continue
+		}
+		withoutAlways := c.prefix + c.open + " { " + probe + "; }" + c.closer
+		cfg := compileText(t, withoutAlways)
+		if cfg == nil {
+			continue // refused outright: an even stronger requirement
+		}
+		if got := c.read(cfg); got != "" {
+			t.Errorf("container %q declares always=%q, but WITHOUT that statement "+
+				"the container still contributes %q -- so it is not an existence "+
+				"requirement, and the leaf it names is exempt from the per-leaf "+
+				"fixture demand for no reason.\n  fixture: %s\n"+
+				"  `always` exists for a container that produces NOTHING without a "+
+				"statement, which is why its leaf need not also be varied: every "+
+				"comparison for every other leaf would otherwise have both arms "+
+				"empty. Using it for a leaf that is merely inconvenient to fixture "+
+				"removes that leaf from comparison while looking handled (#8768).",
+				name, c.always, got, withoutAlways)
+		}
+	}
+
 	for name, node := range optedIn {
 		c, ok := cases[name]
 		if !ok {
