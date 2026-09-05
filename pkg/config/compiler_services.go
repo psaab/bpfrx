@@ -1442,12 +1442,34 @@ func compileForwardingOptions(node *Node, fo *ForwardingOptionsConfig) error {
 		}
 	}
 
-	// Parse family { inet6 { mode <flow-based|packet-based> } }
-	if famNode := node.FindChild("family"); famNode != nil {
-		if inet6Node := famNode.FindChild("inet6"); inet6Node != nil {
-			if modeNode := inet6Node.FindChild("mode"); modeNode != nil {
-				fo.FamilyInet6Mode = nodeVal(modeNode)
-			}
+	// Parse `family inet6 { mode <flow-based|packet-based> }`.
+	//
+	// #8797: `family` is a compoundKey container, so the address family is the
+	// SECOND KEY OF THE SAME NODE — `Keys=["family","inet6"]` — and not a child.
+	// The original walk was FindChild("family").FindChild("inet6"), which finds
+	// nothing at that shape, so the mode was dropped for every spelling an
+	// operator actually produces INCLUDING flat `set`:
+	//
+	//	set forwarding-options family inet6 mode packet-based   -> ""
+	//	family inet6 { mode packet-based; }                     -> ""
+	//	family { inet6 { mode packet-based; } }                 -> "packet-based"
+	//
+	// Only the last is the shape the old walk expected, and it is the one
+	// nothing produces. Both shapes are accepted here rather than picking one,
+	// because the parser genuinely emits both (CLAUDE.md, dual AST shape).
+	for _, famNode := range node.FindChildren("family") {
+		var inet6Node *Node
+		switch {
+		case len(famNode.Keys) >= 2 && famNode.Keys[1] == "inet6":
+			inet6Node = famNode
+		default:
+			inet6Node = famNode.FindChild("inet6")
+		}
+		if inet6Node == nil {
+			continue
+		}
+		if modeNode := inet6Node.FindChild("mode"); modeNode != nil {
+			fo.FamilyInet6Mode = nodeVal(modeNode)
 		}
 	}
 

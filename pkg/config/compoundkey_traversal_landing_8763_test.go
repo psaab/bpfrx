@@ -27,6 +27,17 @@ import (
 // The baseline leg caught `inet6 mode` (nothing reads it in any spelling) and
 // it is what distinguishes a real recovery from two spellings agreeing on a
 // dropped value.
+//
+// #8797 RECLASSIFIED `inet6 mode` FROM reader-defect TO recovery, and the
+// distinction that class encodes is why this sweep found it at all. The reader
+// was not absent — it walked FindChild("family").FindChild("inet6") while
+// `family` is a compoundKey container, so it looked for a child that is the
+// same node's SECOND KEY. Every spelling an operator produces, flat `set`
+// included, therefore compiled the same as the statement being absent, which
+// is exactly what `reader-defect` describes and why a two-way check calls the
+// site clean: both spellings deliver the same nothing. Once the reader handles
+// the shape the parser actually builds, the packed form delivers the braced
+// result and the pair is an ordinary recovery.
 type famOnlyCase8763 struct {
 	pair     string
 	preamble string
@@ -302,7 +313,7 @@ func famOnlyCases8763() []famOnlyCase8763 {
 		// Nothing reads it in ANY spelling: braced compiles the same as absent,
 		// and `packet-based` compiles the same as `flow-based`. Pre-existing and
 		// untouched by the traversal; recorded so it is not mistaken for one.
-		{"inet6 mode", "", "forwarding-options {\n family inet6 {\n  mode packet-based;\n }\n}\n", "forwarding-options {\n family inet6 mode packet-based;\n}\n", "forwarding-options {\n family inet6 {\n }\n}\n", readerBug},
+		{"inet6 mode", "", "forwarding-options {\n family inet6 {\n  mode packet-based;\n }\n}\n", "forwarding-options {\n family inet6 mode packet-based;\n}\n", "forwarding-options {\n family inet6 {\n }\n}\n", recover8763}, // #8797: was readerBug; see the note above the class list
 	}
 }
 
