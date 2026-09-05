@@ -788,6 +788,9 @@ func parseCoSInterfaceUnitBody(node *Node, unit *CoSInterfaceUnit) {
 		unit.OutputTrafficControlProfile = nodeVal(tcpNode)
 	}
 	if classifiersNode := node.FindChild("classifiers"); classifiersNode != nil {
+		// issue 8939: the flat-set spelling nests the bindings into a chain, so
+		// FindChild sees only the first. Flatten before reading.
+		classifiersNode = flattenChainedNode(classifiersNode, cosBindingSchema8939("classifiers"))
 		if dscpNode := classifiersNode.FindChild("dscp"); dscpNode != nil {
 			unit.DSCPClassifier = nodeVal(dscpNode)
 		}
@@ -804,6 +807,7 @@ func parseCoSInterfaceUnitBody(node *Node, unit *CoSInterfaceUnit) {
 		}
 	}
 	if rewriteRulesNode := node.FindChild("rewrite-rules"); rewriteRulesNode != nil {
+		rewriteRulesNode = flattenChainedNode(rewriteRulesNode, cosBindingSchema8939("rewrite-rules"))
 		if dscpNode := rewriteRulesNode.FindChild("dscp"); dscpNode != nil {
 			unit.DSCPRewriteRule = nodeVal(dscpNode)
 		}
@@ -1214,4 +1218,26 @@ func parseCoSShapingRate(node *Node) (rateBytes uint64, percent float64) {
 		}
 	}
 	return rateBytes, percent
+}
+
+// cosBindingSchema8939 resolves the class-of-service unit-level binding
+// container (`classifiers` or `rewrite-rules`) so flattenChainedNode can tell a
+// terminating binding from one that owns a body.
+func cosBindingSchema8939(which string) *schemaNode {
+	cos := resolveSchemaChild(setSchema, "class-of-service")
+	ifs := resolveSchemaChild(cos, "interfaces")
+	if ifs == nil {
+		return nil
+	}
+	if ifs.wildcard != nil {
+		ifs = ifs.wildcard
+	}
+	unit := resolveSchemaChild(ifs, "unit")
+	if unit == nil {
+		return nil
+	}
+	if unit.wildcard != nil {
+		unit = unit.wildcard
+	}
+	return resolveSchemaChild(unit, which)
 }

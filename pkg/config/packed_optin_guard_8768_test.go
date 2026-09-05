@@ -462,6 +462,123 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 				return out
 			},
 		},
+		// issue 8939: the class-of-service BINDING containers, at BOTH the unit
+		// level and the interface level -- the schema declares each twice and
+		// this guard requires a case for each, so an opt-in cannot ship
+		// exercised on only one.
+		//
+		// THE TWO LEVELS DO NOT HAVE THE SAME CHILDREN, which the reverse check
+		// caught after the first version gave them the same fixtures:
+		// `inet-precedence` is declared only under `classifiers` at the UNIT
+		// level; `exp` is declared by neither binding container here. A fixture
+		// for a leaf the container does not declare is silently unused, so
+		// writing one is a false claim of coverage -- the same error as
+		// registering a whole family when only some members qualify.
+		//
+		// Every admitted leaf is an args:1 named reference, so each carries a
+		// second instance.
+		"class-of-service/interfaces/unit/classifiers": {
+			prefix: "class-of-service { interfaces ge-0/0/0 { unit 0 { ",
+			open:   "classifiers",
+			closer: " } } }",
+			stmts: map[string]string{
+				"dscp":            "dscp ref1",
+				"ieee-802.1":      "ieee-802.1 ref2",
+				"inet-precedence": "inet-precedence ref3",
+			},
+			second: map[string]string{
+				"dscp":            "dscp alt1",
+				"ieee-802.1":      "ieee-802.1 alt2",
+				"inet-precedence": "inet-precedence alt3",
+			},
+			read: func(c *Config) string {
+				out := ""
+				for _, i := range c.ClassOfService.Interfaces {
+					for _, u := range i.Units {
+						out += fmt.Sprintf("|%s.%d dc=%s ic=%s pc=%s dr=%s ir=%s",
+							i.Name, u.Unit, u.DSCPClassifier, u.IEEE8021Classifier,
+							u.INetPrecedenceClassifier, u.DSCPRewriteRule, u.IEEE8021RewriteRule)
+					}
+				}
+				return out
+			},
+		},
+		"class-of-service/interfaces/unit/rewrite-rules": {
+			prefix: "class-of-service { interfaces ge-0/0/0 { unit 0 { ",
+			open:   "rewrite-rules",
+			closer: " } } }",
+			stmts: map[string]string{
+				"dscp":       "dscp ref1",
+				"ieee-802.1": "ieee-802.1 ref2",
+			},
+			second: map[string]string{
+				"dscp":       "dscp alt1",
+				"ieee-802.1": "ieee-802.1 alt2",
+			},
+			read: func(c *Config) string {
+				out := ""
+				for _, i := range c.ClassOfService.Interfaces {
+					for _, u := range i.Units {
+						out += fmt.Sprintf("|%s.%d dc=%s ic=%s pc=%s dr=%s ir=%s",
+							i.Name, u.Unit, u.DSCPClassifier, u.IEEE8021Classifier,
+							u.INetPrecedenceClassifier, u.DSCPRewriteRule, u.IEEE8021RewriteRule)
+					}
+				}
+				return out
+			},
+		},
+		"class-of-service/interfaces/classifiers": {
+			prefix: "class-of-service { interfaces ge-0/0/0 { ",
+			open:   "classifiers",
+			closer: " } }",
+			stmts: map[string]string{
+				"dscp":       "dscp ref1",
+				"ieee-802.1": "ieee-802.1 ref2",
+			},
+			second: map[string]string{
+				"dscp":       "dscp alt1",
+				"ieee-802.1": "ieee-802.1 alt2",
+			},
+			read: func(c *Config) string {
+				out := ""
+				for _, i := range c.ClassOfService.Interfaces {
+					if i.Level == nil {
+						continue
+					}
+					u := i.Level
+					out += fmt.Sprintf("|%s dc=%s ic=%s pc=%s dr=%s ir=%s",
+						i.Name, u.DSCPClassifier, u.IEEE8021Classifier,
+						u.INetPrecedenceClassifier, u.DSCPRewriteRule, u.IEEE8021RewriteRule)
+				}
+				return out
+			},
+		},
+		"class-of-service/interfaces/rewrite-rules": {
+			prefix: "class-of-service { interfaces ge-0/0/0 { ",
+			open:   "rewrite-rules",
+			closer: " } }",
+			stmts: map[string]string{
+				"dscp":       "dscp ref1",
+				"ieee-802.1": "ieee-802.1 ref2",
+			},
+			second: map[string]string{
+				"dscp":       "dscp alt1",
+				"ieee-802.1": "ieee-802.1 alt2",
+			},
+			read: func(c *Config) string {
+				out := ""
+				for _, i := range c.ClassOfService.Interfaces {
+					if i.Level == nil {
+						continue
+					}
+					u := i.Level
+					out += fmt.Sprintf("|%s dc=%s ic=%s pc=%s dr=%s ir=%s",
+						i.Name, u.DSCPClassifier, u.IEEE8021Classifier,
+						u.INetPrecedenceClassifier, u.DSCPRewriteRule, u.IEEE8021RewriteRule)
+				}
+				return out
+			},
+		},
 		"security/ipsec/proposal": {
 			prefix: "security { ipsec { ",
 			open:   "proposal ip1",
@@ -771,6 +888,15 @@ func TestPackedOptInHoldsForEveryLeafPair8768(t *testing.T) {
 	// that stops diverging fails as stale, and an unadjudicated divergence still
 	// fails. Empty until a measurement puts something here.
 	sameLeafAdjudicated := map[string]string{
+		"class-of-service/interfaces/classifiers ieee-802.1+ieee-802.1":                "scalar binding: a repeated statement OVERWRITES, so both spellings yield one value",
+		"class-of-service/interfaces/rewrite-rules dscp+dscp":                          "scalar binding: a repeated statement OVERWRITES, so both spellings yield one value",
+		"class-of-service/interfaces/rewrite-rules ieee-802.1+ieee-802.1":              "scalar binding: a repeated statement OVERWRITES, so both spellings yield one value",
+		"class-of-service/interfaces/unit/classifiers dscp+dscp":                       "scalar binding: a repeated statement OVERWRITES, so both spellings yield one value",
+		"class-of-service/interfaces/unit/classifiers ieee-802.1+ieee-802.1":           "scalar binding: a repeated statement OVERWRITES, so both spellings yield one value",
+		"class-of-service/interfaces/unit/classifiers inet-precedence+inet-precedence": "scalar binding: a repeated statement OVERWRITES, so both spellings yield one value",
+		"class-of-service/interfaces/unit/rewrite-rules dscp+dscp":                     "scalar binding: a repeated statement OVERWRITES, so both spellings yield one value",
+		"class-of-service/interfaces/unit/rewrite-rules ieee-802.1+ieee-802.1":         "scalar binding: a repeated statement OVERWRITES, so both spellings yield one value",
+
 		// Two instances of `address-set`, the divergence the round-1 review of
 		// #8873 found live at head. It is NESTED ELISION, not a same-leaf split
 		// failure: `address-set` is args:1 WITH children, so the run cannot be
@@ -803,6 +929,31 @@ func TestPackedOptInHoldsForEveryLeafPair8768(t *testing.T) {
 	// wired the comparison becomes live and the stale check below fails, which
 	// is the signal to delete the entry and let the leaf be measured.
 	sameLeafUnobservable := map[string]string{
+		// issue 8939: the class-of-service BINDING containers. Every binding is
+		// a SCALAR field -- CoSInterfaceUnit.DSCPClassifier is one string, not a
+		// list -- so a repeated statement OVERWRITES rather than accumulating,
+		// and one instance reads identically to two. The same-leaf comparison
+		// therefore cannot distinguish a split run from a swallowed one, and no
+		// fixture can repair that: it is a property of the FIELD, not of the
+		// arms.
+		//
+		// THIS IS NOT THE GUARD BEING LENIENT, and the distinction matters
+		// because an unobservable entry is exactly what a wrong verdict hides
+		// behind. The ORDERED-PAIR comparisons for these four containers are
+		// live and are the ones that do the work: `dscp c1 ieee-802.1 c2` is
+		// precisely the shape that was losing the second binding, and it is
+		// compared for every ordered pair of admitted leaves at all four sites.
+		// Only the leaf-against-ITSELF case is degenerate.
+		"class-of-service/interfaces/classifiers dscp+dscp":                            "scalar binding: a repeated statement OVERWRITES, so one instance and two read alike",
+		"class-of-service/interfaces/classifiers ieee-802.1+ieee-802.1":                "scalar binding: a repeated statement OVERWRITES, so one instance and two read alike",
+		"class-of-service/interfaces/rewrite-rules dscp+dscp":                          "scalar binding: a repeated statement OVERWRITES, so one instance and two read alike",
+		"class-of-service/interfaces/rewrite-rules ieee-802.1+ieee-802.1":              "scalar binding: a repeated statement OVERWRITES, so one instance and two read alike",
+		"class-of-service/interfaces/unit/classifiers dscp+dscp":                       "scalar binding: a repeated statement OVERWRITES, so one instance and two read alike",
+		"class-of-service/interfaces/unit/classifiers ieee-802.1+ieee-802.1":           "scalar binding: a repeated statement OVERWRITES, so one instance and two read alike",
+		"class-of-service/interfaces/unit/classifiers inet-precedence+inet-precedence": "scalar binding: a repeated statement OVERWRITES, so one instance and two read alike",
+		"class-of-service/interfaces/unit/rewrite-rules dscp+dscp":                     "scalar binding: a repeated statement OVERWRITES, so one instance and two read alike",
+		"class-of-service/interfaces/unit/rewrite-rules ieee-802.1+ieee-802.1":         "scalar binding: a repeated statement OVERWRITES, so one instance and two read alike",
+
 		"security/ike/proposal description+description":   "IKEProposal has no Description field; value discarded at compile",
 		"security/ipsec/proposal description+description": "IPsecProposal has no Description field; value discarded at compile",
 	}

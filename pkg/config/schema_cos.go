@@ -242,7 +242,24 @@ var schemaClassOfService = &schemaNode{desc: "Class of service configuration", c
 	}},
 	"interfaces": {desc: "Apply CoS to an interface", args: 1, multi: true, placeholder: "<interface-name>", children: map[string]*schemaNode{
 		"unit": {desc: "Logical unit number", args: 1, multi: true, placeholder: "<unit-number>", children: map[string]*schemaNode{
-			"classifiers": {desc: "Classifiers applied to traffic arriving on this unit", children: map[string]*schemaNode{
+			// issue 8939: packedStatements so a run written on one line --
+			// `classifiers dscp c1 ieee-802.1 c2;` -- splits into siblings
+			// instead of landing whole on this node's Keys, where the compiler
+			// reads the first binding and drops the rest.
+			//
+			// The loss is the FALLBACK shape rather than the missing shape:
+			// pkg/dataplane/userspace/interfaces.go records that an unpublished
+			// classifier binding means "the dataplane sees no classifier and
+			// every packet falls through to the DEFAULT QUEUE". Traffic is
+			// still classified, into the wrong queue -- and because the FIRST
+			// binding survives, the interface visibly carries a working
+			// classifier while the second silently does nothing. Partial
+			// application reads as success.
+			//
+			// Declared on the NODE, so no #8921 collision check is owed: this
+			// reaches these four binding sites and not the top-level
+			// classifier/rewrite-rule DEFINITIONS, which are a different shape.
+			"classifiers": {desc: "Classifiers applied to traffic arriving on this unit", packedStatements: true, children: map[string]*schemaNode{
 				"dscp": {desc: "DSCP classifier to apply", args: 1, placeholder: "<classifier-name>", children: nil},
 				// #6847: before this the unit had NO inet-precedence binding
 				// site, so an inet-precedence classifier was definable at the
@@ -253,7 +270,24 @@ var schemaClassOfService = &schemaNode{desc: "Class of service configuration", c
 				"inet-precedence": {desc: "IP-precedence classifier to apply (cannot be combined with dscp on the same unit)", args: 1, placeholder: "<classifier-name>", children: nil},
 				"ieee-802.1":      {desc: "IEEE 802.1p classifier to apply", args: 1, placeholder: "<classifier-name>", children: nil},
 			}},
-			"rewrite-rules": {desc: "Rewrite rules applied to traffic leaving this unit", children: map[string]*schemaNode{
+			// issue 8939: packedStatements so a run written on one line --
+			// `classifiers dscp c1 ieee-802.1 c2;` -- splits into siblings
+			// instead of landing whole on this node's Keys, where the compiler
+			// reads the first binding and drops the rest.
+			//
+			// The loss is the FALLBACK shape rather than the missing shape:
+			// pkg/dataplane/userspace/interfaces.go records that an unpublished
+			// classifier binding means "the dataplane sees no classifier and
+			// every packet falls through to the DEFAULT QUEUE". Traffic is
+			// still classified, into the wrong queue -- and because the FIRST
+			// binding survives, the interface visibly carries a working
+			// classifier while the second silently does nothing. Partial
+			// application reads as success.
+			//
+			// Declared on the NODE, so no #8921 collision check is owed: this
+			// reaches these four binding sites and not the top-level
+			// classifier/rewrite-rule DEFINITIONS, which are a different shape.
+			"rewrite-rules": {desc: "Rewrite rules applied to traffic leaving this unit", packedStatements: true, children: map[string]*schemaNode{
 				"dscp":       {desc: "DSCP rewrite rule to apply", args: 1, placeholder: "<rewrite-rule-name>", children: nil},
 				"ieee-802.1": {desc: "IEEE 802.1p (PCP) rewrite rule to apply (accepted-but-inert; dataplane rewrites dscp only)", args: 1, placeholder: "<rewrite-rule-name>", children: nil},
 			}},
@@ -268,11 +302,45 @@ var schemaClassOfService = &schemaNode{desc: "Class of service configuration", c
 		// overrides per knob. The compiler folds them into the configured
 		// units (applyCoSInterfaceLevelBindings). Same knobs as the unit
 		// level so flat-set grouping nests them identically.
-		"classifiers": {desc: "Classifiers applied at the interface level (all units)", children: map[string]*schemaNode{
+		// issue 8939: packedStatements so a run written on one line --
+		// `classifiers dscp c1 ieee-802.1 c2;` -- splits into siblings
+		// instead of landing whole on this node's Keys, where the compiler
+		// reads the first binding and drops the rest.
+		//
+		// The loss is the FALLBACK shape rather than the missing shape:
+		// pkg/dataplane/userspace/interfaces.go records that an unpublished
+		// classifier binding means "the dataplane sees no classifier and
+		// every packet falls through to the DEFAULT QUEUE". Traffic is
+		// still classified, into the wrong queue -- and because the FIRST
+		// binding survives, the interface visibly carries a working
+		// classifier while the second silently does nothing. Partial
+		// application reads as success.
+		//
+		// Declared on the NODE, so no #8921 collision check is owed: this
+		// reaches these four binding sites and not the top-level
+		// classifier/rewrite-rule DEFINITIONS, which are a different shape.
+		"classifiers": {desc: "Classifiers applied at the interface level (all units)", packedStatements: true, children: map[string]*schemaNode{
 			"dscp":       {desc: "DSCP classifier to apply", args: 1, placeholder: "<classifier-name>", children: nil},
 			"ieee-802.1": {desc: "IEEE 802.1p classifier to apply", args: 1, placeholder: "<classifier-name>", children: nil},
 		}},
-		"rewrite-rules": {desc: "Rewrite rules applied at the interface level (all units)", children: map[string]*schemaNode{
+		// issue 8939: packedStatements so a run written on one line --
+		// `classifiers dscp c1 ieee-802.1 c2;` -- splits into siblings
+		// instead of landing whole on this node's Keys, where the compiler
+		// reads the first binding and drops the rest.
+		//
+		// The loss is the FALLBACK shape rather than the missing shape:
+		// pkg/dataplane/userspace/interfaces.go records that an unpublished
+		// classifier binding means "the dataplane sees no classifier and
+		// every packet falls through to the DEFAULT QUEUE". Traffic is
+		// still classified, into the wrong queue -- and because the FIRST
+		// binding survives, the interface visibly carries a working
+		// classifier while the second silently does nothing. Partial
+		// application reads as success.
+		//
+		// Declared on the NODE, so no #8921 collision check is owed: this
+		// reaches these four binding sites and not the top-level
+		// classifier/rewrite-rule DEFINITIONS, which are a different shape.
+		"rewrite-rules": {desc: "Rewrite rules applied at the interface level (all units)", packedStatements: true, children: map[string]*schemaNode{
 			"dscp":       {desc: "DSCP rewrite rule to apply", args: 1, placeholder: "<rewrite-rule-name>", children: nil},
 			"ieee-802.1": {desc: "IEEE 802.1p (PCP) rewrite rule to apply (accepted-but-inert; dataplane rewrites dscp only)", args: 1, placeholder: "<rewrite-rule-name>", children: nil},
 		}},
