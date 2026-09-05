@@ -9,6 +9,32 @@ import (
 // A COUNTED RATCHET over pairs that are admitted to the brace-elision scope but
 // whose container CANNOT SPLIT a multi-statement packed run.
 //
+// THERE ARE TWO FAILURE MODES AND THEY SPLIT ON THIS PREDICATE'S OWN
+// DISJUNCTION, which is why `multi || args >= N` is not one population wearing
+// two hats:
+//
+//	multi leaves      INJECTION -- the repeated statement's KEYWORD is absorbed
+//	                  as a list value, so the packed arm has MORE members than
+//	                  the braced one, one of them a phantom named after the
+//	                  keyword.
+//	args >= 2 keys    TRUNCATION -- later instances are simply lost, so the
+//	                  packed arm has FEWER.
+//
+// A CELL THAT COMPARES LENGTHS SCORES INJECTION AS INCREASED COVERAGE. "3 vs 2"
+// reads as a gain until you print the members and see that one of the three is
+// a phantom. Every comparison here is on rendered CONTENTS for that reason.
+//
+// SEVERITY IS NOT A PROPERTY OF THE MODE. Injection is SILENT in a NAT pool and
+// in the resolver list, REJECTED for a WireGuard peer, and WARNED for an
+// address-set. Whether the operator hears about it depends entirely on whether
+// some unrelated downstream validator happens to trip over the phantom, so the
+// gate verdict has to be measured per pair and cannot be inferred from the mode.
+//
+// A `STRICT-REJECTS` VERDICT ONLY MEANS "HANDLED" IF THE BRACED ARM WAS
+// ACCEPTED. A fixture whose braced arm also fails makes the packed rejection
+// evidence of nothing -- the liveness rule pointed at reject verdicts rather
+// than at equality ones. Each member below asserts its braced reference first.
+//
 // THE DEFECT CLASS, with a live member measured at this base:
 //
 //	system { name-server 1.1.1.1 name-server 8.8.8.8; }
@@ -98,7 +124,7 @@ func unsplittablePairs8880(minArgs int) (map[string]bool, map[string]bool) {
 }
 
 func TestUnsplittablePairRatchet8880(t *testing.T) {
-	// Measured at master 947633533, twice, with the counts asserted equal.
+	// Measured at master e2018595f, twice, with the counts asserted equal.
 	//
 	// TWO THRESHOLDS, BOTH ASSERTED, because picking one silently would hide the
 	// judgement. `args >= 2` was the original predicate. `args >= 1` is the one
@@ -111,7 +137,7 @@ func TestUnsplittablePairRatchet8880(t *testing.T) {
 	// something changes the arity model.
 	const (
 		wantArgs2 = 95
-		wantArgs1 = 462
+		wantArgs1 = 460
 	)
 	pairs2, _ := unsplittablePairs8880(2)
 	pairs1, conflict1 := unsplittablePairs8880(1)
@@ -193,7 +219,7 @@ func TestUnsplittablePairRatchet8880(t *testing.T) {
 	// -- so at master it is absent from the population for a reason that has
 	// nothing to do with the clause under test, and the check could never fire.
 	// A control that cannot fail is not a control. Both below are admitted AND
-	// their container declares packedStatements at 947633533; there are 32 such
+	// their container declares packedStatements at e2018595f; there are 32 such
 	// pairs, so this is a sample of a real set rather than a lucky pick.
 	for _, optedIn := range []string{"gateway local-identity", "dead-peer-detection interval"} {
 		if set2[optedIn] {
@@ -206,6 +232,56 @@ func TestUnsplittablePairRatchet8880(t *testing.T) {
 	// LIVE MEMBERS. A counted ratchet with no demonstrated member is a number.
 	// These two are adjudicated: the packed spelling does not merely lose the
 	// second statement, it absorbs that statement's KEYWORD as a value.
+	// TRUNCATION MODE, kept beside the injection ones so a reader does not
+	// generalise from a single mode. This is issue #8880: with the `policies`
+	// brace elided, the SECOND from-zone/to-zone block is discarded entirely,
+	// on a clean commit with zero warnings -- the product's primary enforcement
+	// surface losing a whole zone-pair policy set silently.
+	t.Run("member/policies from-zone (truncation)", func(t *testing.T) {
+		const rule = "policy p1 { match { source-address any; destination-address " +
+			"any; application any; } then { permit; } }"
+		const zones = "security-zone a { } security-zone b { } security-zone c { } " +
+			"security-zone d { }"
+		const blocks = "from-zone a to-zone b { " + rule + " } from-zone c to-zone d { " + rule + " }"
+		pairs := func(txt string) []string {
+			tree, errs := NewParser(txt).Parse()
+			if len(errs) > 0 {
+				t.Fatalf("parse: %v", errs)
+			}
+			cfg, err := CompileConfigLenient(tree)
+			if err != nil {
+				t.Fatalf("compile: %v", err)
+			}
+			var out []string
+			for _, p := range cfg.Security.Policies {
+				out = append(out, p.FromZone+"->"+p.ToZone)
+			}
+			sort.Strings(out)
+			return out
+		}
+		// BOTH ARMS CARRY THE SAME TWO BLOCKS. An earlier version of this
+		// fixture gave the braced arm two rule bodies and the packed arm one,
+		// so "1 vs 2" would have been the fixture rather than the fold -- right
+		// by accident, which is worse than wrong.
+		braced := pairs("security { zones { " + zones + " } policies { " + blocks + " } }")
+		packed := pairs("security { zones { " + zones + " } policies " + blocks + " }")
+		if len(braced) != 2 {
+			t.Fatalf("the BRACED reference produced %v, not two zone pairs, so "+
+				"this member demonstrates nothing", braced)
+		}
+		if strings.Join(packed, "|") == strings.Join(braced, "|") {
+			t.Errorf("policies/from-zone no longer truncates (packed %v == braced "+
+				"%v), so it is FIXED and must leave this cell -- and the counts "+
+				"above re-derived (#8880)", packed, braced)
+		}
+		if len(packed) >= len(braced) {
+			t.Errorf("policies/from-zone still differs but no longer LOSES a "+
+				"block (packed %v, braced %v). This member is the TRUNCATION "+
+				"mode; if it has become injection the mode split above is wrong "+
+				"and must be re-derived, not edited (#8880)", packed, braced)
+		}
+	})
+
 	for _, c := range []struct {
 		pair, packed, braced string
 		read                 func(*Config) []string
@@ -293,6 +369,6 @@ func TestUnsplittablePairRatchet8880(t *testing.T) {
 			"them: %v", len(conflict1), c)
 	}
 	t.Logf("#8880: %d pairs at args>=2, %d at args>=1 (of %d whose remedy "+
-		"resolves: %d multi, %d not), wildcard-traversing, master 947633533; "+
+		"resolves: %d multi, %d not), wildcard-traversing, master e2018595f; "+
 		"e.g. %v", got2, got1, resolved, multi, resolved-multi, sample)
 }
