@@ -33,7 +33,13 @@ type exclusion8690 struct {
 var exclusionClasses8690 = map[string]bool{
 	"partial": true, "gate-confirmed": true, "gate-open-question": true,
 	"gate-collateral": true, "unmeasurable": true, "unreachable": true,
-	"hazard": true, "open": true, "unclassified": true,
+	// #8690: measured — with the pair ADMITTED, pass on and off — to change
+	// nothing at the commit boundary, because a required sibling the compact
+	// spelling cannot carry is still missing. Distinct from `unreachable`
+	// (a rule cannot NAME it) and from `unmeasurable` (nobody could measure
+	// it): here the rule names it fine and the measurement was taken.
+	"sibling-blocked": true,
+	"hazard":          true, "open": true, "unclassified": true,
 	// #8690: MEASURED, at every reachable spelling and with the pass both
 	// enabled and disabled, to drop nothing. There is no fix to make. It is not
 	// `open` (nothing to normalize), not `unmeasurable` (it WAS measured), and
@@ -69,6 +75,7 @@ var exclusionClasses8690 = map[string]bool{
 var permanentClasses8690 = map[string]bool{
 	"partial": true, "gate-confirmed": true, "gate-collateral": true,
 	"unreachable": true, "hazard": true, "no-drop-measured": true,
+	"sibling-blocked": true,
 }
 
 func readPermanentExclusions8690(t *testing.T) map[string]exclusion8690 {
@@ -295,6 +302,22 @@ func TestPermanentExclusionRegisterIsDiscriminating8690(t *testing.T) {
 				t.Errorf("%q is classed `gate-confirmed` with a %d-character reason. That "+
 					"class asserts a PERSON measured it; the measurement IS the claim",
 					site, len(e.reason))
+			}
+		case "sibling-blocked":
+			// Asserts a measurement taken with the pair ADMITTED. That
+			// qualifier is the whole content of the class: for an EXCLUDED pair
+			// the pass touches 0 nodes, so "the pass changes nothing here" is
+			// true by construction and says nothing about the site. An entry
+			// that does not state it is indistinguishable from that null.
+			if !strings.Contains(e.reason, "ADMITTED") {
+				t.Errorf("%q is classed `sibling-blocked` but its reason does not say the "+
+					"measurement was taken with the pair ADMITTED. For an excluded pair "+
+					"the pass touches no nodes, so \"nothing changes\" is guaranteed and "+
+					"measures nothing — the qualifier IS the claim", site)
+			}
+			if !strings.Contains(e.reason, "ENABLED") || !strings.Contains(e.reason, "DISABLED") {
+				t.Errorf("%q is classed `sibling-blocked` but its reason does not say the "+
+					"pass was exercised BOTH ways", site)
 			}
 		case "no-drop-measured":
 			// Asserts a MEASUREMENT, so it must cite the executable form of it.
