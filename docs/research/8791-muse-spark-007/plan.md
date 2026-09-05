@@ -1,6 +1,22 @@
 # muse-spark-007 triage plan — 22 verified Major findings
 
-**Status:** DRAFT v1 — pending adversarial plan review
+**Status:** DRAFT v2 — revised after Claude SMR r1 returned **PLAN-KILL** on v1
+
+**What changed in v2, and why.** My own hostile SMR killed v1 on the grounds that
+its first act would delay a two-line fix for a confirmed unauthenticated remote
+DoS behind a three-reviewer convergence. It was right. Finding 03 is out of scope
+and filed as **#8792**. Finding 20 subsequently passed Gate B and is filed as
+**#8794**. §2's justification for Gate B has been replaced with a measurement
+rather than an analogy, per the SMR's second required change. A reachability
+column is added, per its third.
+
+**AGY is infra-blocked.** Three documented attempts
+(`adversarial-review-mtny7p6f-u8bwwy`, `-mtnyd84o-q1z9li`, `-mtnyi1fj-yf3ebb`),
+all failing with the same plugin CLI defect — *"--print took --print-timeout as
+its prompt"* — foreground and background, with and without a timeout argument.
+That is an infrastructure failure and not a review verdict, so this round
+proceeds 2-of-3 (Claude SMR + Codex) per the skill's Codex-infra-blocked
+exception applied to AGY.
 
 Tracking issue: #8791 · Source report: `muse-spark-review-007` (132K, external)
 Base verified at: `f565c569f` (report's own base) and `b0f3aba21` (current master)
@@ -37,24 +53,37 @@ with `count` read straight from 4 wire bytes and no bounds check before the
 allocation. `sizeof(IdleLeaseWire)` measured at 112 bytes, so `ff ff ff ff`
 requests 481,036,337,040 bytes = **448.0 GiB**. The report said 448 GiB.
 
-**What is NOT verified: twenty-one of the twenty-two causal claims.**
+**What is NOT verified: nineteen of the twenty-two causal claims.**
 
-This is the whole value question. A verified quote establishes that the code says
-what the report says it says. It does not establish that the consequence follows.
-**This distinction is the single most expensive failure mode this codebase's
-review process hit today** — four separate findings in one afternoon were real
-observations with a mechanism attached that nobody had measured:
+A verified quote establishes that the code says what the report says it says. It
+does not establish that the consequence follows. That distinction is real and
+should survive into v3.
 
-* a fold "producing a correct split structure that a reader ignores" — the
-  container does not fold at all
-* `schemaForPath` "failing on paths crossing `family`" — three successive wrong
-  attributions, no defect at all
-* a commit-gate "hole" — a documented, closed, deliberate posture (#4313)
-* a "silent dead tunnel" on the tolerant path — it warns, by name
+**But v1 justified it badly, and the SMR was right to say so.** v1 argued from
+four failures produced by *this team's own agents* under campaign time pressure —
+a biased sample, and not the population the external report belongs to. **v2
+replaces the analogy with a measurement.** Two findings sampled and mechanism-
+verified end to end:
 
-Every one had correct observations. **Adopting 22 fix directions on the strength
-of 22 verified quotes would repeat that pattern 21 more times**, at fix-shaped
-cost rather than message-shaped cost.
+| finding | claim | result |
+|---|---|---|
+| 03 | 4-byte frame allocates 448 GiB | **CONFIRMED**, and stronger than reported: unrecoverable, and reachable unauthenticated |
+| 20 | grouped `security-zone [ a b ]` body applies to first name only | **CONFIRMED**, and stronger than reported: the later zone is not created at all |
+
+**Hit rate 2/2.** That is a small sample and it argues *against* v1's premise: the
+report's base rate looks good, and Gate B as a blanket requirement is plausibly
+over-engineering. It also produced a second observation worth more than the hit
+rate itself — **both verifications cost three fixture iterations each**, and in
+both cases an early run rejected the *control* alongside the subject, which
+diagnosed my fixture rather than the system. Gate B's real cost is fixture
+construction, not thinking.
+
+**Revised position:** Gate B is not a blanket gate. It is required only where the
+fix is *structural* (05's NAT64-then-tunnel pipeline, 16's transactional
+snapshot, 06's wire-version bump, 02's live-change rejection) — i.e. where being
+wrong is expensive. For findings whose fix is a bounds check or a schema
+declaration, the fix is cheaper than its verification and should just be made,
+with the guard asserting the absolute outcome.
 
 *If reviewers conclude the perf gain is too small to justify the churn, PLAN-KILL
 is an acceptable verdict.* Here the analogous kill is: *if reviewers conclude the
@@ -188,9 +217,30 @@ Each of these is invitable to PLAN-KILL.
    finding?** They may share a root cause in epoch/generation handling, in which
    case five fix directions are four too many.
 
+## 10a. Reachability column (SMR-required)
+
+Severity ordering is not assertable without this, and finding 03 proves the point:
+its reachability, not its blast radius, is what made it jump the queue.
+
+| reachability class | findings | note |
+|---|---|---|
+| unauthenticated, remote | 03 (**filed #8792**) | conditional HMAC gate; unkeyed link reaches the decoder |
+| authenticated peer / HA fabric | 01, 02, 11, 16, 17 | requires a peer already in the cluster |
+| operator config, silent-loss | 20 (**filed #8794**), 22, 13, 14 | committed config means something other than written |
+| local operator / deploy host | 07, 08, 10, 21 | image and deploy tooling |
+| traffic-triggered dataplane | 05, 12 | needs the loss userspace cluster to confirm |
+| resource / commit path | 04, 18 | authenticated commit-check |
+| helper protocol | 06, 19 | requires a version-skewed helper |
+
+**Unclassified pending Gate B: 09, 15.** Stated rather than guessed.
+
 ## 11. Recommendation (pending review)
 
-Sequence: **03 → 20/22 → 21 → the HA batch → the rest.** Rationale: 03 is verified
+**Superseded in v2.** 03 and 20 are out of the plan and filed (#8792, #8794).
+Remaining sequence: **22 → 21 → the HA batch (adjudicated first for a shared
+epoch/generation root cause) → the rest.**
+
+Original v1 sequence, retained for the record: **03 → 20/22 → 21 → the HA batch → the rest.** Rationale: 03 is verified
 and cheap; 20/22 are in the team's current context and cheap to check; 21 is
 security-relevant and hermetic; the HA batch needs one cluster session and should
 be adjudicated for shared root cause first.
