@@ -330,15 +330,31 @@ func TestUnsplittablePairRatchet8880(t *testing.T) {
 		pair, packed, braced string
 		read                 func(*Config) []string
 	}{
-		// #8883.
-		{"system name-server",
-			"system { name-server 1.1.1.1 name-server 8.8.8.8; }",
-			"system { name-server 1.1.1.1; name-server 8.8.8.8; }",
-			func(c *Config) []string { return c.System.NameServers }},
-		{"system domain-search",
-			"system { domain-search a.example domain-search b.example; }",
-			"system { domain-search a.example; domain-search b.example; }",
-			func(c *Config) []string { return c.System.DomainSearch }},
+		// #8883 FIXED both `system name-server` and `system domain-search` and
+		// this cell RED when they stopped diverging, exactly as designed — a
+		// member that becomes adjudicated must leave the list or the list
+		// outlives its reason.
+		//
+		// They are replaced rather than merely removed: an empty loop would
+		// measure nothing while still passing. The replacements are members of
+		// the SAME class that #8883's fix does NOT reach, which is the point
+		// worth keeping — the remedy is PER-READER, not per-class.
+		// `firewallMatchValues` serves name-server, domain-search, ssh
+		// key-exchange and bgp export; `ntp server` and `nat source pool
+		// address` have their own value loops and still absorb the keyword.
+		{"ntp server",
+			"system { ntp { server 1.1.1.1 server 2.2.2.2; } }",
+			"system { ntp { server 1.1.1.1; server 2.2.2.2; } }",
+			func(c *Config) []string { return c.System.NTPServers }},
+		{"pool address",
+			"security { nat { source { pool P { address 10.0.0.1/32 address 10.0.0.2/32; } } } }",
+			"security { nat { source { pool P { address 10.0.0.1/32; address 10.0.0.2/32; } } } }",
+			func(c *Config) []string {
+				for _, p := range c.Security.NAT.SourcePools {
+					return p.Addresses
+				}
+				return nil
+			}},
 	} {
 		t.Run("member/"+c.pair, func(t *testing.T) {
 			compile := func(txt string) []string {

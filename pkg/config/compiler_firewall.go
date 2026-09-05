@@ -906,7 +906,12 @@ func validateFirewallFilterFamilyAnyMatchesAST(nodes []*Node, lenient bool) ([]s
 //     made the two sides of one node agree.
 func firewallMatchValues(child *Node) []string {
 	var vals []string
+	self := child.Keys[0]
 	for _, k := range child.Keys[1:] {
+		if k == self {
+			// EXPERIMENT (#8883): skip a repeat of the leaf's own keyword.
+			continue
+		}
 		if k != "" {
 			vals = append(vals, k)
 		}
