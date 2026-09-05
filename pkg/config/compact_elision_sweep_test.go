@@ -469,3 +469,61 @@ func TestSweepVerdictsAreNotSingleSample8859(t *testing.T) {
 	t.Logf("#8859: %d published rows, %d LEAF-CONTINGENT, %d of those mix SAME "+
 		"with CANDIDATE-DROP", len(rows), contingent, harmful)
 }
+
+// #8859. NO ALREADY-ADMITTED PAIR MAY ENTER THE SWEPT POPULATION.
+//
+// The sweep's whole claim is that it reports on pairs the brace-elision pass
+// does NOT handle. An admitted pair inside it reads `SAME` -- and reads it for
+// the wrong reason: because THE FOLD ALREADY HANDLES IT, not because the two
+// spellings are naturally equivalent. That conflates "no defect here" with
+// "already fixed", in the column nobody re-opens.
+//
+// It got in because the filter keyed on `s.container[1]`, and a container
+// ELEMENT can hold two tokens -- `"policer xpfarg"` -- so the bare-keyword
+// lookup never matched. 16 admitted pairs across 108 sites were being swept.
+//
+// WHY THIS CELL EXISTS SEPARATELY FROM THE PUBLICATION GUARD: that one binds
+// what the sweep PUBLISHES and says nothing about what ENTERS it. Reverting the
+// keying returns the population to 46 with SAME:18 and every other cell in this
+// file stays green, because the count reaches the reader through t.Logf and A
+// LOGGED NUMBER IS NOT AN ASSERTION. Same family as the publication defect, one
+// stage earlier in the pipeline.
+func TestSweptPopulationExcludesAdmittedPairs8859(t *testing.T) {
+	_, _, pairOrder := sweepPairVerdicts8859()
+
+	// NON-VACUITY FIRST. The loop below passes trivially over an empty
+	// population, so without this the cell would join the list of guards it
+	// exists to close rather than closing it.
+	if len(pairOrder) == 0 {
+		t.Fatal("the swept population is EMPTY, so the admitted-pair check below " +
+			"asserts nothing. Either every pair is now admitted -- in which case " +
+			"this sweep has no subject -- or the enumeration is broken (#8859)")
+	}
+
+	var admitted []string
+	for _, pair := range pairOrder {
+		f := strings.Fields(pair)
+		if len(f) < 2 {
+			t.Errorf("pair %q does not split into a (container, child) keyword "+
+				"pair, so it cannot be checked against the scope predicate at "+
+				"all (#8859)", pair)
+			continue
+		}
+		if compactNormalizeInScope(f[0], f[1]) {
+			admitted = append(admitted, pair)
+		}
+	}
+	if len(admitted) > 0 {
+		sort.Strings(admitted)
+		t.Errorf("%d ALREADY-ADMITTED pair(s) are in the swept population: %v\n"+
+			"The sweep reports on pairs the fold does NOT handle. An admitted "+
+			"pair here reads SAME because the fold already handles it, which is "+
+			"a different fact from the two spellings being equivalent -- and it "+
+			"lands in the column that never gets re-opened.\n"+
+			"Check the keying: a container ELEMENT can hold two tokens "+
+			"(`policer xpfarg`), so the scope lookup must be done on "+
+			"strings.Fields of the joined container, not on container[1] "+
+			"(#8859)", len(admitted), admitted)
+	}
+	t.Logf("#8859: %d pairs in the swept population, 0 already admitted", len(pairOrder))
+}
