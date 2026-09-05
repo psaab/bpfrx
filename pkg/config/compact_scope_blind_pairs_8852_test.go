@@ -99,7 +99,14 @@ var knownBlindScopePairs8852 = map[string]string{
 	// all four are blind to arm 2 for the same structural reason as the rest of
 	// this group, so their fold correctness rests on the per-pair cells in
 	// elision_admissions_8879_test.go rather than on the census.
-	"protocols bgp":          "plain-container",
+	"protocols bgp": "plain-container",
+	// #8879 batch 2, same reasoning as batch 1: admitted after measuring the
+	// elided spelling SILENT, blind to arm 2 for the same structural reason, so
+	// their fold correctness rests on the per-pair cells rather than the census.
+	"chassis device-map":     "plain-container",
+	"protocols ospf":         "plain-container",
+	"security address-book":  "plain-container",
+	"system ntp":             "plain-container",
 	"security ike":           "plain-container",
 	"security nat":           "plain-container",
 	"system syslog":          "plain-container",
@@ -125,6 +132,13 @@ var knownBlindScopePairs8852 = map[string]string{
 	// a pair leaves this list only when arm 2 starts generating a site for it.
 	// The four `root-authentication <leaf>` pairs are NOT here: their heads are
 	// single-arg valued leaves, so arm 2 does adjudicate them.
+	// issue 8898. Same shape as root-authentication below: arm 2 emits no site
+	// for a zero-arg plain container. Its fold IS measured -- across all three
+	// depths and on the enforced value -- by the cells in
+	// pkg/configstore/master_password_elision_8898_test.go, which is where the
+	// real consumer lives; registration records only that THIS arm does not
+	// measure it.
+	"system master-password":     "plain-container",
 	"system root-authentication": "plain-container",
 	// issue 8875. Their folds ARE measured -- by
 	// TestSecurityTopLevelElisionKeepsContents8875, across all three depths and

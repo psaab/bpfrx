@@ -1550,6 +1550,9 @@ pub(crate) struct BindingLiveSnapshot {
     /// Routing header (Segments Left > 0), or a Mobility / HIP / Shim6 header —
     /// RFC 7915 §5.1 / §5.1.1).
     pub(crate) nat64_exthdr_ineligible: u64,
+    /// #8890: fail-closed NAT64 tunnel-encapsulation drops (see
+    /// `BindingLiveState::nat64_tunnel_encap_unsupported`).
+    pub(crate) nat64_tunnel_encap_unsupported: u64,
     /// #8670: cumulative fail-closed NAT64 protocol-ineligibility drops
     /// snapshotted from BindingLiveState (a Pref64-addressed packet whose IP
     /// protocol stateful NAT64 does not translate — RFC 6146 covers TCP, UDP

@@ -154,6 +154,9 @@ impl BindingLiveState {
             nat64_ineligible_source: self.nat64_ineligible_source.load(Ordering::Relaxed),
             nat64_ineligible_dest: self.nat64_ineligible_dest.load(Ordering::Relaxed),
             nat64_exthdr_ineligible: self.nat64_exthdr_ineligible.load(Ordering::Relaxed),
+            nat64_tunnel_encap_unsupported: self
+                .nat64_tunnel_encap_unsupported
+                .load(Ordering::Relaxed),
             nat64_ineligible_protocol: self.nat64_ineligible_protocol.load(Ordering::Relaxed),
             nat_alloc_fail: self.nat_alloc_fail.load(Ordering::Relaxed),
             nat_frag_untranslated_dropped: self

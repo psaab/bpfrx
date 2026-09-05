@@ -154,6 +154,16 @@ func effectiveMasterPasswordPRF(tree *config.ConfigTree) string {
 	if tree == nil {
 		return ""
 	}
+	// issue 8898: fold admitted compact stanzas before scanning. This reader
+	// walks the RAW tree, so it never sees the normalizer that runs inside the
+	// compiler -- `system master-password pseudorandom-function <p>;` resolved
+	// to nothing here even after the pair was admitted to the scope, and the
+	// selector fell back to defaultMasterPasswordPRF while `show
+	// configuration` rendered the one the operator wrote.
+	//
+	// Clone-safe: returns the original tree when nothing folds, and never
+	// mutates the argument, which callers persist.
+	tree = config.NormalizeCompactForScan(tree)
 	// Fast path: with no groups to expand and no inactive nodes to strip, the
 	// effective scope is exactly the raw top-level `system` stanzas. Scan
 	// directly with zero extra allocation — this covers every normal active

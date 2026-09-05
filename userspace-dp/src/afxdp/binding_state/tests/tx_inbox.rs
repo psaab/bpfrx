@@ -173,6 +173,15 @@ fn enqueue_tx_owned_below_cap_does_not_touch_overflow_counter() {
 // not held. An unchanged 2368 is therefore not evidence a field failed to
 // land; the offsets are what carried the proof, which is the whole reason this
 // guard pins them separately from the size.
+//
+// #8890 re-measured the two OFFSETS again (2192 -> 2200, 2320 -> 2328) when the
+// unconditional `nat64_tunnel_encap_unsupported` counter joined the cold run.
+// Same lockstep, verified the way the paragraph above requires: BOTH build
+// configurations were built and both reported the same two shifts, by the same
+// 8 bytes, so one set of literals makes both green — which a `#[cfg(test)]`
+// field could not achieve, and which is the entire discriminator between
+// answering this guard and defeating it. `size_of` did NOT move — still 2368 —
+// the FOURTH time the "tail padding is full" prediction has not held.
 fn admission_attempt_instrument_leaves_four_pinned_layout_values_unchanged_6304() {
     assert_eq!(
         std::mem::size_of::<BindingLiveState>(),
@@ -189,14 +198,14 @@ fn admission_attempt_instrument_leaves_four_pinned_layout_values_unchanged_6304(
     );
     assert_eq!(
         std::mem::offset_of!(BindingLiveState, pending_tx_admitted),
-        2192,
+        2200,
         "#6304/#6114: ...nor the OFFSET of the admission counter whose \
          cacheline this is all about. A `cfg(test)` field ahead of it moves \
          this to 2160 while leaving the size assert above satisfied"
     );
     assert_eq!(
         std::mem::offset_of!(BindingLiveState, delta_loss_pending),
-        2320,
+        2328,
         "#6304: ...nor the offset of the last-declared field, which is the \
          sentinel for a `cfg(test)` member appended at the END of the struct — \
          that shape moves this to 2288 and trips nothing else"
