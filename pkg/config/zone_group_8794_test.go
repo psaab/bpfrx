@@ -90,11 +90,11 @@ func TestBracketedZoneGroupCreatesEveryZone8794(t *testing.T) {
 		}
 		packed := &Node{Keys: []string{"security-zone", "trust", "screen", "edge"}}
 
-		got := zoneGroupInstances8794([]*Node{group})
+		got := bracketedGroupInstances8794([]*Node{group})
 		if len(got) != 2 {
 			t.Errorf("a braced group yielded %d instance(s), want 2 (#8794)", len(got))
 		}
-		got = zoneGroupInstances8794([]*Node{packed})
+		got = bracketedGroupInstances8794([]*Node{packed})
 		if len(got) != 1 {
 			t.Errorf("a BODILESS packed tail yielded %d instance(s), want 1. Surplus keys "+
 				"without a braced body are PROPERTY tokens, and fanning them out invents "+

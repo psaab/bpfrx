@@ -27,7 +27,7 @@ func compileDeviceMap(node *Node) *DeviceMapConfig {
 		}
 	}
 
-	for _, inst := range namedInstances(node.FindChildren("interface")) {
+	for _, inst := range bracketedGroupInstances8794(node.FindChildren("interface")) {
 		entry := DeviceMapEntry{LogicalName: inst.name}
 		props := map[string]string{}
 		collectDeviceMapProps(inst.node, props)
