@@ -257,7 +257,76 @@ func ExpandApplicationSet(name string, apps *ApplicationsConfig) ([]string, erro
 	return expandAppSet(name, apps, 0)
 }
 
+// appSetMemo collapses the repeated expansion of the SAME application-set
+// within one compile (issue 8889).
+//
+// Without it, a nest of sets each referencing B others re-expands every shared
+// subtree on every path that reaches it, and the depth cap of 3 fixes the
+// exponent at four: doubling B costs about 23x, and ~193 sets extrapolates to
+// roughly a minute. That runs under the store's READ lock in CommitCheck, so
+// Commit, Load and the HA SyncApply path queue behind it.
+//
+// KEYED ON (name, depth), NOT NAME. A set that expands cleanly at depth 0 may
+// exceed the cap when reached at depth 3, so a name-keyed memo would serve a
+// shallow success into a deep context and silently satisfy the depth check that
+// makes the cost bounded in the first place. Keying on the pair reuses a result
+// only in the identical depth context, so cap behaviour is unchanged
+// bit-for-bit, and the memo is still at most 4 entries per set -- O(total)
+// rather than O(B^4).
+//
+// calls counts expansion BODIES executed. It exists so the guard can assert the
+// CURVE (a count that does not grow with B) instead of a wall-clock threshold,
+// which is flaky and tells the next reader nothing about why.
+type appSetMemo struct {
+	done  map[appSetMemoKey]appSetMemoEntry
+	calls int
+}
+
+type appSetMemoKey struct {
+	name  string
+	depth int
+}
+
+type appSetMemoEntry struct {
+	result []string
+	err    error
+}
+
+func newAppSetMemo() *appSetMemo {
+	return &appSetMemo{done: make(map[appSetMemoKey]appSetMemoEntry)}
+}
+
 func expandAppSet(name string, apps *ApplicationsConfig, depth int) ([]string, error) {
+	return expandAppSetMemo(name, apps, depth, newAppSetMemo())
+}
+
+func expandAppSetMemo(name string, apps *ApplicationsConfig, depth int, memo *appSetMemo) ([]string, error) {
+	if memo == nil {
+		memo = newAppSetMemo()
+	}
+	key := appSetMemoKey{name: name, depth: depth}
+	if hit, ok := memo.done[key]; ok {
+		// Copy: callers append to and dedupe into their own result slice, and a
+		// shared backing array would let one caller's append corrupt another's.
+		if hit.result == nil {
+			return nil, hit.err
+		}
+		out := make([]string, len(hit.result))
+		copy(out, hit.result)
+		return out, hit.err
+	}
+	memo.calls++
+	result, err := expandAppSetUncached(name, apps, depth, memo)
+	memo.done[key] = appSetMemoEntry{result: result, err: err}
+	if result == nil {
+		return nil, err
+	}
+	out := make([]string, len(result))
+	copy(out, result)
+	return out, err
+}
+
+func expandAppSetUncached(name string, apps *ApplicationsConfig, depth int, memo *appSetMemo) ([]string, error) {
 	if depth > 3 {
 		return nil, fmt.Errorf("application-set nesting too deep (max 3): %s", name)
 	}
@@ -276,7 +345,7 @@ func expandAppSet(name string, apps *ApplicationsConfig, depth int) ([]string, e
 		// the historical classification (user-set → application → error) and
 		// only recurses a predefined set when the member is not an application.
 		if memberIsNestedSet(memberName, apps) {
-			expanded, err := expandAppSet(memberName, apps, depth+1)
+			expanded, err := expandAppSetMemo(memberName, apps, depth+1, memo)
 			if err != nil {
 				return nil, err
 			}
