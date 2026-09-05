@@ -104,10 +104,14 @@ var knownBlindScopePairs8852 = map[string]string{
 	// { filter ... }` compiles its filters instead of silently producing zero.
 	// `family` is args:0 with children and no wildcard, so blindShape8852
 	// classifies it plain-container like the rest of this group -- the census
-	// emits no site for it, which is why arm 2 adjudicates nothing. Registered
-	// rather than left to red: the pair is admitted deliberately and its
-	// behaviour is asserted directly by TestElidedFirewallFamily8850, which
-	// compares the WHOLE Firewall struct braced-vs-elided for inet and inet6.
+	// emits no site for it, which is why arm 2 adjudicates nothing.
+	//
+	// COVERED THERE IS NOT ADJUDICATED HERE. TestElidedFirewallFamily8850
+	// compares the WHOLE Firewall struct braced-vs-elided for inet and inet6,
+	// so the pair's BEHAVIOUR is asserted -- but this entry records that arm 2
+	// is BLIND to it, and that stays true however the fold behaves. Fixing or
+	// breaking the fold does not remove this pair from the map; only the census
+	// gaining a site for it does. Read this as a boundary, not as a clearance.
 	"firewall family":                    "plain-container",
 	"security-zone host-inbound-traffic": "plain-container",
 	// Head takes two or more identity args.
@@ -118,12 +122,18 @@ var knownBlindScopePairs8852 = map[string]string{
 	// prefix), so blindShape8852 classifies both multi-arg and the census emits
 	// no site -- arm 2 adjudicates nothing for them.
 	//
-	// Registered rather than left to red, on the same terms as `firewall family`
-	// above: the pair is admitted deliberately and its behaviour is asserted
-	// DIRECTLY by TestElidedAddressBook8850, which compares the compiled address
-	// NAMES braced-vs-elided for both books at one and at TWO entries. The
-	// two-entry arm is the one that matters -- the scope entry alone folds a
-	// multi-statement run into one and silently keeps only the first.
+	// Same boundary as `firewall family` above. TestElidedAddressBook8850
+	// asserts the BEHAVIOUR -- compiled address NAMES braced-vs-elided, for both
+	// books, at one AND at two entries, the two-entry arm being the one that
+	// matters because the scope entry alone folds a multi-statement run into one
+	// and silently keeps only the first. That cell existing is why these pairs
+	// are registered instead of red; it is NOT why they are in the map. They are
+	// in the map because arm 2 emits no site for them, which no amount of
+	// behavioural coverage changes.
+	//
+	// So: if TestElidedAddressBook8850 is ever deleted, this comment becomes
+	// false and should break loudly. If the fold is repaired, broken, or
+	// rewritten, these entries stay exactly as they are.
 	"address-book address":    "multi-arg",
 	"global address":          "multi-arg",
 	"gateway local-identity":  "multi-arg",
