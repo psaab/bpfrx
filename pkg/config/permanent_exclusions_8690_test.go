@@ -120,7 +120,7 @@ func TestPermanentExclusionsMatchTheInventory8690(t *testing.T) {
 	for _, s := range sites {
 		inInv[s] = true
 	}
-	var becameAdmissible, unclassifiedDrift, completed []string
+	var becameAdmissible, unclassifiedDrift, completed, owedDeparture, measuredAway []string
 	for site, e := range reg {
 		if inInv[site] {
 			continue
@@ -140,6 +140,30 @@ func TestPermanentExclusionsMatchTheInventory8690(t *testing.T) {
 			completed = append(completed, site)
 			continue
 		}
+		// #8690: `owed-own-change` is a THIRD departure meaning, and neither of
+		// the two above fits it. That class says the fix is CORRECT but the
+		// vehicle is not a family sweep — for the `scheduler-name` sites,
+		// normalizing converts a permanently-active security policy into a
+		// time-limited one, which owes `make test-failover` v4+v6.
+		//
+		// So a departure here is legitimate ONLY IF that verification actually
+		// ran. Reporting it as a violation would be wrong when someone did the
+		// dedicated change properly; reporting it as completion would let a
+		// family sweep take it silently, which is the entire failure the class
+		// was created to prevent. The cell cannot tell those apart — a smoke
+		// leaves no trace in this tree — so it asks, and names what to check.
+		if e.class == "owed-own-change" {
+			owedDeparture = append(owedDeparture, site)
+			continue
+		}
+		// `unclassified` / `unmeasurable` departing is neither a violation nor a
+		// completion: it means somebody MEASURED a site this register recorded
+		// as unknown, and the measurement is the thing worth keeping. The line
+		// goes, but the verdict should not vanish with it.
+		if e.class == "unclassified" || e.class == "unmeasurable" {
+			measuredAway = append(measuredAway, site+" (was "+e.class+")")
+			continue
+		}
 		becameAdmissible = append(becameAdmissible, site+" ("+e.class+": "+e.reason+")")
 	}
 	sort.Strings(completed)
@@ -149,6 +173,29 @@ func TestPermanentExclusionsMatchTheInventory8690(t *testing.T) {
 			"delete these lines. They are reported rather than ignored because a stale `open` "+
 			"entry sends the next lane looking for a site that is no longer there.",
 			len(completed), strings.Join(completed, "\n  "))
+	}
+	sort.Strings(owedDeparture)
+	if len(owedDeparture) > 0 {
+		t.Errorf("#8690: %d site(s) classed `owed-own-change` left the inventory:\n  %s\n\n"+
+			"That class means the fix is CORRECT and the VEHICLE is not a family sweep. So "+
+			"this is legitimate IF the owed verification ran, and a silent sweep if it did "+
+			"not — and this cell cannot tell, because a smoke leaves no trace in the tree. "+
+			"CHECK: did the change that normalized these run `make test-failover` v4+v6? "+
+			"For the scheduler-name sites the consequence is a forwarding one — a "+
+			"permanently-active security policy becomes time-limited — so a commit-check "+
+			"alone does not cover it. If the verification ran, delete the line and say where; "+
+			"if it did not, this is the sweep the class exists to stop.",
+			len(owedDeparture), strings.Join(owedDeparture, "\n  "))
+	}
+	sort.Strings(measuredAway)
+	if len(measuredAway) > 0 {
+		t.Errorf("#8690: %d site(s) recorded as UNKNOWN left the inventory:\n  %s\n\n"+
+			"Somebody measured a site this register said was unmeasured, and normalized it. "+
+			"That is fine — but the MEASUREMENT is the part worth keeping, and deleting the "+
+			"line drops it. Record what was measured (in the commit, or in the arm's own "+
+			"classification map) before removing the entry, so the next site in the same "+
+			"bucket inherits the answer rather than re-deriving it.",
+			len(measuredAway), strings.Join(measuredAway, "\n  "))
 	}
 	for _, s := range sites {
 		if _, ok := reg[s]; !ok {
