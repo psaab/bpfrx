@@ -15,9 +15,29 @@
 #                    removes a value that is READ, on a config that commits
 #                    clean. Forbidden to every scope by
 #                    TestNormalizerScopeNeverCoversAPartialSite8690.
-#   gate             normalizing makes a configuration the box REFUSES today
-#                    start committing clean. Measured: rejected at strict commit
-#                    with the pass disabled, accepted with it enabled.
+#   gate-open-question
+#                    the disarm arm reds here: rejected at strict commit with the
+#                    pass disabled, accepted with it enabled. THAT IS A QUESTION,
+#                    NOT A VERDICT, and this register got it wrong at first by
+#                    recording such reds as permanent.
+#                    The arm cannot distinguish a gate refusing the packed
+#                    SPELLING (harmful to disarm) from one refusing the
+#                    CONSEQUENCE OF THE DROP — where the pass repairs the drop
+#                    and the acceptance is correct. Only a person can, and the
+#                    verdict's home is the `benign` map in
+#                    compact_normalize_scope_8690_test.go.
+#                    PROOF THAT THIS DISTINCTION IS LOAD-BEARING: `security ipsec
+#                    policy <p> proposal-set` and its ike collateral were listed
+#                    here as permanent on this arm's red alone. Classified, they
+#                    were BENIGN — the gate refuses the dropped proposal-set and
+#                    says so in its own message — and they normalized in
+#                    0c4818aa0. Two of the entries this register called permanent
+#                    were available work.
+#                    So these are NOT permanent. They are unanswered questions,
+#                    and answering one is the available work.
+#   gate-confirmed   classified BY A PERSON as a genuine disarm, with the
+#                    evidence. Permanent. Currently empty: no site here has been
+#                    carried through step 3.
 #   gate-collateral  not itself gate-disarming, but shares a (container, head)
 #                    pair with a `gate` site, and the predicate's two arguments
 #                    cannot express the difference. Lost with the pair.
@@ -28,11 +48,32 @@
 #                    name where a rule would need a keyword.
 #   hazard           normalizing breaks documented, shipped behaviour that no
 #                    disarm measurement detects.
-#   open             genuinely available work. The ONLY class that should shrink.
+#   open             genuinely available work with no gate in the way.
 #   unclassified     in another lane's family and NOT measured here. Deliberately
 #                    distinct from `open`: "nobody has checked" is a third state,
 #                    and recording it as available asserts a measurement that was
 #                    not taken.
+#
+# THIS REGISTER WAS WRONG TWICE IN ITS FIRST HOUR, BOTH TIMES IN THE
+# OVER-RESTRICTIVE DIRECTION, AND BOTH ERRORS HAD THE SAME SHAPE: a result
+# established at one granularity, recorded at a finer one.
+#
+#   `security ipsec policy <p> proposal-set` (+ its ike collateral) were listed
+#   permanent on the DISARM ARM'S RED. That red is a question, not a verdict —
+#   the arm cannot tell a gate refusing the packed spelling from one refusing
+#   the CONSEQUENCE of the drop. Classified by a person, they were BENIGN, and
+#   they normalized in 0c4818aa0.
+#
+#   `chassis device-map interface` / `unmapped-interface-policy` were listed
+#   `hazard` on a PER-FAMILY bisection: admitting every chassis pair reds three
+#   redundancy-group cells. True of the family; not true of these two sites,
+#   whose pairs are different. Measured per site they are safe, and they
+#   normalized alongside schedulers.
+#
+# Four sites this file called permanent were available work. The lesson is the
+# one the sweep has been applying everywhere else and this register did not:
+# CHECK PER SITE, NOT PER FAMILY — and treat an instrument's red as the
+# question it is until a person answers it.
 #
 # THIS FILE IS A GATE, NOT A REGISTRY. The guard asserts set-equality with the
 # inventory in BOTH directions, and drives every non-`open` site through the
@@ -42,8 +83,6 @@
 
 bridge-domains xpfname domain-type	partial	drop shape "partial" in the inventory
 bridge-domains xpfname routing-interface	partial	drop shape "partial" in the inventory
-chassis device-map interface	hazard	adjacent to the packedTail opt-in the shipped HA config depends on; admitting the chassis family reds three redundancy-group cells incl. "lost `preempt` from a multi-statement packed body". Arm 2 PASSES it — only per-family bisection finds it
-chassis device-map unmapped-interface-policy	hazard	same as chassis device-map interface
 interfaces xpfname description	partial	drop shape "partial" in the inventory
 interfaces xpfname duplex	partial	drop shape "partial" in the inventory
 interfaces xpfname encapsulation	partial	drop shape "partial" in the inventory
@@ -60,30 +99,26 @@ policy-options policy-statement xpfarg term xpfarg then metric	partial	drop shap
 policy-options policy-statement xpfarg term xpfarg then metric-type	partial	drop shape "partial"
 policy-options policy-statement xpfarg term xpfarg then next-hop	partial	drop shape "partial"
 policy-options policy-statement xpfarg term xpfarg then origin	partial	drop shape "partial"
-protocols bgp group xpfarg neighbor xpfarg peer-as	gate	arm 2: REJECTED at strict commit with the pass disabled, ACCEPTED with it enabled. Pair ("neighbor","peer-as") excluded in #8720
-schedulers scheduler xpfarg start-date	open	not reached by the #8729 scope; genuinely available
-schedulers scheduler xpfarg stop-date	open	not reached by the #8729 scope; genuinely available
-security dynamic-address feed-server xpfarg hostname	gate	arm 2 named it. Pair ("feed-server","hostname") excluded in #8729
-security dynamic-address feed-server xpfarg url	gate	NOT found by arm 2 — it sat in the fixture-limited bucket because the census could not synthesize a valid URL. Measured BY HAND with a real URL: a live disarm. Pair ("feed-server","url") excluded in #8729
-security ike policy xpfarg proposal-set	gate-collateral	not in the census itself, but shares ("policy","proposal-set") with the ipsec site below; the predicate cannot distinguish the ike and ipsec subtrees
-security ipsec policy xpfarg proposal-set	gate	arm 2 named it. Pair excluded in #8729, taking the ike site with it
+protocols bgp group xpfarg neighbor xpfarg peer-as	gate-open-question	arm 2: REJECTED at strict commit with the pass disabled, ACCEPTED with it enabled. Pair ("neighbor","peer-as") excluded in #8720
+security dynamic-address feed-server xpfarg hostname	gate-open-question	arm 2 named it. Pair ("feed-server","hostname") excluded in #8729
+security dynamic-address feed-server xpfarg url	gate-open-question	NOT found by arm 2 — it sat in the fixture-limited bucket because the census could not synthesize a valid URL. Measured BY HAND with a real URL: a live disarm. Pair ("feed-server","url") excluded in #8729
 system dataplane control-socket	unclassified	in lane-8388's family and NOT measured by this lane. Recorded as unknown rather than open: "nobody has checked" is a third state, and calling it available asserts a measurement that was not taken
 system domain-name	unclassified	in lane-8388's family and NOT measured by this lane. Recorded as unknown rather than open: "nobody has checked" is a third state, and calling it available asserts a measurement that was not taken
 system login class	partial	drop shape "partial" in the inventory
-system login class xpfarg allow-commands	gate	lane-8388: widening the login subtree disarms the #6662 packed-login commit gate
-system login class xpfarg allow-configuration	gate	lane-8388: #6662 packed-login gate
-system login class xpfarg deny-commands	gate	lane-8388: #6662 packed-login gate
-system login class xpfarg deny-configuration	gate	lane-8388: #6662 packed-login gate
-system login class xpfarg idle-timeout	gate	lane-8388: #6662 packed-login gate
-system login class xpfarg permissions	gate	lane-8388: #6662 packed-login gate
+system login class xpfarg allow-commands	gate-open-question	lane-8388: widening the login subtree disarms the #6662 packed-login commit gate
+system login class xpfarg allow-configuration	gate-open-question	lane-8388: #6662 packed-login gate
+system login class xpfarg deny-commands	gate-open-question	lane-8388: #6662 packed-login gate
+system login class xpfarg deny-configuration	gate-open-question	lane-8388: #6662 packed-login gate
+system login class xpfarg idle-timeout	gate-open-question	lane-8388: #6662 packed-login gate
+system login class xpfarg permissions	gate-open-question	lane-8388: #6662 packed-login gate
 system login user	partial	drop shape "partial" in the inventory
-system login user xpfarg authentication encrypted-password	gate	lane-8388: #6662 packed-login gate; also filedByDesign
-system login user xpfarg authentication ssh-dsa	gate	lane-8388: #6662 packed-login gate; also filedByDesign
-system login user xpfarg authentication ssh-ed25519	gate	lane-8388: #6662 packed-login gate; also filedByDesign
-system login user xpfarg authentication ssh-rsa	gate	lane-8388: #6662 packed-login gate; also filedByDesign
-system login user xpfarg class	gate	lane-8388: the ("user","class") widening that compiles a fail-closed `unauthorized` class clean
-system login user xpfarg uid	gate	lane-8388: entered the gate census via #8697
-system services dhcp-local-server group xpfarg pool xpfarg static-binding xpfarg fixed-address	gate	lane-8388: ("static-binding","fixed-address") collides across dhcp v4/v6
+system login user xpfarg authentication encrypted-password	gate-open-question	lane-8388: #6662 packed-login gate; also filedByDesign
+system login user xpfarg authentication ssh-dsa	gate-open-question	lane-8388: #6662 packed-login gate; also filedByDesign
+system login user xpfarg authentication ssh-ed25519	gate-open-question	lane-8388: #6662 packed-login gate; also filedByDesign
+system login user xpfarg authentication ssh-rsa	gate-open-question	lane-8388: #6662 packed-login gate; also filedByDesign
+system login user xpfarg class	gate-open-question	lane-8388: the ("user","class") widening that compiles a fail-closed `unauthorized` class clean
+system login user xpfarg uid	gate-open-question	lane-8388: entered the gate census via #8697
+system services dhcp-local-server group xpfarg pool xpfarg static-binding xpfarg fixed-address	gate-open-question	lane-8388: ("static-binding","fixed-address") collides across dhcp v4/v6
 system services dhcpv6-local-server group xpfarg pool xpfarg static-binding xpfarg fixed-address	unmeasurable	lane-8388: the census fixture supplies an IPv4 literal to a v6 leaf, so the pass-enabled compile fails for an unrelated reason
 system services ssh protocol-version	unclassified	in lane-8388's family and NOT measured by this lane. Recorded as unknown rather than open: "nobody has checked" is a third state, and calling it available asserts a measurement that was not taken
 system services web-management api-auth user xpfname password	unreachable	lane-8388: wildcard-named container, so production passes an arbitrary instance name where a pair rule needs a keyword

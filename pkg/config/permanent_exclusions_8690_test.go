@@ -31,15 +31,27 @@ type exclusion8690 struct {
 }
 
 var exclusionClasses8690 = map[string]bool{
-	"partial": true, "gate": true, "gate-collateral": true,
-	"unmeasurable": true, "unreachable": true, "hazard": true,
-	"open": true, "unclassified": true,
+	"partial": true, "gate-confirmed": true, "gate-open-question": true,
+	"gate-collateral": true, "unmeasurable": true, "unreachable": true,
+	"hazard": true, "open": true, "unclassified": true,
 }
 
-// classes whose sites must never be normalized.
+// Classes whose sites must never be normalized.
+//
+// `gate-open-question` IS DELIBERATELY ABSENT, and its absence is the correction
+// this register needed most. The disarm arm redding on a site is a QUESTION: it
+// cannot distinguish a gate refusing the packed SPELLING from one refusing the
+// CONSEQUENCE of the drop, where the pass repairs the drop and the acceptance is
+// correct. Recording such a red as permanent overstates it — and did: `security
+// ipsec policy <p> proposal-set` and its ike collateral were listed here as
+// permanent on that basis, were classified BENIGN by a person, and normalized in
+// 0c4818aa0. A red is available work until somebody answers it.
+//
+// `unmeasurable` is absent for the same reason in a weaker form: "the fixture
+// could not produce a type-valid value" is not a finding about the site.
 var permanentClasses8690 = map[string]bool{
-	"partial": true, "gate": true, "gate-collateral": true,
-	"unmeasurable": true, "unreachable": true, "hazard": true,
+	"partial": true, "gate-confirmed": true, "gate-collateral": true,
+	"unreachable": true, "hazard": true,
 }
 
 func readPermanentExclusions8690(t *testing.T) map[string]exclusion8690 {

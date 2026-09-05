@@ -124,6 +124,50 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 	if containerKeyword == "authentication" || containerKeyword == "user" {
 		return false
 	}
+	// #8690, the SCHEDULERS and CHASSIS surfaces. 23 sites, all shape `empty`,
+	// all measured safe: no gate disarms, nothing fixture-limited, nothing
+	// unsynthesizable, no collision with a `partial` site.
+	//
+	// The weekday containers are the reason this is 23 pairs and not two. The
+	// head `start-time` appears under nine different containers here -- `daily`
+	// and each weekday -- so `head == "start-time"` would be a shorter rule
+	// covering the same sites today. That is exactly the contingent-on-the-
+	// population shape #8727 removed from three older rules, and a schedule is
+	// a security control: `security policies ... scheduler <s>` decides WHEN a
+	// policy is in force, so a dropped `stop-time` leaves a permit active past
+	// the window the operator wrote, on a commit that reported success.
+	//
+	// `start-date` and `stop-date` were NOT in this family when it was first
+	// measured -- they entered the census between the measurement and the
+	// change, from another lane's fixture work. Re-deriving rather than reusing
+	// the earlier list is what caught them; the count moved 21 -> 23.
+	switch containerKeyword + " " + head {
+	case
+		"schedulers scheduler",
+		"scheduler start-date",
+		"scheduler start-time",
+		"scheduler stop-date",
+		"scheduler stop-time",
+		"daily start-time",
+		"daily stop-time",
+		"monday start-time",
+		"monday stop-time",
+		"tuesday start-time",
+		"tuesday stop-time",
+		"wednesday start-time",
+		"wednesday stop-time",
+		"thursday start-time",
+		"thursday stop-time",
+		"friday start-time",
+		"friday stop-time",
+		"saturday start-time",
+		"saturday stop-time",
+		"sunday start-time",
+		"sunday stop-time",
+		"device-map interface",
+		"device-map unmapped-interface-policy":
+		return true
+	}
 	// EVERY RULE HERE IS SCOPED BY (container, head) PAIR. None matches a head
 	// alone or a container alone, and that is a deliberate change from how the
 	// first two increments were written.
@@ -149,6 +193,15 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 	// `empty` and admissible while `term <t> then community <c>` is `partial`
 	// and must never be admitted. Same head, one token apart, opposite sides of
 	// the safety rule.
+	//
+	// SOME PAIRS BELOW TRIP A COMMIT GATE and are in scope anyway, because the
+	// gate objects to the DROP rather than to the spelling and the pass repairs
+	// the drop. `snmp trap-group <t> targets` is one. Those are classified,
+	// with their measurement, in `benign` in
+	// compact_normalize_scope_8690_test.go -- not here, because the
+	// classification gates a guard VERDICT and never makes a site in scope. A
+	// reader of this list would otherwise see an ordinary-looking pair with no
+	// sign that it was a deliberate call.
 	//
 	// These 32 pairs are exactly what the three former rules admitted, measured
 	// at the production call site rather than derived from the schema — so this
@@ -244,6 +297,38 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 	// family label is not a safety property, and this is the case that proves
 	// it. TestNormalizerScopeNeverCoversAPartialSite8690 binds it mechanically
 	// so the next widening cannot make the same mistake by inspection.
+	// #8690: `policy proposal-set`, the two sites lane-8015's security family
+	// could not take.
+	//
+	// It landed the rest of security in 950df1331 while I was measuring the
+	// same family — so 45 of the 47 sites I had scoped were already done, and
+	// my pair list for them is dropped rather than landed redundantly. These
+	// two are what remained:
+	//
+	//	security ike   policy <p> proposal-set
+	//	security ipsec policy <p> proposal-set
+	//
+	// They share one pair, and they were blocked by a commit gate rather than
+	// by anything about the fold. The disarm arm flags
+	// `security ipsec policy xpfarg proposal-set` as REJECTED without the pass
+	// and ACCEPTED with it, which is a red until a person classifies it.
+	//
+	// Classified benign, with the measurement in the guard's `benign` map: the
+	// gate refuses the CONSEQUENCE of the drop and says so itself — the elided
+	// spelling loses the proposal-set, and the gate rejects with "has no
+	// resolvable ipsec proposal ... the configured perfect-forward-secrecy
+	// group would be SILENTLY DROPPED". With the pass the proposal-set survives
+	// and the same gate accepts. The braced spelling is accepted either way, so
+	// the config was always legitimate and only the elided form lost it.
+	//
+	// That gate exists to catch this exact drop, so the pass repairing the drop
+	// and the gate then passing is the intended interaction. Without the
+	// classification these two sites are unreachable by any widening — which is
+	// why they were still here.
+	if containerKeyword == "policy" && head == "proposal-set" {
+		return true
+	}
+
 	// #8690 family 5: applications, services, snmp, event-options. 30 sites,
 	// every one drop shape "empty" in the inventory.
 	//
