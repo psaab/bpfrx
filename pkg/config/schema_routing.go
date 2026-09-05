@@ -261,7 +261,17 @@ var schemaPolicyOptions = &schemaNode{desc: "Policy options", children: map[stri
 				"origin": {desc: "Origin", args: 1, valueType: ValueEnumOf, valueDesc: "BGP origin (igp | egp | incomplete)", valueExamples: []string{"igp", "egp", "incomplete"}, validator: ValidateEnum([]string{"igp", "egp", "incomplete"}), placeholder: "<origin>", children: nil},
 			}},
 		}},
-		"then": {desc: "Default action", children: nil},
+		// #8807-followup: compiler_routing.go:908 ITERATES this node's children
+		// ("Default action at the policy level"), so it is a container the
+		// schema declared as a bare leaf. Nothing was dropped — the compiler
+		// never consulted the schema here — but `policy-statement <p> then
+		// <TAB>` offered nothing, so the default action was undiscoverable
+		// through `?` help. Declaring the two arms the compiler actually
+		// reads makes completion match compilation.
+		"then": {desc: "Default action", children: map[string]*schemaNode{
+			"accept": {desc: "Accept routes not matched by any term", children: nil},
+			"reject": {desc: "Reject routes not matched by any term", children: nil},
+		}},
 	}},
 }}
 

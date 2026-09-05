@@ -489,8 +489,32 @@ var schemaFirewall = &schemaNode{desc: "Firewall filters and policers", children
 						}},
 					}},
 					"then": {desc: "Actions for matching packets", children: map[string]*schemaNode{
-						"accept":           {desc: "Accept the packet", children: nil},
-						"reject":           {desc: "Reject the packet", children: nil},
+						"accept": {desc: "Accept the packet", children: nil},
+						// #8807-followup: the compiler reads a message type after `reject`
+						// (compiler_firewall.go: child.Keys[1] for the packed form, a
+						// CHILD node for `reject { tcp-reset; }`) while the schema
+						// declared none, so `then reject <TAB>` offered nothing and an
+						// operator could not discover the types through `?` help.
+						// Declared as CHILDREN rather than args because the compiler
+						// already reads both shapes and children is the one completion
+						// can enumerate. Bare `then reject;` stays valid — these are
+						// optional children, not a required argument.
+						"reject": {desc: "Reject the packet", children: map[string]*schemaNode{
+							"administratively-prohibited": {desc: "ICMP/TCP reject message type", children: nil},
+							"bad-host-tos":                {desc: "ICMP/TCP reject message type", children: nil},
+							"bad-network-tos":             {desc: "ICMP/TCP reject message type", children: nil},
+							"host-prohibited":             {desc: "ICMP/TCP reject message type", children: nil},
+							"host-unreachable":            {desc: "ICMP/TCP reject message type", children: nil},
+							"network-prohibited":          {desc: "ICMP/TCP reject message type", children: nil},
+							"network-unreachable":         {desc: "ICMP/TCP reject message type", children: nil},
+							"port-unreachable":            {desc: "ICMP/TCP reject message type", children: nil},
+							"precedence-cutoff":           {desc: "ICMP/TCP reject message type", children: nil},
+							"precedence-violation":        {desc: "ICMP/TCP reject message type", children: nil},
+							"protocol-unreachable":        {desc: "ICMP/TCP reject message type", children: nil},
+							"source-host-isolated":        {desc: "ICMP/TCP reject message type", children: nil},
+							"source-route-failed":         {desc: "ICMP/TCP reject message type", children: nil},
+							"tcp-reset":                   {desc: "ICMP/TCP reject message type", children: nil},
+						}},
 						"discard":          {desc: "Discard the packet", children: nil},
 						"log":              {desc: "Log matching packets", children: nil},
 						"syslog":           {desc: "Log matching packets to the system log", children: nil},
@@ -565,8 +589,32 @@ var schemaFirewall = &schemaNode{desc: "Firewall filters and policers", children
 						}},
 					}},
 					"then": {desc: "Actions for matching packets", children: map[string]*schemaNode{
-						"accept":           {desc: "Accept the packet", children: nil},
-						"reject":           {desc: "Reject the packet", children: nil},
+						"accept": {desc: "Accept the packet", children: nil},
+						// #8807-followup: the compiler reads a message type after `reject`
+						// (compiler_firewall.go: child.Keys[1] for the packed form, a
+						// CHILD node for `reject { tcp-reset; }`) while the schema
+						// declared none, so `then reject <TAB>` offered nothing and an
+						// operator could not discover the types through `?` help.
+						// Declared as CHILDREN rather than args because the compiler
+						// already reads both shapes and children is the one completion
+						// can enumerate. Bare `then reject;` stays valid — these are
+						// optional children, not a required argument.
+						"reject": {desc: "Reject the packet", children: map[string]*schemaNode{
+							"administratively-prohibited": {desc: "ICMP/TCP reject message type", children: nil},
+							"bad-host-tos":                {desc: "ICMP/TCP reject message type", children: nil},
+							"bad-network-tos":             {desc: "ICMP/TCP reject message type", children: nil},
+							"host-prohibited":             {desc: "ICMP/TCP reject message type", children: nil},
+							"host-unreachable":            {desc: "ICMP/TCP reject message type", children: nil},
+							"network-prohibited":          {desc: "ICMP/TCP reject message type", children: nil},
+							"network-unreachable":         {desc: "ICMP/TCP reject message type", children: nil},
+							"port-unreachable":            {desc: "ICMP/TCP reject message type", children: nil},
+							"precedence-cutoff":           {desc: "ICMP/TCP reject message type", children: nil},
+							"precedence-violation":        {desc: "ICMP/TCP reject message type", children: nil},
+							"protocol-unreachable":        {desc: "ICMP/TCP reject message type", children: nil},
+							"source-host-isolated":        {desc: "ICMP/TCP reject message type", children: nil},
+							"source-route-failed":         {desc: "ICMP/TCP reject message type", children: nil},
+							"tcp-reset":                   {desc: "ICMP/TCP reject message type", children: nil},
+						}},
 						"discard":          {desc: "Discard the packet", children: nil},
 						"log":              {desc: "Log matching packets", children: nil},
 						"syslog":           {desc: "Log matching packets to the system log", children: nil},
