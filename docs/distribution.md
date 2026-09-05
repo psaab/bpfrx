@@ -147,6 +147,16 @@ publisher isolates suites in its own database and is unaffected. `selftest.sh`
   one — `--allow-rollback` permits a deliberate downgrade. This detects stale
   mirrors / accidental rollback; it is not TUF-grade freeze protection, and a
   fresh workstation with no watermark trusts the artifact's own signature.
+  Version ordering is FAIL-CLOSED (#8969): a version the comparator cannot
+  order — a non-numeric release component such as `1.2.x`, or any spelling
+  `validate_version` accepts but semver does not define — sorts BELOW the
+  watermark and is refused, so an unorderable candidate cannot silently pass
+  as newer. `--allow-rollback` is the escape hatch for a deliberate install of
+  one. Debian's tilde pre-release (`1.2.3~rc1`) and git-describe's hyphen
+  (`1.2.3-rc1`) are ordered identically, both BEFORE their base release, and
+  semver build metadata is ignored for precedence (`1.0.0+build.7` ranks equal
+  to `1.0.0`, per semver 11.4) — all three spellings are advertised as
+  accepted by `validate_version`.
 
 ### Key rotation
 

@@ -134,6 +134,57 @@ class VersionKeyOrderingTests(unittest.TestCase):
         self.assertGreater(self.k("1.2.3-1-gabc"), self.k("1.2.3"))
         self.assertGreater(self.k("1.2.3-1-gabc"), self.k("1.2.3-rc9"))
 
+    # ── #8969: the tilde prerelease, and the general fail-open ──────────
+    #
+    # These live in the same class as the hyphen cases above ON PURPOSE. The
+    # hyphen assertions are the control for the tilde ones: the two spellings
+    # are the same semantic operation, the hyphen form was always handled as
+    # the docstring promises, and the tilde form got the opposite ordering. No
+    # argument about what a prerelease SHOULD do is needed -- the sibling row
+    # already establishes it.
+
+    def test_tilde_prerelease_sorts_before_its_base_like_the_hyphen(self):
+        # RED on revert: `partition("-")` never saw `~`, so "1.2.3~rc1" had no
+        # suffix, its release token parsed as the non-numeric "3~rc1", and it
+        # sorted AFTER "1.2.3" -- passing an anti-rollback watermark that the
+        # identical "1.2.3-rc1" is correctly refused by.
+        self.assertLess(self.k("1.2.3~rc1"), self.k("1.2.3"))
+        self.assertLess(self.k("1.2.3~beta2"), self.k("1.2.3"))
+        # the two spellings denote the SAME version, so they compare equal --
+        # a same-version redeploy passes, exactly as "1.2.3" over "1.2.3" does.
+        self.assertEqual(self.k("1.2.3~rc1"), self.k("1.2.3-rc1"))
+
+    def test_unparseable_version_fails_CLOSED_not_open(self):
+        # The tilde was one instance of a general fail-open: ANY non-numeric
+        # release token used to rank ABOVE every numeric one, so an
+        # unorderable candidate passed the watermark silently. An unparseable
+        # version now ranks BELOW, which refuses the upgrade loudly instead.
+        #
+        # Every string here is ACCEPTED by validate_version, so each is
+        # reachable through `fetch --version` rather than hypothetical.
+        for bad in ("garbage", "1.2.x", "1.2.3_rc1"):
+            with self.subTest(bad):
+                self.assertLess(self.k(bad), self.k("1.2.3"))
+
+    def test_semver_build_metadata_is_not_precedence(self):
+        # semver 11.4: build metadata is IGNORED when determining precedence.
+        # Left in, its "+" made the release token non-numeric and "1.0.0+build.7"
+        # outranked "1.0.0" -- and the version validator's own docstring
+        # advertises that spelling as accepted input.
+        self.assertEqual(self.k("1.0.0+build.7"), self.k("1.0.0"))
+        self.assertLess(self.k("1.0.0+build.7"), self.k("1.0.1"))
+
+    def test_real_upgrades_still_pass_the_watermark(self):
+        # THE CONTROL FOR THE FAIL-CLOSED CHANGE. Ranking unparseable versions
+        # BELOW the watermark is trivially satisfiable by ranking everything
+        # below it -- a comparator that refuses every upgrade would pass every
+        # assertion above. These rows fail if the fix is levelled down.
+        self.assertGreater(self.k("1.2.4"), self.k("1.2.3"))
+        self.assertGreater(self.k("1.3.0"), self.k("1.2.3"))
+        self.assertGreater(self.k("2.0.0"), self.k("1.2.3"))
+        self.assertGreaterEqual(self.k("1.2.3"), self.k("1.2.3"))
+        self.assertGreater(self.k("1.2.3-1-gabc"), self.k("1.2.3"))
+
     def test_release_component_still_orders_numerically(self):
         self.assertGreater(self.k("1.10.0"), self.k("1.9.0"))
         self.assertGreater(self.k("2.0.0"), self.k("1.99.99"))
