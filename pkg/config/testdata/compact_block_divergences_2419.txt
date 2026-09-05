@@ -32,10 +32,12 @@
 # legitimate reader consumes the tail. Nine are unreachable because their
 # container slot is an instance name (a permanent bound of a pair-keyed
 # predicate, #8921), two sit under the #6966-declined system login, and the
-# last two are a defect of the same shape as #8933 — the elided
-# "tunnel routing-instance destination vrf1" compiles RoutingInstance to
-# "destination" rather than to "vrf1", binding the tunnel to a routing-instance
-# that does not exist.
+# last two WERE a defect of the same shape as #8933 — the elided
+# "tunnel routing-instance destination vrf1" compiled RoutingInstance to
+# "destination" rather than "vrf1", binding the tunnel to a routing-instance
+# that does not exist. That consumer is FIXED and those two sites have left this
+# inventory, so the partial class now excludes nothing for a legitimate-reader
+# reason at all.
 #
 # So this count is NOT a backlog and the target is NOT zero. Every remaining
 # line is classified, with the measurement behind it, in
@@ -237,7 +239,6 @@ interfaces xpfname encapsulation	partial
 interfaces xpfname mtu	partial
 interfaces xpfname native-vlan-id	partial
 interfaces xpfname speed	partial
-interfaces xpfname tunnel routing-instance destination	partial
 interfaces xpfname unit	partial
 interfaces xpfname unit xpfarg family inet address xpfarg vrrp-group	empty
 interfaces xpfname unit xpfarg family inet dhcp lease-time	empty
@@ -254,7 +255,6 @@ interfaces xpfname unit xpfarg family inet6 dhcpv6-client req-option	empty
 interfaces xpfname unit xpfarg family inet6 dhcpv6-client update-router-advertisement interface	empty
 interfaces xpfname unit xpfarg family inet6 mtu	empty
 interfaces xpfname unit xpfarg inner-vlan-id	empty
-interfaces xpfname unit xpfarg tunnel routing-instance destination	partial
 security policies from-zone xpfarg xpfarg xpfarg policy xpfarg scheduler-name	empty
 security policies global policy xpfarg scheduler-name	empty
 services rpm probe xpfarg test xpfarg destination-interface	empty
