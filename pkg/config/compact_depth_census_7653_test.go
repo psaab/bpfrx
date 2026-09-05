@@ -42,7 +42,6 @@ func compactAtDepth(container []string, leaf, val string, j int) (string, bool) 
 	}
 	parent := container[:len(container)-j]
 	tail := container[len(container)-j:]
-	inner := strings.Join(tail, " ") + " " + leaf + " " + val + ";"
 	// #8690: the SAME scaffolding the base census uses. "Depth 1 IS the base
 	// census's spelling" is this file's premise, and the agreement cell below
 	// is what enforces it — it went red the moment the base census learned a
@@ -56,8 +55,16 @@ func compactAtDepth(container []string, leaf, val string, j int) (string, bool) 
 	if len(tail) > 0 {
 		stanza = tail[0]
 	}
-	return preambleFor(parent, stanza) +
-		nest(parent, contextForStanza(parent, stanza)+inner), true
+	// #8690: the same instance-name rendering the base census uses, or "depth 1
+	// IS the base census's spelling" stops being true. The scaffolds are keyed
+	// on the canonical path and their TEXT is rendered to match.
+	rendered := renderInstanceNames(container)
+	ctx := renderScaffold(contextForStanza(parent, stanza), container, rendered)
+	pre := renderScaffold(preambleFor(parent, stanza), container, rendered)
+	rparent := rendered[:len(rendered)-j]
+	rtail := rendered[len(rendered)-j:]
+	rinner := strings.Join(rtail, " ") + " " + leaf + " " + val + ";"
+	return pre + nest(rparent, ctx+rinner), true
 }
 
 type depthOutcome struct {
@@ -84,10 +91,13 @@ func runDepthCensus7653(t *testing.T) (map[int]*depthOutcome, int, map[string]bo
 		}
 		parent := s.container[:len(s.container)-1]
 		stanza := s.container[len(s.container)-1]
-		pre := preambleFor(parent, stanza)
-		ctx := contextForStanza(parent, stanza)
-		blockV1 := pre + nest(parent, ctx+stanza+" { "+s.leaf+" "+v1+"; }")
-		blockV2 := pre + nest(parent, ctx+stanza+" { "+s.leaf+" "+v2+"; }")
+		rendered := renderInstanceNames(s.container)
+		pre := renderScaffold(preambleFor(parent, stanza), s.container, rendered)
+		ctx := renderScaffold(contextForStanza(parent, stanza), s.container, rendered)
+		rparent := rendered[:len(rendered)-1]
+		rstanza := rendered[len(rendered)-1]
+		blockV1 := pre + nest(rparent, ctx+rstanza+" { "+s.leaf+" "+v1+"; }")
+		blockV2 := pre + nest(rparent, ctx+rstanza+" { "+s.leaf+" "+v2+"; }")
 		cb1, cb2 := compileText(t, blockV1), compileText(t, blockV2)
 		if cb1 == nil || cb2 == nil {
 			continue

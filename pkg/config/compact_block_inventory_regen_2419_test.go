@@ -198,6 +198,46 @@ const inventoryNotes = `#
 # Recording the split is the point. 236 reads as one backlog; the three numbers
 # are three different pieces of work, and only the first is what the note said.
 #
+# #8690 INSTANCE-NAME MODEL: checked 699 -> 769, divergent +24, not-observable
+# 236 -> 167. NOTHING was removed.
+#
+# The census named EVERY instance "xpfarg", whatever the container declares its
+# name must look like. "unit" declares a NUMBER, so the compiler dropped the
+# whole unit and every site beneath it recorded "leaf value not observable" — a
+# verdict about the site MODEL rather than about the leaf. All 24 newly
+# divergent sites are under interfaces <if> unit <u>.
+#
+# The site KEY still carries "xpfarg". The key is an IDENTITY — this inventory,
+# every per-site verdict and three lanes' family lists are keyed on it — and
+# re-rendering identities to fix a fixture would rewrite the whole file for a
+# reason that has nothing to do with what it records. Only the fixture TEXT
+# renders real names, and contextForStanza / preambleFor entries stay keyed on
+# the canonical path with their text rendered to match.
+#
+# What was hidden, measured by hand on the strict commit path:
+#
+#	family inet { address 10.0.0.1/24; }   -> addresses [10.0.0.1/24]
+#	family inet address 10.0.0.1/24;       -> addresses []          , 0 warnings
+#	family inet { filter { input f1; } }   -> filter input "f1"
+#	family inet { filter input f1; }       -> filter input ""       , 0 warnings
+#
+# The brace-elided spelling commits CLEAN and emits FEWER warnings than the
+# correct one, because there is no binding left to warn about. The flat-set
+# "set" form is unaffected; the loss is the hierarchical elided spelling a
+# config file, a "load override" or a peer-sync payload carries.
+#
+# HOW IT WAS FOUND, because the route matters more than the result. I flagged
+# class-of-service interfaces <i> unit <u> scheduler-map as possibly "a config
+# subtree that commits and does nothing". The first falsifier — re-run the
+# fixture with a REAL interface name and unit number — showed it compiles
+# correctly. The finding was about my fixture, and the rule that catches it
+# applies to a lane's own claims as readily as to a review's:
+#
+#	A FINDING WHOSE FIXTURE USES AN INVENTED VALUE IS A FINDING ABOUT THE
+#	FIXTURE UNTIL IT IS RE-MEASURED WITH A REAL ONE.
+#
+# Retracting that claim is what exposed the model defect underneath it.
+#
 # Seven sites remain in the no-pair bucket and SIX of them are declared inert
 # by their own valueDesc — ` + "`authentication-type`" + ` ("not an OSPF leaf") and the
 # four ` + "`system login class`" + ` regexp leaves ("not implemented by xpf"). They are

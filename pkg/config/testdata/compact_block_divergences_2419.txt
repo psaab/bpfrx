@@ -99,14 +99,6 @@
 # divergent sites are not new defects; they are compact-blind readers this
 # census could not see, in `schedulers` and `system`.
 #
-# UPDATE: all five have since been NORMALIZED and have left this file -- the
-# two `schedulers` date leaves in #8732, the three `system` leaves after them.
-# The paragraph above is kept as the history of how they were found, but it no
-# longer describes the current inventory, and a reader arriving at "5 DIVERGENT"
-# would otherwise take it as present tense. The five became visible, were
-# measured, and were resolved; that is the whole arc rather than a standing
-# blind spot.
-#
 # #8690 unruled-fixture sweep, second increment: the UNCOMPILABLE bucket,
 # 45 -> 31. checked 685 -> 699, divergent +12, nothing removed.
 #
@@ -168,6 +160,46 @@
 # Recording the split is the point. 236 reads as one backlog; the three numbers
 # are three different pieces of work, and only the first is what the note said.
 #
+# #8690 INSTANCE-NAME MODEL: checked 699 -> 769, divergent +24, not-observable
+# 236 -> 167. NOTHING was removed.
+#
+# The census named EVERY instance "xpfarg", whatever the container declares its
+# name must look like. "unit" declares a NUMBER, so the compiler dropped the
+# whole unit and every site beneath it recorded "leaf value not observable" — a
+# verdict about the site MODEL rather than about the leaf. All 24 newly
+# divergent sites are under interfaces <if> unit <u>.
+#
+# The site KEY still carries "xpfarg". The key is an IDENTITY — this inventory,
+# every per-site verdict and three lanes' family lists are keyed on it — and
+# re-rendering identities to fix a fixture would rewrite the whole file for a
+# reason that has nothing to do with what it records. Only the fixture TEXT
+# renders real names, and contextForStanza / preambleFor entries stay keyed on
+# the canonical path with their text rendered to match.
+#
+# What was hidden, measured by hand on the strict commit path:
+#
+#	family inet { address 10.0.0.1/24; }   -> addresses [10.0.0.1/24]
+#	family inet address 10.0.0.1/24;       -> addresses []          , 0 warnings
+#	family inet { filter { input f1; } }   -> filter input "f1"
+#	family inet { filter input f1; }       -> filter input ""       , 0 warnings
+#
+# The brace-elided spelling commits CLEAN and emits FEWER warnings than the
+# correct one, because there is no binding left to warn about. The flat-set
+# "set" form is unaffected; the loss is the hierarchical elided spelling a
+# config file, a "load override" or a peer-sync payload carries.
+#
+# HOW IT WAS FOUND, because the route matters more than the result. I flagged
+# class-of-service interfaces <i> unit <u> scheduler-map as possibly "a config
+# subtree that commits and does nothing". The first falsifier — re-run the
+# fixture with a REAL interface name and unit number — showed it compiles
+# correctly. The finding was about my fixture, and the rule that catches it
+# applies to a lane's own claims as readily as to a review's:
+#
+#	A FINDING WHOSE FIXTURE USES AN INVENTED VALUE IS A FINDING ABOUT THE
+#	FIXTURE UNTIL IT IS RE-MEASURED WITH A REAL ONE.
+#
+# Retracting that claim is what exposed the model defect underneath it.
+#
 # Seven sites remain in the no-pair bucket and SIX of them are declared inert
 # by their own valueDesc — `authentication-type` ("not an OSPF leaf") and the
 # four `system login class` regexp leaves ("not implemented by xpf"). They are
@@ -175,10 +207,10 @@
 # seventh, `security nat source interface port-overloading`, declares one
 # example and a validator whose message does not enumerate.
 #
-# checked: 699
+# checked: 770
 #
-# skipped (leaf value not observable in the typed config): 236
-# skipped (a spelling did not parse or compile): 31
+# skipped (leaf value not observable in the typed config): 167
+# skipped (a spelling did not parse or compile): 29
 # skipped (no two distinct synthesizable values): 7
 # skipped (under groups (schema re-host, duplicate coverage)): 806
 #
@@ -192,6 +224,30 @@ interfaces xpfname native-vlan-id	partial
 interfaces xpfname speed	partial
 interfaces xpfname tunnel routing-instance destination	partial
 interfaces xpfname unit	partial
+interfaces xpfname unit xpfarg description	empty
+interfaces xpfname unit xpfarg family inet address	empty
+interfaces xpfname unit xpfarg family inet address xpfarg vrrp-group	empty
+interfaces xpfname unit xpfarg family inet dhcp lease-time	empty
+interfaces xpfname unit xpfarg family inet dhcp retransmission-attempt	empty
+interfaces xpfname unit xpfarg family inet dhcp retransmission-interval	empty
+interfaces xpfname unit xpfarg family inet filter input	empty
+interfaces xpfname unit xpfarg family inet filter output	empty
+interfaces xpfname unit xpfarg family inet mtu	empty
+interfaces xpfname unit xpfarg family inet unnumbered-address	empty
+interfaces xpfname unit xpfarg family inet6 address	empty
+interfaces xpfname unit xpfarg family inet6 address xpfarg vrrp-group	empty
+interfaces xpfname unit xpfarg family inet6 dhcpv6-client client-ia-type	empty
+interfaces xpfname unit xpfarg family inet6 dhcpv6-client client-type	empty
+interfaces xpfname unit xpfarg family inet6 dhcpv6-client prefix-delegating preferred-prefix-length	empty
+interfaces xpfname unit xpfarg family inet6 dhcpv6-client prefix-delegating sub-prefix-length	empty
+interfaces xpfname unit xpfarg family inet6 dhcpv6-client req-option	empty
+interfaces xpfname unit xpfarg family inet6 dhcpv6-client update-router-advertisement interface	empty
+interfaces xpfname unit xpfarg family inet6 filter input	empty
+interfaces xpfname unit xpfarg family inet6 filter output	empty
+interfaces xpfname unit xpfarg family inet6 mtu	empty
+interfaces xpfname unit xpfarg inner-vlan-id	empty
+interfaces xpfname unit xpfarg tunnel routing-instance destination	partial
+interfaces xpfname unit xpfarg vlan-id	empty
 policy-options policy-statement xpfarg term xpfarg then as-path-prepend	partial
 policy-options policy-statement xpfarg term xpfarg then community	partial
 policy-options policy-statement xpfarg term xpfarg then load-balance	partial
