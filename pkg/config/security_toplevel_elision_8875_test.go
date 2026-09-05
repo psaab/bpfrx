@@ -163,3 +163,49 @@ func TestZonePairIsNotEmptyAtDepth3_8875(t *testing.T) {
 		t.Errorf("policy name = %q, want p1", zp.Policies[0].Name)
 	}
 }
+
+// The severity of losing the policy set depends entirely on what zero policies
+// falls back to, and that fallback is currently a fact nothing asserts.
+//
+//	PolicyPermit PolicyAction = iota   // == 0, the ZERO VALUE of the field
+//	PolicyDeny
+//	PolicyReject
+//
+// A config with no `default-policy` compiles to DENY because the compiler sets
+// it EXPLICITLY, not because the field defaults to it. Nothing pins that today,
+// so a `PolicyAction` reordering -- or a refactor that drops the explicit set
+// and lets the field keep its zero value -- would silently convert a
+// fail-CLOSED outage into a fail-OPEN breach. The elision defect above is one
+// way to reach the fallback; a NAT or apply-groups bug is another. The guard
+// belongs to the fallback, not to any one route into it.
+//
+// The assertion is deliberately on "not the zero value" rather than only on
+// "== PolicyDeny": that is the property which stops holding the moment the
+// explicit set is removed, whichever order the enum happens to be in.
+func TestDefaultPolicyIsDenyAndNotMerelyTheZeroValue8875(t *testing.T) {
+	var zero PolicyAction
+	if zero != PolicyPermit {
+		t.Fatalf("premise moved: the zero value of PolicyAction is no longer PolicyPermit (got %v). "+
+			"Re-read this cell before adjusting it — the fail-open hazard it guards may have changed shape", zero)
+	}
+
+	const noDefaultPolicy = "security { zones { security-zone trust { } security-zone untrust { } } " +
+		"policies { from-zone trust to-zone untrust { policy p1 { match { source-address any; " +
+		"destination-address any; application any; } then { permit; } } } } }"
+
+	cfg, _ := compileSecurity8875(t, noDefaultPolicy)
+
+	// Liveness: the fixture must actually reach the policy compiler, or the
+	// assertion below is about an empty config rather than a real one.
+	if len(cfg.Security.Policies) == 0 {
+		t.Fatal("fixture compiled no zone pairs — the default-policy assertion would be measuring an empty config")
+	}
+	if cfg.Security.DefaultPolicy == zero {
+		t.Errorf("an unconfigured default policy compiled to the ZERO VALUE (%v = PolicyPermit). "+
+			"Losing the policy set now FAILS OPEN: every inter-zone flow is permitted rather than denied. "+
+			"The compiler must set the default explicitly", cfg.Security.DefaultPolicy)
+	}
+	if cfg.Security.DefaultPolicy != PolicyDeny {
+		t.Errorf("unconfigured default policy = %v, want PolicyDeny", cfg.Security.DefaultPolicy)
+	}
+}
