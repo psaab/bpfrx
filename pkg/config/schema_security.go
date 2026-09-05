@@ -1194,7 +1194,30 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			"description": {desc: "Proposal description", args: 1, scalar: true, placeholder: "<text>", children: nil},
 		}},
 		"policy": {desc: "IPsec policy name", args: 1, placeholder: "<policy-name>", children: map[string]*schemaNode{
-			"perfect-forward-secrecy": {desc: "Perfect forward secrecy (keys group<N>)", children: nil},
+			// #8844: `keys` was NOT declared while compileIPsec reads it as a child
+			// (compiler_ipsec.go, `case "perfect-forward-secrecy"` iterates
+			// p.Children for "keys"). The desc above already documented the child
+			// it failed to declare. Undeclared meant the head was not a schema
+			// child, the brace-elision pass was never ASKED about the
+			// ("perfect-forward-secrecy","keys") pair, and the packed spelling
+			// `perfect-forward-secrecy keys group14;` produced PFSGroup=0 --
+			// byte-identical to never configuring PFS at all.
+			//
+			// This is the #8800 shape failing in the INSECURE direction. The other
+			// members fail closed (a zero-address NAT pool is rejected at strict
+			// commit; an empty application-set is caught by #3146); this one
+			// commits clean with forward secrecy silently off, and no gate can
+			// detect it afterwards because 0 is a legitimate "disabled" value.
+			//
+			// No keyValidator/validator on `keys`: parseDHGroup accepts any
+			// `group<N>` or bare integer and leaves PFSGroup at 0 otherwise, and
+			// validating here would newly REJECT a value the tolerant Load path
+			// accepts today. The silent-disable-by-bad-value route is noted on
+			// #8844 as a separate question from the silent-disable-by-SPELLING
+			// route this fixes.
+			"perfect-forward-secrecy": {desc: "Perfect forward secrecy (keys group<N>)", children: map[string]*schemaNode{
+				"keys": {desc: "Diffie-Hellman group for phase-2 PFS (e.g. group14)", args: 1, placeholder: "<group>", children: nil},
+			}},
 			// multi (#3904): mirror of the IKE proposals leaf — offer every
 			// listed ESP proposal for phase-2 negotiation.
 			"proposals": {desc: "IPsec proposal reference(s)", args: 1, multi: true, placeholder: "<proposal-name>", children: nil},
