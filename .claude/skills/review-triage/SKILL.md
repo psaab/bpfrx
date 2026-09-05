@@ -28,14 +28,17 @@ automatic side effect of classifying a finding.
 The established watcher compatibility paths are `/tmp/*-review*.md`,
 `/tmp/result-<basename>.md`, and `/tmp/.researched-<basename>`. Exclude result/
 report derivatives and intermediate files from new input selection. Prefer the
-exact final `<WHOAMI>-review-<digits>.md` form and validate its complete report
-header; legacy inputs require provenance reconciliation. Never process a
-different repository's report just because its filename matches.
+named final `<WHOAMI>-review-<REVIEW_SLUG>-<digits>.md` form and also accept legacy
+`<WHOAMI>-review-<digits>.md` finals. Validate the header's identity, review
+name/slug, run ID and exact output basename; do not infer ambiguous components
+by splitting on hyphens. Legacy inputs require provenance reconciliation.
+Never process a different repository's report just because its filename matches.
 
 ## 1. Resolve the report's target
 
 - Read repository identity, base SHA, comparison target, run ID, scope, and
-  evidence locations. Preserve stable finding IDs throughout triage.
+  evidence locations, review name/slug and filing ledger. Preserve stable finding
+  IDs throughout triage, including their discovering model/source.
 - Reconcile `MODEL_RAW`, `MODEL_SOURCE`, `MODEL_HOST` and `WHOAMI` using the
   shared naming rules. Never infer the model from the filename or preserve a
   known wrong label as a "compatibility family". Keep coordinator and worker
@@ -106,15 +109,26 @@ independent corrective task gets its own issue when filing is authorized.
 Only tightly related bounded improvements share a cohort issue, with each
 member's evidence and acceptance criterion retained.
 
+Apply the shared issue-filing and origin-tagging contract to every authorized
+filing. Confirm `source:deep-review` and `model:<originating-WHOAMI>` on GitHub
+and include the Review origin block in the issue body. Attribute the actual
+discoverer, not whichever model is doing triage. Reconcile lost create responses
+by repository/run ID/Finding ID before retrying; retain existing issue provenance
+when linking a duplicate. Report pending tag actions separately from creation.
+
 ## 3. Write the reasoned result
 
 Use a unique owned scratch directory. Produce a complete draft result before
 publication. The result includes:
 
 - Source report/run ID, repository identity, review base, comparison ref/SHA/
-  timestamp, scope, and provenance/freshness limits.
+  timestamp, review name/slug, scope, and provenance/freshness limits.
 - Per-finding table keyed by original Finding ID: disposition, severity,
   confidence, verification, concrete reasoning, and issue/draft/owner mapping.
+- The original findings and an updated filing ledger: originating models,
+  actual issue URLs, OPENED_THIS_RUN versus LINKED_EXISTING, confirmed origin
+  labels, pending actions and snapshot timestamp. This report must stand alone
+  as the later filing-status snapshot without mutating the original report.
 - Full evidence and fix acceptance criteria for surviving actionable findings,
   including Adversarial analysis, Probe validity and limitations from the shared
   contract; preserve both the discovery rationale and contrary evidence.
@@ -130,11 +144,15 @@ publication. The result includes:
 Say "filed" only with actual issue IDs. In a report-only run, say "drafted" or
 "recommended". Release/backport actions are tracked only for requested release
 targets; do not infer that every historical tag is supported.
+Return both the source report path and this updated result path, clearly naming
+which snapshot records the later issue-filing status.
 
 Publish `/tmp/result-<basename>.md` atomically with create-if-absent semantics
 after the draft is complete, using a same-filesystem hard link where available
 (`ln -T -- <draft> <result>` on this Linux host). An existing directory is a
 collision, not a destination to follow into.
+For result naming, `<basename>` is the source report stem without the final
+`.md`, as illustrated in the shared contract; do not append the extension twice.
 Freeze the draft once linked. If a result already exists, verify its report
 identity and reconcile the prior work; never overwrite another run's result.
 Concurrent authorized filing workers must hold one exclusive per-report lock
