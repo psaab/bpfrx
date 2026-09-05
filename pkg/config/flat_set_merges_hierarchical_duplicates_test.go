@@ -1,9 +1,26 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
-// The flat `set` spelling MERGES into an existing instance; hand-written
-// hierarchical text with a repeated instance block does NOT — it produces two.
+// The flat `set` spelling MERGES into an existing instance, structurally, for
+// every container. Hand-written hierarchical text with a repeated instance
+// block does NOT — it produces two — everywhere except the containers #8752
+// folds.
+//
+// #8752 UPDATE. This cell used to state the contrast as unconditional, and it
+// was pinned at `security policies ... policy`. The #8752 fold merges a
+// repeated `policy` on the TOLERANT path, so at that one container the two
+// spellings have now converged, and the sub-test that discriminated there can
+// no longer see the substitution trap it was built to catch. The trap did not
+// go away with it: the fold is scoped to a PAIR LIST, not to a shape, so every
+// container outside that list still duplicates where `set` merges. The
+// discriminating sub-test therefore moved to `security nat source rule-set`,
+// measured (not assumed) to still show the split, and `policy` kept a
+// sub-test asserting the CONVERGENCE instead — which doubles as the top-level
+// regression guard for the fold.
 //
 // This cell exists because three separate people got that wrong on ONE issue in
 // ONE day, each writing hierarchical text through NewParser as a stand-in for
@@ -17,6 +34,12 @@ import "testing"
 // rendering of a CLI session, and the merge behaviour is the entire difference
 // between the two. A fixture that gets it wrong does not fail — it produces a
 // different, plausible config and answers a question nobody asked.
+//
+// The moved sub-test is doing a second job now: it is the only executable
+// statement of where the #8752 fold STOPS. If the fold is later widened to
+// `nat source rule-set`, this cell goes red and the person widening it has to
+// choose a still-unfolded container deliberately, rather than discovering
+// later that the trap became undetectable.
 func TestFlatSetMergesWhereHierarchicalDuplicates(t *testing.T) {
 	const zones = "set security zones security-zone trust\nset security zones security-zone untrust"
 	base := []string{
@@ -83,11 +106,13 @@ func TestFlatSetMergesWhereHierarchicalDuplicates(t *testing.T) {
 		}
 	})
 
-	// HIERARCHICAL: a repeated instance block does NOT merge. This is the shape
-	// that reaches production through a hand-edited file, a config written by an
-	// older build, or an HA peer push — the population the LENIENT path exists
-	// to accept — and NOT through the CLI.
-	t.Run("hierarchicalDuplicates", func(t *testing.T) {
+	// HIERARCHICAL at `policy`: CONVERGED by #8752. A repeated instance block
+	// used to produce two policies here; the tolerant-path fold now merges it
+	// into the first occurrence, so the two spellings agree at this container.
+	// This is the top-level regression guard for that fold — it asserts the
+	// operator-visible RESULT (one policy, carrying both the leaf from the
+	// duplicate and its own match criteria), not the mechanism.
+	t.Run("hierarchicalConvergedForPolicy", func(t *testing.T) {
 		const text = `schedulers { scheduler S { daily { start-time 09:00; stop-time 17:00; } } }
 security { zones { security-zone trust; security-zone untrust; }
 policies { from-zone trust to-zone untrust {
@@ -103,33 +128,87 @@ policies { from-zone trust to-zone untrust {
 			t.Fatalf("the LENIENT path must accept a duplicate block — that is what it is for: %v", err)
 		}
 		got := policiesOf(t, cfg)
-		if len(got) != 2 {
-			t.Fatalf("hierarchical duplicate produced %d policies, want 2 — if this now merges, "+
-				"the two spellings have converged and the #8690 `wrong-remedy` reasoning needs "+
-				"re-deriving", len(got))
+		if len(got) != 1 {
+			t.Fatalf("hierarchical duplicate produced %d policies, want 1 — #8752 folds a "+
+				"repeated `policy` into the first occurrence on the tolerant path; if this "+
+				"is 2 again the fold has regressed and the duplicate is once more shadowing "+
+				"the operator's policy with a default-deny", len(got))
 		}
-		// The operator's policy is the one carrying match criteria. Identify it
-		// by that rather than by index, so a reordering does not silently
-		// invert the assertion.
-		var operator, dup *Policy
-		for _, p := range got {
-			if len(p.Match.SourceAddresses) > 0 {
-				operator = p
-			} else {
-				dup = p
+		if got[0].SchedulerName != "S" {
+			t.Errorf("merged policy scheduler-name = %q, want %q — the fold must carry the "+
+				"duplicate's leaf ONTO the surviving policy, not just discard the duplicate",
+				got[0].SchedulerName, "S")
+		}
+		if len(got[0].Match.SourceAddresses) == 0 {
+			t.Errorf("merged policy lost its match criteria — the fold REPLACED rather than " +
+				"combined, which would be a worse outcome than the duplicate it replaced")
+		}
+		if got[0].Action != PolicyPermit {
+			t.Errorf("merged policy action = %v, want PolicyPermit — the operator's `then "+
+				"permit` must survive the fold; a policy with no terminal action defaults to "+
+				"deny, which is exactly the #8752 harm", got[0].Action)
+		}
+		// The whole point of merging rather than dropping: the tolerant path
+		// must still TELL the operator, because a strict commit rejects this.
+		var warned bool
+		for _, w := range cfg.Warnings {
+			if strings.Contains(w, "duplicate policy name") {
+				warned = true
 			}
 		}
-		if operator == nil || dup == nil {
-			t.Fatalf("expected one policy with match criteria and one without; got %d policies", len(got))
+		if !warned {
+			t.Errorf("the fold merged silently — warnings=%v; merging without warning turns a "+
+				"config a strict commit REJECTS into one that loads with no diagnostic",
+				cfg.Warnings)
 		}
-		if operator.SchedulerName != "" {
-			t.Errorf("the operator's policy has scheduler-name %q — if the duplicate now merges "+
-				"its leaf in, the #8690 harm is fixed and that entry should be re-measured",
-				operator.SchedulerName)
+	})
+
+	// HIERARCHICAL outside the fold's scope: still duplicates where `set`
+	// merges. This is the sub-test that carries the original purpose of this
+	// cell — the substitution trap — after #8752 removed the contrast at
+	// `policy`. The container was MEASURED to still split, not assumed:
+	// hierarchical gives two rule-sets of one rule each, flat `set` gives one
+	// rule-set of two rules.
+	t.Run("hierarchicalStillDuplicatesOutsideFoldScope", func(t *testing.T) {
+		const text = `security { nat { source {
+    rule-set rs1 { from zone trust; to zone untrust; rule r1 { match { source-address 10.0.0.0/8; } then { source-nat { interface; } } } }
+    rule-set rs1 { rule r2 { match { source-address 192.168.0.0/16; } then { source-nat { interface; } } } }
+} } }`
+		tree, perrs := NewParser(text).Parse()
+		if len(perrs) > 0 {
+			t.Fatalf("fixture must parse: %v", perrs)
 		}
-		if dup.Action != PolicyDeny {
-			t.Errorf("the spurious duplicate's action = %v, want PolicyDeny — a policy with no "+
-				"terminal action defaults to deny on the tolerant load path", dup.Action)
+		cfg, err := compileConfigWithOpts(tree, lenientCompileOpts())
+		if err != nil || cfg == nil {
+			t.Fatalf("lenient compile: %v", err)
+		}
+		if n := len(cfg.Security.NAT.Source); n != 2 {
+			t.Fatalf("hierarchical duplicate `rule-set rs1` produced %d rule-sets, want 2 — "+
+				"if this is now 1, the #8752 fold (or something like it) has been widened to "+
+				"cover `nat source rule-set`, and this cell must move to a container that is "+
+				"still unfolded. Do NOT delete it: it is the only executable statement that "+
+				"hand-written hierarchical text is not a stand-in for a `set` session, and "+
+				"three people got that wrong on one issue in one day", n)
+		}
+
+		tree2 := &ConfigTree{}
+		for _, c := range []string{
+			"set security nat source rule-set rs1 from zone trust",
+			"set security nat source rule-set rs1 to zone untrust",
+			"set security nat source rule-set rs1 rule r1 match source-address 10.0.0.0/8",
+			"set security nat source rule-set rs1 rule r1 then source-nat interface",
+			"set security nat source rule-set rs1 rule r2 match source-address 192.168.0.0/16",
+			"set security nat source rule-set rs1 rule r2 then source-nat interface",
+		} {
+			applySet(t, tree2, c)
+		}
+		cfg2, err := compileConfigWithOpts(tree2, lenientCompileOpts())
+		if err != nil || cfg2 == nil {
+			t.Fatalf("flat set must compile: %v", err)
+		}
+		if n := len(cfg2.Security.NAT.Source); n != 1 {
+			t.Fatalf("flat `set` produced %d rule-sets, want 1 — `set` MERGES; the contrast "+
+				"with the hierarchical spelling above is the entire point of this cell", n)
 		}
 	})
 }

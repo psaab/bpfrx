@@ -83,42 +83,57 @@ var dupConservationSkipped8436 = []string{
 	// #8752: THAT REASON IS A STRICT-PATH FACT, AND THIS CENSUS GOVERNS BOTH
 	// PATHS. `Store.Load` and `Store.SyncApply` compile leniently — which is the
 	// entire point of them, since they read configurations the operator did not
-	// just author — and the lenient path does NOT refuse. Measured:
+	// just author — and the lenient path does NOT refuse. So both entries were
+	// exempted here on a rejection that does not happen on the path where the
+	// defect lives.
 	//
-	//	security policies from-zone <a> <b> <c> policy   strict REJECTED, lenient ACCEPTED -> 2 policies
-	//	security policies global policy                  strict REJECTED, lenient ACCEPTED -> 2 policies
-	//
-	// So both entries are exempted here on a rejection that does not happen on
-	// the path where the defect lives. The operator's policy keeps its match
-	// criteria and the spurious one is a match-less deny -- but the duplicate
-	// does NOT "win", and the harm is not the one that reading implies.
-	// Measured (TestTheDuplicatePolicyPoisonsTheSnapshot8752):
+	// THE DEFECT THAT FINDING EXPOSED IS NOW FIXED, and this note is kept
+	// because the exemption is still taken and a reader has to be able to tell
+	// which half of it was answered. As measured BEFORE the fix
+	// (TestTheDuplicatePolicyPoisonsTheSnapshot8752, since re-pointed):
 	//
 	//	policy[0] src=[10.0.0.0/8] dst=[any] app=[any] permit  dropped=false
 	//	policy[1] src=[]           dst=[]    app=[]    deny    dropped=TRUE
 	//
-	// The spurious policy sits SECOND, so it never wins a first-match
-	// evaluation; an all-empty match reads as match-ANY, which puts a deny-all
-	// exactly where the zone pair already has an implicit default-deny. On its
-	// own that is close to inert.
+	// The spurious policy sat SECOND, so it never won a first-match evaluation,
+	// and an all-empty match reads as match-ANY — a deny-all exactly where the
+	// zone pair already has an implicit default-deny. On its own that was close
+	// to inert, and "the duplicate wins" was the wrong reading: it invites
+	// making the FIRST occurrence authoritative, which would have left the real
+	// harm in place.
 	//
-	// THE OPERATIVE HARM IS `LenientContentDropped`. compilePolicy sets it
-	// (compiler_security_policy.go:413) because the tolerant path accepted the
-	// policy only by dropping a required match dimension, and
-	// policies_lower.go:194 then poisons the rule with the `__unsupported__`
-	// application sentinel SO THAT the Rust integrity preflight rejects the
-	// WHOLE SNAPSHOT -- previous-good retained, fresh-boot default-deny. The
-	// consequence is therefore not an altered policy set that an operator could
-	// read in `show`: it is that the operator's ENTIRE configuration does not
-	// load. On a fresh boot that is a blackout.
+	// THE OPERATIVE HARM WAS `LenientContentDropped`. compilePolicy sets it
+	// because the tolerant path accepted the policy only by dropping a required
+	// match dimension, and policies_lower.go then poisons the rule with the
+	// `__unsupported__` application sentinel SO THAT the Rust integrity
+	// preflight rejects the WHOLE SNAPSHOT — previous-good retained, fresh-boot
+	// default-deny. The consequence was therefore not an altered policy set an
+	// operator could read in `show`: it was that the operator's ENTIRE
+	// configuration did not load. On a fresh boot, a blackout.
 	//
-	// Stated exactly because the two readings prescribe different fixes. "The
-	// duplicate wins" invites making the FIRST occurrence authoritative, which
-	// would leave LenientContentDropped set and the snapshot still poisoned.
-	// Folding the occurrences into one policy carrying the operator's criteria
-	// is what clears the flag, and clearing the flag is what makes the config
-	// load at all. #8752 tracks the fold itself.
+	// THE FIX (mergeDuplicateNamedInstances, gated on the tolerant path) folds
+	// the repeated `policy <p>` into the first occurrence, carrying its children
+	// and any packed tail onto the surviving policy. Measured after it:
 	//
+	//	security policies from-zone <a> <b> <c> policy   strict REJECTED, lenient ACCEPTED -> 1 policy
+	//	security policies global policy                  strict REJECTED, lenient ACCEPTED -> 1 policy
+	//
+	//	policy[0] src=[10.0.0.0/8] dst=[any] app=[any] deny    dropped=false
+	//
+	// — one policy, criteria intact, the poison flag CLEAR, so the snapshot
+	// loads. The terminal action resolves to the later statement's `deny`, which
+	// is what the flat `set` spelling produces for the same input, and the
+	// existing conflicting-terminal-action gate still reports the disagreement.
+	// The fold also warns, so a configuration a strict commit REJECTS does not
+	// load silently.
+	//
+	// WHAT THIS MEANS FOR THE TWO ENTRIES: the strict-path premise they are
+	// skipped on is UNCHANGED and still asserted — both are still refused at
+	// commit — so the skip remains correct. What changed is that the tolerant
+	// path now has an answer instead of an unexamined gap. The finding that
+	// produced this annotation was not that the entries were wrong to skip; it
+	// was that their stated reason could not speak for the path where the
+	// defect lived.
 	// The entries STAY — the census genuinely cannot synthesize these, so
 	// skipping is right — but the REASON is annotated rather than left standing,
 	// because a skip with a stated reason reads as settled and nobody
