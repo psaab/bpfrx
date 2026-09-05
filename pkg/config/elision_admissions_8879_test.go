@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -37,366 +38,373 @@ import (
 // historical evidence configs with no cluster authentication-key, one node-id
 // mismatch). Confirming a rule catches its target says nothing about what else
 // it catches, so the corpus is swept per batch rather than per campaign.
+// admittedElisionCases8879 is the SINGLE source of the #8879 fixtures.
+// It is package level so the guard below and the ratio re-derivation
+// (TestAdmittedDropsAreReadSomewhere8879) measure the SAME fixtures. A
+// second copy would drift, and a ratio derived from a drifted copy is a
+// claim about the copy.
+var admittedElisionCases8879 = []struct {
+	pair, braced, elided string
+	get                  func(*Config) string
+}{
+	{"protocols bgp",
+		`protocols { bgp { local-as 65001; router-id 10.0.0.1; } }`,
+		`protocols bgp { local-as 65001; router-id 10.0.0.1; }`,
+		func(c *Config) string {
+			if c.Protocols.BGP == nil {
+				return "<nil>"
+			}
+			return fmt.Sprintf("as=%d rid=%s", c.Protocols.BGP.LocalAS, c.Protocols.BGP.RouterID)
+		}},
+	{"security ike",
+		`security { ike { proposal pr { authentication-method pre-shared-keys; } } }`,
+		`security ike { proposal pr { authentication-method pre-shared-keys; } }`,
+		func(c *Config) string { return fmt.Sprintf("proposals=%d", len(c.Security.IPsec.IKEProposals)) }},
+	{"security nat",
+		`security { nat { source { pool P { address 10.0.0.1/32; } } } }`,
+		`security nat { source { pool P { address 10.0.0.1/32; } } }`,
+		func(c *Config) string { return fmt.Sprintf("pools=%d", len(c.Security.NAT.SourcePools)) }},
+	// #8879 batch 9 — the last of the population.
+	//
+	// Two fixtures here had to be repaired before they could answer, and
+	// both failures were mine rather than the code's: `ssh-known-hosts`
+	// with a bare `host` compiled to ZERO hosts on BOTH arms (a host with
+	// no key is not stored), which is a dead comparison that would have
+	// read as "no drop"; and `ip-monitoring` needs BOTH a defined rpm
+	// probe and a `then preferred-route`, without which the braced
+	// reference did not compile at all.
+	{"forwarding-options port-mirroring",
+		`forwarding-options { port-mirroring { instance pm1 { input { rate 313; } } } }`,
+		`forwarding-options port-mirroring { instance pm1 { input { rate 313; } } }`,
+		func(c *Config) string {
+			if c.ForwardingOptions.PortMirroring == nil {
+				return "<nil>"
+			}
+			return fmt.Sprintf("inst=%d", len(c.ForwardingOptions.PortMirroring.Instances))
+		}},
+	{"routing-options interface-routes",
+		`routing-options { interface-routes { rib-group inet rg-7717; } }`,
+		`routing-options interface-routes { rib-group inet rg-7717; }`,
+		func(c *Config) string { return "rg=" + c.RoutingOptions.InterfaceRoutesRibGroup }},
+	{"security ssh-known-hosts",
+		`security { ssh-known-hosts { host h7717.example.invalid { rsa-key AAAAB3NzaC1yc2EAAAADAQABAAABgQxx; } } }`,
+		`security ssh-known-hosts { host h7717.example.invalid { rsa-key AAAAB3NzaC1yc2EAAAADAQABAAABgQxx; } }`,
+		func(c *Config) string { return fmt.Sprintf("hosts=%d", len(c.Security.SSHKnownHosts)) }},
+	// 313, not 60/15 — those are the compiled defaults for the flow
+	// timeouts and a fixture carrying one reads clean while broken.
+	{"services flow-monitoring",
+		`services { flow-monitoring { version9 { template tpl1 { flow-active-timeout 313; } } } }`,
+		`services flow-monitoring { version9 { template tpl1 { flow-active-timeout 313; } } }`,
+		func(c *Config) string {
+			if c.Services.FlowMonitoring == nil || c.Services.FlowMonitoring.Version9 == nil {
+				return "<nil>"
+			}
+			return fmt.Sprintf("tpl=%d", len(c.Services.FlowMonitoring.Version9.Templates))
+		}},
+	{"services ip-monitoring",
+		`services { rpm { probe pr1 { test t1 { probe-type icmp-ping; target address 198.51.100.9; } } } ip-monitoring { policy ipm1 { match { rpm-probe pr1; } then { preferred-route { route 203.0.113.0/24 { next-hop 198.51.100.1; } } } } } }`,
+		`services { rpm { probe pr1 { test t1 { probe-type icmp-ping; target address 198.51.100.9; } } } } services ip-monitoring { policy ipm1 { match { rpm-probe pr1; } then { preferred-route { route 203.0.113.0/24 { next-hop 198.51.100.1; } } } } }`,
+		func(c *Config) string {
+			if c.Services.IPMonitoring == nil {
+				return "<nil>"
+			}
+			return fmt.Sprintf("pol=%d", len(c.Services.IPMonitoring.Policies))
+		}},
+	// #8879 batch 8.
+	//
+	// `forwarding-options family` uses mode `packet-based` and NOT
+	// `flow-based`, which is the compiled default. A fixture carrying the
+	// default value reads CLEAN WHILE BROKEN: losing it and keeping it
+	// produce the same compiled answer, so the comparison can never fail.
+	// This is the row where that trap was closest to being stepped in.
+	{"forwarding-options family",
+		`forwarding-options { family { inet6 { mode packet-based; } } }`,
+		`forwarding-options family { inet6 { mode packet-based; } }`,
+		func(c *Config) string { return "mode=" + c.ForwardingOptions.FamilyInet6Mode }},
+	{"protocols ospf3",
+		`protocols { ospf3 { area 0.0.0.9 { interface ge-0/0/0.0 { metric 33; } } } }`,
+		`protocols ospf3 { area 0.0.0.9 { interface ge-0/0/0.0 { metric 33; } } }`,
+		func(c *Config) string {
+			if c.Protocols.OSPFv3 == nil {
+				return "<nil>"
+			}
+			return fmt.Sprintf("areas=%d", len(c.Protocols.OSPFv3.Areas))
+		}},
+	{"security dynamic-address",
+		`security { dynamic-address { feed-server fs1 { url https://feeds.example.invalid/x; } } }`,
+		`security dynamic-address { feed-server fs1 { url https://feeds.example.invalid/x; } }`,
+		func(c *Config) string {
+			return fmt.Sprintf("feeds=%d", len(c.Security.DynamicAddress.FeedServers))
+		}},
+	{"system dataplane",
+		`system { dataplane { binary /opt/xpf/dp-7717; workers 5; } }`,
+		`system dataplane { binary /opt/xpf/dp-7717; workers 5; }`,
+		func(c *Config) string {
+			if c.System.UserspaceDataplane == nil {
+				return "<nil>"
+			}
+			return fmt.Sprintf("bin=%s/w=%d",
+				c.System.UserspaceDataplane.Binary, c.System.UserspaceDataplane.Workers)
+		}},
+	// #8879 batch 7. THE FIRST TWO ARE A CORRECTION OF MY OWN BATCH-5
+	// WORK. Batch 5 re-checked the sweep's SAME rows by hand and cleared
+	// `class-of-service classifiers` and `class-of-service rewrite-rules`
+	// as "genuinely SAME". That was true of the ONE leaf I tried (`dscp`)
+	// and false of the pair: via `inet-precedence` and `exp` both drop.
+	//
+	// It is precisely the error I had diagnosed in the sweep one batch
+	// earlier -- a verdict derived from a single leaf, reported about the
+	// pair -- committed by the person who wrote the diagnosis. The
+	// fixtures below therefore use the DROPPING leaf, not the convenient
+	// one.
+	{"class-of-service classifiers",
+		`class-of-service { classifiers { inet-precedence cl2 { forwarding-class expedited-forwarding { loss-priority low code-points 101; } } } }`,
+		`class-of-service classifiers { inet-precedence cl2 { forwarding-class expedited-forwarding { loss-priority low code-points 101; } } }`,
+		func(c *Config) string {
+			return fmt.Sprintf("prec=%d", len(c.ClassOfService.INetPrecedenceClassifierDefs))
+		}},
+	// SEVERITY NOTE, so this row is not read as worse than it is: the
+	// braced arm raises "rewrite-rules exp is accepted for compatibility
+	// but inert" -- the value has no runtime effect either way. What the
+	// elision actually costs here is the ADVISORY, not the behaviour. The
+	// operator writing the elided spelling gets neither the (inert)
+	// config nor the notice telling them it is inert.
+	{"class-of-service rewrite-rules",
+		`class-of-service { rewrite-rules { exp rw2 { forwarding-class expedited-forwarding { loss-priority low code-point 101; } } } }`,
+		`class-of-service rewrite-rules { exp rw2 { forwarding-class expedited-forwarding { loss-priority low code-point 101; } } }`,
+		func(c *Config) string {
+			return fmt.Sprintf("exp=%d", len(c.ClassOfService.EXPRewriteRules))
+		}},
+	{"protocols lldp",
+		`protocols { lldp { interface ge-0/0/6.0; transmit-interval 47; } }`,
+		`protocols lldp { interface ge-0/0/6.0; transmit-interval 47; }`,
+		func(c *Config) string {
+			if c.Protocols.LLDP == nil {
+				return "<nil>"
+			}
+			return fmt.Sprintf("if=%d/int=%d",
+				len(c.Protocols.LLDP.Interfaces), c.Protocols.LLDP.Interval)
+		}},
+	// Same severity note as `rewrite-rules exp`: the braced arm warns that
+	// pre-id session logging is inert in the userspace dataplane, so the
+	// loss is the advisory rather than a live behaviour.
+	{"security pre-id-default-policy",
+		`security { pre-id-default-policy { then { log { session-init; } } } }`,
+		`security pre-id-default-policy { then { log { session-init; } } }`,
+		func(c *Config) string {
+			if c.Security.PreIDDefaultPolicy == nil {
+				return "<nil>"
+			}
+			return fmt.Sprintf("init=%v/close=%v",
+				c.Security.PreIDDefaultPolicy.LogSessionInit,
+				c.Security.PreIDDefaultPolicy.LogSessionClose)
+		}},
+	// #8879 batch 6. Read `routing-options forwarding-table` twice: the
+	// elision was not only dropping a value, it was SUPPRESSING A COMMIT
+	// CHECK. See TestElisionSuppressedAValidation8879 below.
+	{"forwarding-options dhcp-relay",
+		`forwarding-options { dhcp-relay { group g1 { active-server-group sg1; interface ge-0/0/4.0; } } }`,
+		`forwarding-options dhcp-relay { group g1 { active-server-group sg1; interface ge-0/0/4.0; } }`,
+		func(c *Config) string {
+			if c.ForwardingOptions.DHCPRelay == nil {
+				return "<nil>"
+			}
+			return fmt.Sprintf("groups=%d", len(c.ForwardingOptions.DHCPRelay.Groups))
+		}},
+	{"protocols rip",
+		`protocols { rip { neighbor ge-0/0/5.0; redistribute static; } }`,
+		`protocols rip { neighbor ge-0/0/5.0; redistribute static; }`,
+		func(c *Config) string {
+			if c.Protocols.RIP == nil {
+				return "<nil>"
+			}
+			return fmt.Sprintf("if=%d/redist=%d",
+				len(c.Protocols.RIP.Interfaces), len(c.Protocols.RIP.Redistribute))
+		}},
+	// The export policy is DEFINED in both arms on purpose. With an
+	// undefined one the braced arm is rejected and the elided arm is not,
+	// which is a real asymmetry but a different one -- it would make this
+	// row measure the dangling-reference check rather than the drop.
+	{"routing-options forwarding-table",
+		`policy-options { policy-statement ecmp-policy-7717 { then accept; } } routing-options { forwarding-table { export ecmp-policy-7717; } }`,
+		`policy-options { policy-statement ecmp-policy-7717 { then accept; } } routing-options forwarding-table { export ecmp-policy-7717; }`,
+		func(c *Config) string { return "fte=" + c.RoutingOptions.ForwardingTableExport }},
+	// #8879 batch 5. TWO OF THESE FOUR WERE PUBLISHED AS BENIGN.
+	//
+	// `class-of-service fairness` and `security policy-stats` came out of
+	// the sweep's SAME column, not its SILENT column — the instrument
+	// reported "elided delivers what braced delivers" for both. That
+	// verdict was true of the single leaf the instrument synthesised and
+	// false of the pair. With a hand-written fixture `fairness` drops its
+	// entire expectation list and `policy-stats` silently flips
+	// PolicyStatsEnabled from true to FALSE, which turns a security
+	// feature off without telling anyone.
+	//
+	// Kept here as provenance, because it is the part that generalises: a
+	// per-pair verdict derived from one synthesised leaf is a claim about
+	// that leaf, and a SAME verdict is the one place where being wrong is
+	// invisible — nobody re-opens a row the instrument already cleared.
+	{"class-of-service fairness",
+		`class-of-service { fairness { rss-expectation { interface ge-0/0/1 { queue 3 { at-least-active-workers 4; } } } } }`,
+		`class-of-service fairness { rss-expectation { interface ge-0/0/1 { queue 3 { at-least-active-workers 4; } } } }`,
+		func(c *Config) string {
+			return fmt.Sprintf("fair=%d", len(c.ClassOfService.FairnessExpectations))
+		}},
+	{"security policy-stats",
+		`security { policy-stats { system-wide enable; } }`,
+		`security policy-stats { system-wide enable; }`,
+		func(c *Config) string {
+			return fmt.Sprintf("stats=%v", c.Security.PolicyStatsEnabled)
+		}},
+	{"security ipsec",
+		`security { ipsec { proposal ip1 { encryption-algorithm aes-256-gcm; } } }`,
+		`security ipsec { proposal ip1 { encryption-algorithm aes-256-gcm; } }`,
+		func(c *Config) string {
+			return fmt.Sprintf("ipsecprop=%d", len(c.Security.IPsec.Proposals))
+		}},
+	// The braced arm needs probe-type AND target to pass STRICT commit.
+	// A reference that fails strict compile would put this row in the
+	// same unanswerable third state the batch-4 cell exists to resolve.
+	{"services rpm",
+		`services { rpm { probe pr1 { test t1 { probe-type icmp-ping; target address 198.51.100.9; probe-count 7; } } } }`,
+		`services rpm { probe pr1 { test t1 { probe-type icmp-ping; target address 198.51.100.9; probe-count 7; } } }`,
+		func(c *Config) string {
+			if c.Services.RPM == nil {
+				return "<nil>"
+			}
+			return fmt.Sprintf("rpm=%d", len(c.Services.RPM.Probes))
+		}},
+	// #8879 batch 4. Mode-spanning again — a pointer struct reached
+	// through a keyed sub-map (`sampling`), a slice
+	// (`router-advertisement`), a map (`snmp v3`), and a struct whose
+	// every OTHER field is a default (`archival`).
+	//
+	// `system archival` is the reason the liveness check compares against
+	// an empty config rather than against nil: TransferOnCommit,
+	// ArchiveDir and MaxArchives all come back at their defaults here, so
+	// only TransferInterval carries the fixture's signal. Reading the
+	// whole struct and asking "is it non-empty" would have been satisfied
+	// entirely by defaults.
+	{"forwarding-options sampling",
+		`forwarding-options { sampling { instance si1 { input { rate 7717; } } } }`,
+		`forwarding-options sampling { instance si1 { input { rate 7717; } } }`,
+		func(c *Config) string {
+			if c.ForwardingOptions.Sampling == nil {
+				return "<nil>"
+			}
+			return fmt.Sprintf("inst=%d", len(c.ForwardingOptions.Sampling.Instances))
+		}},
+	{"protocols router-advertisement",
+		`protocols { router-advertisement { interface ge-0/0/7.0 { link-mtu 1444; } } }`,
+		`protocols router-advertisement { interface ge-0/0/7.0 { link-mtu 1444; } }`,
+		func(c *Config) string {
+			return fmt.Sprintf("ra=%d", len(c.Protocols.RouterAdvertisement))
+		}},
+	{"snmp v3",
+		`snmp { v3 { usm { local-engine { user u7717 { authentication-sha { authentication-password sekritpw; } } } } } }`,
+		`snmp v3 { usm { local-engine { user u7717 { authentication-sha { authentication-password sekritpw; } } } } }`,
+		func(c *Config) string {
+			if c.System.SNMP == nil {
+				return "<no-snmp>"
+			}
+			return fmt.Sprintf("v3users=%d", len(c.System.SNMP.V3Users))
+		}},
+	{"system archival",
+		`system { archival { configuration { transfer-interval 77; } } }`,
+		`system archival { configuration { transfer-interval 77; } }`,
+		func(c *Config) string {
+			if c.System.Archival == nil {
+				return "<nil>"
+			}
+			return fmt.Sprintf("interval=%d", c.System.Archival.TransferInterval)
+		}},
+	// #8879 batch 3, chosen to SPAN MODES: four subsystems and four
+	// different compiled shapes — a pointer struct (`isis`), a slice
+	// (`generate`), a scalar string (`license`) and a struct-of-scalars
+	// (`log`). Picking the top four rows of the sweep table would have
+	// sampled one region of the schema; picking the four most
+	// consequential would have sampled the regions with the MOST
+	// downstream validators, which is bias toward being caught rather
+	// than bias toward being representative.
+	//
+	// `security log` is the shape that most needs the empty-config
+	// liveness check below: Security.Log is a VALUE, not a pointer, so
+	// the elided arm yields a zero struct rather than nil and a
+	// nil-check would have called that "no drop".
+	{"protocols isis",
+		`protocols { isis { net 49.0001.1921.6800.1001.00; } }`,
+		`protocols isis { net 49.0001.1921.6800.1001.00; }`,
+		func(c *Config) string {
+			if c.Protocols.ISIS == nil {
+				return "<nil>"
+			}
+			return "net=" + c.Protocols.ISIS.NET
+		}},
+	{"routing-options generate",
+		`routing-options { generate { route 203.0.113.0/24 { discard; } } }`,
+		`routing-options generate { route 203.0.113.0/24 { discard; } }`,
+		func(c *Config) string {
+			return fmt.Sprintf("gen=%d", len(c.RoutingOptions.GenerateRoutes))
+		}},
+	{"system license",
+		`system { license { autoupdate { url https://lic.example.invalid/x; } } }`,
+		`system license { autoupdate { url https://lic.example.invalid/x; } }`,
+		func(c *Config) string { return "url=" + c.System.LicenseAutoUpdate }},
+	{"security log",
+		`security { log { mode event; format binary; } }`,
+		`security log { mode event; format binary; }`,
+		func(c *Config) string {
+			return fmt.Sprintf("mode=%s/fmt=%s", c.Security.Log.Mode, c.Security.Log.Format)
+		}},
+	// #8879 batch 2. Values are chosen NOT to equal any compiled default:
+	// a fixture whose value IS the fallback reads CLEAN WHILE BROKEN, because
+	// losing the value and keeping it produce the same compiled result. That
+	// trap is invisible in exactly the way a dead reference arm is, and the
+	// braced arm is LIVE throughout it.
+	{"security address-book",
+		`security { address-book { global { address a1 203.0.113.0/24; } } }`,
+		`security address-book { global { address a1 203.0.113.0/24; } }`,
+		func(c *Config) string {
+			if c.Security.AddressBook == nil {
+				return "<nil>"
+			}
+			return fmt.Sprintf("addrs=%d", len(c.Security.AddressBook.Addresses))
+		}},
+	{"protocols ospf",
+		`protocols { ospf { area 0.0.0.7 { interface ge-0/0/0.0 { metric 42; } } } }`,
+		`protocols ospf { area 0.0.0.7 { interface ge-0/0/0.0 { metric 42; } } }`,
+		func(c *Config) string {
+			if c.Protocols.OSPF == nil {
+				return "<nil>"
+			}
+			return fmt.Sprintf("areas=%d", len(c.Protocols.OSPF.Areas))
+		}},
+	{"chassis device-map",
+		`chassis { device-map { interface ge-0/0/5 { pci 0000:07:00.3; } } }`,
+		`chassis device-map { interface ge-0/0/5 { pci 0000:07:00.3; } }`,
+		func(c *Config) string {
+			if c.Chassis.DeviceMap == nil {
+				return "<nil>"
+			}
+			return fmt.Sprintf("entries=%d", len(c.Chassis.DeviceMap.Entries))
+		}},
+	{"system ntp",
+		`system { ntp { server 198.51.100.23; } }`,
+		`system ntp { server 198.51.100.23; }`,
+		func(c *Config) string { return fmt.Sprintf("servers=%d", len(c.System.NTPServers)) }},
+	{"system syslog",
+		`system { syslog { host 10.0.0.9 { any any; } } }`,
+		`system syslog { host 10.0.0.9 { any any; } }`,
+		func(c *Config) string {
+			if c.System.Syslog == nil {
+				return "<nil>"
+			}
+			return fmt.Sprintf("hosts=%d", len(c.System.Syslog.Hosts))
+		}},
+}
+
 func TestAdmittedPairsCompileLikeBraced8879(t *testing.T) {
-	for _, c := range []struct {
-		pair, braced, elided string
-		get                  func(*Config) string
-	}{
-		{"protocols bgp",
-			`protocols { bgp { local-as 65001; router-id 10.0.0.1; } }`,
-			`protocols bgp { local-as 65001; router-id 10.0.0.1; }`,
-			func(c *Config) string {
-				if c.Protocols.BGP == nil {
-					return "<nil>"
-				}
-				return fmt.Sprintf("as=%d rid=%s", c.Protocols.BGP.LocalAS, c.Protocols.BGP.RouterID)
-			}},
-		{"security ike",
-			`security { ike { proposal pr { authentication-method pre-shared-keys; } } }`,
-			`security ike { proposal pr { authentication-method pre-shared-keys; } }`,
-			func(c *Config) string { return fmt.Sprintf("proposals=%d", len(c.Security.IPsec.IKEProposals)) }},
-		{"security nat",
-			`security { nat { source { pool P { address 10.0.0.1/32; } } } }`,
-			`security nat { source { pool P { address 10.0.0.1/32; } } }`,
-			func(c *Config) string { return fmt.Sprintf("pools=%d", len(c.Security.NAT.SourcePools)) }},
-		// #8879 batch 9 — the last of the population.
-		//
-		// Two fixtures here had to be repaired before they could answer, and
-		// both failures were mine rather than the code's: `ssh-known-hosts`
-		// with a bare `host` compiled to ZERO hosts on BOTH arms (a host with
-		// no key is not stored), which is a dead comparison that would have
-		// read as "no drop"; and `ip-monitoring` needs BOTH a defined rpm
-		// probe and a `then preferred-route`, without which the braced
-		// reference did not compile at all.
-		{"forwarding-options port-mirroring",
-			`forwarding-options { port-mirroring { instance pm1 { input { rate 313; } } } }`,
-			`forwarding-options port-mirroring { instance pm1 { input { rate 313; } } }`,
-			func(c *Config) string {
-				if c.ForwardingOptions.PortMirroring == nil {
-					return "<nil>"
-				}
-				return fmt.Sprintf("inst=%d", len(c.ForwardingOptions.PortMirroring.Instances))
-			}},
-		{"routing-options interface-routes",
-			`routing-options { interface-routes { rib-group inet rg-7717; } }`,
-			`routing-options interface-routes { rib-group inet rg-7717; }`,
-			func(c *Config) string { return "rg=" + c.RoutingOptions.InterfaceRoutesRibGroup }},
-		{"security ssh-known-hosts",
-			`security { ssh-known-hosts { host h7717.example.invalid { rsa-key AAAAB3NzaC1yc2EAAAADAQABAAABgQxx; } } }`,
-			`security ssh-known-hosts { host h7717.example.invalid { rsa-key AAAAB3NzaC1yc2EAAAADAQABAAABgQxx; } }`,
-			func(c *Config) string { return fmt.Sprintf("hosts=%d", len(c.Security.SSHKnownHosts)) }},
-		// 313, not 60/15 — those are the compiled defaults for the flow
-		// timeouts and a fixture carrying one reads clean while broken.
-		{"services flow-monitoring",
-			`services { flow-monitoring { version9 { template tpl1 { flow-active-timeout 313; } } } }`,
-			`services flow-monitoring { version9 { template tpl1 { flow-active-timeout 313; } } }`,
-			func(c *Config) string {
-				if c.Services.FlowMonitoring == nil || c.Services.FlowMonitoring.Version9 == nil {
-					return "<nil>"
-				}
-				return fmt.Sprintf("tpl=%d", len(c.Services.FlowMonitoring.Version9.Templates))
-			}},
-		{"services ip-monitoring",
-			`services { rpm { probe pr1 { test t1 { probe-type icmp-ping; target address 198.51.100.9; } } } ip-monitoring { policy ipm1 { match { rpm-probe pr1; } then { preferred-route { route 203.0.113.0/24 { next-hop 198.51.100.1; } } } } } }`,
-			`services { rpm { probe pr1 { test t1 { probe-type icmp-ping; target address 198.51.100.9; } } } } services ip-monitoring { policy ipm1 { match { rpm-probe pr1; } then { preferred-route { route 203.0.113.0/24 { next-hop 198.51.100.1; } } } } }`,
-			func(c *Config) string {
-				if c.Services.IPMonitoring == nil {
-					return "<nil>"
-				}
-				return fmt.Sprintf("pol=%d", len(c.Services.IPMonitoring.Policies))
-			}},
-		// #8879 batch 8.
-		//
-		// `forwarding-options family` uses mode `packet-based` and NOT
-		// `flow-based`, which is the compiled default. A fixture carrying the
-		// default value reads CLEAN WHILE BROKEN: losing it and keeping it
-		// produce the same compiled answer, so the comparison can never fail.
-		// This is the row where that trap was closest to being stepped in.
-		{"forwarding-options family",
-			`forwarding-options { family { inet6 { mode packet-based; } } }`,
-			`forwarding-options family { inet6 { mode packet-based; } }`,
-			func(c *Config) string { return "mode=" + c.ForwardingOptions.FamilyInet6Mode }},
-		{"protocols ospf3",
-			`protocols { ospf3 { area 0.0.0.9 { interface ge-0/0/0.0 { metric 33; } } } }`,
-			`protocols ospf3 { area 0.0.0.9 { interface ge-0/0/0.0 { metric 33; } } }`,
-			func(c *Config) string {
-				if c.Protocols.OSPFv3 == nil {
-					return "<nil>"
-				}
-				return fmt.Sprintf("areas=%d", len(c.Protocols.OSPFv3.Areas))
-			}},
-		{"security dynamic-address",
-			`security { dynamic-address { feed-server fs1 { url https://feeds.example.invalid/x; } } }`,
-			`security dynamic-address { feed-server fs1 { url https://feeds.example.invalid/x; } }`,
-			func(c *Config) string {
-				return fmt.Sprintf("feeds=%d", len(c.Security.DynamicAddress.FeedServers))
-			}},
-		{"system dataplane",
-			`system { dataplane { binary /opt/xpf/dp-7717; workers 5; } }`,
-			`system dataplane { binary /opt/xpf/dp-7717; workers 5; }`,
-			func(c *Config) string {
-				if c.System.UserspaceDataplane == nil {
-					return "<nil>"
-				}
-				return fmt.Sprintf("bin=%s/w=%d",
-					c.System.UserspaceDataplane.Binary, c.System.UserspaceDataplane.Workers)
-			}},
-		// #8879 batch 7. THE FIRST TWO ARE A CORRECTION OF MY OWN BATCH-5
-		// WORK. Batch 5 re-checked the sweep's SAME rows by hand and cleared
-		// `class-of-service classifiers` and `class-of-service rewrite-rules`
-		// as "genuinely SAME". That was true of the ONE leaf I tried (`dscp`)
-		// and false of the pair: via `inet-precedence` and `exp` both drop.
-		//
-		// It is precisely the error I had diagnosed in the sweep one batch
-		// earlier -- a verdict derived from a single leaf, reported about the
-		// pair -- committed by the person who wrote the diagnosis. The
-		// fixtures below therefore use the DROPPING leaf, not the convenient
-		// one.
-		{"class-of-service classifiers",
-			`class-of-service { classifiers { inet-precedence cl2 { forwarding-class expedited-forwarding { loss-priority low code-points 101; } } } }`,
-			`class-of-service classifiers { inet-precedence cl2 { forwarding-class expedited-forwarding { loss-priority low code-points 101; } } }`,
-			func(c *Config) string {
-				return fmt.Sprintf("prec=%d", len(c.ClassOfService.INetPrecedenceClassifierDefs))
-			}},
-		// SEVERITY NOTE, so this row is not read as worse than it is: the
-		// braced arm raises "rewrite-rules exp is accepted for compatibility
-		// but inert" -- the value has no runtime effect either way. What the
-		// elision actually costs here is the ADVISORY, not the behaviour. The
-		// operator writing the elided spelling gets neither the (inert)
-		// config nor the notice telling them it is inert.
-		{"class-of-service rewrite-rules",
-			`class-of-service { rewrite-rules { exp rw2 { forwarding-class expedited-forwarding { loss-priority low code-point 101; } } } }`,
-			`class-of-service rewrite-rules { exp rw2 { forwarding-class expedited-forwarding { loss-priority low code-point 101; } } }`,
-			func(c *Config) string {
-				return fmt.Sprintf("exp=%d", len(c.ClassOfService.EXPRewriteRules))
-			}},
-		{"protocols lldp",
-			`protocols { lldp { interface ge-0/0/6.0; transmit-interval 47; } }`,
-			`protocols lldp { interface ge-0/0/6.0; transmit-interval 47; }`,
-			func(c *Config) string {
-				if c.Protocols.LLDP == nil {
-					return "<nil>"
-				}
-				return fmt.Sprintf("if=%d/int=%d",
-					len(c.Protocols.LLDP.Interfaces), c.Protocols.LLDP.Interval)
-			}},
-		// Same severity note as `rewrite-rules exp`: the braced arm warns that
-		// pre-id session logging is inert in the userspace dataplane, so the
-		// loss is the advisory rather than a live behaviour.
-		{"security pre-id-default-policy",
-			`security { pre-id-default-policy { then { log { session-init; } } } }`,
-			`security pre-id-default-policy { then { log { session-init; } } }`,
-			func(c *Config) string {
-				if c.Security.PreIDDefaultPolicy == nil {
-					return "<nil>"
-				}
-				return fmt.Sprintf("init=%v/close=%v",
-					c.Security.PreIDDefaultPolicy.LogSessionInit,
-					c.Security.PreIDDefaultPolicy.LogSessionClose)
-			}},
-		// #8879 batch 6. Read `routing-options forwarding-table` twice: the
-		// elision was not only dropping a value, it was SUPPRESSING A COMMIT
-		// CHECK. See TestElisionSuppressedAValidation8879 below.
-		{"forwarding-options dhcp-relay",
-			`forwarding-options { dhcp-relay { group g1 { active-server-group sg1; interface ge-0/0/4.0; } } }`,
-			`forwarding-options dhcp-relay { group g1 { active-server-group sg1; interface ge-0/0/4.0; } }`,
-			func(c *Config) string {
-				if c.ForwardingOptions.DHCPRelay == nil {
-					return "<nil>"
-				}
-				return fmt.Sprintf("groups=%d", len(c.ForwardingOptions.DHCPRelay.Groups))
-			}},
-		{"protocols rip",
-			`protocols { rip { neighbor ge-0/0/5.0; redistribute static; } }`,
-			`protocols rip { neighbor ge-0/0/5.0; redistribute static; }`,
-			func(c *Config) string {
-				if c.Protocols.RIP == nil {
-					return "<nil>"
-				}
-				return fmt.Sprintf("if=%d/redist=%d",
-					len(c.Protocols.RIP.Interfaces), len(c.Protocols.RIP.Redistribute))
-			}},
-		// The export policy is DEFINED in both arms on purpose. With an
-		// undefined one the braced arm is rejected and the elided arm is not,
-		// which is a real asymmetry but a different one -- it would make this
-		// row measure the dangling-reference check rather than the drop.
-		{"routing-options forwarding-table",
-			`policy-options { policy-statement ecmp-policy-7717 { then accept; } } routing-options { forwarding-table { export ecmp-policy-7717; } }`,
-			`policy-options { policy-statement ecmp-policy-7717 { then accept; } } routing-options forwarding-table { export ecmp-policy-7717; }`,
-			func(c *Config) string { return "fte=" + c.RoutingOptions.ForwardingTableExport }},
-		// #8879 batch 5. TWO OF THESE FOUR WERE PUBLISHED AS BENIGN.
-		//
-		// `class-of-service fairness` and `security policy-stats` came out of
-		// the sweep's SAME column, not its SILENT column — the instrument
-		// reported "elided delivers what braced delivers" for both. That
-		// verdict was true of the single leaf the instrument synthesised and
-		// false of the pair. With a hand-written fixture `fairness` drops its
-		// entire expectation list and `policy-stats` silently flips
-		// PolicyStatsEnabled from true to FALSE, which turns a security
-		// feature off without telling anyone.
-		//
-		// Kept here as provenance, because it is the part that generalises: a
-		// per-pair verdict derived from one synthesised leaf is a claim about
-		// that leaf, and a SAME verdict is the one place where being wrong is
-		// invisible — nobody re-opens a row the instrument already cleared.
-		{"class-of-service fairness",
-			`class-of-service { fairness { rss-expectation { interface ge-0/0/1 { queue 3 { at-least-active-workers 4; } } } } }`,
-			`class-of-service fairness { rss-expectation { interface ge-0/0/1 { queue 3 { at-least-active-workers 4; } } } }`,
-			func(c *Config) string {
-				return fmt.Sprintf("fair=%d", len(c.ClassOfService.FairnessExpectations))
-			}},
-		{"security policy-stats",
-			`security { policy-stats { system-wide enable; } }`,
-			`security policy-stats { system-wide enable; }`,
-			func(c *Config) string {
-				return fmt.Sprintf("stats=%v", c.Security.PolicyStatsEnabled)
-			}},
-		{"security ipsec",
-			`security { ipsec { proposal ip1 { encryption-algorithm aes-256-gcm; } } }`,
-			`security ipsec { proposal ip1 { encryption-algorithm aes-256-gcm; } }`,
-			func(c *Config) string {
-				return fmt.Sprintf("ipsecprop=%d", len(c.Security.IPsec.Proposals))
-			}},
-		// The braced arm needs probe-type AND target to pass STRICT commit.
-		// A reference that fails strict compile would put this row in the
-		// same unanswerable third state the batch-4 cell exists to resolve.
-		{"services rpm",
-			`services { rpm { probe pr1 { test t1 { probe-type icmp-ping; target address 198.51.100.9; probe-count 7; } } } }`,
-			`services rpm { probe pr1 { test t1 { probe-type icmp-ping; target address 198.51.100.9; probe-count 7; } } }`,
-			func(c *Config) string {
-				if c.Services.RPM == nil {
-					return "<nil>"
-				}
-				return fmt.Sprintf("rpm=%d", len(c.Services.RPM.Probes))
-			}},
-		// #8879 batch 4. Mode-spanning again — a pointer struct reached
-		// through a keyed sub-map (`sampling`), a slice
-		// (`router-advertisement`), a map (`snmp v3`), and a struct whose
-		// every OTHER field is a default (`archival`).
-		//
-		// `system archival` is the reason the liveness check compares against
-		// an empty config rather than against nil: TransferOnCommit,
-		// ArchiveDir and MaxArchives all come back at their defaults here, so
-		// only TransferInterval carries the fixture's signal. Reading the
-		// whole struct and asking "is it non-empty" would have been satisfied
-		// entirely by defaults.
-		{"forwarding-options sampling",
-			`forwarding-options { sampling { instance si1 { input { rate 7717; } } } }`,
-			`forwarding-options sampling { instance si1 { input { rate 7717; } } }`,
-			func(c *Config) string {
-				if c.ForwardingOptions.Sampling == nil {
-					return "<nil>"
-				}
-				return fmt.Sprintf("inst=%d", len(c.ForwardingOptions.Sampling.Instances))
-			}},
-		{"protocols router-advertisement",
-			`protocols { router-advertisement { interface ge-0/0/7.0 { link-mtu 1444; } } }`,
-			`protocols router-advertisement { interface ge-0/0/7.0 { link-mtu 1444; } }`,
-			func(c *Config) string {
-				return fmt.Sprintf("ra=%d", len(c.Protocols.RouterAdvertisement))
-			}},
-		{"snmp v3",
-			`snmp { v3 { usm { local-engine { user u7717 { authentication-sha { authentication-password sekritpw; } } } } } }`,
-			`snmp v3 { usm { local-engine { user u7717 { authentication-sha { authentication-password sekritpw; } } } } }`,
-			func(c *Config) string {
-				if c.System.SNMP == nil {
-					return "<no-snmp>"
-				}
-				return fmt.Sprintf("v3users=%d", len(c.System.SNMP.V3Users))
-			}},
-		{"system archival",
-			`system { archival { configuration { transfer-interval 77; } } }`,
-			`system archival { configuration { transfer-interval 77; } }`,
-			func(c *Config) string {
-				if c.System.Archival == nil {
-					return "<nil>"
-				}
-				return fmt.Sprintf("interval=%d", c.System.Archival.TransferInterval)
-			}},
-		// #8879 batch 3, chosen to SPAN MODES: four subsystems and four
-		// different compiled shapes — a pointer struct (`isis`), a slice
-		// (`generate`), a scalar string (`license`) and a struct-of-scalars
-		// (`log`). Picking the top four rows of the sweep table would have
-		// sampled one region of the schema; picking the four most
-		// consequential would have sampled the regions with the MOST
-		// downstream validators, which is bias toward being caught rather
-		// than bias toward being representative.
-		//
-		// `security log` is the shape that most needs the empty-config
-		// liveness check below: Security.Log is a VALUE, not a pointer, so
-		// the elided arm yields a zero struct rather than nil and a
-		// nil-check would have called that "no drop".
-		{"protocols isis",
-			`protocols { isis { net 49.0001.1921.6800.1001.00; } }`,
-			`protocols isis { net 49.0001.1921.6800.1001.00; }`,
-			func(c *Config) string {
-				if c.Protocols.ISIS == nil {
-					return "<nil>"
-				}
-				return "net=" + c.Protocols.ISIS.NET
-			}},
-		{"routing-options generate",
-			`routing-options { generate { route 203.0.113.0/24 { discard; } } }`,
-			`routing-options generate { route 203.0.113.0/24 { discard; } }`,
-			func(c *Config) string {
-				return fmt.Sprintf("gen=%d", len(c.RoutingOptions.GenerateRoutes))
-			}},
-		{"system license",
-			`system { license { autoupdate { url https://lic.example.invalid/x; } } }`,
-			`system license { autoupdate { url https://lic.example.invalid/x; } }`,
-			func(c *Config) string { return "url=" + c.System.LicenseAutoUpdate }},
-		{"security log",
-			`security { log { mode event; format binary; } }`,
-			`security log { mode event; format binary; }`,
-			func(c *Config) string {
-				return fmt.Sprintf("mode=%s/fmt=%s", c.Security.Log.Mode, c.Security.Log.Format)
-			}},
-		// #8879 batch 2. Values are chosen NOT to equal any compiled default:
-		// a fixture whose value IS the fallback reads CLEAN WHILE BROKEN, because
-		// losing the value and keeping it produce the same compiled result. That
-		// trap is invisible in exactly the way a dead reference arm is, and the
-		// braced arm is LIVE throughout it.
-		{"security address-book",
-			`security { address-book { global { address a1 203.0.113.0/24; } } }`,
-			`security address-book { global { address a1 203.0.113.0/24; } }`,
-			func(c *Config) string {
-				if c.Security.AddressBook == nil {
-					return "<nil>"
-				}
-				return fmt.Sprintf("addrs=%d", len(c.Security.AddressBook.Addresses))
-			}},
-		{"protocols ospf",
-			`protocols { ospf { area 0.0.0.7 { interface ge-0/0/0.0 { metric 42; } } } }`,
-			`protocols ospf { area 0.0.0.7 { interface ge-0/0/0.0 { metric 42; } } }`,
-			func(c *Config) string {
-				if c.Protocols.OSPF == nil {
-					return "<nil>"
-				}
-				return fmt.Sprintf("areas=%d", len(c.Protocols.OSPF.Areas))
-			}},
-		{"chassis device-map",
-			`chassis { device-map { interface ge-0/0/5 { pci 0000:07:00.3; } } }`,
-			`chassis device-map { interface ge-0/0/5 { pci 0000:07:00.3; } }`,
-			func(c *Config) string {
-				if c.Chassis.DeviceMap == nil {
-					return "<nil>"
-				}
-				return fmt.Sprintf("entries=%d", len(c.Chassis.DeviceMap.Entries))
-			}},
-		{"system ntp",
-			`system { ntp { server 198.51.100.23; } }`,
-			`system ntp { server 198.51.100.23; }`,
-			func(c *Config) string { return fmt.Sprintf("servers=%d", len(c.System.NTPServers)) }},
-		{"system syslog",
-			`system { syslog { host 10.0.0.9 { any any; } } }`,
-			`system syslog { host 10.0.0.9 { any any; } }`,
-			func(c *Config) string {
-				if c.System.Syslog == nil {
-					return "<nil>"
-				}
-				return fmt.Sprintf("hosts=%d", len(c.System.Syslog.Hosts))
-			}},
-	} {
+	for _, c := range admittedElisionCases8879 {
 		t.Run(c.pair, func(t *testing.T) {
 			read := func(txt string) string {
 				tree, perrs := NewParser(txt).Parse()
@@ -460,18 +468,146 @@ func TestRejectedPairStaysUnadmitted8879(t *testing.T) {
 			"regression wearing the shape of a fix (#8868). Admit only pairs whose " +
 			"elided spelling is measured SILENT.")
 	}
-	// And the property behind the flag: the elided spelling must still be
-	// refused. Asserting the flag alone would pass if the rejection moved.
-	txt := `system login { user u1 { class super-user; } }`
-	tree, perrs := NewParser(txt).Parse()
-	if len(perrs) > 0 {
-		t.Fatalf("fixture must parse: %v", perrs[0])
+	// And the property behind the flag, asserted as an ASYMMETRY rather than
+	// as a bare refusal.
+	//
+	// This is #8879's NEGATIVE CONTROL: the row that shows the instrument is
+	// not simply calling everything a silent drop. #8917 reclassified the
+	// sweep's `system login` row to BOTH-ARMS-REJECTED, which reads as the
+	// control having dissolved -- if the BRACED spelling is refused too, the
+	// row demonstrates nothing about elision.
+	//
+	// It has not dissolved. That verdict is a statement about the SYNTHESIZED
+	// leaf, not about the pair; it is the leaf-contingency lesson pointed in
+	// the opposite direction from where this campaign has been applying it. A
+	// reclassification to BOTH-ARMS-REJECTED is evidence the SWEEP cannot
+	// tell, not evidence the asymmetry is absent. Asked with a hand-written
+	// fixture the asymmetry is intact, and both halves are asserted here so
+	// no future reader has to take the sweep's word either way.
+	compiles := func(txt string) bool {
+		tree, perrs := NewParser(txt).Parse()
+		if len(perrs) > 0 {
+			t.Fatalf("fixture must parse (%q): %v", txt, perrs[0])
+		}
+		_, err := CompileConfig(tree)
+		return err == nil
 	}
-	if _, err := CompileConfig(tree); err == nil {
+	const braced = `system { login { user u1 { class super-user; } } }`
+	const elided = `system login { user u1 { class super-user; } }`
+
+	// Half one, and the half the sweep row lost: the BRACED spelling is
+	// ACCEPTED. Without this the refusal below is consistent with the stanza
+	// being invalid for reasons that have nothing to do with elision.
+	if !compiles(braced) {
+		t.Error("the BRACED `system login` spelling is refused at strict commit. " +
+			"This cell is #8879's negative control and it only controls anything " +
+			"while the two spellings DIFFER -- if both are refused it demonstrates " +
+			"nothing about elision, which is exactly the state #8917 found the " +
+			"sweep's synthesized fixture to be in.")
+	}
+	// Half two: the ELIDED spelling is REFUSED.
+	if compiles(elided) {
 		t.Error("the elided `system login` spelling is no longer refused at strict " +
 			"commit. If that rejection was removed deliberately this cell should " +
 			"move; if not, the operator has lost a signal (#8868).")
 	}
+}
+
+// TestAdmittedDropsAreReadSomewhere8879 re-derives #8879's headline ratio
+// against the CURRENT population, because the issue body's ratio rests on an
+// argument that has since been withdrawn.
+//
+// The body justified "at least 37 of 38" by pointing at `system login` and
+// `interfaces xpfname` reading STRICT-REJECTS -- "the reason the other rows
+// mean something". #8917 reclassified both (BOTH-ARMS-REJECTED and
+// LEAF-CONTINGENT). One survives when re-asked with a hand-written fixture
+// (see the negative control above); the other does not -- with a real leaf
+// `interfaces <name>` accepts on BOTH arms, so it was never a control. A
+// number whose stated control has moved needs re-deriving rather than
+// re-quoting.
+//
+// WHAT THIS MEASURES, and its bound. A drop matters when something READS the
+// value. The signal is the compiler's own accepted-but-inert advisories: a
+// stanza that raises one is declaring the value has no runtime effect, so
+// losing it costs the ADVISORY rather than behaviour.
+//
+// The bound runs one way and must be stated: absence of an advisory is weaker
+// evidence than presence of one. A stanza that is inert and says nothing would
+// be counted READ. The project enforces advisory-firing only for
+// class-of-service (#6850), so outside CoS this is an UPPER bound on READ.
+// Six of the READ rows were additionally confirmed by hand to have consumers
+// outside pkg/config (PolicyStatsEnabled, Protocols.LLDP, UserspaceDataplane,
+// FairnessExpectations, IPMonitoring, SSHKnownHosts -- reaching daemon,
+// grpcapi, cli and the userspace dataplane).
+func TestAdmittedDropsAreReadSomewhere8879(t *testing.T) {
+	// Named rather than counted. A bare count is satisfied by any three rows
+	// going inert, which would silently swap one finding for another; naming
+	// them means a MEMBERSHIP change reds this cell even when the total holds.
+	knownNotRead := map[string]string{
+		"forwarding-options family":      "inet6 mode packet-based is accepted-only; the dataplane is flow-based",
+		"class-of-service rewrite-rules": "exp rewrite is inert; the dataplane rewrites dscp on egress only",
+		"security pre-id-default-policy": "pre-id session logging is inert; no pre-identification admit path exists",
+	}
+	inertMarkers := []string{
+		"inert", "no runtime effect", "no effect", "accepted-only",
+		"accepted but", "accepted for compatibility", "runtime no-op",
+		"not yet enforced",
+	}
+
+	read, notRead := 0, 0
+	got := map[string]bool{}
+	for _, c := range admittedElisionCases8879 {
+		tree, perrs := NewParser(c.braced).Parse()
+		if len(perrs) > 0 {
+			t.Fatalf("%s: fixture must parse: %v", c.pair, perrs[0])
+		}
+		cfg, err := CompileConfigLenient(tree)
+		if err != nil || cfg == nil {
+			t.Fatalf("%s: braced fixture must compile: %v", c.pair, err)
+		}
+		inert := false
+		for _, w := range cfg.Warnings {
+			ws := strings.ToLower(w)
+			for _, m := range inertMarkers {
+				if strings.Contains(ws, m) {
+					inert = true
+					break
+				}
+			}
+			if inert {
+				break
+			}
+		}
+		if inert {
+			notRead++
+			got[c.pair] = true
+		} else {
+			read++
+		}
+	}
+
+	for pair := range got {
+		if _, ok := knownNotRead[pair]; !ok {
+			t.Errorf("%q now raises an accepted-but-inert advisory and was not "+
+				"one of the three rows #8879's re-derived ratio is built on. "+
+				"Either a stanza became inert or a new advisory changed what "+
+				"this measures -- the ratio must be re-derived, not adjusted.", pair)
+		}
+	}
+	for pair, why := range knownNotRead {
+		if !got[pair] {
+			t.Errorf("%q no longer raises an accepted-but-inert advisory (%s). "+
+				"If the value became live, the drop it used to suffer is worse "+
+				"than recorded and #8879's ratio moves in the WORSE direction.",
+				pair, why)
+		}
+	}
+	if total := read + notRead; total != len(admittedElisionCases8879) {
+		t.Errorf("accounted %d of %d cases", total, len(admittedElisionCases8879))
+	}
+	t.Logf("#8879 re-derived: %d of %d adjudicated drops lose a value something "+
+		"reads; %d lose only an advisory. Upper bound on READ -- see the doc "+
+		"comment.", read, read+notRead, notRead)
 }
 
 // The tolerant ingress must accept everything it accepts today. It DOES
