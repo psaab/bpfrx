@@ -207,8 +207,9 @@
 
 ### Family inet/inet6 AST shape
 - Hierarchical syntax `family inet { dhcp; }` creates `Node{Keys:["family","inet"]}` — AF name is Keys[1]
-- Set-command `set interfaces eth0 unit 0 family inet dhcp` creates `Node{Keys:["family"]}` with child `Node{Keys:["inet"]}`
-- **Fix:** Compiler must handle BOTH shapes
+- Set-command `set interfaces eth0 unit 0 family inet dhcp` creates the SAME node — `SetPath` descends `compoundKey` like the parser (corrected in #8808; the old claim that it splits into `family` + child `inet` was false)
+- A separately BRACED `family { inet { dhcp; } }` is what creates `Node{Keys:["family"]}` with an `inet` child; a brace-elided `family inet dhcp;` creates one packed `Node{Keys:["family","inet","dhcp"]}` (#2419)
+- **Fix:** Compiler must handle ALL THREE shapes
 - **File:** compiler.go
 
 ### SessionValueV6 trailing padding
