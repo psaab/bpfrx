@@ -504,6 +504,12 @@ var filedFixed = map[string]string{
 	// file exists to prevent.
 	"security log stream xpfarg transport protocol":    "#6821",
 	"security log stream xpfarg transport tls-profile": "#6821",
+	// #8933 moved the eight `policy-options policy-statement <p> term <t> then
+	// <action>` sites here from the inventory, and this one from
+	// filedStillOpen, rather than deleting them: a site dropped from both maps
+	// stops being checked in EITHER direction. This anchor is the one whose
+	// retirement from filedStillOpen is explained in full below.
+	"policy-options policy-statement xpfarg term xpfarg then local-preference": "#8933",
 	// #8690 family 3 moved this here from filedStillOpen rather than deleting
 	// it, for the same reason #6821 moved its two: a site dropped from both
 	// maps stops being checked in EITHER direction, and the anchor's value is
@@ -601,7 +607,42 @@ var filedStillOpen = map[string]string{
 	// node's own Keys and never reaches the switch. Different compiler file
 	// from the LACP anchor above, which is the property this second entry
 	// exists to provide.
-	"policy-options policy-statement xpfarg term xpfarg then local-preference": "compiler_routing.go:1083",
+	// #8933 RETIRED the `then local-preference` anchor that stood here, and the
+	// reason it had to go is a correction to the argument that put it here.
+	//
+	// It was chosen to be DURABLE on the premise that a "partial" site is
+	// structurally immune to a family sweep, because
+	// TestNormalizerScopeNeverCoversAPartialSite8690 forbids any scope from
+	// covering one. THAT PREMISE IS FALSE, and #8933 is the counterexample: a
+	// site is "partial" when the elided form compiles to something non-empty,
+	// i.e. when SOMETHING CONSUMED PART OF THE TAIL -- but that consumer can be
+	// the DEFECT rather than a legitimate reader. For `then <action>` the
+	// compiler packed the action name into PolicyTerm.Action, which is exactly
+	// the corruption #8933 fixes. Admitting the pair removes the consumer, the
+	// site becomes equivalent, and the "immune" anchor is consumed like the two
+	// `empty` anchors before it. Third anchor in a row invalidated by the next
+	// family to land, and this one was picked expressly to end that churn.
+	//
+	// THE PROPERTY THAT ACTUALLY HOLDS is the one the first anchor above has
+	// and nobody wrote down: its container slot is an ARG PLACEHOLDER. The
+	// normalizer's predicate is keyed on a (container keyword, head) pair, and
+	// production calls it with `node.Keys[0]` -- which for these sites is an
+	// arbitrary INSTANCE NAME (`ge-0/0/0`, `bd1`), not a keyword. No static
+	// pair can name it, so no widening can admit it. That is a permanent bound
+	// of the predicate (#8921), not a contingent classification, and it is the
+	// only durability argument on offer that a later fix cannot dissolve.
+	//
+	// Verified by reading the compiler, which is what membership here requires:
+	// compiler_services.go:2404 reaches the value with
+	// `child.FindChild("routing-interface")`, and the compact spelling
+	// `bd1 routing-interface irb.100;` is a LEAF whose Keys are
+	// ["bd1","routing-interface","irb.100"] -- there is no child to find, so
+	// the value is dropped entirely.
+	//
+	// It also keeps the property the swap must preserve: a THIRD compiler file
+	// (compiler_services.go), distinct from the compiler_interfaces.go anchor
+	// above and from the compiler_routing.go anchor it replaces.
+	"bridge-domains xpfname routing-interface": "compiler_services.go:2404",
 }
 
 type censusResult struct {

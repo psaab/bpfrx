@@ -226,11 +226,15 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 	// to spell its criteria block `match`. It is in scope below because it
 	// measured safe, not because the rule intended it.
 	//
-	// The head-only direction is the same defect mirrored, and is the one
-	// lane-8526's illustration names: `term <t> from community <c>` is shape
-	// `empty` and admissible while `term <t> then community <c>` is `partial`
-	// and must never be admitted. Same head, one token apart, opposite sides of
-	// the safety rule.
+	// The head-only direction is the same defect mirrored. The illustration
+	// that used to stand here -- `from community` admissible, `then community`
+	// "partial" and never admissible -- WAS RETIRED BY #8933, which measured
+	// that the consumer of `then community`'s tail was the defect itself and
+	// admitted all eight `then` actions. The live illustration is now head
+	// `description`: admitted under `unit` and `policy`, excluded under an
+	// instance-name container, where the exclusion is a permanent bound of a
+	// pair-keyed predicate (#8921) rather than a classification a fix can
+	// dissolve. See TestHeadAloneCannotDecideScope8690.
 	//
 	// SOME PAIRS BELOW TRIP A COMMIT GATE and are in scope anyway, because the
 	// gate objects to the DROP rather than to the spelling and the pass repairs
@@ -683,18 +687,27 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 	}
 
 	// #8690 family 3: policy-options. Taken PER SITE rather than as a family
-	// sweep, because this is the family where a family sweep is actively
-	// harmful: of its 17 inventory sites, 9 are drop shape "empty" and 8 are
-	// "partial" — and all 8 partials sit under `then`.
+	// sweep: of its 17 inventory sites, 9 were drop shape "empty" and 8 were
+	// "partial", and all 8 partials sat under `then`.
 	//
-	//	policy-statement <p> term <t> from community <c>   empty    admitted
-	//	policy-statement <p> term <t> then community <c>   partial  NOT admitted
+	// #8933 ADMITTED THOSE EIGHT, and the reason is worth keeping because it
+	// corrects the rule, not just the list. A site is "partial" when the elided
+	// form compiles to something non-empty -- something consumed part of the
+	// tail. The safety rule read that as "a reader depends on this tail, so
+	// folding truncates it". For `then <action>` the consumer was the DEFECT:
+	// the compiler packed the action name into PolicyTerm.Action, losing the
+	// value AND the terminal action. Removing the consumer is the fix, and the
+	// fold then preserves everything -- measured across all eight heads,
+	// including the multi-token tails (`community add <v>`,
+	// `community delete [ a b ]`, `as-path-prepend "<asn> <asn>"`).
 	//
-	// The same head, one token apart, on opposite sides of the safety rule.
-	// That pair is the clearest argument in the tree for scoping on
-	// (container, head) rather than on either token alone: a head-only rule
-	// admits both, and a container-only rule on `then` admits all eight
-	// partials. Both mistakes were available and neither is visible by reading.
+	// SO "PARTIAL" IS NOT A PERMANENT EXCLUSION. It says something reads the
+	// tail; it does not say that something is entitled to. The pair-keyed
+	// scoping argument stands unchanged -- a container-only rule on `then`
+	// would still have admitted these eight without measuring any of them, and
+	// a head-only rule still confuses `unit description` with
+	// `<instance> description`. What does NOT stand is treating a partial
+	// classification as immune to revision (see the retired #2419 anchor).
 	//
 	// Every one of the 9 below was checked individually against the inventory's
 	// drop shape, and TestNormalizerScopeNeverCoversAPartialSite8690 re-checks
@@ -854,6 +867,32 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		// the operator did not choose while `show configuration` renders the
 		// one they did.
 		"system master-password",
+		// #8933: the policy-statement term's `then` clause. The elided
+		// spelling loses EVERY value-carrying routing action AND corrupts the
+		// terminal action: the compiler consumes the first packed token into
+		// PolicyTerm.Action, so `then metric 50;` yields Action="metric" --
+		// neither "accept" nor "reject" -- and policy_render.go branches on
+		// exactly that, rendering `permit` + `on-match next` with no `set`
+		// clauses. The term loses its attributes AND STOPS TERMINATING,
+		// falling through to later terms and the default action (#2451).
+		//
+		// All eight admitted together, because a partially-admitted family is
+		// the #8922 shape: partial application reads as success.
+		//
+		// SAFE ACROSS THE KEYWORD, MEASURED not assumed (#8921): the schema
+		// holds 14 containers named `then`, and the predicate is keyed on
+		// (containerKeyword, head) with no parent context -- so an admission
+		// here is live at every `then` that declares the same head. Walked the
+		// schema: EXACTLY ONE `then` declares any of these eight, the
+		// policy-statement term's own. No sibling container is reached.
+		"then as-path-prepend",
+		"then community",
+		"then load-balance",
+		"then local-preference",
+		"then metric",
+		"then metric-type",
+		"then next-hop",
+		"then origin",
 		"system root-authentication",
 		"system backup-router",
 		"system domain-search",
