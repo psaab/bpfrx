@@ -263,9 +263,29 @@ func TestUnsplittablePairRatchet8880(t *testing.T) {
 	// not vindicated by having differed. It is the practice that is worth
 	// keeping, and a run where it agrees is the cheapest possible confirmation
 	// that nothing unmodelled happened.
+	// SYSLOG ADMISSION moves args>=1 463 -> 466 and HOLDS args>=2 at 100.
+	// Three pairs entered -- `syslog file`, `syslog host`, `syslog user` --
+	// admitted because the elided `system { syslog file f1 { any any; } }`
+	// compiled to NO syslog configuration at all (files=0 hosts=0 users=0,
+	// strictErr=false, warnings=0): a firewall that silently logged nothing.
+	//
+	// THIS CELL'S WARNING APPLIES AND IS NOT WAIVED: `syslog` cannot split a
+	// multi-statement packed run, so `syslog file f1 {…} syslog host h {…}` on
+	// one line still folds only the first. #8850's decline branch already
+	// refuses that shape, so nothing is made worse -- the admission fixes the
+	// single-destination spelling, which is the one a config file carries.
+	// Whether `packedStatements` would resolve the run here is UNMEASURED, not
+	// known-absent; #8925 established that being `multi` does not by itself
+	// make the opt-in insufficient, so the question is open rather than closed.
+	//
+	// args>=2 holding at 100 is the expected divergence: all three syslog
+	// destinations are args:1, so none could enter that population. A change
+	// that moved both would mean something else had happened too.
+	//
+	// Re-derived at this base, twice, not computed as 463 + 3.
 	const (
 		wantArgs2 = 100
-		wantArgs1 = 463
+		wantArgs1 = 466
 	)
 	pairs2, _ := unsplittablePairs8880(2)
 	pairs1, conflict1 := unsplittablePairs8880(1)

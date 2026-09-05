@@ -1243,7 +1243,12 @@ func TestDepth2UnadmittedPopulation8929(t *testing.T) {
 		"flow-monitoring version-ipfix", "flow-monitoring version9",
 		"interface-routes rib-group", "license autoupdate",
 		"policies policy-rematch", "pre-id-default-policy then",
-		"rib static", "syslog file", "syslog host", "syslog user",
+		"rib static",
+		// `syslog file` / `host` / `user` were REMOVED here because they were
+		// ADMITTED, which is the removal this list is designed to force. The
+		// elided `system { syslog file f1 { any any; } }` compiled to NO syslog
+		// at all -- files=0 hosts=0 users=0, strictErr=false, warnings=0 -- so a
+		// firewall silently logged nothing. All three now fold.
 	}
 	// 50 UNIQUE pairs. #8929 said 51 by counting a slice that double-counted
 	// `family inet6`, which appears under two different top-level stanzas.
@@ -1251,7 +1256,19 @@ func TestDepth2UnadmittedPopulation8929(t *testing.T) {
 	// stanza, so the same pair reached by two routes is ONE pair — counting
 	// sites where the population is pairs is the unit mismatch this campaign
 	// already hit once, on the 320-sites / 95-pairs reconciliation.
-	const wantPopulation = 40
+	// 40 -> 37 at THIS base: the three `syslog` destinations were admitted, so
+	// they left the
+	// un-admitted population. Both numbers moved together, which is exactly what
+	// the count assertion above demands of a legitimate removal -- an entry
+	// leaving knownDropping without the population shrinking would mean the
+	// record was edited rather than the defect fixed.
+	//
+	// RE-DERIVED AT THE REBASED BASE, not computed. The `nat` and `flow`
+	// families landed while this change was in flight, so the numbers this
+	// branch was written against (50/26) are not the ones it merges onto
+	// (40/16). Subtracting three from either would have been arithmetic on a
+	// base that moved underneath it. Measured: 37 and 13.
+	const wantPopulation = 37
 
 	parentAdmitted := func(mid string) bool {
 		for stanza := range setSchema.children {
@@ -1293,10 +1310,11 @@ func TestDepth2UnadmittedPopulation8929(t *testing.T) {
 	// catches an entry that should have been REMOVED and is blind to one that
 	// was removed silently (a bad merge, a tidy-up). Measured: deleting an
 	// entry left this cell green until this assertion was added.
-	if len(knownDropping) != 16 {
-		t.Errorf("knownDropping has %d entries, want 16. #8938 measured 26 of "+
-			"the 50 dropping; the `nat` and `flow` families were admitted in "+
-			"#8943, leaving 16. Removing one is only correct if the pair was "+
+	if len(knownDropping) != 13 {
+		t.Errorf("knownDropping has %d entries, want 23. #8938 measured 26 of "+
+			"the 50 dropping; the `nat` and `flow` families and the three "+
+			"`syslog` destinations have since been admitted, leaving 13. "+
+			"and removed, leaving 23. Removing one is only correct if the pair was "+
 			"ADMITTED — in which case the membership check below fires too and "+
 			"BOTH numbers move together. A count change on its own means the "+
 			"record was edited without a measurement.", len(knownDropping))

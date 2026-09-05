@@ -817,12 +817,39 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		// one container (reached directly and through the `groups` mirror of
 		// the same node), and `ciphers`/`macs` are declared by no other
 		// container. The admission cannot leak to a same-named neighbour.
+		// issue 8939-adjacent, syslog family: `system { syslog file f1 { … } }`
+		// -- the syslog brace elided -- compiled to NO syslog configuration at
+		// all. Measured: braced files=1 hosts=1 users=1, elided 0/0/0, with
+		// strictErr=false and warnings=0 on both the strict commit path and the
+		// tolerant Store.Load / SyncApply ingress.
+		//
+		// The consequence is that a firewall silently logs NOTHING: no local
+		// file, no remote host, no per-user destination, on a commit that
+		// reported success and a `show configuration` that renders exactly what
+		// the operator wrote. Security logging that is absent looks identical
+		// to security logging that is quiet.
+		//
+		// Empty-equivalence holds as this pass's admission rule requires: the
+		// elided spelling yields the same config as the stanza being absent, so
+		// nothing consumes the packed tail today and folding it can only ADD
+		// what the operator asked for.
+		//
+		// #8921 check before landing: `syslog` names exactly one container
+		// (reached directly and through the `groups` mirror of the same node),
+		// so the admission cannot leak to a same-named neighbour. `file`,
+		// `host` and `user` DO appear as leaves of other containers
+		// (`traceoptions file`, `stream host`, `login user`), but the pair key
+		// is (syslog, <head>) and the container half is unique, so those are
+		// unreachable from these entries.
 		"ssh ciphers",
 		"ssh connection-limit",
 		"ssh key-exchange",
 		"ssh macs",
 		"ssh root-login",
 		"static-binding host-name",
+		"syslog file",
+		"syslog host",
+		"syslog user",
 		// issue 8858: the OUTER half of the root-authentication fold, and the
 		// only half that was missing. The four inner pairs
 		// (`root-authentication encrypted-password` / `ssh-dsa` / `ssh-ed25519`

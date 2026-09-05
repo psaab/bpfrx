@@ -447,7 +447,28 @@ func collectCompactSites() []compactSite {
 			// read correctly in both spellings) and 1 DIVERGENT — the zone
 			// member this issue was filed on.
 			wildcardNamed := ch.args == 0 && ch.wildcard != nil
-			if (ch.wildcard == nil && ch.args == 1 || wildcardNamed) && len(path) >= 1 {
+			// A THIRD SHAPE: an ARG-NAMED container that ALSO carries a
+			// wildcard body. `system syslog file <name>` is args:1 (the file
+			// name) with a wildcard for the open-ended facility keyword and
+			// modifier children besides, so it satisfies NEITHER of the two
+			// clauses above -- not a bare valued leaf (it has children), not a
+			// wildcard-NAMED container (its instance comes from args, not the
+			// wildcard).
+			//
+			// Those sites were invisible to this census, and the blindness was
+			// SILENT: they appeared in no skip bucket, so `syslog file` /
+			// `host` / `user` could be admitted to the elision scope with the
+			// standing empty-equivalence verification passing VACUOUSLY over
+			// them. TestScopeWideningYieldsAdjudicatedSites8852 is what caught
+			// it, and its instruction is explicit -- fix the census, do not
+			// register the blindness.
+			//
+			// The population is bounded and was measured before widening:
+			// exactly six schema nodes carry this shape, the three syslog
+			// destinations and their `groups` mirrors. No other container in
+			// the schema is arg-named with a wildcard body.
+			argNamedWithBody := ch.args >= 1 && ch.wildcard != nil
+			if (ch.wildcard == nil && ch.args == 1 || wildcardNamed || argNamedWithBody) && len(path) >= 1 {
 				key := strings.Join(path, "/") + "|" + name
 				if !seen[key] {
 					seen[key] = true
