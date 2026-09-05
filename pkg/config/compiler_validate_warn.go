@@ -584,6 +584,30 @@ func ValidateConfig(cfg *Config) []string {
 		warnings = append(warnings, "forwarding-options allow-dataplane-sleep configured but is accepted-only — the userspace dataplane workers busy-poll and idle-yield is not yet implemented")
 	}
 
+	// #8797: `forwarding-options family inet6 mode`. The value is recorded and
+	// rendered by `show forwarding-options`, and it drives NOTHING — grep for
+	// FamilyInet6Mode finds the compiler that sets it and two show renderers
+	// that print it, and the dataplane has no packet-mode path at all.
+	//
+	// `flow-based` is therefore an accurate description of what xpf does and is
+	// not worth a warning. `packet-based` is a request the dataplane cannot
+	// honour: it is a flow-based firewall, sessions and conntrack all the way
+	// down. Warn rather than reject, matching allow-dataplane-sleep above and
+	// `interface-specific` — refusing it would fail a commit that is valid
+	// Junos and that xpf will simply keep serving flow-based.
+	//
+	// Before #8797 this could not fire at all: the compiler looked for the
+	// nested `family { inet6 { ... } }` shape while `family` is a compoundKey
+	// container, so every spelling an operator produces — flat `set` included —
+	// left the field empty, and an accepted-but-unenforced knob was also an
+	// unrecorded one.
+	if m := cfg.ForwardingOptions.FamilyInet6Mode; m != "" && m != "flow-based" {
+		warnings = append(warnings, "forwarding-options family inet6 mode "+m+
+			" configured but is accepted-only — the userspace dataplane is flow-based "+
+			"and has no packet-mode forwarding path, so IPv6 continues to be "+
+			"session-forwarded regardless of this setting")
+	}
+
 	// #2078: the `security flow tcp-session` presence flags are typed and
 	// committed but the userspace AF_XDP dataplane enforces none of them
 	// today. no-syn-check / no-syn-check-in-tunnel would gate the

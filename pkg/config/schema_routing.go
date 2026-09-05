@@ -687,7 +687,7 @@ var schemaForwardingOptions = &schemaNode{desc: "Packet forwarding options", chi
 	"allow-dataplane-sleep": {desc: "Allow the dataplane to idle (accepted; idle-yield not yet enforced)", children: nil},
 	"family": {desc: "Protocol family forwarding options", compoundKey: true, children: map[string]*schemaNode{
 		"inet6": {desc: "IPv6 forwarding options", children: map[string]*schemaNode{
-			"mode": {desc: "IPv6 forwarding mode (flow-based|packet-based)", args: 1, placeholder: "<mode>", children: nil},
+			"mode": {desc: "IPv6 forwarding mode (flow-based|packet-based; packet-based is accepted-only — the dataplane is flow-based, advisory at commit)", args: 1, placeholder: "<mode>", children: nil},
 		}},
 	}},
 	"sampling": {desc: "Traffic sampling for flow export", children: map[string]*schemaNode{
