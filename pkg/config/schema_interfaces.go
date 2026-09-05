@@ -108,7 +108,7 @@ var schemaInterfaces = &schemaNode{desc: "Interface configuration", wildcard: &s
 	"fabric-options": {desc: "Fabric interface options", children: map[string]*schemaNode{
 		"member-interfaces": {desc: "Member interfaces", children: nil},
 	}},
-	"tunnel": {desc: "Tunnel parameters", children: tunnelSchemaChildren()},
+	"tunnel": {desc: "Tunnel parameters", packedStatements: true, children: tunnelSchemaChildren()},
 	// #5829: the unit instance key is a NUMERIC identity token — type it so
 	// `commit`/`commit check` reject a non-numeric / negative / overflow /
 	// out-of-range `unit <n>` naming the bad value, instead of the compiler
@@ -164,7 +164,7 @@ var schemaInterfaces = &schemaNode{desc: "Interface configuration", wildcard: &s
 			validator:     ValidateInteger(1, 4094),
 			children:      nil,
 		},
-		"tunnel": {desc: "Tunnel parameters", children: tunnelSchemaChildren()},
+		"tunnel": {desc: "Tunnel parameters", packedStatements: true, children: tunnelSchemaChildren()},
 		"family": {desc: "Protocol family", compoundKey: true, children: map[string]*schemaNode{
 			"inet": {desc: "IPv4 protocol", children: map[string]*schemaNode{
 				// #4308 (fable-review-167 I-3): typed + compiled so they stop
