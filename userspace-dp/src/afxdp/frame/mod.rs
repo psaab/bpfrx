@@ -250,6 +250,45 @@ pub(super) fn build_injected_packet(
 /// Build a forwarded frame for NAT64 packets. NAT64 changes the IP address
 /// family so the frame size changes (IPv6→IPv4 shrinks by 20, IPv4→IPv6 grows
 /// by 20). This always uses a copy path — in-place rewrite is not possible.
+///
+/// # §8890: a tunnel-marked decision FAILS CLOSED here
+///
+/// This builder performs no encapsulation of any kind, and the TX copy path
+/// selects between it and `build_forwarded_frame_from_frame` **exclusively**
+/// on `is_nat64` — while only the branch it skips carries the tunnel post-pass
+/// (`frame/mod.rs`, `tunnel_endpoint_id != 0` → WireGuard / native GRE).
+/// `enqueue_pending_forwards` refuses direct TX when `is_nat64 ||
+/// uses_native_tunnel`, so the combination is routed *into* this builder rather
+/// than away from it. Measured at `c2e0a9ecb` before this gate existed: with a
+/// tunnel endpoint set on the decision, the emitted frame was **byte-identical
+/// to the no-tunnel control** — plain IPv4, no encapsulation, no drop. Traffic
+/// an operator routed through WireGuard left as plaintext on the underlay.
+///
+/// The codebase already recognises that outcome as a must-not-happen and has
+/// already chosen its posture for the sibling case: `tests_nat64_tunnel.rs`
+/// (§1873 R-E) drops a tunnel-marked decision whose OUTER next-hop is
+/// unresolved rather than let the retry path's in-place rewrite "later TX
+/// PLAINTEXT". That closed the *unresolved-neighbour* route; this is the
+/// *resolved* route reached through NAT64, and it was ungated. §2327 settled
+/// the same question one function over, for an unknown tunnel mode: drop, do
+/// not emit, because a fail-OPEN default in a security appliance is the defect.
+///
+/// Encapsulating instead would be better for the operator and is deliberately
+/// NOT done here. The tunnel post-pass is a wrapper over a finished inner
+/// frame, so it *looks* composable — but `wg_encap_frame` parses that inner
+/// frame using `inner_meta.addr_family`, in three places
+/// (`packet_trimmed_len`, `inner_dst_ip` for AllowedIPs peer selection, and
+/// `inner_tos_byte`). After NAT64 the frame is IPv4 while `meta` still
+/// describes the IPv6 *ingress*, so passing `meta` through would parse an IPv4
+/// packet as IPv6: a wrong length, a destination read past the header into the
+/// TCP payload, and therefore the wrong peer or none. Composing the two needs
+/// a corrected meta AND a re-derivation of the outer identity
+/// (§2680/§3992/§5292) for a family-translated inner packet. That is a larger,
+/// separately reviewable change — tracked as its own issue — and shipping it
+/// wrongly reintroduces exactly the confidentiality failure this gate closes.
+///
+/// The caller attributes this `None` to `nat64_tunnel_encap_unsupported`, and
+/// checks that reason FIRST, mirroring the order below.
 pub(super) fn build_nat64_forwarded_frame(
     frame: &[u8],
     meta: impl Into<ForwardPacketMeta>,
@@ -258,6 +297,12 @@ pub(super) fn build_nat64_forwarded_frame(
     no_v6_frag_header: bool,
 ) -> Option<Vec<u8>> {
     let meta = meta.into();
+    // §8890 fail-closed: this builder cannot encapsulate, so a tunnel-marked
+    // decision must NOT be emitted. See the doc comment above for why the
+    // encapsulating alternative is not a drop-in.
+    if decision.resolution.tunnel_endpoint_id != 0 {
+        return None;
+    }
     let dst_mac = decision.resolution.neighbor_mac?;
     let src_mac = decision.resolution.src_mac?;
     let vlan_id = decision.resolution.tx_vlan_id;

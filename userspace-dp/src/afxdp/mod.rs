@@ -765,6 +765,16 @@ pub(in crate::afxdp) struct BatchCounters {
     // ext-header ineligible drops` operator counter. Distinct from the
     // source/pool/fragment counters — this is an ext-header input reject.
     nat64_exthdr_ineligible: u64,
+    // #8890: fail-closed NAT64 TUNNEL-ENCAPSULATION drops — a
+    // NAT64-translated packet whose decision carries a non-zero
+    // `resolution.tunnel_endpoint_id`. The NAT64 builder cannot
+    // encapsulate and the copy path picks it exclusively on `is_nat64`,
+    // so emitting would put the inner packet on the underlay in
+    // plaintext. Bumped from the TX dispatcher when
+    // `build_nat64_forwarded_frame` returns `None` and the decision is
+    // tunnel-marked — checked FIRST, mirroring the builder's own guard
+    // order. Flushed to BindingLiveState.nat64_tunnel_encap_unsupported.
+    nat64_tunnel_encap_unsupported: u64,
     // #8670: fail-closed NAT64 PROTOCOL-ineligibility drops — an IPv6 packet
     // addressed to a Pref64 destination whose IP protocol stateful NAT64 does
     // not translate. RFC 6146 specifies stateful NAT64 for TCP, UDP and ICMP
@@ -1024,6 +1034,19 @@ impl BatchCounters {
         self.nat64_exthdr_ineligible += 1;
     }
 
+    /// #8890: record one fail-closed NAT64 tunnel-encapsulation drop — a
+    /// NAT64-translated packet whose route resolved through a GRE or
+    /// WireGuard endpoint. The NAT64 builder has no encapsulation path and
+    /// the copy fallback selects it exclusively on `is_nat64`, so the
+    /// alternative to this drop is emitting the inner packet as plaintext
+    /// on the underlay. Batched like the sibling nat64 drop counters and
+    /// flushed to `BindingLiveState.nat64_tunnel_encap_unsupported`.
+    #[inline]
+    pub(in crate::afxdp) fn record_nat64_tunnel_encap_unsupported(&mut self) {
+        self.touched = true;
+        self.nat64_tunnel_encap_unsupported += 1;
+    }
+
     /// #8670: record one fail-closed NAT64 protocol-ineligibility drop — a
     /// packet addressed to a Pref64 destination carrying an IP protocol
     /// stateful NAT64 does not translate (RFC 6146 covers TCP, UDP and ICMP
@@ -1150,6 +1173,13 @@ impl BatchCounters {
             live.nat64_exthdr_ineligible
                 .fetch_add(self.nat64_exthdr_ineligible, Ordering::Relaxed);
             self.nat64_exthdr_ineligible = 0;
+        }
+        // #8890: fail-closed NAT64 tunnel-encap tally, batched like the
+        // sibling nat64 drop counters above.
+        if self.nat64_tunnel_encap_unsupported != 0 {
+            live.nat64_tunnel_encap_unsupported
+                .fetch_add(self.nat64_tunnel_encap_unsupported, Ordering::Relaxed);
+            self.nat64_tunnel_encap_unsupported = 0;
         }
         // #8670: fail-closed NAT64 protocol-ineligibility tally, batched like
         // the sibling nat64 drop counters above.

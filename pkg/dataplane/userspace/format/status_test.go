@@ -265,14 +265,21 @@ func TestFormatStatusSummaryShowsNAT64FragDropped(t *testing.T) {
 func TestFormatStatusSummaryShowsNAT64ExthdrIneligible(t *testing.T) {
 	status := userspace.ProcessStatus{
 		Bindings: []userspace.BindingStatus{
-			{Slot: 0, Nat64ExthdrIneligible: 6, Nat64IneligibleProtocol: 4},
-			{Slot: 1, Nat64ExthdrIneligible: 9, Nat64IneligibleProtocol: 8},
+			{Slot: 0, Nat64ExthdrIneligible: 6, Nat64IneligibleProtocol: 4, Nat64TunnelEncapUnsupported: 2},
+			{Slot: 1, Nat64ExthdrIneligible: 9, Nat64IneligibleProtocol: 8, Nat64TunnelEncapUnsupported: 5},
 		},
 	}
 
 	out := FormatStatusSummary(status)
 	if !strings.Contains(out, "NAT64 ext-header ineligible drops:15") {
 		t.Fatalf("summary missing NAT64 ext-header ineligible drop row (want 15):\n%s", out)
+	}
+	// #8890: the tunnel-encap drop must AGGREGATE across bindings like its
+	// siblings, not report one worker's value. The two slots carry 2 and 5, so
+	// a row reading 2 or 5 would be a per-binding read that happens to look
+	// plausible; only 7 distinguishes summing from picking.
+	if !strings.Contains(out, "NAT64 tunnel encap unsupported drops:7") {
+		t.Fatalf("summary missing aggregated NAT64 tunnel-encap-unsupported row (want 7 = 2+5):\n%s", out)
 	}
 	// #8670: the protocol-ineligibility row aggregates across bindings like its
 	// siblings. A DISTINCT total (12, not 15) so a row that accidentally

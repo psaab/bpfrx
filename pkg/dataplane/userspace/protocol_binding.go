@@ -249,6 +249,18 @@ type BindingStatus struct {
 	// is an ext-header input reject. omitempty + the Rust serde `default` keep
 	// cross-version wire safety (an older helper omits it → 0).
 	Nat64ExthdrIneligible uint64 `json:"nat64_exthdr_ineligible,omitempty"`
+	// Nat64TunnelEncapUnsupported (#8890) counts fail-closed drops of a
+	// NAT64-translated packet whose route resolved through a GRE or
+	// WireGuard endpoint. build_nat64_forwarded_frame performs no
+	// encapsulation and the TX copy path selects it exclusively on
+	// is_nat64, so before #8890 the inner packet was emitted on the
+	// physical NIC as plaintext. It is dropped instead, matching the
+	// #1873 R-E posture for the unresolved-neighbour route. A non-zero
+	// value means a NAT64 + tunnel route combination is configured and
+	// is NOT being forwarded — an unsupported-configuration signal, not
+	// a capacity one. omitempty + the Rust serde `default` keep
+	// cross-version wire safety (an older helper omits it → 0).
+	Nat64TunnelEncapUnsupported uint64 `json:"nat64_tunnel_encap_unsupported,omitempty"`
 	// Nat64IneligibleProtocol (#8670) counts fail-closed drops of a packet
 	// addressed to a Pref64 destination whose IP protocol stateful NAT64 does
 	// not translate — RFC 6146 covers TCP, UDP and ICMP only, so GRE, ESP,

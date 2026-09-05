@@ -693,6 +693,14 @@ pub(crate) struct BindingStatus {
     /// (serde default; Go side omitempty).
     #[serde(rename = "tunnel_encap_unresolved_drops", default)]
     pub tunnel_encap_unresolved_drops: u64,
+    /// #8890: NAT64-translated packets dropped because the route resolved
+    /// through a GRE / WireGuard endpoint the NAT64 builder cannot
+    /// encapsulate into — the fail-closed sibling of
+    /// `tunnel_encap_unresolved_drops` on the RESOLVED route. Wire-additive
+    /// (serde default; Go side omitempty): a counter absent from an older
+    /// helper reads 0, which is honest — that build does not report it.
+    #[serde(rename = "nat64_tunnel_encap_unsupported", default)]
+    pub nat64_tunnel_encap_unsupported: u64,
     /// #1946: FabricRedirect frames dropped fail-closed because they
     /// could not be TX'd to the HA peer (no fabric XSK binding, or the
     /// forward-frame build/enqueue failed). Wire-additive (serde

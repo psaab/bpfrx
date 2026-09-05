@@ -124,6 +124,7 @@
     "nat64_no_source_pool": 0,
     "nat64_pool_exhausted": 0,
     "nat64_translations": 0,
+    "nat64_tunnel_encap_unsupported": 0,
     "nat_alloc_fail": 0,
     "nat_frag_untranslated_dropped": 0,
     "neighbor_miss_packets": 0,
