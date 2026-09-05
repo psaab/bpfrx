@@ -15,6 +15,26 @@
 #                    removes a value that is READ, on a config that commits
 #                    clean. Forbidden to every scope by
 #                    TestNormalizerScopeNeverCoversAPartialSite8690.
+#
+#                    #8933 NARROWED WHAT THIS CLASS ENTITLES YOU TO CONCLUDE.
+#                    "Partial" is a measurement that something consumed the
+#                    tail. It is NOT a finding that the consumer is entitled
+#                    to it. The eight `policy-options ... term <t> then
+#                    <action>` entries that stood here were partial because
+#                    the compiler packed the action name into
+#                    PolicyTerm.Action -- losing the value AND the term's
+#                    terminal action, so the term stopped terminating. The
+#                    consumer WAS the defect; removing it made all eight
+#                    equivalent, verified across the multi-token tails too
+#                    (`community add <v>`, `community delete [ a b ]`,
+#                    `as-path-prepend "<asn> <asn>"`). They were removed from
+#                    this register by #8933, not deleted silently.
+#
+#                    So before classing a site partial FOREVER, ask what reads
+#                    the tail and whether it should. And do not build a control
+#                    on the assumption that a partial site can never be
+#                    normalized -- the #2419 positive-control anchor was chosen
+#                    on exactly that premise and #8933 consumed it.
 #   gate-open-question
 #                    the disarm arm reds here: rejected at strict commit with the
 #                    pass disabled, accepted with it enabled. THAT IS A QUESTION,
@@ -164,14 +184,6 @@ interfaces xpfname native-vlan-id	partial	drop shape "partial" in the inventory
 interfaces xpfname speed	partial	drop shape "partial" in the inventory
 interfaces xpfname tunnel routing-instance destination	partial	drop shape "partial" in the inventory
 interfaces xpfname unit	partial	drop shape "partial" in the inventory
-policy-options policy-statement xpfarg term xpfarg then as-path-prepend	partial	drop shape "partial"; the eight `then` actions family 2 nearly swallowed by scoping on the container keyword
-policy-options policy-statement xpfarg term xpfarg then community	partial	drop shape "partial"; same head as the safe `from community`, one token apart
-policy-options policy-statement xpfarg term xpfarg then load-balance	partial	drop shape "partial"
-policy-options policy-statement xpfarg term xpfarg then local-preference	partial	drop shape "partial"; also the #2419 positive-control anchor, chosen BECAUSE a partial site is immune to the sweep
-policy-options policy-statement xpfarg term xpfarg then metric	partial	drop shape "partial"
-policy-options policy-statement xpfarg term xpfarg then metric-type	partial	drop shape "partial"
-policy-options policy-statement xpfarg term xpfarg then next-hop	partial	drop shape "partial"
-policy-options policy-statement xpfarg term xpfarg then origin	partial	drop shape "partial"
 system login class	partial	drop shape "partial" in the inventory
 system login class xpfarg allow-commands	gate-confirmed	STEP 3 DONE — GENUINE disarm, permanent. Admitting the login-subtree pairs reds the dedicated TestCompactNormalizeDoesNotDisarmTheLoginPackedGate8690 AND five #6662 cells (LoginPackedRejectedAtCommit, ...NamesTheDroppedTokens, ...PreservesQuoting, ...ExplainsTheRBACCost, ...InsideAppliedGroupRejected). The gate refuses the packed SPELLING, not the consequence of a drop, so normalizing it defeats the gate outright. Independently reached by lane-8526, which measured the same subtree directly rather than deferring to the owning lane. MEASURED AT d8021931b; the pairs are NOT admitted there, so this is a disarm that would occur on admission, not one currently open
 system login class xpfarg allow-configuration	gate-confirmed	STEP 3 DONE — GENUINE disarm, permanent. Admitting the login-subtree pairs reds the dedicated TestCompactNormalizeDoesNotDisarmTheLoginPackedGate8690 AND five #6662 cells (LoginPackedRejectedAtCommit, ...NamesTheDroppedTokens, ...PreservesQuoting, ...ExplainsTheRBACCost, ...InsideAppliedGroupRejected). The gate refuses the packed SPELLING, not the consequence of a drop, so normalizing it defeats the gate outright. Independently reached by lane-8526, which measured the same subtree directly rather than deferring to the owning lane. MEASURED AT d8021931b; the pairs are NOT admitted there, so this is a disarm that would occur on admission, not one currently open

@@ -215,9 +215,23 @@ func TestUnsplittablePairRatchet8880(t *testing.T) {
 	// the two deltas: a shared ratchet's movement is the sum of everyone's
 	// work, and arithmetic on two separately-measured numbers is not a
 	// measurement.
+	//
+	// #8933 MOVED IT AGAIN, AND THE INTERACTION IS THE POINT. #8930 measured
+	// 98/463 on its own branch and #8933 measured 100/471 on its own; both were
+	// correct about their own tree and BOTH WOULD HAVE BEEN WRONG had either
+	// been carried across the other's merge. Re-derived once more at the base
+	// that has both (master 2338ae3b0): 100 / 471. This is the third
+	// re-derivation on this constant in a day and every one of them agreed with
+	// a measurement and disagreed with an addition.
+	//
+	// The +8 is the eight `policy-options ... term <t> then <action>` pairs
+	// admitted by #8933. They enter this population because `then` cannot split
+	// a multi-statement packed run -- but a two-statement `then` has no elided
+	// spelling to reach it with, so the over-approximation this comment already
+	// warns about is where they sit.
 	const (
-		wantArgs2 = 98
-		wantArgs1 = 463
+		wantArgs2 = 100
+		wantArgs1 = 471
 	)
 	pairs2, _ := unsplittablePairs8880(2)
 	pairs1, conflict1 := unsplittablePairs8880(1)

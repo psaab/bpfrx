@@ -38,38 +38,52 @@ func TestElidedPolicyFromCriterionReachesTheTerm8690(t *testing.T) {
 
 // THE DISCRIMINATION, demonstrated rather than asserted about the predicate.
 //
-// `from community` is drop shape "empty" and is normalized. `then community` —
-// the same head, one token apart — is "partial": something already consumes
-// part of that tail, so normalizing it could remove a value that is read.
+// #8933 CONSUMED THE ORIGINAL EXAMPLE. This cell used to contrast `from
+// community` (shape "empty", admitted) with `then community` (shape "partial",
+// excluded) -- the same head, one token apart. #8933 measured that the thing
+// consuming `then community`'s tail was the DEFECT (the compiler packing the
+// action name into PolicyTerm.Action), not a legitimate reader, and admitted
+// all eight `then` actions. Both sides of the old contrast are now admitted, so
+// the pair can no longer demonstrate anything.
 //
-// This cell exists because both available mistakes look right when read. A
-// head-only rule admits both. A container-only rule on `then` admits all eight
-// partials. Only the (container, head) pair separates them, and the separation
-// is invisible without running it.
-func TestFromAndThenCommunityAreTreatedDifferently8690(t *testing.T) {
-	if !compactNormalizeInScope("from", "community") {
-		t.Error("`from community` is drop shape empty and must be normalized")
+// THE REPLACEMENT IS CHOSEN TO BE DURABLE, which the original was not. Head
+// `description` is admitted under `unit` and under `policy`, and excluded under
+// an INSTANCE-NAME container (`interfaces <name> description`, shape
+// "partial"). That exclusion cannot be dissolved by a later fix the way the
+// `then` one was: the predicate is keyed on (container keyword, head) and
+// production passes `node.Keys[0]`, which for that site is an arbitrary
+// interface name. No static pair can name it (#8921). The discrimination this
+// cell exists to demonstrate therefore survives the next widening, which is
+// exactly what the `then community` version failed to do.
+func TestHeadAloneCannotDecideScope8690(t *testing.T) {
+	// Admitted under two different containers...
+	for _, kw := range []string{"unit", "policy"} {
+		if !compactNormalizeInScope(kw, "description") {
+			t.Errorf("`%s description` is admitted and must stay in scope; without it "+
+				"the contrast below has only one side and proves nothing", kw)
+		}
 	}
-	if compactNormalizeInScope("then", "community") {
-		t.Error("`then community` is drop shape PARTIAL — something consumes part of its tail. " +
-			"Admitting it would truncate a value that is currently read, on a config that " +
-			"commits clean. The head is identical to `from community`, which IS admitted; only " +
-			"the container distinguishes them (#8690)")
+	// ...and excluded under the instance-name container, where the head is
+	// identical and only the container differs.
+	if compactNormalizeInScope("xpfname", "description") {
+		t.Error("`<instance> description` (interfaces <name> description) is shape " +
+			"PARTIAL and must NOT be in scope. A head-only rule admits it along with " +
+			"`unit description`, which is the mistake this cell exists to catch (#8690)")
 	}
-	// And the consequence of that distinction, on the compiler rather than the
-	// predicate: the `then` spelling must still diverge, because it is not
-	// normalized. If it stops diverging the site was fixed elsewhere and this
-	// family's scope should be re-derived rather than left claiming a hazard.
-	const thenBraced = `policy-options { policy-statement ps1 { term t1 { then { community add c1; } } } }`
-	const thenElided = `policy-options { policy-statement ps1 { term t1 { then community add c1; } } }`
-	tb, te := compileText(t, thenBraced), compileText(t, thenElided)
+	// The consequence on the compiler, not the predicate: the excluded spelling
+	// must still diverge. If it stops, the site was fixed elsewhere and the
+	// scope should be re-derived rather than left claiming a hazard -- the
+	// lesson #8933 taught about the entry that used to stand here.
+	const braced = `interfaces { ge-0/0/0 { description "wan uplink"; } }`
+	const elided = `interfaces { ge-0/0/0 description "wan uplink"; }`
+	tb, te := compileText(t, braced), compileText(t, elided)
 	if tb == nil || te == nil {
-		t.Skip("the `then community` fixture does not compile in this tree; the inventory's " +
+		t.Skip("the description fixture does not compile in this tree; the inventory's " +
 			"drop shape is the binding record for it")
 	}
 	if cfgEqual(tb, te) {
-		t.Log("`then community` now compiles identically in both spellings — it may no longer be " +
-			"partial. Re-derive the policy-options scope against the current inventory before " +
+		t.Log("`<instance> description` now compiles identically in both spellings — it " +
+			"may no longer be partial. Re-derive against the current inventory before " +
 			"widening further")
 	}
 }
