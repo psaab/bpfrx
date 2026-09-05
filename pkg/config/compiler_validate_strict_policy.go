@@ -180,6 +180,13 @@ func validatePolicyMatchApplicationsStrict(cfg *Config) error {
 	// (#3146 — the same fail-open class this gate kills).
 	// #2217's validateApplicationSetMembersStrict `continue`s on an empty set,
 	// so nothing else catches it.
+	// issue 8889: ONE memo for the whole validation, not one per policy. Every
+	// referencing policy re-expanded the same sets from scratch, so the real
+	// cost was N_policies x B^4 -- 8 policies took 357ms at B=16 and 1125ms at
+	// B=20. A per-call memo removes only the within-policy factor; sharing it
+	// across the loop removes both. This runs under the store's READ lock in
+	// CommitCheck, so writers (Commit, Load, HA SyncApply) queue behind it.
+	appSetExpansions := newAppSetMemo()
 	appRefError := func(scope, policyName, name string) error {
 		switch name {
 		case "", "any":
@@ -192,7 +199,7 @@ func validatePolicyMatchApplicationsStrict(cfg *Config) error {
 			// A malformed member (ExpandApplicationSet error) is #2217's gate's
 			// job and runs first; here a clean expansion to zero members is the
 			// empty-set fail-open (#3146).
-			expanded, err := ExpandApplicationSet(name, &cfg.Applications)
+			expanded, err := expandAppSetMemo(name, &cfg.Applications, 0, appSetExpansions)
 			if err == nil && len(expanded) == 0 {
 				return policyMatchEmptyAppSetError(scope, policyName, name)
 			}
