@@ -64,7 +64,6 @@ func TestSitesThatCannotBeSeparatedShareAClass8690(t *testing.T) {
 
 	keysBySite := map[string]map[[2]string]bool{}
 	allKeys := map[[2]string]bool{}
-	realKeys := map[[2]string]bool{}
 	for _, s := range collectCompactSites() {
 		if len(s.container) == 0 || strings.HasPrefix(s.container[0], "groups") {
 			continue
@@ -84,9 +83,6 @@ func TestSitesThatCannotBeSeparatedShareAClass8690(t *testing.T) {
 		if len(keys) > 0 {
 			keysBySite[siteKey] = keys
 		}
-		for k := range recordScopeKeys8690(text, false) {
-			realKeys[k] = true
-		}
 		for k := range keys {
 			allKeys[k] = true
 		}
@@ -97,63 +93,63 @@ func TestSitesThatCannotBeSeparatedShareAClass8690(t *testing.T) {
 			"vacuous (#8690)")
 	}
 
-	// NON-VACUITY, and a MEASURED correction to why this recorder is admit-all.
+	// WHY THE RECORDER IS ADMIT-ALL, and the limit that follows from it.
 	//
-	// The intent was that admit-all explores PAST a refusal, so the recorded
-	// chain would not be truncated at today's scope. Asserting that as a hard
-	// control FAILED on the real code, which is how the assumption got checked:
+	// The intent was that admit-all explores PAST a refusal, so a recorded
+	// chain is not truncated at today's scope. Asserting that as a hard control
+	// FAILED on the real code, which is how the assumption got checked:
 	// admit-all observes exactly the same keys as the real predicate for every
-	// site here. At the packing the census synthesizes, folding a node does not
-	// expose a further packed node, so these chains are ONE LINK and there is
-	// nothing past the refusal to reach.
+	// site here. At the packing this census synthesizes, folding a node does
+	// not expose a further packed node, so these chains are ONE LINK and there
+	// is nothing past a refusal to reach.
 	//
-	// READ THAT AS A FACT ABOUT THE FIXTURES, NOT ABOUT THE PASS. It is easy to
-	// take "these chains are one link" as a property of the normalizer, and it
-	// is not -- it is a property of the packing this census synthesizes. The
-	// same content written the way a config file writes it produces three
-	// links, measured with an injected recorder (#8763):
+	// READ THAT AS A FACT ABOUT THE FIXTURES, NOT ABOUT THE PASS. The same
+	// content written the way a config file writes it produces three links:
 	//
 	//	family inet { dhcp lease-time 600; }   touched=0  asked=[]
 	//	family inet dhcp lease-time 600;       touched=3  asked=[family inet | inet dhcp | dhcp lease-time]
 	//
-	// So admit-all IS load-bearing for a real spelling and observes nothing
-	// extra only here. The first version of this note said "0 is expected"
-	// without that qualifier, which would have told a future reader that
-	// chains do not cascade -- a claim about production drawn from a probe
-	// artifact, which is the exact error this file has recorded three lanes
-	// making today.
-	//
-	// (That the braced spelling asks NOTHING is #8763, a traversal defect in
-	// the pass, not a property of packing. It is why the two lines differ by
+	// (The braced form asking NOTHING is #8763, a traversal defect in the pass
+	// rather than a property of packing, which is why those two lines differ by
 	// more than link count.)
 	//
-	// lane-8367's multi-link chains were
-	// measured on MAXIMALLY-packed spellings; this fixture set is not that.
+	// That claim is ASSERTED, not left in prose:
+	// TestRealSpellingsCascadeUnlikeTheCensusPacking8690 pins that a one-line
+	// spelling consults more than one key. A second recorder pass used to run
+	// here to compute the same fact and only LOG it — an unasserted traversal
+	// with no claim attached — and it is gone; the assertion in that cell is
+	// where the fact belongs.
 	//
-	// The recorder stays admit-all because it is correct for the case where
-	// chains do cascade, and costs nothing where they do not. But the claim
-	// this cell can make is correspondingly narrower, so it is stated rather
-	// than assumed: the comparison below is over the keys consulted AT THIS
-	// PACKING. A pair that looks separable here can share a key at another one.
+	// ── THE LIMIT THIS PUTS ON THE COMPARISON BELOW ──────────────────────────
 	//
-	// What is still asserted is the part that would make the cell vacuous: the
-	// recorder must observe something. A recorder wired to the wrong function,
-	// or one never invoked, records nothing and every site trivially "agrees".
-	widened := 0
-	for k := range allKeys {
-		if !realKeys[k] {
-			widened++
-		}
-	}
-	if len(allKeys) == 0 {
-		t.Fatal("the recorder observed NO scope keys at all — it is not reaching the " +
-			"pass, so every comparison below is between empty sets and passes for the " +
-			"wrong reason (#8690)")
-	}
-	t.Logf("#8690 recorder: %d key(s) observed, %d reachable only with admit-all "+
-		"(0 expected: the CENSUS FIXTURES are one link — a real spelling is not, "+
-		"see the note above)",
-		len(allKeys), widened)
+	// THE CONTAINMENT TEST DEGENERATES TO EQUALITY HERE, and the cell's name
+	// promises more than that. Every key set this cell compares has exactly ONE
+	// element, so there are no proper subset relations at all.
+	//
+	// The counts are deliberately NOT written here. A comment carrying "10
+	// equal pairs, 0 proper subsets" is accurate for one head and wrong at the
+	// next — the register moved from 68 sites to 66 while this note was being
+	// written. The SHAPE is the claim, and the check below enforces it; the
+	// numbers are logged where they can be read fresh.
+	//
+	// A one-element set contains another only by being equal to it, so
+	// `subset()` never takes its general branch and what this cell tests is
+	// "sites sharing THE SAME SINGLE KEY share a class". That is the live
+	// ipsec/ike hazard and it is worth guarding — but it is not chain
+	// containment, and a reader who sees `subset` will assume it is.
+	//
+	// The danger is the reading rather than the code. At REAL packings chains
+	// are two to four links, which is where proper subsets would exist and
+	// where this guard would matter most; it looks where chains are one link
+	// long. A guard built to catch census artifacts is itself measuring at the
+	// census packing — the fourth form of that error found today, and the first
+	// found inside the countermeasure.
+	//
+	// So: a RED here is a definite hazard. A GREEN is "no hazard among sites
+	// whose single census key matches", not "these sites are separable".
+	// properSubsets below keeps that note from going stale.
+	t.Logf("#8690 recorder: %d distinct key(s) observed across %d register site(s)",
+		len(allKeys), len(keysBySite))
 
 	subset := func(a, b map[[2]string]bool) bool {
 		if len(a) > len(b) {
@@ -171,6 +167,25 @@ func TestSitesThatCannotBeSeparatedShareAClass8690(t *testing.T) {
 		sites = append(sites, s)
 	}
 	sort.Strings(sites)
+
+	// Keep the note above honest. If key sets ever stop being single-element,
+	// `subset()` starts doing what its name says and the degeneracy paragraph
+	// becomes false — a comment describing a version of the code that no longer
+	// exists, which is the defect class this file was built to record.
+	//
+	// This reds on an IMPROVEMENT, deliberately, and asks for a comment change
+	// rather than a revert. Nothing here should be reverted to make it green.
+	sizes, equalPairs, properSubsets, multiKey := keySetShape8690(keysBySite)
+	t.Logf("#8690 key-set shape: sizes=%v, %d ordered pair(s) with EQUAL sets, "+
+		"%d with a PROPER subset", sizes, equalPairs, properSubsets)
+	if multiKey > 0 || properSubsets > 0 {
+		t.Errorf("the degeneracy note above is now FALSE: %d site(s) have a key set "+
+			"larger than one element and %d proper subset relation(s) exist. `subset()` "+
+			"has started doing what its name says, which is an IMPROVEMENT — the guard "+
+			"now covers chain containment rather than only shared single keys. UPDATE "+
+			"THE NOTE to say so; do not revert anything to make this green (#8690)",
+			multiKey, properSubsets)
+	}
 
 	var bad []string
 	for _, a := range sites {
@@ -241,4 +256,101 @@ func TestRealSpellingsCascadeUnlikeTheCensusPacking8690(t *testing.T) {
 			"cell above should drop its two-line table, which describes the pre-fix "+
 			"behaviour", len(braced), len(keys))
 	}
+}
+
+// keySetShape8690 summarises a site->keys map: the size distribution, and how
+// many ordered pairs stand in an EQUAL or a PROPER-subset relation.
+//
+// Extracted from the cell so it can be exercised against a SYNTHETIC input.
+// Inside the cell it only ever sees single-element sets, so every mutation of
+// its subset arithmetic escaped — the arms that matter cannot fire on today's
+// data. That is the same reason #8613 built its census machinery a synthetic
+// struct to run against.
+func keySetShape8690(keysBySite map[string]map[[2]string]bool) (sizes map[int]int, equalPairs, properSubsets, multiKey int) {
+	sizes = map[int]int{}
+	sub := func(a, b map[[2]string]bool) bool {
+		if len(a) > len(b) {
+			return false
+		}
+		for k := range a {
+			if !b[k] {
+				return false
+			}
+		}
+		return true
+	}
+	for a, ka := range keysBySite {
+		sizes[len(ka)]++
+		if len(ka) > 1 {
+			multiKey++
+		}
+		for b, kb := range keysBySite {
+			if a == b || !sub(kb, ka) {
+				continue
+			}
+			if len(kb) == len(ka) {
+				equalPairs++
+			} else {
+				properSubsets++
+			}
+		}
+	}
+	return sizes, equalPairs, properSubsets, multiKey
+}
+
+// The freshness guard above fires only when key sets stop being single-element,
+// which cannot happen at this packing — so nothing in the live cell can kill a
+// mutation of its arithmetic. This exercises the same function against inputs
+// that DO have the shapes it is meant to detect.
+func TestKeySetShapeDetectsWhatTheNoteDenies8690(t *testing.T) {
+	k := func(pairs ...[2]string) map[[2]string]bool {
+		m := map[[2]string]bool{}
+		for _, p := range pairs {
+			m[p] = true
+		}
+		return m
+	}
+	a := [2]string{"family", "inet"}
+	b := [2]string{"inet", "filter"}
+	c := [2]string{"filter", "input"}
+
+	t.Run("today's shape: all single, no relations but equality", func(t *testing.T) {
+		sizes, eq, proper, multi := keySetShape8690(map[string]map[[2]string]bool{
+			"s1": k(c), "s2": k(c), "s3": k(a),
+		})
+		if multi != 0 || proper != 0 {
+			t.Errorf("single-element sets reported multiKey=%d proper=%d", multi, proper)
+		}
+		if eq != 2 {
+			t.Errorf("equalPairs=%d, want 2 (s1<->s2 both directions)", eq)
+		}
+		if sizes[1] != 3 {
+			t.Errorf("sizes=%v, want three single-element sets", sizes)
+		}
+	})
+
+	t.Run("a chain: proper subset detected", func(t *testing.T) {
+		_, _, proper, multi := keySetShape8690(map[string]map[[2]string]bool{
+			"deep":    k(a, b, c),
+			"shallow": k(c),
+		})
+		if proper != 1 {
+			t.Errorf("properSubsets=%d, want 1 — {c} is strictly inside {a,b,c}, which "+
+				"is the containment the cell's name promises and the case its live "+
+				"data cannot produce", proper)
+		}
+		if multi != 1 {
+			t.Errorf("multiKey=%d, want 1", multi)
+		}
+	})
+
+	t.Run("disjoint sets are neither", func(t *testing.T) {
+		_, eq, proper, _ := keySetShape8690(map[string]map[[2]string]bool{
+			"x": k(a), "y": k(b),
+		})
+		if eq != 0 || proper != 0 {
+			t.Errorf("disjoint single-element sets reported eq=%d proper=%d — the "+
+				"relation would then hold between any two sites", eq, proper)
+		}
+	})
 }

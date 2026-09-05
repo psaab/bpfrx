@@ -100,6 +100,9 @@ Keep stable area IDs for ownership and `--area`; refresh actual paths/counts:
 | A9 | Telemetry, flow export, logging, SNMP, probes, feeds, event automation and monitoring |
 | A10 | DHCP/DDNS/services, policy simulator, CLI, `cmd/`, packaging, image/upgrade/deploy/build tooling |
 
+These file areas also require the cross-cutting kernel/NIC, networking, and
+high-performance experts defined below; A1 and A7 do not subsume that expertise.
+
 Assign unmapped files explicitly. Test files include Rust `tests.rs`,
 `*_tests.rs`, `tests_*`, Go `*_test.go`, Python tests, and shell harnesses;
 production and test code may also coexist in one file. Counts alone do not
@@ -181,6 +184,65 @@ the actual behavior, and record consequential omissions or missing expertise.
   tooling for integrity/authenticity checks, TOCTOU, path/scheme validation and
   recovery.
 
+### Required cross-cutting experts
+
+Retain A1–A10 as file-area IDs. The following are additional review roles, not
+new `--area` values or disjoint file batches. Full reviews assign all three;
+focused and change-based reviews assign those implicated by the selected
+contracts, dependencies or workloads without expanding the requested scope.
+Record applicability, named reviewer, affected areas, contract, and expected
+evidence in the worklist. Record a reason for non-applicability or an explicit
+coverage gap when relevant expertise cannot be supplied.
+
+One reviewer may cover multiple roles, but each role's scope and conclusions
+remain explicit; that does not count as independent verification. Include the
+applicable cross-cutting checklist in each assignment. Do not discharge these
+roles with an A1/A7 label or a generic `HPC/invariant check` sentence.
+
+- **Linux kernel and NIC datapath expert.** Own the kernel/driver/userspace
+  contract across A1, A6, A7 and their consumers: AF_XDP/XDP and libxdp/libbpf
+  interfaces; RX/TX/fill/completion rings, descriptor publication and UMEM
+  ownership/reclamation; mapped-memory and socket/map lifetime through setup,
+  failure and teardown. Review `need_wakeup`, NAPI/busy-poll and interrupt/error
+  paths, queue/RSS configuration, native/generic attach and zero-copy/copy modes,
+  and the checksum, VLAN and segmentation offloads actually used. Follow
+  redirect/drop/host-stack handoff and netfilter/nftables interaction without
+  assuming userspace and kernel paths enforce identical protections.
+  Challenge whether ring pressure, partial attachment, interface churn or driver
+  fallback preserves ownership, forward progress and enforcement. Ground
+  dependency claims in the relevant kernel, driver and library versions; an old
+  workaround or historical BPF path is not the current kernel contract. Read
+  `userspace-dp/src/afxdp/umem/README.md`, the relevant worker/FFI/shim docs and
+  `pkg/dataplane/README.md`, then verify the participating source and modes.
+- **Network protocols and firewall architecture expert.** Own packet semantics
+  across A1/A2/A3/A5/A6/A7 and relevant services: Ethernet/VLAN, ARP/IPv6 neighbor
+  discovery, IPv4/IPv6, TCP/UDP/ICMP, fragment and extension-header handling,
+  MTU/PMTUD and generated errors. Follow supported tunnel encapsulation and
+  decapsulation, routing/neighbor decisions, NAT, policy and session state in
+  both directions, including asymmetric paths and HA transitions. Check that
+  zone/VRF/interface identity and policy meaning survive transformations and
+  cached/fast-path decisions. Challenge assumptions about packet completeness,
+  classification, state freshness and the authority of control traffic; preserve
+  both denied-traffic protection and permitted-traffic correctness. Read the
+  relevant forwarding, NAT, routing, tunnel and HA contracts and cite applicable
+  protocol requirements. Do not invent support promises or accept simulator/
+  runtime agreement as an independent protocol oracle.
+- **High-performance systems coding expert.** Own cost and scalability across
+  packet processing, new-flow installation, shared state, HA replication,
+  control updates and telemetry, not only Rust micro-optimizations. Review
+  allocations, copies, syscalls, data layout and working-set size; cache locality,
+  false sharing, NUMA and CPU/queue affinity; lock/atomic contention, memory
+  ordering and reclamation; hash/index behavior, batching and amortized work.
+  Account for growth with flows, rules, workers and peers, including fan-out,
+  cancellation, expiry and recovery. Challenge whether pressure, queue skew or
+  slow consumers violate bounded work, backpressure, scheduling fairness or
+  management responsiveness. Preserve correctness and isolation in proposed
+  optimization directions; "lock-free", "zero-copy" and "branchless" are not
+  performance evidence. Read `docs/engineering-style.md`, relevant worker/queue
+  docs and `docs/userspace-newflow-ceiling.md`. Use the shared workload/evidence
+  requirements to distinguish source cost bounds from measured bottlenecks,
+  hardware effects and end-to-end improvement.
+
 The validation-assurance assignment also needs a **test/reliability engineer**
 perspective: test registration and selection, production-path and artifact
 identity, independent oracles, meaningful failure observations, concurrency and
@@ -225,7 +287,8 @@ when their supporting assumptions or dependencies changed.
 Use bounded assignments and the available concurrency; do not assume a named
 agent host/tool is installed. Follow `AGENTS.md` when delegating and give each
 worker the run manifest, scope, specialist persona and applicable checklist,
-behavior contract, adversarial questions, relevant history, and report location.
+cross-cutting expert ownership, behavior contract, adversarial questions,
+relevant history, and report location.
 Limit simultaneous builds to available resources. Reallocate effort when the
 next useful step needs evidence a batch cannot supply. Preserve unfinished work
 and its next check; do not manufacture a negative result to complete a checklist.
