@@ -937,12 +937,58 @@ func TestElisionSuppressedAValidation8879(t *testing.T) {
 	//	elided, bad reference  ->  COMMITTED CLEAN     (fail-open)
 	//
 	// The operator gets no value AND no complaint, and it inverts the usual
-	// intuition that the more explicit spelling is the risky one. Both are
-	// closed by admitting the pair; both were measured two-sided when found.
-	for _, c := range []struct{ pair, braced, elided, costs string }{
+	// intuition that the more explicit spelling is the risky one.
+	//
+	// A FAIL-OPEN CLAIM NEEDS THREE ROWS, NOT TWO, AND THE THIRD IS THE ONE
+	// EVERYONE REACHES PAST:
+	//
+	//	braced, BAD  reference  ->  REJECTED   (the validator exists)
+	//	elided, BAD  reference  ->  ACCEPTED   (the finding)
+	//	braced, GOOD reference  ->  ACCEPTED   (the CONTROL)
+	//
+	// Without the control, "elided accepts" is equally consistent with the
+	// validator never firing on that path AT ALL -- in which case there is no
+	// fail-open, just a validator that does not apply. That is not
+	// hypothetical: `class-of-service forwarding-classes` looked exactly like
+	// a fourth instance until the no-definition control came back ACCEPTED
+	// too, and it would have been filed wrong.
+	//
+	// The control is therefore a REQUIRED FIELD of the table below rather than
+	// a note here, so a fourth row cannot be added without one. A rule that
+	// lives only in a comment is a rule the next person reads after they have
+	// already written the row.
+	//
+	// THE MECHANISM IS NARROWER THAN "ELISION SUPPRESSED A VALIDATION", and
+	// the refinement is what makes the class screenable:
+	//
+	//	REFERENCE-side elision  -> FAILS OPEN. The elided container holds the
+	//	                           statement that NAMES something; dropping it
+	//	                           removes the reference before the check runs,
+	//	                           so nothing is left to complain about.
+	//	DEFINITION-side elision -> FAILS LOUD. The elided container holds the
+	//	                           DEFINITION; dropping it makes a reference
+	//	                           elsewhere dangle, and the check fires.
+	//
+	// All three rows here are reference-side. Screened the remaining #8943
+	// population against it: of the 16 un-admitted rows only `flow-monitoring
+	// version9` and `flow-monitoring version-ipfix` are named by any
+	// cross-reference validator, both are DEFINITION-side, and both were
+	// measured fail-loud (eliding the templates makes the flow-server's
+	// reference dangle and strict commit refuses, matching the no-definition
+	// control exactly). So this class is closed at three among that
+	// population rather than needing 16 individual adjudications.
+	//
+	// A near-miss worth keeping: the first version of that screen elided
+	// `(services, flow-monitoring)` -- a pair admitted in #8879 batch 9, which
+	// folds correctly -- and produced an apparent FOURTH instance. Checking
+	// WHICH PAIR the fixture actually elides is the same discipline that the
+	// #8938 correction turned on.
+	for _, c := range []struct{ pair, braced, elided, control, costs string }{
 		{"routing-options forwarding-table",
 			`routing-options { forwarding-table { export no-such-policy-7717; } }`,
 			`routing-options forwarding-table { export no-such-policy-7717; }`,
+			`policy-options { policy-statement ok-policy-7717 { then accept; } } ` +
+				`routing-options { forwarding-table { export ok-policy-7717; } }`,
 			"ECMP / consistent-hash load-balancing is silently disabled"},
 		// THIRD instance (#8943). Same shape, security-relevant: a
 		// destination-NAT rule naming a pool that does not exist.
@@ -951,12 +997,18 @@ func TestElisionSuppressedAValidation8879(t *testing.T) {
 				`match { destination-address 10.9.0.0/24; } then { destination-nat pool no-such-pool-7717; } } } } } }`,
 			`security { nat destination { rule-set rs1 { from zone untrust; rule r1 { ` +
 				`match { destination-address 10.9.0.0/24; } then { destination-nat pool no-such-pool-7717; } } } } }`,
+			`security { nat { destination { pool ok-pool-7717 { address 10.9.0.9/32; } ` +
+				`rule-set rs1 { from zone untrust; rule r1 { match { destination-address 10.9.0.0/24; } ` +
+				`then { destination-nat pool ok-pool-7717; } } } } } }`,
 			"destination NAT silently does not translate"},
 		{"services ip-monitoring",
 			`services { ip-monitoring { policy ipm1 { match { rpm-probe no-such-probe-7717; } ` +
 				`then { preferred-route { route 203.0.113.0/24 { next-hop 198.51.100.1; } } } } } }`,
 			`services ip-monitoring { policy ipm1 { match { rpm-probe no-such-probe-7717; } ` +
 				`then { preferred-route { route 203.0.113.0/24 { next-hop 198.51.100.1; } } } } }`,
+			`services { rpm { probe ok-probe-7717 { test t1 { probe-type icmp-ping; target address 198.51.100.9; } } } ` +
+				`ip-monitoring { policy ipm1 { match { rpm-probe ok-probe-7717; } ` +
+				`then { preferred-route { route 203.0.113.0/24 { next-hop 198.51.100.1; } } } } } }`,
 			"probe-driven WAN failover silently never arms"},
 	} {
 		t.Run(c.pair, func(t *testing.T) {
@@ -967,6 +1019,17 @@ func TestElisionSuppressedAValidation8879(t *testing.T) {
 				}
 				_, err := CompileConfig(tree)
 				return err != nil
+			}
+			// THE CONTROL, first and fatal. If the validator does not ACCEPT a
+			// GOOD reference, it is not discriminating on the reference at
+			// all, and "elided accepts" below says nothing about elision.
+			// This is the row that stops a non-finding being filed as one.
+			if refused(c.control) {
+				t.Fatalf("%s: the CONTROL (braced spelling, VALID reference) is "+
+					"REFUSED. Then the validator is not discriminating on the "+
+					"reference, and the fail-open assertion below would be "+
+					"evidence about the fixture rather than about elision "+
+					"(#8879).", c.pair)
 			}
 			// LIVENESS, fatal: if the braced arm stops being refused, the
 			// check this row is about no longer exists and the assertion
