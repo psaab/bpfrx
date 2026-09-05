@@ -3141,10 +3141,13 @@ fail-open on a netdev the only row describing it had refused:
 
 - **A canonical alias.** `LinuxIfName` maps `/` to `-` and nothing else, so
   `gr-0/0/3` and `gr-0-0-3` are one device under two authored names — and both
-  are legal, because a fabric member MUST be slot-spelled with slashes for
-  `InterfaceSlot` to resolve it to a node while the interface stanza's name is a
-  wildcard. `validateInterfaceNameCollisionStrict` cannot object: it compares
-  authored interface-map KEYS and there is only one. The verdict's exact map
+  are legal. (When this was written the reason was that a fabric member had to be
+  slot-spelled with slashes for `InterfaceSlot` to resolve it to a node, while
+  the interface stanza's name is a wildcard. #8829 taught `InterfaceSlot` the
+  dash spelling, so BOTH spellings now resolve — the two names remain legal and
+  remain one device, so the collision this round is about is if anything easier
+  to reach, not harder.) `validateInterfaceNameCollisionStrict` cannot object:
+  it compares authored interface-map KEYS and there is only one. The verdict's exact map
   lookup missed the stanza's `tunnel` and voted bindable against an unbindable
   row. Fixed by keying the lookup on the NETDEV (`interfaceConfigForNetdev`).
 - **A re-sampled kernel.** `SyncFabricState` rebuilds the fabric rows from a

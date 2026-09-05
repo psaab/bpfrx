@@ -268,7 +268,14 @@ func gateLeafChangesWarnings(g gateLeaf, pre string, epath []string) bool {
 // `flag` ceiling going 179 -> 209 for the #8807 `then` fix, not this one, and
 // all three buckets sit exactly at their ceilings (141 + 209 + 43 = 393).
 // Re-measured at this head rather than derived by adding two.
-const gateCoverageFloor = 705
+//
+// 705 -> 706 for #8844. Declaring `keys` under `perfect-forward-secrecy`
+// made that spelling COMPARE, and the parent left the enumeration in the
+// same move: it was a childless leaf and now has a child, so `unreachable`
+// drops 141 -> 140 (see the ceiling below). Both deltas are from this one
+// change -- ATTRIBUTED, not assumed: the only schema edit on this branch is
+// the #8844 declaration, and enumerated is unchanged at 1098.
+const gateCoverageFloor = 706
 
 var gateBlindCeiling = map[gateBlindClass]int{
 	// #7492 moved leaves out of `unreachable` in two rounds. The parent
@@ -371,11 +378,24 @@ var gateBlindCeiling = map[gateBlindClass]int{
 	// `pre-shared-key` leaf — the shape its description and compileIPsec always
 	// stated — moved it out of the unreachable class. The ratchet is tightened
 	// here rather than left loose, per this cell's own instruction.
-	// #8830 RECLASSIFICATION, not a regression: 141 -> 134. Seven leaves moved
-	// to `advisory` because they DO change output via a warning, which the
-	// classifier could not see while it compared through gateMarshal (warnings
-	// nulled). Nothing about those leaves changed; the measurement did.
-	gateBlindUnreachable: 134,
+	// Both #8844 and #8830 moved this bucket, in DIFFERENT ways, and the value
+	// below is RE-MEASURED at the merge rather than reconciled from the two.
+	//
+	//   #8844 (already on master) 141 -> 140. A real SHRINK, not a
+	//   reclassification: `perfect-forward-secrecy` was a CHILDLESS leaf
+	//   whose value genuinely landed nowhere, because the compiler reads a
+	//   `keys` CHILD. Declaring that child moved the parent out of the leaf
+	//   enumeration and put `keys` in as COMPARED. The tree got less blind.
+	//
+	//   #8830 (this branch) moves SEVEN leaves to `advisory` -- they DO
+	//   change output, via a warning the classifier could not see while it
+	//   compared through gateMarshal. A pure reclassification: nothing about
+	//   those leaves changed, the measurement did.
+	//
+	// PREDICTED BEFORE MEASURING, so the number is falsifiable rather than
+	// confirmatory: `perfect-forward-secrecy` is NOT one of the seven, so
+	// the two changes are disjoint and 140 - 7 = 133 was expected.
+	gateBlindUnreachable: 133,
 	// #8830: read, value deliberately ignored, advisory says so. Measured at
 	// this head: vrrp-group track-interface priority-cost (inet and inet6),
 	// security log stream transport tls-profile, system dataplane

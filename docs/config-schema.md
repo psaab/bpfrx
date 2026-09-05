@@ -2165,9 +2165,18 @@ Measured through `configstore.CheckText` on the canonical two-fab shape from
 | `ge-0/0/0` | `ge-7/0/0` | 0 | `fab0` |
 | `ge-0/0/0` | `ge-7/0/0` | 1 | `fab1` |
 | `fabster`  | `ge-7/0/0` | 0 | **`""` — outage** |
-| `ge-0-0-0` | `ge-7-0-0` | 0 | **`""` — outage** |
-| `ge-0-0-0` | `ge-7-0-0` | 1 | **`""` — outage** |
+| `ge-0-0-0` | `ge-7-0-0` | 0 | `fab0` (was **`""` — outage** before #8829) |
+| `ge-0-0-0` | `ge-7-0-0` | 1 | `fab1` (was **`""` — outage** before #8829) |
 | `ge-0/0/99` | `ge-7/0/99` | 0 | `fab0` (derives; see scope below) |
+
+The two `ge-0-0-0` rows were re-measured after #8829 and INVERTED. That change
+taught `InterfaceSlot` the operational dash spelling, so the dash form now
+derives exactly like the slash form and is no longer rejected at commit. It also
+brings up identically: every consumer resolves a member through `LinuxIfName`,
+which is `ReplaceAll(name, "/", "-")` and so idempotent on the dash form, making
+`ge-0-0-0` and `ge-0/0/0` the same kernel netdev at `LinkByName`. The gate still
+rejects `fabster`, which is the case it was built for — a name that parses to no
+FPC slot and therefore derives nothing.
 
 Note the member LIST is populated in every row, including the outage rows — an
 assertion that `FabricMembers` is non-empty stays green straight through the
@@ -2193,9 +2202,10 @@ more specific zone diagnostic still wins the first-error slot).
 **This is also why the gate is node-agnostic.** One config text describes both
 nodes and is synced verbatim between them, so a check whose answer depended on
 which node evaluated it would accept on one node and reject on its peer,
-wedging the sync. `ge-0/0/0` and `ge-7/0/0` parse on both nodes; `fabster` and
-`ge-0-0-0` parse on neither. The gate therefore rejects the typo on either node,
-which is what an operator wants at the terminal they typed it on.
+wedging the sync. `ge-0/0/0` and `ge-7/0/0` parse on both nodes, as do
+`ge-0-0-0` and `ge-7-0-0` since #8829; `fabster` parses on neither. The gate
+therefore rejects the typo on either node, which is what an operator wants at
+the terminal they typed it on.
 
 Not to be confused with the `.unit`-reference validation (#5933) above: that
 gate validates the `.unit` SUFFIX of a `<if>.<unit>` reference via
