@@ -1694,7 +1694,36 @@ func compileSNMP(node *Node, sys *SystemConfig, cfg *Config, lenient bool) error
 				// cannot silently drop an earlier block's source-IP allowlist.
 				var blockAuth string
 				var blockClients []SNMPClient
-				for _, prop := range commChildren {
+				// #8778: flat `set` builds a CHAIN, not siblings. The command
+				//   set snmp community public authorization read-only clients 10.0.0.0/8
+				// produces
+				//   community public
+				//     authorization read-only
+				//       clients 10.0.0.0/8        <- CHILD of authorization
+				// so a loop over one level sees `authorization` and never sees
+				// `clients` at all. The allowlist was silently dropped, and an
+				// empty allowlist is documented allow-all rather than deny —
+				// the operator's restriction inverted, on a commit that
+				// succeeded. Splitting the same statements across two `set`
+				// lines enforced correctly, so the difference was a line break.
+				//
+				// Descend only through keywords this switch recognises. A
+				// `clients` node's own children hold its VALUE tokens (prefixes
+				// and `restrict`), which parseSNMPClients reads and which must
+				// not be mistaken for statements.
+				var stmts []*Node
+				var collect func(nodes []*Node)
+				collect = func(nodes []*Node) {
+					for _, n := range nodes {
+						switch n.Name() {
+						case "authorization", "clients":
+							stmts = append(stmts, n)
+							collect(n.Children)
+						}
+					}
+				}
+				collect(commChildren)
+				for _, prop := range stmts {
 					switch prop.Name() {
 					case "authorization":
 						blockAuth = nodeVal(prop)
@@ -1707,10 +1736,41 @@ func compileSNMP(node *Node, sys *SystemConfig, cfg *Config, lenient bool) error
 						blockClients = append(blockClients, parseSNMPClients(prop)...)
 					}
 				}
-				// Flat form: community public authorization read-only
-				for i := 2; i < len(child.Keys)-1; i++ {
-					if child.Keys[i] == "authorization" {
-						blockAuth = child.Keys[i+1]
+				// Flat form: the whole community body can arrive packed onto
+				// this node's Keys —
+				//   community public authorization read-only clients 10.0.0.0/8
+				// — which is what `set snmp community public authorization
+				// read-only clients 10.0.0.0/8` produces, and what the
+				// brace-elided hierarchical spelling produces too.
+				//
+				// #8778: this loop read `authorization` and NOT `clients`, so
+				// the one-line spelling compiled to an EMPTY allowlist. That is
+				// not a smaller allowlist, it is the INVERSE of one: AllowsSource
+				// documents `len(Clients) == 0` as allow-all (the Junos default),
+				// so the community became answerable from every source while the
+				// operator's config said otherwise and the commit reported
+				// success. Splitting the same statements across two `set` lines
+				// enforced correctly, so the difference was a line break.
+				//
+				// The run after `clients` is handed to parseSNMPClients rather
+				// than parsed here, so the `restrict` modifier and the #5898
+				// orphan-`restrict` fail-closed path behave identically to the
+				// braced spelling instead of being reimplemented beside them.
+				for i := 2; i < len(child.Keys); i++ {
+					switch child.Keys[i] {
+					case "authorization":
+						if i+1 < len(child.Keys) {
+							blockAuth = child.Keys[i+1]
+						}
+					case "clients":
+						j := i + 1
+						for j < len(child.Keys) &&
+							child.Keys[j] != "authorization" && child.Keys[j] != "clients" {
+							j++
+						}
+						run := append([]string{"clients"}, child.Keys[i+1:j]...)
+						blockClients = append(blockClients, parseSNMPClients(&Node{Keys: run})...)
+						i = j - 1
 					}
 				}
 				// #4834: reject/warn on an unparseable `clients` entry before
