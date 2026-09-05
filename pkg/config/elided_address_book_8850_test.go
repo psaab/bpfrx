@@ -162,10 +162,19 @@ func TestElidedAddressBook8850(t *testing.T) {
 // the missing-becomes-EMPTY inversion this whole issue exists to avoid, and it
 // was silent on BOTH paths -- strict and lenient both accept it.
 //
-// It also shows why the #8768 pair guard could not see it: that cell spells the
-// set BRACED (`address-set s1 { address a1; }`), which lands in the decline
-// branch and never reaches the splitter. The ELIDED spelling is a different
-// path through the same container, so this cell asserts on it directly.
+// WHY THE #8768 PAIR GUARD COULD NOT SEE IT, which is the durable half: at the
+// time, that cell's fixture spelled the set BRACED (`address-set s1 { address
+// a1; }`). The braced spelling lands in the #8850 decline branch and never
+// reaches the splitter at all, so the guard was exercising a DIFFERENT PATH
+// THROUGH THE SAME CONTAINER than the one under test. A fixture can name the
+// right container, the right leaf and the right pair and still miss the code
+// it is pointed at, because the SPELLING selects the path.
+//
+// That fixture has since been rewritten flat, so the guard now reaches the
+// splitter and this cell is no longer the only thing covering it. The comment
+// stays because the reason it was blind outlives the blindness -- and because
+// this cell asserts something the pair guard still does not: that the member
+// is not silently reparented into a top-level entry.
 func TestPackedAddressSetKeepsItsMembers8850(t *testing.T) {
 	for _, tc := range []struct{ name, txt string }{
 		{"global-elided", "security { address-book { global address-set s1 address a1; } }"},
