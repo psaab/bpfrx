@@ -149,6 +149,31 @@ records this in a `filedByDesign` category so the entry is not mistaken for one
 awaiting a fix. #6821's two leaves USED to sit in the same category; they moved
 to `filedFixed` once `packedTail` removed their blocker.
 
+**Making a packed container body work is THREE decisions, and they have an
+order.** Declaring arity on a leaf is the last of them and is INERT on its own —
+a fix that changes only the arity measures as correct on any harness that forces
+the other two and changes nothing in the shipped product.
+
+| decision | what it controls | symptom when missing |
+|---|---|---|
+| the pair is admitted to `compactNormalizeInScope` | **whether** the tail folds at all | the tail stays on the node's `Keys`; a compiler looping `node.Children` sees an empty body |
+| `packedStatements: true` on the container | **how** the folded tail splits | the tail becomes a CHAIN — each statement nested under the previous — so everything after the first is lost |
+| `args: N` on each leaf | where each statement **ends** | the split cannot find the boundary and declines to guess |
+
+The IKE gateway had all three wrong at once, which is why the symptom moved
+depending on statement ORDER: `gateway gw1 external-interface ge-0/0/0
+local-identity hostname foo;` compiled the external-interface and silently
+dropped the identity, while the same statements in the other order dropped
+everything — because the *first* leaf decides whether the pass fires. An
+order-dependent symptom is the signature of this trio rather than of any one of
+them.
+
+**Diagnose it with a control that varies the SUSPECTED-INNOCENT leaf.** Two
+`args`-declared siblings in one packed tail (`external-interface ge-0/0/0
+ike-policy pol1`) lost the second one too — which refuted "the leaf with no
+arity is the problem" in one measurement, since neither of those leaves lacks
+arity.
+
 A group applying a stanza in the compact spelling over an existing same-name
 peer drops the group's value (#7648). That is a property of the group merge
 rather than of any compiler, and it predates these fixes — but #6822 changes its

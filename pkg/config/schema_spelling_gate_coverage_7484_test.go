@@ -161,7 +161,25 @@ func classifyGateBlindLeaf(g gateLeaf) gateBlindClass {
 // +2 here. The gate itself asked for this: it reports a floor it can now beat
 // as "COVERAGE IMPROVED — TIGHTEN THE RATCHET (this is a good failure)", and
 // leaving it slack would let a later regression drop back to 689 unnoticed.
-const gateCoverageFloor = 703
+// LOWERED 703 -> 699 for the #8781-follow-up IKE identity fix, and the cause was
+// found rather than the floor moved to make a red go away — which is what the
+// failure message demands.
+//
+// The four leaves are `local-identity` and `remote-identity` on each of the two
+// `gateway` containers (security ike, security ipsec). They did not stop
+// compiling; they left this gate's ENUMERABLE POPULATION, because it enumerates
+// leaves of arity <= 1 and those four now correctly declare `args: 2`. The
+// compiler reads two tokens after the keyword and the schema description says
+// "type and value" — the arity was the thing that was wrong, and with it wrong
+// a packed gateway body silently dropped the IKE identity.
+//
+// So this is a real trade and it is recorded as one: four leaves lose a
+// spelling-gate verdict, and in exchange their packed spelling stops discarding
+// an IKE peer identity. TestIKEGatewayPackedTailCarriesIdentity covers them
+// directly instead, asserting the compiled struct rather than a spelling
+// comparison — a narrower guard on a specific pair, not a replacement for this
+// one's breadth.
+const gateCoverageFloor = 699
 
 var gateBlindCeiling = map[gateBlindClass]int{
 	// #7492 moved leaves out of `unreachable` in two rounds. The parent

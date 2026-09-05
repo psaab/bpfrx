@@ -52,6 +52,75 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 	const ikeProp = "proposal pr1 { authentication-method pre-shared-keys; dh-group group14; " +
 		"authentication-algorithm sha1; encryption-algorithm aes-128-cbc; }"
 	return map[string]packedOptInCase8768{
+		// #8781-follow-up: the IKE gateway opted in so a packed body carries
+		// `local-identity`/`remote-identity`. The schema declares the container
+		// TWICE — under `security ike` and under `security ipsec` — and this
+		// guard requires a case for each, so an opt-in cannot ship exercised on
+		// one spelling and unmeasured on the other.
+		"security/ike/gateway": {
+			prefix: "security { ike { " + ikeProp + " policy pol1 { proposals pr1; pre-shared-key ascii-text \"s\"; } ",
+			open:   "gateway gw1",
+			closer: " } }",
+			stmts: map[string]string{
+				"address":             "address 192.0.2.1",
+				"local-address":       "local-address 192.0.2.2",
+				"ike-policy":          "ike-policy pol1",
+				"external-interface":  "external-interface ge-0/0/0",
+				"local-certificate":   "local-certificate cert1",
+				"version":             "version v2-only",
+				"nat-traversal":       "nat-traversal disable",
+				"no-nat-traversal":    "no-nat-traversal",
+				"local-identity":      "local-identity hostname foo",
+				"remote-identity":     "remote-identity hostname bar",
+				"dead-peer-detection": "dead-peer-detection",
+				"dynamic":             "dynamic hostname peer.example",
+			},
+			read: func(c *Config) string {
+				out := ""
+				for _, g := range c.Security.IPsec.Gateways {
+					out += fmt.Sprintf("addr=%q la=%q pol=%q ext=%q cert=%q ver=%q nat=%q local=%q/%q remote=%q/%q",
+						g.Address, g.LocalAddress, g.IKEPolicy, g.ExternalIface,
+						g.LocalCertificate, g.Version, g.NATTraversal,
+						g.LocalIDType, g.LocalIDValue, g.RemoteIDType, g.RemoteIDValue)
+				}
+				if out == "" {
+					return "<no gateway>"
+				}
+				return out
+			},
+		},
+		"security/ipsec/gateway": {
+			prefix: "security { ipsec { ",
+			open:   "gateway gw1",
+			closer: " } }",
+			stmts: map[string]string{
+				"address":             "address 192.0.2.1",
+				"local-address":       "local-address 192.0.2.2",
+				"ike-policy":          "ike-policy pol1",
+				"external-interface":  "external-interface ge-0/0/0",
+				"local-certificate":   "local-certificate cert1",
+				"version":             "version v2-only",
+				"nat-traversal":       "nat-traversal disable",
+				"no-nat-traversal":    "no-nat-traversal",
+				"local-identity":      "local-identity hostname foo",
+				"remote-identity":     "remote-identity hostname bar",
+				"dead-peer-detection": "dead-peer-detection",
+				"dynamic":             "dynamic hostname peer.example",
+			},
+			read: func(c *Config) string {
+				out := ""
+				for _, g := range c.Security.IPsec.Gateways {
+					out += fmt.Sprintf("addr=%q la=%q pol=%q ext=%q cert=%q ver=%q nat=%q local=%q/%q remote=%q/%q",
+						g.Address, g.LocalAddress, g.IKEPolicy, g.ExternalIface,
+						g.LocalCertificate, g.Version, g.NATTraversal,
+						g.LocalIDType, g.LocalIDValue, g.RemoteIDType, g.RemoteIDValue)
+				}
+				if out == "" {
+					return "<no gateway>"
+				}
+				return out
+			},
+		},
 		"snmp/trap-group": {
 			prefix: "snmp { ",
 			open:   "trap-group tg1",
