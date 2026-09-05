@@ -1235,7 +1235,12 @@ var schemaSNMP = &schemaNode{desc: "SNMP configuration", children: map[string]*s
 		// is paired to its prefix by parseSNMPClients.
 		"clients": {desc: "Source-IP allowlist for this community (<prefix> [restrict])", args: 1, multi: true, placeholder: "<prefix>", children: nil},
 	}},
-	"trap-group": {desc: "Trap group", args: 1, placeholder: "<group-name>", children: map[string]*schemaNode{
+	// packedStatements (#8768): compileSNMP reads `targets` and `version` as
+	// separate statements, and the packed spelling
+	// `trap-group tg1 targets 10.0.0.1 version v2;` used to collapse both into
+	// one node, silently losing the version. Measured: with the split the packed
+	// and braced spellings compile identically.
+	"trap-group": {desc: "Trap group", args: 1, placeholder: "<group-name>", packedStatements: true, children: map[string]*schemaNode{
 		"targets": {
 			desc:        "Trap target host (IP address or FQDN, optional :port)",
 			args:        1,
