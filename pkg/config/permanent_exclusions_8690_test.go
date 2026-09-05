@@ -114,12 +114,27 @@ func TestPermanentExclusionsMatchTheInventory8690(t *testing.T) {
 	for _, s := range sites {
 		inInv[s] = true
 	}
-	var becameAdmissible, unclassifiedDrift []string
+	// SPLIT BY CLASS. A site leaving the inventory means a widening normalized
+	// it, and what that MEANS depends entirely on the class it was filed under.
+	// For a permanent class it is a violation. For an open one it is the
+	// question being ANSWERED — `permanentClasses8690` deliberately excludes
+	// `open`, `gate-open-question`, `unmeasurable` and `unclassified`, because
+	// this register's own note says a red is available work until somebody
+	// answers it. Reporting both with "this register says must never be
+	// normalized" told the second group something false about themselves.
+	var becameAdmissible, answered, unclassifiedDrift []string
 	for site, e := range reg {
-		if !inInv[site] {
-			becameAdmissible = append(becameAdmissible, site+" ("+e.class+": "+e.reason+")")
+		if inInv[site] {
+			continue
+		}
+		row := site + " (" + e.class + ": " + e.reason + ")"
+		if permanentClasses8690[e.class] {
+			becameAdmissible = append(becameAdmissible, row)
+		} else {
+			answered = append(answered, row)
 		}
 	}
+	sort.Strings(answered)
 	for _, s := range sites {
 		if _, ok := reg[s]; !ok {
 			unclassifiedDrift = append(unclassifiedDrift, s)
@@ -128,6 +143,16 @@ func TestPermanentExclusionsMatchTheInventory8690(t *testing.T) {
 	sort.Strings(becameAdmissible)
 	sort.Strings(unclassifiedDrift)
 
+	if len(answered) > 0 {
+		t.Errorf("#8690: %d site(s) left the inventory that were filed under a "+
+			"NON-permanent class:\n  %s\n\n"+
+			"This is the expected way an open question ends: somebody measured "+
+			"the site and normalized it. It still reds, because a register that "+
+			"keeps answered questions is the accumulating list this file exists "+
+			"not to be. REMOVE the entry and put the measurement in the widening's "+
+			"commit — do not reclassify it as permanent to silence this.",
+			len(answered), strings.Join(answered, "\n  "))
+	}
 	if len(becameAdmissible) > 0 {
 		t.Errorf("#8690: %d site(s) left the inventory while still listed in the "+
 			"permanent-exclusion register:\n  %s\n\n"+

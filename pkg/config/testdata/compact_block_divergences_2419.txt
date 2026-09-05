@@ -99,6 +99,14 @@
 # divergent sites are not new defects; they are compact-blind readers this
 # census could not see, in `schedulers` and `system`.
 #
+# UPDATE: all five have since been NORMALIZED and have left this file -- the
+# two `schedulers` date leaves in #8732, the three `system` leaves after them.
+# The paragraph above is kept as the history of how they were found, but it no
+# longer describes the current inventory, and a reader arriving at "5 DIVERGENT"
+# would otherwise take it as present tense. The five became visible, were
+# measured, and were resolved; that is the whole arc rather than a standing
+# blind spot.
+#
 # #8690 unruled-fixture sweep, second increment: the UNCOMPILABLE bucket,
 # 45 -> 31. checked 685 -> 699, divergent +12, nothing removed.
 #
@@ -207,8 +215,6 @@ services rpm probe xpfarg test xpfarg routing-instance	empty
 services rpm probe xpfarg test xpfarg source-address	empty
 services rpm probe xpfarg test xpfarg target	empty
 services rpm probe xpfarg test xpfarg test-interval	empty
-system dataplane control-socket	empty
-system domain-name	empty
 system login class	partial
 system login class xpfarg allow-commands	empty
 system login class xpfarg allow-configuration	empty
@@ -225,5 +231,4 @@ system login user xpfarg class	empty
 system login user xpfarg uid	empty
 system services dhcp-local-server group xpfarg pool xpfarg static-binding xpfarg fixed-address	empty
 system services dhcpv6-local-server group xpfarg pool xpfarg static-binding xpfarg fixed-address	empty
-system services ssh protocol-version	empty
 system services web-management api-auth user xpfname password	empty

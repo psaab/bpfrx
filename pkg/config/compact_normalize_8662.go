@@ -168,6 +168,27 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		"device-map unmapped-interface-policy":
 		return true
 	}
+	// #8690, the three `system` sites that entered the census AFTER the system
+	// family landed in #8719. All shape `empty`, all measured safe: no gate
+	// disarms, nothing unmeasurable, nothing introduced-rejection.
+	//
+	// They are here rather than in #8719 because the census GREW under the
+	// family -- improved value synthesis made three previously-unruled leaves
+	// visible. That is worth stating because a family is not finished when its
+	// count reaches zero; it is finished when nothing new arrives, and nothing
+	// announces an arrival except the inventory changing size.
+	//
+	// The `system` residue after these is 17 lines and is DELIBERATE: 15
+	// gate-disarming, 1 unmeasurable, 1 unreachable by a pair rule. See #8719.
+	// `system` cannot reach 0 under pair scoping, so a count driving toward
+	// zero will point at an exclusion set rather than at work.
+	switch containerKeyword + " " + head {
+	case
+		"dataplane control-socket",
+		"system domain-name",
+		"ssh protocol-version":
+		return true
+	}
 	// EVERY RULE HERE IS SCOPED BY (container, head) PAIR. None matches a head
 	// alone or a container alone, and that is a deliberate change from how the
 	// first two increments were written.
