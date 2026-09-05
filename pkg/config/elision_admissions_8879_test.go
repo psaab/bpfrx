@@ -59,6 +59,42 @@ func TestAdmittedPairsCompileLikeBraced8879(t *testing.T) {
 			`security { nat { source { pool P { address 10.0.0.1/32; } } } }`,
 			`security nat { source { pool P { address 10.0.0.1/32; } } }`,
 			func(c *Config) string { return fmt.Sprintf("pools=%d", len(c.Security.NAT.SourcePools)) }},
+		// #8879 batch 8.
+		//
+		// `forwarding-options family` uses mode `packet-based` and NOT
+		// `flow-based`, which is the compiled default. A fixture carrying the
+		// default value reads CLEAN WHILE BROKEN: losing it and keeping it
+		// produce the same compiled answer, so the comparison can never fail.
+		// This is the row where that trap was closest to being stepped in.
+		{"forwarding-options family",
+			`forwarding-options { family { inet6 { mode packet-based; } } }`,
+			`forwarding-options family { inet6 { mode packet-based; } }`,
+			func(c *Config) string { return "mode=" + c.ForwardingOptions.FamilyInet6Mode }},
+		{"protocols ospf3",
+			`protocols { ospf3 { area 0.0.0.9 { interface ge-0/0/0.0 { metric 33; } } } }`,
+			`protocols ospf3 { area 0.0.0.9 { interface ge-0/0/0.0 { metric 33; } } }`,
+			func(c *Config) string {
+				if c.Protocols.OSPFv3 == nil {
+					return "<nil>"
+				}
+				return fmt.Sprintf("areas=%d", len(c.Protocols.OSPFv3.Areas))
+			}},
+		{"security dynamic-address",
+			`security { dynamic-address { feed-server fs1 { url https://feeds.example.invalid/x; } } }`,
+			`security dynamic-address { feed-server fs1 { url https://feeds.example.invalid/x; } }`,
+			func(c *Config) string {
+				return fmt.Sprintf("feeds=%d", len(c.Security.DynamicAddress.FeedServers))
+			}},
+		{"system dataplane",
+			`system { dataplane { binary /opt/xpf/dp-7717; workers 5; } }`,
+			`system dataplane { binary /opt/xpf/dp-7717; workers 5; }`,
+			func(c *Config) string {
+				if c.System.UserspaceDataplane == nil {
+					return "<nil>"
+				}
+				return fmt.Sprintf("bin=%s/w=%d",
+					c.System.UserspaceDataplane.Binary, c.System.UserspaceDataplane.Workers)
+			}},
 		// #8879 batch 7. THE FIRST TWO ARE A CORRECTION OF MY OWN BATCH-5
 		// WORK. Batch 5 re-checked the sweep's SAME rows by hand and cleared
 		// `class-of-service classifiers` and `class-of-service rewrite-rules`
