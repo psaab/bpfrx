@@ -359,9 +359,38 @@ var gateBlindCeiling = map[gateBlindClass]int{
 	// config AND produces its accepted-only advisory, and it is a member of the
 	// accept-side keyword corpus that guards the tcp-session closed-world flip
 	// against false-rejecting it.
-	gateBlindFlag:       179,
-	gateBlindErr:        43,
-	gateBlindValueMoves: 1,
+	// RAISED 179 -> 209 for the #8807-followup completion fix, DELIBERATELY and
+	// with the reason, which is what this cell asks for rather than a silent
+	// bump. The 30 new members are the `reject` message types (14 per address
+	// family) and the two policy-statement default actions, declared as children
+	// so `then reject <TAB>` and `policy-statement <p> then <TAB>` offer what the
+	// compiler already accepts.
+	//
+	// They are enum VALUES modelled as child keywords, not configuration leaves
+	// of their own. This class means "read, but value-less", and for these the
+	// value-lessness is the whole nature of the thing: `tcp-reset` IS the value.
+	// There is no second spelling of it for a differential to compare, so they
+	// can never leave this class however the gate improves — unlike the other
+	// 179, where "make them compare" is a real option.
+	//
+	// The alternative was declaring `reject` as args:1 with an enum validator,
+	// which adds no leaves. Measured: it preserves every compiled spelling but
+	// completion still offers only <[Enter]>, so it does not fix the defect. The
+	// children form was chosen on that measurement rather than on which number
+	// it moves.
+	gateBlindFlag: 209,
+	gateBlindErr:  43,
+	// TIGHTENED 1 -> 0. The single member of this class was
+	// `policy-options policy-statement <*> then`, and it is gone because the
+	// schema now declares that node's children instead of calling it a bare
+	// leaf. Its value always moved the output — compiler_routing.go iterates
+	// those children for the policy-level default action — while fewer than two
+	// spellings were comparable, which is exactly what this class is for.
+	//
+	// A ZERO CEILING HERE IS A CLAIM, not an absence: it says no leaf remains
+	// whose value demonstrably reaches the compiler while the gate cannot
+	// compare its spellings. If a new one appears this reds, which is the point.
+	gateBlindValueMoves: 0,
 }
 
 func TestSchemaSpellingGateCoverageIsGated_7484(t *testing.T) {
