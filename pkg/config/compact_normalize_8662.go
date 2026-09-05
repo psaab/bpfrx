@@ -1249,6 +1249,7 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		"policy description",
 		"policy mode",
 		"policy proposals",
+		"perfect-forward-secrecy keys",
 		"policy-stats system-wide",
 		"pool address",
 		"pool port-overloading-factor",
