@@ -59,6 +59,59 @@ func TestAdmittedPairsCompileLikeBraced8879(t *testing.T) {
 			`security { nat { source { pool P { address 10.0.0.1/32; } } } }`,
 			`security nat { source { pool P { address 10.0.0.1/32; } } }`,
 			func(c *Config) string { return fmt.Sprintf("pools=%d", len(c.Security.NAT.SourcePools)) }},
+		// #8879 batch 7. THE FIRST TWO ARE A CORRECTION OF MY OWN BATCH-5
+		// WORK. Batch 5 re-checked the sweep's SAME rows by hand and cleared
+		// `class-of-service classifiers` and `class-of-service rewrite-rules`
+		// as "genuinely SAME". That was true of the ONE leaf I tried (`dscp`)
+		// and false of the pair: via `inet-precedence` and `exp` both drop.
+		//
+		// It is precisely the error I had diagnosed in the sweep one batch
+		// earlier -- a verdict derived from a single leaf, reported about the
+		// pair -- committed by the person who wrote the diagnosis. The
+		// fixtures below therefore use the DROPPING leaf, not the convenient
+		// one.
+		{"class-of-service classifiers",
+			`class-of-service { classifiers { inet-precedence cl2 { forwarding-class expedited-forwarding { loss-priority low code-points 101; } } } }`,
+			`class-of-service classifiers { inet-precedence cl2 { forwarding-class expedited-forwarding { loss-priority low code-points 101; } } }`,
+			func(c *Config) string {
+				return fmt.Sprintf("prec=%d", len(c.ClassOfService.INetPrecedenceClassifierDefs))
+			}},
+		// SEVERITY NOTE, so this row is not read as worse than it is: the
+		// braced arm raises "rewrite-rules exp is accepted for compatibility
+		// but inert" -- the value has no runtime effect either way. What the
+		// elision actually costs here is the ADVISORY, not the behaviour. The
+		// operator writing the elided spelling gets neither the (inert)
+		// config nor the notice telling them it is inert.
+		{"class-of-service rewrite-rules",
+			`class-of-service { rewrite-rules { exp rw2 { forwarding-class expedited-forwarding { loss-priority low code-point 101; } } } }`,
+			`class-of-service rewrite-rules { exp rw2 { forwarding-class expedited-forwarding { loss-priority low code-point 101; } } }`,
+			func(c *Config) string {
+				return fmt.Sprintf("exp=%d", len(c.ClassOfService.EXPRewriteRules))
+			}},
+		{"protocols lldp",
+			`protocols { lldp { interface ge-0/0/6.0; transmit-interval 47; } }`,
+			`protocols lldp { interface ge-0/0/6.0; transmit-interval 47; }`,
+			func(c *Config) string {
+				if c.Protocols.LLDP == nil {
+					return "<nil>"
+				}
+				return fmt.Sprintf("if=%d/int=%d",
+					len(c.Protocols.LLDP.Interfaces), c.Protocols.LLDP.Interval)
+			}},
+		// Same severity note as `rewrite-rules exp`: the braced arm warns that
+		// pre-id session logging is inert in the userspace dataplane, so the
+		// loss is the advisory rather than a live behaviour.
+		{"security pre-id-default-policy",
+			`security { pre-id-default-policy { then { log { session-init; } } } }`,
+			`security pre-id-default-policy { then { log { session-init; } } }`,
+			func(c *Config) string {
+				if c.Security.PreIDDefaultPolicy == nil {
+					return "<nil>"
+				}
+				return fmt.Sprintf("init=%v/close=%v",
+					c.Security.PreIDDefaultPolicy.LogSessionInit,
+					c.Security.PreIDDefaultPolicy.LogSessionClose)
+			}},
 		// #8879 batch 6. Read `routing-options forwarding-table` twice: the
 		// elision was not only dropping a value, it was SUPPRESSING A COMMIT
 		// CHECK. See TestElisionSuppressedAValidation8879 below.
