@@ -986,10 +986,26 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 	// inventory marker is necessary but not sufficient evidence there. It is
 	// admitted here on a different basis: arm 2 of the widening rule
 	// (TestCompactNormalizeScopePreservesCompiledResult8690) compiles every
-	// admitted site through the strict path with the pass disabled and compares
+	// admitted SITE through the strict path with the pass disabled and compares
 	// acceptance, which is the check the marker cannot perform. That guard runs
-	// over whatever scope is current, so it adjudicates these sites rather than
-	// a list adjudicating them.
+	// over whatever scope is current, so for the sites it generates it
+	// adjudicates them rather than a list adjudicating them.
+	//
+	// READ "SITE" LITERALLY — it is not "pair" (#8852). Arm 2 adjudicates the
+	// sites collectCompactSites emits, and that census emits a site only for a
+	// single-arg valued leaf or a named-instance container. Admitting a pair
+	// whose HEAD is a plain container, a zero-arg leaf, or a multi-arg node
+	// therefore yields NO site, and the guard is green and silent about it —
+	// indistinguishable from having adjudicated it. Measured: the entire #8847
+	// widening (`security alg`, `security flow`, `routing-options static`) was
+	// adjudicated by nothing here, established by REMOVING those entries and
+	// observing the adjudicated total not move.
+	//
+	// So this paragraph is not a guarantee that widening the list is
+	// self-adjudicating. The set of admitted pairs arm 2 says nothing about is
+	// held, with a re-derived reason per entry, by
+	// TestScopeWideningYieldsAdjudicatedSites8852; a widening that adds to that
+	// set reds there and needs its own evidence.
 	//
 	// ONE PAIR REACHES OUTSIDE the three families: (route, next-hop) is also
 	// used by `services ip-monitoring policy <p> then preferred-route route
