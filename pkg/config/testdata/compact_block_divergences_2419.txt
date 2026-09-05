@@ -224,7 +224,6 @@ interfaces xpfname native-vlan-id	partial
 interfaces xpfname speed	partial
 interfaces xpfname tunnel routing-instance destination	partial
 interfaces xpfname unit	partial
-interfaces xpfname unit xpfarg description	empty
 interfaces xpfname unit xpfarg family inet address	empty
 interfaces xpfname unit xpfarg family inet address xpfarg vrrp-group	empty
 interfaces xpfname unit xpfarg family inet dhcp lease-time	empty
@@ -247,7 +246,6 @@ interfaces xpfname unit xpfarg family inet6 filter output	empty
 interfaces xpfname unit xpfarg family inet6 mtu	empty
 interfaces xpfname unit xpfarg inner-vlan-id	empty
 interfaces xpfname unit xpfarg tunnel routing-instance destination	partial
-interfaces xpfname unit xpfarg vlan-id	empty
 policy-options policy-statement xpfarg term xpfarg then as-path-prepend	partial
 policy-options policy-statement xpfarg term xpfarg then community	partial
 policy-options policy-statement xpfarg term xpfarg then load-balance	partial
