@@ -193,3 +193,58 @@ func TestSweepFull(t *testing.T) {
 	}
 	t.Logf("SW === %d pairs swept: %v", len(rows), counts)
 }
+
+// #8859. The sweep's gate column classifies every candidate SILENT /
+// STRICT-REJECTS / WARNS, and that column is what stops a HANDLED drop being
+// scored as a defect -- `system login` was in the candidate set looking exactly
+// like one until the column existed.
+//
+// AFTER THE DEPTH CORRECTION, THE `WARNS` ARM HAS NO MEMBER. Its only row
+// (`schedulers scheduler/daily`) turned out not to be a defect at all once each
+// row elided only the brace it was named for. An empty column is the third
+// state this board keeps rediscovering: it looks identical to a branch that
+// STOPPED WORKING and to a branch that is simply unpopulated, and the sweep
+// cannot tell you which.
+//
+// So the arm gets its own positive control, out of band from the sweep. Found
+// by lane-8526; reproduced here before adopting rather than taken on report.
+//
+// TWO NEGATIVES SIT BESIDE IT DELIBERATELY. A control that only asserts
+// "WARNS is reachable" is satisfied by a gate that returns WARNS for
+// everything, which would silently reclassify every SILENT row in the table as
+// handled -- the exact direction that makes a defect list under-report.
+func TestGateColumnArmsAreReachable8859(t *testing.T) {
+	gated := func(text string) string {
+		tr, perrs := NewParser(text).Parse()
+		if len(perrs) > 0 || tr == nil {
+			return "?"
+		}
+		if _, err := compileConfigWithOpts(tr, compileOpts{}); err != nil {
+			return "STRICT-REJECTS"
+		}
+		tr2, _ := NewParser(text).Parse()
+		if cfg, err := CompileConfigLenient(tr2); err == nil && cfg != nil && len(cfg.Warnings) > 0 {
+			return "WARNS"
+		}
+		return "SILENT"
+	}
+	for _, c := range []struct{ name, txt, want string }{
+		// Strict accepts, lenient raises an advisory.
+		{"warns-braced", "security { alg { h323; } }", "WARNS"},
+		{"warns-packed", "security alg h323;", "WARNS"},
+		// Negatives: without these the cell passes on a gate stuck at WARNS.
+		{"silent-proposal", "security { ike { proposal P { description hi; } } }", "SILENT"},
+		{"silent-empty", "", "SILENT"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if got := gated(c.txt); got != c.want {
+				t.Errorf("gate arm for %q: got %s want %s (#8859)\n"+
+					"The sweep's gate column decides whether a dropped value is a "+
+					"DEFECT or a HANDLED case. An arm that no longer fires "+
+					"reclassifies rows silently and in the under-reporting "+
+					"direction, and the sweep itself cannot detect it because "+
+					"WARNS currently has no member.", c.txt, got, c.want)
+			}
+		})
+	}
+}
