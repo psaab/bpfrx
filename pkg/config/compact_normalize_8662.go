@@ -1273,11 +1273,66 @@ func normalizeCompactNodes(nodes []*Node, schema *schemaNode, inScope func(conta
 				tail := append([]string(nil), node.Keys[identity:]...)
 				node.Keys = append([]string(nil), node.Keys[:identity]...)
 				node.IsLeaf = false
-				node.Children = append(node.Children, &Node{Keys: tail, IsLeaf: true})
+				for _, stmt := range splitPackedStatements8768(tail, child) {
+					node.Children = append(node.Children, &Node{Keys: stmt, IsLeaf: true})
+				}
 				n++
 			}
 		}
 		n += normalizeCompactNodes(node.Children, child, inScope)
 	}
 	return n
+}
+
+// splitPackedStatements8768 divides a packed tail into one node per STATEMENT,
+// instead of moving the whole run into a single child.
+//
+// The fold emitted `tail` as one node, which is right only when the run holds
+// one statement. A run may hold several, and then every statement after the
+// first was swallowed into the first one's Keys and lost:
+//
+//	policy p1 pre-shared-key ascii-text SEKRIT mode main;
+//	  before -> policy p1 { [pre-shared-key ascii-text SEKRIT mode main] }
+//	  after  -> policy p1 { [pre-shared-key ascii-text SEKRIT] [mode main] }
+//
+// THE BOUNDARY IS ANSWERED BY consumeNodeKeys, NOT GUESSED. Asking "is this
+// token a sibling keyword" is not sufficient and is actively wrong: a VALUE may
+// coincide with a sibling keyword, and #4313 makes some tails open-world. The
+// measured case is `then { source-nat pool P persistent-nat permit off; }`,
+// where `off` is a source-nat child AND a value inside a sub-grammar the schema
+// does not model. Splitting on the name invents a second translation action and
+// rejects a config that commits today — there is a cell for it,
+// TestOpenWorldTailContainingOffStillCommits_7033, and it is why the
+// name-matching version of this function was abandoned.
+//
+// So this borrows packedBodyChildren's contract: consume each statement by the
+// schema's own count, and THE MOMENT a token leaves the modelled grammar, stop
+// and hand back the whole tail unsplit. Not guessing is the entire safety
+// argument; a partial split is worse than none because it publishes a shape the
+// operator did not write.
+func splitPackedStatements8768(tail []string, container *schemaNode) [][]string {
+	if len(tail) == 0 || container == nil || !container.packedStatements {
+		return [][]string{tail}
+	}
+	var out [][]string
+	rest := tail
+	for len(rest) > 0 {
+		childSchema := resolveSchemaChild(container, rest[0])
+		if childSchema == nil {
+			// Outside the modelled grammar: do not guess where the next
+			// statement starts. Everything measured so far is discarded and the
+			// tail is returned whole, which is the pre-#8768 behaviour.
+			return [][]string{tail}
+		}
+		n, _ := consumeNodeKeys(rest, childSchema)
+		if n <= 0 || n > len(rest) {
+			return [][]string{tail}
+		}
+		out = append(out, append([]string(nil), rest[:n]...))
+		rest = rest[n:]
+	}
+	if len(out) <= 1 {
+		return [][]string{tail}
+	}
+	return out
 }
