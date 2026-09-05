@@ -385,6 +385,30 @@ func sweepGateVerdict8859(bracedText, elidedText string) string {
 		return "?"
 	}
 	if _, err := compileConfigWithOpts(tr, compileOpts{}); err != nil {
+		// A STRICT REJECTION ONLY MEANS "HANDLED" IF THE BRACED ARM WAS
+		// ACCEPTED. If both arms are refused, the rejection is about the fixture
+		// -- an undefined reference, a missing required sibling -- and says
+		// nothing about the elision. Reporting it as STRICT-REJECTS tells a
+		// reader the drop is loud when it has not been shown to be a drop at
+		// all.
+		//
+		// This is the same defect as the WARNS one fixed in #8897, in the other
+		// operator-facing channel: the gate reported a SIGNAL without asking
+		// whether the signal was ABOUT THE VARIABLE. There the fix was comparing
+		// warning SETS between arms; here it is requiring the braced arm to
+		// compile.
+		//
+		// MEASURED on two rows adjudicated as HANDLED before this check existed
+		// -- `interfaces -> classifiers` and `interfaces -> rewrite-rules` --
+		// both of which reject on BOTH arms. The error is in the under-reporting
+		// direction: a row the census has cleared is one nobody re-opens.
+		bt, bperrs := NewParser(bracedText).Parse()
+		if len(bperrs) > 0 || bt == nil {
+			return "?"
+		}
+		if _, berr := compileConfigWithOpts(bt, compileOpts{}); berr != nil {
+			return "BOTH-ARMS-REJECTED"
+		}
 		return "STRICT-REJECTS"
 	}
 	braced := warningSet8859(bracedText)
