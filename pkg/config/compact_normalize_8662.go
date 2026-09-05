@@ -1229,6 +1229,27 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		"routing-options static",
 		"security alg",
 		"security flow",
+		// issue 8875: the TOP-LEVEL security containers. `security` itself had
+		// no admitted children at all, while the children's own pairs
+		// (`policies from-zone`, `policies global`, `zones security-zone`) were
+		// admitted -- which is exactly why the braced and once-elided spellings
+		// deliver and the fully-elided one loses everything:
+		//
+		//	security { policies { from-zone a to-zone b { policy p } } }  1
+		//	security { policies from-zone a to-zone b { policy p } }      1
+		//	security policies from-zone a to-zone b { policy p }          0
+		//
+		// Silent on both paths -- strict and lenient accept, no warning. The
+		// zone-pair policy set is the product's primary enforcement surface, so
+		// losing it denies all inter-zone traffic: with no `default-policy` the
+		// compiled default is DENY (PolicyPermit is iota, but the compiler sets
+		// deny explicitly), making this a total outage and NOT a fail-open.
+		//
+		// One container, three symptoms: policies, zones and screen all fail on
+		// this single missing admission.
+		"security policies",
+		"security screen",
+		"security zones",
 		"flow route-change-timeout",
 		"friday start-time",
 		"friday stop-time",

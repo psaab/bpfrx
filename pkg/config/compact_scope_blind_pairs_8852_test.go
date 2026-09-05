@@ -104,7 +104,15 @@ var knownBlindScopePairs8852 = map[string]string{
 	// a pair leaves this list only when arm 2 starts generating a site for it.
 	// The four `root-authentication <leaf>` pairs are NOT here: their heads are
 	// single-arg valued leaves, so arm 2 does adjudicate them.
-	"system root-authentication":         "plain-container",
+	"system root-authentication": "plain-container",
+	// issue 8875. Their folds ARE measured -- by
+	// TestSecurityTopLevelElisionKeepsContents8875, across all three depths and
+	// on compiled CONTENTS -- but not by arm 2, and a pair leaves this list
+	// only when arm 2 generates a site for it. Registration records that this
+	// arm does not measure them; it is not a claim that they are unfixed.
+	"security policies":                  "plain-container",
+	"security screen":                    "plain-container",
+	"security zones":                     "plain-container",
 	"security-zone address-book":         "plain-container",
 	"security-zone host-inbound-traffic": "plain-container",
 	// Head takes two or more identity args.
