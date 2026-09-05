@@ -1164,7 +1164,11 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 				valueExamples: []string{"standard", "suiteb-gcm-128"},
 				validator:     ValidateEnum(ProposalSetNames()), children: nil},
 		}},
-		"gateway": {desc: "IKE gateway (VPN peer) name", args: 1, placeholder: "<gateway-name>", children: map[string]*schemaNode{
+		// #8796: the `security ipsec` gateway is the same container as the
+		// `security ike` one above — same children, same compiler path — and it
+		// needs the same opt-in. Fixing one and not the other leaves the defect
+		// live at a spelling an operator reaches the same way.
+		"gateway": {desc: "IKE gateway (VPN peer) name", args: 1, packedStatements: true, placeholder: "<gateway-name>", children: map[string]*schemaNode{
 			"address":            {desc: "Remote gateway address", args: 1, placeholder: "<address>", children: nil},
 			"local-address":      {desc: "Local IKE address", args: 1, placeholder: "<address>", children: nil},
 			"ike-policy":         {desc: "IKE policy reference", args: 1, placeholder: "<policy-name>", children: nil},
