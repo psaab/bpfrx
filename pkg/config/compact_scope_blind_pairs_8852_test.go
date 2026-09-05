@@ -94,7 +94,15 @@ import (
 // starts generating a site for it.
 var knownBlindScopePairs8852 = map[string]string{
 	// Head is a plain container (args==0, no wildcard, has children).
-	"policies global":        "plain-container",
+	"policies global": "plain-container",
+	// #8879 batch 1. Admitted after measuring their elided spelling SILENT;
+	// all four are blind to arm 2 for the same structural reason as the rest of
+	// this group, so their fold correctness rests on the per-pair cells in
+	// elision_admissions_8879_test.go rather than on the census.
+	"protocols bgp":          "plain-container",
+	"security ike":           "plain-container",
+	"security nat":           "plain-container",
+	"system syslog":          "plain-container",
 	"policy then":            "plain-container",
 	"routing-options static": "plain-container",
 	"security alg":           "plain-container",
