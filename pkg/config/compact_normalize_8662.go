@@ -831,6 +831,212 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		"virtual-link transit-area":
 		return true
 	}
+
+	// #8690 family 7: the SECURITY remainder and schedulers. 114 inventory
+	// sites, every one drop shape "empty"; schedulers goes to zero and security
+	// 99 -> 4.
+	//
+	// SEVEN PAIRS ARE EXCLUDED and each exclusion has a different provenance,
+	// which is the reason to list them here rather than to say "measured":
+	//
+	//   arm 2 named three — ("feed-server","hostname"), ("policy",
+	//   "proposal-set") and, in another lane's family, ("trap-group","targets").
+	//   Excluding ("policy","proposal-set") also holds `security ike policy <p>
+	//   proposal-set`, which shares the pair.
+	//
+	//   ("feed-server","url") was found BY HAND. Arm 2 reports a third state —
+	//   sites whose gate status it could not measure because the census
+	//   fixture's value fails a different validator — and says they are NOT
+	//   known-safe. Measured with a type-valid URL, that site is a real
+	//   gate disarm: rejected at strict commit without the pass, accepted with
+	//   it. No guard in the tree would have caught it.
+	//
+	//   ("dynamic","hostname") disarms a TRAILING-TOKEN gate (`security ike
+	//   gateway <g> dynamic hostname <fqdn> <extra>`). Arm 2's fixture emits one
+	//   clean value, so it cannot build the input that trips that gate.
+	//
+	//   ("deterministic","block-size"), ("host","address") and ("policy",
+	//   "scheduler-name") are excluded because the scope guard cannot EXAMINE
+	//   them: their reference spelling does not compile in isolation. Its
+	//   instruction is to give them a compilable fixture instead, which does not
+	//   work here — `contextFor` injects siblings INSIDE the parent path, while
+	//   these need context ABOVE it (the policy needs its zones declared under
+	//   `security zones`; the pool needs an address at pool level). None is an
+	//   inventory site, so excluding them costs no coverage.
+	//
+	// Pairs measured by running the pass with an instrumented gate, not derived
+	// from inventory paths, and checked for over-reach against every site
+	// outside the two families: NONE, which is why this scope carries no
+	// "neighbours come along" note where the earlier families did.
+	switch containerKeyword + " " + head {
+	case "address-book address-set",
+		"address-set address",
+		"address-set address-set",
+		"address-set description",
+		"aging early-ageout",
+		"aging high-watermark",
+		"aging low-watermark",
+		"daily start-time",
+		"daily stop-time",
+		"dead-peer-detection interval",
+		"dead-peer-detection threshold",
+		"deny log",
+		"destination pool",
+		"destination rule-set",
+		"destination-nat pool",
+		"dynamic-address address-name",
+		"dynamic-address feed-server",
+		"feed-name path",
+		"feed-server feed-name",
+		"feed-server hold-interval",
+		"feed-server update-interval",
+		"flood threshold",
+		"flow multicast-session-lifetime",
+		"flow route-change-timeout",
+		"friday start-time",
+		"friday stop-time",
+		"from interface",
+		"from routing-instance",
+		"from zone",
+		"from-zone policy",
+		"gateway address",
+		"gateway external-interface",
+		"gateway ike-policy",
+		"gateway local-address",
+		"gateway local-certificate",
+		"gateway nat-traversal",
+		"gateway version",
+		"global address-set",
+		"global policy",
+		"host-inbound-traffic protocols",
+		"host-inbound-traffic system-services",
+		"icmp-session timeout",
+		"ike gateway",
+		"ike ipsec-policy",
+		"ike policy",
+		"ike proposal",
+		"interface address",
+		"ip-sweep threshold",
+		"ipsec gateway",
+		"ipsec policy",
+		"ipsec proposal",
+		"ipsec vpn",
+		"limit-session destination-ip-based",
+		"limit-session source-ip-based",
+		"log format",
+		"log mode",
+		"log profile",
+		"log source-interface",
+		"log stream",
+		"manual authentication-algorithm",
+		"manual encryption-algorithm",
+		"manual protocol",
+		"manual spi",
+		"match application",
+		"match destination-address",
+		"match destination-address-name",
+		"match destination-port",
+		"match from-zone",
+		"match protocol",
+		"match source-address",
+		"match source-address-name",
+		"match to-zone",
+		"monday start-time",
+		"monday stop-time",
+		"nat64 rule-set",
+		"packet-filter destination-prefix",
+		"packet-filter protocol",
+		"packet-filter source-prefix",
+		"persistent-nat inactivity-timeout",
+		"persistent-nat permit",
+		"policies default-policy",
+		"policies default-policy-log",
+		"policy description",
+		"policy mode",
+		"policy proposals",
+		"policy-stats system-wide",
+		"pool port-overloading-factor",
+		"pool routing-instance",
+		"port-scan threshold",
+		"profile feed-name",
+		"profile stream-name",
+		"proposal authentication-algorithm",
+		"proposal authentication-method",
+		"proposal description",
+		"proposal dh-group",
+		"proposal encryption-algorithm",
+		"proposal lifetime-kilobytes",
+		"proposal lifetime-seconds",
+		"proposal protocol",
+		"proxy-arp interface",
+		"rule-set prefix",
+		"rule-set rule",
+		"rule-set source-pool",
+		"saturday start-time",
+		"saturday stop-time",
+		"scheduler start-time",
+		"scheduler stop-time",
+		"schedulers scheduler",
+		"screen ids-option",
+		"security-zone description",
+		"security-zone interfaces",
+		"security-zone screen",
+		"session field-extra-name",
+		"source pool",
+		"source rule-set",
+		"source-nat pool",
+		"ssh-known-hosts host",
+		"static rule-set",
+		"stream category",
+		"stream facility",
+		"stream format",
+		"stream host",
+		"stream port",
+		"stream severity",
+		"stream source-address",
+		"stream source-interface",
+		"sunday start-time",
+		"sunday stop-time",
+		"syn-flood alarm-threshold",
+		"syn-flood attack-threshold",
+		"syn-flood destination-threshold",
+		"syn-flood source-threshold",
+		"syn-flood timeout",
+		"tcp-session closing-timeout",
+		"tcp-session established-timeout",
+		"tcp-session initial-timeout",
+		"tcp-session time-wait-timeout",
+		"then log",
+		"thursday start-time",
+		"thursday stop-time",
+		"to interface",
+		"to routing-instance",
+		"to zone",
+		"traceoptions file",
+		"traceoptions flag",
+		"traceoptions packet-filter",
+		"traffic-selector local-ip",
+		"traffic-selector remote-ip",
+		"transport protocol",
+		"transport tls-profile",
+		"tuesday start-time",
+		"tuesday stop-time",
+		"udp-session timeout",
+		"vpn bind-interface",
+		"vpn df-bit",
+		"vpn establish-tunnels",
+		"vpn local-address",
+		"vpn local-identity",
+		"vpn pre-shared-key",
+		"vpn remote-identity",
+		"vpn traffic-selector",
+		"vpn-monitor destination-ip",
+		"vpn-monitor source-interface",
+		"wednesday start-time",
+		"wednesday stop-time",
+		"zones security-zone":
+		return true
+	}
 	return false
 }
 
