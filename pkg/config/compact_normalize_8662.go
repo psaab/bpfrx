@@ -1329,6 +1329,12 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		// Doubly elided, `security nat source { pool p1 { address ...; } }`
 		// compiled to exactly what an EMPTY config produces: the source NAT
 		// pool silently vanished, both spellings accepted at strict commit.
+		// #8943: syslog destinations. One site each; no cross-reference
+		// validator names them so #8928 does not apply; the loss reaches the
+		// RUNTIME (applySyslogConfig builds the clients). docs/log/8943-syslog.md.
+		"syslog host",
+		"syslog file",
+		"syslog user",
 		// #8943: the `flow` family. All five drop their whole body when the
 		// child's brace is elided, both spellings accepted at strict commit.
 		// #8921 collision check: one schema site each.

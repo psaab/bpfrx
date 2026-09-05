@@ -64,6 +64,36 @@ var admittedElisionCases8879 = []struct {
 		`security { nat { source { pool P { address 10.0.0.1/32; } } } }`,
 		`security nat { source { pool P { address 10.0.0.1/32; } } }`,
 		func(c *Config) string { return fmt.Sprintf("pools=%d", len(c.Security.NAT.SourcePools)) }},
+	// #8943 — the `syslog` destinations. The lost field reaches the RUNTIME:
+	// applySyslogConfig builds the syslog clients from these, so an elided
+	// destination means the operator has configured a log target and has none.
+	{"syslog host",
+		`system { syslog { host 198.51.100.44 { any warning; } } }`,
+		`system { syslog host 198.51.100.44 { any warning; } }`,
+		func(c *Config) string {
+			if c.System.Syslog == nil {
+				return "<nil>"
+			}
+			return fmt.Sprintf("hosts=%d", len(c.System.Syslog.Hosts))
+		}},
+	{"syslog file",
+		`system { syslog { file trace7717.log { any info; } } }`,
+		`system { syslog file trace7717.log { any info; } }`,
+		func(c *Config) string {
+			if c.System.Syslog == nil {
+				return "<nil>"
+			}
+			return fmt.Sprintf("files=%d", len(c.System.Syslog.Files))
+		}},
+	{"syslog user",
+		`system { syslog { user opsuser7717 { any critical; } } }`,
+		`system { syslog user opsuser7717 { any critical; } }`,
+		func(c *Config) string {
+			if c.System.Syslog == nil {
+				return "<nil>"
+			}
+			return fmt.Sprintf("users=%d", len(c.System.Syslog.Users))
+		}},
 	// #8943 — the `flow` family. Values chosen NOT to equal the compiled
 	// defaults: udp-session and icmp-session both default to 60, so a fixture
 	// using 60 would read clean while broken.
@@ -1243,7 +1273,7 @@ func TestDepth2UnadmittedPopulation8929(t *testing.T) {
 		"flow-monitoring version-ipfix", "flow-monitoring version9",
 		"interface-routes rib-group", "license autoupdate",
 		"policies policy-rematch", "pre-id-default-policy then",
-		"rib static", "syslog file", "syslog host", "syslog user",
+		"rib static",
 	}
 	// 50 UNIQUE pairs. #8929 said 51 by counting a slice that double-counted
 	// `family inet6`, which appears under two different top-level stanzas.
@@ -1251,7 +1281,7 @@ func TestDepth2UnadmittedPopulation8929(t *testing.T) {
 	// stanza, so the same pair reached by two routes is ONE pair — counting
 	// sites where the population is pairs is the unit mismatch this campaign
 	// already hit once, on the 320-sites / 95-pairs reconciliation.
-	const wantPopulation = 40
+	const wantPopulation = 37
 
 	parentAdmitted := func(mid string) bool {
 		for stanza := range setSchema.children {
@@ -1293,10 +1323,10 @@ func TestDepth2UnadmittedPopulation8929(t *testing.T) {
 	// catches an entry that should have been REMOVED and is blind to one that
 	// was removed silently (a bad merge, a tidy-up). Measured: deleting an
 	// entry left this cell green until this assertion was added.
-	if len(knownDropping) != 16 {
-		t.Errorf("knownDropping has %d entries, want 16. #8938 measured 26 of "+
+	if len(knownDropping) != 13 {
+		t.Errorf("knownDropping has %d entries, want 13. #8938 measured 26 of "+
 			"the 50 dropping; the `nat` and `flow` families were admitted in "+
-			"#8943, leaving 16. Removing one is only correct if the pair was "+
+			"#8943, leaving 13. Removing one is only correct if the pair was "+
 			"ADMITTED — in which case the membership check below fires too and "+
 			"BOTH numbers move together. A count change on its own means the "+
 			"record was edited without a measurement.", len(knownDropping))
