@@ -659,6 +659,34 @@ identity (#2680/#3992/#5292) for a family-translated inner packet.
 means such a route is configured and is not being forwarded. That is an
 unsupported-configuration signal, not a capacity or fragmentation one.
 
+> [!WARNING]
+> **This is an availability regression on upgrade for one class of deployment,
+> and it is deliberate.** Before #8890 these packets were *delivered* — as
+> plaintext on the underlay. Where the underlay path to the IPv4 destination
+> happens to work regardless of the configured tunnel, that traffic was flowing
+> and will now stop. An availability-first deployment carrying already-encrypted
+> payloads (TLS telemetry to a public IPv4 endpoint, say) therefore trades a
+> working path for an outage, and for such an operator the pre-#8890 behaviour
+> was, in effect, the one they wanted.
+>
+> It is still the wrong default. The operator configured a tunnel route and the
+> dataplane silently did not honour it, with no counter to notice by — a
+> tunnel-policy violation whether or not the payload was independently
+> protected. The drop is at least observable. Operators hitting this should
+> either remove the tunnel route for the NAT64 destinations (making the
+> underlay path explicit and intended) or track #8896, which makes the two
+> compose.
+
+**What the counter does NOT tell you.** The tunnel reason is attributed FIRST,
+ahead of the ext-header (#5625) and fragment (#2562) reasons, because the gate
+runs first and the translator never evaluated the packet. A frame that is
+*also* ext-header-ineligible or an unassociated fragment is therefore counted
+here, and would still not forward if #8896 landed. The ordering is deliberate —
+the tunnel reason is a CONFIGURATION fault affecting every packet on that
+route, while the other two are per-packet traffic properties — but a drop
+counted here is not a promise that tunnel support alone would make the packet
+forwardable.
+
 ## Observability — per-zone traffic + flood counters (both populated, #3651)
 
 Per-zone ingress/egress packet+byte volume (`show security zones` "Traffic

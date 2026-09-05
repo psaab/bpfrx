@@ -361,6 +361,15 @@ pub(in crate::afxdp) struct BindingLiveState {
     /// encap unsupported drops` operator counter; a non-zero value means a
     /// NAT64 + tunnel route combination is configured and is NOT being
     /// forwarded — an unsupported-configuration signal, not a capacity one.
+    ///
+    /// Two caveats an operator reading this counter needs. It is an
+    /// AVAILABILITY REGRESSION relative to pre-#8890 for a deployment whose
+    /// underlay path to the IPv4 destination works regardless of the
+    /// configured tunnel: that traffic was flowing (as plaintext) and now
+    /// stops. And because the gate runs before the translator, a frame that is
+    /// ALSO ext-header-ineligible (#5625) or an unassociated fragment (#2562)
+    /// is counted here, so a drop on this counter is not a promise that tunnel
+    /// support alone (#8896) would make the packet forwardable.
     pub(super) nat64_tunnel_encap_unsupported: AtomicU64,
     /// #8670: cumulative fail-closed NAT64 PROTOCOL-ineligibility drops — a
     /// packet addressed to a Pref64 destination whose IP protocol stateful
