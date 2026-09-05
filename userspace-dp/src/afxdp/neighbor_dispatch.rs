@@ -213,6 +213,15 @@ pub(super) fn retry_pending_neigh(
     }
     let ingress_slot = binding.slot;
     let ingress_ifindex = binding.ifindex;
+    // §8916: cloned (an Rc bump) so the cross-binding push below can ask
+    // whether the target shares this binding's UMEM while `binding` is
+    // mutably borrowed inside the loop.
+    //
+    // `shares_allocation_with` rather than comparing `allocation_ptr()`: the
+    // codebase already expresses this question, and re-deriving it here would
+    // be a second implementation of the same predicate that can drift from the
+    // first.
+    let ingress_umem = binding.umem.clone();
     let ingress_queue = binding.queue_id;
     // #1636 option D: the drop timeout is computed per snapshot from the
     // kernel retrans_time_ms sysctls (800ms when fast-retrans is
@@ -621,12 +630,64 @@ pub(super) fn retry_pending_neigh(
         } else if let Some(target) =
             binding_by_index_mut(left, binding_index, binding, right, target_idx)
         {
-            target.tx_pipeline.pending_tx_prepared.push_back(req);
-            bound_pending_tx_prepared(target, Some(shared_recycles));
-            target.tx_counters.pending_in_place_tx_packets += 1;
-            target
-                .tx_counters
-                .record_in_place_l2_rewrite(rewrite_result.l2_rewrite);
+            // §8916: A PREPARED REQUEST CARRIES AN OFFSET INTO THE *INGRESS*
+            // UMEM. Pushing it onto another binding's queue is only meaningful
+            // when the two bindings share that UMEM.
+            //
+            // `WorkerBindingLookup::target_index` resolves purely by
+            // `(egress_ifindex, ingress_queue_id)` with a `first_by_if`
+            // fallback -- no UMEM, sharing-group or ownership term -- so a
+            // target on a DIFFERENT NIC with its own UMEM is an ordinary
+            // result. With `shared_umem` mode `off` (a supported
+            // configuration) the bindings do not share an allocation, and
+            // `rewrite_result.offset` does not address the same frame in the
+            // target's UMEM, or any valid frame.
+            //
+            // The normal dispatcher already refuses this: it gates the
+            // prepared/zero-copy path on the target sharing the ingress
+            // allocation and falls back to the single-copy local path
+            // otherwise. That guard appears three times in
+            // `tx/dispatch/mod.rs` and zero times here -- this deferred
+            // neighbor-retry path was the one exit that did not have it.
+            //
+            // FALL BACK TO A COPY RATHER THAN DROPPING. The frame has already
+            // been rewritten in place and its neighbor has just resolved, so
+            // the packet is deliverable; copying it into the target's local
+            // queue delivers it at the cost of one memcpy on a deferred path
+            // that is already off the fast path. Recycling it to fill instead
+            // would drop a packet the dataplane went to some trouble to hold.
+            if target.umem.shares_allocation_with(&ingress_umem) {
+                target.tx_pipeline.pending_tx_prepared.push_back(req);
+                bound_pending_tx_prepared(target, Some(shared_recycles));
+                target.tx_counters.pending_in_place_tx_packets += 1;
+                target
+                    .tx_counters
+                    .record_in_place_l2_rewrite(rewrite_result.l2_rewrite);
+            } else if let Some(bytes) =
+                area.slice(rewrite_result.offset as usize, rewrite_result.len as usize)
+            {
+                target.tx_pipeline.pending_tx_local.push_back(TxRequest {
+                    bytes: bytes.to_vec(),
+                    expected_ports: req.expected_ports,
+                    expected_addr_family: req.expected_addr_family,
+                    expected_protocol: req.expected_protocol,
+                    flow_key: req.flow_key,
+                    egress_ifindex: req.egress_ifindex,
+                    cos_queue_id: req.cos_queue_id,
+                    dscp_rewrite: req.dscp_rewrite,
+                    mirror_clone: req.mirror_clone,
+                    enqueue_ns: req.enqueue_ns,
+                });
+                target.tx_counters.neighbor_retry_cross_umem_copies += 1;
+                // The ingress descriptor is ours to recycle: the copy owns the
+                // bytes now, so the frame goes back to this binding's fill
+                // ring rather than riding a foreign recycle.
+                binding.tx_pipeline.pending_fill_frames.push_back(pkt.addr);
+            } else {
+                // The rewritten extent is not addressable in our own area --
+                // recycle rather than submit anything.
+                binding.tx_pipeline.pending_fill_frames.push_back(pkt.addr);
+            }
         } else {
             binding.tx_pipeline.pending_fill_frames.push_back(pkt.addr);
         }

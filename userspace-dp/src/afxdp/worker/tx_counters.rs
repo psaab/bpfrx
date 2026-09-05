@@ -27,6 +27,16 @@ use crate::afxdp::types::InPlaceL2Rewrite;
 pub(crate) struct WorkerTxCounters {
     pub(crate) pending_direct_tx_packets: u64,
     pub(crate) pending_copy_tx_packets: u64,
+    /// §8916: deferred neighbor-retry frames that resolved to a target binding
+    /// which does NOT share the ingress UMEM, and were therefore copied into
+    /// the target's local queue instead of submitted as a prepared offset.
+    ///
+    /// Non-zero means the retry path is crossing a UMEM boundary — expected
+    /// under `shared_umem` mode `off` with multi-NIC egress, and the signal
+    /// that the copy fallback is load-bearing rather than dead code. Before
+    /// §8916 these frames were submitted with an offset into a UMEM they did
+    /// not belong to, with no counter and no guard.
+    pub(crate) neighbor_retry_cross_umem_copies: u64,
     pub(crate) pending_in_place_tx_packets: u64,
     pub(crate) pending_in_place_vlan_push_desc_packets: u64,
     pub(crate) pending_in_place_vlan_pop_desc_packets: u64,
