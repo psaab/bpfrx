@@ -385,6 +385,30 @@ func sweepGateVerdict8859(bracedText, elidedText string) string {
 		return "?"
 	}
 	if _, err := compileConfigWithOpts(tr, compileOpts{}); err != nil {
+		// A STRICT REJECTION ONLY MEANS "HANDLED" IF THE BRACED ARM WAS
+		// ACCEPTED. If both arms are refused, the rejection is about the fixture
+		// -- an undefined reference, a missing required sibling -- and says
+		// nothing about the elision. Reporting it as STRICT-REJECTS tells a
+		// reader the drop is loud when it has not been shown to be a drop at
+		// all.
+		//
+		// This is the same defect as the WARNS one fixed in #8897, in the other
+		// operator-facing channel: the gate reported a SIGNAL without asking
+		// whether the signal was ABOUT THE VARIABLE. There the fix was comparing
+		// warning SETS between arms; here it is requiring the braced arm to
+		// compile.
+		//
+		// MEASURED on two rows adjudicated as HANDLED before this check existed
+		// -- `interfaces -> classifiers` and `interfaces -> rewrite-rules` --
+		// both of which reject on BOTH arms. The error is in the under-reporting
+		// direction: a row the census has cleared is one nobody re-opens.
+		bt, bperrs := NewParser(bracedText).Parse()
+		if len(bperrs) > 0 || bt == nil {
+			return "?"
+		}
+		if _, berr := compileConfigWithOpts(bt, compileOpts{}); berr != nil {
+			return "BOTH-ARMS-REJECTED"
+		}
 		return "STRICT-REJECTS"
 	}
 	braced := warningSet8859(bracedText)
@@ -526,4 +550,57 @@ func TestSweptPopulationExcludesAdmittedPairs8859(t *testing.T) {
 			"(#8859)", len(admitted), admitted)
 	}
 	t.Logf("#8859: %d pairs in the swept population, 0 already admitted", len(pairOrder))
+}
+
+// #8859. THE BRACED-ARM PROBE MUST BE OBSERVABLE IN THE PUBLISHED TABLE.
+//
+// `sweepGateVerdict8859` only reports STRICT-REJECTS when the BRACED arm also
+// compiles; when both arms are refused it reports BOTH-ARMS-REJECTED, because a
+// rejection of both says nothing about the elision.
+//
+// THE OBVIOUS GUARD FOR THAT IS VACUOUS AND I WANT THE REASON RECORDED HERE
+// RATHER THAN LEARNED AGAIN. Asserting "every published STRICT-REJECTS row has
+// a compiling braced arm" passes with ZERO ROWS CHECKED -- the probe removes
+// the only STRICT-REJECTS row from this population, so the class the assertion
+// quantifies over is empty, and an empty class is satisfied just as well by the
+// probe being deleted. team-lead wrote that version first and measured it
+// passing against the mutant.
+//
+// So the assertion binds the PROBE rather than the class: at least one
+// published row must carry BOTH-ARMS-REJECTED. Delete the probe and that
+// verdict cannot be produced, and this reds.
+//
+// Measured at the time of writing: `system login` is the row that fires it --
+// the row #8859 cites as proof the STRICT-REJECTS arm works. Its synthesized
+// fixture fails strict on BOTH spellings, so the sweep was never demonstrating
+// that the elision is loud. The underlying fact is true and established
+// elsewhere by a hand-written fixture; only the sweep's evidence for it was an
+// artifact.
+func TestSweepBracedArmProbeIsObservable8859(t *testing.T) {
+	rows, counts := sweepPublishedRows8859()
+	if len(rows) == 0 {
+		t.Fatal("the sweep published no rows, so nothing below asserts anything (#8859)")
+	}
+	fired := 0
+	var examples []string
+	for _, r := range rows {
+		if strings.Contains(r.Verdict, "BOTH-ARMS-REJECTED") ||
+			strings.Contains(r.Detail, "BOTH-ARMS-REJECTED") {
+			fired++
+			examples = append(examples, r.Pair)
+		}
+	}
+	if fired == 0 {
+		t.Error("no published row carries BOTH-ARMS-REJECTED. Either every " +
+			"braced arm in the population now compiles, or the braced-arm probe " +
+			"in sweepGateVerdict8859 has been removed -- AND THOSE LOOK " +
+			"IDENTICAL FROM THE TABLE. Without the probe, a fixture that fails " +
+			"strict on BOTH spellings is published as STRICT-REJECTS, which " +
+			"tells a reader the drop is loud when it has not been shown to be a " +
+			"drop at all (#8859)")
+	}
+	sort.Strings(examples)
+	t.Logf("#8859: %d published rows, %d carrying BOTH-ARMS-REJECTED (probe "+
+		"fired: %v), %d STRICT-REJECTS", len(rows), fired, examples,
+		counts["CANDIDATE-DROP/STRICT-REJECTS"])
 }
