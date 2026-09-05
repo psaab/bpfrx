@@ -63,10 +63,13 @@ or prerequisites becomes a named validation task, not an improvised probe.
    `mktemp -d /tmp/review-work.XXXXXXXXXX`. Its unique basename is the run ID.
    Record owned paths in its run manifest. Do not use the future report sequence
    number to allocate shared scratch resources.
-5. Record runtime-provided model identity and its source when available.
-   Otherwise record `unknown`; installed binaries or another app's settings do
-   not identify the active model. Preserve distinct `muse-*` and `claude-*`
-   families. Use a filesystem-safe family name only for the final filename.
+5. Establish the coordinator's identity using the shared contract's model
+   identity and naming rules. Record `MODEL_RAW`, `MODEL_SOURCE`, `MODEL_HOST`
+   and `WHOAMI` in the manifest and report header before assigning work.
+   `WHOAMI` is derived from the evidenced model, not a historical report family
+   or the Unix username. Preserve full GPT model/version names when exposed;
+   GPT must never become `muse-spark` for "compatibility". Unknown identity is
+   explicit, not a reason to reuse a previous run's prefix.
 6. The coordinator creates each detached worker worktree from the pinned base
    under the unique run directory, following `AGENTS.md` ownership rules.
    Before work starts, the worker reports its path, SHA, and assigned scope.
@@ -320,8 +323,15 @@ high-impact questions, verification gaps, and suggested implementation work.
 A review report is not an issue filing: say "recommended for filing" unless
 actual issue IDs exist.
 
-The compatibility output is `/tmp/<family>-review-NNN.md`. Determine the next
-number from exact final basenames for that family at publication time. Publish
+The compatibility output shape is `/tmp/<WHOAMI>-review-NNN.md`; compatibility
+preserves the shape, not another model's prefix. Use the identity established
+for this run, never an inherited shell `WHOAMI` or a prior report's family.
+Before publication, independently re-derive `WHOAMI` from the recorded identity
+and check that the manifest, report header and final basename agree. A mismatch
+blocks publication until reconciled; no "compatibility family" override exists.
+Determine the next number from exact final basenames for that `WHOAMI` at
+publication time. A new model/version prefix can legitimately begin at 001;
+deduplication still reads prior reports across all model prefixes. Publish
 the complete draft with an atomic create-if-absent operation, such as a hard link
 on the same filesystem (`ln -T -- <draft> <final>`), never a replacing copy. On
 collision, update the draft's output-path header and retry the next number.

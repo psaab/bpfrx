@@ -194,6 +194,76 @@ known limitations, not proof that their checks have run for this review.
 
 ## Freshness and provenance
 
+### Model identity and report naming
+
+The model, the agent application, and the report filename are different things.
+Record these exact header labels in both the run manifest and final report:
+
+- `MODEL_RAW`: the coordinator's model identifier as reported for the current
+  run/turn, including version and suffix, or `unknown` if no exact identifier is
+  exposed. Do not turn a broad "based on GPT-5" statement into an exact serving
+  model or snapshot. Preserve a reported alias literally and identify it as an
+  alias rather than guessing the model behind it.
+- `MODEL_SOURCE`: where the identity was actually observed, scoped to this
+  run/turn. Distinguish a runtime-reported model, a selected/requested model,
+  a known family only, and unavailable/conflicting evidence. A model picker or
+  launch selection is not proof of a hidden backend snapshot.
+- `MODEL_HOST`: the application running the coordinator (for example `codex`),
+  or `unknown`. The host is not the model: GPT can run through another host.
+- `WHOAMI`: the filesystem-safe report prefix derived below. It is not the
+  output of Unix `whoami`, a free-form alias or a compatibility override.
+
+Use current-run metadata exposed by the active runtime or its run-scoped
+configuration. Do not start another agent or change models to discover identity.
+Global settings, inherited `MUSE_MODEL`/`ANTHROPIC_MODEL`/`OPENAI_MODEL` values,
+installed binaries, old transcripts and existing filenames do not establish the
+current model unless independently tied to this run. Codex permits per-turn model
+overrides ([official documentation](https://learn.chatgpt.com/docs/app-server#turns));
+a saved default alone cannot settle the current identity. Read only relevant
+metadata, not credentials, environment dumps or unrelated conversation history.
+
+Derive `WHOAMI` in this order:
+
+1. If `MODEL_RAW` is known, use the full identifier: lowercase it, replace runs
+   of characters outside ASCII `a-z`, `0-9`, `.`, `_`, `-` with `-`, and strip
+   leading/trailing `.`, `_`, `-`. Preserve version numbers and model suffixes;
+   do not apply `cut -d- -f1`, strip GPT versions, or translate provider families.
+   Keep the unsanitized identifier in `MODEL_RAW`. If nothing remains after
+   sanitization, treat the identity as unresolved instead of inventing a label.
+2. If only the model family is established, keep `MODEL_RAW: unknown`, state
+   that family and its source in `MODEL_SOURCE`, and use `<family>-unknown`.
+   Apply the same safe-name normalization to the family. Known GPT with no exact
+   model identifier yields `gpt-unknown`, never `muse-spark` or a guessed GPT ID.
+3. If only the host is established, use `<host>-unknown` with the same
+   normalization and `MODEL_RAW: unknown`. With neither, use `unknown`.
+   An empty normalized family/host is unavailable, not a valid prefix.
+   Conflicting evidence must be reported; use only the level actually established.
+
+Naming examples, not defaults or model-selection instructions:
+
+| Observed coordinator identity | `MODEL_RAW` | `WHOAMI` |
+| --- | --- | --- |
+| Exact runtime identifier `gpt-5.6-sol` | `gpt-5.6-sol` | `gpt-5.6-sol` |
+| Exact runtime identifier `gpt-daybreak-blue-latest` | `gpt-daybreak-blue-latest` | `gpt-daybreak-blue-latest` |
+| Exact runtime identifier `muse-spark-1.1` | `muse-spark-1.1` | `muse-spark-1.1` |
+| GPT family only, running in Codex | `unknown` | `gpt-unknown` |
+| Codex host only, model family unavailable | `unknown` | `codex-unknown` |
+| No usable identity evidence | `unknown` | `unknown` |
+
+The final prefix identifies the coordinator, not an arbitrarily selected worker.
+Record each worker's model/source separately in its assignment evidence; do not
+copy the coordinator's identity onto workers or use one worker's model to label
+the entire campaign. Record model changes during the campaign with their work
+scope and derive the final prefix from the coordinator's identity at publication.
+
+The publication gate compares the derived prefix with `WHOAMI` in the manifest,
+header and final basename. An existing report sequence is never evidence of the
+current model. Preserve legacy filenames during triage; record identity conflicts
+as provenance corrections without rewriting history or discarding valid findings
+solely because their original author used the wrong prefix.
+
+### Repository and revision identity
+
 Reports identify the repository independently of checkout names or model names.
 Use the credential-free remote identity plus base SHA; local-only reviews use
 an explicit local identity. Never publish embedded credentials or raw environment
@@ -219,7 +289,8 @@ The final header contains:
 
 - `Review contract: xpf-review-v3`, run ID, repository identity, checkout path.
 - Base SHA; comparison repository/ref/SHA and fetch time, or unavailable reason.
-- Model identity/family and identity source (or unknown).
+- `MODEL_RAW`, `MODEL_SOURCE`, `MODEL_HOST`, `WHOAMI` as defined above;
+  worker identities and any coordinator model changes remain separately visible.
 - Mode, requested/effective scope, focus, exclusions, review/validation limits.
 - Output path and retained evidence location; release target only when in scope.
 
@@ -269,8 +340,9 @@ and conditions checked and those still unknown. Implementation handoff includes
 the acceptance criterion and all affected consumers. Source fixes, verified
 regression guards, and delivery to an in-scope release are separate milestones.
 
-V2 and older reports remain readable: derive their metadata and map
-`Verified against origin/master` to the named comparison revision where
+Reports predating these fields, including earlier v3 identity headers, remain
+readable: derive their metadata and map `Verified against origin/master` to the
+named comparison revision where
 supported. Reconstruct missing adversarial analysis only from evidence actually
 checked; do not fabricate it or missing Probe/provenance fields. Mark substantively
 incomplete claims NEEDS_VALIDATION; an old format or absent new label is not by
@@ -292,6 +364,10 @@ a network transformation spanning area boundaries, a throughput-only result used
 to claim new-flow capacity, and a focused review where an expert is not relevant.
 Verify that missing host evidence bounds the claim without erasing valid static
 reasoning, and that expert assignments do not silently expand user scope.
+For identity changes, check full GPT identifiers and versions, a GPT coordinator
+with a differently named worker, inherited Muse settings, family-only and wholly
+unknown identity, and a conflicting filename/header. A model-prefix mismatch
+must not pass publication merely because that prefix has historical reports.
 
 For an empirical quality claim, compare old and revised instructions on held-out
 historical review cases using matched scope, model settings, context, and effort.
