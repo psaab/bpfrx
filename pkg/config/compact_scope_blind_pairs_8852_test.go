@@ -125,6 +125,13 @@ var knownBlindScopePairs8852 = map[string]string{
 	// a pair leaves this list only when arm 2 starts generating a site for it.
 	// The four `root-authentication <leaf>` pairs are NOT here: their heads are
 	// single-arg valued leaves, so arm 2 does adjudicate them.
+	// issue 8898. Same shape as root-authentication below: arm 2 emits no site
+	// for a zero-arg plain container. Its fold IS measured -- across all three
+	// depths and on the enforced value -- by the cells in
+	// pkg/configstore/master_password_elision_8898_test.go, which is where the
+	// real consumer lives; registration records only that THIS arm does not
+	// measure it.
+	"system master-password":     "plain-container",
 	"system root-authentication": "plain-container",
 	// issue 8875. Their folds ARE measured -- by
 	// TestSecurityTopLevelElisionKeepsContents8875, across all three depths and
