@@ -361,8 +361,11 @@ var arityAdjudicated8807 = map[string]arityVerdict8807{
 
 	"reject": {"genuine", "compiler_firewall.go:1337 reads an OPTIONAL Keys[1] message-type on `then reject <type>` " +
 		"while the leaf is args:0 -- possibly the #3332 trailing-token class. NOT MEASURED: needs braced-vs-packed."},
-	"then": {"genuine", "`/policy-options/policy-statement/then` is declared a true leaf args:0 while the compiler " +
-		"iterates its children -- a container declared as a leaf. NOT MEASURED: needs braced-vs-packed."},
+	"then": {"genuine", "`/policy-options/policy-statement/then` is declared a true leaf args:0. The sites THIS " +
+		"predicate sees (compiler_routing.go:908, :1138) iterate its children -- a container declared as a leaf. " +
+		"lane-8015 found a THIRD site the predicate cannot see, parsePolicyTermInlineKeys at :1269, which consumes " +
+		"a FOLLOWING KEY via a variable index. Both descriptions are true of different sites, and they want " +
+		"different remedies, so measure before choosing one. NOT MEASURED: needs braced-vs-packed."},
 }
 
 // arityGenuineFloor8807 is a RATCHET, not an equality. It fails in BOTH
@@ -389,7 +392,13 @@ func TestArityCensusIsRatcheted8807(t *testing.T) {
 		"unread-at-path under `nat source pool`, declared under `proxy-arp interface`), " +
 		"and no arity predicate can see it because it is an EXISTENCE question. So " +
 		"GREEN MEANS \"no new arity contradiction this predicate can localise\", NEVER " +
-		"\"the class is covered\". The positional predicate is not built (#8807)."
+		"\"the class is covered\". The positional predicate is not built (#8807).\n\n" +
+		"THIRD BLINDNESS, found by lane-8015 while checking a row here: it only sees a " +
+		"CONSTANT Keys[i]. A site consuming a following token through a VARIABLE index " +
+		"-- parsePolicyTermInlineKeys at compiler_routing.go:1269 does `i++; " +
+		"term.Action = keys[i]` -- is invisible to it. So a keyword can have sites this " +
+		"predicate reports AND sites it cannot see, and the evidence recorded for a row " +
+		"may describe only the visible half."
 
 	// 1. The hit SET must match the adjudication. A new hit is unadjudicated and
 	//    nobody can tell from the number whether it is a defect.
