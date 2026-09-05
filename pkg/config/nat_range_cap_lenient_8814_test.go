@@ -178,3 +178,129 @@ func TestTheRecordedFieldIsOnlySetWhenOverCap8814(t *testing.T) {
 		t.Errorf("the recorded spec does not carry the size: %q", pool2.OversizedAddressRanges[0])
 	}
 }
+
+// buildFlatSet8814 builds a tree from flat `set` lines. CLAUDE.md: flat set
+// syntax MUST be built with ParseSetCommand + tree.SetPath, never NewParser —
+// the parser treats newlines as whitespace and merges every line into one node.
+func buildFlatSet8814(t *testing.T, lines ...string) *ConfigTree {
+	t.Helper()
+	tree := &ConfigTree{}
+	for _, line := range lines {
+		p, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(p); err != nil {
+			t.Fatalf("SetPath(%q): %v", line, err)
+		}
+	}
+	return tree
+}
+
+// TestOversizedRangeOnTheFlatSetPath8814 pins the #8814 behaviour for the
+// spelling an OPERATOR TYPES, which the cells above do not reach.
+//
+// Those cover the hierarchical spellings and the recorded field. Flat `set`
+// builds a CHAIN rather than a Keys run (#8778), so it is a different traversal
+// and a fix correct for one has repeatedly not been correct for the other —
+// #8778 itself was a case where repairing the packed form left the flat form
+// still failing open, with a passing test beside it.
+//
+// The measurement came back green before this cell existed, which is the reason
+// to pin it rather than to skip it: an unpinned green is a fact about today.
+//
+// It also settles the reachability column that decided severity on
+// `instance-type` and `local-identity` — whether a defect is config-file-only
+// or operator-facing. This one is OPERATOR-FACING: an operator typing the `set`
+// line gets a clean commit-time rejection naming the cap, and a persisted config
+// carrying the same range still boots.
+func TestOversizedRangeOnTheFlatSetPath8814(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		sets         []string
+		wantAddrs    int
+		wantRecorded int
+		wantStrict   bool
+	}{
+		{
+			name:         "pool 257 IPs — one over the cap",
+			sets:         []string{"set security nat source pool p1 address 10.0.0.1/32 to 10.0.1.1/32"},
+			wantAddrs:    0,
+			wantRecorded: 1,
+			wantStrict:   true,
+		},
+		{
+			// The boundary. An off-by-one here rejects configs that are legal
+			// today, which is the failure a "strict rejects" assertion alone
+			// cannot distinguish from correct behaviour.
+			name:         "pool 256 IPs — the boundary, must stay legal",
+			sets:         []string{"set security nat source pool p1 address 10.0.0.1/32 to 10.0.1.0/32"},
+			wantAddrs:    256,
+			wantRecorded: 0,
+			wantStrict:   false,
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			tree := buildFlatSet8814(t, tc.sets...)
+			cfg, lerr := CompileConfigLenient(tree)
+			if lerr != nil {
+				t.Fatalf("CompileConfigLenient FAILED on the flat `set` path: %v\n"+
+					"A persisted config must LOAD whichever spelling produced it (#8814).", lerr)
+			}
+			pool := cfg.Security.NAT.SourcePools["p1"]
+			if pool == nil {
+				t.Fatal("pool p1 absent from the leniently compiled config")
+			}
+			if got := len(pool.Addresses); got != tc.wantAddrs {
+				t.Errorf("pool has %d address(es), want %d (#8814)", got, tc.wantAddrs)
+			}
+			// The recorded field is what the strict gate reads. Asserting it
+			// separately from the rejection means an off-by-one at the boundary
+			// is visible even while "strict rejects" still looks right.
+			if got := len(pool.OversizedAddressRanges); got != tc.wantRecorded {
+				t.Errorf("OversizedAddressRanges has %d entrie(s), want %d — the strict gate "+
+					"reads this field, so recording at 256 would reject a legal config and "+
+					"not recording at 257 would let an unexpandable range through (#8814)",
+					got, tc.wantRecorded)
+			}
+			_, serr := CompileConfig(buildFlatSet8814(t, tc.sets...))
+			if tc.wantStrict {
+				if serr == nil {
+					t.Error("strict CompileConfig ACCEPTED an oversized range authored via flat " +
+						"`set`. An operator can then commit a range the dataplane cannot " +
+						"expand (#8814)")
+				} else if !strings.Contains(serr.Error(), "256") {
+					t.Errorf("strict rejection does not name the cap: %v", serr)
+				}
+			} else if serr != nil {
+				t.Errorf("strict CompileConfig rejected a legal flat-`set` config: %v", serr)
+			}
+		})
+	}
+
+	// The SECOND caller of expandAddressRange, on the same path. lane-8367
+	// measured proxy-arp rather than inheriting the conclusion from the shared
+	// function; this pins the flat spelling of it for the same reason.
+	t.Run("proxy-arp 257 IPs via flat set", func(t *testing.T) {
+		sets := []string{"set security nat proxy-arp interface ge-0/0/1.0 address 10.0.0.1/32 to 10.0.1.1/32"}
+		cfg, lerr := CompileConfigLenient(buildFlatSet8814(t, sets...))
+		if lerr != nil {
+			t.Fatalf("CompileConfigLenient FAILED for proxy-arp on the flat path: %v (#8814)", lerr)
+		}
+		if len(cfg.Security.NAT.ProxyARP) == 0 {
+			t.Fatal("no proxy-arp entry compiled at all")
+		}
+		var recorded int
+		for _, e := range cfg.Security.NAT.ProxyARP {
+			recorded += len(e.OversizedRangeSpecs)
+		}
+		if recorded == 0 {
+			t.Error("no oversized range RECORDED for proxy-arp — the strict gate reads that " +
+				"field, so an unexpandable range would commit clean (#8814)")
+		}
+		if _, serr := CompileConfig(buildFlatSet8814(t, sets...)); serr == nil {
+			t.Error("strict CompileConfig ACCEPTED an oversized proxy-arp range via flat `set` (#8814)")
+		}
+	})
+}
