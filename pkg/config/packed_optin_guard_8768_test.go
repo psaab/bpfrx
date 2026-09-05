@@ -158,6 +158,29 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 				return out
 			},
 		},
+		"security/ike/gateway": {
+			prefix: "security { ike { policy p1 { mode main; pre-shared-key ascii-text S; } ",
+			open:   "gateway g1",
+			closer: " } }",
+			stmts: map[string]string{
+				"address":            "address 1.2.3.4",
+				"external-interface": "external-interface ge-0/0/0",
+				"ike-policy":         "ike-policy p1",
+				"local-address":      "local-address 5.6.7.8",
+				"local-certificate":  "local-certificate cert1",
+				"nat-traversal":      "nat-traversal disable",
+				"version":            "version v2-only",
+			},
+			read: func(c *Config) string {
+				out := ""
+				for _, g := range c.Security.IPsec.Gateways {
+					out += fmt.Sprintf("addr=%q ext=%q pol=%q la=%q cert=%q natt=%v ver=%q",
+						g.Address, g.ExternalIface, g.IKEPolicy, g.LocalAddress,
+						g.LocalCertificate, g.NoNATTraversal, g.Version)
+				}
+				return out
+			},
+		},
 		"security/ike/proposal": {
 			prefix: "security { ike { ",
 			open:   "proposal pr1",
