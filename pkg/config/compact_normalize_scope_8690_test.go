@@ -687,6 +687,31 @@ func TestElidedSSHRootLoginReachesTheDaemon8690(t *testing.T) {
 // and re-opening the instance does not merge, so these are unmeasurable by this
 // method until #8436 lands, not merely unfixtured.
 var knownUnexaminable8690 = []string{
+	// #8690: this one is the INVERSE of every other entry, and the difference
+	// is worth stating because the failure message tells the next person to
+	// supply a missing sibling — which cannot work here.
+	//
+	// The cell evaluates three configs: `stanza { leaf v1; }`, `{ leaf v2; }`
+	// and the EMPTY skeleton `stanza { }`. For every other entry the empty
+	// skeleton fails because some OTHER required leaf is absent, so a richer
+	// fixture fixes it. Here the empty skeleton fails because `test T1 { }` is
+	// rejected with "target is required" — THE LEAF UNDER TEST IS ITSELF THE
+	// REQUIRED SIBLING. Any fixture that makes the control compile has to
+	// supply `target`, which is the value the control exists to omit.
+	//
+	// So this is not a fixture gap; it is a limit of the three-config method
+	// for a leaf whose own presence is the stanza's validity condition. It is
+	// listed rather than fixed, and the verdict comes from a HAND measurement
+	// taken with the pair admitted and the pass both ways:
+	//
+	//	BLOCK   test T { target address 1.2.3.4; }   passOFF clean   passON clean
+	//	COMPACT test T target address 1.2.3.4;       passOFF REJECT  passON clean, test registers
+	//
+	// which is the benign pattern — the gate refuses the consequence of the
+	// drop and the pass repairs it. Its nine sibling leaves are NOT benign and
+	// do not share this verdict; they are `sibling-blocked` in the register.
+	"services rpm probe xpfarg test xpfarg target",
+
 	"class-of-service fairness rss-expectation interface xpfarg queue",
 	"class-of-service fairness rss-expectation interface xpfarg queue xpfarg active-workers",
 	"class-of-service fairness rss-expectation interface xpfarg queue xpfarg at-least-active-workers",
