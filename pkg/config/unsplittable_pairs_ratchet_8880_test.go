@@ -263,6 +263,26 @@ func TestUnsplittablePairRatchet8880(t *testing.T) {
 	// not vindicated by having differed. It is the practice that is worth
 	// keeping, and a run where it agrees is the cheapest possible confirmation
 	// that nothing unmodelled happened.
+	// READ THIS BEFORE REACHING FOR A REMEDY -- twice now someone has reached
+	// for the wrong one, including me.
+	//
+	// THIS POPULATION'S MEMBERSHIP CRITERION IS BROADER THAN ITS REMEDY
+	// ADVICE, and the gap is where both corrections landed. Membership is
+	// "the container cannot split a multi-statement run". The advice assumes
+	// the cause is a packed run failing to split, for which packedStatements
+	// is a candidate. Those are DIFFERENT CLAIMS, so a member can be here for
+	// a cause the advice does not fit:
+	//
+	//	policy-options as-path   packedStatements DOES fix it, contradicting
+	//	                         the advice's own "a multi leaf makes it
+	//	                         insufficient" generalisation.
+	//	syslog host/file/user    packedStatements does NOT fix it; the
+	//	                         residual is a FOLDED-SIBLING MERGE, not a
+	//	                         split failure at all.
+	//
+	// MEASURE the member's actual residual before choosing a remedy; do not
+	// infer the cause from the population it landed in.
+	//
 	// #8943 args1 463 -> 466: the three `syslog` destinations were admitted.
 	// GROWTH, deliberate, attributed, and a strict improvement -- measured for
 	// a config carrying TWO syslog hosts:
@@ -334,6 +354,10 @@ func TestUnsplittablePairRatchet8880(t *testing.T) {
 			dir = "SHRANK"
 		}
 		t.Errorf("unsplittable-pair population %s %s: got %d, want %d (#8880)\n"+
+			"MEMBERSHIP IS BROADER THAN THE REMEDY ADVICE: measure this "+
+			"member's actual residual before choosing a remedy, and do not "+
+			"infer the cause from the population -- two members so far had "+
+			"causes the advice did not fit. "+
 			"GREW means a pair was admitted to the brace-elision scope whose "+
 			"container cannot split a multi-statement run -- the #8850 "+
 			"address-book shape, where the scope entry alone folds two "+

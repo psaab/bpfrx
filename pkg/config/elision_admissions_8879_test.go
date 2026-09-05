@@ -64,6 +64,110 @@ var admittedElisionCases8879 = []struct {
 		`security { nat { source { pool P { address 10.0.0.1/32; } } } }`,
 		`security nat { source { pool P { address 10.0.0.1/32; } } }`,
 		func(c *Config) string { return fmt.Sprintf("pools=%d", len(c.Security.NAT.SourcePools)) }},
+	// #8943 final — the remaining depth-2 drops. Per-row evidence, collision
+	// counts and the dataplane-vs-compiler severity axis in
+	// docs/log/8943-final.md.
+	{"address-book global",
+		`security { address-book { global { address a7717 203.0.113.7/32; } } }`,
+		`security { address-book global { address a7717 203.0.113.7/32; } }`,
+		func(c *Config) string {
+			if c.Security.AddressBook == nil {
+				return "<nil>"
+			}
+			return fmt.Sprintf("addrs=%d", len(c.Security.AddressBook.Addresses))
+		}},
+	{"archival configuration",
+		`system { archival { configuration { transfer-interval 77; } } }`,
+		`system { archival configuration { transfer-interval 77; } }`,
+		func(c *Config) string {
+			if c.System.Archival == nil {
+				return "<nil>"
+			}
+			return fmt.Sprintf("iv=%d", c.System.Archival.TransferInterval)
+		}},
+	{"bgp damping",
+		`protocols { bgp { damping { half-life 27; } } }`,
+		`protocols { bgp damping { half-life 27; } }`,
+		func(c *Config) string {
+			if c.Protocols.BGP == nil {
+				return "<nil>"
+			}
+			return fmt.Sprintf("damp=%v/%d", c.Protocols.BGP.Dampening, c.Protocols.BGP.DampeningHalfLife)
+		}},
+	{"bgp multipath",
+		`protocols { bgp { multipath { multiple-as; } } }`,
+		`protocols { bgp multipath { multiple-as; } }`,
+		func(c *Config) string {
+			if c.Protocols.BGP == nil {
+				return "<nil>"
+			}
+			return fmt.Sprintf("mpAS=%v", c.Protocols.BGP.MultipathMultipleAS)
+		}},
+	{"dataplane coalescence",
+		`system { dataplane { coalescence { rx-usecs 37; } } }`,
+		`system { dataplane coalescence { rx-usecs 37; } }`,
+		func(c *Config) string {
+			if c.System.UserspaceDataplane == nil {
+				return "<nil>"
+			}
+			return fmt.Sprintf("rx=%d", c.System.UserspaceDataplane.CoalescenceRXUsecs)
+		}},
+	{"dataplane shared-umem",
+		`system { dataplane { shared-umem { mode cross-nic; } } }`,
+		`system { dataplane shared-umem { mode cross-nic; } }`,
+		func(c *Config) string {
+			if c.System.UserspaceDataplane == nil || c.System.UserspaceDataplane.SharedUMEM == nil {
+				return "<nil>"
+			}
+			return "umem=" + c.System.UserspaceDataplane.SharedUMEM.Mode
+		}},
+	{"flow-monitoring version9",
+		`services { flow-monitoring { version9 { template t7717 { flow-active-timeout 313; } } } }`,
+		`services { flow-monitoring version9 { template t7717 { flow-active-timeout 313; } } }`,
+		func(c *Config) string {
+			if c.Services.FlowMonitoring == nil || c.Services.FlowMonitoring.Version9 == nil {
+				return "<nil>"
+			}
+			return fmt.Sprintf("v9=%d", len(c.Services.FlowMonitoring.Version9.Templates))
+		}},
+	{"flow-monitoring version-ipfix",
+		`services { flow-monitoring { version-ipfix { template t7718 { flow-active-timeout 317; } } } }`,
+		`services { flow-monitoring version-ipfix { template t7718 { flow-active-timeout 317; } } }`,
+		func(c *Config) string {
+			if c.Services.FlowMonitoring == nil || c.Services.FlowMonitoring.VersionIPFIX == nil {
+				return "<nil>"
+			}
+			return fmt.Sprintf("ipfix=%d", len(c.Services.FlowMonitoring.VersionIPFIX.Templates))
+		}},
+	{"interface-routes rib-group",
+		`routing-options { interface-routes { rib-group inet rg7717; } }`,
+		`routing-options { interface-routes rib-group inet rg7717; }`,
+		func(c *Config) string { return "rg=" + c.RoutingOptions.InterfaceRoutesRibGroup }},
+	{"license autoupdate",
+		`system { license { autoupdate { url https://lic7717.example.invalid/x; } } }`,
+		`system { license autoupdate { url https://lic7717.example.invalid/x; } }`,
+		func(c *Config) string { return "url=" + c.System.LicenseAutoUpdate }},
+	{"policies policy-rematch",
+		`security { policies { policy-rematch { extensive; } } }`,
+		`security { policies policy-rematch { extensive; } }`,
+		func(c *Config) string {
+			return fmt.Sprintf("rematch=%v/%v", c.Security.PolicyRematch, c.Security.PolicyRematchExtensive)
+		}},
+	{"pre-id-default-policy then",
+		`security { pre-id-default-policy { then { log { session-init; } } } }`,
+		`security { pre-id-default-policy then { log { session-init; } } }`,
+		func(c *Config) string {
+			if c.Security.PreIDDefaultPolicy == nil {
+				return "<nil>"
+			}
+			return fmt.Sprintf("init=%v", c.Security.PreIDDefaultPolicy.LogSessionInit)
+		}},
+	{"rib static",
+		`routing-options { rib inet.0 { static { route 203.0.113.0/24 { next-hop 10.9.0.1; } } } }`,
+		`routing-options { rib inet.0 static { route 203.0.113.0/24 { next-hop 10.9.0.1; } } }`,
+		func(c *Config) string {
+			return fmt.Sprintf("static=%d", len(c.RoutingOptions.StaticRoutes))
+		}},
 	// #8943 — the `syslog` destinations. The lost field reaches the RUNTIME:
 	// applySyslogConfig builds the syslog clients from these, so an elided
 	// destination means the operator has configured a log target and has none.
@@ -701,6 +805,7 @@ func TestAdmittedDropsAreReadSomewhere8879(t *testing.T) {
 	knownNotRead := map[string]string{
 		"forwarding-options family":      "inet6 mode packet-based is accepted-only; the dataplane is flow-based",
 		"flow aging":                     "pressure-based shedding is accepted-only; the AF_XDP dataplane ages on per-session idle timeout only",
+		"pre-id-default-policy then":     "pre-id session logging is inert; no pre-identification admit path exists (the depth-2 pair, same advisory as the depth-1 one above)",
 		"class-of-service rewrite-rules": "exp rewrite is inert; the dataplane rewrites dscp on egress only",
 		"security pre-id-default-policy": "pre-id session logging is inert; no pre-identification admit path exists",
 	}
@@ -1267,21 +1372,14 @@ func TestDepth2UnadmittedPopulation8929(t *testing.T) {
 	// MEASURED TO DROP (#8938). Named rather than counted so that fixing one
 	// reds this cell and forces its removal — a list that outlives its reason
 	// is the failure this campaign keeps finding.
-	knownDropping := []string{
-		"address-book global", "archival configuration", "bgp damping",
-		"bgp multipath", "dataplane coalescence", "dataplane shared-umem",
-		"flow-monitoring version-ipfix", "flow-monitoring version9",
-		"interface-routes rib-group", "license autoupdate",
-		"policies policy-rematch", "pre-id-default-policy then",
-		"rib static",
-	}
+	knownDropping := []string{}
 	// 50 UNIQUE pairs. #8929 said 51 by counting a slice that double-counted
 	// `family inet6`, which appears under two different top-level stanzas.
 	// The predicate is keyed on (mid, head) and knows nothing about the
 	// stanza, so the same pair reached by two routes is ONE pair — counting
 	// sites where the population is pairs is the unit mismatch this campaign
 	// already hit once, on the 320-sites / 95-pairs reconciliation.
-	const wantPopulation = 37
+	const wantPopulation = 24
 
 	parentAdmitted := func(mid string) bool {
 		for stanza := range setSchema.children {
@@ -1323,7 +1421,7 @@ func TestDepth2UnadmittedPopulation8929(t *testing.T) {
 	// catches an entry that should have been REMOVED and is blind to one that
 	// was removed silently (a bad merge, a tidy-up). Measured: deleting an
 	// entry left this cell green until this assertion was added.
-	if len(knownDropping) != 13 {
+	if len(knownDropping) != 0 {
 		t.Errorf("knownDropping has %d entries, want 13. #8938 measured 26 of "+
 			"the 50 dropping; the `nat` and `flow` families were admitted in "+
 			"#8943, leaving 13. Removing one is only correct if the pair was "+

@@ -103,6 +103,20 @@ var knownBlindScopePairs8852 = map[string]string{
 	// #8879 batch 2, same reasoning as batch 1: admitted after measuring the
 	// elided spelling SILENT, blind to arm 2 for the same structural reason, so
 	// their fold correctness rests on the per-pair cells rather than the census.
+	// #8943 final: shapes derived by the sentinel method; all plain-container.
+	"address-book global":           "plain-container",
+	"archival configuration":        "plain-container",
+	"bgp damping":                   "plain-container",
+	"bgp multipath":                 "plain-container",
+	"dataplane coalescence":         "plain-container",
+	"dataplane shared-umem":         "plain-container",
+	"flow-monitoring version9":      "plain-container",
+	"flow-monitoring version-ipfix": "plain-container",
+	"interface-routes rib-group":    "plain-container",
+	"license autoupdate":            "plain-container",
+	"policies policy-rematch":       "plain-container",
+	"pre-id-default-policy then":    "plain-container",
+	"rib static":                    "plain-container",
 	// #8943, the syslog destinations: named containers (see blindShape8852).
 	"syslog file": "named-container",
 	"syslog host": "named-container",
