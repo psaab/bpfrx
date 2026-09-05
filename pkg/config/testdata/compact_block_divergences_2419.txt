@@ -139,6 +139,27 @@
 #     accepts a value the compiler then rejects, which is a finding about those
 #     two disagreeing rather than about this census).
 #
+# #8690 unruled-fixture sweep, third increment: the LARGEST bucket, split.
+#
+# "leaf value not observable" holds 236 sites, and the census note called every
+# one of them "a site whose synthesized fixture was too thin to observe the
+# value (as #6821 was before its required-sibling context line)". Measured, that
+# describes FIVE:
+#
+#	nothing registered (fixture too thin)          5
+#	stanza registered, leaf contributed nothing  219
+#	registered, but the value did not vary        12
+#
+# The 219 are NOT a fixture backlog. Their stanza compiles, their own empty
+# skeleton compiles, and the two are EQUAL — so the compiler reads the stanza
+# and does not read the leaf, under EITHER spelling. That is why they cannot be
+# compact/block divergences, and it makes them a question about the COMPILER
+# (a leaf that commits and does nothing, a leaf consumed elsewhere, or one
+# needing an in-stanza sibling) rather than about this census.
+#
+# Recording the split is the point. 236 reads as one backlog; the three numbers
+# are three different pieces of work, and only the first is what the note said.
+#
 # Seven sites remain in the no-pair bucket and SIX of them are declared inert
 # by their own valueDesc — `authentication-type` ("not an OSPF leaf") and the
 # four `system login class` regexp leaves ("not implemented by xpf"). They are
