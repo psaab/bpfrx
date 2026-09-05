@@ -1258,6 +1258,19 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		// admitting `system login` would turn a loud #6662 rejection into a
 		// silent acceptance, which is a regression wearing the shape of a fix).
 		"protocols bgp",
+		// #8879 batch 6. THREE admitted, `system services` DECLINED -- it
+		// measured like a clean candidate on every column and re-opened #6966
+		// when folded (see TestSystemServicesStaysUnadmitted8879).
+		// `routing-options forwarding-table` is the one to read
+		// twice: dropping the export policy also drops the DANGLING-REFERENCE
+		// CHECK on it, so before this admission the braced spelling was
+		// REJECTED at strict commit for naming an undefined policy while the
+		// elided spelling committed clean. The elision was not only losing a
+		// value, it was suppressing the validation that would have complained
+		// -- a fail-open in the direction an operator would never suspect.
+		"forwarding-options dhcp-relay",
+		"protocols rip",
+		"routing-options forwarding-table",
 		// #8879 batch 5. TWO OF THESE FOUR CAME OUT OF THE SWEEP'S "SAME"
 		// COLUMN, not its SILENT column -- they were published as benign.
 		// `class-of-service fairness` drops its whole expectation list and

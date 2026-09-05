@@ -59,6 +59,36 @@ func TestAdmittedPairsCompileLikeBraced8879(t *testing.T) {
 			`security { nat { source { pool P { address 10.0.0.1/32; } } } }`,
 			`security nat { source { pool P { address 10.0.0.1/32; } } }`,
 			func(c *Config) string { return fmt.Sprintf("pools=%d", len(c.Security.NAT.SourcePools)) }},
+		// #8879 batch 6. Read `routing-options forwarding-table` twice: the
+		// elision was not only dropping a value, it was SUPPRESSING A COMMIT
+		// CHECK. See TestElisionSuppressedAValidation8879 below.
+		{"forwarding-options dhcp-relay",
+			`forwarding-options { dhcp-relay { group g1 { active-server-group sg1; interface ge-0/0/4.0; } } }`,
+			`forwarding-options dhcp-relay { group g1 { active-server-group sg1; interface ge-0/0/4.0; } }`,
+			func(c *Config) string {
+				if c.ForwardingOptions.DHCPRelay == nil {
+					return "<nil>"
+				}
+				return fmt.Sprintf("groups=%d", len(c.ForwardingOptions.DHCPRelay.Groups))
+			}},
+		{"protocols rip",
+			`protocols { rip { neighbor ge-0/0/5.0; redistribute static; } }`,
+			`protocols rip { neighbor ge-0/0/5.0; redistribute static; }`,
+			func(c *Config) string {
+				if c.Protocols.RIP == nil {
+					return "<nil>"
+				}
+				return fmt.Sprintf("if=%d/redist=%d",
+					len(c.Protocols.RIP.Interfaces), len(c.Protocols.RIP.Redistribute))
+			}},
+		// The export policy is DEFINED in both arms on purpose. With an
+		// undefined one the braced arm is rejected and the elided arm is not,
+		// which is a real asymmetry but a different one -- it would make this
+		// row measure the dangling-reference check rather than the drop.
+		{"routing-options forwarding-table",
+			`policy-options { policy-statement ecmp-policy-7717 { then accept; } } routing-options { forwarding-table { export ecmp-policy-7717; } }`,
+			`policy-options { policy-statement ecmp-policy-7717 { then accept; } } routing-options forwarding-table { export ecmp-policy-7717; }`,
+			func(c *Config) string { return "fte=" + c.RoutingOptions.ForwardingTableExport }},
 		// #8879 batch 5. TWO OF THESE FOUR WERE PUBLISHED AS BENIGN.
 		//
 		// `class-of-service fairness` and `security policy-stats` came out of
@@ -471,5 +501,106 @@ func TestSweepUnanswerableRowIsNotADefect8879(t *testing.T) {
 			"real drop has appeared here, or the decline recorded in this "+
 			"cell is now wrong -- it must not stay declined by inertia.",
 			len(got), len(want))
+	}
+}
+
+// TestElisionSuppressedAValidation8879 pins the most consequential thing found
+// in the whole #8879 population: an elision that did not merely lose a value
+// but SUPPRESSED THE COMMIT CHECK that would have reported the loss.
+//
+// `routing-options forwarding-table export <policy>` is validated at strict
+// commit -- naming an undefined policy-statement is refused, and the error says
+// why it matters ("the expected ECMP / consistent-hash load-balancing would be
+// silently disabled"). Before this pair was admitted, the ELIDED spelling
+// dropped the export leaf before that check ran, so:
+//
+//	braced, undefined policy   -> REJECTED at commit (correct)
+//	elided, undefined policy   -> COMMITTED CLEAN     (fail-open)
+//
+// The operator who wrote the elided spelling got no value AND no complaint.
+// That is the worst of the three shapes this issue found: a silent drop is bad,
+// a silent drop that also disarms its own detector is worse, and it inverts the
+// usual intuition that the stricter-looking spelling is the risky one.
+//
+// Measured two-sided when it was found: removing the admission restores the
+// fail-open, so the admission is what closes it.
+func TestElisionSuppressedAValidation8879(t *testing.T) {
+	const undefined = "no-such-policy-7717"
+	refused := func(txt string) bool {
+		tree, perrs := NewParser(txt).Parse()
+		if len(perrs) > 0 {
+			t.Fatalf("fixture must parse: %v", perrs[0])
+		}
+		_, err := CompileConfig(tree)
+		return err != nil
+	}
+	braced := `routing-options { forwarding-table { export ` + undefined + `; } }`
+	elided := `routing-options forwarding-table { export ` + undefined + `; }`
+
+	// LIVENESS, fatal: if the braced arm stops being refused, the check this
+	// cell is about no longer exists and the comparison below is vacuous --
+	// it would pass trivially with both arms accepting.
+	if !refused(braced) {
+		t.Fatalf("the braced spelling with an UNDEFINED export policy is no " +
+			"longer refused at strict commit. This cell asserts that the " +
+			"elided spelling is refused TOO; with the check gone it would " +
+			"pass for the wrong reason.")
+	}
+	if !refused(elided) {
+		t.Error("the elided `routing-options forwarding-table export " +
+			"<undefined>` spelling COMMITS CLEAN. The elision is dropping the " +
+			"export leaf before the dangling-reference check can see it, so " +
+			"the operator gets neither the load-balancing policy nor the " +
+			"error explaining why -- ECMP is silently disabled (#8879).")
+	}
+}
+
+// TestSystemServicesStaysUnadmitted8879 records the #8879 batch-6 DECLINE, and
+// the way it was found matters more than the decline itself.
+//
+// `system services` measures like a textbook admission candidate: gate SILENT,
+// zero warnings, both spellings accepted at strict commit, braced arm live
+// against an empty config, elided arm dropping the whole stanza. Every column
+// this issue adjudicates on said "admit it". It was admitted, and the FULL
+// package suite -- not the scoped run, not the #8879 cells -- went red on
+// TestPackedLoginBehindAnotherSystemStatementIsRejected_6966.
+//
+// The reason: with `system services` folded, `system services ssh login user
+// alice class ops;` parses into the services container, `login` is not a child
+// of `ssh`, and the stanza is dropped -- but strict commit now ACCEPTS it.
+// That is #6966 re-opened: the CLI then runs with an empty class. Admitting
+// this pair converts a loud rejection into a silent acceptance, which is the
+// #8868 shape exactly, and no measurement taken on the pair ITSELF could have
+// seen it because the damage is to a DIFFERENT statement that happens to pack
+// behind it.
+//
+// The general lesson, worth more than this one pair: a pair's own before/after
+// columns cannot see a regression in a sibling statement. Only the whole suite
+// can, which is why #8879 batches gate on the full package rather than on the
+// cells they add.
+func TestSystemServicesStaysUnadmitted8879(t *testing.T) {
+	// Errorf, not Fatalf: the property assertion below must still run so a
+	// mutant admitting the pair is caught by both, not just by this one.
+	if compactNormalizeInScope("system", "services") {
+		t.Errorf("`system services` has been ADMITTED to " +
+			"compactNormalizeInScope. It measures like a clean silent-drop " +
+			"candidate, but folding it makes `system services ssh login user " +
+			"<u> class <c>;` strict-ACCEPT while still dropping the login " +
+			"stanza, re-opening #6966 (the CLI runs with an empty class). " +
+			"Admitting it trades a loud rejection for a silent acceptance " +
+			"(#8868).")
+	}
+	// The property behind the flag. Asserting the flag alone would pass if the
+	// rejection moved somewhere else or disappeared entirely.
+	txt := `system services ssh login user alice class ops;`
+	tree, perrs := NewParser(txt).Parse()
+	if len(perrs) > 0 {
+		t.Fatalf("fixture must parse: %v", perrs[0])
+	}
+	if _, err := CompileConfig(tree); err == nil {
+		t.Error("`system services ssh login user alice class ops;` is now " +
+			"ACCEPTED at strict commit. The login stanza is not modelled " +
+			"there, so it is dropped and the CLI runs with an empty class -- " +
+			"the operator must be told, not silently obeyed (#6966/#8879).")
 	}
 }
