@@ -392,6 +392,11 @@ func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, 
 		// loop against the live comms context, and a knob-OFF commit stops it.
 		d.ensureDHCPLeaseSyncLoop(d.dhcpLeaseSyncEnabled(cfg))
 
+		// #8967: the same reconcile for the IPsec SA advertisement loop. It
+		// was the one comms-scoped loop with no apply-path presence, so a
+		// knob-ON commit on a running cluster started nothing.
+		d.ensureIPsecSASyncLoop(d.ipsecSASyncEnabled(cfg))
+
 		// #6628: reconcile the AUTHENTICATION posture of any established
 		// session-sync connection against the just-committed control-link key.
 		//

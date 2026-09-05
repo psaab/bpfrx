@@ -213,7 +213,10 @@ type Daemon struct {
 	// into dhcpLeaseSyncState (see daemon_dhcp_lease_sync.go) as increment 1
 	// of the #4407 Daemon god-struct decomposition — grouping only, no
 	// behavior change. The mirrored ddnsReconcile* fields above remain flat.
-	dhcpLeaseSync  dhcpLeaseSyncState
+	dhcpLeaseSync dhcpLeaseSyncState
+	// #8967: lifecycle for the IPsec SA advertisement loop, so the knob can
+	// be toggled from the apply path like its three sibling loops.
+	ipsecSASync    ipsecSASyncState
 	ipsecSANudgeCh chan struct{} // nudge: peer (re)connect -> IPsec SA re-advertise (#4385)
 	// #4899 DHCP-lease-change IPsec rebind recovery state. When a DHCP
 	// renewal moves the kernel address an IPsec gateway is dynamically bound
