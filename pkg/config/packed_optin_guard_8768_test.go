@@ -57,6 +57,23 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 				return out
 			},
 		},
+		"vpn-monitor": {
+			prefix: "security { ipsec { vpn v1 { ",
+			open:   "vpn-monitor",
+			closer: " } } }",
+			stmts: map[string]string{
+				"destination-ip":   "destination-ip 1.2.3.4",
+				"source-interface": "source-interface ge-0/0/0",
+			},
+			read: func(c *Config) string {
+				out := ""
+				for _, v := range c.Security.IPsec.VPNs {
+					out += fmt.Sprintf("mon=%v src=%q dst=%q",
+						v.VPNMonitor, v.VPNMonitorSourceInterface, v.VPNMonitorDestinationIP)
+				}
+				return out
+			},
+		},
 		"policy": {
 			prefix: "security { ike { " + ikeProp + " ",
 			open:   "policy p1",
@@ -82,12 +99,18 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 func TestPackedOptInHoldsForEveryLeafPair8768(t *testing.T) {
 	// Find every container in the schema that has opted in.
 	optedIn := map[string]*schemaNode{}
+	var collisions []string
+	seenCollision := map[string]bool{}
 	var walk func(n *schemaNode, name string, depth int)
 	walk = func(n *schemaNode, name string, depth int) {
 		if n == nil || depth > 12 {
 			return
 		}
 		if n.packedStatements && name != "" {
+			if prev, dup := optedIn[name]; dup && prev != n && !seenCollision[name] {
+				seenCollision[name] = true
+				collisions = append(collisions, name)
+			}
 			optedIn[name] = n
 		}
 		for cn, ch := range n.children {
@@ -98,6 +121,22 @@ func TestPackedOptInHoldsForEveryLeafPair8768(t *testing.T) {
 		}
 	}
 	walk(setSchema, "", 0)
+
+	// NAME COLLISIONS ARE FATAL, because this registry is keyed by container
+	// NAME and schema names repeat: `proposal` exists under both `ike` and
+	// `ipsec`, and `dead-peer-detection` under both too. If two nodes of one
+	// name opt in, the map holds whichever the walk reached last and the leaf
+	// enumeration silently describes the wrong container — a guard that reports
+	// on a node nobody opted in. Refuse rather than guess; keying by path is
+	// the real fix and is deliberately left until a second node needs it.
+	if len(collisions) > 0 {
+		sort.Strings(collisions)
+		t.Fatalf("%d container name(s) opt in at MORE THAN ONE schema position: %v.\n"+
+			"This registry is keyed by name, so it cannot tell them apart and would "+
+			"enumerate the leaves of whichever the walk reached last. Key it by "+
+			"schema path before opting in a second node of the same name (#8768).",
+			len(collisions), collisions)
+	}
 	if len(optedIn) == 0 {
 		t.Fatal("no container declares packedStatements, so this cell asserts " +
 			"nothing — either the flag was removed or the walk lost reach (#8768)")
