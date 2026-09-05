@@ -244,6 +244,38 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 	// family label is not a safety property, and this is the case that proves
 	// it. TestNormalizerScopeNeverCoversAPartialSite8690 binds it mechanically
 	// so the next widening cannot make the same mistake by inspection.
+	// #8690: `policy proposal-set`, the two sites lane-8015's security family
+	// could not take.
+	//
+	// It landed the rest of security in 950df1331 while I was measuring the
+	// same family — so 45 of the 47 sites I had scoped were already done, and
+	// my pair list for them is dropped rather than landed redundantly. These
+	// two are what remained:
+	//
+	//	security ike   policy <p> proposal-set
+	//	security ipsec policy <p> proposal-set
+	//
+	// They share one pair, and they were blocked by a commit gate rather than
+	// by anything about the fold. The disarm arm flags
+	// `security ipsec policy xpfarg proposal-set` as REJECTED without the pass
+	// and ACCEPTED with it, which is a red until a person classifies it.
+	//
+	// Classified benign, with the measurement in the guard's `benign` map: the
+	// gate refuses the CONSEQUENCE of the drop and says so itself — the elided
+	// spelling loses the proposal-set, and the gate rejects with "has no
+	// resolvable ipsec proposal ... the configured perfect-forward-secrecy
+	// group would be SILENTLY DROPPED". With the pass the proposal-set survives
+	// and the same gate accepts. The braced spelling is accepted either way, so
+	// the config was always legitimate and only the elided form lost it.
+	//
+	// That gate exists to catch this exact drop, so the pass repairing the drop
+	// and the gate then passing is the intended interaction. Without the
+	// classification these two sites are unreachable by any widening — which is
+	// why they were still here.
+	if containerKeyword == "policy" && head == "proposal-set" {
+		return true
+	}
+
 	// #8690 family 5: applications, services, snmp, event-options. 30 sites,
 	// every one drop shape "empty" in the inventory.
 	//

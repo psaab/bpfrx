@@ -124,8 +124,6 @@ schedulers scheduler xpfarg start-date	empty
 schedulers scheduler xpfarg stop-date	empty
 security dynamic-address feed-server xpfarg hostname	empty
 security dynamic-address feed-server xpfarg url	empty
-security ike policy xpfarg proposal-set	empty
-security ipsec policy xpfarg proposal-set	empty
 system dataplane control-socket	empty
 system domain-name	empty
 system login class	partial

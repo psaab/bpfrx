@@ -269,6 +269,15 @@ func TestCompactNormalizeScopePreservesCompiledResult8690(t *testing.T) {
 	// reds instead of quietly excusing the next real disarm that lands on the
 	// same key.
 	benign := map[string]string{
+		"security ipsec policy xpfarg proposal-set": "the gate refuses the CONSEQUENCE of the " +
+			"drop, and says so in its own message. Measured: with the pass disabled the elided " +
+			"`policy p1 proposal-set standard;` loses the proposal-set and the gate rejects with " +
+			"\"has no resolvable ipsec proposal ... the configured perfect-forward-secrecy group " +
+			"would be SILENTLY DROPPED\"; with the pass enabled the proposal-set survives and the " +
+			"same gate accepts. The braced spelling — the reference behaviour — is accepted " +
+			"either way, so the config is legitimate and only the elided form was losing it. " +
+			"This gate was written to catch exactly this drop class, so the pass repairing the " +
+			"drop and the gate then passing is the intended interaction, not a disarm.",
 		"snmp trap-group xpfarg targets": "the gate refuses the CONSEQUENCE of the drop, not " +
 			"the spelling. Measured: with the pass disabled the elided " +
 			"`trap-group tg1 targets 10.0.0.1;` loses its targets and snmp rejects with " +
