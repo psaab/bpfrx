@@ -1303,10 +1303,35 @@ def _ver_key(v):
     not lexically (fable-165 H-25). Split on the FIRST '-': left = release,
     right = suffix."""
     s = str(v)
-    rel, _, suffix = s.partition("-")
+    # #8969: SEMVER BUILD METADATA IS NOT PRECEDENCE. `1.0.0+build.7` is the
+    # same release as `1.0.0` (semver 11.4), and the version validator's own
+    # docstring advertises that spelling as accepted input. Left in, its `+`
+    # made the release component non-numeric and it outranked the base.
+    s = s.partition("+")[0]
+    # #8969: split on the FIRST `-` OR `~`. Debian spells a pre-release with a
+    # tilde and orders it before everything; git-describe spells it with a
+    # hyphen. Both mean "before the base release", and only the hyphen was
+    # recognised -- so `1.2.3~rc1` had no suffix, parsed as the non-numeric
+    # release token `3~rc1`, and passed an anti-rollback watermark set at
+    # `1.2.3` that the identical `1.2.3-rc1` was correctly refused by.
+    cut = min((i for i in (s.find("-"), s.find("~")) if i >= 0), default=-1)
+    if cut >= 0:
+        rel, suffix = s[:cut], s[cut + 1:]
+    else:
+        rel, suffix = s, ""
     rel_key = []
     for tok in rel.split("."):
-        rel_key.append((0, int(tok)) if tok.isdigit() else (1, tok))
+        # #8969: a non-numeric release token now sorts BELOW every numeric one
+        # (-1), where it used to sort ABOVE (1). This is the FAIL-CLOSED
+        # direction and it was chosen deliberately rather than inherited: an
+        # unparseable version is a candidate we cannot order, and the two
+        # outcomes are a refused upgrade (loud, an operator sees it) or a
+        # bypassed anti-rollback watermark (silent, an older image replaces a
+        # newer one). Measured before the change: `garbage`, `1.2.x` and
+        # `1.0.0+build.7` ALL ranked newer than `1.2.3` and passed the
+        # watermark, so the fail-open was general and the tilde was one
+        # instance of it.
+        rel_key.append((0, int(tok)) if tok.isdigit() else (-1, tok))
     if not suffix:
         pre_rank = (1,)                          # base release: after pre-release
     elif suffix[:1].isdigit():
