@@ -993,7 +993,12 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			// multi-word description must be quoted.
 			"description": {desc: "Proposal description", args: 1, scalar: true, placeholder: "<text>", children: nil},
 		}},
-		"policy": {desc: "IKE policy name", args: 1, placeholder: "<policy-name>", children: map[string]*schemaNode{
+		// packedStatements (#8768): compileIPsec reads `mode`, `proposals`,
+		// `proposal-set` and `pre-shared-key` as separate statements, and the
+		// packed spelling `policy p1 pre-shared-key ascii-text <k> mode main;`
+		// used to collapse them into one node, recovering the PSK and silently
+		// losing the mode. Both spellings compiled cleanly and disagreed.
+		"policy": {desc: "IKE policy name", args: 1, placeholder: "<policy-name>", packedStatements: true, children: map[string]*schemaNode{
 			// #3896: type mode/version/nat-traversal so a typo fails closed at
 			// commit instead of silently downgrading. The accepted sets mirror
 			// exactly what the strongSwan generator (pkg/ipsec) recognizes:
@@ -1018,7 +1023,14 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 				valueType: ValueEnumOf, valueDesc: "predefined IKE proposal set",
 				valueExamples: []string{"standard", "suiteb-gcm-128"},
 				validator:     ValidateEnum(ProposalSetNames()), children: nil},
-			"pre-shared-key": {desc: "Pre-shared key (ascii-text <key>)", children: nil},
+			// args: 2 declares the shape the description has always stated and
+			// the compiler has always read — `pre-shared-key ascii-text <key>`
+			// is THREE tokens, and compileIPsec takes the value from Keys[2].
+			// Leaving args at 0 meant consumeNodeKeys could not tell where this
+			// statement ended, so a packed tail carrying a SECOND statement
+			// (`... mode main`) could not be split and the second was swallowed
+			// (#8768). Declaring the arity is what makes the split possible.
+			"pre-shared-key": {desc: "Pre-shared key (ascii-text <key>)", args: 2, placeholder: "ascii-text <key>", children: nil},
 		}},
 		"gateway": {desc: "IKE gateway (VPN peer) name", args: 1, placeholder: "<gateway-name>", children: map[string]*schemaNode{
 			"address":            {desc: "Remote gateway address", args: 1, placeholder: "<address>", children: nil},

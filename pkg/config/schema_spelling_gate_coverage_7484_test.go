@@ -260,7 +260,11 @@ var gateBlindCeiling = map[gateBlindClass]int{
 	// output for a spelling to move. If OSPF ever gains a real
 	// `authentication-type`, these two must LEAVE this class and the ceiling
 	// must come back down by two.
-	gateBlindUnreachable: 142,
+	// 142 -> 141 (#8768): declaring `args: 2` on the IKE policy
+	// `pre-shared-key` leaf — the shape its description and compileIPsec always
+	// stated — moved it out of the unreachable class. The ratchet is tightened
+	// here rather than left loose, per this cell's own instruction.
+	gateBlindUnreachable: 141,
 	// #7132 raised this 175 -> 176 for `system ntp server ... prefer`.
 	//
 	// Raised deliberately, and it is the one kind of raise that is not a
