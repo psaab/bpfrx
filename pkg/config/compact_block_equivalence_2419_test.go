@@ -447,7 +447,38 @@ func collectCompactSites() []compactSite {
 			// read correctly in both spellings) and 1 DIVERGENT — the zone
 			// member this issue was filed on.
 			wildcardNamed := ch.args == 0 && ch.wildcard != nil
-			if (ch.wildcard == nil && ch.args == 1 || wildcardNamed) && len(path) >= 1 {
+			// A THIRD SHAPE: an ARG-NAMED container that ALSO carries a
+			// wildcard body. `system syslog file <name>` is args:1 for the file
+			// name, PLUS a wildcard for the open-ended facility keyword, PLUS
+			// modifier children -- so it satisfies NEITHER clause above. Not a
+			// bare valued leaf (it has children); not a wildcard-NAMED
+			// container (its instance comes from args, not the wildcard, and
+			// every existing branch requires wildcard == nil).
+			//
+			// THE BLINDNESS WAS SILENT AND IT DISARMED A DIFFERENT GUARD. These
+			// pairs produced NO census site, so when #8943/#8957 admitted
+			// `syslog file` / `host` / `user` to the elision scope, the standing
+			// empty-equivalence verification -- the rule this pass requires
+			// before ANY admission -- passed over all three by examining
+			// nothing. Green, and about nothing.
+			//
+			//	sites for pair (syslog, <leaf>)   before 0   after 6
+			//
+			// #8852 offers two remedies, "fix the census or the classifier".
+			// #8957 took the classifier branch and registered the three as
+			// `named-container`, which is legitimate by that guard's text and
+			// correctly diagnosed the shape. It leaves the verification
+			// vacuous, which is a different thing from being wrong. This takes
+			// the census branch, so the rule examines them instead.
+			//
+			// BOUNDED, AND MEASURED BEFORE WIDENING A SHARED INSTRUMENT:
+			// exactly six schema nodes carry this shape -- the three syslog
+			// destinations and their `groups` mirrors. No other container in
+			// the schema is arg-named with a wildcard body, so this is three
+			// containers wide rather than a re-baselining of every lane's
+			// population.
+			argNamedWithBody := ch.args >= 1 && ch.wildcard != nil
+			if (ch.wildcard == nil && ch.args == 1 || wildcardNamed || argNamedWithBody) && len(path) >= 1 {
 				key := strings.Join(path, "/") + "|" + name
 				if !seen[key] {
 					seen[key] = true

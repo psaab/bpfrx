@@ -103,10 +103,19 @@ var knownBlindScopePairs8852 = map[string]string{
 	// #8879 batch 2, same reasoning as batch 1: admitted after measuring the
 	// elided spelling SILENT, blind to arm 2 for the same structural reason, so
 	// their fold correctness rests on the per-pair cells rather than the census.
-	// #8943, the syslog destinations: named containers (see blindShape8852).
-	"syslog file": "named-container",
-	"syslog host": "named-container",
-	"syslog user": "named-container",
+	// The three syslog destinations were REGISTERED here as `named-container`
+	// and are now REMOVED, because the census can SEE them: collectCompactSites
+	// gained the arg-named-with-wildcard-body clause, so they emit sites like
+	// any other pair.
+	//
+	// Registering correctly DIAGNOSED why they were blind. It did not remove
+	// the consequence: while blind, the standing empty-equivalence
+	// verification passed over all three admissions by examining nothing.
+	// Measured 0 sites before the census fix, 6 after.
+	//
+	// This is the removal this registry exists to force -- a registration that
+	// outlives its reason is a recorded blindness nobody re-opens, and this
+	// cell reds the moment one does.
 	// #8943, the flow family; shapes derived by the sentinel method.
 	"flow aging":        "plain-container",
 	"flow icmp-session": "plain-container",
