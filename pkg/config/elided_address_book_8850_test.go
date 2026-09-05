@@ -36,6 +36,31 @@ import (
 // and the global one was NOT fixed by the zone-local change -- its container is
 // `global`, so it needed its own pair and its own opt-in. When the code names
 // one member of a declared pair the other is a candidate by construction.
+// addrPairs8850 renders NAME->PREFIX, never names alone.
+//
+// The cells below originally collected `for k := range ...Addresses` and
+// compared the name set. That is blind to the failure mode that matters most
+// here: a splitter that keeps both entries but SWAPS THEIR PREFIXES between
+// statements passes a name-only comparison completely --
+// `a1 -> 10.0.0.2/32, a2 -> 10.0.0.1/32` against a correct braced reference.
+//
+// An address book whose names resolve to the WRONG SUBNETS is worse than one
+// that lost an entry. The lost entry breaks the policy that references it, and
+// somebody notices; the swapped prefix leaves the policy existing, reading as
+// correct, and permitting the wrong traffic.
+func addrPairs8850(m map[string]*Address) []string {
+	var out []string
+	for k, v := range m {
+		val := "<nil>"
+		if v != nil {
+			val = v.Value
+		}
+		out = append(out, k+"="+val)
+	}
+	sort.Strings(out)
+	return out
+}
+
 func TestElidedAddressBook8850(t *testing.T) {
 	zoneAddrs := func(t *testing.T, ab string) []string {
 		t.Helper()
@@ -52,12 +77,7 @@ func TestElidedAddressBook8850(t *testing.T) {
 			if z.AddressBook == nil {
 				return nil
 			}
-			var out []string
-			for k := range z.AddressBook.Addresses {
-				out = append(out, k)
-			}
-			sort.Strings(out)
-			return out
+			return addrPairs8850(z.AddressBook.Addresses)
 		}
 		return nil
 	}
@@ -74,12 +94,7 @@ func TestElidedAddressBook8850(t *testing.T) {
 		if cfg.Security.AddressBook == nil {
 			return nil
 		}
-		var out []string
-		for k := range cfg.Security.AddressBook.Addresses {
-			out = append(out, k)
-		}
-		sort.Strings(out)
-		return out
+		return addrPairs8850(cfg.Security.AddressBook.Addresses)
 	}
 
 	for _, tc := range []struct {

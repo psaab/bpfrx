@@ -4,6 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"sort"
+	"strings"
 	"testing"
 )
 
@@ -68,18 +70,35 @@ func TestElidedContainerBraceKeepsBody8850(t *testing.T) {
 	}
 
 	// The same shape for screen profiles.
-	screens := func(t *testing.T, txt string) int {
+	// CONTENTS, NOT COUNTS -- this half was `len(cfg.Security.Screen)` on both
+	// arms, so with compileScreen never called at all both are 0 and it passes,
+	// against this file's own stated rule. It now renders the profile name AND
+	// the enabled check, so a screen that materialises EMPTY reds.
+	screens := func(t *testing.T, txt string) string {
 		t.Helper()
 		tree, _ := NewParser(txt).Parse()
 		cfg, err := CompileConfigLenient(tree)
 		if err != nil {
 			t.Fatalf("compile: %v", err)
 		}
-		return len(cfg.Security.Screen)
+		var out []string
+		for name, sc := range cfg.Security.Screen {
+			out = append(out, fmt.Sprintf("%s:pingDeath=%v", name, sc != nil && sc.ICMP.PingDeath))
+		}
+		sort.Strings(out)
+		return strings.Join(out, ",")
 	}
-	if b, e := screens(t, "security { screen { ids-option s1 { icmp { ping-death; } } } }"),
-		screens(t, "security { screen ids-option s1 { icmp { ping-death; } } }"); b != e {
-		t.Errorf("screen profiles braced=%d elided=%d", b, e)
+	braced := screens(t, "security { screen { ids-option s1 { icmp { ping-death; } } } }")
+	// LIVENESS: an equality assertion between two empty strings is satisfied
+	// perfectly, and that is exactly what a never-called compileScreen produces.
+	if braced == "" {
+		t.Fatalf("the BRACED screen reference compiled NOTHING, so comparing the " +
+			"elided spelling against it proves nothing (#8850)")
+	}
+	if e := screens(t, "security { screen ids-option s1 { icmp { ping-death; } } }"); braced != e {
+		t.Errorf("screen profile differs braced=%q elided=%q (#8850); a profile "+
+			"that exists with its checks OFF reads as configured and is worse "+
+			"than one that is absent", braced, e)
 	}
 }
 
@@ -96,35 +115,88 @@ func TestElidedContainerBraceKeepsBody8850(t *testing.T) {
 // These fingerprints were byte-compared against master before the change and
 // were identical; this cell pins that they stay so.
 func TestElidedBraceLeavesPayloadsAlone8850(t *testing.T) {
-	fp := func(t *testing.T, txt string) string {
+	fp := func(t *testing.T, txt string, skipPass bool) string {
 		t.Helper()
 		tree, errs := NewParser(txt).Parse()
 		if len(errs) > 0 {
 			t.Fatalf("parse: %v", errs)
 		}
-		cfg, err := CompileConfigLenient(tree)
+		opts := lenientCompileOpts()
+		opts.skipCompactNormalize = skipPass
+		cfg, err := compileConfigWithOpts(tree, opts)
 		if err != nil {
-			t.Fatalf("compile: %v", err)
+			t.Fatalf("compile (skipPass=%v): %v", skipPass, err)
 		}
 		j, _ := json.Marshal(cfg)
 		return fmt.Sprintf("%x", sha256.Sum256(j))[:16]
 	}
-	for _, c := range []struct{ name, txt, want string }{
-		{"bracket-list-in-term", "firewall { family inet { filter f1 { term t1 { from { protocol [ tcp udp icmp ]; } then { accept; } } } } }", ""},
-		{"policy-application-list", "security { policies { from-zone a to-zone b { policy p1 { match { source-address any; destination-address any; application [ junos-http junos-https ]; } then { permit; } } } } }", ""},
-		{"ospf-auth-md5-with-body", "protocols { ospf { area 0.0.0.0 { interface ge-0/0/0 { authentication md5 7 { key \"x\"; } } } } }", ""},
-		{"static-route-with-body", "routing-options { static { route 10.0.0.0/24 { next-hop 10.0.0.1; preference 5; } } }", ""},
-		{"vrrp-virtual-address", "interfaces { ge-0/0/0 { unit 0 { family inet { address 10.0.0.1/24 { vrrp-group 1 { virtual-address 10.0.0.9; priority 120; } } } } } }", ""},
+	for _, c := range []struct{ name, txt string }{
+		{"bracket-list-in-term", "firewall { family inet { filter f1 { term t1 { from { protocol [ tcp udp icmp ]; } then { accept; } } } } }"},
+		{"policy-application-list", "security { policies { from-zone a to-zone b { policy p1 { match { source-address any; destination-address any; application [ junos-http junos-https ]; } then { permit; } } } } }"},
+		{"ospf-auth-md5-with-body", "protocols { ospf { area 0.0.0.0 { interface ge-0/0/0 { authentication md5 7 { key \"x\"; } } } } }"},
+		{"static-route-with-body", "routing-options { static { route 10.0.0.0/24 { next-hop 10.0.0.1; preference 5; } } }"},
+		{"vrrp-virtual-address", "interfaces { ge-0/0/0 { unit 0 { family inet { address 10.0.0.1/24 { vrrp-group 1 { virtual-address 10.0.0.9; priority 120; } } } } } }"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			// The assertion is that it COMPILES and is stable; the byte-identity
-			// against master was checked out-of-band when the relaxation landed.
-			a, b := fp(t, c.txt), fp(t, c.txt)
-			if a != b {
-				t.Fatalf("non-deterministic compile: %s vs %s", a, b)
+			// COMPARE THE PASS AGAINST ITSELF DISABLED, not an input against
+			// itself.
+			//
+			// This previously read `a, b := fp(t, c.txt), fp(t, c.txt)` -- the
+			// SAME string hashed twice -- and carried a `want` field that every
+			// row set to "" and nothing ever read. An unread field is the tell:
+			// an assertion intended and never wired. It could not fail:
+			// reintroducing the #2419 multi-value drop moved every fixture's
+			// hash identically and all five subtests still passed.
+			//
+			// A pinned hash would be the obvious repair and is the wrong one --
+			// it changes whenever any unrelated Config field is added, so it
+			// would be deleted the first time it reds for an innocent reason.
+			//
+			// The property actually worth asserting is that the brace-elision
+			// pass LEAVES THESE NODES ALONE. Each fixture is a node carrying a
+			// multi-value payload or a braced body that the pass must not fold,
+			// so compiling with the pass and with it disabled must agree. That
+			// is stable under unrelated schema growth, and it fails for exactly
+			// the reason this cell exists: the relaxation starting to touch a
+			// payload node.
+			withPass := fp(t, c.txt, false)
+			without := fp(t, c.txt, true)
+			if withPass != without {
+				t.Errorf("the brace-elision pass CHANGED a node it must leave "+
+					"alone (#8850)\n  %s\n  with pass %s\n  pass disabled %s\n"+
+					"These fixtures are multi-value payloads and braced bodies, "+
+					"not elided containers. The pass folding one of them is the "+
+					"#2419 class returning through the relaxation.",
+					c.txt, withPass, without)
 			}
 		})
 	}
+
+	// LIVENESS FOR THE COMPARISON ITSELF, and it is not optional here.
+	//
+	// Measured: forcing the pass's gate FULLY OPEN -- `isBody || inScope(...) ||
+	// true` -- leaves all five fixtures above byte-identical. The pass does not
+	// reach them under any mutation of its gate, so their agreement is not
+	// evidence that the pass declined; it is evidence that the pass was never
+	// asked. Five green subtests that cannot move are exactly the shape this
+	// cell was rewritten to stop being.
+	//
+	// So the fixtures above are BREADTH, not sensitivity, and this control is
+	// what makes the comparison mean anything: a node the pass certainly DOES
+	// fold, asserted to DIFFER between pass-on and pass-off. If this ever stops
+	// differing, `fp` is comparing something that no longer depends on the pass
+	// and every row above went vacuous with it.
+	t.Run("control-the-pass-is-live", func(t *testing.T) {
+		const elided = "security { zones security-zone z1 { host-inbound-traffic " +
+			"{ system-services { ping; } } } }"
+		withPass, without := fp(t, elided, false), fp(t, elided, true)
+		if withPass == without {
+			t.Errorf("pass-on and pass-off agree on a node the pass MUST fold "+
+				"(#8850)\n  %s\n  both %s\n"+
+				"`fp` is no longer sensitive to the brace-elision pass, so every "+
+				"agreement asserted above is vacuous.", elided, withPass)
+		}
+	})
 }
 
 // #8850. The relaxation DECLINES one shape: a packed tail that splits into
