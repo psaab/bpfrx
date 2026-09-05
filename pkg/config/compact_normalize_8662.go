@@ -1414,7 +1414,24 @@ func normalizeCompactNodes(nodes []*Node, schema *schemaNode, inScope func(conta
 				childSub = sub
 			}
 		}
-		if len(node.Keys) > identity && len(node.Children) == 0 {
+		// #8850: a node may carry a packed tail AND a braced body at once --
+		// `security { zones security-zone z1 { host-inbound-traffic { ... } } }`
+		// is Keys=["zones","security-zone","z1"] with Children=[the zone body].
+		// The old `len(node.Children) == 0` guard declined those silently, so an
+		// elided container brace dropped the ENTIRE stanza: zones=0, screens=0,
+		// filters=0, with no error on either path.
+		//
+		// The body must be re-attached UNDER the deepest packed node, never left
+		// as a SIBLING of it. Leaving it as a sibling is wrong in the silent
+		// direction and is the trap this fix nearly shipped: the zone then
+		// EXISTS with an empty body, which reads as configured and is worse than
+		// the zone being absent. Measured on the way: braced gave
+		// hostInboundTraffic=[ping], sibling-attachment gave <nil>.
+		//
+		// Same rule packedBodyChildren already applies for READERS (#6821): they
+		// spell one path, so the nested block belongs under the deepest packed
+		// node.
+		if len(node.Keys) > identity {
 			head := node.Keys[identity]
 			// The tail only reads as an elided BODY if its first token names a
 			// child of this container. Otherwise it is this node's own
@@ -1432,10 +1449,22 @@ func normalizeCompactNodes(nodes []*Node, schema *schemaNode, inScope func(conta
 			}
 			if _, isBody := childSub.children[head]; isBody && inScope(ckw, head) {
 				tail := append([]string(nil), node.Keys[identity:]...)
+				body := node.Children
 				node.Keys = append([]string(nil), node.Keys[:identity]...)
+				node.Children = nil
 				node.IsLeaf = false
-				for _, stmt := range splitPackedStatements8768(tail, childSub) {
-					node.Children = append(node.Children, &Node{Keys: stmt, IsLeaf: true})
+				stmts := splitPackedStatements8768(tail, childSub)
+				for i, stmt := range stmts {
+					child := &Node{Keys: stmt, IsLeaf: true}
+					// The braced body belongs to the LAST packed statement --
+					// the deepest node the run names. Attaching it to the
+					// container, or to every statement, invents structure the
+					// operator did not write.
+					if i == len(stmts)-1 && len(body) > 0 {
+						child.Children = body
+						child.IsLeaf = false
+					}
+					node.Children = append(node.Children, child)
 				}
 				n++
 			}
