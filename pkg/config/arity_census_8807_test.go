@@ -379,11 +379,24 @@ var arityAdjudicated8807 = map[string]arityVerdict8807{
 		"baseline: every spelling delivers, and a bogus message-type is a LOUD commit rejection via the " +
 		"UnknownActions path rather than a silent drop. No defect. The residue is that COMPLETION under-offers, " +
 		"because the compiler is ahead of the schema -- the mirror of the #8773 rule."},
-	"then": {"measured-benign", "`/policy-options/policy-statement/then` is declared a true leaf args:0. The sites " +
-		"THIS predicate sees (compiler_routing.go:908, :1138) iterate its children; lane-8015 found a THIRD it " +
-		"cannot see, parsePolicyTermInlineKeys at :1269, consuming a FOLLOWING KEY via a variable index. MEASURED: " +
-		"every spelling delivers and the values reach real consumers. No defect. Same completion residue as " +
-		"`reject`."},
+	// `then` WAS HERE AND IS GONE BECAUSE IT WAS FIXED, not because the
+	// instrument stopped seeing it — which this cell rightly demands be
+	// distinguished before the entry is deleted.
+	//
+	// The predicate flagged `/policy-options/policy-statement/then` as a bare
+	// leaf whose compiler (compiler_routing.go:908) iterates children it did not
+	// declare. The schema now declares those two children (accept, reject), so
+	// the node is no longer a bare leaf and the predicate correctly stops
+	// matching. The mismatch is resolved rather than hidden.
+	//
+	// THE CONTROL that separates those two readings: `reject` is STILL reported
+	// by this census in the same run. If the compiler-file glob or the schema
+	// walk had broken, both would have vanished together. One leaving while its
+	// sibling stays is what a real fix looks like from here.
+	//
+	// The completion residue that made it worth fixing is recorded on `reject`
+	// below, which keeps it: the compiler was AHEAD of the schema, so nothing
+	// dropped and `?` help under-offered instead — the mirror of the #8773 rule.
 }
 
 // arityGenuineFloor8807 is a RATCHET, not an equality. It fails in BOTH
