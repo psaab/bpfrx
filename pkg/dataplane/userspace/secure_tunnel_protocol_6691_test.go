@@ -44,7 +44,20 @@ const preSecureTunnelProtocolVersion = 4
 // different bindings for a VLAN sibling of a flagged parent. A version whose
 // meaning depends on which round produced the binary is not a version. Nothing
 // has shipped at either value, so the cost is zero.
-const secureTunnelSnapshotProtocolVersion = 8
+//
+// issue 8892 moved it 8 -> 9. That bump is NOT about secure_tunnel: it is the
+// routing_domain field, which was added at v8 with no bump. This constant
+// tracks the CURRENT snapshot version, so it moves with any bump — it is not a
+// feature floor. The floor for this feature is MinProtocolSecureTunnelRefusal
+// (7) in protocol.go, it gates real behaviour in manager_compile.go, it is
+// immutable, and it is deliberately untouched: a v8 helper still handles
+// secure_tunnel correctly, so nothing about this feature's compatibility
+// changed.
+//
+// What the equality below still buys after that bump: the two planes must
+// agree on the number, and the number must move whenever the meaning does.
+// Both survive; only the literal moved.
+const secureTunnelSnapshotProtocolVersion = 9
 
 // preV5HelperAcceptsSnapshot models the exact-equality version gate a pre-v5
 // helper applies before touching any dataplane state

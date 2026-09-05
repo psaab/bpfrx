@@ -93,7 +93,15 @@ use super::snapshot::{ConfigSnapshot, FabricSnapshot, NeighborSnapshot, Userspac
 /// precisely the collision both comments below describe: a helper built from one
 /// branch alone advertises the same number and reads the rows differently. 8 was
 /// never shipped by either side, so no mixed pairing can agree on it by accident.
-pub(crate) const CONFIG_SNAPSHOT_PROTOCOL_VERSION: i32 = 8;
+/// v9 (issue 8892): `routing_domain` was added to the snapshot without bumping
+/// this constant, so a helper built before it advertises the same 8, passes the
+/// exact-equality gate, ignores the field, and resolves every interface to
+/// domain 0 -- the cross-tenant session aliasing that #7160 exists to close and
+/// that `afxdp/tests_routing_domain_7160.rs` asserts is a defect. Additive and
+/// degrading to the old behaviour is a sound argument for a FEATURE; it is not
+/// sound when the old behaviour IS the defect the field was added to fix, and
+/// for those the bump is the only mechanism that refuses the pairing.
+pub(crate) const CONFIG_SNAPSHOT_PROTOCOL_VERSION: i32 = 9;
 pub(crate) const INJECT_PACKET_TUPLE_PROTOCOL_VERSION: i32 = 1;
 
 /// #3651: one per-zone traffic-volume row inside the `ProcessStatus`-level

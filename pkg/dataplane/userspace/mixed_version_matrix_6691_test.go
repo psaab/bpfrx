@@ -119,7 +119,7 @@ func TestMixedVersionMatrix_6691(t *testing.T) {
 
 	// (4) THE TWO PLANES AGREE ON THE NUMBER. A bump that moved only one side
 	// would make every pairing a mismatch — including matched deployments.
-	t.Run("both planes are at 8", func(t *testing.T) {
+	t.Run("both planes agree on the version", func(t *testing.T) {
 		if ProtocolVersion != secureTunnelSnapshotProtocolVersion {
 			t.Fatalf("Go ProtocolVersion = %d, want %d", ProtocolVersion,
 				secureTunnelSnapshotProtocolVersion)

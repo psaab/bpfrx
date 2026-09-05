@@ -2888,6 +2888,53 @@ additive *in meaning* (an old reader that ignores it still enforces
 exactly what it enforced before) does not need a bump; a field that
 changes what a rule COVERS does.
 
+**EXCEPT when the old behaviour is the defect the field was added to fix
+(#8892).** The additive test above asks "does an old reader still enforce
+what it enforced before?" and treats *yes* as safe. That is sound for a
+feature and unsound for a security fix, because there *yes* is precisely
+the problem: the old behaviour is the thing being repaired.
+
+`routing_domain` is the worked example, and it passed the rule as
+written. An old helper that ignores it resolves every interface to domain
+0 — exactly what it enforced before — so the rule said no bump was
+needed, and none was made. But "what it enforced before" is the
+cross-tenant session aliasing that #7160 exists to close, and
+`userspace-dp/src/afxdp/tests_routing_domain_7160.rs` asserts that same
+state is a defect. The wire note called it a safe degradation; the
+regression test calls it the bug. Both describe the same behaviour.
+
+So the rule has two questions, not one:
+
+1. Does an old reader still enforce what it enforced before?
+2. **Is "what it enforced before" acceptable?**
+
+A *no* to either requires a bump. For a field added to close a security
+hole the answer to (2) is no by construction, and the bump is the only
+mechanism that refuses the mismatched pairing — the gate is exact
+equality, so an unbumped field is silently ignored rather than refused.
+
+**Rolling upgrade.** The daemon and the helper are a node-local pair over
+the control socket, deployed together, so a version mismatch is a
+same-node deploy skew rather than a cross-node one. On mismatch the
+helper refuses the snapshot with `unsupported snapshot protocol version`
+and does not arm the dataplane — loud and fail-closed, in place of
+silently enforcing a weaker isolation. In an HA pair mid-upgrade each
+node runs its own matched pair, so an upgraded node and an un-upgraded
+peer are each internally consistent; the config-sync wire between them
+carries its own version (`sync_wire_version_7990.go`) and is unaffected
+by this constant.
+
+**What pins this.** `TestSnapshotProtocolVersionLockstepWithRust` pins the
+two constants to each other. It cannot catch the #8892 shape, because
+both sides stayed at 8 and therefore agreed — the drift was between the
+snapshot's SHAPE and its version, not between the two constants.
+`TestSnapshotShapeIsPinnedToProtocolVersion8892` pins that: a digest over
+the wire structs' exported fields, checked against the version it was
+recorded at. Change the shape without bumping and it reds. It cannot tell
+a compatible addition from an incompatible one and does not try — it
+forces the decision at the moment it is cheap, which is the moment the
+field is added.
+
 #### Per-feature protocol floors (#6648, #6649)
 
 The gates in `manager_compile.go` answer **two different questions**, and
