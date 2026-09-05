@@ -227,7 +227,23 @@ func TestTheNewValueTypesSynthesizeAcceptedPairs_8690(t *testing.T) {
 // reporting both sites as now compiling equivalently, which is the normalizer
 // working rather than the synthesiser regressing.
 func TestNewlyVisibleSitesAreAccountedFor_8690(t *testing.T) {
-	want := []string{
+	// `want` is now EMPTY: the last three — `system dataplane control-socket`,
+	// `system domain-name`, `system services ssh protocol-version` — were
+	// normalized, so their lines are correctly gone. They follow
+	// `schedulers scheduler <s> {start,stop}-date` out of this list for the
+	// same reason and by the same confirmation.
+	//
+	// An empty membership list asserts NOTHING, so the sites change sides
+	// rather than leaving: `normalized` below carries them, and the cell now
+	// checks the opposite property — that each compiles IDENTICALLY in both
+	// spellings. A site that stops being equivalent has been un-normalized, and
+	// a site that never was would have failed here on arrival.
+	//
+	// Deleting them instead would stop them being checked in EITHER direction,
+	// which is the stale-allowlist failure the #2419 inventory exists to
+	// prevent.
+	want := []string{}
+	normalized := []string{
 		"system dataplane control-socket",
 		"system domain-name",
 		"system services ssh protocol-version",
@@ -240,6 +256,20 @@ func TestNewlyVisibleSitesAreAccountedFor_8690(t *testing.T) {
 				"the line is correctly gone and this list should shrink with it — but "+
 				"if it went missing because the synthesiser regressed, the site is "+
 				"unruled again and nothing else says so (#8690)", w)
+		}
+	}
+	// DEGENERACY CONTROL. With `want` empty the loop above proves nothing, so
+	// the cell would pass on any tree at all unless something else carries the
+	// claim.
+	if len(want) == 0 && len(normalized) == 0 {
+		t.Fatal("both lists are empty — this cell asserts nothing and its silence means " +
+			"nothing. Re-derive it against whatever now needs watching (#8690)")
+	}
+	for _, n := range normalized {
+		if inv[n] {
+			t.Errorf("%q is recorded as NORMALIZED but is still in the inventory — either the "+
+				"normalization was reverted or it never took effect, and nothing else says so "+
+				"(#8690)", n)
 		}
 	}
 }

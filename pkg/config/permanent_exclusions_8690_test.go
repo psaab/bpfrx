@@ -120,11 +120,35 @@ func TestPermanentExclusionsMatchTheInventory8690(t *testing.T) {
 	for _, s := range sites {
 		inInv[s] = true
 	}
-	var becameAdmissible, unclassifiedDrift []string
+	var becameAdmissible, unclassifiedDrift, completed []string
 	for site, e := range reg {
-		if !inInv[site] {
-			becameAdmissible = append(becameAdmissible, site+" ("+e.class+": "+e.reason+")")
+		if inInv[site] {
+			continue
 		}
+		// #8690: an `open` site leaving the inventory is the SUCCESS case, not a
+		// violation. This register is named for permanent exclusions, and every
+		// other class means "must never be normalized" — but `open` means the
+		// opposite, so the failure below was written for classes that do not
+		// include it. The first time an `open` site was actually completed
+		// (lane-8526 normalizing the three `system` sites it had measured), the
+		// cell reported the work as though a gate had been disarmed.
+		//
+		// So `open` is separated rather than exempted: it still has to be
+		// noticed, because a stale `open` entry for work already done is a lane
+		// pointing at a site that no longer exists. It just is not an error.
+		if e.class == "open" {
+			completed = append(completed, site)
+			continue
+		}
+		becameAdmissible = append(becameAdmissible, site+" ("+e.class+": "+e.reason+")")
+	}
+	sort.Strings(completed)
+	if len(completed) > 0 {
+		t.Errorf("#8690: %d site(s) classed `open` have been normalized and their register "+
+			"lines are now stale:\n  %s\n\nThat is the work being DONE, not a violation — "+
+			"delete these lines. They are reported rather than ignored because a stale `open` "+
+			"entry sends the next lane looking for a site that is no longer there.",
+			len(completed), strings.Join(completed, "\n  "))
 	}
 	for _, s := range sites {
 		if _, ok := reg[s]; !ok {

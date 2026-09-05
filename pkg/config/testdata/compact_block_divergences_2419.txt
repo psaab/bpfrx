@@ -207,8 +207,6 @@ services rpm probe xpfarg test xpfarg routing-instance	empty
 services rpm probe xpfarg test xpfarg source-address	empty
 services rpm probe xpfarg test xpfarg target	empty
 services rpm probe xpfarg test xpfarg test-interval	empty
-system dataplane control-socket	empty
-system domain-name	empty
 system login class	partial
 system login class xpfarg allow-commands	empty
 system login class xpfarg allow-configuration	empty
@@ -225,5 +223,4 @@ system login user xpfarg class	empty
 system login user xpfarg uid	empty
 system services dhcp-local-server group xpfarg pool xpfarg static-binding xpfarg fixed-address	empty
 system services dhcpv6-local-server group xpfarg pool xpfarg static-binding xpfarg fixed-address	empty
-system services ssh protocol-version	empty
 system services web-management api-auth user xpfname password	empty
