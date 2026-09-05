@@ -380,6 +380,46 @@ func TestCompactNormalizeScopePreservesCompiledResult8690(t *testing.T) {
 			"either way, so the config is legitimate and only the elided form was losing it. " +
 			"This gate was written to catch exactly this drop class, so the pass repairing the " +
 			"drop and the gate then passing is the intended interaction, not a disarm.",
+		// The three sites admitted with the #8690 `open` residue. All three were
+		// re-measured HERE with the pair ADMITTED, which is the only state in
+		// which the measurement means anything: for an EXCLUDED pair the pass
+		// touches 0 nodes, so `passDisabled` true and false are the same run and
+		// a "the pass is not load-bearing here" result is a restatement of the
+		// exclusion rather than a finding about the site. lane-8015 established
+		// that on `policy scheduler-name`. Here the axis genuinely moves — the
+		// elided spelling flips REJECTED -> accepted — which is what makes these
+		// gradeable at all.
+		//
+		// Measured, with type-VALID values, all three identical in shape:
+		//
+		//	BRACED passDisabled=true   <nil>      <- the config is legitimate
+		//	BRACED passDisabled=false  <nil>
+		//	ELIDED passDisabled=true   REJECTED   <- the gate catches the drop
+		//	ELIDED passDisabled=false  <nil>      <- the pass repairs it
+		//
+		// The braced leg is the one that decides benign-vs-genuine, and each
+		// gate's own message names the MISSING VALUE rather than the spelling.
+		"protocols bgp group xpfarg neighbor xpfarg peer-as": "the gate refuses the CONSEQUENCE of the drop. " +
+			"Measured with the pass disabled, elided `neighbor 10.0.0.2 peer-as 65001;` " +
+			"loses the peer-as and BGP rejects with \"missing/invalid peer-as — a BGP " +
+			"neighbor requires a peer-as\"; with the pass enabled the value survives and " +
+			"the same gate accepts. Braced is accepted either way. The gate names the " +
+			"absent value, so it is objecting to the drop and the pass repairs it.",
+		"security dynamic-address feed-server xpfarg hostname": "the gate refuses the CONSEQUENCE of the drop. " +
+			"Measured with the pass disabled, elided `feed-server f1 hostname " +
+			"\"feeds.example.com\";` loses the hostname and the compiler rejects with " +
+			"\"feed-server \\\"f1\\\" resolves to an empty endpoint (no url or hostname, or a " +
+			"slash-only url)\"; with the pass enabled it survives and the same gate " +
+			"accepts. Braced is accepted either way.",
+		"system services dhcp-local-server group xpfarg pool xpfarg static-binding xpfarg fixed-address": "the gate refuses the CONSEQUENCE of the " +
+			"drop. Measured with the pass disabled, elided `static-binding b1 " +
+			"fixed-address 10.0.1.50;` loses the address and the compiler rejects with " +
+			"\"static-binding \\\"b1\\\" has no fixed-address — a reservation cannot be " +
+			"empty\"; with the pass enabled it survives and the same gate accepts. " +
+			"Braced is accepted either way. ONE key covers the dhcp and dhcpv6 twins " +
+			"because they share dhcpStaticBindingSchema(); the v4 twin is what this arm " +
+			"grades, and the v6 twin is hand-measured in knownFixtureLimited8690 " +
+			"because the census fixture cannot give it a type-valid address.",
 		"snmp trap-group xpfarg targets": "the gate refuses the CONSEQUENCE of the drop, not " +
 			"the spelling. Measured: with the pass disabled the elided " +
 			"`trap-group tg1 targets 10.0.0.1;` loses its targets and snmp rejects with " +
@@ -804,6 +844,32 @@ var knownFixtureLimited8690 = map[string]string{
 	// verdict a person reached with a type-VALID value and the siblings the
 	// validator needs, not merely the fact that the census fixture could not
 	// decide. A visible unmeasured bucket is still unmeasured.
+	// The two halves of the #8690 `open` residue whose census value is not
+	// type-valid. Each is the TWIN of a site this arm DOES grade, in the same
+	// container one leaf over, and neither inherits its twin's verdict — that
+	// inference is what the v4/v6 static-binding pair disproved. Both were
+	// measured by hand, with the pair ADMITTED and a type-valid value.
+	"security dynamic-address feed-server xpfarg url": "HAND-MEASURED: BENIGN, and " +
+		"the twin of `feed-server <f> hostname` which this arm grades directly. With " +
+		"a real URL, elided `feed-server f1 url \"https://feeds.example.com/list\";` is " +
+		"refused without the pass (\"resolves to an empty endpoint (no url or " +
+		"hostname, or a slash-only url)\") and compiles with it; BRACED is accepted " +
+		"both ways, so the config is legitimate and only the elided form lost the " +
+		"value. Same gate and same message as the hostname twin, which is expected: " +
+		"one validator covers both leaves. NOTE ON PROVENANCE — this site was " +
+		"previously reported as a LIVE disarm; it was not, because the pair was not " +
+		"admitted at that time. It is live NOW, in this commit, because this change " +
+		"admits it.",
+
+	"system services dhcpv6-local-server group xpfarg pool xpfarg static-binding xpfarg fixed-address": "HAND-MEASURED: " +
+		"BENIGN, and the twin of the dhcp-local-server site this arm grades " +
+		"directly. With a real IPv6 address, elided `static-binding b1 fixed-address " +
+		"2001:db8::50;` is refused without the pass (\"has no fixed-address — a " +
+		"reservation cannot be empty\") and compiles with it; BRACED is accepted both " +
+		"ways. Measured SEPARATELY from its v4 twin rather than inheriting it: that " +
+		"pair is the one that established the rule, since arm 2 caught the v4 side " +
+		"and was structurally blind to this one.",
+
 	"security ipsec policy xpfarg proposals": "HAND-MEASURED: BENIGN. Elided " +
 		"`ipsec policy pol1 proposals pr1;` is refused without the pass (\"has no " +
 		"resolvable ipsec proposal ... the configured perfect-forward-secrecy group " +

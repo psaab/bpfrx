@@ -200,9 +200,6 @@ policy-options policy-statement xpfarg term xpfarg then metric	partial
 policy-options policy-statement xpfarg term xpfarg then metric-type	partial
 policy-options policy-statement xpfarg term xpfarg then next-hop	partial
 policy-options policy-statement xpfarg term xpfarg then origin	partial
-protocols bgp group xpfarg neighbor xpfarg peer-as	empty
-security dynamic-address feed-server xpfarg hostname	empty
-security dynamic-address feed-server xpfarg url	empty
 security policies from-zone xpfarg xpfarg xpfarg policy xpfarg scheduler-name	empty
 security policies global policy xpfarg scheduler-name	empty
 services rpm probe xpfarg test xpfarg destination-interface	empty
@@ -229,6 +226,4 @@ system login user xpfarg authentication ssh-ed25519	empty
 system login user xpfarg authentication ssh-rsa	empty
 system login user xpfarg class	empty
 system login user xpfarg uid	empty
-system services dhcp-local-server group xpfarg pool xpfarg static-binding xpfarg fixed-address	empty
-system services dhcpv6-local-server group xpfarg pool xpfarg static-binding xpfarg fixed-address	empty
 system services web-management api-auth user xpfname password	empty
