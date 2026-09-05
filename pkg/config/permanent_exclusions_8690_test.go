@@ -34,12 +34,19 @@ var exclusionClasses8690 = map[string]bool{
 	"partial": true, "gate-confirmed": true, "gate-open-question": true,
 	"gate-collateral": true, "unmeasurable": true, "unreachable": true,
 	"hazard": true, "open": true, "unclassified": true,
-	// #8690: the fix is CORRECT but the vehicle is not a family sweep — it
-	// changes behaviour that owes its own change and a smoke. Deliberately
-	// neither `open` (sweeping it would be wrong) nor permanent (normalizing it
-	// is right). Without this class such a site can only be recorded as an
-	// exclusion, which is false, or as available, which invites the sweep.
-	"owed-own-change": true,
+	// #8690: MEASURED, at every reachable spelling and with the pass both
+	// enabled and disabled, to drop nothing. There is no fix to make. It is not
+	// `open` (nothing to normalize), not `unmeasurable` (it WAS measured), and
+	// not `hazard` (normalizing breaks nothing — it is merely pointless).
+	//
+	// This class replaced `owed-own-change`, which existed for one hour and held
+	// only the two `scheduler-name` sites. That class was created to hold an
+	// argument that was reasoned and never run: that a packed `scheduler-name`
+	// is silently dropped, leaving a PERMANENTLY-ACTIVE security policy, so
+	// normalizing it was a correct fix owing a failover smoke. Measured, every
+	// clause is false — the argument was built on a hierarchical spelling nobody
+	// writes, instead of the flat `set` form operators actually use.
+	"no-drop-measured": true,
 }
 
 // Classes whose sites must never be normalized.
@@ -55,9 +62,13 @@ var exclusionClasses8690 = map[string]bool{
 //
 // `unmeasurable` is absent for the same reason in a weaker form: "the fixture
 // could not produce a type-valid value" is not a finding about the site.
+// `no-drop-measured` is permanent in the sense that matters to the COUNT: the
+// remaining line is not available work. It differs from the others in why —
+// normalizing it is not forbidden, it is simply a no-op, and listing it `open`
+// would invite someone to "fix" a site with no defect.
 var permanentClasses8690 = map[string]bool{
 	"partial": true, "gate-confirmed": true, "gate-collateral": true,
-	"unreachable": true, "hazard": true,
+	"unreachable": true, "hazard": true, "no-drop-measured": true,
 }
 
 func readPermanentExclusions8690(t *testing.T) map[string]exclusion8690 {
@@ -120,7 +131,7 @@ func TestPermanentExclusionsMatchTheInventory8690(t *testing.T) {
 	for _, s := range sites {
 		inInv[s] = true
 	}
-	var becameAdmissible, unclassifiedDrift, completed, owedDeparture, measuredAway []string
+	var becameAdmissible, unclassifiedDrift, completed, noDropDeparture, measuredAway []string
 	for site, e := range reg {
 		if inInv[site] {
 			continue
@@ -140,20 +151,20 @@ func TestPermanentExclusionsMatchTheInventory8690(t *testing.T) {
 			completed = append(completed, site)
 			continue
 		}
-		// #8690: `owed-own-change` is a THIRD departure meaning, and neither of
-		// the two above fits it. That class says the fix is CORRECT but the
-		// vehicle is not a family sweep — for the `scheduler-name` sites,
-		// normalizing converts a permanently-active security policy into a
-		// time-limited one, which owes `make test-failover` v4+v6.
+		// #8690: `no-drop-measured` is a THIRD departure meaning, and neither of
+		// the two above fits it. That class records a MEASUREMENT — this site
+		// drops nothing, at every reachable spelling, with the pass enabled and
+		// disabled — and therefore that there was never anything here to
+		// normalize.
 		//
-		// So a departure here is legitimate ONLY IF that verification actually
-		// ran. Reporting it as a violation would be wrong when someone did the
-		// dedicated change properly; reporting it as completion would let a
-		// family sweep take it silently, which is the entire failure the class
-		// was created to prevent. The cell cannot tell those apart — a smoke
-		// leaves no trace in this tree — so it asks, and names what to check.
-		if e.class == "owed-own-change" {
-			owedDeparture = append(owedDeparture, site)
+		// So a departure is not completion: nobody can complete work that did
+		// not exist. It means the census stopped seeing the site as divergent,
+		// which implies the compiler or the census changed underneath the
+		// measurement. That is not necessarily wrong, but the measurement is now
+		// unverified, and it is the measurement — not the line — that the next
+		// reader will rely on.
+		if e.class == "no-drop-measured" {
+			noDropDeparture = append(noDropDeparture, site)
 			continue
 		}
 		// `unclassified` / `unmeasurable` departing is neither a violation nor a
@@ -174,18 +185,18 @@ func TestPermanentExclusionsMatchTheInventory8690(t *testing.T) {
 			"entry sends the next lane looking for a site that is no longer there.",
 			len(completed), strings.Join(completed, "\n  "))
 	}
-	sort.Strings(owedDeparture)
-	if len(owedDeparture) > 0 {
-		t.Errorf("#8690: %d site(s) classed `owed-own-change` left the inventory:\n  %s\n\n"+
-			"That class means the fix is CORRECT and the VEHICLE is not a family sweep. So "+
-			"this is legitimate IF the owed verification ran, and a silent sweep if it did "+
-			"not — and this cell cannot tell, because a smoke leaves no trace in the tree. "+
-			"CHECK: did the change that normalized these run `make test-failover` v4+v6? "+
-			"For the scheduler-name sites the consequence is a forwarding one — a "+
-			"permanently-active security policy becomes time-limited — so a commit-check "+
-			"alone does not cover it. If the verification ran, delete the line and say where; "+
-			"if it did not, this is the sweep the class exists to stop.",
-			len(owedDeparture), strings.Join(owedDeparture, "\n  "))
+	sort.Strings(noDropDeparture)
+	if len(noDropDeparture) > 0 {
+		t.Errorf("#8690: %d site(s) classed `no-drop-measured` left the inventory:\n  %s\n\n"+
+			"That class says the site was MEASURED to drop nothing, so this is not a "+
+			"completion — there was no work here to complete. It means the census stopped "+
+			"seeing the site as divergent, so the compiler or the census moved underneath "+
+			"the measurement. CHECK: re-run the cell named in the entry's reason. If it "+
+			"still passes, the site genuinely stopped diverging and the line should go, with "+
+			"the measurement recorded where the next reader will find it. If it now FAILS, "+
+			"the class is stale and the site needs re-classifying — do not delete the line "+
+			"on the strength of it having disappeared.",
+			len(noDropDeparture), strings.Join(noDropDeparture, "\n  "))
 	}
 	sort.Strings(measuredAway)
 	if len(measuredAway) > 0 {
@@ -285,14 +296,20 @@ func TestPermanentExclusionRegisterIsDiscriminating8690(t *testing.T) {
 					"class asserts a PERSON measured it; the measurement IS the claim",
 					site, len(e.reason))
 			}
-		case "owed-own-change":
-			// Says the fix is right and the VEHICLE is wrong. Without naming what
-			// the vehicle owes it is `open` with a caveat, and the next sweep
-			// takes it.
-			if !strings.Contains(e.reason, "test-failover") && !strings.Contains(e.reason, "smoke") {
-				t.Errorf("%q is classed `owed-own-change` but its reason names no owed "+
-					"verification. That class exists to say the vehicle is wrong; without "+
-					"naming what it owes, the next sweep takes the site", site)
+		case "no-drop-measured":
+			// Asserts a MEASUREMENT, so it must cite the executable form of it.
+			// A "measured" claim with no runnable cite is prose, and prose is
+			// exactly what this class was created to replace: its predecessor
+			// held a confident, coherent, entirely unrun argument.
+			if !strings.Contains(e.reason, "_test.go") {
+				t.Errorf("%q is classed `no-drop-measured` but its reason cites no test "+
+					"file. That class asserts a measurement; without a runnable cite it is "+
+					"the same prose that put the wrong verdict here in the first place", site)
+			}
+			if !strings.Contains(e.reason, "ENABLED") || !strings.Contains(e.reason, "DISABLED") {
+				t.Errorf("%q is classed `no-drop-measured` but its reason does not say the "+
+					"site was measured with the pass BOTH enabled and disabled. A result "+
+					"from one side cannot show the pass is not load-bearing", site)
 			}
 		case "unclassified", "unmeasurable":
 			// UNKNOWN must say WHY it cannot be measured. A placeholder reads as
