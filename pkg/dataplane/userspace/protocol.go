@@ -102,7 +102,24 @@ const (
 	// from ensureRequiredSnapshotProtocolLocked. The per-branch prose above
 	// still says "4 -> 5" and "moved to 6"; those describe each branch's own
 	// history, not this constant's current value.
-	ProtocolVersion = 8
+	// v9 (issue 8892): `RoutingDomain` was added to the snapshot in 9472a66fd
+	// WITHOUT bumping this constant, so a helper built before it advertises the
+	// same 8, passes the exact-equality gate, ignores the field, and resolves
+	// every interface to domain 0.
+	//
+	// The compatibility note left on the field was true and pointed one step
+	// the wrong way: the field IS additive, and an old helper DOES degrade to
+	// pre-#7160 behaviour. What does not hold is treating pre-#7160 behaviour
+	// as an acceptable fallback -- #7160 exists because that behaviour is the
+	// cross-tenant session aliasing defect, and the project's own regression
+	// test (afxdp/tests_routing_domain_7160.rs) asserts that exact state is a
+	// defect while the wire note called it a safe degradation.
+	//
+	// ADDITIVE-AND-DEGRADES-TO-OLD-BEHAVIOUR IS SOUND FOR A FEATURE AND UNSOUND
+	// WHEN THE OLD BEHAVIOUR IS THE DEFECT THE FIELD WAS ADDED TO FIX. For
+	// those, the version bump IS the mechanism that refuses the pairing, and
+	// skipping it removes the only signal.
+	ProtocolVersion = 9
 
 	// MinProtocolMultiZoneScopedPolicy is the FIRST snapshot protocol version
 	// that can represent a multi-zone scoped global policy — the plural
