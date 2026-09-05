@@ -231,7 +231,29 @@ func (c *Config) resolveBareKernelIfName(name string) string {
 	return LinuxIfName(name)
 }
 
+// ResolveKernelIfName resolves a Junos interface reference to the Linux device
+// name. It builds the tunnel-name map itself; a caller resolving MANY refs
+// should hoist that map once and use resolveKernelIfNameWith instead (#8862).
 func (c *Config) ResolveKernelIfName(ref string) string {
+	return c.resolveKernelIfNameWith(ref, tunnelNameMapFn(c))
+}
+
+// resolveKernelIfNameWith is ResolveKernelIfName with the tunnel-name map
+// supplied by the caller.
+//
+// TunnelNameMap walks every interface and every unit, so building it per
+// reference makes a per-interface loop quadratic: #8854 fixed one such loop and
+// this is the same shape at the two sites that dominated the profile
+// afterwards. The map is a pure function of c.Interfaces and does not change
+// during validation — verified by instrumenting TunnelNameMap to compare its
+// rendering against the first call for the same *Config across pkg/config and
+// pkg/configstore, with a positive control that mutated a unit tunnel mid-walk
+// and did fire.
+//
+// The map is a REQUIRED parameter rather than an optional nil: TunnelNameMap
+// returns a non-nil EMPTY map for a config with no tunnels, so nil would be a
+// sentinel that collides with a legitimate value.
+func (c *Config) resolveKernelIfNameWith(ref string, tunMap map[string]string) string {
 	parts := strings.SplitN(ref, ".", 2)
 	base := parts[0]
 
@@ -280,7 +302,7 @@ func (c *Config) ResolveKernelIfName(ref string) string {
 	}
 
 	// Per-unit tunnel by ref.
-	if tunMap := c.TunnelNameMap(); tunMap != nil {
+	if tunMap != nil {
 		if linuxName, ok := tunMap[ref]; ok && linuxName != "" {
 			return linuxName
 		}
@@ -476,3 +498,11 @@ func (c *Config) TunnelNameMap() map[string]string {
 	}
 	return m
 }
+
+// tunnelNameMapFn is the seam through which the hoisting call sites reach
+// TunnelNameMap (#8862). Production always holds the method; the guard swaps it
+// to COUNT builds, because the property being protected is "built a bounded
+// number of times per validation, not once per interface or unit" and no
+// correctness assertion can observe that. Same idiom as
+// resolveInterfaceHostInboundFn (#8854) and pkg/daemon's deriveKernelNameFn.
+var tunnelNameMapFn = (*Config).TunnelNameMap
