@@ -786,6 +786,31 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		"ssh key-exchange",
 		"ssh root-login",
 		"static-binding host-name",
+		// issue 8858: the OUTER half of the root-authentication fold, and the
+		// only half that was missing. The four inner pairs
+		// (`root-authentication encrypted-password` / `ssh-dsa` / `ssh-ed25519`
+		// / `ssh-rsa`) have been admitted in the CREDENTIAL family above since
+		// #8690's first increment -- and were INERT the whole time, because the
+		// tail needs TWO splits:
+		//
+		//	system -> root-authentication          (this entry, absent)
+		//	root-authentication -> <credential>    (admitted, unreachable)
+		//
+		// The pass never reaches a container it has not yet created, so the
+		// inner admission could not fire and `system root-authentication
+		// encrypted-password "<hash>";` compiled to a NIL stanza. Measured
+		// empty-equivalent, and the gate check matters here specifically: the
+		// sibling `system login` case is excluded above because normalizing it
+		// would convert the loud #6662 commit rejection into a silent
+		// acceptance. Root-authentication has no such gate -- strict accepts
+		// the packed spelling and nothing warns -- so admitting it converts a
+		// silent DROP into a correct compile, not a rejection into a drop.
+		//
+		// Consequence if left out: applyRootAuth reads a nil stanza as "not
+		// configured" and REVOKES the credentials xpf provisioned, D2-locking
+		// root (#5276). It fails closed -- an availability hazard, not a
+		// breach.
+		"system root-authentication",
 		"system backup-router",
 		"system domain-search",
 		"system name-server",

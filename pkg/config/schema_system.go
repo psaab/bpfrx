@@ -98,15 +98,21 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 	"backup-router": {desc: "Backup router", args: 1, placeholder: "<address>", children: map[string]*schemaNode{
 		"destination": {desc: "Destination network", args: 1, placeholder: "<network>", children: nil},
 	}},
-	"root-authentication": {desc: "Root authentication", children: map[string]*schemaNode{
+	// packedStatements (issue 8858): SSHKeys is a []string, so a packed
+	// `root-authentication ssh-ed25519 <k1> ssh-ed25519 <k2>` run must split
+	// into one child per statement or the second key is silently lost. The
+	// scope admission alone compiles the FIRST key and looks complete; only a
+	// two-key fixture shows the fold. Every child here is a modelled args:1
+	// leaf, so the tail splits cleanly.
+	"root-authentication": {desc: "Root authentication", packedStatements: true, children: map[string]*schemaNode{
 		// #1944 E1: share ValidateCryptHash with per-user
 		// authentication so root's identical plaintext footgun is
 		// closed (one validator, one error message).
 		"encrypted-password": {desc: "Encrypted password", args: 1, placeholder: "<crypt-hash>",
 			valueType: ValueCryptHash, validator: ValidateCryptHash, children: nil},
-		"ssh-ed25519": {desc: "SSH ED25519 public key", args: 1, placeholder: "<key>", children: nil},
-		"ssh-rsa":     {desc: "SSH RSA public key", args: 1, placeholder: "<key>", children: nil},
-		"ssh-dsa":     {desc: "SSH DSA public key", args: 1, placeholder: "<key>", children: nil},
+		"ssh-ed25519": {desc: "SSH ED25519 public key", args: 1, multi: true, placeholder: "<key>", children: nil},
+		"ssh-rsa":     {desc: "SSH RSA public key", args: 1, multi: true, placeholder: "<key>", children: nil},
+		"ssh-dsa":     {desc: "SSH DSA public key", args: 1, multi: true, placeholder: "<key>", children: nil},
 	}},
 	"archival": {desc: "Configuration archival", children: map[string]*schemaNode{
 		"configuration": {desc: "Configuration archival", children: map[string]*schemaNode{
@@ -323,9 +329,9 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 				"authentication": {desc: "Authentication methods", children: map[string]*schemaNode{
 					"encrypted-password": {desc: "Encrypted password", args: 1, placeholder: "<crypt-hash>",
 						valueType: ValueCryptHash, validator: ValidateCryptHash, children: nil},
-					"ssh-ed25519": {desc: "SSH ED25519 public key", args: 1, placeholder: "<key>", children: nil},
-					"ssh-rsa":     {desc: "SSH RSA public key", args: 1, placeholder: "<key>", children: nil},
-					"ssh-dsa":     {desc: "SSH DSA public key", args: 1, placeholder: "<key>", children: nil},
+					"ssh-ed25519": {desc: "SSH ED25519 public key", args: 1, multi: true, placeholder: "<key>", children: nil},
+					"ssh-rsa":     {desc: "SSH RSA public key", args: 1, multi: true, placeholder: "<key>", children: nil},
+					"ssh-dsa":     {desc: "SSH DSA public key", args: 1, multi: true, placeholder: "<key>", children: nil},
 				}},
 			}},
 	}},

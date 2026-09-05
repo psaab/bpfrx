@@ -99,6 +99,12 @@ var knownBlindScopePairs8852 = map[string]string{
 	"routing-options static": "plain-container",
 	"security alg":           "plain-container",
 	"security flow":          "plain-container",
+	// issue 8858. Unlike the two confirmed-broken entries above, this pair's
+	// fold IS repaired and measured -- but by its own cells, not by arm 2, and
+	// a pair leaves this list only when arm 2 starts generating a site for it.
+	// The four `root-authentication <leaf>` pairs are NOT here: their heads are
+	// single-arg valued leaves, so arm 2 does adjudicate them.
+	"system root-authentication": "plain-container",
 	// issue 8875. Their folds ARE measured -- by
 	// TestSecurityTopLevelElisionKeepsContents8875, across all three depths and
 	// on compiled CONTENTS -- but not by arm 2, and a pair leaves this list
