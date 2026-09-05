@@ -1258,6 +1258,17 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		// admitting `system login` would turn a loud #6662 rejection into a
 		// silent acceptance, which is a regression wearing the shape of a fix).
 		"protocols bgp",
+		// #8879 batch 5. TWO OF THESE FOUR CAME OUT OF THE SWEEP'S "SAME"
+		// COLUMN, not its SILENT column -- they were published as benign.
+		// `class-of-service fairness` drops its whole expectation list and
+		// `security policy-stats` silently flips PolicyStatsEnabled from true
+		// to false. A row is SAME only for the leaf the instrument sampled;
+		// with a hand-written fixture both diverge. See the cell for the
+		// provenance, which is the part worth keeping.
+		"class-of-service fairness",
+		"security policy-stats",
+		"security ipsec",
+		"services rpm",
 		// #8879 batch 4. Mode-spanning again: a struct behind a pointer
 		// (`sampling`), a slice (`router-advertisement`), a map (`snmp v3`)
 		// and a struct whose OTHER fields are all defaults (`archival`).

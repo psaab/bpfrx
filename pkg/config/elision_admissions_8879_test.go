@@ -59,6 +59,51 @@ func TestAdmittedPairsCompileLikeBraced8879(t *testing.T) {
 			`security { nat { source { pool P { address 10.0.0.1/32; } } } }`,
 			`security nat { source { pool P { address 10.0.0.1/32; } } }`,
 			func(c *Config) string { return fmt.Sprintf("pools=%d", len(c.Security.NAT.SourcePools)) }},
+		// #8879 batch 5. TWO OF THESE FOUR WERE PUBLISHED AS BENIGN.
+		//
+		// `class-of-service fairness` and `security policy-stats` came out of
+		// the sweep's SAME column, not its SILENT column — the instrument
+		// reported "elided delivers what braced delivers" for both. That
+		// verdict was true of the single leaf the instrument synthesised and
+		// false of the pair. With a hand-written fixture `fairness` drops its
+		// entire expectation list and `policy-stats` silently flips
+		// PolicyStatsEnabled from true to FALSE, which turns a security
+		// feature off without telling anyone.
+		//
+		// Kept here as provenance, because it is the part that generalises: a
+		// per-pair verdict derived from one synthesised leaf is a claim about
+		// that leaf, and a SAME verdict is the one place where being wrong is
+		// invisible — nobody re-opens a row the instrument already cleared.
+		{"class-of-service fairness",
+			`class-of-service { fairness { rss-expectation { interface ge-0/0/1 { queue 3 { at-least-active-workers 4; } } } } }`,
+			`class-of-service fairness { rss-expectation { interface ge-0/0/1 { queue 3 { at-least-active-workers 4; } } } }`,
+			func(c *Config) string {
+				return fmt.Sprintf("fair=%d", len(c.ClassOfService.FairnessExpectations))
+			}},
+		{"security policy-stats",
+			`security { policy-stats { system-wide enable; } }`,
+			`security policy-stats { system-wide enable; }`,
+			func(c *Config) string {
+				return fmt.Sprintf("stats=%v", c.Security.PolicyStatsEnabled)
+			}},
+		{"security ipsec",
+			`security { ipsec { proposal ip1 { encryption-algorithm aes-256-gcm; } } }`,
+			`security ipsec { proposal ip1 { encryption-algorithm aes-256-gcm; } }`,
+			func(c *Config) string {
+				return fmt.Sprintf("ipsecprop=%d", len(c.Security.IPsec.Proposals))
+			}},
+		// The braced arm needs probe-type AND target to pass STRICT commit.
+		// A reference that fails strict compile would put this row in the
+		// same unanswerable third state the batch-4 cell exists to resolve.
+		{"services rpm",
+			`services { rpm { probe pr1 { test t1 { probe-type icmp-ping; target address 198.51.100.9; probe-count 7; } } } }`,
+			`services rpm { probe pr1 { test t1 { probe-type icmp-ping; target address 198.51.100.9; probe-count 7; } } }`,
+			func(c *Config) string {
+				if c.Services.RPM == nil {
+					return "<nil>"
+				}
+				return fmt.Sprintf("rpm=%d", len(c.Services.RPM.Probes))
+			}},
 		// #8879 batch 4. Mode-spanning again — a pointer struct reached
 		// through a keyed sub-map (`sampling`), a slice
 		// (`router-advertisement`), a map (`snmp v3`), and a struct whose
