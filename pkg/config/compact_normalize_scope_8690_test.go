@@ -142,6 +142,34 @@ func TestCompactNormalizeScopePreservesCompiledResult8690(t *testing.T) {
 		// not the site: under a type-valid value the same site might well
 		// compile clean and be a real disarm. So it is counted and named
 		// separately rather than silently passing.
+		// WHAT THIS ARM CANNOT SEE AT ALL, and why a green arm 2 does NOT mean a
+		// widening is safe. It compiles ONE well-formed elided spelling and
+		// compares acceptance against rejection. Any gate whose predicate needs
+		// something that single spelling cannot express is invisible to it BY
+		// CONSTRUCTION, not by oversight. Three kinds are known, all found by
+		// ordinary cells in the full suite after arm 2 passed:
+		//
+		//   - a gate that fires on a DUPLICATE. `chassis ... ip-monitoring
+		//     global-weight` rejects "specified 2 times with different values";
+		//     one spelling cannot be two occurrences.
+		//   - a gate that fires on a TRAILING TOKEN. `security ike gateway <g>
+		//     dynamic hostname <fqdn> <extra>` rejects the extra token; the
+		//     synthesized fixture supplies a well-formed value and no extra.
+		//   - CONTENT SURVIVAL across a multi-statement packed body. A
+		//     `redundancy-group` body loses `preempt` when its tail is moved,
+		//     which is a wrong compiled result rather than a wrong verdict, so
+		//     an acceptance comparison never looks at it.
+		//
+		// SO: RUN THE FULL pkg/config SUITE AFTER A WIDENING. It is not
+		// redundant with this cell; it is the only thing that catches the three
+		// above, and each was caught that way rather than here.
+		//
+		// The duplicate case is also circular in a way worth keeping: those
+		// chassis sites are ABSENT FROM THE CENSUS precisely because the gate
+		// rejects their packed spelling — so an over-reach analysis based on
+		// the inventory cannot see them either. Absence caused by the very gate
+		// the widening would disarm.
+		//
 		// LIMITATION, stated because this arm's failure condition is coarser
 		// than the harm it is named for. A rejection becoming an acceptance is
 		// harmful only when the gate was refusing the packed SPELLING on
@@ -263,7 +291,14 @@ func TestCompactNormalizeScopePreservesCompiledResult8690(t *testing.T) {
 			"unmeasured, not safe, and it needs a deliberate decision rather "+
 			"than a bigger number in a log line. A REMOVED entry means one "+
 			"became measurable (usually improved value synthesis) and the list "+
-			"should shrink (#8690).", diff)
+			"should shrink.\n"+
+			"MEASURE A NEW ENTRY BY HAND before adding it — write the site out "+
+			"with a type-VALID value and compare strict compiles with the pass "+
+			"disabled and enabled. This bucket is where a disarm hides: "+
+			"`security dynamic-address feed-server <n> url` sat here reported "+
+			"as merely unmeasured, and hand-measurement with a real URL showed "+
+			"it rejected without the pass and accepted with it. Visibility is "+
+			"not a verdict (#8690).", diff)
 	}
 	if len(fixtureLimited) > 0 {
 		t.Logf("#8690: %d admitted site(s) could not have their gate status "+
@@ -744,4 +779,57 @@ var knownFixtureLimited8690 = []string{
 	"security policies global policy xpfarg match application",
 	"security policies global policy xpfarg match destination-address",
 	"security policies global policy xpfarg match source-address",
+}
+
+// #8690: a DEMONSTRATION that arm 2's reach is narrower than its name suggests,
+// kept executable so the limitation note above cannot quietly stop being true.
+//
+// Arm 2 compiles one WELL-FORMED elided spelling and compares acceptance
+// against rejection. A gate whose predicate needs something that spelling
+// cannot express is invisible to it by construction. This pins the
+// trailing-token kind, which is the one measurable in isolation:
+//
+//	security ike gateway <g> dynamic hostname <fqdn>          -> accepted
+//	security ike gateway <g> dynamic hostname <fqdn> <extra>  -> REJECTED
+//
+// Arm 2 only ever builds the first, so it reports "no gate here" for a site
+// governed by a gate that fires on the second. If someone later teaches the
+// arm to vary token count, this cell reds — and the limitation note above
+// should shrink with it rather than outliving its reason.
+//
+// Two sibling blind spots are NOT asserted here because I could not isolate
+// them in a fixture, and asserting a shape I have not measured would be the
+// defect this file exists to catch. Both were found by lane-8015 with ordinary
+// cells in the full suite after arm 2 passed: a gate firing on a DUPLICATE
+// (`chassis ... ip-monitoring global-weight`, "specified 2 times with
+// different values") and CONTENT SURVIVAL across a multi-statement packed body
+// (a `redundancy-group` losing `preempt`). The duplicate case is also circular
+// — those sites are absent from the census precisely because the gate rejects
+// their packed spelling, so an inventory-based over-reach analysis cannot see
+// them either.
+func TestArm2CannotSeeATrailingTokenGate8690(t *testing.T) {
+	const wellFormed = `security { ike { gateway g1 { dynamic hostname host.example.com; } } }`
+	const withExtra = `security { ike { gateway g1 { dynamic hostname host.example.com extra; } } }`
+
+	compile := func(txt string) error {
+		tree, perrs := NewParser(txt).Parse()
+		if len(perrs) > 0 {
+			return nil // a parse failure is not the gate we are probing
+		}
+		_, err := compileConfigWithOpts(tree, compileOpts{})
+		return err
+	}
+
+	if err := compile(wellFormed); err != nil {
+		t.Fatalf("the well-formed spelling must compile — it is what arm 2 builds, "+
+			"and if it stopped compiling this demonstration would be measuring "+
+			"something else: %v", err)
+	}
+	if compile(withExtra) == nil {
+		t.Error("the trailing-token spelling now COMPILES, so the gate this cell " +
+			"demonstrates is gone. Arm 2's stated blind spot for token-count " +
+			"predicates no longer has this example behind it — find another or " +
+			"shrink the limitation note above, rather than leaving a claim with " +
+			"no evidence under it (#8690)")
+	}
 }
