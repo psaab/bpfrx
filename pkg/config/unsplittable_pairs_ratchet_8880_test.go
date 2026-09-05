@@ -181,9 +181,43 @@ func TestUnsplittablePairRatchet8880(t *testing.T) {
 	// packedStatements fixes it completely -- being `multi` is not by itself
 	// what makes the opt-in insufficient. Recorded rather than rewritten: the
 	// message's 89/373 split is lane-8388's measurement, not mine to re-derive.
+	// issue 8922 moves it again, on top of #8925. Exactly two more pairs
+	// entered: `ssh ciphers` and `ssh macs`, admitted so the brace-elided
+	// spelling stops silently dropping the SSH algorithm allowlists while their
+	// schema-identical `key-exchange` sibling was already applied.
+	//
+	// STRICT IMPROVEMENT, measured on both sides rather than argued:
+	//
+	//	                            before        after
+	//	ssh ciphers X;              []            [aes256-ctr]        FIXED
+	//	ssh ciphers [ a b ];        []            [a b]               FIXED
+	//	ssh ciphers X; macs Y;      [] and []     [] and []           UNCHANGED
+	//
+	// The multi-statement run was ALREADY fully lost before the admission --
+	// #8850's decline branch refuses to fold an ambiguous run, so nothing folds
+	// and everything is dropped. The admission does not create that case and
+	// does not worsen it; it fixes the single-statement and bracketed-list
+	// spellings, which are the ones an operator writes.
+	//
+	// I FIRST JUSTIFIED THIS BY SAYING ciphers/macs ARE `multi`, SO THE
+	// packedStatements OPT-IN IS KNOWN INSUFFICIENT FOR THEM. #8925's
+	// measurement above REFUTES THAT INFERENCE: `as-path` is args:2 AND multi,
+	// and packedStatements fixes it completely. Being `multi` is not by itself
+	// what makes the opt-in insufficient, so the claim is withdrawn.
+	//
+	// WHAT IS ACTUALLY TRUE HERE IS NARROWER AND UNTESTED: the opt-in has not
+	// been tried on `ssh`. It may or may not resolve the packed run. The
+	// residual is open and its remedy is UNMEASURED rather than known-absent --
+	// which is a weaker statement than the one this comment carried when it was
+	// written, and the honest one.
+	//
+	// The count below is RE-DERIVED at the merged base, not obtained by adding
+	// the two deltas: a shared ratchet's movement is the sum of everyone's
+	// work, and arithmetic on two separately-measured numbers is not a
+	// measurement.
 	const (
-		wantArgs2 = 96
-		wantArgs1 = 461
+		wantArgs2 = 98
+		wantArgs1 = 463
 	)
 	pairs2, _ := unsplittablePairs8880(2)
 	pairs1, conflict1 := unsplittablePairs8880(1)

@@ -106,6 +106,7 @@ security-relevant direction with **zero warnings on the strict commit path**:
 |---|---|---|
 | #6818 | `protocols ospf area <a> interface <i> authentication` | `AuthType`/`AuthKey` — the adjacency forms UNAUTHENTICATED |
 | #6822 | `snmp v3 usm local-engine user <u> authentication-* / privacy-*` | the passwords, while the PROTOCOL still set — the user is registered as requiring SHA-256 and AES-128 with empty credentials |
+| 8922 | `system services ssh ciphers` / `macs` | the algorithm allowlists, while the schema-identical `key-exchange` SIBLING was already admitted and still applied. An empty list writes NO line into the sshd drop-in, so sshd keeps its permissive built-in default — **partial application, which reads as success**: the drop-in visibly carries the operator's `KexAlgorithms` line. Reachable through a config FILE using the compact spelling; the CLI `set` path builds a nested tree and is unaffected |
 
 **A packed tail and a nested block can appear on ONE node**, contrary to what
 `packedBodyChildren`'s comment used to claim. `authentication md5 7 { key "x"; }`
