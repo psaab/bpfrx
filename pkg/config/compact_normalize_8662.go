@@ -360,6 +360,54 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		return true
 	}
 
+	// #8690 family 6: the five sites the register carried as `open` — the
+	// BENIGN residue of the gate arm, now admitted.
+	//
+	// Each was classified through step 3 by hand, with the BRACED CONTROL that
+	// distinguishes benign from genuine: braced accepted with the pass both off
+	// and on (so the config is legitimate), elided REJECTED with the pass off,
+	// elided ACCEPTED with the pass on. The gate exists to catch the dropped
+	// value and the pass restores it, so the gate then passing is the intended
+	// interaction and not a disarm. Same argument and same shape as `security
+	// ipsec policy <p> proposal-set` in 0c4818aa0.
+	//
+	// The braced leg is the one that matters and it is easy to omit: without it
+	// "elided rejected, then accepted" is equally consistent with the pass
+	// papering over a config the gate should refuse on its own merits.
+	//
+	// PAIR SCOPING CHECKED AGAINST THE SCHEMA, NOT THE INVENTORY. The inventory
+	// is a census of DIVERGENT sites; a pair rule applies to the whole schema,
+	// so "no other inventory line carries this head" is the wrong question.
+	// Three of these four heads appear under other containers, and the pair is
+	// what keeps them out:
+	//
+	//	peer-as        also under `group`     (schema_routing.go) — NOT admitted
+	//	hostname       also under `dynamic`   (IKE dynamic peer, x2) and ddns
+	//	url            also under `autoupdate` and under rpm `target`
+	//	fixed-address  one definition, dhcpStaticBindingSchema()
+	//
+	// A head-only rule would have taken the IKE dynamic-peer FQDN and the
+	// autoupdate URL along with the feed-server pair.
+	//
+	// `static-binding fixed-address` is ONE rule covering TWO sites, the
+	// dhcp-local-server and dhcpv6-local-server twins. That is sound here and
+	// was checked rather than assumed: both reach the same subtree through the
+	// shared dhcpLocalServerGroupSchema(), so there is a single definition to
+	// reason about. The v4/v6 asymmetry that does exist in this subtree —
+	// `dhcp-socket-type`, IPv4-only because Kea's Dhcp6 has no raw mode — is
+	// two levels up and does not touch the pair. The twins were also measured
+	// SEPARATELY: arm 2 caught the v4 side, and the v6 side was hand-measured
+	// out of the fixture-limited bucket the arm could not examine. One measured
+	// member of a shape says nothing about the other, which is the lesson that
+	// bucket produced.
+	switch containerKeyword + " " + head {
+	case "neighbor peer-as",
+		"feed-server hostname",
+		"feed-server url",
+		"static-binding fixed-address":
+		return true
+	}
+
 	// #8690 family 5: applications, services, snmp, event-options. 30 sites,
 	// every one drop shape "empty" in the inventory.
 	//
