@@ -44,6 +44,37 @@ func (d *Daemon) publishMgmtVRFIfaces(m map[string]bool) {
 	d.mgmtVRFInterfaces.Store(&m)
 }
 
+// dhcpRouteVRFMap maps a lease's interface name to the routing instance that
+// owns it, "" for the default context (#8963).
+//
+// Keyed on the KERNEL/lease interface name, and matched against the instance's
+// configured member names with the unit suffix tolerated in both directions,
+// because a lease reports the interface it was learned on while the config
+// names the logical unit.
+func (d *Daemon) dhcpRouteVRFMap() map[string]string {
+	out := map[string]string{}
+	cfg := d.store.ActiveConfig()
+	if cfg == nil {
+		return out
+	}
+	for _, ri := range cfg.RoutingInstances {
+		if ri == nil || ri.Name == "" {
+			continue
+		}
+		for _, member := range ri.Interfaces {
+			if member == "" {
+				continue
+			}
+			out[member] = ri.Name
+			// `ge-0/0/1.0` in the config, `ge-0/0/1` on the lease.
+			if i := strings.LastIndex(member, "."); i > 0 {
+				out[member[:i]] = ri.Name
+			}
+		}
+	}
+	return out
+}
+
 // collectDHCPRoutes builds FRR DHCPRoute entries from active DHCP leases.
 // Interfaces bound to the management VRF are excluded — their routes are
 // programmed directly via netlink into the VRF table by applyMgmtVRFRoutes.
@@ -52,11 +83,18 @@ func (d *Daemon) collectDHCPRoutes() []frr.DHCPRoute {
 		return nil
 	}
 	mgmtSet := d.mgmtVRFIfaceSet()
+	// #8963: the routing instance the LEARNING interface belongs to. Without
+	// it every DHCP-learned route was emitted in the default FRR context, even
+	// when its interface sat in a routing instance -- so the instance did not
+	// get the route it learned and the default context got one it should not
+	// have. Static routes have carried a `vrf <name>` clause since #5557.
+	ifaceVRF := d.dhcpRouteVRFMap()
 	var routes []frr.DHCPRoute
 	for _, lease := range d.dhcp.Leases() {
 		if mgmtSet[lease.Interface] {
 			continue
 		}
+		vrf := ifaceVRF[lease.Interface]
 		isIPv6 := lease.Family == dhcp.AFInet6
 		// Default route (option-3 gateway, or option-121 0.0.0.0/0 entry).
 		if lease.Gateway.IsValid() {
@@ -64,6 +102,7 @@ func (d *Daemon) collectDHCPRoutes() []frr.DHCPRoute {
 				Gateway:   lease.Gateway.String(),
 				Interface: lease.Interface,
 				IsIPv6:    isIPv6,
+				VRF:       vrf,
 			})
 		}
 		// RFC 3442 classless static routes (option 121 / legacy 249). A
@@ -74,6 +113,7 @@ func (d *Daemon) collectDHCPRoutes() []frr.DHCPRoute {
 				Gateway:     cr.Gateway.String(),
 				Interface:   lease.Interface,
 				IsIPv6:      isIPv6,
+				VRF:         vrf,
 			})
 		}
 	}

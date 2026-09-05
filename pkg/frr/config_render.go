@@ -320,18 +320,44 @@ func renderDHCPDefaults(b *strings.Builder, fc *FullConfig) {
 	// default that actually renders a FIB entry (has next-hop(s) or is an
 	// explicit discard/reject) suppresses the DHCP default, matching the
 	// pre-#5519 behavior for those cases exactly.
-	hasV4Default := false
+	// #8963: suppression is PER-VRF. The comparison read only the top-level
+	// static lists, so a static default INSIDE a routing instance neither
+	// suppressed nor was suppressed by the DHCP-learned one -- the instance
+	// could end up with both, and the default context's static could suppress
+	// a DHCP default that belongs to an instance entirely.
+	//
+	// Keyed on the same VRF name the route carries, with "" the default
+	// context, so the existing top-level behaviour is the "" entry and is
+	// unchanged.
+	hasV4Default := map[string]bool{}
+	hasV6Default := map[string]bool{}
 	for _, sr := range fc.StaticRoutes {
 		if sr.Destination == "0.0.0.0/0" && staticRouteRendersFIB(sr) {
-			hasV4Default = true
+			hasV4Default[""] = true
 			break
 		}
 	}
-	hasV6Default := false
 	for _, sr := range fc.Inet6StaticRoutes {
 		if sr.Destination == "::/0" && staticRouteRendersFIB(sr) {
-			hasV6Default = true
+			hasV6Default[""] = true
 			break
+		}
+	}
+	for _, inst := range fc.Instances {
+		if inst.Name == "" {
+			continue
+		}
+		for _, sr := range inst.StaticRoutes {
+			if sr.Destination == "0.0.0.0/0" && staticRouteRendersFIB(sr) {
+				hasV4Default[inst.Name] = true
+				break
+			}
+		}
+		for _, sr := range inst.Inet6StaticRoutes {
+			if sr.Destination == "::/0" && staticRouteRendersFIB(sr) {
+				hasV6Default[inst.Name] = true
+				break
+			}
 		}
 	}
 	wrote := false
@@ -347,27 +373,37 @@ func renderDHCPDefaults(b *strings.Builder, fc *FullConfig) {
 			// more-specific and must not be dropped by a static default.
 			if dr.IsIPv6 {
 				dest = "::/0"
-				if hasV6Default {
+				if hasV6Default[dr.VRF] {
 					continue
 				}
 			} else {
 				dest = "0.0.0.0/0"
-				if hasV4Default {
+				if hasV4Default[dr.VRF] {
 					continue
 				}
 			}
 		}
+		// #8963: the `vrf <name>` clause, through sanitizeFRRValue for the same
+		// #5557 reason the static-route clause is sanitized -- the tolerant
+		// load / HA config-sync paths only warn, so a control character
+		// reaching here could inject a second vtysh line into the managed
+		// frr.conf. This is the single interpolation point for the DHCP route's
+		// vrf clause, matching how the static renderer keeps that property.
+		vrfPart := ""
+		if dr.VRF != "" {
+			vrfPart = " vrf " + sanitizeFRRValue(dr.VRF)
+		}
 		if dr.IsIPv6 {
 			if dr.Interface != "" {
-				fmt.Fprintf(b, "ipv6 route %s %s %s 200\n", dest, dr.Gateway, dr.Interface)
+				fmt.Fprintf(b, "ipv6 route %s %s %s 200%s\n", dest, dr.Gateway, dr.Interface, vrfPart)
 			} else {
-				fmt.Fprintf(b, "ipv6 route %s %s 200\n", dest, dr.Gateway)
+				fmt.Fprintf(b, "ipv6 route %s %s 200%s\n", dest, dr.Gateway, vrfPart)
 			}
 		} else {
 			if dr.Interface != "" {
-				fmt.Fprintf(b, "ip route %s %s %s 200\n", dest, dr.Gateway, dr.Interface)
+				fmt.Fprintf(b, "ip route %s %s %s 200%s\n", dest, dr.Gateway, dr.Interface, vrfPart)
 			} else {
-				fmt.Fprintf(b, "ip route %s %s 200\n", dest, dr.Gateway)
+				fmt.Fprintf(b, "ip route %s %s 200%s\n", dest, dr.Gateway, vrfPart)
 			}
 		}
 		wrote = true
