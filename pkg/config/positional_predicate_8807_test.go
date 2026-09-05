@@ -282,11 +282,12 @@ type posVerdict8807 struct {
 }
 
 var posAdjudicated8807 = map[string]posVerdict8807{
-	"application-set / application": {"defect", "#8825. Packed `application-set as1 application a1;` compiles to " +
-		"members=[] while the braced form gives [a1], and it is not even recorded in UnknownMembers. Strict REJECTS " +
-		"via the #3146 empty-application-set gate, so the commit path is safe; CompileConfigLenient ACCEPTS, and that " +
-		"is Store.Load, so the exposure is a config arriving by file or peer sync. Config-file-only, like #8800."},
-	"application-set / application-set": {"defect", "#8825, same node: nested set membership is lost in the packed spelling."},
+	// `application-set / application` and `application-set / application-set`
+	// were here as #8825 defects and are GONE because #8825 declared them.
+	// The ratchet reported them as removed and demanded the floor be
+	// tightened, which is the mechanism working: a fixed row must not leave
+	// slack behind. `application-set / description` stays -- it is still
+	// undeclared, and still benign, because the value lands nowhere by design.
 	// MEASURED SEPARATELY, and it is NOT a defect -- which is why the three
 	// heads under this one node had to be measured one at a time rather than
 	// inherited from `application`. compileApplications accepts `description`
@@ -313,7 +314,7 @@ var posAdjudicated8807 = map[string]posVerdict8807{
 // posDefectFloor8807 is a RATCHET. It fails in BOTH directions: a rise means an
 // unadjudicated positional hit, and a DROP means one was fixed and this must be
 // tightened so the next regression has no slack to hide in (#7484's shape).
-const posDefectFloor8807 = 2
+const posDefectFloor8807 = 0
 
 const posBlindness8807 = "\n\nWHAT THIS PREDICATE CANNOT SEE:\n" +
 	"  (1) CONTAINER RECOVERY IS PARTIAL. A site is localised only when its immediate " +

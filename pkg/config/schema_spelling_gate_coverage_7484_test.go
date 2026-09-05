@@ -198,7 +198,14 @@ func classifyGateBlindLeaf(g gateLeaf) gateBlindClass {
 // held at 364, so the leaf is genuinely gate-covered rather than having
 // moved into a blind class. Re-MEASURED at this head, not derived by adding
 // one to the source-pool number.
-const gateCoverageFloor = 703
+//
+// 703 -> 705 for #8825: declaring `application` and `application-set` under
+// `applications application-set` made those two spellings COMPARE. Blind is
+// unchanged BY THIS CHANGE at 393 -- the earlier 364 -> 393 rise was the
+// `flag` ceiling going 179 -> 209 for the #8807 `then` fix, not this one, and
+// all three buckets sit exactly at their ceilings (141 + 209 + 43 = 393).
+// Re-measured at this head rather than derived by adding two.
+const gateCoverageFloor = 705
 
 var gateBlindCeiling = map[gateBlindClass]int{
 	// #7492 moved leaves out of `unreachable` in two rounds. The parent
