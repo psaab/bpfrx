@@ -59,20 +59,63 @@ func TestFabricMemberTypoFailsCommit8444(t *testing.T) {
 	}
 }
 
-// TestFabricMemberDashFormFailsCommit8444 covers the second live spelling of
-// the same outage. `ge-0-0-0` is the KERNEL name form (what networkd renames
-// the NIC to, and what other config surfaces in this tree accept), so it is a
-// plausible thing to type here — but measured, it derives nothing on either
-// node, exactly like the typo. Distinct from the `fabster` cell because it is
-// a well-formed interface name that a reviewer would read straight past.
-func TestFabricMemberDashFormFailsCommit8444(t *testing.T) {
-	for _, node := range []int{0, 1} {
-		_, err := CheckText(fabricBody8444("ge-0-0-0", "ge-7-0-0", node), node)
-		if err == nil {
-			t.Fatalf("node %d: expected commit to reject a dash-form fabric member, got nil", node)
+// TestFabricMemberDashFormDerivesInterface8444 INVERTED in #8829, and the
+// inversion is the point of the comment.
+//
+// #8444 originally hard-REJECTED `ge-0-0-0` here, on a premise it had measured
+// and stated: the dash form "derives nothing on EITHER node", exactly like the
+// `fabster` typo. #8829 removed that premise rather than working around it.
+// `InterfaceSlot` now parses the operational dash spelling (the spelling
+// pkg/daemon/linksetup.go actually emits, so it is what an operator reads off a
+// running box), and the dash form now derives fab0 on node 0 and fab1 on node 1
+// — identically to the slash form.
+//
+// It also BRINGS UP identically, which is what makes accepting it safe rather
+// than merely permissive: every consumer resolves a member through
+// config.LinuxIfName, which is ReplaceAll(name, "/", "-") and therefore
+// idempotent on the dash form, so `ge-0-0-0` and `ge-0/0/0` reach the SAME
+// kernel netdev at LinkByName (pkg/routing/bond.go enslaveMembers). This is NOT
+// the deliberately-out-of-scope `ge-0/0/99` case, which parses and derives but
+// names a NIC that does not exist and fails visibly at netlink.
+//
+// So the old rejection became an over-rejection: it refused a config that
+// derives correctly and works — the #4191 class #8444 itself set out to avoid.
+// The guard's real purpose, catching a member that derives NOTHING, is
+// unchanged and is covered by the `fabster` cell above.
+//
+// This cell asserts the DERIVATION, not just that the commit was accepted:
+// an accepted commit with an empty FabricInterface is precisely the #8444
+// outage, and "no error" alone cannot tell the two apart.
+func TestFabricMemberDashFormDerivesInterface8444(t *testing.T) {
+	cases := []struct {
+		node            int
+		wantFabric      string
+		wantLocalMember string
+	}{
+		{0, "fab0", "ge-0-0-0"},
+		{1, "fab1", "ge-7-0-0"},
+	}
+	for _, tc := range cases {
+		cfg, err := CheckText(fabricBody8444("ge-0-0-0", "ge-7-0-0", tc.node), tc.node)
+		if err != nil {
+			t.Fatalf("node %d: the dash-form fabric member must commit since #8829 — it parses to an FPC slot and derives: %v", tc.node, err)
 		}
-		if !strings.Contains(err.Error(), "ge-0-0-0") {
-			t.Fatalf("node %d: error %q does not name the offending member", node, err.Error())
+		cc := cfg.Chassis.Cluster
+		if cc == nil {
+			t.Fatalf("node %d: no cluster compiled", tc.node)
+		}
+		if cc.FabricInterface != tc.wantFabric {
+			t.Fatalf("node %d: FabricInterface = %q, want %q — an EMPTY value here is the #8444 outage itself (every fabric bring-up is gated on it), and it is what accepting the commit would otherwise hide",
+				tc.node, cc.FabricInterface, tc.wantFabric)
+		}
+		ifc := cfg.Interfaces.Interfaces[tc.wantFabric]
+		if ifc == nil || ifc.LocalFabricMember != tc.wantLocalMember {
+			got := "<no interface>"
+			if ifc != nil {
+				got = ifc.LocalFabricMember
+			}
+			t.Fatalf("node %d: LocalFabricMember = %q, want %q — the bring-up path consumes this to pick THIS node's physical port",
+				tc.node, got, tc.wantLocalMember)
 		}
 	}
 }

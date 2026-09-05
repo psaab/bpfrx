@@ -16,8 +16,20 @@ import (
 //
 //	member fab0=ge-0/0/0 fab1=ge-7/0/0  node=0 -> FabricInterface="fab0"
 //	member fab0=fabster  fab1=ge-7/0/0  node=0 -> FabricInterface=""      <-- outage
-//	member fab0=ge-0-0-0 fab1=ge-7-0-0  node=0 -> FabricInterface=""      <-- outage
-//	member fab0=ge-0-0-0 fab1=ge-7-0-0  node=1 -> FabricInterface=""      <-- outage
+//	member fab0=ge-0-0-0 fab1=ge-7-0-0  node=0 -> FabricInterface="fab0"  (since #8829)
+//	member fab0=ge-0-0-0 fab1=ge-7-0-0  node=1 -> FabricInterface="fab1"  (since #8829)
+//
+// The last two rows READ AS OUTAGES UNTIL #8829 and no longer are. This gate
+// originally rejected the dash form `ge-0-0-0` on the premise, measured at the
+// time, that it derived nothing on either node. #8829 removed that premise
+// instead of working around it: `InterfaceSlot` now parses the operational
+// dash spelling too, so the dash form derives exactly like the slash form, and
+// every consumer normalises through `LinuxIfName` (idempotent on the dash
+// form), so both spellings reach the SAME kernel netdev at bring-up. Keeping
+// the rejection would have refused a config that demonstrably works — the
+// #4191 over-rejection class this gate exists to stay out of. What the gate
+// still catches is the case it was built for: a member that parses to no FPC
+// slot at all, and therefore derives NOTHING.
 //
 // `deriveFabricInterface` (compiler_derivations.go) selects the fabric
 // interface ONLY from a member for which `InterfaceSlot(member) >= 0` and
@@ -43,8 +55,8 @@ import (
 // node-agnostic, which also dissolves the node-scoping hazard — one config
 // describes both nodes and is synced verbatim between them, so a check whose
 // answer depended on WHICH node evaluated it would accept on one node and
-// reject on its peer. `ge-0/0/0` and `ge-7/0/0` both parse on both nodes;
-// `fabster` and `ge-0-0-0` parse on neither.
+// reject on its peer. `ge-0/0/0` and `ge-7/0/0` both parse on both nodes, as
+// do `ge-0-0-0` and `ge-7-0-0` since #8829; `fabster` parses on neither.
 //
 // DELIBERATELY OUT OF SCOPE: a member that parses but names no real NIC
 // (`ge-0/0/99`). Measured, that one DOES derive — FabricInterface is set and
