@@ -101,8 +101,6 @@
 #
 bridge-domains xpfname domain-type	partial
 bridge-domains xpfname routing-interface	partial
-chassis device-map interface	empty
-chassis device-map unmapped-interface-policy	empty
 interfaces xpfname description	partial
 interfaces xpfname duplex	partial
 interfaces xpfname encapsulation	partial
@@ -120,8 +118,6 @@ policy-options policy-statement xpfarg term xpfarg then metric-type	partial
 policy-options policy-statement xpfarg term xpfarg then next-hop	partial
 policy-options policy-statement xpfarg term xpfarg then origin	partial
 protocols bgp group xpfarg neighbor xpfarg peer-as	empty
-schedulers scheduler xpfarg start-date	empty
-schedulers scheduler xpfarg stop-date	empty
 security dynamic-address feed-server xpfarg hostname	empty
 security dynamic-address feed-server xpfarg url	empty
 system dataplane control-socket	empty
