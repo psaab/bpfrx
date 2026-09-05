@@ -1258,6 +1258,15 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		// admitting `system login` would turn a loud #6662 rejection into a
 		// silent acceptance, which is a regression wearing the shape of a fix).
 		"protocols bgp",
+		// #8879 batch 7. Two of these four are pairs I MYSELF cleared as
+		// "genuinely SAME" in batch 5, using a `dscp` fixture. They are not:
+		// via `inet-precedence` and `exp` they drop. I made the same
+		// one-leaf-generalised-to-the-pair error I had diagnosed in the sweep
+		// one batch earlier. Both are admitted here on the DROPPING leaf.
+		"class-of-service classifiers",
+		"class-of-service rewrite-rules",
+		"protocols lldp",
+		"security pre-id-default-policy",
 		// #8879 batch 6. THREE admitted, `system services` DECLINED -- it
 		// measured like a clean candidate on every column and re-opened #6966
 		// when folded (see TestSystemServicesStaysUnadmitted8879).

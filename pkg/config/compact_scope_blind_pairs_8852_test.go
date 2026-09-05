@@ -103,6 +103,11 @@ var knownBlindScopePairs8852 = map[string]string{
 	// #8879 batch 2, same reasoning as batch 1: admitted after measuring the
 	// elided spelling SILENT, blind to arm 2 for the same structural reason, so
 	// their fold correctness rests on the per-pair cells rather than the census.
+	// #8879 batch 7, shapes derived by the sentinel method.
+	"class-of-service classifiers":   "plain-container",
+	"class-of-service rewrite-rules": "plain-container",
+	"protocols lldp":                 "plain-container",
+	"security pre-id-default-policy": "plain-container",
 	// #8879 batch 6, shapes derived by the sentinel method.
 	"forwarding-options dhcp-relay":    "plain-container",
 	"protocols rip":                    "plain-container",
