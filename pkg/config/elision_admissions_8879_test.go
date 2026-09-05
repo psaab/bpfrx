@@ -58,6 +58,44 @@ func TestAdmittedPairsCompileLikeBraced8879(t *testing.T) {
 			`security { nat { source { pool P { address 10.0.0.1/32; } } } }`,
 			`security nat { source { pool P { address 10.0.0.1/32; } } }`,
 			func(c *Config) string { return fmt.Sprintf("pools=%d", len(c.Security.NAT.SourcePools)) }},
+		// #8879 batch 3, chosen to SPAN MODES: four subsystems and four
+		// different compiled shapes — a pointer struct (`isis`), a slice
+		// (`generate`), a scalar string (`license`) and a struct-of-scalars
+		// (`log`). Picking the top four rows of the sweep table would have
+		// sampled one region of the schema; picking the four most
+		// consequential would have sampled the regions with the MOST
+		// downstream validators, which is bias toward being caught rather
+		// than bias toward being representative.
+		//
+		// `security log` is the shape that most needs the empty-config
+		// liveness check below: Security.Log is a VALUE, not a pointer, so
+		// the elided arm yields a zero struct rather than nil and a
+		// nil-check would have called that "no drop".
+		{"protocols isis",
+			`protocols { isis { net 49.0001.1921.6800.1001.00; } }`,
+			`protocols isis { net 49.0001.1921.6800.1001.00; }`,
+			func(c *Config) string {
+				if c.Protocols.ISIS == nil {
+					return "<nil>"
+				}
+				return "net=" + c.Protocols.ISIS.NET
+			}},
+		{"routing-options generate",
+			`routing-options { generate { route 203.0.113.0/24 { discard; } } }`,
+			`routing-options generate { route 203.0.113.0/24 { discard; } }`,
+			func(c *Config) string {
+				return fmt.Sprintf("gen=%d", len(c.RoutingOptions.GenerateRoutes))
+			}},
+		{"system license",
+			`system { license { autoupdate { url https://lic.example.invalid/x; } } }`,
+			`system license { autoupdate { url https://lic.example.invalid/x; } }`,
+			func(c *Config) string { return "url=" + c.System.LicenseAutoUpdate }},
+		{"security log",
+			`security { log { mode event; format binary; } }`,
+			`security log { mode event; format binary; }`,
+			func(c *Config) string {
+				return fmt.Sprintf("mode=%s/fmt=%s", c.Security.Log.Mode, c.Security.Log.Format)
+			}},
 		// #8879 batch 2. Values are chosen NOT to equal any compiled default:
 		// a fixture whose value IS the fallback reads CLEAN WHILE BROKEN, because
 		// losing the value and keeping it produce the same compiled result. That
@@ -199,5 +237,60 @@ func TestAdmissionsIntroduceNoNewRejection8879(t *testing.T) {
 			t.Errorf("the tolerant ingress must still accept %q: %v — a config "+
 				"already on disk must keep loading (#1960 no-brick)", txt, err)
 		}
+	}
+}
+
+// TestInstanceNamePairCannotBeAdmitted8879 records the one DECLINE in #8879
+// batch 3, and records it for the reason that is actually true.
+//
+// `interfaces <name>` appears in the sweep as a CANDIDATE-DROP whose elided
+// arm STRICT-REJECTS, which reads like "declined because the drop is loud".
+// It is not that. With a hand-written leaf (`unit 0 family inet address ...`)
+// BOTH arms compile strictly clean and both yield one interface, so that
+// row's gate verdict is a property of the single synthesized leaf the sweep
+// happened to pick, not of the pair. A per-row verdict derived from one
+// synthesized leaf does not generalise to the pair it names.
+//
+// The real reason this pair is declined is STRUCTURAL and holds for every
+// leaf: compactNormalizeInScope is keyed on a (container, head) pair of
+// literal keywords, and here the head is an INSTANCE NAME chosen by the
+// operator. There is no string to admit. This is a permanent bound of the
+// pair-keyed design, not a backlog item, and it is asserted rather than
+// written down so that a future redesign which removes the bound also
+// removes this cell.
+func TestInstanceNamePairCannotBeAdmitted8879(t *testing.T) {
+	// The bound: an instance-named head is not a fixed keyword, so no
+	// admission list can name it. Two arbitrary interface names must be
+	// treated identically by the predicate — if they ever differ, the
+	// predicate has started keying on instance names and this whole cell,
+	// plus the reasoning above, needs revisiting.
+	a := compactNormalizeInScope("interfaces", "ge-0/0/0")
+	b := compactNormalizeInScope("interfaces", "xe-7/1/3")
+	if a != b {
+		t.Errorf("compactNormalizeInScope treats `interfaces ge-0/0/0` (%v) "+
+			"differently from `interfaces xe-7/1/3` (%v). The predicate is "+
+			"keyed on literal keyword pairs, so an instance-named head must "+
+			"be indistinguishable from any other (#8879).", a, b)
+	}
+	if a {
+		t.Errorf("`interfaces <name>` is reported IN SCOPE. An instance name " +
+			"cannot be a literal admission key, so this can only mean the " +
+			"predicate matched something it should not have (#8879).")
+	}
+	// And the property the sweep's verdict was mistaken about: with a real
+	// leaf, the elided spelling is NOT refused. Asserting this keeps the
+	// decline honest — if someone later reads the sweep row and concludes
+	// "declined because loud", this cell contradicts them.
+	txt := `interfaces ge-0/0/0 { unit 0 { family inet { address 10.9.9.1/24; } } }`
+	tree, perrs := NewParser(txt).Parse()
+	if len(perrs) > 0 {
+		t.Fatalf("fixture must parse: %v", perrs[0])
+	}
+	if _, err := CompileConfig(tree); err != nil {
+		t.Errorf("the elided `interfaces <name>` spelling is now refused at "+
+			"strict commit (%v). If that is deliberate the decline reason in "+
+			"this cell should move to the gate; as measured for #8879 it was "+
+			"accepted, and the decline rests on the instance-name bound "+
+			"instead.", err)
 	}
 }

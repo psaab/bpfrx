@@ -1258,6 +1258,16 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		// admitting `system login` would turn a loud #6662 rejection into a
 		// silent acceptance, which is a regression wearing the shape of a fix).
 		"protocols bgp",
+		// #8879 batch 3. Selected to SPAN MODES rather than to top the list:
+		// four subsystems and four different compiled shapes (pointer struct,
+		// slice, scalar string, struct-of-scalars). A consequence-weighted
+		// sample would have been biased toward the areas carrying the most
+		// downstream validators, which is bias toward being CAUGHT rather than
+		// bias toward being representative.
+		"protocols isis",
+		"routing-options generate",
+		"system license",
+		"security log",
 		// #8879 batch 2. Same rule as batch 1: admitted only after measuring the
 		// elided spelling SILENT on both paths, with the braced arm asserted LIVE
 		// against an EMPTY config rather than merely non-nil.
