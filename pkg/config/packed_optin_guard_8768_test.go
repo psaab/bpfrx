@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -51,7 +52,7 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 	const ikeProp = "proposal pr1 { authentication-method pre-shared-keys; dh-group group14; " +
 		"authentication-algorithm sha1; encryption-algorithm aes-128-cbc; }"
 	return map[string]packedOptInCase8768{
-		"trap-group": {
+		"snmp/trap-group": {
 			prefix: "snmp { ",
 			open:   "trap-group tg1",
 			closer: " }",
@@ -71,7 +72,7 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 				return out
 			},
 		},
-		"vpn-monitor": {
+		"security/ipsec/vpn/vpn-monitor": {
 			prefix: "security { ipsec { vpn v1 { ",
 			open:   "vpn-monitor",
 			closer: " } } }",
@@ -88,7 +89,67 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 				return out
 			},
 		},
-		"policy": {
+		"security/ike/proposal": {
+			prefix: "security { ike { ",
+			open:   "proposal pr1",
+			closer: " } }",
+			stmts: map[string]string{
+				"authentication-algorithm": "authentication-algorithm sha1",
+				"authentication-method":    "authentication-method pre-shared-keys",
+				"description":              "description hello",
+				"dh-group":                 "dh-group group14",
+				"encryption-algorithm":     "encryption-algorithm aes-128-cbc",
+				"lifetime-seconds":         "lifetime-seconds 3600",
+			},
+			read: func(c *Config) string {
+				out := ""
+				for _, p := range c.Security.IPsec.IKEProposals {
+					out += fmt.Sprintf("auth=%q meth=%q dh=%d enc=%q life=%d",
+						p.AuthAlg, p.AuthMethod, p.DHGroup, p.EncryptionAlg, p.LifetimeSeconds)
+				}
+				return out
+			},
+		},
+		"security/ipsec/proposal": {
+			prefix: "security { ipsec { ",
+			open:   "proposal ip1",
+			closer: " } }",
+			stmts: map[string]string{
+				"authentication-algorithm": "authentication-algorithm hmac-sha-256-128",
+				"description":              "description hello",
+				"dh-group":                 "dh-group group14",
+				"encryption-algorithm":     "encryption-algorithm aes-128-cbc",
+				"lifetime-kilobytes":       "lifetime-kilobytes 100000",
+				"lifetime-seconds":         "lifetime-seconds 3600",
+				"protocol":                 "protocol esp",
+			},
+			read: func(c *Config) string {
+				out := ""
+				for _, p := range c.Security.IPsec.Proposals {
+					out += fmt.Sprintf("proto=%q auth=%q dh=%d enc=%q life=%d",
+						p.Protocol, p.AuthAlg, p.DHGroup, p.EncryptionAlg, p.LifetimeSeconds)
+				}
+				return out
+			},
+		},
+		"security/ike/gateway/dead-peer-detection": {
+			prefix: "security { ike { gateway g1 { ",
+			open:   "dead-peer-detection",
+			closer: " } } }",
+			stmts: map[string]string{
+				"interval":  "interval 10",
+				"threshold": "threshold 3",
+			},
+			read: func(c *Config) string {
+				out := ""
+				for _, g := range c.Security.IPsec.Gateways {
+					out += fmt.Sprintf("dpdOn=%v mode=%q int=%d thr=%d",
+						g.DPDEnable, g.DeadPeerDetect, g.DPDInterval, g.DPDThreshold)
+				}
+				return out
+			},
+		},
+		"security/ike/policy": {
 			prefix: "security { ike { " + ikeProp + " ",
 			open:   "policy p1",
 			closer: " } }",
@@ -112,45 +173,54 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 
 func TestPackedOptInHoldsForEveryLeafPair8768(t *testing.T) {
 	// Find every container in the schema that has opted in.
+	// KEYED BY SCHEMA PATH, not by container name. Names repeat: `proposal`
+	// exists under both `ike` and `ipsec`, and `dead-peer-detection` under both
+	// too. A name-keyed registry does not fail on that — it silently holds
+	// whichever node the walk reached last and enumerates the WRONG container's
+	// leaves while reading as coverage for the one someone opted in.
+	//
+	// The earlier version refused when two names collided, which was correct
+	// and blocked three containers from opting in. A path is unique by
+	// construction, so the refusal is replaced by an address that cannot be
+	// ambiguous. Wildcard levels render as `*`, matching how the schema
+	// addresses an instance rather than a keyword.
 	optedIn := map[string]*schemaNode{}
-	var collisions []string
-	seenCollision := map[string]bool{}
-	var walk func(n *schemaNode, name string, depth int)
-	walk = func(n *schemaNode, name string, depth int) {
+	canonical := map[*schemaNode]string{}
+	var walk func(n *schemaNode, path string, depth int)
+	walk = func(n *schemaNode, path string, depth int) {
 		if n == nil || depth > 12 {
 			return
 		}
-		if n.packedStatements && name != "" {
-			if prev, dup := optedIn[name]; dup && prev != n && !seenCollision[name] {
-				seenCollision[name] = true
-				collisions = append(collisions, name)
+		if n.packedStatements && path != "" {
+			// THE SAME NODE IS REACHABLE BY TWO PATHS. Junos `groups` mirrors
+			// the entire schema, so every container also has a
+			// `groups/*/<path>` address pointing at the identical node. Keying
+			// on the raw path would list each opted-in container twice and
+			// demand two identical fixture sets.
+			//
+			// Dedupe by node IDENTITY and keep the shortest path as the
+			// canonical address — which is the non-groups one, because the
+			// mirror only ever adds a prefix.
+			if prev, seen := canonical[n]; !seen || len(path) < len(prev) {
+				canonical[n] = path
 			}
-			optedIn[name] = n
 		}
 		for cn, ch := range n.children {
-			walk(ch, cn, depth+1)
+			next := cn
+			if path != "" {
+				next = path + "/" + cn
+			}
+			walk(ch, next, depth+1)
 		}
 		if n.wildcard != nil {
-			walk(n.wildcard, name, depth+1)
+			walk(n.wildcard, path+"/*", depth+1)
 		}
 	}
 	walk(setSchema, "", 0)
-
-	// NAME COLLISIONS ARE FATAL, because this registry is keyed by container
-	// NAME and schema names repeat: `proposal` exists under both `ike` and
-	// `ipsec`, and `dead-peer-detection` under both too. If two nodes of one
-	// name opt in, the map holds whichever the walk reached last and the leaf
-	// enumeration silently describes the wrong container — a guard that reports
-	// on a node nobody opted in. Refuse rather than guess; keying by path is
-	// the real fix and is deliberately left until a second node needs it.
-	if len(collisions) > 0 {
-		sort.Strings(collisions)
-		t.Fatalf("%d container name(s) opt in at MORE THAN ONE schema position: %v.\n"+
-			"This registry is keyed by name, so it cannot tell them apart and would "+
-			"enumerate the leaves of whichever the walk reached last. Key it by "+
-			"schema path before opting in a second node of the same name (#8768).",
-			len(collisions), collisions)
+	for n, path := range canonical {
+		optedIn[path] = n
 	}
+
 	if len(optedIn) == 0 {
 		t.Fatal("no container declares packedStatements, so this cell asserts " +
 			"nothing — either the flag was removed or the walk lost reach (#8768)")
@@ -207,9 +277,14 @@ func TestPackedOptInHoldsForEveryLeafPair8768(t *testing.T) {
 		// Every ADMITTED leaf must have a statement: a leaf admitted to the
 		// scope but missing here is exactly the leaf whose packed spelling was
 		// never compared.
+		//
+		// The scope predicate takes the container KEYWORD, which is the last
+		// non-wildcard segment of the path — `security/ike/gateway/*/dead-peer-
+		// detection` asks about `dead-peer-detection`, not about `*`.
+		kw := containerKeywordOfPath8768(name)
 		var leaves []string
 		for leaf := range node.children {
-			if !compactNormalizeInScope(name, leaf) {
+			if !compactNormalizeInScope(kw, leaf) {
 				continue
 			}
 			if _, ok := c.stmts[leaf]; !ok {
@@ -251,4 +326,16 @@ func TestPackedOptInHoldsForEveryLeafPair8768(t *testing.T) {
 			"anything (#8768)")
 	}
 	t.Logf("#8768: %d opted-in container(s), %d ordered leaf pairs compared", len(optedIn), checked)
+}
+
+// containerKeywordOfPath8768 returns the keyword the scope predicate is asked
+// about for a schema path: the last segment that is not a wildcard.
+func containerKeywordOfPath8768(path string) string {
+	segs := strings.Split(path, "/")
+	for i := len(segs) - 1; i >= 0; i-- {
+		if segs[i] != "*" && segs[i] != "" {
+			return segs[i]
+		}
+	}
+	return ""
 }
