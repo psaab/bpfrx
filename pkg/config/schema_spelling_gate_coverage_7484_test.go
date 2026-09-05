@@ -183,7 +183,16 @@ func classifyGateBlindLeaf(g gateLeaf) gateBlindClass {
 // directly instead, asserting the compiled struct rather than a spelling
 // comparison — a narrower guard on a specific pair, not a replacement for this
 // one's breadth.
-const gateCoverageFloor = 701
+//
+// #8800 then raised it by one. Declaring `address` under `security nat source
+// pool` -- the compiler had read it since #4521 but the schema never declared
+// it, so the brace-elision pass was never asked about the pair and the packed
+// spelling compiled to a ZERO-address pool -- made that spelling COMPARE.
+// Every blind bucket held at its ceiling, so the new leaf is genuinely
+// gate-covered rather than having moved into a blind class. The value below
+// was RE-MEASURED on the merge of the two changes, not obtained by adding one
+// to either side's number.
+const gateCoverageFloor = 702
 
 var gateBlindCeiling = map[gateBlindClass]int{
 	// #7492 moved leaves out of `unreachable` in two rounds. The parent
