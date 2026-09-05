@@ -72,6 +72,18 @@ func synthPair(n *schemaNode) (string, string, bool) {
 	}
 	// A numeric-looking placeholder (`<n>`, `<0..128>`, `<seconds>`) means the
 	// invented identifier will be rejected. Prefer two small integers.
+	//
+	// #8690 — DO NOT "FIX" THE `id` TEST TO A WORD BOUNDARY. It matches `id` as
+	// a SUBSTRING, so `<provider-name>` (prov-ID-er), `<identity>` and
+	// `<bandwidth>` get numeric probes as well as `<uid>` and `<vlan-id>`. That
+	// reads as a defect and was measured as a fix: bounding `id` to a whole
+	// token made the census measure LESS — checked 699 -> 697, not-observable
+	// 236 -> 238. Two sites are observable ONLY because the loose match hands
+	// them a number.
+	//
+	// A heuristic that is wrong for the right reason can be right in effect.
+	// Recorded here rather than only in an issue comment because the next
+	// reader will find the substring match before they find the measurement.
 	if ph := strings.ToLower(n.placeholder); ph != "" {
 		if strings.ContainsAny(ph, "0123456789") ||
 			strings.Contains(ph, "number") || strings.Contains(ph, "count") ||
