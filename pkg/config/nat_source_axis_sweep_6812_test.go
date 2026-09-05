@@ -878,6 +878,20 @@ var walkRuleAxisExemptions6812 = mergeAxisExemptions6812(
 		"Rule.nil",
 	),
 	fixtureConstantAxes6812(
+		"#8814. NOT production-constant: a pool CAN carry an oversized "+
+			"`address <low> to <high>` range on the tolerant load / peer-sync path, "+
+			"which is the entire point of recording it rather than erroring — "+
+			"CompileConfigLenient accepts such a config and the strict gate "+
+			"(validateNATPoolAddressRangeStrict) is what refuses it at commit. What "+
+			"makes the column constant HERE is that this fixture authors no range at "+
+			"all, so nothing can exceed the cap. Registered as a FIXTURE blind spot "+
+			"rather than a production invariant, because claiming the latter would "+
+			"assert that no config the compiler produces can populate the field, and "+
+			"that is false by construction.",
+		"Pool.OversizedAddressRanges.nil", "Pool.OversizedAddressRanges.len",
+		"Pool.OversizedAddressRanges.all", "Pool.OversizedAddressRanges[0]",
+	),
+	fixtureConstantAxes6812(
 		"NOT production-constant, corrected in round 11. Round 10 classified this "+
 			"alongside Rule.nil on the argument that the charge walk filters a dangling "+
 			"pool reference out before charging (compiler_validate_strict_nat.go:3192) — "+

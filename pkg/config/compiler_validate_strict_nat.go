@@ -2979,6 +2979,24 @@ func validateProxyARPAddressesStrict(cfg *Config) error {
 		// this entry does carry are the single-value fallback — they parse
 		// fine, and reporting only them would name the one address that DID
 		// survive while staying silent about the ones that did not.
+		// #8814: an `address <low> to <high>` range larger than the 256-address
+		// expansion cap. Reported alongside the malformed-range specs above and
+		// for the same reason: the compiler installs NOTHING for such a
+		// statement, so the firewall answers no ARP/ND for the authored range
+		// and inbound traffic to those addresses is never drawn to it.
+		//
+		// The cap cannot be raised in the compiler as an error -- that is what
+		// #8814 fixed. It fired on the LENIENT path too, so a persisted config
+		// with an oversized range could not boot.
+		for _, spec := range entry.OversizedRangeSpecs {
+			return fmt.Errorf(
+				"security nat proxy-arp interface %q address range %s; a proxy-arp "+
+					"range is expanded to one kernel NTF_PROXY neighbour per address "+
+					"and is capped at %d — narrow the range, or author the addresses "+
+					"individually. Nothing is installed for an over-cap range, so the "+
+					"firewall answers no ARP/ND for it (#8814)",
+				entry.Interface, spec, proxyARPMaxExpandedHosts)
+		}
 		for _, spec := range entry.MalformedRangeSpecs {
 			return fmt.Errorf(
 				"security nat proxy-arp interface %q address %q is not a valid "+

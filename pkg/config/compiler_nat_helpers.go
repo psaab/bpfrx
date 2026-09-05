@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -287,10 +288,25 @@ func appendPoolAddresses(pool *NATPool, tokens []string) error {
 		// following high address present.
 		if i+2 < len(tokens) && tokens[i+1] == "to" {
 			expanded, err := expandAddressRange(tok, tokens[i+2])
-			if err != nil {
+			switch {
+			case errors.Is(err, errNATAddressRangeTooLarge):
+				// #8814: RECORD rather than fail. A hard error here reaches the
+				// LENIENT path too -- appendPoolAddresses is called from the
+				// security compiler chain, which carries no compileOpts -- so a
+				// persisted config with an oversized range could not boot,
+				// defeating what CompileConfigLenient exists for. The pool loads
+				// WITHOUT the oversized range and
+				// validateNATPoolAddressRangeStrict hard-rejects it at commit.
+				// Same shape as PortRangeInvalidSpec on this struct.
+				pool.OversizedAddressRanges = append(pool.OversizedAddressRanges,
+					fmt.Sprintf("%s to %s: %v", tok, tokens[i+2], err))
+			case err != nil:
+				// Malformed input (not a /32, not IPv4, low > high) still fails
+				// on both paths: there is no safe interpretation to fall back to.
 				return fmt.Errorf("pool %q address range: %w", pool.Name, err)
+			default:
+				pool.Addresses = append(pool.Addresses, expanded...)
 			}
-			pool.Addresses = append(pool.Addresses, expanded...)
 			i += 3
 			continue
 		}
@@ -300,8 +316,27 @@ func appendPoolAddresses(pool *NATPool, tokens []string) error {
 	return nil
 }
 
+// errNATAddressRangeTooLarge marks the ONE expandAddressRange failure that is a
+// SIZE limit rather than a malformed input (#8814).
+//
+// The distinction is what lets the caller record an oversized range and keep
+// going on the tolerant load / peer-sync path while a malformed one still fails
+// there. Malformed input has no safe interpretation; an oversized range has one
+// -- omit it -- and CompileConfigLenient exists precisely so an already-persisted
+// config boots through.
+//
+// THE CAP ITSELF STAYS HERE, and that is deliberate rather than a half-measure.
+// #8814 proposed moving it out of the compiler entirely, into a strict
+// validator. Measured, the widest legal spelling is
+// `address 0.0.0.0/32 to 255.255.255.255/32` -> 4294967296 IPs, so an expansion
+// with no bound would try to allocate 4.29 BILLION strings on the LENIENT path,
+// which is the boot path. That trades a load failure for an OOM, which is worse.
+// So the bound stays and only the ERROR becomes a recordable fact.
+var errNATAddressRangeTooLarge = errors.New("address range too large")
+
 // expandAddressRange expands "low/mask to high/mask" into individual IP strings.
-// Both low and high must be /32 CIDRs. Max 256 IPs.
+// Both low and high must be /32 CIDRs. Max 256 IPs; a larger range returns
+// errNATAddressRangeTooLarge (see above) rather than an anonymous error.
 func expandAddressRange(low, high string) ([]string, error) {
 	lowCIDR := low
 	if !strings.Contains(lowCIDR, "/") {
@@ -336,7 +371,7 @@ func expandAddressRange(low, high string) ([]string, error) {
 	// instead of the promised size error.
 	count := uint64(highN) - uint64(lowN) + 1
 	if count > 256 {
-		return nil, fmt.Errorf("address range too large: %d IPs (max 256)", count)
+		return nil, fmt.Errorf("%w: %d IPs (max 256)", errNATAddressRangeTooLarge, count)
 	}
 	var result []string
 	buf := make(net.IP, 4)
