@@ -94,6 +94,24 @@ func SchemaValidateWithDefinitions(tree, defsSource *ConfigTree, cfg *Config) er
 	//
 	// No-op (no clone) when nothing is packed, like WithoutInactive above.
 	tree = normalizePackedChassisCluster(tree)
+	// issue 8867: the SAME reasoning as #6672 above, generalised. That fix
+	// un-packs one container (`chassis cluster`) before the walk because the
+	// walker descends `.Children`, so a statement packed onto a container line
+	// sits below every modelled depth and no typed-leaf validator fires on it.
+	// Every pair admitted to compactNormalizeInScope has exactly that property:
+	// the compiler normalizes it (compiler.go) and therefore COMPILES its
+	// value, while this walk still sees the un-normalized shape and validates
+	// nothing. Measured before this change: of 161 validator-bearing typed
+	// leaves reachable at an admitted pair, 146 were rejected in the braced
+	// spelling and ACCEPTED in the packed one.
+	//
+	// One splitter, both consumers -- the same conclusion #6672 reached for its
+	// single container, applied to the whole admitted population.
+	//
+	// The clone is required: this tree is the operator's candidate and is
+	// persisted by the caller. Normalizing it in place here would rewrite the
+	// stored configuration as a side effect of validating it.
+	tree = normalizeCompactForValidation(tree)
 	// #4060: reject the raw-AST redaction placeholder ("##SECRET-DATA##") on
 	// commit-ingest. This is the symmetric guard for the #4051 display
 	// redaction — re-applying a secret-redacted REST export must not silently

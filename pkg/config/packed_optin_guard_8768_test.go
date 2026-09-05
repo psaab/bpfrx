@@ -154,6 +154,28 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 				return out
 			},
 		},
+		// issue 8858: root-authentication opted in because SSHKeys is a
+		// []string and a packed multi-key run folded into ONE key without it.
+		// The keys deliberately differ so a fold that keeps only the first is
+		// visible in the compared value rather than averaging out.
+		"system/root-authentication": {
+			prefix: "system { ",
+			open:   "root-authentication",
+			closer: " }",
+			stmts: map[string]string{
+				"encrypted-password": `encrypted-password "$6$rounds=5000$abc$def"`,
+				"ssh-ed25519":        `ssh-ed25519 "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKed a@b"`,
+				"ssh-rsa":            `ssh-rsa "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABrsa c@d"`,
+				"ssh-dsa":            `ssh-dsa "ssh-dss AAAAB3NzaC1kc3MAAACBAdsa e@f"`,
+			},
+			read: func(c *Config) string {
+				ra := c.System.RootAuthentication
+				if ra == nil {
+					return "<no root-authentication>"
+				}
+				return fmt.Sprintf("pw=%q keys=%v", ra.EncryptedPassword.Reveal(), ra.SSHKeys)
+			},
+		},
 		"snmp/trap-group": {
 			prefix: "snmp { ",
 			open:   "trap-group tg1",
