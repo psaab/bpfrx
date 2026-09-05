@@ -59,6 +59,52 @@ func TestAdmittedPairsCompileLikeBraced8879(t *testing.T) {
 			`security { nat { source { pool P { address 10.0.0.1/32; } } } }`,
 			`security nat { source { pool P { address 10.0.0.1/32; } } }`,
 			func(c *Config) string { return fmt.Sprintf("pools=%d", len(c.Security.NAT.SourcePools)) }},
+		// #8879 batch 9 — the last of the population.
+		//
+		// Two fixtures here had to be repaired before they could answer, and
+		// both failures were mine rather than the code's: `ssh-known-hosts`
+		// with a bare `host` compiled to ZERO hosts on BOTH arms (a host with
+		// no key is not stored), which is a dead comparison that would have
+		// read as "no drop"; and `ip-monitoring` needs BOTH a defined rpm
+		// probe and a `then preferred-route`, without which the braced
+		// reference did not compile at all.
+		{"forwarding-options port-mirroring",
+			`forwarding-options { port-mirroring { instance pm1 { input { rate 313; } } } }`,
+			`forwarding-options port-mirroring { instance pm1 { input { rate 313; } } }`,
+			func(c *Config) string {
+				if c.ForwardingOptions.PortMirroring == nil {
+					return "<nil>"
+				}
+				return fmt.Sprintf("inst=%d", len(c.ForwardingOptions.PortMirroring.Instances))
+			}},
+		{"routing-options interface-routes",
+			`routing-options { interface-routes { rib-group inet rg-7717; } }`,
+			`routing-options interface-routes { rib-group inet rg-7717; }`,
+			func(c *Config) string { return "rg=" + c.RoutingOptions.InterfaceRoutesRibGroup }},
+		{"security ssh-known-hosts",
+			`security { ssh-known-hosts { host h7717.example.invalid { rsa-key AAAAB3NzaC1yc2EAAAADAQABAAABgQxx; } } }`,
+			`security ssh-known-hosts { host h7717.example.invalid { rsa-key AAAAB3NzaC1yc2EAAAADAQABAAABgQxx; } }`,
+			func(c *Config) string { return fmt.Sprintf("hosts=%d", len(c.Security.SSHKnownHosts)) }},
+		// 313, not 60/15 — those are the compiled defaults for the flow
+		// timeouts and a fixture carrying one reads clean while broken.
+		{"services flow-monitoring",
+			`services { flow-monitoring { version9 { template tpl1 { flow-active-timeout 313; } } } }`,
+			`services flow-monitoring { version9 { template tpl1 { flow-active-timeout 313; } } }`,
+			func(c *Config) string {
+				if c.Services.FlowMonitoring == nil || c.Services.FlowMonitoring.Version9 == nil {
+					return "<nil>"
+				}
+				return fmt.Sprintf("tpl=%d", len(c.Services.FlowMonitoring.Version9.Templates))
+			}},
+		{"services ip-monitoring",
+			`services { rpm { probe pr1 { test t1 { probe-type icmp-ping; target address 198.51.100.9; } } } ip-monitoring { policy ipm1 { match { rpm-probe pr1; } then { preferred-route { route 203.0.113.0/24 { next-hop 198.51.100.1; } } } } } }`,
+			`services { rpm { probe pr1 { test t1 { probe-type icmp-ping; target address 198.51.100.9; } } } } services ip-monitoring { policy ipm1 { match { rpm-probe pr1; } then { preferred-route { route 203.0.113.0/24 { next-hop 198.51.100.1; } } } } }`,
+			func(c *Config) string {
+				if c.Services.IPMonitoring == nil {
+					return "<nil>"
+				}
+				return fmt.Sprintf("pol=%d", len(c.Services.IPMonitoring.Policies))
+			}},
 		// #8879 batch 8.
 		//
 		// `forwarding-options family` uses mode `packet-based` and NOT
@@ -614,33 +660,60 @@ func TestSweepUnanswerableRowIsNotADefect8879(t *testing.T) {
 // Measured two-sided when it was found: removing the admission restores the
 // fail-open, so the admission is what closes it.
 func TestElisionSuppressedAValidation8879(t *testing.T) {
-	const undefined = "no-such-policy-7717"
-	refused := func(txt string) bool {
-		tree, perrs := NewParser(txt).Parse()
-		if len(perrs) > 0 {
-			t.Fatalf("fixture must parse: %v", perrs[0])
-		}
-		_, err := CompileConfig(tree)
-		return err != nil
-	}
-	braced := `routing-options { forwarding-table { export ` + undefined + `; } }`
-	elided := `routing-options forwarding-table { export ` + undefined + `; }`
-
-	// LIVENESS, fatal: if the braced arm stops being refused, the check this
-	// cell is about no longer exists and the comparison below is vacuous --
-	// it would pass trivially with both arms accepting.
-	if !refused(braced) {
-		t.Fatalf("the braced spelling with an UNDEFINED export policy is no " +
-			"longer refused at strict commit. This cell asserts that the " +
-			"elided spelling is refused TOO; with the check gone it would " +
-			"pass for the wrong reason.")
-	}
-	if !refused(elided) {
-		t.Error("the elided `routing-options forwarding-table export " +
-			"<undefined>` spelling COMMITS CLEAN. The elision is dropping the " +
-			"export leaf before the dangling-reference check can see it, so " +
-			"the operator gets neither the load-balancing policy nor the " +
-			"error explaining why -- ECMP is silently disabled (#8879).")
+	// TWO instances, not one. The first (`forwarding-table`) was found in
+	// batch 6 and read as a curiosity; the second (`ip-monitoring`) turned up
+	// in batch 9 the moment a fixture happened to name a probe that did not
+	// exist. Two independent instances in the two batches that looked make
+	// this a CLASS, and a table is the honest shape for a class -- a
+	// single-case cell would keep reading as an oddity.
+	//
+	// The shape: a container whose child carries a CROSS-REFERENCE that strict
+	// commit validates. Elide the container and the child is dropped BEFORE
+	// the check runs, so a dangling reference commits clean:
+	//
+	//	braced, bad reference  ->  REJECTED at commit  (correct)
+	//	elided, bad reference  ->  COMMITTED CLEAN     (fail-open)
+	//
+	// The operator gets no value AND no complaint, and it inverts the usual
+	// intuition that the more explicit spelling is the risky one. Both are
+	// closed by admitting the pair; both were measured two-sided when found.
+	for _, c := range []struct{ pair, braced, elided, costs string }{
+		{"routing-options forwarding-table",
+			`routing-options { forwarding-table { export no-such-policy-7717; } }`,
+			`routing-options forwarding-table { export no-such-policy-7717; }`,
+			"ECMP / consistent-hash load-balancing is silently disabled"},
+		{"services ip-monitoring",
+			`services { ip-monitoring { policy ipm1 { match { rpm-probe no-such-probe-7717; } ` +
+				`then { preferred-route { route 203.0.113.0/24 { next-hop 198.51.100.1; } } } } } }`,
+			`services ip-monitoring { policy ipm1 { match { rpm-probe no-such-probe-7717; } ` +
+				`then { preferred-route { route 203.0.113.0/24 { next-hop 198.51.100.1; } } } } }`,
+			"probe-driven WAN failover silently never arms"},
+	} {
+		t.Run(c.pair, func(t *testing.T) {
+			refused := func(txt string) bool {
+				tree, perrs := NewParser(txt).Parse()
+				if len(perrs) > 0 {
+					t.Fatalf("fixture must parse: %v", perrs[0])
+				}
+				_, err := CompileConfig(tree)
+				return err != nil
+			}
+			// LIVENESS, fatal: if the braced arm stops being refused, the
+			// check this row is about no longer exists and the assertion
+			// below would pass for the wrong reason -- both arms accepting.
+			if !refused(c.braced) {
+				t.Fatalf("%s: the BRACED spelling with a bad cross-reference is "+
+					"no longer refused at strict commit. This row asserts the "+
+					"ELIDED spelling is refused too; with the check gone it "+
+					"would pass vacuously.", c.pair)
+			}
+			if !refused(c.elided) {
+				t.Errorf("%s: the ELIDED spelling with a bad cross-reference "+
+					"COMMITS CLEAN. The elision drops the child before the "+
+					"validation can see it, so the operator gets neither the "+
+					"configuration nor the error -- %s (#8879).", c.pair, c.costs)
+			}
+		})
 	}
 }
 

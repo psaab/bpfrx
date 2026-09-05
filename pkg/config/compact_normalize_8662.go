@@ -1258,6 +1258,17 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		// admitting `system login` would turn a loud #6662 rejection into a
 		// silent acceptance, which is a regression wearing the shape of a fix).
 		"protocols bgp",
+		// #8879 batch 9, the last of the population. `services ip-monitoring`
+		// is the SECOND validation-suppressing elision found (after
+		// `routing-options forwarding-table` in batch 6): its elided spelling
+		// dropped the policy before the dangling-rpm-probe check could run, so
+		// a typo'd probe name committed clean and probe-driven WAN failover
+		// silently never armed. The fail-open is a CLASS, not a one-off.
+		"forwarding-options port-mirroring",
+		"routing-options interface-routes",
+		"security ssh-known-hosts",
+		"services flow-monitoring",
+		"services ip-monitoring",
 		// #8879 batch 8. `forwarding-options family` uses mode `packet-based`
 		// deliberately: `flow-based` is the compiled DEFAULT, and a fixture
 		// carrying the default reads CLEAN WHILE BROKEN.
