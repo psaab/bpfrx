@@ -1526,3 +1526,21 @@ func splitPackedStatements8768(tail []string, container *schemaNode) [][]string 
 	}
 	return out
 }
+
+// normalizeCompactForValidation returns a tree with every admitted compact
+// stanza folded, for the typed-leaf walk to validate (issue 8867).
+//
+// It never mutates the argument: SchemaValidate runs on the operator's
+// candidate tree, which the caller persists, so folding in place would rewrite
+// the stored configuration as a side effect of checking it. When nothing folds
+// the original is returned and the clone is discarded.
+func normalizeCompactForValidation(tree *ConfigTree) *ConfigTree {
+	if tree == nil {
+		return nil
+	}
+	clone := tree.Clone()
+	if normalizeCompactStanzas(clone) == 0 {
+		return tree
+	}
+	return clone
+}

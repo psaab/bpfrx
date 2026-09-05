@@ -476,17 +476,29 @@ func TestSchemaValidate_ChildLeafGarbageRejected(t *testing.T) {
 		}
 	}
 	// Packed single-node shorthand (`schedulers be transmit-rate asd` as ONE
-	// node with no children): the compiler does NOT compile the packed tail —
-	// it names the scheduler `be` and discards `transmit-rate asd` (the
-	// scheduler ends up with no rate, same as if it were never written). This
-	// is NOT a symptom-2 silent-coerce of a real leaf, so the gate leaves it
-	// alone (rejecting compiler-discarded tokens is out of #1319 scope).
+	// node with no children). This block asserted the OPPOSITE until issue
+	// 8867, on the premise that "the compiler does NOT compile the packed tail
+	// -- it names the scheduler `be` and discards `transmit-rate asd`", which
+	// made rejecting it out of #1319 scope.
+	//
+	// That premise was true when it was written and is now false. Admitting
+	// `schedulers transmit-rate` to compactNormalizeInScope made the compiler
+	// fold the packed tail, and nothing re-checked this cell. Measured:
+	//
+	//	class-of-service { schedulers be transmit-rate 1g; }        rateBytes=125000000
+	//	class-of-service { schedulers { be { transmit-rate 1g; } } } rateBytes=125000000
+	//
+	// The value is compiled and reaches the dataplane. So the packed spelling
+	// IS compiler-reachable and garbage in it must be rejected, exactly as the
+	// braced spelling's garbage is. The cell passed only because the validator
+	// could not see the packed tail either -- two gaps agreeing, which is what
+	// made the stale premise invisible.
 	for _, in := range []string{
 		`class-of-service { schedulers be transmit-rate asd; }`,
 		`class-of-service { schedulers be priority foo; }`,
 	} {
-		if err := schemaCheck(t, in); err != nil {
-			t.Fatalf("packed single-node shorthand %q is compiler-discarded; gate must not reject it, got %v", in, err)
+		if err := schemaCheck(t, in); err == nil {
+			t.Fatalf("packed shorthand %q compiles its value, so garbage must be rejected; got nil", in)
 		}
 	}
 	accept := []string{
