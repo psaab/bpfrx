@@ -103,6 +103,12 @@ var knownBlindScopePairs8852 = map[string]string{
 	// #8879 batch 2, same reasoning as batch 1: admitted after measuring the
 	// elided spelling SILENT, blind to arm 2 for the same structural reason, so
 	// their fold correctness rests on the per-pair cells rather than the census.
+	// #8879 batch 9, shapes derived by the sentinel method.
+	"forwarding-options port-mirroring": "plain-container",
+	"routing-options interface-routes":  "plain-container",
+	"security ssh-known-hosts":          "plain-container",
+	"services flow-monitoring":          "plain-container",
+	"services ip-monitoring":            "plain-container",
 	// #8879 batch 8, shapes derived by the sentinel method.
 	"forwarding-options family": "plain-container",
 	"protocols ospf3":           "plain-container",
