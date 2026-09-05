@@ -10,16 +10,30 @@ import (
 // and BRACED spellings identically for EVERY ORDERED PAIR of its admitted
 // leaves — not for the one pair whoever opted it in happened to measure.
 //
-// lane-8526 established why the container is the wrong unit. The divergence it
-// found under `snmp community` is not in the fold: the splitter produces a
-// correct two-statement structure and the `clients` READER does not take its
-// value from it, while `authorization` in the same tail does. So whether a
-// packed tail survives is a property of each leaf's reader, and a container is
-// safe only if every one of them agrees.
+// THE JUSTIFICATION IS A PRIORI, NOT A COUNTER-EXAMPLE, and an earlier version
+// of this comment claimed otherwise. Opting a container in is a claim about
+// EVERY admitted leaf — that each survives the packed spelling — so every pair
+// has to be compared for the claim to be tested. That argument needs no
+// observed defect and does not weaken without one.
 //
-// Multi-ness is NOT the discriminator, which is worth recording because it is
-// the obvious wrong answer: `snmp trap-group targets` is multi and fine, and
-// `snmp community clients` is multi and diverges.
+// THE MECHANISM THIS ORIGINALLY CITED WAS RETRACTED. It said `snmp community`
+// showed a leaf-level reader ignoring a correctly-split tail. It does not:
+// `snmp community` does not fold at all, because ("community","authorization")
+// is not in the scope list, so there is no split structure and no reader
+// ignoring one. Its lost `clients` is an ordinary drop at an unadmitted site
+// (#8778). NO per-leaf reader divergence has ever been demonstrated, and the
+// 18-of-18 EQUAL measured here is entirely consistent with none existing.
+//
+// The retraction is recorded rather than deleted because the cell's assertions
+// were never affected by it — only the story about why they matter. A guard
+// whose stated reason is a phantom still passes review, and the next person to
+// read it inherits the phantom.
+//
+// "Multi-ness is not the discriminator" is likewise NOT asserted here. It was
+// supported by `snmp community clients` diverging, and that divergence is not a
+// fold divergence, so the evidence is gone even though the claim may still be
+// true. `snmp trap-group targets` is multi and fine, which is one half and not
+// a discriminator.
 //
 // THE REGISTRY IS ASSERTED AGAINST THE SCHEMA IN BOTH DIRECTIONS. A container
 // that opts in without adding fixtures here reds, because otherwise this cell
@@ -162,8 +176,8 @@ func TestPackedOptInHoldsForEveryLeafPair8768(t *testing.T) {
 	if len(unfixtured) > 0 {
 		t.Errorf("%d container(s) declare packedStatements with NO fixtures here: %v.\n"+
 			"Opting a container in is a claim that every admitted leaf survives the "+
-			"packed spelling, and that claim is per-leaf-READER rather than "+
-			"per-container. Add real statements for each admitted leaf (#8768).",
+			"packed spelling, and every one has to be COMPARED for that claim to "+
+			"be tested. Add real statements for each admitted leaf (#8768).",
 			len(unfixtured), unfixtured)
 	}
 	if len(stale) > 0 {
@@ -191,16 +205,17 @@ func TestPackedOptInHoldsForEveryLeafPair8768(t *testing.T) {
 			continue
 		}
 		// Every ADMITTED leaf must have a statement: a leaf admitted to the
-		// scope but missing here is exactly the untested reader.
+		// scope but missing here is exactly the leaf whose packed spelling was
+		// never compared.
 		var leaves []string
 		for leaf := range node.children {
 			if !compactNormalizeInScope(name, leaf) {
 				continue
 			}
 			if _, ok := c.stmts[leaf]; !ok {
-				t.Errorf("container %q admits leaf %q with no fixture statement — "+
-					"that leaf's reader is unverified against the packed spelling (#8768)",
-					name, leaf)
+				t.Errorf("container %q admits leaf %q with no fixture statement, so "+
+					"its packed spelling is never compared against its braced one "+
+					"(#8768)", name, leaf)
 				continue
 			}
 			leaves = append(leaves, leaf)
@@ -218,9 +233,15 @@ func TestPackedOptInHoldsForEveryLeafPair8768(t *testing.T) {
 				if got != want {
 					t.Errorf("%s: packed and braced DIFFER for %q + %q (#8768)\n"+
 						"  packed %s\n  braced %s\n"+
-						"One of those leaves' readers does not take its value from the "+
-						"split structure. The container must not stay opted in on the "+
-						"strength of a different pair.", name, a, b, got, want)
+						"MEASURED, NOT DIAGNOSED: this cell knows the two spellings "+
+						"disagree and nothing more. Do not assume a reader defect — no "+
+						"per-leaf reader divergence has ever been observed, and the "+
+						"likelier causes are the fold declining to split (a token "+
+						"outside the modelled grammar, so the tail returns whole) or an "+
+						"arity the schema under-declares, which was the #8777 case. "+
+						"Establish which before changing anything; the container must "+
+						"not stay opted in on the strength of a different pair.",
+						name, a, b, got, want)
 				}
 			}
 		}
