@@ -580,3 +580,93 @@ func diffSiteSets8690(got, want []string) string {
 	}
 	return b.String()
 }
+
+// #8690: every rule in compactNormalizeInScope must be scoped by (container,
+// head) PAIR — never by a head alone, never by a container alone.
+//
+// This is not style. A head-only rule is safe only while no container acquires
+// that head with a tail somebody reads; a container-only rule is safe only
+// while no head appears under that container that somebody reads. Both make
+// the predicate's correctness contingent on the CURRENT INVENTORY rather than
+// on the rule, and this sweep moves the inventory. Such a rule therefore fails
+// at the moment a family lands — inside someone else's merge conflict.
+//
+// Both directions really existed here. `head == "authentication-key"` was
+// head-only, and `containerKeyword == "match"` was container-only and admitted
+// `services ip-monitoring policy <p> match rpm-probe` — a different feature in
+// a different subtree, reached only because it spells its criteria block
+// `match`.
+//
+// The probe is a sentinel that cannot occur in any config: if the predicate
+// still says yes when the container is replaced by a token no schema contains,
+// it was not reading the container.
+func TestNormalizerScopeIsPairScopedNotTokenScoped8690(t *testing.T) {
+	const noSuchContainer = "xpf-no-such-container-8690"
+	const noSuchHead = "xpf-no-such-head-8690"
+
+	var headOnly, containerOnly []string
+	checked := 0
+	var walk func(n *schemaNode, kw string, depth int)
+	walk = func(n *schemaNode, kw string, depth int) {
+		if n == nil || depth > 9 {
+			return
+		}
+		for name, ch := range n.children {
+			if kw != "" && compactNormalizeInScope(kw, name) {
+				checked++
+				if compactNormalizeInScope(noSuchContainer, name) {
+					headOnly = append(headOnly, kw+" "+name)
+				}
+				if compactNormalizeInScope(kw, noSuchHead) {
+					containerOnly = append(containerOnly, kw+" "+name)
+				}
+			}
+			walk(ch, name, depth+1)
+		}
+		if n.wildcard != nil {
+			walk(n.wildcard, kw, depth+1)
+		}
+	}
+	walk(setSchema, "", 0)
+
+	// DEGENERACY CONTROL: if the walk admitted nothing, both checks above are
+	// vacuous and this cell reports a clean scope for the same reason a correct
+	// one does.
+	if checked == 0 {
+		t.Fatal("the schema walk found NO admitted pair, so the pair-scoping " +
+			"assertions ran against nothing. Either the walk broke or the " +
+			"predicate stopped admitting anything (#8690)")
+	}
+	sort.Strings(headOnly)
+	sort.Strings(containerOnly)
+
+	if len(headOnly) > 0 {
+		t.Errorf("%d rule(s) admit on the HEAD ALONE — the predicate still says "+
+			"yes with the container replaced by a token no schema contains: %v.\n"+
+			"That rule is safe only until some other container acquires the same "+
+			"head with a tail a reader consumes, and it will fail when a family "+
+			"lands rather than when it is written. Scope it to the containers "+
+			"that measured safe (#8690).", len(headOnly), dedupe8690(headOnly))
+	}
+	if len(containerOnly) > 0 {
+		t.Errorf("%d rule(s) admit on the CONTAINER ALONE — the predicate still "+
+			"says yes with the head replaced by a token no schema contains: %v.\n"+
+			"That rule is safe only until some head appears under that container "+
+			"that a reader consumes. `containerKeyword == \"match\"` was exactly "+
+			"this and reached services ip-monitoring (#8690).",
+			len(containerOnly), dedupe8690(containerOnly))
+	}
+	t.Logf("#8690: %d admitted (container, head) pair(s), none head-only or container-only", checked)
+}
+
+func dedupe8690(in []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, x := range in {
+		if !seen[x] {
+			seen[x] = true
+			out = append(out, x)
+		}
+	}
+	return out
+}
