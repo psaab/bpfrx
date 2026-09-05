@@ -1,9 +1,10 @@
 # Plan of action — gemini-review-049 (#8869)
 
-- **Revision:** r1
+- **Revision:** r2 (after Codex r1 PLAN-REVISE — 8 findings, all applied)
 - **Base:** `f36be93c5` (origin/master at drafting)
 - **Report base:** `b0f3aba21`, which was master-identical when the review ran
-- **Status:** drafted; awaiting Claude SMR + Codex plan review (AGY infra-blocked, 2-of-3 exception)
+- **Status:** revised. Codex r1 `PLAN-REVISE` (8 findings). AGY infra-blocked (2-of-3 exception).
+- **PINNED COMPARISON SHA: `f36be93c5`.** *(Codex r1 #8.)* The census is a snapshot of **one** commit. The procedure says "the pinned tip", never "master" — master moved **142 commits in 6h15m** during this campaign, so a distribution assembled against a moving tip would be built from different repository states. Every cell records **both** SHAs: report base `b0f3aba21` and pinned tip `f36be93c5`. **If relevant changes land, affected conclusions are revalidated before implementation or closure — an older snapshot is never silently presented as current.**
 
 ## 1. What is actually in this report — derived, not quoted
 
@@ -89,9 +90,26 @@ Evidence block matched one regex, so they are biased toward one formatting.** Th
 claim is therefore *"the index column is unreliable"*, **not** *"40% of it is
 wrong"*. Widening the parser is step 1.
 
-**Consequence: route on the Evidence path, never on the index table.** #8865
-established that a file routes and a discriminator adjudicates; 049 adds that
-**you must first establish which file the report even means.**
+**Consequence, corrected at r2 *(Codex r1 #3)*.** r1 concluded "route on the
+Evidence path, never on the index table". **The counterexample is sufficient to
+reject the index as authoritative; it is not sufficient to install Evidence as
+its replacement.** Four differing filenames establish **disagreement, not four
+index errors**, and an Evidence block can name a caller, a *safe comparison
+implementation* (051 does exactly that in the other direction), or several
+relevant files.
+
+**And the 6 agreements are NOT independent negative controls — both fields can
+agree on the wrong target.**
+
+So the artifact is a **resolved-target record** per finding: the implicated
+**symbol**, the relevant **paths**, and each path's **role** (defect site /
+caller / comparison / test). **Ambiguous and multi-target cases are preserved as
+such, never collapsed to one path.** Validate the parser against manually
+resolved examples that deliberately include a misleading comparison path.
+**Publish disagreement rate and resolution coverage separately; neither is an
+accuracy rate.** #8865 established that a file routes and a discriminator
+adjudicates; 049 adds that **you must first establish which file the report even
+means, and that resolution is itself a claim needing a control.**
 
 ### 2.4 This is NOT primarily a Rust dataplane report
 
@@ -159,21 +177,80 @@ plan does not re-litigate that class.
    **census with its own negative control** (the rows that agree). Until this
    lands, no triage column is trustworthy. **Report the parser's failure count as
    a third state — "did not resolve" is not "agrees".**
-2. **Build the liveness column at the REPORT'S BASE, not at the tip** (§2.2).
-   Per finding: does the cited construct exist at `b0f3aba21`, and does it still
-   exist at master? Four outcomes, and all four are informative:
-   - present at base, present at tip -> **LIVE**
-   - present at base, absent/guarded at tip -> **FIXED SINCE** (close, credit the commit)
-   - absent at base -> **WRONG WHEN WRITTEN** (a real calibration signal)
-   - unresolved -> **UNKNOWN**, reported as its own count
-3. **Publish the four-way distribution.** That number governs everything after it
-   and is the deliverable the user actually asked for.
+2. **Build TWO INDEPENDENT JUDGMENTS per finding — not one four-way label.**
+   *(Codex r1 #1, and this is the plan's most important correction.)*
+
+   r1's four-way column (LIVE / FIXED-SINCE / WRONG-WHEN-WRITTEN / UNRESOLVED)
+   **conflates three different questions and its categories are not mutually
+   exclusive.** A finding can be **wrong at the base AND currently live**, if it
+   mis-described a defect that a later commit then introduced. A multi-part
+   finding can be **partly fixed and partly live**. A construct can survive while
+   a caller-side check removes the defect; it can disappear while a refactor
+   preserves it. Forcing one label with precedence rules would produce a headline
+   "N still live" that is **misleading rather than merely imprecise.**
+
+   | judgment | question | values |
+   |---|---|---|
+   | **A — validity at report base `b0f3aba21`** | did the finding correctly describe the tree it claims to have read? | VALID / INVALID / **UNKNOWN** |
+   | **B — defect status at pinned tip `f36be93c5`** | is there a defect there now? | LIVE / NOT-PRESENT / **UNKNOWN** |
+
+   **Both allow UNKNOWN, and UNKNOWN is a recorded state, not a gap.** Historical
+   labels are *derived* afterwards (`VALID + NOT-PRESENT` = fixed since;
+   `INVALID + LIVE` = wrong description of a real defect). **Split a finding when
+   its parts disagree.** Text matching produces **candidates** for A and B; it
+   never establishes either.
+
+   **Judgment B does not wait on judgment A** *(Codex r1 #2)*. Establishing an
+   actionable current defect does not require proving when it originated. Only a
+   **closure** as fixed-since needs both — and it needs the original defect to
+   have existed *and* the current behaviour to address it. **Naming an apparent
+   fix commit is evidence, not proof.**
+
+2b. **First batch is an EFFORT CALIBRATION, not just a classification.**
+   *(Codex r1 #4.)* r1 asserted the column is cheap because extraction is
+   automated. **Extraction is cheap; deciding whether a claimed defect existed,
+   remained reachable, and was fully corrected can cost as much as adjudication
+   itself**, so "classify all 100 before adjudicating any" promises a separation
+   that may not exist. Take **8-10 findings spanning straightforward,
+   ambiguous, and cross-file shapes** and measure: time per defensible verdict,
+   manual routing effort, and unresolved rate. **Publish those three numbers
+   before committing to the full census.** Two prior samples are not calibration
+   — which is an argument for measuring effort, not for skipping the measurement.
+
+   **Confirmed serious defects are worked as they are found.** Finding 100 must
+   never block action on one.
+
+3. **Publish the A x B distribution**, with UNKNOWN counts shown as their own
+   cells rather than folded. That table governs everything after it.
 4. **Adjudicate the LIVE Highs**, in consequence order, 3-4 per posted verdict
    table — an aggregate is not reviewable, the sample is.
-5. **Cross-report dedup.** 049 overlaps 007/008/009 at least at the wire-count
-   class. **#8869's own body claims 049 is "disjoint from 007/008/009" — that
-   claim is now known to be false** and must be corrected on the issue, not just
-   in this doc.
+
+4b. **UNKNOWN Highs get an explicit investigation queue, not silence.**
+   *(Codex r1 #5.)* r1's step 4 adjudicated only LIVE Highs, which **rewards
+   findings that were easy to classify and strands the most consequential ones
+   behind unresolved routing or semantics** — precisely the wrong selection
+   pressure. Queue them by *plausible consequence x uncertainty*, with an owner
+   and a revisit condition each. **An unadjudicated severity label is never
+   reported as confirmed.**
+
+   **Contract, stated once to remove r1's internal contradiction** (§4 required
+   all 100 classified before any adjudication; §7 waited only on the Highs):
+   **the census MAY be published with unresolved and deferred entries**, and
+   prioritized investigation follows it. Classification does not gate
+   adjudication of anything already resolved.
+5. **Cross-report dedup — PER FINDING, and it happens EARLY, not last.**
+   *(Codex r1 #6.)* 049 overlaps 007/008/009 at least at the wire-count class,
+   and #8869's body claimed disjointness — **now known false and corrected on the
+   issue.**
+
+   **Sharing a defect PATTERN does not establish duplicate root cause, affected
+   path, or fix coverage.** #8865's wire-count class publishes its own coverage
+   as explicitly **UNKNOWN**, so it **cannot discharge** these findings by
+   delegation. Each deferred finding needs a **per-ID owner, a linked
+   disposition, and a coverage status**, recorded *before* expensive
+   adjudication, and the census must distinguish **"confirmed resolved
+   elsewhere"** from **"delegated; still unresolved"**. Unmatched members stay
+   active here.
 
 ## 5. Acceptance criteria
 
@@ -186,8 +263,21 @@ plan does not re-litigate that class.
   defect.
 - No finding closed on "the file changed"; a file changing is routing, not
   adjudication.
-- Rust findings gate on `make test-rust`; Go findings on `make test-go`. **The
-  52/28 split (§2.4) decides which, and it is mostly Go.**
+- **Validation is PROPORTIONAL TO THE CLAIMED BEHAVIOUR, not to the report's
+  language totals.** *(Codex r1 #7.)* r1 selected suites from the 52/28 path
+  split, which is a routing signal, not an acceptance criterion.
+  - A **triage census** needs no cluster run; requiring one per historical
+    verdict would be waste.
+  - A **local defect fix** needs focused regression checks.
+  - **Anything whose correctness depends on replication, failover, rejoin or
+    forwarding continuity — the HA session-sync and VRRP findings — needs
+    integration/cluster validation**, and `make test-go` passing is not
+    acceptance for those.
+  - Cells assert **successful behaviour as well as rejection**.
+  - Suites are chosen from the **resolved target and its dependencies**,
+    including both languages where the target spans them.
+  - **Where a conclusion depends on runtime behaviour and that validation is
+    unavailable, the limitation is reported explicitly** rather than absorbed.
 
 ## 6. Risks
 
