@@ -132,3 +132,97 @@ func TestCrossFamilyDSCPSpelling8773(t *testing.T) {
 		}
 	}
 }
+
+// #8781 follow-up: the flat `set` spelling is a SEPARATE CASE, not an assumed
+// equivalent of the hierarchical one.
+//
+// CLAUDE.md documents the dual AST shape and forbids using NewParser as a
+// stand-in for a `set` session, and the cell above uses NewParser exclusively —
+// so on its own it says nothing about what the CLI produces. That gap is not
+// hypothetical: on #8778 a fix for the hierarchical packed form left the flat
+// `set` spelling still failing open, with a passing hierarchical test beside
+// it, because flat `set` builds a CHAIN where the fixture built siblings.
+//
+// The outcome asserted here is the ENFORCED one — `Protocols` is exactly
+// [tcp] — never that two spellings agree. An IPv6 term whose protocol match is
+// dropped matches EVERY protocol, so two dropped spellings agree perfectly
+// while the filter is wide open; an agreement assertion is satisfied by the
+// regression it is supposed to catch.
+//
+// WHAT THIS CELL BINDS, AND WHAT IT DOES NOT — measured, because a coverage
+// cell that is assumed to guard the fix is worse than no cell:
+//
+//	removing `next-header` from compileFilterFrom's switch arm   -> RED
+//	removing the inet6 `next-header` schema declaration          -> still green
+//
+// The flat `set` path does not go through the schema at all: SetPath builds a
+// real child node and the compiler reads it from node.Children. So this cell
+// binds the COMPILER ARM, and the packed hierarchical path's dependency on the
+// schema DECLARATION is bound by TestCrossFamilyDSCPSpelling8773 above. Two
+// paths, two dependencies, one cell each — and neither substitutes for the
+// other. Do not cite this cell as covering #8781's schema fix.
+func TestFlatSetNextHeaderIsEnforced8781(t *testing.T) {
+	compile := func(t *testing.T, cmds []string) *Config {
+		t.Helper()
+		tree := &ConfigTree{}
+		for _, c := range cmds {
+			path, err := ParseSetCommand(c)
+			if err != nil {
+				t.Fatalf("ParseSetCommand(%q): %v", c, err)
+			}
+			if err := tree.SetPath(path); err != nil {
+				t.Fatalf("SetPath(%q): %v", c, err)
+			}
+		}
+		cfg, err := CompileConfig(tree)
+		if err != nil || cfg == nil {
+			t.Fatalf("flat set must COMMIT: %v", err)
+		}
+		return cfg
+	}
+	protocols := func(t *testing.T, cfg *Config) []string {
+		t.Helper()
+		for _, f := range cfg.Firewall.FiltersInet6 {
+			for _, term := range f.Terms {
+				return term.Protocols
+			}
+		}
+		t.Fatal("flat set compiled no inet6 filter term")
+		return nil
+	}
+
+	base := "set firewall family inet6 filter f1 term t1 "
+	for _, leaf := range []string{"next-header", "protocol"} {
+		got := protocols(t, compile(t, []string{base + "from " + leaf + " tcp", base + "then accept"}))
+		if len(got) != 1 || got[0] != "tcp" {
+			t.Errorf("flat set `from %s tcp` -> Protocols=%v, want exactly [tcp]. An empty "+
+				"list is not a weaker match, it is NO match: the term matches every "+
+				"protocol, so a filter meant to accept TCP accepts everything and one "+
+				"meant to discard TCP discards everything (#8781)", leaf, got)
+		}
+	}
+
+	// The one-line spelling, where `next-header` is multi:true and absorbs the
+	// trailing tokens onto its own Keys. It must FAIL CLOSED — a commit error
+	// naming the bad token — rather than compile with a mangled match. The
+	// `protocol` case is the control: this is long-established behaviour of
+	// multi-value leaves, not something the #8781 declaration introduced, and
+	// asserting both keeps a future change from quietly making one of them
+	// compile.
+	for _, leaf := range []string{"next-header", "protocol"} {
+		tree := &ConfigTree{}
+		path, err := ParseSetCommand(base + "from " + leaf + " tcp then accept")
+		if err != nil {
+			t.Fatalf("ParseSetCommand: %v", err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath: %v", err)
+		}
+		if _, err := CompileConfig(tree); err == nil {
+			t.Errorf("one-line `from %s tcp then accept` COMPILED. `%s` is multi:true, so "+
+				"it absorbs `then accept` onto its own Keys; accepting that silently "+
+				"would compile a term whose action and protocol set are both wrong. It "+
+				"must be refused at commit", leaf, leaf)
+		}
+	}
+}
