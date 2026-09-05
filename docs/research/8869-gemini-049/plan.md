@@ -1,10 +1,10 @@
 # Plan of action — gemini-review-049 (#8869)
 
-- **Revision:** r3 (after Claude SMR r1 PLAN-REVISE — the census is now GATED on a calibration, not entered directly)
+- **Revision:** r4 (after Codex r2 PLAN-REVISE — the gate now has a DECISION RULE fixed in advance, and the sample-size claim is withdrawn)
 - **Base:** `f36be93c5` (origin/master at drafting)
 - **Report base:** `b0f3aba21`, which was master-identical when the review ran
 - **Status:** revised. Codex r1 `PLAN-REVISE` (8 findings). AGY infra-blocked (2-of-3 exception).
-- **THE CENSUS IS A HISTORICAL SNAPSHOT, not a statement about current master.** *(r3, Claude SMR S3.)* r2 pinned a tip *and* said confirmed defects are worked as they are found — those are in tension, because working defects during the census changes the tree it describes. And at 142 commits/6h15m the pin is stale before the census finishes; "revalidate if relevant changes land" is **continuous revalidation, which is not a procedure**. So: the census describes `f36be93c5` **and says so**; a row is revalidated **only when someone acts on it**, at that moment, against the then-current master. **No row is ever presented as a claim about current master without that revalidation.** Fixing defects during the census is therefore fine and expected — it does not invalidate a snapshot that never claimed to be current.
+- **THE CENSUS IS A HISTORICAL SNAPSHOT, not a statement about current master. (r4: Codex r2 CONFIRMED this is sound, and refuted my own worry about it.)** I had objected that a defect fixed mid-census makes its own row wrong while nobody looks again. **That objection is incorrect: if judgment B says LIVE at `f36be93c5`, a later fix leaves that assertion TRUE** — demanding the row change after every fix would destroy the snapshot's meaning. The needed distinction is between the **immutable classification** and a **dated action disposition**: *"LIVE at `f36be93c5`; resolved by commit H; closure validated at commit V."* The second is an ordinary linked fix record, **not a continuously maintained second census**. The "already handled, so nobody acts again" failure only bites if *handled* is used as an **undated** claim about current master, or if closure skipped validation — and **closure is itself an action**, which this plan already requires revalidation for.** *(r3, Claude SMR S3.)* r2 pinned a tip *and* said confirmed defects are worked as they are found — those are in tension, because working defects during the census changes the tree it describes. And at 142 commits/6h15m the pin is stale before the census finishes; "revalidate if relevant changes land" is **continuous revalidation, which is not a procedure**. So: the census describes `f36be93c5` **and says so**; a row is revalidated **only when someone acts on it**, at that moment, against the then-current master. **No row is ever presented as a claim about current master without that revalidation.** Fixing defects during the census is therefore fine and expected — it does not invalidate a snapshot that never claimed to be current.
 - **PINNED COMPARISON SHA: `f36be93c5`.** *(Codex r1 #8.)* The census is a snapshot of **one** commit. The procedure says "the pinned tip", never "master" — master moved **142 commits in 6h15m** during this campaign, so a distribution assembled against a moving tip would be built from different repository states. Every cell records **both** SHAs: report base `b0f3aba21` and pinned tip `f36be93c5`. **If relevant changes land, affected conclusions are revalidated before implementation or closure — an older snapshot is never silently presented as current.**
 
 ## 1. What is actually in this report — derived, not quoted
@@ -225,28 +225,67 @@ plan does not re-litigate that class.
    the *extraction* step, which is automated; the *judgment* step is the one that
    may cost as much as adjudication.
 
-   **The unasked question is prevalence, and it decides the shape of the work:**
+   **The unasked question is prevalence, and it changes the shape of the work:**
+   at a 10% live rate the census spends 100 judgments to find 10 defects; at 60%
+   it spends 100 to find 60.
 
-   | live rate | defects found | judgments spent |
-   |---|---|---|
-   | 60% | 60 | 100 |
-   | 10% | **10** | **100** |
+   > **(r4) The sample-size claim r3 made here is WITHDRAWN.** *(Codex r2.)* r3
+   > wrote *"a 15-finding sample would have established that for 15"*. **It would
+   > not.** Near a 50% observed rate a 95% margin is roughly **±23-27 points at
+   > n=12-15**; even **zero** live findings in 15 leaves a one-sided 95% upper
+   > bound around **17%**; and if 10 of 100 are live, a random 15 misses all ten
+   > about **18%** of the time. **None of those figures even apply here**, because
+   > §2c stratifies mechanically rather than randomly — a purposive sample has no
+   > such interval at all.
+   >
+   > **What a batch of 12-15 CAN do: distinguish gross differences (10% vs 60%)
+   > and produce an effort estimate. What it CANNOT do: establish that the
+   > residual High population is acceptably understood.** r3 used a rhetorically
+   > tidy table to claim the second, and the table was the most persuasive thing
+   > in the revision — which is why it needed attacking rather than repeating.
 
-   **At the low end the census costs ten judgments per defect**, and a 15-finding
-   sample would have established that for 15. Two prior samples (`-004` credible,
-   `-051` stale) are a coin, not a calibration — which is an argument for measuring
-   prevalence, not for skipping to a census.
+   **Define the population the decision is about.** Aggregate liveness across all
+   100 is **not** live-High prevalence, and the decision is about the Highs.
+   **UNKNOWN outcomes contribute uncertainty — they are never dropped from the
+   denominator and never counted as absent.**
 
    **Gate output — publish all four before proceeding:** live rate, time per
    defensible verdict (**counting BOTH judgments A and B, plus role assignment per
    §2.3**), manual routing effort, unresolved rate.
 
-   **Then choose, explicitly and in writing:**
-   - **prevalence high or consequence concentrated** -> run the full census;
-   - **prevalence low** -> abandon the census, work the confirmed Highs, and state
-     that the remainder is **unclassified** rather than clean;
-   - **either way**, if the census is run for **completeness** rather than
-     efficiency, say so — that is defensible, and it is not what r2 said.
+   **DECISION RULE — fixed HERE, before the sample is drawn.** *(r4, Codex r2:
+   r3's "high" and "low" had no thresholds, three of the four published outputs
+   had no stated effect on the decision, and intermediate or unresolved-heavy
+   results had no branch at all. A gate whose thresholds are chosen after seeing
+   the data is not a gate; it postpones the same discretionary commitment.)*
+
+   Let **L** = live-High rate in the batch, **U** = unresolved rate, **T** =
+   median time per defensible verdict (both judgments plus role assignment).
+
+   | condition | action |
+   |---|---|
+   | **L >= 40%** | **RUN the full census.** Enough of the population is live that classification is the cheapest route to the defects. |
+   | **L < 15%** and **U < 25%** | **ABANDON the census.** Work the confirmed Highs; disposition the remainder per §4b. |
+   | **15% <= L < 40%** | **ONE bounded second batch of 12-15**, then re-apply this table. **At most one expansion** — a third batch means the rule is not discriminating and the decision goes to the user. |
+   | **U >= 25%** at any L | **Routing is the bottleneck, not prevalence.** Fix the resolver, re-run the same batch. Do not decide on a sample whose targets are mostly unresolved. |
+   | **T > 20 min/finding** at any L | **Census is unaffordable regardless of L.** Abandon it and work by consequence. |
+
+   **Effort limit: the calibration itself is capped at two batches (~30 findings).**
+   Exceeding it without a decision is a result — report it and escalate.
+
+   **CONSEQUENCE ESCALATION — a defined override, not a free one.** *(Codex r2:
+   as r3 wrote it, "consequence concentrated" allowed every outcome to justify
+   proceeding.)* A severe finding in the batch may expand scope only with all
+   three of: **(i)** the specific consequence named, **(ii)** evidence it is live
+   at the pinned tip, **(iii)** an argument that the affected set **cannot be
+   bounded** short of the full population. **Concentration in one subsystem
+   justifies investigating THAT SUBSYSTEM, not all 100** — that is the default
+   and it is a *narrower* scope than the census, not a wider one.
+
+   **Completeness is a separate, legitimate reason to run the census — and it
+   OVERRIDES this table rather than being supported by it.** If it is chosen, say
+   so plainly: the census is being run because the findings must all be
+   dispositioned, not because calibration favoured it.
 
 2c. **What the calibration batch IS.**
    *(Codex r1 #4.)* r1 asserted the column is cheap because extraction is
@@ -266,6 +305,26 @@ plan does not re-litigate that class.
    cells rather than folded. That table governs everything after it.
 4. **Adjudicate the LIVE Highs**, in consequence order, 3-4 per posted verdict
    table — an aggregate is not reviewable, the sample is.
+
+4a. **(r4) THE BACKLOG IS DISPOSITIONED ON BOTH BRANCHES — abandoning the census
+   does not discharge the findings.** *(Codex r2, and this is the correction that
+   most changes what ABANDON means.)*
+
+   r3 said an abandoned census leaves the remainder *"unclassified rather than
+   clean"*. **That is honest reporting and it is not a disposition.** These are
+   **69 REPORTED Highs, not 69 established defects** — and neither their labels
+   nor a low sampled prevalence settles their importance. **ABANDON terminates a
+   MEASUREMENT; it cannot silently terminate a backlog.**
+
+   So on **either** branch, every unexamined High keeps a row carrying: **ID,
+   provisional severity (marked provisional), assessment state, owner, priority,
+   and revisit condition.** A documented decision to defer the remaining scope is
+   entirely allowed — **but it is a work-allocation decision, not a statistical
+   conclusion that little remains**, and it must read as the former.
+
+   **This is not full adjudication through the back door.** It is the distinction
+   between *"we stopped this measurement"* and *"we discharged responsibility for
+   these findings."* r3 collapsed them.
 
 4b. **UNKNOWN Highs get an explicit investigation queue, not silence.**
    *(Codex r1 #5.)* r1's step 4 adjudicated only LIVE Highs, which **rewards
