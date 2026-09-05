@@ -23,10 +23,23 @@ non-trivial code. This page is the quick-reference gotcha list.
 ## Parser dual AST shape & set-syntax testing
 
 - Hierarchical `family inet { dhcp; }` → `Node{Keys:["family","inet"]}`
-  with children.
-- Flat `set interfaces eth0 unit 0 family inet dhcp` →
-  `Node{Keys:["family"]}` with child `Node{Keys:["inet"]}`.
-- The compiler must handle **both** shapes.
+  with children. **Flat `set interfaces eth0 unit 0 family inet dhcp`
+  produces the IDENTICAL tree** — `SetPath` descends a `compoundKey`
+  container exactly as the parser does, so flat-vs-hierarchical is *not*
+  where the shape varies (#8808).
+- **The real variable is BRACING**, and there are three shapes:
+
+  | spelling | tree |
+  |---|---|
+  | `family inet { dhcp; }` | `[family inet]` + child `[dhcp]` (COMPOUND) |
+  | `family { inet { dhcp; } }` | `[family]` → `[inet]` → `[dhcp]` (SPLIT) |
+  | `family inet dhcp;` | `[family inet dhcp]` (PACKED, the #2419 class) |
+
+- The compiler must handle **all three**. The SPLIT form is where a bare
+  `Node{Keys:["family"]}` with an `inet` child actually comes from — an
+  operator bracing the family separately, never a `set` command.
+- Pinned by `TestFlatSetAndHierarchicalProduceTheSameTree8808` and
+  `TestBracingProducesThreeDistinctShapes8808`.
 - **Testing flat set syntax:** ALWAYS use `ParseSetCommand()` +
   `tree.SetPath()` loop, NEVER `NewParser()` — the parser treats newlines
   as whitespace and will merge all set lines into one giant node.

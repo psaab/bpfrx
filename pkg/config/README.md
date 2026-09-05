@@ -251,12 +251,24 @@ Almost everyone. The package has no internal dependencies.
 The compiler must accept both AST shapes:
 
 - Hierarchical `family inet { dhcp; }` lowers to `Node{Keys:["family","inet"]}`
-  with a child `Node{Keys:["dhcp"]}`.
-- Flat `set interfaces eth0 unit 0 family inet dhcp` lowers to
-  `Node{Keys:["family"]}` with child `Node{Keys:["inet"]}`.
+  with a child `Node{Keys:["dhcp"]}`. **Flat `set interfaces eth0 unit 0 family
+  inet dhcp` lowers to the IDENTICAL tree** — `SetPath` descends a `compoundKey`
+  container exactly as the parser does (#8808).
+- **The variable is BRACING, not flat-vs-hierarchical**, and there are three
+  shapes:
 
-If you only handle one shape, set-syntax tests will look fine but real
-hierarchical commits will break (or vice versa).
+  | spelling | tree |
+  |---|---|
+  | `family inet { dhcp; }` | `[family inet]` + child `[dhcp]` (COMPOUND) |
+  | `family { inet { dhcp; } }` | `[family]` → `[inet]` → `[dhcp]` (SPLIT) |
+  | `family inet dhcp;` | `[family inet dhcp]` (PACKED, the #2419 class) |
+
+If you only handle one shape, one spelling will look fine and another will
+silently drop the value. The SPLIT form is where a bare `Node{Keys:["family"]}`
+with an `inet` child comes from — a separately braced family, never a `set`
+command. Believing the flat form has a different shape is how a defect proven
+against the compound shape gets assumed not to apply to `set` input; it does
+(#8763, #8797).
 
 **Testing flat-set syntax:** ALWAYS use `ParseSetCommand()` + a
 `tree.SetPath()` loop, NEVER `NewParser()` on a multi-line set blob. The
