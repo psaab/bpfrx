@@ -108,7 +108,7 @@ func compileNAT(node *Node, sec *SecurityConfig) error {
 	//
 	// proxyARPAddressValues is defined below compileNAT (see #6659).
 	if err := forEachChild(node.Children, "proxy-arp", func(proxyNode *Node) error {
-		for _, inst := range namedInstances(proxyNode.FindChildren("interface")) {
+		for _, inst := range bracketedGroupInstances8794(proxyNode.FindChildren("interface")) {
 			entry := &ProxyARPEntry{Interface: inst.name}
 			for _, prop := range inst.node.Children {
 				if prop.Name() != "address" {
