@@ -11,6 +11,9 @@ work using impact, reachability, change history, and uncertainty. Distinguish
 inventory coverage, refuted hypotheses, and verified behavior. Preserve unresolved
 high-impact questions, and give every confirmed finding an acceptance criterion
 for its fix. File counts and finding counts are bookkeeping, not success targets.
+Use domain-specialist expertise and an adversarial defensive perspective: question
+whether the implementation preserves its protections under untrusted influence,
+state transitions, and failure, not only whether the intended path works.
 
 Read [the shared review contract](references/review-contract.md) before discovery
 or triage. It owns severity, evidence, dispositions, report fields, and completion
@@ -116,6 +119,74 @@ test ran. Prioritize actual missing gates separately from intentional manual
 diagnostics. Keep test/harness coverage visible rather than declaring it
 low-value supporting material.
 
+### Required specialist personas and checklists
+
+Area ownership is not a substitute for expertise. Include the applicable persona
+and technical checklist in every assignment, including work done by the
+coordinator. These are required review perspectives, not claims of credentials.
+For cross-area contracts, combine the relevant expertise; a directory boundary
+must not cut off a validation or lifecycle argument. Select checks relevant to
+the actual behavior, and record consequential omissions or missing expertise.
+
+- **A1 — Senior Rust systems engineer.** Check unsafe ownership, lifetimes,
+  aliasing and UMEM/frame reuse; packet parse/rewrite bounds and checksum
+  correctness; integer overflow, narrowing `as` casts and byte order; lock-free
+  queues, atomic ordering and worker handoff; cache-line/HPC invariants and
+  hot-path allocation. Examine fail-closed parsing, policy/session cache validity,
+  and resource reclamation across the AF_XDP shim and userspace boundary.
+- **A2 — NAT/CGNAT specialist.** Check port allocation ownership, exhaustion and
+  reclamation; twice-NAT ordering; forward/reverse NAT, NAT64 and NPTv6
+  translation; checksum and embedded-ICMP reversal; fragment handling; zone/VRF
+  identity in mappings. Follow HA port reservations on synchronized sessions,
+  collision prevention, expiry and recovery, not just first-packet translation.
+- **A3 — Parser/compiler engineer.** Check Junos AST dual shapes and bracketed
+  lists (#2419); strict-versus-lenient gates; typed-leaf schema validation;
+  `Atoi`/length-to-`uint16`/`uint32` narrowing; malformed-input rejection and
+  recursion/resource caps. Follow accepted match dimensions and defaults through
+  compilation to their consumers; parse success alone does not prove enforcement.
+- **A4 — Storage/crypto engineer.** Check durable temp-write, fsync, rename and
+  directory-sync ordering; AES-GCM/HKDF, nonce uniqueness and error handling;
+  commit/rollback and commit-confirmed timer ownership; journal torn-tail
+  recovery, envelope compatibility and secret redaction. Include `fsatomic`
+  consumers and distinguish persisted, acknowledged and actually applied state.
+- **A5 — Distributed-systems/HA engineer.** Check failover timing, fencing,
+  split-brain and dual-primary prevention; VRID/priority arithmetic and `uint8`
+  wraps; session-sync framing, peer identity, wire compatibility and anti-replay;
+  cold-boot ordering, lock discipline and data races; dual-stack tie-breaks. Follow stale
+  generations, ownership transfer, rejoin and resource accounting across peers.
+- **A6 — Control-plane engineer.** Trace typed configuration into dataplane
+  messages, snapshots and map writes; check pool/binding index arithmetic and
+  caps, event-stream framing and write serialization, generation acknowledgement,
+  HA integration and partial-apply safety. Verify that Go/Rust field meanings,
+  defaults and rejection behavior agree and rollback restores the intended state.
+- **A7 — Linux systems engineer.** Check systemd/interface lifecycle, netlink,
+  device identity and namespace/VRF isolation; nftables host enforcement;
+  FRR/strongSwan configuration generation and safe command/argument boundaries;
+  IPsec apply/teardown ordering and route isolation. Include startup, reload and
+  failure cleanup, with management recovery and host-inbound protection explicit.
+- **A8 — API/security engineer.** Check untrusted RPC/HTTP fields, authentication
+  and authorization at dispatch and resource access, allowlists, principal
+  propagation, integer/format handling and command/data separation. Account for
+  unbounded scans/streams, cancellation, resource leaks and graceful shutdown;
+  authentication alone does not establish permission or bounded resource use.
+- **A9 — Telemetry engineer.** Check NetFlow/IPFIX/SNMP wire encoders and length
+  fields; SNMPv3 IV/salt handling and RNG failures; goroutine/fd lifecycle;
+  log-record accuracy, secret handling and backoff/retry overflow. Follow
+  untrusted feed/event inputs, collector backpressure and telemetry failure
+  isolation so observability cannot silently misstate or impair enforcement.
+- **A10 — Protocol and tooling engineer.** Check DHCPv4/v6 and relay semantics;
+  DDNS backend ownership (`PrevAddr` and foreign-record safety); simulator versus
+  dataplane verdicts against an independent oracle; CLI dispatch and show-output
+  correctness. Review Python/shell signing, image, package, upgrade and deployment
+  tooling for integrity/authenticity checks, TOCTOU, path/scheme validation and
+  recovery.
+
+The validation-assurance assignment also needs a **test/reliability engineer**
+perspective: test registration and selection, production-path and artifact
+identity, independent oracles, meaningful failure observations, concurrency and
+lifecycle coverage, and false-green results. A specialist checklist guides
+inspection; completing its wording is not evidence that a behavior is safe.
+
 ## 3. Review contracts, transitions, and specific sites
 
 Assign a reviewer the whole behavior chain even when its files span areas:
@@ -123,6 +194,13 @@ configuration -> typed compilation -> wire representation -> runtime consumer ->
 cached state and kernel effects. File-batch owners still report inspection
 coverage. Contract owners can follow callers, shared types, consumers, and
 lifecycle dependencies beyond a batch; name overlap so it is coordinated.
+
+Start each assignment with the shared contract's adversarial discovery analysis:
+the protection owed, trust boundary, actor's actual influence, and assumptions
+the implementation depends on. Carry those questions through the whole behavior
+chain, even when no candidate finding results. This is distinct from the later
+refutation of candidate findings. Retain the analysis and unresolved assumptions
+in the inspection log, and attach the relevant analysis to each candidate.
 
 Select relevant cases from the shared contract's behavior and workload matrix.
 Use documented semantics as the oracle; surface ambiguity rather than silently
@@ -146,7 +224,8 @@ when their supporting assumptions or dependencies changed.
 
 Use bounded assignments and the available concurrency; do not assume a named
 agent host/tool is installed. Follow `AGENTS.md` when delegating and give each
-worker the run manifest, contract, scope, relevant history, and report location.
+worker the run manifest, scope, specialist persona and applicable checklist,
+behavior contract, adversarial questions, relevant history, and report location.
 Limit simultaneous builds to available resources. Reallocate effort when the
 next useful step needs evidence a batch cannot supply. Preserve unfinished work
 and its next check; do not manufacture a negative result to complete a checklist.
@@ -158,6 +237,10 @@ decisions. Apply the shared contract to every candidate, including dependencies
 that establish reachability or safety; an unchanged evidence file alone is
 insufficient. Independently check high-impact material findings and a
 risk-selected sample of NEG/DUP/STALE/COHORT decisions. Log the checks and gaps.
+The verifier challenges both the evidence for a defect and the evidence for
+safety, including whether a cited guard covers the stated actor and all relevant
+paths/transitions. Specialist discovery and independent refutation are separate
+responsibilities; neither replaces the other.
 
 Use prior final reports, durable `docs/reviews/` records, and relevant issue/PR
 history as leads. Check repository identity before deduplication. Paginate needed
@@ -168,10 +251,11 @@ a closed issue, or an old report disposition does not decide the new claim.
 ## 5. Publish the report and hand off fixes
 
 Write one self-contained draft inside the run directory using the shared
-contract's header, per-finding fields (including Probe), inspection log, and
-counts. Clearly distinguish confirmed findings, unresolved high-impact questions,
-verification gaps, and suggested implementation work. A review report is not an
-issue filing: say "recommended for filing" unless actual issue IDs exist.
+contract's header, per-finding fields (including Adversarial analysis and Probe),
+inspection log, and counts. Clearly distinguish confirmed findings, unresolved
+high-impact questions, verification gaps, and suggested implementation work.
+A review report is not an issue filing: say "recommended for filing" unless
+actual issue IDs exist.
 
 The compatibility output is `/tmp/<family>-review-NNN.md`. Determine the next
 number from exact final basenames for that family at publication time. Publish

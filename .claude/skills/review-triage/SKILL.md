@@ -48,7 +48,7 @@ different repository's report just because its filename matches.
 - If fresh source/history cannot be obtained, retain the limitation. Do not
   silently reinterpret an old local ref as current verification.
 
-For legacy reports lacking repository metadata or the v2 fields, derive only
+For v2 or older reports lacking current fields or repository metadata, derive only
 what the source and session establish. Map old comparison labels as described
 in the contract. Missing evidence is a validation gap, not a guessed success.
 
@@ -57,6 +57,12 @@ in the contract. Missing evidence is a validation gap, not a guessed success.
 For each candidate, inspect the claimed behavior and the callers, validators,
 types, build inclusion, consumers, and lifecycle dependencies needed to establish
 or refute it. Reassess changed dependencies even when the cited file is unchanged.
+Use the contract's adversarial analysis to verify the claimed protection, trust
+boundary, actor's actual influence, prerequisites and challenged assumptions.
+Do not replace it with the refutation attempt: the latter must independently
+check both the alleged defect and whether proposed guards cover its relevant
+paths and transitions. Reconstruct missing legacy analysis only from checked
+evidence, preserving substantive gaps without penalizing the format alone.
 
 Use the contract's MATERIAL / NEEDS_VALIDATION / FIXED / STALE / DUP / COHORT /
 NEG dispositions. Never trust the discovery label without its evidence.
@@ -98,7 +104,8 @@ publication. The result includes:
 - Per-finding table keyed by original Finding ID: disposition, severity,
   confidence, verification, concrete reasoning, and issue/draft/owner mapping.
 - Full evidence and fix acceptance criteria for surviving actionable findings,
-  including Probe validity and limitations from the shared contract.
+  including Adversarial analysis, Probe validity and limitations from the shared
+  contract; preserve both the discovery rationale and contrary evidence.
 - Specific refutation, duplicate ownership, or fixing evidence for every
   dropped/downgraded candidate; no bare "LOW", "stale", or "already fixed".
 - Actual coverage and verification gaps, unresolved high-impact questions with

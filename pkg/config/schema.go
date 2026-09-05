@@ -71,6 +71,31 @@ type schemaNode struct {
 	// TestPackedTailContainersValidateBothSpellings6821 holds the pairing.
 	packedTail bool
 
+	// packedStatements opts a CONTAINER into having its packed tail split into
+	// one child per STATEMENT by the brace-elision fold (#8768), instead of the
+	// whole run becoming a single child.
+	//
+	// It is OPT-IN and defaults off, for two measured reasons.
+	//
+	// Splitting changes what a packed run lowers to, and at least one container
+	// has a gate that depends on the current lowering: the NAT `then` family
+	// rejects a packed cross-mode contradiction with a check that exists
+	// PRECISELY BECAUSE `pool <p> off` lowers to one action and cannot be
+	// counted (#7033). Two earlier attempts to fix that class in the lowering
+	// were reverted; splitting `source-nat` would be a third.
+	//
+	// And splitting is only possible where the schema models the tail. The fold
+	// consumes each statement with consumeNodeKeys and stops the moment a token
+	// leaves the modelled grammar, so a container whose leaves take values the
+	// schema does not describe cannot be split even if it opts in — `ike policy
+	// <p> pre-shared-key ascii-text <v> mode main` is one: `ascii-text` is not
+	// modelled, so the tail is returned whole and `mode main` stays swallowed.
+	//
+	// So a container opts in after someone measures that its packed and braced
+	// spellings compile identically once split, one container at a time. That
+	// is the same discipline the #8690 scope list arrived at.
+	packedStatements bool
+
 	// blockValue opts a single-value typed leaf into the HIERARCHICAL BLOCK
 	// spelling `keyword { value; }`, in addition to the ordinary
 	// `keyword value` (#6774).
