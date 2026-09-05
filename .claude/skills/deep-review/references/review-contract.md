@@ -1,6 +1,6 @@
 # Shared review contract
 
-Contract version: `xpf-review-v2`. Both `deep-review` and `review-triage`
+Contract version: `xpf-review-v3`. Both `deep-review` and `review-triage`
 read this file. Changes to this contract must be reflected in both workflows.
 Repository guidance and actual user scope/authorization still apply.
 
@@ -76,6 +76,43 @@ at two independent consumers may need distinct fixes; a single proven root fix
 may cover several sites. A shared title, line number, model, closed issue, or
 opposite failure direction does not settle this. Preserve distinct surfaces
 and reopened residuals even when linking them to an existing owner.
+
+## Adversarial discovery and independent refutation
+
+Use adversarial reasoning to assess the implementation's defensive guarantees,
+not merely to argue against findings after discovery. Each source-review
+assignment records the following, grounded in the supported product and source:
+
+- **Protection and boundary:** the enforcement, isolation, authority, integrity
+  or availability property owed, the assets/principals it protects, and where
+  less-trusted data or state acquires authority.
+- **Actor and influence:** the relevant network participant, authenticated
+  low-privilege user, operator, peer or external service; what it actually
+  controls and the configuration/lifecycle prerequisites. Do not silently grant
+  administrative access, peer compromise or control of internal state. Distinguish
+  deliberate untrusted influence from ordinary faults and operator mistakes.
+- **Assumptions to challenge:** where validation, authorization and resource
+  limits are enforced; whether all relevant consumers preserve them; and whether
+  cached state, alternate paths, version differences, partial failure, restart
+  and recovery preserve the same property. Combine relevant domain expertise
+  when a guarantee crosses subsystem boundaries.
+- **Evidence and limits:** the source-grounded reasoning, actual guard and its
+  scope, bounded local evidence where available, plausible consequence, and
+  unresolved assumptions with a next check. A threat hypothesis is not a defect
+  until the evidence supports it; a guard's existence is not proof of coverage.
+
+Select relevant questions rather than inventing an attacker for every bug.
+For a purely reliability finding, record the triggering fault and explain why
+an adversarial actor is not required. Review coverage retains the important
+questions checked even when no finding results. Do not claim a whole threat
+class is covered by one negative test or one inspected entry point.
+
+Independent refutation is a second responsibility: challenge the claimed defect
+and challenge proposed dismissals with their actual guards, actor assumptions,
+paths and transitions. Keep `Adversarial analysis` separate from
+`Refutation attempt` so neither the discovery rationale nor contrary evidence
+disappears in triage. These requirements do not authorize exploit construction
+or live probes; the defensive scope and evidence rules still apply.
 
 ## Behavior and workload selection
 
@@ -160,7 +197,7 @@ is not proof of a complete fix. Offline/partial history is explicitly incomplete
 
 The final header contains:
 
-- `Review contract: xpf-review-v2`, run ID, repository identity, checkout path.
+- `Review contract: xpf-review-v3`, run ID, repository identity, checkout path.
 - Base SHA; comparison repository/ref/SHA and fetch time, or unavailable reason.
 - Model identity/family and identity source (or unknown).
 - Mode, requested/effective scope, focus, exclusions, review/validation limits.
@@ -176,6 +213,8 @@ Use "not applicable" with a reason where a field is not relevant:
 - `Verification`
 - `Gate verdict`
 - `Contract`: expected behavior and its documented basis.
+- `Adversarial analysis`: protection/trust boundary, actor and actual influence
+  (or non-adversarial fault), prerequisites, challenged assumptions and limits.
 - `Evidence`: repository-relative file:line at a named SHA and a concise
   excerpt actually read; separate observations from inferences.
 - `Probe`: commands/fixtures, build/artifact provenance, observations, controls,
@@ -195,9 +234,10 @@ Use "not applicable" with a reason where a field is not relevant:
   regression-verified, delivered, or pending validation, with evidence/IDs.
 
 A final report includes ranked findings and unresolved high-impact questions,
-the inspection/disposition log, risk worklist, actual coverage, verification gaps,
-and counts that reconcile to stable finding IDs. Include reasons for every
-drop/downgrade. Do not put NEG in the findings table or count it as a defect.
+the inspection/disposition log (including assigned expertise, adversarial
+questions checked and unresolved assumptions), risk worklist, actual coverage,
+verification gaps, and counts that reconcile to stable finding IDs. Include
+reasons for every drop/downgrade. Do not put NEG in the findings table or count it as a defect.
 Report confirmed, unresolved, fixed, duplicate, stale, and cohort counts
 separately; count actual issue filings only when IDs exist.
 
@@ -206,10 +246,12 @@ and conditions checked and those still unknown. Implementation handoff includes
 the acceptance criterion and all affected consumers. Source fixes, verified
 regression guards, and delivery to an in-scope release are separate milestones.
 
-Legacy reports remain readable: derive their metadata and map
+V2 and older reports remain readable: derive their metadata and map
 `Verified against origin/master` to the named comparison revision where
-supported. Do not fabricate missing Probe/provenance fields. Mark incomplete
-claims NEEDS_VALIDATION; an old report format is not itself a false finding.
+supported. Reconstruct missing adversarial analysis only from evidence actually
+checked; do not fabricate it or missing Probe/provenance fields. Mark substantively
+incomplete claims NEEDS_VALIDATION; an old format or absent new label is not by
+itself a false finding or a reason to discard otherwise sufficient evidence.
 
 ## Evaluating changes to this skill
 
@@ -217,6 +259,11 @@ First walk through representative decisions: confirmed defect, refuted candidate
 unavailable validation, stale artifact, changed dependency, closed-owner residual,
 wrong repository, and fixed-in-source but undelivered release work. Check that
 both discovery and triage preserve the same evidence and limitations.
+Also check specialist assignment and adversarial reasoning on a cross-boundary
+contract, a guard covering only one relevant path or lifecycle state, and a
+reliability fault with no adversarial actor. Verify that a no-finding assignment
+retains the important questions checked and its unresolved assumptions. Include
+a v2 report with sufficient evidence but no new adversarial-analysis label.
 
 For an empirical quality claim, compare old and revised instructions on held-out
 historical review cases using matched scope, model settings, context, and effort.
