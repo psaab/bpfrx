@@ -1634,3 +1634,77 @@ fn nat64_8890_tunnel_marked_decision_is_not_emitted_plaintext() {
         subject.as_ref().map(|f| f.len()),
     );
 }
+
+/// #8890 — the gate must hold in the REVERSE (v4->v6) direction too.
+///
+/// **A hostile review proposed this exact weakening and it survived every other
+/// cell**: restricting the gate to `meta.addr_family == AF_INET6` — i.e. the
+/// forward direction only — left the builder cell above and both dispatcher
+/// cells GREEN, because all three drive an IPv6 ingress. Measured, not
+/// hypothesised.
+///
+/// The reverse direction has the same defect and needs the same gate. The
+/// builder's v4->v6 arm performs no encapsulation either — `grep
+/// 'encap|wg_|gre|tunnel_endpoint'` returns 0 for the WHOLE function, both arms
+/// — so a reply toward an IPv6 client reached through a tunnel would leave
+/// unencapsulated exactly as the forward packet did. Placing the gate above the
+/// family match is what makes one line cover both, and this cell is what stops
+/// someone narrowing it to a single arm.
+#[test]
+fn nat64_8890_gate_holds_in_the_reverse_v4_to_v6_direction() {
+    let client: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let synthetic: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let pool = Ipv4Addr::new(203, 0, 113, 1);
+    let server = Ipv4Addr::new(8, 8, 8, 8);
+    let orig_sport = 5000u16;
+    let translated = 40001u16;
+
+    let reply = build_ipv4_tcp_frame(
+        server, pool, 443, translated, 1, 1, crate::tcp_flags::TCP_ACK,
+    );
+    let fwd = Nat64State::forward_decision(pool, server, translated);
+    let rev = fwd.reverse(IpAddr::V6(client), IpAddr::V6(synthetic), orig_sport, 443);
+    let info = Nat64ReverseInfo {
+        orig_src_v6: client,
+        orig_dst_v6: synthetic,
+    };
+
+    // CONTROL: untunnelled reverse reply builds a real IPv6 frame.
+    let control_decision = icmp_test_decision(rev.clone());
+    assert_eq!(
+        control_decision.resolution.tunnel_endpoint_id, 0,
+        "control arm must be untunnelled, or both arms are the subject"
+    );
+    let control = build_nat64_forwarded_frame(
+        &reply,
+        nat64_reverse_meta(),
+        &control_decision,
+        Some(&info),
+        false,
+    )
+    .expect(
+        "NON-VACUITY: the untunnelled reverse control MUST build. The reverse arm          already fails closed without reverse info (#5606), so a broken fixture          here would satisfy the is_none() below for the wrong reason entirely",
+    );
+    assert_eq!(
+        u16::from_be_bytes([control[12], control[13]]),
+        0x86dd,
+        "control must be a genuine IPv6 reply, so the subject's None is about the          tunnel and not about the reverse translation failing"
+    );
+
+    // SUBJECT: same reverse reply, tunnel-marked.
+    let mut tunnel_decision = icmp_test_decision(rev);
+    tunnel_decision.resolution.tunnel_endpoint_id = 7;
+    let subject = build_nat64_forwarded_frame(
+        &reply,
+        nat64_reverse_meta(),
+        &tunnel_decision,
+        Some(&info),
+        false,
+    );
+
+    assert!(
+        subject.is_none(),
+        "#8890 must gate the REVERSE (v4->v6) direction as well as the forward          one. The reverse arm encapsulates nothing either, so a tunnel-marked          reply toward an IPv6 client would go out unencapsulated. A gate narrowed          to AF_INET6 survives every other #8890 cell — this is the one that          catches it. Got {:?} bytes.",
+        subject.as_ref().map(|f| f.len()),
+    );
+}
