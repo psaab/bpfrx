@@ -1373,21 +1373,36 @@ func TestNoPairIsAdmittedByTwoFamilySwitches8690(t *testing.T) {
 		return true
 	})
 
-	// REACH CONTROL, not merely a non-emptiness check. The version this replaced
-	// had `len(counts) == 0` and it could never have fired: a pattern matching
-	// 500+ entries masks one matching zero, so the cell reported a healthy total
-	// while a whole shape was invisible. A degeneracy check on the TOTAL cannot
-	// see a gap in the SHAPES.
+	// REACH CONTROL, and it must cover every SHAPE, not merely be non-empty.
 	//
-	// So the control is specific: two pairs that are only reachable through the
-	// `case`-line shape must be present. They were the two real duplicates the
-	// regex version missed, which makes them evidence rather than decoration.
-	for _, must := range []string{"address-book address-set", "dataplane control-socket"} {
-		if counts[must] == 0 {
-			t.Fatalf("the walk did not find %q, which is written as the FIRST pair "+
-				"of its case clause and is therefore only reachable if case-line "+
-				"expressions are being read. Its absence means the walk has lost "+
-				"reach over a shape again — the exact defect this replaced (#8690)", must)
+	// The version this replaces had `len(counts) == 0`, which could never fire:
+	// a pattern matching 500+ entries masks one matching zero, so the cell
+	// reported a healthy total while a whole shape was invisible. A degeneracy
+	// check on the TOTAL cannot see a gap in the SHAPES.
+	//
+	// The first attempt at fixing that used two pairs -- and BOTH were written
+	// as `case "X",`, so they proved only that the case-line shape is read. A
+	// regex covering `\t\t"X",` plus `case "X",` (the two-pattern fix that
+	// landed before this one) would have passed that control while missing the
+	// 16 pairs written `"X":`. Two controls covering one shape is one control.
+	//
+	// So the pairs below are chosen for the SHAPE each one proves, and each is a
+	// real cross-switch duplicate rather than a decorative literal -- a control
+	// made of the evidence the cell exists to find:
+	for _, c := range []struct{ pair, proves string }{
+		{"address-book address-set", "case-line: written `case \"X\",` in one switch"},
+		{"dataplane control-socket", "case-line: written `case \"X\",` in one switch"},
+		{"ssh protocol-version", "trailing-colon: BOTH occurrences are the last entry of their clause, so it is invisible unless `\"X\":` is read"},
+		{"global policy", "trailing-colon: one occurrence ends its clause"},
+		{"md5 key", "trailing-colon: one occurrence ends its clause"},
+		{"zones security-zone", "BOTH shapes: `case \"X\",` in one switch and `\"X\":` in the other, so it counts as a duplicate only if both are read"},
+	} {
+		if counts[c.pair] < 2 {
+			t.Fatalf("the walk did not see %q as a duplicate (%s). It is one, so "+
+				"the walk has lost reach over a shape -- which is the defect this "+
+				"cell shipped with twice, first as one regex and then as two. "+
+				"Reading %q proves: %s (#8690)",
+				c.pair, "count "+itoa8690(counts[c.pair]), c.pair, c.proves)
 		}
 	}
 	// TOTAL-AGAINST-SOURCE control, the shape-independent version of the
@@ -1490,3 +1505,6 @@ var knownDuplicatePairs8690 = []string{
 	"wednesday stop-time",
 	"zones security-zone",
 }
+
+// itoa8690 keeps the reach-control message free of an extra import.
+func itoa8690(n int) string { return strconv.Itoa(n) }
