@@ -626,11 +626,43 @@ type censusResult struct {
 	// PARSING, or whose key was quietly misspelled, passed as "fixed". That is
 	// a check failing to a value indistinguishable from healthy.
 	state map[string]string
+
+	// unobservedClass sub-classifies the "leaf value not observable" bucket
+	// (#8690). That bucket is the largest by far and the census's own note
+	// called every member "a site whose synthesized fixture was too thin" —
+	// which is true of five of them and false of the other 231. Counting the
+	// three cases separately is the difference between a fixture backlog and a
+	// set of leaves nothing reads.
+	unobservedClass map[string]int
 }
+
+// The three answers to "why did changing the value change nothing?", in the
+// order a reader should rule them out.
+const (
+	// unobservedNothingRegistered: the whole fixture compiles to an EMPTY
+	// config. This is the case the census note describes — the stanza never
+	// registered, so of course the leaf is invisible. A contextFor /
+	// preambleFor entry addresses it.
+	unobservedNothingRegistered = "nothing registered (fixture too thin)"
+	// unobservedLeafIgnored: the stanza registered and compiles IDENTICALLY to
+	// its own empty skeleton. The fixture is fine; the compiler reads the
+	// stanza and does not read this leaf — under EITHER spelling, which is why
+	// the site cannot be a compact/block divergence. Whether that is a defect
+	// (a leaf that commits and does nothing) or correct (a leaf consumed
+	// elsewhere, or one needing an in-stanza sibling) is a question about the
+	// COMPILER, not about this census.
+	unobservedLeafIgnored = "stanza registered, leaf contributed nothing"
+	// unobservedOther: something registered and the value still did not vary.
+	unobservedOther = "registered, but the value did not vary"
+)
 
 func runCompactBlockCensus(t *testing.T) censusResult {
 	t.Helper()
-	res := censusResult{skipped: map[string]int{}, state: map[string]string{}, dropShape: map[string]string{}}
+	res := censusResult{
+		skipped: map[string]int{}, state: map[string]string{},
+		dropShape: map[string]string{}, unobservedClass: map[string]int{},
+	}
+	emptyCfg := compileText(t, "")
 	for _, s := range collectCompactSites() {
 		siteKey := strings.Join(s.container, " ") + " " + s.leaf
 		if len(s.container) > 0 && strings.HasPrefix(s.container[0], "groups") {
@@ -666,6 +698,16 @@ func runCompactBlockCensus(t *testing.T) censusResult {
 		if cfgEqual(cb1, cb2) {
 			res.skipped["leaf value not observable in the typed config"]++
 			res.state[siteKey] = "skipped: leaf value not observable"
+			// #8690: say WHICH of the three it is, so the bucket stops reading
+			// as one backlog.
+			switch skel := compileText(t, pre+nest(parent, ctx+stanza+" { }")); {
+			case cfgEqual(cb1, emptyCfg):
+				res.unobservedClass[unobservedNothingRegistered]++
+			case skel != nil && cfgEqual(cb1, skel):
+				res.unobservedClass[unobservedLeafIgnored]++
+			default:
+				res.unobservedClass[unobservedOther]++
+			}
 			continue
 		}
 		res.checked++
@@ -903,8 +945,17 @@ func TestCompactBlockCensusReport2419(t *testing.T) {
 	for _, k := range keys {
 		t.Logf("  cells SKIPPED — %-52s %d", k, res.skipped[k])
 	}
-	t.Logf("  NOTE: the %d 'not observable' skips are UNRULED, not clean — each is a site "+
-		"whose synthesized fixture was too thin to observe the value (as #6821 was before "+
-		"its required-sibling context line). The census is a FLOOR.",
-		res.skipped["leaf value not observable in the typed config"])
+	t.Logf("  NOTE: the %d 'not observable' skips are UNRULED, not clean. The census "+
+		"is a FLOOR.", res.skipped["leaf value not observable in the typed config"])
+	// #8690: and they are not one population. This note used to say every one
+	// of them was "a site whose synthesized fixture was too thin to observe the
+	// value (as #6821 was before its required-sibling context line)". Measured,
+	// that describes FIVE of them. The rest register their stanza perfectly
+	// well and simply add nothing to it, which is a question about the compiler
+	// rather than about the fixture — and a very different piece of work.
+	for _, k := range []string{
+		unobservedNothingRegistered, unobservedLeafIgnored, unobservedOther,
+	} {
+		t.Logf("    of which — %-46s %d", k, res.unobservedClass[k])
+	}
 }
