@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -64,6 +65,18 @@ var admittedElisionCases8879 = []struct {
 		`security { nat { source { pool P { address 10.0.0.1/32; } } } }`,
 		`security nat { source { pool P { address 10.0.0.1/32; } } }`,
 		func(c *Config) string { return fmt.Sprintf("pools=%d", len(c.Security.NAT.SourcePools)) }},
+	// #8929 — a DEPTH-2 pair. `braced` is the fully braced spelling and
+	// `elided` is the DOUBLY elided one: `security nat { ... }` folds because
+	// (security, nat) is admitted, but whether `nat source { ... }` folds is a
+	// separate decision answered by (nat, source). Before this admission the
+	// doubly-elided spelling compiled to exactly what an EMPTY config
+	// produces — the source NAT pool silently vanished.
+	{"nat source",
+		`security { nat { source { pool p1 { address 10.9.0.1; } } } }`,
+		`security nat source { pool p1 { address 10.9.0.1; } }`,
+		func(c *Config) string {
+			return fmt.Sprintf("pools=%d", len(c.Security.NAT.SourcePools))
+		}},
 	// #8925 — found by SCHEMA WALK, not by the sweep. See
 	// TestUnadmittedTopLevelPairsAreAdjudicated8925 for the instrument and
 	// why the sweep could not see these.
@@ -954,10 +967,18 @@ func TestSystemServicesStaysUnadmitted8879(t *testing.T) {
 // Every one must be here with a reason, so a newly-added or newly-un-admitted
 // pair cannot slip in silently the way those four did.
 //
-// It is deliberately restricted to TOP-LEVEL pairs. A deeper pair is reachable
-// only through a parent that is itself either admitted (so the parent's body
-// is folded and the child is reached) or listed here. Top level is where a
-// whole stanza can vanish.
+// It covers TOP-LEVEL pairs. It ORIGINALLY justified stopping there by arguing
+// that "a deeper pair is reachable only through a parent that is itself either
+// admitted or listed here" — and THAT ARGUMENT WAS FALSE (#8929). Elision is a
+// per-level decision: an admitted parent gets you to the child's brace, it does
+// not fold the child's brace. `security nat source { ... }` dropped its whole
+// body while `(security, nat)` was admitted, compiling to exactly what an empty
+// config produces.
+//
+// The depth-2 population is ratcheted separately by
+// TestDepth2UnadmittedPopulation8929. This cell keeps the top-level scope
+// because that is where a whole STANZA vanishes — but the stated bound no
+// longer does work it cannot support.
 func TestUnadmittedTopLevelPairsAreAdjudicated8925(t *testing.T) {
 	// Reasons are re-derived where they can be. `no-body` is checked against
 	// the schema every run rather than trusted: a pair that GAINS children
@@ -1030,4 +1051,94 @@ func TestUnadmittedTopLevelPairsAreAdjudicated8925(t *testing.T) {
 		}
 	}
 	t.Logf("#8925: %d top-level pairs un-admitted, all adjudicated", len(got))
+}
+
+// TestDepth2UnadmittedPopulation8929 ratchets the DEPTH-2 population that
+// TestUnadmittedTopLevelPairsAreAdjudicated8925 does not reach.
+//
+// The population: pairs (mid, head) where head declares a body, (mid, head) is
+// NOT admitted, and mid sits under an ADMITTED top-level parent — exactly the
+// set the #8925 census's original bound claimed was safe. A doubly-elided
+// spelling can drop any of their bodies.
+//
+// THIS IS A RATCHET, NOT AN ADJUDICATION, and the distinction is the point.
+// Six members were drop-tested and one of the six DROPPED silently
+// (`nat source`, now admitted). The rest are UN-MEASURED. A guard asserting
+// they are fine would claim a census I did not run; a guard pinning the COUNT
+// makes the population visible and stops it growing unnoticed, which is the
+// honest instrument for a partial result.
+func TestDepth2UnadmittedPopulation8929(t *testing.T) {
+	// The measured members, kept so the sample is reviewable rather than a
+	// bare rate. `nat source` is deliberately absent: it is the one that
+	// dropped, and it is now admitted.
+	measuredSame := []string{
+		"policer if-exceeding",
+		"rib static",
+		"flow tcp-session",
+		"interfaces classifiers",
+		"bgp multipath",
+	}
+	const wantPopulation = 51
+
+	parentAdmitted := func(mid string) bool {
+		for stanza := range setSchema.children {
+			if compactNormalizeInScope(stanza, mid) {
+				return true
+			}
+		}
+		return false
+	}
+
+	var pop []string
+	for _, sn := range setSchema.children {
+		if sn == nil {
+			continue
+		}
+		for mid, mn := range sn.children {
+			if mn == nil || !parentAdmitted(mid) {
+				continue
+			}
+			for head, hn := range mn.children {
+				if compactNormalizeInScope(mid, head) {
+					continue
+				}
+				if hn == nil || (len(hn.children) == 0 && hn.wildcard == nil) {
+					continue
+				}
+				pop = append(pop, mid+" "+head)
+			}
+		}
+	}
+	sort.Strings(pop)
+
+	if !compactNormalizeInScope("nat", "source") {
+		t.Error("`nat source` is no longer admitted. It is the one member of " +
+			"this population measured to DROP silently: doubly elided it " +
+			"compiled to what an EMPTY config produces, losing the source NAT " +
+			"pool entirely (#8929).")
+	}
+	for _, p := range pop {
+		if p == "nat source" {
+			t.Error("`nat source` is back in the depth-2 un-admitted population " +
+				"— it must stay admitted (#8929).")
+		}
+	}
+	if got := len(pop); got != wantPopulation {
+		verb := "GREW"
+		if got < wantPopulation {
+			verb = "SHRANK"
+		}
+		t.Errorf("depth-2 un-admitted population %s: got %d, want %d.\n"+
+			"GREW means a new depth-2 pair declares a body and is not admitted, "+
+			"so a DOUBLY elided spelling can drop it — measure it (braced vs "+
+			"doubly elided, gate column FIRST, braced arm live against an EMPTY "+
+			"config) before moving this constant. SHRANK means something was "+
+			"admitted or adjudicated: tighten it. Only %d of this population "+
+			"have been drop-tested; the rest are UN-MEASURED and this cell does "+
+			"not claim otherwise (#8929).",
+			verb, got, wantPopulation, len(measuredSame)+1)
+	}
+	t.Logf("#8929: %d depth-2 un-admitted pairs with a body under an admitted "+
+		"parent; %d drop-tested (1 dropped, now admitted), %d un-measured",
+		len(pop), len(measuredSame)+1, len(pop)-len(measuredSame))
 }
