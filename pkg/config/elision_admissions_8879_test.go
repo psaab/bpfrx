@@ -3,7 +3,6 @@ package config
 import (
 	"encoding/json"
 	"fmt"
-	"sort"
 	"strings"
 	"testing"
 )
@@ -1053,32 +1052,57 @@ func TestUnadmittedTopLevelPairsAreAdjudicated8925(t *testing.T) {
 	t.Logf("#8925: %d top-level pairs un-admitted, all adjudicated", len(got))
 }
 
-// TestDepth2UnadmittedPopulation8929 ratchets the DEPTH-2 population that
-// TestUnadmittedTopLevelPairsAreAdjudicated8925 does not reach.
+// TestDepth2UnadmittedPopulation8929 ratchets the DEPTH-2 population and
+// records the pairs measured to DROP.
 //
 // The population: pairs (mid, head) where head declares a body, (mid, head) is
-// NOT admitted, and mid sits under an ADMITTED top-level parent — exactly the
-// set the #8925 census's original bound claimed was safe. A doubly-elided
-// spelling can drop any of their bodies.
+// NOT admitted, and mid sits under an ADMITTED top-level parent. A spelling
+// that elides HEAD's brace under MID can drop any of their bodies.
 //
-// THIS IS A RATCHET, NOT AN ADJUDICATION, and the distinction is the point.
-// Six members were drop-tested and one of the six DROPPED silently
-// (`nat source`, now admitted). The rest are UN-MEASURED. A guard asserting
-// they are fine would claim a census I did not run; a guard pinning the COUNT
-// makes the population visible and stops it growing unnoticed, which is the
-// honest instrument for a partial result.
+// THIS CELL PREVIOUSLY CARRIED A FALSE SAMPLE, and the correction is the point
+// (#8938). It reported "1 of 6 drop-tested" and named five pairs as
+// measured-SAME. Those fixtures elided the WRONG BRACE: for `(flow,
+// tcp-session)` they compared
+//
+//	security { flow { tcp-session { ... } } }  vs  security flow { tcp-session { ... } }
+//
+// which elides `(security, flow)` — an ADMITTED pair that folds correctly —
+// and leaves tcp-session's brace intact. Five of the six rows tested a pair
+// that was never in the population, which is why only `nat source` (the one
+// fixture built correctly) came back DROPS.
+//
+// Re-measured against the right spellings, the population is 26 DROPS / 20
+// SAME / 4 unanswerable, not 1 of 6.
+//
+// THE SAME COLUMN BOUNDS NOTHING, and there is direct evidence rather than
+// caution: `policy-statement then` reads SAME under the census instrument and
+// is KNOWN BROKEN (#8933 — the compiler consumes the packed token into the
+// terminal-action slot, so the term stops terminating). One synthesised body
+// statement per pair inherits the leaf-contingency defect this campaign has
+// now found in three separate instruments, two of them mine. So 26 is a LOWER
+// BOUND and a SAME verdict here is not evidence of health.
 func TestDepth2UnadmittedPopulation8929(t *testing.T) {
-	// The measured members, kept so the sample is reviewable rather than a
-	// bare rate. `nat source` is deliberately absent: it is the one that
-	// dropped, and it is now admitted.
-	measuredSame := []string{
-		"policer if-exceeding",
-		"rib static",
-		"flow tcp-session",
-		"interfaces classifiers",
-		"bgp multipath",
+	// MEASURED TO DROP (#8938). Named rather than counted so that fixing one
+	// reds this cell and forces its removal — a list that outlives its reason
+	// is the failure this campaign keeps finding.
+	knownDropping := []string{
+		"address-book global", "archival configuration", "bgp damping",
+		"bgp multipath", "dataplane coalescence", "dataplane shared-umem",
+		"flow aging", "flow icmp-session", "flow tcp-session",
+		"flow traceoptions", "flow udp-session",
+		"flow-monitoring version-ipfix", "flow-monitoring version9",
+		"interface-routes rib-group", "license autoupdate",
+		"nat destination", "nat nat64", "nat natv6v4", "nat proxy-arp",
+		"nat static", "policies policy-rematch", "pre-id-default-policy then",
+		"rib static", "syslog file", "syslog host", "syslog user",
 	}
-	const wantPopulation = 51
+	// 50 UNIQUE pairs. #8929 said 51 by counting a slice that double-counted
+	// `family inet6`, which appears under two different top-level stanzas.
+	// The predicate is keyed on (mid, head) and knows nothing about the
+	// stanza, so the same pair reached by two routes is ONE pair — counting
+	// sites where the population is pairs is the unit mismatch this campaign
+	// already hit once, on the 320-sites / 95-pairs reconciliation.
+	const wantPopulation = 50
 
 	parentAdmitted := func(mid string) bool {
 		for stanza := range setSchema.children {
@@ -1089,7 +1113,7 @@ func TestDepth2UnadmittedPopulation8929(t *testing.T) {
 		return false
 	}
 
-	var pop []string
+	pop := map[string]bool{}
 	for _, sn := range setSchema.children {
 		if sn == nil {
 			continue
@@ -1105,22 +1129,37 @@ func TestDepth2UnadmittedPopulation8929(t *testing.T) {
 				if hn == nil || (len(hn.children) == 0 && hn.wildcard == nil) {
 					continue
 				}
-				pop = append(pop, mid+" "+head)
+				pop[mid+" "+head] = true
 			}
 		}
 	}
-	sort.Strings(pop)
 
 	if !compactNormalizeInScope("nat", "source") {
-		t.Error("`nat source` is no longer admitted. It is the one member of " +
+		t.Error("`nat source` is no longer admitted. It was the first member of " +
 			"this population measured to DROP silently: doubly elided it " +
 			"compiled to what an EMPTY config produces, losing the source NAT " +
 			"pool entirely (#8929).")
 	}
-	for _, p := range pop {
-		if p == "nat source" {
-			t.Error("`nat source` is back in the depth-2 un-admitted population " +
-				"— it must stay admitted (#8929).")
+	// COUNT ASSERTED, because the membership check below is one-sided: it
+	// catches an entry that should have been REMOVED and is blind to one that
+	// was removed silently (a bad merge, a tidy-up). Measured: deleting an
+	// entry left this cell green until this assertion was added.
+	if len(knownDropping) != 26 {
+		t.Errorf("knownDropping has %d entries, want 26. #8938 measured 26 of "+
+			"the 50 dropping. Removing one is only correct if the pair was "+
+			"ADMITTED — in which case the membership check below fires too and "+
+			"BOTH numbers move together. A count change on its own means the "+
+			"record was edited without a measurement.", len(knownDropping))
+	}
+	// Every known-dropping pair must still be IN the population. One leaving it
+	// means it was admitted — good news that must be reflected here, because a
+	// stale entry turns this list into a claim nobody re-checked.
+	for _, p := range knownDropping {
+		if !pop[p] {
+			t.Errorf("`%s` is recorded as a measured DROP but is no longer in the "+
+				"depth-2 un-admitted population — it was admitted or the schema "+
+				"changed. Remove it from knownDropping; this list must not "+
+				"outlive its reason (#8938).", p)
 		}
 	}
 	if got := len(pop); got != wantPopulation {
@@ -1130,15 +1169,14 @@ func TestDepth2UnadmittedPopulation8929(t *testing.T) {
 		}
 		t.Errorf("depth-2 un-admitted population %s: got %d, want %d.\n"+
 			"GREW means a new depth-2 pair declares a body and is not admitted, "+
-			"so a DOUBLY elided spelling can drop it — measure it (braced vs "+
-			"doubly elided, gate column FIRST, braced arm live against an EMPTY "+
-			"config) before moving this constant. SHRANK means something was "+
-			"admitted or adjudicated: tighten it. Only %d of this population "+
-			"have been drop-tested; the rest are UN-MEASURED and this cell does "+
-			"not claim otherwise (#8929).",
-			verb, got, wantPopulation, len(measuredSame)+1)
+			"so a spelling eliding its brace can drop it — measure it (braced "+
+			"vs the spelling that elides HEAD's brace under MID, not the "+
+			"parent's) before moving this constant. SHRANK means something was "+
+			"admitted: tighten it, and drop any knownDropping entry it "+
+			"resolves (#8938).", verb, got, wantPopulation)
 	}
-	t.Logf("#8929: %d depth-2 un-admitted pairs with a body under an admitted "+
-		"parent; %d drop-tested (1 dropped, now admitted), %d un-measured",
-		len(pop), len(measuredSame)+1, len(pop)-len(measuredSame))
+	t.Logf("#8938: %d depth-2 un-admitted pairs; %d MEASURED TO DROP, the rest "+
+		"read SAME under a one-leaf instrument that is known to produce false "+
+		"SAMEs — a lower bound, not a census of health",
+		len(pop), len(knownDropping))
 }
