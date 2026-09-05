@@ -561,7 +561,18 @@ func TestConversePredicateIsPinned8807(t *testing.T) {
 			"CANDIDATE: it may be read through a helper rather than a .Name() "+
 			"switch, which this predicate cannot see. Compile both spellings and "+
 			"check the typed struct actually HOLDS the value -- #8785's defect was "+
-			"a missing struct field behind a correct declaration.%s", added, posBlindness8807)
+			"a missing struct field behind a correct declaration.\n\n"+
+			"AND ENUMERATE WHERE THE VALUE LANDS BEFORE CALLING ANYTHING UNREAD. "+
+			"#8787 declared `then next` measured-clean by checking `Action`, which "+
+			"is the wrong field -- `next term` sets `NextTerm`, and it IS read. That "+
+			"was not an honest \"could not tell\"; it was a confident CLEAN produced "+
+			"by reading a field the value never lands in. A value that lands in a "+
+			"field you did not check is INDISTINGUISHABLE from a value that lands "+
+			"nowhere, and \"unread\" is precisely the judgement this predicate makes. "+
+			"Compare whole compiled results, and DO NOT discard cfg.Warnings while "+
+			"doing it: a keyword whose only visible effect is an advisory is still "+
+			"being read, and nulling warnings made a read keyword look like a silent "+
+			"drop.%s", added, posBlindness8807)
 	}
 	if len(removed) > 0 {
 		t.Errorf("converse hit(s) GONE: %v\n"+
