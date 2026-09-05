@@ -47,6 +47,21 @@ var exclusionClasses8690 = map[string]bool{
 	// clause is false — the argument was built on a hierarchical spelling nobody
 	// writes, instead of the flat `set` form operators actually use.
 	"no-drop-measured": true,
+	// #8690: RESTORED. `no-drop-measured` replaced this class on a measurement
+	// of the STRICT path — flat `set`, and the hierarchical sibling form rejected
+	// by three gates — which is correct and shows nothing dropping. But the
+	// #2419 census compares via the LENIENT path, and so does production on
+	// Load/SyncApply (configstore/store.go: boot config load and HA config
+	// sync). There the brace-elided scheduler-name IS silently dropped, so a
+	// time-limited policy runs permanently active. Both measurements are true;
+	// they are of different paths, and this class is the one the register's
+	// question is about.
+	// #8690: normalizing does not fix the site, and admitting it would clear
+	// inventory lines while the reachable harm stands. Permanent for the COUNT,
+	// but unlike `partial` (forbidden) or `no-drop-measured` (a no-op) this one
+	// is a FALSE FIX — the most dangerous kind to leave unlabelled, because it
+	// looks like progress.
+	"wrong-remedy": true,
 }
 
 // Classes whose sites must never be normalized.
@@ -69,6 +84,7 @@ var exclusionClasses8690 = map[string]bool{
 var permanentClasses8690 = map[string]bool{
 	"partial": true, "gate-confirmed": true, "gate-collateral": true,
 	"unreachable": true, "hazard": true, "no-drop-measured": true,
+	"wrong-remedy": true,
 }
 
 func readPermanentExclusions8690(t *testing.T) map[string]exclusion8690 {
@@ -163,7 +179,7 @@ func TestPermanentExclusionsMatchTheInventory8690(t *testing.T) {
 		// measurement. That is not necessarily wrong, but the measurement is now
 		// unverified, and it is the measurement — not the line — that the next
 		// reader will rely on.
-		if e.class == "no-drop-measured" {
+		if e.class == "no-drop-measured" || e.class == "owed-own-change" {
 			noDropDeparture = append(noDropDeparture, site)
 			continue
 		}
@@ -295,6 +311,28 @@ func TestPermanentExclusionRegisterIsDiscriminating8690(t *testing.T) {
 				t.Errorf("%q is classed `gate-confirmed` with a %d-character reason. That "+
 					"class asserts a PERSON measured it; the measurement IS the claim",
 					site, len(e.reason))
+			}
+		case "wrong-remedy":
+			// Must name the real defect and cite the cell showing the remedy
+			// missing its target — otherwise it is indistinguishable from an
+			// ordinary exclusion, and the actual bug goes unrecorded.
+			if !strings.Contains(e.reason, "_test.go") {
+				t.Errorf("%q is classed `wrong-remedy` with no runnable cite. That class "+
+					"asserts a remedy was measured MISSING ITS TARGET; without a cell the "+
+					"claim is prose", site)
+			}
+		case "owed-own-change":
+			// Says the fix is right and the VEHICLE is wrong. Without naming what
+			// the vehicle owes it is `open` with a caveat, and the next sweep
+			// takes it. It must also cite a runnable cell: an unrun argument in
+			// this class is precisely what put the wrong verdict here twice.
+			if !strings.Contains(e.reason, "test-failover") && !strings.Contains(e.reason, "smoke") {
+				t.Errorf("%q is classed `owed-own-change` but names no owed verification", site)
+			}
+			if !strings.Contains(e.reason, "_test.go") {
+				t.Errorf("%q is classed `owed-own-change` with no runnable cite. That class "+
+					"asserts a behaviour change was measured; without a cell the claim is "+
+					"prose, which is how this entry was wrong twice", site)
 			}
 		case "no-drop-measured":
 			// Asserts a MEASUREMENT, so it must cite the executable form of it.
