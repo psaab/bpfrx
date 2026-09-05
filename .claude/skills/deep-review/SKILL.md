@@ -17,7 +17,7 @@ state transitions, and failure, not only whether the intended path works.
 
 Read [the shared review contract](references/review-contract.md) before discovery
 or triage. It owns severity, evidence, dispositions, report fields, and completion
-criteria for both this skill and `review-triage`.
+criteria shared by this skill, `review-triage`, and code-finding research.
 
 ## Scope and modes
 
@@ -336,7 +336,10 @@ Write `/tmp/<WHOAMI>-review-<REVIEW_SLUG>-NNN.md`, for example
 Use the shared filing/provenance contract to mark each finding's actual issue
 status, originating model, issue URL and verified origin tags. When filing is
 authorized during the run, reconcile that ledger before freezing the report;
-when filing happens later, return the self-contained triage result with the
+acquire the contract's shared repository filing mutex before any per-report lock
+and hold it through filing, readback and publication. A finding discovered here
+uses `source:deep-review`; later research does not replace its source/model credit.
+When filing happens later, return the self-contained triage result with the
 updated ledger alongside the unchanged original. Never label drafts or existing
 issues as newly opened.
 

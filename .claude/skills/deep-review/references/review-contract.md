@@ -1,7 +1,9 @@
 # Shared review contract
 
-Contract version: `xpf-review-v4`. Both `deep-review` and `review-triage`
-read this file. Changes to this contract must be reflected in both workflows.
+Contract version: `xpf-review-v5`. `deep-review`, `review-triage`, and `research`
+read this file. Changes must be reflected in all affected workflows. Research
+uses defect-specific requirements for code findings, not for every general
+question; its distinct publication format is defined below.
 Repository guidance and actual user scope/authorization still apply.
 
 ## Impact, confidence, and verification are separate
@@ -311,25 +313,72 @@ LINKED_EXISTING is not a new filing. Keep origin-tag verification separate from
 issue creation, so a created issue with missing tags is visible as incomplete.
 
 For each finding, record the discovering agent and its evidenced model/source
-using the identity rules above. The issue's `model:` label identifies the
+using the identity rules above, plus the actual discovery source. The issue's
+`model:` label identifies the
 discoverer, not the coordinator or independent verifier by default. Unknown
 worker identity remains unknown; do not copy the coordinator's model into it.
 If one issue groups findings from multiple evidenced models, retain each model
-label and the per-finding attribution in its body.
+label and the per-finding attribution in its body. A known non-model author is
+credited in the body without an invented model label; unknown authorship remains
+explicitly unknown, not attributed to the model currently doing research.
+
+### Shared filing coordination
+
+All three workflows use one repository-wide filing mutex, in addition to any
+existing per-report lock, to serialize issue creation and reconciliation across
+renamed reports, multi-report research and new discoveries. Resolve the intended
+GitHub target, then record a `Filing repository key`: lowercase
+`<github-host>/<owner>/<repository>`, without scheme, credentials or trailing
+`.git`. Hash its exact UTF-8 bytes, without a newline, using SHA-256. The mutex is
+`/tmp/xpf-review-filing-<hex-digest>.lock` on the shared filing host/filesystem.
+A local-only or unresolved target remains report-only until this is resolved.
+
+Draft evidence before acquiring the mutex. Before final preflight, a live owner
+must acquire and hold the OS lock through issue-state readback, mutations,
+uncertain-response reconciliation and result publication. File existence or a
+standalone `flock` that has already exited does not hold a mutex. If ownership
+cannot be acquired or retained, do not file. Acquire this repository mutex
+before existing per-report locks; acquire multiple report locks in sorted key
+order. Never delete shared lock files. `/tmp` protects only cooperating writers
+in that filesystem namespace; coordinate other hosts or incompatible legacy
+writers before filing, rather than assuming they are serialized.
+
+Under the lock, reconcile prior source/triage/research ledgers and current GitHub
+state. Preserve original repository/run ID/Finding ID keys through copies,
+revalidation and grouped findings; a new research run ID is not a new discovery
+key. Missing legacy IDs use a recorded source artifact SHA-256 plus local intake
+IDs, not fabricated original metadata. Search relevant existing issues and
+corrective scope as well as these keys: modified copies can have different
+hashes. An old result or processed marker is not proof of a permanent disposition
+or completed filing. Publish a later research snapshot without rewriting history.
+
+### Origin labels and issue evidence
 
 In an authorized issue-filing run:
 
-- Apply `source:deep-review` and `model:<originating-WHOAMI>` to each new issue,
-  plus the repository's existing `audit` label where available and relevant
+- Apply the actual originating source label to each new issue: `source:deep-review`
+  for a deep-review discovery, `source:external-review` for another supplied
+  review, or `source:research` for a genuinely new research discovery. Use
+  `source:unknown` when evidence cannot establish the source. Do not classify
+  every report consumed by triage/research as deep-review or overwrite its origin.
+  Apply `model:<originating-WHOAMI>` for model-originated or unknown-author
+  findings, plus the existing `audit` label where applicable and relevant
   severity/component labels. The model suffix uses the same safe normalization
   and explicit unknown handling as report identity, but for the discoverer.
   Inspect repository labels first; create missing required origin labels only
   within authorized filing/tagging scope. Do not overwrite unrelated labels or
   silently truncate/substitute a model if label policy or permissions prevent it.
+  Add `validated-by:research` for findings actually investigated through research;
+  this names the validation workflow, not discovery or confirmation. Unresolved
+  validation tasks remain explicitly unresolved in title/body. Grouped issues
+  retain each evidenced source/model and per-finding mapping.
 - Include a visible **Review origin** section in the initial issue body:
-  source `deep-review`, review name/slug, immutable run ID, repository, base and
+  actual discovery source, review name/slug, immutable origin run ID (or explicit
+  legacy intake identity), repository, base and
   verification SHAs, Finding ID(s), discovering model(s) and evidence sources,
-  and coordinator model/source separately. Include the published report basename
+  and coordinator model/source separately. Research also records its own run ID,
+  model/source, verification revision and disposition, without replacing the
+  original discovery identity. Include the published report basename
   and durable report URL if available; a local `/tmp` path is a locator, not a
   GitHub-accessible evidence link. Include decisive evidence and fix acceptance
   criteria in the issue itself rather than relying on a temporary report.
@@ -338,8 +387,9 @@ In an authorized issue-filing run:
   exact pending/failed provenance action. Do not claim labeling succeeded from
   an intended label list. No issue or label mutations occur in report-only mode.
 - If creation times out or its result is lost, mark CREATE_UNCERTAIN and search
-  the intended repository for the exact run ID and Finding ID(s), checking the
-  issue body before retrying. Hold the existing per-report filing lock through
+  the intended repository for the original source run ID and Finding ID(s), or
+  legacy intake identity, checking the issue body before retrying. Hold the shared
+  repository mutex and existing per-report filing lock through
   this reconciliation; an ambiguous response must not produce duplicate issues.
   An empty search result alone does not prove creation failed; unresolved or
   unavailable readback stays CREATE_UNCERTAIN instead of triggering a blind retry.
@@ -357,11 +407,46 @@ Return both paths and identify the result as the later status snapshot.
 Pending filing/tagging actions remain explicit; neither an issue-creation count
 nor the triaged marker means provenance tagging or remediation is complete.
 
+### Research result publication
+
+Research publishes `/tmp/result-<WHOAMI>-research-<RESEARCH_SLUG>-NNN.md`.
+Derive `WHOAMI` from the researching coordinator's evidenced identity, not the
+external discoverer. Record `Research name`; derive `RESEARCH_SLUG` with the same
+ASCII name normalization as `REVIEW_SLUG`, falling back to `research` if empty.
+Record `Artifact kind: research-result`, `Review contract: xpf-review-v5`, research
+run ID, identity fields, requested/effective scope, timestamp, output path and
+evidence location. Include repository and pinned revisions for code research;
+general research without a repository records not applicable with a reason.
+
+Include source report names/paths/hashes, origin run/finding IDs, discovering
+models/authors, prior result paths and current verification evidence. Retain the
+full original-claim disposition ledger (including NEG) separately from actionable
+findings. Use the shared filing ledger, including an empty ledger when no findings
+exist. Reconcile actual issue URLs, newly opened versus linked owners, and verified
+or pending tags; copy decisive evidence inline so the result stands alone.
+
+Draft in the unique owned run directory, not directly in the watcher directory.
+Before publication, re-derive the coordinator prefix and research slug and check
+manifest/header/basename agreement. Choose the next number from exact final
+basenames for that pair, starting at 001. Publish atomically create-if-absent
+(`ln -T -- <draft> <final>` on the same filesystem); an existing directory is a
+collision, not a destination. On collision, update the draft's output-path field
+and retry the next number. Freeze the draft after linking and verify the final.
+Do not overwrite source reports, prior results, or another run's artifacts.
+
+The `result-` prefix and artifact kind identify a derivative even if its model or
+slug contains `-review`. Never publish a second discovery alias or treat a research
+result as fresh watcher input. Do not write a source report's `.researched-` marker
+merely because research finished. Later research can investigate unresolved claims
+again, preserving lineage and reconciling existing filings under the shared mutex.
+Return the new result and original report paths, identifying the newer status
+snapshot. Temporary reports are not durable GitHub evidence URLs.
+
 ## Report schema and completion
 
 The final header contains:
 
-- `Review contract: xpf-review-v4`, run ID, repository identity, checkout path.
+- `Review contract: xpf-review-v5`, run ID, repository identity, checkout path.
 - `Review name`, `REVIEW_SLUG`, and filing-status snapshot timestamp.
 - Base SHA; comparison repository/ref/SHA and fetch time, or unavailable reason.
 - `MODEL_RAW`, `MODEL_SOURCE`, `MODEL_HOST`, `WHOAMI` as defined above;
@@ -374,7 +459,8 @@ Use "not applicable" with a reason where a field is not relevant:
 
 - `Finding ID`: stable within this run, carried into triage and fix tracking.
 - `Title`
-- `Discovery origin`: discovering agent, model identifier/source and derived
+- `Discovery origin`: actual discovery workflow/source, discovering agent or
+  non-model author, model identifier/source and derived
   originating-WHOAMI; retain distinct contributors when grouping findings.
 - `Severity`: include impact justification and whether it is potential.
 - `Confidence`
@@ -420,7 +506,7 @@ and conditions checked and those still unknown. Implementation handoff includes
 the acceptance criterion and all affected consumers. Source fixes, verified
 regression guards, and delivery to an in-scope release are separate milestones.
 
-Reports predating these fields, including earlier v3 identity headers, remain
+Reports predating these fields, including earlier v3/v4 headers, remain
 readable: derive their metadata and map `Verified against origin/master` to the
 named comparison revision where
 supported. Reconstruct missing adversarial analysis only from evidence actually
@@ -452,6 +538,14 @@ For filing changes, check a report-only run, a new issue, a linked duplicate,
 multi-model findings grouped into one issue, a lost create response, missing
 label permissions, and triage after immutable report publication. Named and
 legacy filenames must both be consumed exactly once without inventing origin.
+For research integration, include general questions with no issue or defect table,
+mixed/partial review claims, a valid defect with a rejected fix, unknown and human
+authors, and stale source evidence with changed guards. Check model/name strings
+containing `-review`, prior research derivatives, renamed inputs and grouped
+multi-report findings. Verify all consumers use the same held filing mutex and
+original finding keys, without mistaking a lock file for an acquired OS lock or
+assuming cross-host coordination. A research run must not overwrite discovery
+credit, silently drop NEG from the input ledger, or auto-close a real defect.
 
 For an empirical quality claim, compare old and revised instructions on held-out
 historical review cases using matched scope, model settings, context, and effort.

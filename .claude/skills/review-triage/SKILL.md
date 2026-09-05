@@ -8,8 +8,9 @@ description: Verify a private source-review report against its intended reposito
 Triage every finding with explicit reasoning. Read
 [the shared review contract](../deep-review/references/review-contract.md) first;
 it defines severity, verification, dispositions, evidence fields, and fix
-completion for both discovery and triage. Assess the evidence independently of
-the originating model. Do not hardcode model credibility rates, another
+completion shared by discovery, triage and code-finding research. Assess the
+evidence independently of the originating model. Do not hardcode model
+credibility rates, another
 checkout, or assumptions about which enforcement subsystems exist.
 
 ## Scope and authorization
@@ -27,7 +28,9 @@ automatic side effect of classifying a finding.
 
 The established watcher compatibility paths are `/tmp/*-review*.md`,
 `/tmp/result-<basename>.md`, and `/tmp/.researched-<basename>`. Exclude result/
-report derivatives and intermediate files from new input selection. Prefer the
+report derivatives and intermediate files from new input selection. In particular,
+exclude every `result-` basename and `Artifact kind: research-result`, even when
+the model or research slug contains `-review` and matches the broad glob. Prefer the
 named final `<WHOAMI>-review-<REVIEW_SLUG>-<digits>.md` form and also accept legacy
 `<WHOAMI>-review-<digits>.md` finals. Validate the header's identity, review
 name/slug, run ID and exact output basename; do not infer ambiguous components
@@ -57,7 +60,7 @@ Never process a different repository's report just because its filename matches.
 - If fresh source/history cannot be obtained, retain the limitation. Do not
   silently reinterpret an old local ref as current verification.
 
-For reports lacking current fields or repository metadata, including earlier v3
+For reports lacking current fields or repository metadata, including earlier v3/v4
 identity headers, derive only what the source and session establish. Map old
 comparison labels as described
 in the contract. Missing evidence is a validation gap, not a guessed success.
@@ -110,11 +113,15 @@ Only tightly related bounded improvements share a cohort issue, with each
 member's evidence and acceptance criterion retained.
 
 Apply the shared issue-filing and origin-tagging contract to every authorized
-filing. Confirm `source:deep-review` and `model:<originating-WHOAMI>` on GitHub
-and include the Review origin block in the issue body. Attribute the actual
+filing. Confirm the actual `source:` and applicable
+`model:<originating-WHOAMI>` labels on GitHub and include the Review origin block
+in the issue body. Attribute the actual
 discoverer, not whichever model is doing triage. Reconcile lost create responses
 by repository/run ID/Finding ID before retrying; retain existing issue provenance
-when linking a duplicate. Report pending tag actions separately from creation.
+when linking a duplicate. Reports from other external reviewers are not
+automatically deep-review discoveries; preserve unknown/human origins explicitly.
+Research validation adds `validated-by:research` only when that work actually
+occurred. Report pending tag actions separately from creation.
 
 ## 3. Write the reasoned result
 
@@ -156,9 +163,14 @@ For result naming, `<basename>` is the source report stem without the final
 Freeze the draft once linked. If a result already exists, verify its report
 identity and reconcile the prior work; never overwrite another run's result.
 Concurrent authorized filing workers must hold one exclusive per-report lock
-from preflight through filing and result publication, rechecking processed/result
-state after acquiring it to avoid duplicate external writes. Never delete a
+in addition to the shared contract's repository filing mutex. Acquire the
+repository mutex first and hold both from preflight through filing and result
+publication, rechecking processed/result state after acquiring it to avoid
+duplicate external writes. Never delete a
 shared lock file or another worker's artifacts.
+Reconcile later research snapshots and original source/finding keys before any
+filing. A new filename or revalidation run is not a new discovery; all workflows
+must share the mutex and account for its host/filesystem coordination limits.
 
 Write the compatibility processed marker only after every input finding has a
 reasoned disposition, all authorized filings are accounted for, and the complete
