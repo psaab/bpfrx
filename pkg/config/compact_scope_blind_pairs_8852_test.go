@@ -94,11 +94,19 @@ import (
 // starts generating a site for it.
 var knownBlindScopePairs8852 = map[string]string{
 	// Head is a plain container (args==0, no wildcard, has children).
-	"policies global":                    "plain-container",
-	"policy then":                        "plain-container",
-	"routing-options static":             "plain-container",
-	"security alg":                       "plain-container",
-	"security flow":                      "plain-container",
+	"policies global":        "plain-container",
+	"policy then":            "plain-container",
+	"routing-options static": "plain-container",
+	"security alg":           "plain-container",
+	"security flow":          "plain-container",
+	// issue 8873. Their folds ARE measured -- by
+	// TestSecurityTopLevelElisionKeepsContents8873, across all three depths and
+	// on compiled CONTENTS -- but not by arm 2, and a pair leaves this list
+	// only when arm 2 generates a site for it. Registration records that this
+	// arm does not measure them; it is not a claim that they are unfixed.
+	"security policies":                  "plain-container",
+	"security screen":                    "plain-container",
+	"security zones":                     "plain-container",
 	"security-zone address-book":         "plain-container",
 	"security-zone host-inbound-traffic": "plain-container",
 	// Head takes two or more identity args.
