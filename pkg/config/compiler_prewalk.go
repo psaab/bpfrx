@@ -231,6 +231,16 @@ func runPreWalkGates(tree *ConfigTree, opts compileOpts) ([]string, error) {
 		return nil, err
 	}
 
+	// #9017 undeclared address-family token. Same AST-level reason as the
+	// collision gate above: an unknown family compiles to nothing, so by the
+	// time fw.FiltersInet exists there is no trace of it left to validate.
+	fwFamilyTokenWarnings, err := validateFirewallFilterFamilyTokensAST(
+		tree.Children, opts.lenientFirewallFilterFamilyCollisions)
+	if err != nil {
+		return nil, err
+	}
+	fwFilterFamilyWarnings = append(fwFilterFamilyWarnings, fwFamilyTokenWarnings...)
+
 	// #4296 firewall-filter family-any specific-match gate. #4287 dual-compiles a
 	// `family any` filter into BOTH the inet and inet6 pools; a family-specific
 	// match under `family any` (a v4/v6 source/destination-address literal or a

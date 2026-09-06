@@ -1386,7 +1386,19 @@ func TestDepth2UnadmittedPopulation8929(t *testing.T) {
 	// means progress. (#8942: this comment said "50 UNIQUE pairs" beside a
 	// constant reading 24 — a stale claim sitting next to the measurement that
 	// contradicted it.)
-	const wantPopulation = 24
+	const // #9017 grew this by ONE: `family any` is a third firewall filter
+	// family, declared so `set firewall family any filter ... then discard`
+	// stops committing clean and minting zero filters. The pair was MEASURED
+	// before this constant moved, as the ratchet's own message demands --
+	// braced vs the spelling that elides HEAD's brace under MID:
+	//
+	//	(family, inet)   braced 1+0   HEAD-elided 1+0   baseline 0+0
+	//	(family, inet6)  braced 0+1   HEAD-elided 0+1   baseline 0+0
+	//	(family, any)    braced 1+1   HEAD-elided 1+1   baseline 0+0
+	//
+	// It reads SAME, exactly like both siblings, so it does not drop and does
+	// not belong in knownDropping.
+	wantPopulation = 25
 
 	parentAdmitted := func(mid string) bool {
 		for stanza := range setSchema.children {

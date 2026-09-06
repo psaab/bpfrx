@@ -1022,6 +1022,18 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		"from traffic-class",
 		"if-exceeding bandwidth-limit",
 		"if-exceeding burst-size-limit",
+		// #9017: `any` joins its two siblings. The scope pair after a
+		// compoundKey descent is the SUB-KEY, not the compound keyword, so
+		// these read ("inet", "filter") and not ("family", "filter").
+		// Declaring `any` in the schema was necessary and NOT sufficient:
+		// without this entry the compact spelling
+		// `family any filter F { … }` stayed packed, compileFirewall's
+		// `afNode.FindChildren("filter")` found nothing, and the filter
+		// silently vanished -- the SAME zero-filter outcome #9017 reports,
+		// surviving the fix for it in a spelling the original probe did not
+		// use. Caught by TestCompactBlockEquivalenceInventory2419 flagging a
+		// NEW compact-blind site, not by review.
+		"any filter",
 		"inet filter",
 		"inet6 filter",
 		"single-rate committed-burst-size",
