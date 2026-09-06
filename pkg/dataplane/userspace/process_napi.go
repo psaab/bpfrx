@@ -75,6 +75,41 @@ func (m *Manager) bootstrapNAPIQueuesAsyncLocked(reason string) {
 //
 // The probes are sent while ctrl is disabled, so only the local/control
 // boundary reaches the kernel; transit remains fail-closed.
+//
+// WHICH INTERFACES ACTUALLY GET PROBED (#9019). The paragraphs above argue the
+// probes are load-bearing; they said nothing about the interfaces that never
+// received one. The target derivation queried IPv4 ONLY — `RouteList(link,
+// FAMILY_V4)` and `NeighList(idx, FAMILY_V4)`, each additionally filtered
+// through `.To4() != nil` — so an interface with no v4 gateway route and no v4
+// neighbour was skipped unconditionally. That is a v6-only segment ALWAYS,
+// and plausibly a cold-boot LAN segment where this firewall is itself the
+// gateway (no gateway route on that link, empty neighbour table).
+//
+// The skip was also SILENT: a bare `continue`, no log, no counter, no status
+// field, which made it indistinguishable from "this interface was probed
+// successfully". That is what made it expensive rather than merely incomplete,
+// because nothing else covers it either — the binding wedge recovery keys on
+// `Registered && Armed && !Bound`, a bind FAILURE, and its own give-up message
+// records that "binding readiness cannot see a queue that is bound-but-dead";
+// and the XSK liveness gate is box-wide, so one live queue sets
+// `xskLivenessProven` for the whole box and masks a cold one.
+//
+// Both lookups now ask for FAMILY_ALL and `deriveNAPIProbeTarget` applies the
+// priority (v4 gateway, v4 neighbour, v6 gateway, v6 neighbour), so an
+// interface that derived a target before derives the SAME one now and the v6
+// arms are reached only where the old code had already given up. A skip that
+// remains is counted (`NAPIProbeTargetSkips`) and logged with the interface
+// name.
+//
+// NOT done here: the issue also suggests a LAST-RESORT target for a segment
+// with neither a gateway nor a neighbour — the link's own address, or a
+// link-local all-nodes destination. Deliberately left out. The probe works by
+// eliciting a hardware RX event, and a datagram to this box's own address is
+// handled locally without one; a multicast probe might work but its efficacy is
+// unmeasured in this tree, and this file's whole history is a warning against
+// adding or weakening a probe path on a source reading rather than a
+// measurement. Such a segment is now COUNTED as unprobed instead of silently
+// skipped, which is the part that can be acted on.
 func (m *Manager) bootstrapNAPIQueuesLocked() {
 	if m.lastSnapshot == nil || m.lastSnapshot.Config == nil {
 		return
@@ -92,28 +127,26 @@ func (m *Manager) bootstrapNAPIQueuesLocked() {
 		// zero-copy XSK packet reception.
 		link, err := netlink.LinkByName(linuxName)
 		if err != nil || link == nil {
+			// #9019: this `continue` was silent too. An interface named by the
+			// config that the kernel does not have is a different fault from an
+			// unprobeable one, but it has the same consequence here — no
+			// synthetic HW RX event — so it is counted the same way.
+			noteNAPIProbeTargetSkip(linuxName, "link lookup failed")
 			continue
 		}
-		// Find a target: gateway or any neighbor
-		var target string
-		routes, _ := netlink.RouteList(link, netlink.FAMILY_V4)
-		for _, r := range routes {
-			if r.Gw != nil && r.Gw.To4() != nil {
-				target = r.Gw.String()
-				break
-			}
-		}
+		// Find a target: gateway or any neighbour, v4 first then v6.
+		//
+		// #9019: both lookups were FAMILY_V4, so an interface with no v4
+		// gateway route and no v4 neighbour was skipped unconditionally — a
+		// v6-only segment always. FAMILY_ALL asks the kernel once for both and
+		// deriveNAPIProbeTarget applies the priority, which keeps the v4 answer
+		// bit-identical while adding the v6 arms below it.
+		routes, _ := netlink.RouteList(link, netlink.FAMILY_ALL)
+		neighs, _ := netlink.NeighList(link.Attrs().Index, netlink.FAMILY_ALL)
+		target := deriveNAPIProbeTarget(routes, neighs)
 		if target == "" {
-			neighs, _ := netlink.NeighList(link.Attrs().Index, netlink.FAMILY_V4)
-			for _, n := range neighs {
-				if n.IP != nil && n.IP.To4() != nil && n.HardwareAddr != nil &&
-					n.State != netlink.NUD_FAILED {
-					target = n.IP.String()
-					break
-				}
-			}
-		}
-		if target == "" {
+			noteNAPIProbeTargetSkip(linuxName,
+				"no gateway route and no resolved neighbour in either family")
 			continue
 		}
 		targetIP := net.ParseIP(target)
