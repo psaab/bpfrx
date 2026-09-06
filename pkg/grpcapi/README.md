@@ -539,6 +539,30 @@ contract.
   `zeroizeFn==nil` fallback. The rendered/BPF/networkd leg targets in
   `performZeroizeWipe` are package vars so the full primitive is hermetically
   testable end-to-end (no real `/etc`) — production paths unchanged.
+- **The peer fan-out is charged to the REMOTE budget, not the local
+  session-walk budget (#9041 part 2).** `GetSessions`, `GetSessionSummary`,
+  `GetZonePairSummary` and `ClearSessions` acquire `sessionWalkLimiter` with
+  `defer release()` over the whole handler and dialled the peer INSIDE that
+  region. `MaxConcurrentSessionWalks` is 4 and the worst case is `dialPeer` 2s
+  per fabric address (4s dual-fabric) plus the peer RPC (3s; 5s for the clear),
+  so four concurrent requests saturated the budget below 1 rps and `GetStatus`
+  and other genuine LOCAL scans answered `ResourceExhausted` while the local
+  table was untouched — the exact wrong `peer_only_5968.go` names and #7294
+  item 3 fixed for the peer-ONLY paths. These four are the paths #7294 did not
+  reach: on them the slot legitimately covers a real local walk, and only the
+  peer-RTT TAIL is excess. `beginPeerLeg` now hands the request off immediately
+  before the dial — it takes a `RemoteWalkLimiter` slot FIRST and only then
+  releases the local one, so a refused peer leg never costs the caller its
+  local admission for a leg that never runs. Not a loosening: bounded by 4
+  slots before and 4 after (`MaxConcurrentRemoteWalks == MaxConcurrentSessionWalks`);
+  what changes is WHICH budget, so saturating the fan-out can no longer refuse
+  a local scan. A refusal is `ResourceExhausted`, which `peerFetchErrorStatus`
+  already classifies `PEER_FETCH_STATUS_BUSY`, so the peer block is reported
+  refused rather than silently absent (#8306). Under a #5880 lease reuse the
+  release is a no-op and the ancestor's slot is deliberately NOT freed — a
+  descendant must not give away admission it does not own. The handoff lives in
+  the four peer helpers rather than at their six call sites, because a
+  forgotten call site is invisible: it just keeps the old behaviour.
 - **Zeroize erases the upgrade config-DB SNAPSHOTS, not just the live DB
   (#9236).** `/var/lib/xpf/versions/.<ver>.dbsnap` is an unfiltered `copyTree`
   of `ConfigDBDir`, and `master.key` lives INSIDE that directory — so each
