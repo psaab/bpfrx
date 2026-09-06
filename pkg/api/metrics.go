@@ -101,6 +101,11 @@ type xpfCollector struct {
 	admissionRefusalsTotal *prometheus.Desc
 	authzDenialsTotal      *prometheus.Desc
 
+	// #9019: work the dataplane DECLINED to do. Both counters existed with no
+	// reader; see metrics_dataplane_silent_skips_9019.go.
+	napiProbeTargetSkipsTotal *prometheus.Desc
+	learnedRouteCapHitsTotal  *prometheus.Desc
+
 	// Interface counters
 	ifacePacketsTotal *prometheus.Desc
 	ifaceBytesTotal   *prometheus.Desc
@@ -804,6 +809,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.counterReadErrorsTotal
 	c.describeAdmissionRefusals(ch)
 	c.describeAuthzDenials(ch)
+	c.describeDataplaneSilentSkips(ch)
 	ch <- c.ifacePacketsTotal
 	ch <- c.ifaceBytesTotal
 	ch <- c.interfaceCounterReadErrorsTotal
@@ -1175,6 +1181,10 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	// after the dataplane gate would hide them in the case they matter most.
 	defer c.emitAdmissionRefusals(ch)
 	defer c.emitAuthzDenials(ch)
+	// #9019: also before the dataplane gate -- these report a dataplane that
+	// came up incompletely, so gating them on a healthy dataplane would hide
+	// them in precisely the case they exist for.
+	defer c.emitDataplaneSilentSkips(ch)
 
 	// #1799: config-persist health is a control-plane signal — emit it
 	// BEFORE the dataplane gate below so the degraded state stays
