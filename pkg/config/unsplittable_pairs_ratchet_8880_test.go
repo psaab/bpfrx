@@ -333,7 +333,10 @@ func TestUnsplittablePairRatchet8880(t *testing.T) {
 	// Re-derived at this base, twice, not computed as 460 - 8.
 	const (
 		wantArgs2 = 101
-		wantArgs1 = 453
+		// #8928 admitted `ip-monitoring policy`, so exactly one more pair is
+		// in scope and therefore one more is unsplittable. Re-derived by
+		// running the cell at this base, not by adding one to the old value.
+		wantArgs1 = 454
 	)
 	pairs2, _ := unsplittablePairs8880(2)
 	pairs1, conflict1 := unsplittablePairs8880(1)
