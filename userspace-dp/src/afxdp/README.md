@@ -701,6 +701,46 @@ sync.
     extracted `queue_prebuilt_embedded_icmp_error` tail with the #5690 arm
     (HA/fabric finalizer, CoS classify with `flow_key = None`, prebuilt
     forward, never seeds a session).
+  - **#9162 — the embedded-ICMP reply key carries the ROUTING DOMAIN:**
+    `icmp_embed::parse::embedded_reply_key` hardcoded `routing_domain: 0`,
+    justified by the domain-agnostic convention in `session/key.rs`. THE
+    CITATION WAS THE DEFECT: that convention governs the keys an INSTALLED
+    session is INDEXED under (`reverse_wire_key` / `reverse_canonical_key`),
+    whose probes `reverse_match_key` zeroes to match — it says nothing about a
+    key a caller builds and hands to a lookup, which is all
+    `embedded_reply_key` produces. #9271 settled the same distinction on the
+    install side (the NAT64 reverse companion now carries the forward flow's
+    domain); this is its lookup side, and the two must move together.
+    Consequences that were live at `483badf39`:
+      * **NAT64, both directions, dead in any routing instance.**
+        `nat64_match.rs` resolves an INSTALLED session half through
+        `lookup_session_across_scopes`, whose four probes (`key_to_handle`,
+        `forward_wire_index`, and the two shared maps) are every one
+        domain-PRESERVING, and it has no second, domain-agnostic arm. The
+        v6→v4 arm (which resolves the forward session, domain-stamped since
+        #7160) had been dead since #7160; the v4→v6 arm was correct only
+        because the companion was ALSO installed at 0, and #9271 ended that
+        accident. `forwards == 0` means the error is DROPPED, so PMTUD and
+        traceroute across the NAT64 boundary were dead both ways in a VRF.
+      * **The same-family #6474 outbound-SNAT arm** silently disabled in a
+        routing instance: the quote's reply key IS the forward session's
+        primary key there, so a domain-0 probe missed and the #5690 identity
+        reversal put the INTERNAL (pre-NAT) source on the wire instead.
+    The fix threads the caller's domain in.
+    `nat64_match.rs` now derives it with `ingress_routing_domain` the way
+    `nat_match_v4.rs` / `nat_match_v6.rs` already did — that file previously
+    contained ZERO `routing_domain` references while both siblings carried
+    one, which was the issue's own positive control. Passing a real domain is
+    correct in BOTH index families: the exact lookups need it, and the
+    reverse-MATCH index (`find_forward_nat_match`,
+    `lookup_shared_forward_nat_match`) zeroes the probe ITSELF before hitting
+    its bucket and spends the domain on a per-tenant preference, so stamping
+    restores the #7160 demux there rather than breaking it. There is
+    deliberately NO domain-agnostic retry in the NAT64 arm: the only fallback
+    available would be a retry at domain 0, which is not "domain-agnostic" but
+    "the DEFAULT instance" — another tenant's sessions. A flow whose error
+    arrives in a different domain than the flow resolved declines to ordinary
+    flowless enforcement, exactly as before the stamp existed.
 - `frame/` — packet parsing (L2 / L3 / L4), checksum helpers, TCP MSS
   clamp. `tests.rs` was relocated out of `mod.rs` in #1046 Phase 1.
   `headers.rs` holds the consolidated outer-header serializers (#1440).

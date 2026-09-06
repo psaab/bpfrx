@@ -295,6 +295,13 @@ pub(in crate::afxdp::icmp_embed) fn embedded_reply_key(
     // identity is a property of the tunnel, not of the direction — so this is
     // passed through unchanged rather than transformed, unlike the ports.
     discriminator: TunnelDiscriminator,
+    // #9162: the routing domain the CALLER resolved for the quoted flow —
+    // `ingress_routing_domain` on the interface the ICMP error arrived on, the
+    // same value the caller stamps on the forward `embedded_key` it builds
+    // alongside this one. Threaded in rather than hardcoded; see the note
+    // below for why 0 was wrong and why a real domain is safe in every index
+    // this key is probed against.
+    routing_domain: u32,
 ) -> SessionKey {
     let (reply_src_port, reply_dst_port) = embedded_reply_ports(protocol, src_port, dst_port);
     SessionKey {
@@ -305,12 +312,39 @@ pub(in crate::afxdp::icmp_embed) fn embedded_reply_key(
         src_port: reply_src_port,
         dst_port: reply_dst_port,
         discriminator,
-        // #7160 (#2387): a REVERSE-direction key, so domain 0 is the correct
-        // value and not an omission — the reverse-match transforms and index
-        // are domain-agnostic by construction (session/key.rs). The forward
-        // `embedded_key` its callers build alongside this one DOES carry the
-        // arriving interface's domain.
-        routing_domain: 0,
+        // #9162: carry the caller's domain. This used to be a hardcoded 0
+        // justified by the `routing_domain: 0` convention in session/key.rs,
+        // and THE CITATION WAS THE DEFECT — that convention governs the keys an
+        // INSTALLED session is INDEXED UNDER (`reverse_wire_key` /
+        // `reverse_canonical_key`), whose probes `reverse_match_key` zeroes to
+        // match. It says nothing about a key a caller builds and hands to a
+        // lookup, which is all this function produces. #9271 settled the same
+        // distinction on the install side; this is the lookup side of it.
+        //
+        // Both kinds of index this key reaches take a real domain correctly,
+        // and each for its own reason:
+        //
+        //   * EXACT lookups — `lookup_session_across_scopes`, whose four
+        //     probes (`key_to_handle`, `forward_wire_index`, and the two
+        //     shared maps) are every one domain-PRESERVING. A hardcoded 0
+        //     could not reach a session installed in a routing instance at
+        //     all. This is the arm that was broken: for NAT64 it is the ONLY
+        //     arm, so both directions of NAT64 PMTUD/traceroute were dead in a
+        //     VRF (#9162), and for the same-family arms it silently disabled
+        //     the #6474 outbound-SNAT reply-key fallback there.
+        //   * The REVERSE-MATCH index — `find_forward_nat_match` and
+        //     `lookup_shared_forward_nat_match`. Neither requires a zeroed
+        //     probe from its caller: both zero it THEMSELVES
+        //     (`reverse_match_key`) to find the bucket, then spend the domain
+        //     on a preference — the local one as a two-pass walk, the shared
+        //     one as an exact-then-zeroed probe pair. Passing a real domain
+        //     there is therefore not merely safe, it is what restores the
+        //     per-tenant demux #7160 built; passing 0 forced the pre-#7160
+        //     fallback pass for every flow.
+        //
+        // A deployment with no routing-instance interface membership resolves
+        // 0 here, so its behaviour is bit-identical to before.
+        routing_domain,
     }
 }
 
@@ -818,10 +852,12 @@ mod embedded_gre_discriminator_9031_tests {
         let ka = embedded_reply_key(
             libc::AF_INET as u8, a.proto,
             IpAddr::V4(a.src), IpAddr::V4(a.dst), a.src_port, a.dst_port, a.discriminator,
+            0,
         );
         let kb = embedded_reply_key(
             libc::AF_INET as u8, b.proto,
             IpAddr::V4(b.src), IpAddr::V4(b.dst), b.src_port, b.dst_port, b.discriminator,
+            0,
         );
         assert_ne!(
             ka, kb,
@@ -830,6 +866,43 @@ mod embedded_gre_discriminator_9031_tests {
              thing separating them — without it one tunnel's ICMP error resolves \
              against another's session"
         );
+    }
+
+    /// #9162: the reply key must carry the ROUTING DOMAIN the caller resolved.
+    ///
+    /// The unit-level twin of the two poll-path cells in
+    /// `tests_embedded_poll_filter.rs`. This one is cheap and total: it pins
+    /// that the argument reaches the field for BOTH a non-default domain and
+    /// the default one, so restoring a `routing_domain: 0` literal reds here
+    /// even if someone deletes the fixture cells.
+    ///
+    /// The old literal was justified by the reverse-MATCH convention in
+    /// `session/key.rs`, which governs the keys an INSTALLED session is
+    /// INDEXED under — not a probe a caller builds. Every index this key is
+    /// looked up in either preserves the domain (the exact ones) or zeroes the
+    /// probe itself (`find_forward_nat_match` /
+    /// `lookup_shared_forward_nat_match`), so a caller's real domain is
+    /// correct in all of them.
+    #[test]
+    fn the_reply_key_carries_the_callers_routing_domain_9162() {
+        let hdr = parse_embedded_v4(&quoted_v4_gre(KEY_FLAG, &42u32.to_be_bytes()), 0)
+            .expect("parse");
+        for domain in [0u32, 7, 460_657] {
+            let reply = embedded_reply_key(
+                libc::AF_INET as u8, hdr.proto,
+                IpAddr::V4(hdr.src), IpAddr::V4(hdr.dst), hdr.src_port, hdr.dst_port,
+                hdr.discriminator,
+                domain,
+            );
+            assert_eq!(
+                reply.routing_domain, domain,
+                "#9162: the reply key must carry the domain its caller resolved. \
+                 Hardcoding 0 made this probe unable to reach any session \
+                 installed in a routing instance -- which is every NAT64 session \
+                 in a VRF, since `nat64_match.rs` has no second, \
+                 domain-agnostic arm to fall back to"
+            );
+        }
     }
 
     /// The checksum field is SKIPPED, not validated, and the Key sits AFTER it.
@@ -955,6 +1028,7 @@ mod embedded_gre_discriminator_9031_tests {
             libc::AF_INET as u8, hdr.proto,
             IpAddr::V4(hdr.src), IpAddr::V4(hdr.dst), hdr.src_port, hdr.dst_port,
             hdr.discriminator,
+            0,
         );
         assert_eq!(
             reply.discriminator,

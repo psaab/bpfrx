@@ -43,7 +43,7 @@ fn no_match_embedded_icmp_returns_none() {
 
     let mut sessions = SessionTable::new();
     // Don't install any sessions
-    let result = try_embedded_icmp_session_match_from_frame(&frame, meta, &mut sessions, 1_000_000);
+    let result = try_embedded_icmp_session_match_from_frame(&frame, meta, &mut sessions, 1_000_000, 0);
     assert!(
         result.is_none(),
         "should return None when no session matches"
@@ -690,6 +690,16 @@ const N6472_WAN_GW_MAC: [u8; 6] = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
 /// companion is keyed on the v4 reply tuple `(server:port → pool:xlated)`
 /// with `is_reverse = true`; BOTH halves carry `nat64_reverse`.
 fn n6472_install_sessions(sessions: &mut SessionTable, now_ns: u64) {
+    n6472_install_sessions_in_domain(sessions, now_ns, 0);
+}
+
+/// #9162: the same two halves, installed in routing domain `domain`. The
+/// production cold path stamps `SessionKey.routing_domain` from the ingress
+/// interface (`poll_descriptor/mod.rs`, the #7160 stamp site) and — since
+/// #9033/#9271 — carries that same domain onto the NAT64 v4 reverse
+/// companion, so a fixture that hardcodes 0 while the forwarding state has a
+/// routing-instance membership no longer describes any real deployment.
+fn n6472_install_sessions_in_domain(sessions: &mut SessionTable, now_ns: u64, domain: u32) {
     let fwd_nat = NatDecision {
         rewrite_src: Some(IpAddr::V4(n6472_pool_v4())),
         rewrite_dst: Some(IpAddr::V4(n6472_server_v4())),
@@ -711,7 +721,7 @@ fn n6472_install_sessions(sessions: &mut SessionTable, now_ns: u64) {
             src_port: N6472_CLIENT_PORT,
             dst_port: N6472_SERVER_PORT,
                     discriminator: Default::default(),
-                    routing_domain: 0,
+                    routing_domain: domain,
         },
         SessionDecision {
             resolution: ForwardingResolution {
@@ -758,7 +768,7 @@ fn n6472_install_sessions(sessions: &mut SessionTable, now_ns: u64) {
             src_port: N6472_SERVER_PORT,
             dst_port: N6472_XLATED_PORT,
                     discriminator: Default::default(),
-                    routing_domain: 0,
+                    routing_domain: domain,
         },
         SessionDecision {
             resolution: ForwardingResolution {
@@ -1050,6 +1060,323 @@ fn poll_descriptor_nat64_icmp_error_v6_to_v4_translated_on_flowless_path_6472() 
     assert!(binding.scratch.scratch_recycle.is_empty());
 }
 
+// ---------------------------------------------------------------------------
+// #9162: the SAME two NAT64 ICMP-error translations, in a NON-DEFAULT routing
+// instance.
+//
+// The two `_6472` cells above run on a snapshot with no routing-instance
+// membership, so `ingress_routing_domain` resolves 0 on both sides and every
+// key in the path agrees at 0 by accident. That is the blind spot #9033's own
+// commit message recorded ("no cell in the tree combines NAT64 with an ICMP
+// error AND routing domains"), and it is why the V4->V6 arm could regress
+// under #9271 with the whole suite green.
+//
+// The cells below are the SAME drivers with one variable changed — the routing
+// domain — so a red at domain 7 beside a green at domain 0 is attributable to
+// the domain and to nothing else.
+// ---------------------------------------------------------------------------
+
+/// `nat64_snapshot` with every interface a member of routing instance
+/// `domain`. Domain 0 reproduces `nat64_snapshot` exactly (the field's
+/// default), which is what makes the reference arm below a true control
+/// rather than a different fixture.
+fn n9162_nat64_snapshot_in_domain(policy: PolicyRuleSnapshot, domain: u32) -> ConfigSnapshot {
+    let mut snapshot = nat64_snapshot(policy);
+    for iface in snapshot.interfaces.iter_mut() {
+        iface.routing_domain = domain;
+    }
+    snapshot
+}
+
+/// What the flowless arm produced, reduced to the facts both directions'
+/// assertions read. Captured rather than asserted inside the driver so the
+/// domain-0 reference arm and the domain-7 arm share one assertion body.
+struct N9162Outcome {
+    forwards: usize,
+    prebuilt: Option<Vec<u8>>,
+    target_ifindex: i32,
+    flow_key_none: bool,
+    sessions_delta: i64,
+    recycles: usize,
+}
+
+/// Drive the v4->v6 (RFC 7915 4.2) arm with everything in routing instance
+/// `domain`. Asserts the FIXTURE precondition — that the domain the poll loop
+/// would stamp really is `domain` — because a fixture whose interfaces carry a
+/// routing instance the forwarding build dropped would make every cell below
+/// vacuous in exactly the way #9033's were.
+fn n9162_run_v4_to_v6(domain: u32) -> N9162Outcome {
+    let router_ip = Ipv4Addr::new(172, 16, 80, 1);
+    let mut frame = build_icmp_te_frame_v4(
+        router_ip,
+        n6472_pool_v4(),
+        n6472_server_v4(),
+        N6472_XLATED_PORT,
+        N6472_SERVER_PORT,
+        PROTO_TCP,
+    );
+    n6472_patch_ptb(&mut frame, 34);
+
+    let forwarding = build_forwarding_state(&n9162_nat64_snapshot_in_domain(
+        lan_to_wan_permit("8.8.8.8/32", "permit-nat64-v4"),
+        domain,
+    ));
+    assert_eq!(
+        crate::afxdp::forwarding::ingress_routing_domain(&forwarding, 12, 0, None),
+        domain,
+        "fixture precondition: the ICMPv4 error ingresses on reth0.80 (ifindex 12), \
+         and the domain the poll loop stamps from that interface must be the domain \
+         this cell is parameterised on — otherwise the cell measures nothing"
+    );
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 12, 0);
+    binding.interface = Arc::<str>::from("reth0.80");
+    let mut sessions = SessionTable::new();
+    n6472_install_sessions_in_domain(&mut sessions, 123_000_000_000, domain);
+    let sessions_before = sessions.len();
+
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        ingress_ifindex: 12,
+        l3_offset: 14,
+        l4_offset: 34,
+        payload_offset: 42,
+        pkt_len: frame.len() as u16,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        tcp_flags: 0,
+        dscp: 0,
+        config_generation: 7,
+        fib_generation: 9,
+        ..UserspaceDpMeta::default()
+    };
+    txn_run_descriptor(&mut binding, &mut sessions, &forwarding, &ha_state, &frame, meta);
+    n9162_capture(&binding, sessions.len() as i64 - sessions_before as i64)
+}
+
+/// Drive the v6->v4 (RFC 7915 5.2) arm with everything in routing instance
+/// `domain`.
+fn n9162_run_v6_to_v4(domain: u32) -> N9162Outcome {
+    let lan_router: Ipv6Addr = "2001:559:8585:ef00::fe".parse().expect("lan v6 router");
+    let frame = build_icmpv6_te_frame(
+        lan_router,
+        n6472_pref64_server(),
+        n6472_client_v6(),
+        N6472_SERVER_PORT,
+        N6472_CLIENT_PORT,
+        PROTO_TCP,
+    );
+
+    let forwarding = build_forwarding_state(&n9162_nat64_snapshot_in_domain(
+        lan_to_wan_permit("8.8.8.8/32", "permit-nat64-v4"),
+        domain,
+    ));
+    assert_eq!(
+        crate::afxdp::forwarding::ingress_routing_domain(&forwarding, 24, 0, None),
+        domain,
+        "fixture precondition: the ICMPv6 error ingresses on reth1.0 (ifindex 24), \
+         and the domain the poll loop stamps from that interface must be the domain \
+         this cell is parameterised on"
+    );
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+    n6472_install_sessions_in_domain(&mut sessions, 123_000_000_000, domain);
+    let sessions_before = sessions.len();
+
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        ingress_ifindex: 24,
+        l3_offset: 14,
+        l4_offset: 54,
+        payload_offset: 62,
+        pkt_len: frame.len() as u16,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_ICMPV6,
+        tcp_flags: 0,
+        dscp: 0,
+        config_generation: 7,
+        fib_generation: 9,
+        ..UserspaceDpMeta::default()
+    };
+    txn_run_descriptor(&mut binding, &mut sessions, &forwarding, &ha_state, &frame, meta);
+    n9162_capture(&binding, sessions.len() as i64 - sessions_before as i64)
+}
+
+fn n9162_capture(binding: &BindingWorker, sessions_delta: i64) -> N9162Outcome {
+    let forwards = binding.scratch.scratch_forwards.len();
+    let (prebuilt, target_ifindex, flow_key_none) = match binding.scratch.scratch_forwards.first() {
+        Some(fwd) => (
+            match &fwd.frame {
+                PendingForwardFrame::Prebuilt(bytes) => Some(bytes.clone()),
+                _ => None,
+            },
+            fwd.target_ifindex,
+            fwd.flow_key.is_none(),
+        ),
+        None => (None, 0, false),
+    };
+    N9162Outcome {
+        forwards,
+        prebuilt,
+        target_ifindex,
+        flow_key_none,
+        sessions_delta,
+        recycles: binding.scratch.scratch_recycle.len(),
+    }
+}
+
+/// The v4->v6 translated-content assertions, byte-for-byte the `_6472` cell's,
+/// applied to whatever domain the driver ran in.
+fn n9162_assert_v4_to_v6(out: &N9162Outcome, domain: u32) {
+    assert_eq!(
+        out.forwards, 1,
+        "the NAT64 v4->v6 ICMP error translation must queue exactly one prebuilt \
+         forward in routing domain {domain}. 0 forwards means the quote's reply key \
+         missed the installed v4 reverse companion and the error was DROPPED by \
+         flowless enforcement -- PMTUD dead toward the client (#9162)"
+    );
+    let outb = out
+        .prebuilt
+        .as_ref()
+        .expect("the NAT64 error translation must queue a PREBUILT frame");
+    let o = outb.as_slice();
+    assert_eq!(&o[0..6], &N6472_CLIENT_MAC, "eth dst = client MAC");
+    assert_eq!(&o[6..12], &N6472_LAN_SRC_MAC, "eth src = LAN unit MAC");
+    assert_eq!(&o[12..14], &[0x86, 0xdd], "ethertype IPv6");
+    let expect_router_v6: Ipv6Addr = "64:ff9b::ac10:5001".parse().expect("Pref64::router");
+    assert_eq!(
+        &o[14 + 8..14 + 24],
+        &expect_router_v6.octets(),
+        "outer src = Pref64::router"
+    );
+    assert_eq!(
+        &o[14 + 24..14 + 40],
+        &n6472_client_v6().octets(),
+        "outer dst = v6 client"
+    );
+    assert_eq!(o[14 + 6], PROTO_ICMPV6, "next header ICMPv6");
+    let icmp6 = &o[14 + 40..];
+    assert_eq!(icmp6[0], 2, "ICMPv6 Packet Too Big type");
+    let mtu = u32::from_be_bytes([icmp6[4], icmp6[5], icmp6[6], icmp6[7]]);
+    assert_eq!(mtu, 1420, "PTB MTU = v4 next-hop MTU + NAT64 header delta");
+    let emb = &icmp6[8..];
+    assert_eq!(&emb[8..24], &n6472_client_v6().octets(), "embedded src = client");
+    assert_eq!(
+        &emb[24..40],
+        &n6472_pref64_server().octets(),
+        "embedded dst = Pref64::server"
+    );
+    assert_eq!(
+        &emb[40..42],
+        &N6472_CLIENT_PORT.to_be_bytes(),
+        "embedded src port restored to the ORIGINAL client port"
+    );
+    assert_eq!(
+        out.target_ifindex, 24,
+        "translated error egresses toward the client"
+    );
+    assert!(out.flow_key_none, "the error never seeds a session/flow-cache entry");
+    assert_eq!(out.sessions_delta, 0, "no new session minted");
+    assert_eq!(out.recycles, 0, "a queued prebuilt forward owns the descriptor");
+}
+
+/// The v6->v4 translated-content assertions, byte-for-byte the `_6472` cell's.
+fn n9162_assert_v6_to_v4(out: &N9162Outcome, domain: u32) {
+    assert_eq!(
+        out.forwards, 1,
+        "the NAT64 v6->v4 ICMP error translation must queue exactly one prebuilt \
+         forward in routing domain {domain}. 0 forwards means the quote's reply key \
+         missed the installed FORWARD session and the error was dropped -- PMTUD dead \
+         toward the server (#9162)"
+    );
+    let outb = out
+        .prebuilt
+        .as_ref()
+        .expect("the NAT64 error translation must queue a PREBUILT frame");
+    let o = outb.as_slice();
+    assert_eq!(&o[0..6], &N6472_WAN_GW_MAC, "eth dst = WAN gateway MAC");
+    assert_eq!(&o[6..12], &N6472_WAN_SRC_MAC, "eth src = WAN unit MAC");
+    assert_eq!(&o[12..14], &[0x81, 0x00], "802.1Q tag present (VLAN 80)");
+    assert_eq!(&o[16..18], &[0x08, 0x00], "ethertype IPv4 after the tag");
+    let ip = &o[18..];
+    assert_eq!(&ip[12..16], &n6472_pool_v4().octets(), "outer src = pool address");
+    assert_eq!(&ip[16..20], &n6472_server_v4().octets(), "outer dst = v4 server");
+    assert_eq!(ip[9], PROTO_ICMP, "protocol ICMPv4");
+    let icmp = &ip[20..];
+    assert_eq!(icmp[0], 11, "ICMPv4 Time Exceeded type");
+    let emb = &icmp[8..];
+    assert_eq!(&emb[12..16], &n6472_server_v4().octets(), "embedded src = server");
+    assert_eq!(&emb[16..20], &n6472_pool_v4().octets(), "embedded dst = pool");
+    assert_eq!(
+        &emb[22..24],
+        &N6472_XLATED_PORT.to_be_bytes(),
+        "embedded dst port restored to the TRANSLATED pool port"
+    );
+    assert_eq!(
+        out.target_ifindex, 12,
+        "translated error egresses toward the server"
+    );
+    assert!(out.flow_key_none, "the error never seeds a session/flow-cache entry");
+    assert_eq!(out.sessions_delta, 0, "no new session minted");
+    assert_eq!(out.recycles, 0, "a queued prebuilt forward owns the descriptor");
+}
+
+/// #9162 REFERENCE ARM (domain 0 — the default instance). Runs the exact
+/// drivers the two domain-7 cells run, with the one variable set to 0.
+///
+/// It is not redundant with the `_6472` cells: those pin the ORIGINAL fixture,
+/// this pins the PARAMETERISED one, so a fix that repairs domain 7 by breaking
+/// domain 0 — trading one tenant for another — reds here rather than passing
+/// two single-direction assertions.
+#[test]
+fn poll_descriptor_nat64_icmp_error_both_arms_default_instance_9162() {
+    n9162_assert_v4_to_v6(&n9162_run_v4_to_v6(0), 0);
+    n9162_assert_v6_to_v4(&n9162_run_v6_to_v4(0), 0);
+}
+
+/// #9162 (v4->v6, RFC 7915 4.2) IN A ROUTING INSTANCE. The ICMPv4 error's
+/// quote resolves the installed v4 REVERSE companion, which since #9033/#9271
+/// carries the forward flow's routing domain. `embedded_reply_key` hardcoded
+/// `routing_domain: 0`, and `lookup_session_across_scopes` is exact on all
+/// four of its indexes (`key_to_handle`, `forward_wire_index`, and the two
+/// shared maps are every one domain-PRESERVING), so a domain-0 probe could not
+/// reach a domain-7 companion and the error was dropped.
+///
+/// This arm is the REGRESSION half: it passed before #9271 only because the
+/// companion was installed at 0 too — probe and entry agreed on a value that
+/// was wrong on both sides.
+///
+/// Fail-on-revert: restore `routing_domain: 0` in `embedded_reply_key` and
+/// this cell reds with `forwards == 0` while the reference arm above stays
+/// green.
+#[test]
+fn poll_descriptor_nat64_icmp_error_v4_to_v6_in_routing_instance_9162() {
+    n9162_assert_v4_to_v6(&n9162_run_v4_to_v6(7), 7);
+}
+
+/// #9162 (v6->v4, RFC 7915 5.2) IN A ROUTING INSTANCE — the issue's original
+/// subject. The ICMPv6 error's quote resolves the installed FORWARD session,
+/// whose key has ALWAYS been domain-stamped at the #7160 stamp site, so this
+/// arm has been broken since #7160 rather than since #9271.
+///
+/// `nat64_match.rs` carried ZERO `routing_domain` references while its
+/// same-family siblings `nat_match_v4.rs` / `nat_match_v6.rs` both derive one
+/// via `ingress_routing_domain` — that asymmetry is the issue's own positive
+/// control, and this cell is what makes it observable.
+///
+/// Fail-on-revert: drop the `ingress_routing_domain` stamp in `nat64_match.rs`
+/// and this cell reds with `forwards == 0`.
+#[test]
+fn poll_descriptor_nat64_icmp_error_v6_to_v4_in_routing_instance_9162() {
+    n9162_assert_v6_to_v4(&n9162_run_v6_to_v4(7), 7);
+}
+
 /// #6472 negative (fail-closed anti-spoof gate): an ICMPv4 error whose
 /// OUTER destination is NOT the quote's source is not about this session's
 /// wire packet (RFC 792: an error is addressed to the offending packet's
@@ -1271,6 +1598,10 @@ fn n6474_install_snat_session(
     server_ip: IpAddr,
     snat_ip: IpAddr,
     addr_family: u8,
+    // #9162: the routing domain the production stamp site would put on this
+    // forward key. 0 for every pre-existing cell (no routing-instance
+    // membership); non-zero for the VRF twins below.
+    routing_domain: u32,
 ) {
     assert!(sessions.install_with_protocol(
         SessionKey {
@@ -1281,7 +1612,7 @@ fn n6474_install_snat_session(
             src_port: 12345,
             dst_port: 80,
                     discriminator: Default::default(),
-                    routing_domain: 0,
+                    routing_domain,
         },
         SessionDecision {
             resolution: ForwardingResolution {
@@ -1392,6 +1723,7 @@ fn poll_descriptor_snat_outbound_icmp_error_renat_v4_6474() {
         IpAddr::V4(server_ip),
         IpAddr::V4(snat_ip),
         libc::AF_INET as u8,
+        0,
     );
     let sessions_before = sessions.len();
 
@@ -1480,6 +1812,7 @@ fn poll_descriptor_snat_outbound_icmp_error_renat_v6_6474() {
         IpAddr::V6(server_v6),
         IpAddr::V6(snat_v6),
         libc::AF_INET6 as u8,
+        0,
     );
 
     let meta = n6474_meta(24, libc::AF_INET6 as u8, PROTO_ICMPV6, frame.len());
@@ -1531,6 +1864,192 @@ fn poll_descriptor_snat_outbound_icmp_error_renat_v6_6474() {
     assert!(fwd.flow_key.is_none());
 }
 
+// ---------------------------------------------------------------------------
+// #9162: the SAME-FAMILY embedded-ICMP reply key in a NON-DEFAULT routing
+// instance.
+//
+// `embedded_reply_key` is shared by the NAT64 arm and by the two same-family
+// arms, so threading the domain into it changes `nat_match_v4` /
+// `nat_match_v6` too. Nothing in the tree could SEE that change: every
+// same-family embedded-ICMP cell also runs at domain 0. These two cells make
+// it observable, so the same-family half of the fix is measured rather than
+// argued.
+//
+// The #6474 outbound-SNAT shape is the right vehicle because it is the arm
+// that depends on the reply key reaching an EXACT
+// `lookup_session_across_scopes` — the quote's reply key IS the forward
+// session's primary key. (The inbound #5690 shape resolves through
+// `lookup_forward_nat_across_scopes`, which zeroes its own probe and so cannot
+// distinguish the two values.)
+// ---------------------------------------------------------------------------
+
+/// `nat_snapshot` with `allow_embedded_icmp` and every interface in routing
+/// instance `domain`.
+fn n9162_snat_snapshot_in_domain(domain: u32) -> ConfigSnapshot {
+    let mut snapshot = nat_snapshot();
+    snapshot.flow.allow_embedded_icmp = true;
+    for iface in snapshot.interfaces.iter_mut() {
+        iface.routing_domain = domain;
+    }
+    snapshot
+}
+
+/// #9162 (same-family v4, the #6474 outbound-SNAT shape) IN A ROUTING
+/// INSTANCE. The internal host's ICMP error quotes the session's reply, so
+/// the quote's REPLY key is the forward session's primary key — an exact
+/// lookup against a domain-stamped installed session.
+///
+/// Fail-on-revert: pass `0` instead of `embedded_routing_domain` at the
+/// `embedded_reply_key` call in `nat_match_v4::match_outer_v4` (or restore the
+/// hardcoded literal in `embedded_reply_key`) and this cell reds — the reply
+/// key misses, no outbound-SNAT match is marked, and the #5690 identity
+/// reversal leaks the INTERNAL source instead.
+#[test]
+fn poll_descriptor_snat_outbound_icmp_error_renat_v4_in_routing_instance_9162() {
+    let client_ip = Ipv4Addr::new(10, 0, 61, 102);
+    let server_ip = Ipv4Addr::new(1, 1, 1, 1);
+    let snat_ip = Ipv4Addr::new(172, 16, 80, 8);
+
+    let mut frame = build_icmp_te_frame_v4(client_ip, server_ip, client_ip, 80, 12345, PROTO_TCP);
+    frame[34] = 3;
+    frame[35] = 3;
+    frame[36] = 0;
+    frame[37] = 0;
+    let icmp_csum = checksum16(&frame[34..]);
+    frame[36..38].copy_from_slice(&icmp_csum.to_be_bytes());
+
+    let forwarding = build_forwarding_state(&n9162_snat_snapshot_in_domain(7));
+    assert_eq!(
+        crate::afxdp::forwarding::ingress_routing_domain(&forwarding, 24, 0, None),
+        7,
+        "fixture precondition: the error ingresses on reth1.0 (ifindex 24) and the \
+         domain stamped from it must be 7, or this cell measures nothing"
+    );
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+    n6474_install_snat_session(
+        &mut sessions,
+        IpAddr::V4(client_ip),
+        IpAddr::V4(server_ip),
+        IpAddr::V4(snat_ip),
+        libc::AF_INET as u8,
+        7,
+    );
+
+    let meta = n6474_meta(24, libc::AF_INET as u8, PROTO_ICMP, frame.len());
+    txn_run_descriptor(&mut binding, &mut sessions, &forwarding, &ha_state, &frame, meta);
+
+    assert_eq!(
+        binding.scratch.scratch_forwards.len(),
+        1,
+        "the outbound SNAT ICMP error must still be re-NAT'd and queued in a \
+         routing instance"
+    );
+    let fwd = &binding.scratch.scratch_forwards[0];
+    let out = match &fwd.frame {
+        PendingForwardFrame::Prebuilt(bytes) => bytes,
+        _ => panic!("the outbound re-NAT must queue a PREBUILT frame"),
+    };
+    let ip = &out[18..];
+    assert_eq!(
+        &ip[12..16],
+        &snat_ip.octets(),
+        "#9162: outer src re-NAT'd to the SNAT address. A domain-0 reply key \
+         misses the domain-7 session, the outbound-SNAT mark never fires, and \
+         the #5690 reversal puts the INTERNAL client address on the wire"
+    );
+    let icmp = &ip[20..];
+    let emb = &icmp[8..];
+    assert_eq!(
+        &emb[16..20],
+        &snat_ip.octets(),
+        "#9162: embedded quote dst re-NAT'd to the external identity"
+    );
+    assert_eq!(
+        &emb[22..24],
+        &40000u16.to_be_bytes(),
+        "#9162: embedded quote dst port re-NAT'd to the translated value"
+    );
+}
+
+/// #9162 (same-family v6 / SNAT66) IN A ROUTING INSTANCE — the twin of the
+/// cell above, covering the SECOND `embedded_reply_key` call in
+/// `nat_match_v6::match_outer_v6` (the `shared_reverse_key`, built from the
+/// NPTv6-translated source), which is a distinct call site from the first.
+///
+/// Fail-on-revert: pass `0` at that call and this cell reds while the v4 twin
+/// stays green — the two same-family arms are scored separately on purpose.
+#[test]
+fn poll_descriptor_snat_outbound_icmp_error_renat_v6_in_routing_instance_9162() {
+    let client_v6: Ipv6Addr = "2001:559:8585:ef00::102".parse().expect("client v6");
+    let server_v6: Ipv6Addr = "2001:db8::1".parse().expect("server v6");
+    let snat_v6: Ipv6Addr = "2001:559:8585:80::8".parse().expect("snat v6 (reth0.80)");
+
+    let mut frame = build_icmpv6_te_frame(client_v6, server_v6, client_v6, 80, 12345, PROTO_TCP);
+    let l4 = 54;
+    frame[l4] = 1;
+    frame[l4 + 1] = 4;
+    frame[l4 + 2] = 0;
+    frame[l4 + 3] = 0;
+    let icmp6_csum = checksum16_ipv6(client_v6, server_v6, PROTO_ICMPV6, &frame[l4..]);
+    frame[l4 + 2..l4 + 4].copy_from_slice(&icmp6_csum.to_be_bytes());
+
+    let forwarding = build_forwarding_state(&n9162_snat_snapshot_in_domain(7));
+    assert_eq!(
+        crate::afxdp::forwarding::ingress_routing_domain(&forwarding, 24, 0, None),
+        7,
+        "fixture precondition: the domain stamped from reth1.0 must be 7"
+    );
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+    n6474_install_snat_session(
+        &mut sessions,
+        IpAddr::V6(client_v6),
+        IpAddr::V6(server_v6),
+        IpAddr::V6(snat_v6),
+        libc::AF_INET6 as u8,
+        7,
+    );
+
+    let meta = n6474_meta(24, libc::AF_INET6 as u8, PROTO_ICMPV6, frame.len());
+    txn_run_descriptor(&mut binding, &mut sessions, &forwarding, &ha_state, &frame, meta);
+
+    assert_eq!(
+        binding.scratch.scratch_forwards.len(),
+        1,
+        "the outbound SNAT66 ICMPv6 error must still be re-NAT'd and queued in a \
+         routing instance"
+    );
+    let fwd = &binding.scratch.scratch_forwards[0];
+    let out = match &fwd.frame {
+        PendingForwardFrame::Prebuilt(bytes) => bytes,
+        _ => panic!("the outbound re-NAT must queue a PREBUILT frame"),
+    };
+    let ip = &out[18..];
+    assert_eq!(
+        &ip[8..24],
+        &snat_v6.octets(),
+        "#9162: outer src re-NAT'd to the SNAT66 address. With a domain-0 reply \
+         key the domain-7 session is unreachable and the internal source leaks"
+    );
+    let icmp = &ip[40..];
+    let emb = &icmp[8..];
+    assert_eq!(
+        &emb[24..40],
+        &snat_v6.octets(),
+        "#9162: embedded quote dst re-NAT'd to the external identity"
+    );
+    assert_eq!(
+        &emb[42..44],
+        &40000u16.to_be_bytes(),
+        "#9162: embedded quote dst port re-NAT'd to the translated value"
+    );
+}
+
 /// #6474 marker pin (match level): the OUTBOUND mark fires ONLY for a pure
 /// source-NAT flow (rewrite_src set, no dst NAT) matched via the quote's
 /// reply key. A DNAT-only flow's outbound-direction error keeps the
@@ -1556,6 +2075,7 @@ fn embedded_icmp_outbound_snat_marker_scoping_6474() {
         IpAddr::V4(server_ip),
         IpAddr::V4(snat_ip),
         libc::AF_INET as u8,
+        0,
     );
     let frame = build_icmp_te_frame_v4(client_ip, server_ip, client_ip, 80, 12345, PROTO_TCP);
     let m = try_embedded_icmp_nat_match_from_frame(
@@ -1651,6 +2171,7 @@ fn embedded_icmp_outbound_snat_marker_scoping_6474() {
         IpAddr::V4(server_ip),
         IpAddr::V4(snat_ip),
         libc::AF_INET as u8,
+        0,
     );
     let inbound_frame = build_icmp_te_frame_v4(
         Ipv4Addr::new(172, 16, 80, 1),
@@ -4736,7 +5257,7 @@ fn the_as_is_embedded_key_carries_the_discriminator_9031() {
     ));
 
     assert!(
-        try_embedded_icmp_session_match_from_frame(&frame, meta, &mut sessions, 123_100_000_000)
+        try_embedded_icmp_session_match_from_frame(&frame, meta, &mut sessions, 123_100_000_000, 0)
             .is_some(),
         "#9031: the as-is embedded key found no session for a quoted GRE tunnel \
          whose session is keyed on exactly that tuple. SessionKey's Eq includes \
@@ -4821,7 +5342,7 @@ fn the_as_is_embedded_key_does_not_cross_tunnels_9031() {
     ));
 
     assert!(
-        try_embedded_icmp_session_match_from_frame(&frame, meta, &mut sessions, 123_100_000_000)
+        try_embedded_icmp_session_match_from_frame(&frame, meta, &mut sessions, 123_100_000_000, 0)
             .is_none(),
         "#9031: a quote naming tunnel key 40001 matched the session for tunnel \
          key 40000. GRE has no L4 ports, so without the discriminator the two \

@@ -54,6 +54,16 @@ pub(in crate::afxdp::icmp_embed) fn match_outer_v4(
         hdr.src_port,
         hdr.dst_port,
         hdr.discriminator,
+        // #9162: the SAME domain the forward `embedded_key` above carries, not
+        // a hardcoded 0. This key is probed against both kinds of index and a
+        // real domain is right for both — the exact
+        // `lookup_session_across_scopes` fallback below could not otherwise
+        // reach a session installed in a routing instance (which silently
+        // disabled the #6474 outbound-SNAT reply-key arm there), and
+        // `lookup_forward_nat_across_scopes` zeroes the probe itself before
+        // hitting its bucket, spending the domain on the two-pass tenant
+        // preference instead. See `embedded_reply_key`.
+        embedded_routing_domain,
     );
 
     // Forward-NAT-by-reverse path: the embedded packet matches the
