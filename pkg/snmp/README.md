@@ -569,6 +569,36 @@ packet handlers, and MIB view that call into them.
   leading zeros then prepend one `0x00` if `buf[0]&0x80 != 0`. TimeTicks lacked
   this (#4924): `sysUpTime` and v1/v2 link-trap timestamps at `>= 0x80000000`
   hundredths (~248.5 days uptime) encoded as non-canonical/negative BER.
+- **OID sub-identifiers are bounded to RFC 2578 §7.1.3's `0..4294967295` at the
+  DECODER (#9133).** They used to be modelled as a platform-width SIGNED `int`
+  with no bound, and three symptoms followed from that one modelling choice: a
+  crafted GET with a long continuation run made `berDecodeOID` return a NEGATIVE
+  component with no error; `berEncodeSubID`'s `val < 0x80` fast path is true for
+  every negative value, so re-encoding emitted a lone continuation octet — and
+  since `echoVarbinds` puts the REQUEST OIDs into the response, the agent
+  answered with BER its own decoder rejects; and `oidCompare`'s signed `<` sorted
+  a huge sub-id BEFORE 1, so a GETNEXT from one restarted at the top of the
+  subtree. `berDecodeOID` is the only entry point from the wire, so bounding it
+  (a `uint64` accumulator checked BEFORE each shift) fixes all three, and
+  `berEncodeSubID`'s parameter is now `uint32` so the bad case is
+  unrepresentable rather than checked. `oidCompare` is deliberately unchanged —
+  with the decoder bounded it only ever sees `0..4294967295`. Components are
+  carried as `[]int`, so a compile-time constant guards that `int` is wider than
+  32 bits; a 32-bit target fails to build rather than wrapping large sub-ids
+  negative. The FOLDED first two arcs are deliberately NOT bounded: X.690
+  §8.19.4 packs them into one octet and `berDecodeOID` reconstructs them as
+  `data[0]/40` / `data[0]%40`, so a first octet above `0x77` yields a first arc
+  above 2 — invalid ASN.1 that nonetheless round-trips byte for byte, and
+  rejecting it would replace a faithful echo of the client's own OID with an
+  empty one.
+- **A varbind whose OID fails to decode is SKIPPED, not rejected — an RFC 1157
+  §4.1.2 arity violation.** `decodePDUFields` `continue`s past it, so a
+  two-varbind GET with one undecodable OID gets a `noError` response carrying
+  ONE varbind. Measured, pre-existing (reachable at master via the same
+  function's "sub-identifier truncated" error, e.g. `06 02 2b 80`), pinned by
+  `TestAnUndecodableVarbindIsSkippedNotRejected9133` and tracked as #9333: the
+  remedy is a decision about all five `continue` arms in that loop, not about
+  OID bounds.
 - Exception values: `noSuchObject` (0x80), `noSuchInstance` (0x81),
   `endOfMibView` (0x82) — emitted for missing OIDs in walks.
 - GETNEXT walking order is driven by a static OID list; it must stay in

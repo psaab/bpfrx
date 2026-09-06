@@ -3,6 +3,7 @@ package snmp
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 )
 
 // --- ASN.1 BER codec + OID helpers ---
@@ -11,6 +12,43 @@ import (
 // encode/decode, the Counter32/Gauge32/Counter64/TimeTicks/OID/integer
 // encoders, the PDU field decoder, and the OID comparison helpers.
 // Extracted verbatim from agent.go (#5661 modularity cohort).
+
+// maxOIDSubIdentifier is the upper bound RFC 2578 §7.1.3 puts on an OID
+// sub-identifier: "the value range for each sub-identifier is 0..4294967295",
+// i.e. an unsigned 32-bit integer.
+//
+// #9133: the codec modelled sub-identifiers as a platform-width SIGNED `int`
+// with no bound at all, and every consequence followed from that one modelling
+// choice rather than from three separate defects:
+//
+//   - `berDecodeOID` accumulated `val = (val << 7) | int(data[i]&0x7f)` over an
+//     unbounded continuation run, so a crafted GET with ten continuation octets
+//     (70 bits) returned a NEGATIVE component with NO error;
+//   - `berEncodeSubID`'s `if val < 0x80 { return []byte{byte(val)} }` is true
+//     for every negative value, so re-encoding such a component emitted a lone
+//     continuation octet — malformed BER the agent's OWN decoder rejects
+//     ("ber: OID sub-identifier truncated"). `echoVarbinds` puts the REQUEST
+//     OIDs into the response, so a crafted request made the agent emit a reply
+//     it could not itself parse;
+//   - `oidCompare` compares components with a signed `<`, so a huge sub-id
+//     sorted BEFORE 1 and a GETNEXT from it restarted at the top of the subtree.
+//
+// Bounding the DECODER is what fixes all three: an out-of-range component can
+// no longer enter the OID list from the wire, so the encoder's guard below and
+// `oidCompare`'s signed comparison are both operating on 0..4294967295 and are
+// correct as written. `oidCompare` is therefore deliberately unchanged — it was
+// the least load-bearing of the three sites, and rewriting it would have left
+// the actual entry point open.
+const maxOIDSubIdentifier = math.MaxUint32
+
+// Compile-time guard for the SECOND half of the title: "platform-width".
+// Components are carried as `[]int`, so `int` must be able to hold
+// maxOIDSubIdentifier for the carry to be lossless. This constant expression is
+// negative — and a uint constant overflow, i.e. a compile error — on a platform
+// whose `int` is 32 bits. xpf builds for amd64/arm64 only; if a 32-bit target
+// is ever added, this fails to build rather than silently wrapping every large
+// sub-identifier negative, which is #9133 restored by the back door.
+const _ uint = uint(^uint(0)>>1) - maxOIDSubIdentifier
 
 // oidHasPrefix checks if oid starts with prefix.
 func oidHasPrefix(oid, prefix []int) bool {
@@ -143,7 +181,25 @@ func berEncodeTimeTicks(hundredths int) []byte {
 	return buf
 }
 
-// berEncodeOID encodes an OID value (without tag/length).
+// berEncodeOID encodes an OID value (without tag/length). Returns nil — the
+// existing "not encodable" signal, already used for an OID with fewer than two
+// components — when any component past the first two is outside RFC 2578's
+// 0..4294967295 (#9133).
+//
+// Reachability, stated precisely rather than assumed: with berDecodeOID bounded
+// this guard cannot fire on a wire-sourced OID, so it is defence in depth
+// against an internal bug, not the fix. It matters anyway because the
+// alternative is silent: berEncodeSubID's old first branch turned a negative
+// component into a lone continuation octet, and nothing downstream could tell
+// that apart from a real encoding.
+//
+// The first two components are deliberately NOT bounded here. X.690 §8.19.4
+// folds them into one octet, and berDecodeOID reconstructs them as
+// `data[0]/40` and `data[0]%40` — which for a first octet above 0x77 yields a
+// first arc above 2, technically invalid ASN.1 that nonetheless round-trips
+// byte-for-byte. Rejecting it would replace a faithful echo of the client's own
+// OID with an empty one, which is worse for the client and is not what #9133 is
+// about.
 func berEncodeOID(oid []int) []byte {
 	if len(oid) < 2 {
 		return nil
@@ -152,13 +208,22 @@ func berEncodeOID(oid []int) []byte {
 	var encoded []byte
 	encoded = append(encoded, byte(oid[0]*40+oid[1]))
 	for i := 2; i < len(oid); i++ {
-		encoded = append(encoded, berEncodeSubID(oid[i])...)
+		if oid[i] < 0 || uint64(oid[i]) > maxOIDSubIdentifier {
+			return nil
+		}
+		encoded = append(encoded, berEncodeSubID(uint32(oid[i]))...)
 	}
 	return encoded
 }
 
 // berEncodeSubID encodes a single OID sub-identifier using base-128 encoding.
-func berEncodeSubID(val int) []byte {
+//
+// #9133: the parameter is `uint32`, RFC 2578's actual sub-identifier type, so
+// the out-of-range case is UNREPRESENTABLE at the call rather than checked
+// inside. The old `int` parameter's `val < 0x80` fast path was true for every
+// negative value and returned `byte(val)` — 0xFF for -1 — a lone continuation
+// octet with no terminator.
+func berEncodeSubID(val uint32) []byte {
 	if val < 0x80 {
 		return []byte{byte(val)}
 	}
@@ -267,7 +332,18 @@ func berDecodeOctetString(data []byte) ([]byte, []byte, error) {
 	return data[headerLen : headerLen+length], data[headerLen+length:], nil
 }
 
-// berDecodeOID decodes the raw bytes of a BER-encoded OID value into integer components.
+// berDecodeOID decodes the raw bytes of a BER-encoded OID value into integer
+// components.
+//
+// #9133: the accumulator is `uint64` and is bounded by RFC 2578's
+// maxOIDSubIdentifier BEFORE each shift, so a sub-identifier that would exceed
+// the standard's range is an ERROR rather than a silently wrapped value. This
+// is the entry point that makes the whole family safe: no out-of-range
+// component can reach berEncodeSubID or oidCompare from the wire.
+//
+// The bound also terminates an unbounded continuation run: five significant
+// octets already exceed 32 bits, so any longer run is rejected at the octet
+// that overflows rather than accumulating for as long as the PDU is.
 func berDecodeOID(data []byte) ([]int, error) {
 	if len(data) == 0 {
 		return nil, fmt.Errorf("ber: empty OID")
@@ -276,19 +352,27 @@ func berDecodeOID(data []byte) ([]int, error) {
 	oid := []int{int(data[0]) / 40, int(data[0]) % 40}
 	i := 1
 	for i < len(data) {
-		val := 0
+		var val uint64
 		for {
 			if i >= len(data) {
 				return nil, fmt.Errorf("ber: OID sub-identifier truncated")
 			}
-			val = (val << 7) | int(data[i]&0x7f)
+			// Checked BEFORE the shift: the pre-shift bound leaves val below
+			// 2^25, so the shift itself can never overflow the accumulator —
+			// no reasoning about the accumulator's width is required.
+			if val > maxOIDSubIdentifier>>7 {
+				return nil, fmt.Errorf(
+					"ber: OID sub-identifier exceeds the RFC 2578 maximum (%d)",
+					uint64(maxOIDSubIdentifier))
+			}
+			val = (val << 7) | uint64(data[i]&0x7f)
 			if data[i]&0x80 == 0 {
 				i++
 				break
 			}
 			i++
 		}
-		oid = append(oid, val)
+		oid = append(oid, int(val))
 	}
 	return oid, nil
 }
