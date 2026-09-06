@@ -822,7 +822,13 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 	ripNode := node.FindChild("rip")
 	if ripNode != nil {
 		proto.RIP = &RIPConfig{}
-		for _, child := range ripNode.Children {
+		// #8939: `set protocols rip authentication-key K authentication-type md5`
+		// nests the TYPE under the KEY, so this loop saw only the key and
+		// AuthType stayed "". AuthTypeIsMD5("") is false, so pkg/frr renders
+		// `ip rip authentication mode text` and puts the operator's key on the
+		// wire in CLEARTEXT -- and AuthTypeUnrecognized("") is ALSO false, so
+		// #8443's downgrade warning does not fire either.
+		for _, child := range expandFlatRun(ripNode.Children, ripLeafSchema8939()) {
 			switch child.Name() {
 			case "group":
 				for _, gc := range child.Children {
@@ -861,7 +867,10 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 	isisNode := node.FindChild("isis")
 	if isisNode != nil {
 		proto.ISIS = &ISISConfig{Level: "level-2"}
-		for _, child := range isisNode.Children {
+		// #8939, and the same cleartext downgrade as `rip` above: a dropped
+		// authentication-type renders `area-password clear` / `domain-password
+		// clear` instead of `md5`.
+		for _, child := range expandFlatRun(isisNode.Children, isisLeafSchema8939()) {
 			switch child.Name() {
 			case "net":
 				if len(child.Keys) >= 2 {
@@ -933,7 +942,9 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 					if appendISISIface {
 						iface = &ISISInterface{Name: child.Keys[1]}
 					}
-					for _, prop := range child.Children {
+					// #8939: per-interface authentication has the same
+					// cleartext-downgrade shape as the area-level pair above.
+					for _, prop := range expandFlatRun(child.Children, isisInterfaceSchema8939()) {
 						switch prop.Name() {
 						case "level":
 							if len(prop.Keys) >= 2 {
