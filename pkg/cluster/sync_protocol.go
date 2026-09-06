@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"math"
 	"net"
-	"strings"
 	"time"
 
 	"github.com/psaab/xpf/pkg/dataplane"
@@ -798,19 +797,78 @@ func encodeIPsecSAPayload(names []string) []byte {
 	return []byte(joined)
 }
 
-// decodeIPsecSAPayload decodes a newline-separated list of IPsec connection names.
-func decodeIPsecSAPayload(payload []byte) []string {
+// Bounds on a peer-supplied IPsec SA full set (#9061).
+//
+// The only bound in the chain was the 16 MiB frame ceiling in sync_conn_read.go,
+// and the old decoder was `strings.Split(string(payload), "\n")`. Measured at
+// the ceiling:
+//
+//	16 MiB of "\n"    -> 16,777,217 parts, 272.1 MB transient, 0 names retained
+//	16 MiB of "a\n"   -> 8,388,609 parts,  674.8 MB transient, 128 MB RETAINED
+//
+// The retained set is the sharper end, twice over. Every one-byte name produced
+// by strings.Split is a SUBSTRING sharing the payload's backing array, so the
+// whole 16 MiB stays reachable for as long as any name does. And
+// reinitiateIPsecSAs iterates the retained set ON TAKEOVER, calling
+// InitiateConnection per name -- 8.4 M exec-shaped calls on the failover path,
+// so the cost lands exactly when the cluster is least able to absorb it.
+//
+// The listener binds the fabric address and HMAC verification runs before this,
+// so in a keyed cluster the sender is authenticated. It is not always keyed:
+// sync_auth_strict_7441.go records that an unkeyed connection is a pass-through
+// and that a stream admitted while unkeyed keeps injecting frames after a key is
+// committed unless `chassis cluster strict-session-auth` is set.
+const (
+	// maxIPsecSANames bounds the element count. A chassis carrying more than
+	// four thousand IPsec connections is far outside what this product targets,
+	// and the sender is the peer's own live SA list -- not a set an operator
+	// grows by accident.
+	maxIPsecSANames = 4096
+	// maxIPsecSANameLen bounds one name. strongSwan connection names are
+	// identifiers; 256 bytes is well past any real one and stops a single
+	// enormous "name" standing in for the element bound.
+	maxIPsecSANameLen = 256
+)
+
+// decodeIPsecSAPayload decodes a newline-separated list of IPsec connection
+// names, and reports whether the frame is malformed.
+//
+// MALFORMED MEANS REFUSE, NOT TRUNCATE, and the arm beside this one in
+// sync_conn_read.go already states why for its own full set: "a full set
+// REPLACES, so installing a stale or truncated one is worse than installing
+// nothing." A truncated SA set would make the standby reinitiate a SUBSET on
+// takeover and look like it succeeded. Keeping the previous set is the
+// recoverable outcome -- the next good frame replaces it.
+//
+// Each name is COPIED. strings.Split would hand back substrings of the payload,
+// so a single retained one-byte name pins the entire frame; scanning and
+// converting per name is what makes the retained size proportional to the names
+// rather than to the frame.
+func decodeIPsecSAPayload(payload []byte) ([]string, bool) {
 	if len(payload) == 0 {
-		return nil
+		return nil, false
 	}
-	parts := strings.Split(string(payload), "\n")
 	var names []string
-	for _, p := range parts {
-		if p != "" {
-			names = append(names, p)
+	for len(payload) > 0 {
+		line := payload
+		if i := bytes.IndexByte(payload, '\n'); i >= 0 {
+			line, payload = payload[:i], payload[i+1:]
+		} else {
+			payload = nil
 		}
+		if len(line) == 0 {
+			continue
+		}
+		if len(line) > maxIPsecSANameLen {
+			return nil, true
+		}
+		if len(names) >= maxIPsecSANames {
+			return nil, true
+		}
+		// string(line) copies; the frame's backing array is not retained.
+		names = append(names, string(line))
 	}
-	return names
+	return names, false
 }
 
 // --- #3931 config-sync generation wire codec ------------------------------

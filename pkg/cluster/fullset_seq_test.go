@@ -294,7 +294,7 @@ func TestIPsecFullSetDelimOldDecoderRecoversAllNames(t *testing.T) {
 	frame := appendIPsecFullSetSeq(encodeIPsecSAPayload(names), 0x1122334455667788, 42)
 
 	// OLD receiver: decode the whole frame with NO trailer strip.
-	got := decodeIPsecSAPayload(frame)
+	got, _ := decodeIPsecSAPayload(frame)
 	if len(got) < 2 {
 		t.Fatalf("old decoder must recover both real names, got %v", got)
 	}
@@ -332,7 +332,7 @@ func TestIPsecFullSetDelimNewRoundTripExact(t *testing.T) {
 	if n := len(stripped); n > 0 && stripped[n-1] == ipsecFullSetDelim {
 		t.Fatalf("stripIPsecFullSetDelim must remove the trailing delimiter; stripped=%q", stripped)
 	}
-	got := decodeIPsecSAPayload(stripped)
+	got, _ := decodeIPsecSAPayload(stripped)
 	if len(got) != 2 || got[0] != "vpn-gw1" || got[1] != "vpn-gw2" {
 		t.Fatalf("new->new roundtrip must decode EXACTLY [vpn-gw1 vpn-gw2] with no trailing empty name, got %v (len %d)", got, len(got))
 	}
@@ -341,7 +341,7 @@ func TestIPsecFullSetDelimNewRoundTripExact(t *testing.T) {
 	// protect) and round-trips to no names.
 	emptyFrame := appendIPsecFullSetSeq(encodeIPsecSAPayload(nil), 1, 1)
 	eBase, _, _ := stripFullSetSeq(emptyFrame)
-	if got := decodeIPsecSAPayload(stripIPsecFullSetDelim(eBase)); len(got) != 0 {
+	if got, _ := decodeIPsecSAPayload(stripIPsecFullSetDelim(eBase)); len(got) != 0 {
 		t.Fatalf("empty IPsec set must round-trip to no names, got %v", got)
 	}
 }

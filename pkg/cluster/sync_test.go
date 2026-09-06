@@ -464,7 +464,7 @@ func TestDecodeSessionV6Short(t *testing.T) {
 func TestIPsecSAPayloadRoundTrip(t *testing.T) {
 	names := []string{"vpn-site-a", "vpn-site-b", "tunnel-corp"}
 	payload := encodeIPsecSAPayload(names)
-	decoded := decodeIPsecSAPayload(payload)
+	decoded, _ := decodeIPsecSAPayload(payload)
 
 	if len(decoded) != len(names) {
 		t.Fatalf("count mismatch: got %d, want %d", len(decoded), len(names))
@@ -478,7 +478,7 @@ func TestIPsecSAPayloadRoundTrip(t *testing.T) {
 
 func TestIPsecSAPayloadEmpty(t *testing.T) {
 	payload := encodeIPsecSAPayload(nil)
-	decoded := decodeIPsecSAPayload(payload)
+	decoded, _ := decodeIPsecSAPayload(payload)
 	if len(decoded) != 0 {
 		t.Fatalf("expected empty, got %d", len(decoded))
 	}

@@ -522,7 +522,17 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		// between the SA name list and the trailer so a new->new roundtrip
 		// leaves no trailing empty name. A legacy / pre-fold frame has no
 		// delimiter, so this is a no-op for it.
-		names := decodeIPsecSAPayload(stripIPsecFullSetDelim(base))
+		names, malformed := decodeIPsecSAPayload(stripIPsecFullSetDelim(base))
+		if malformed {
+			// #9061: same refusal the persistent-NAT and DHCP full-set arms
+			// make, for the same reason -- a full set REPLACES, so installing a
+			// truncated one is worse than installing nothing. The standby keeps
+			// the set it has until a good frame arrives, rather than
+			// reinitiating a SUBSET on takeover and appearing to succeed.
+			slog.Warn("cluster sync: refusing a malformed IPsec SA full set",
+				"payload_bytes", len(payload), "incarnation", incarnation, "seq", seq)
+			return
+		}
 		s.peerIPsecSAsMu.Lock()
 		s.peerIPsecSAs = names
 		s.peerIPsecSAsMu.Unlock()
