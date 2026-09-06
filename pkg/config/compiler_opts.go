@@ -541,6 +541,11 @@ type compileOpts struct {
 	// a failure to load, on the path whose whole purpose is that a persisted
 	// config comes up (#1960). The render site warns in both directions.
 	lenientAuthTypeAbsent bool
+	// lenientMultiLeafSelfRepeat downgrades the #9027 ambiguity rejection to a
+	// warning on the tolerant paths. A config an older binary accepted must
+	// still BOOT; on that path the existing readers keep their behaviour and
+	// the warning says which of the two readings the operator is getting.
+	lenientMultiLeafSelfRepeat bool
 
 	// lenientDynamicAddressFeedRef (#3300) downgrades the
 	// `security dynamic-address address-name <addr> profile feed-name <feed>`
@@ -2628,6 +2633,7 @@ func lenientCompileOpts() compileOpts {
 		lenientIPsecManualKey:                  true,
 		lenientLogProfileStreamRef:             true,
 		lenientAuthTypeAbsent:                  true,
+		lenientMultiLeafSelfRepeat:             true,
 		lenientDynamicAddressFeedRef:           true,
 		lenientDuplicateNamedBlock:             true,
 		lenientDuplicateNATRuleName:            true,

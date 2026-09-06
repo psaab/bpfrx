@@ -225,6 +225,17 @@ func runPreWalkGates(tree *ConfigTree, opts compileOpts) ([]string, error) {
 	// expanded, inactive-pruned AST because the colliding definitions are merged
 	// away by last-write-wins by the time fw.FiltersInet exists — only the raw
 	// AST still carries every family's definition.
+	// #9027: a multi-value run repeating its own keyword is ambiguous, and the
+	// two readers of that shape guess OPPOSITE ways -- one drops the token, one
+	// accepts it as a value, and at `api-auth api-key` accepting it mints a
+	// predictable credential. Refuse rather than guess. AST-level, because the
+	// ambiguity is in the authored spelling and is gone by the time either
+	// reader has produced its list.
+	selfRepeatWarnings, err := validateMultiLeafSelfRepeat9027(tree, opts.lenientMultiLeafSelfRepeat)
+	if err != nil {
+		return nil, err
+	}
+
 	fwFilterFamilyWarnings, err := validateFirewallFilterFamilyCollisionsAST(
 		tree.Children, opts.lenientFirewallFilterFamilyCollisions)
 	if err != nil {
@@ -240,6 +251,7 @@ func runPreWalkGates(tree *ConfigTree, opts compileOpts) ([]string, error) {
 		return nil, err
 	}
 	fwFilterFamilyWarnings = append(fwFilterFamilyWarnings, fwFamilyTokenWarnings...)
+	fwFilterFamilyWarnings = append(fwFilterFamilyWarnings, selfRepeatWarnings...)
 
 	// #4296 firewall-filter family-any specific-match gate. #4287 dual-compiles a
 	// `family any` filter into BOTH the inet and inet6 pools; a family-specific
