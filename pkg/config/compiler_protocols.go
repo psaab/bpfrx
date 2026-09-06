@@ -297,7 +297,9 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 				proto.BGP.LogNeighborChanges = true
 			case "multipath":
 				proto.BGP.Multipath = 64 // default to 64 when enabled
-				for _, mc := range child.Children {
+				// #8939: split the packed run — see
+				// bgp_multipath_schema_8939.go.
+				for _, mc := range expandFlatRun(child.Children, bgpMultipathSchema8939()) {
 					switch mc.Name() {
 					case "multiple-as":
 						proto.BGP.MultipathMultipleAS = true
