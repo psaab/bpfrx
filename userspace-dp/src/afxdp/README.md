@@ -1460,11 +1460,21 @@ the delete verb un-files too and masks the mechanism without it.
 
 `HashMap::retain` is O(**capacity**), not O(len), and pruning does not shrink the
 allocation's high-water capacity. Capacity is bounded by the number of distinct
-owner-RG ids ever filed — single digits on a real chassis cluster, but the helper
-does not enforce that: `metadata.owner_rg_id` arrives from the peer as a raw
-`i32` and every positive value is filed. Bounding it at the import boundary is
-worth doing and is not done today. The walk runs once per authoritative removal
-(never per refresh) on the control thread, and allocates nothing.
+owner-RG ids ever filed — single digits on a real chassis cluster.
+
+**Two corrections to what this paragraph used to say (#9053).** It claimed the
+helper "does not enforce that" and that bounding at the import boundary "is
+worth doing and is not done today". **#8486 enforces it at the filing**, and
+declined filings are counted (`owner_rg_filings_declined_total`,
+`owner_rg_bound_8486_tests.rs`). And it claimed the walk runs "on the **control
+thread**". It does not: `remove_shared_session` — the walk's caller — is invoked
+from `session_delta.rs:520` and `:530`, **twice per Close delta, on WORKER
+threads**. A comment asserting a threading property that is false is how the
+next reader concludes a lock is uncontended and stops measuring it, which is
+exactly the reader this file exists to inform.
+
+What survives unchanged: the walk runs once per authoritative removal (never per
+refresh), and allocates nothing.
 
 ## Which of the four blocking calls can leave the ServerState lock (#7209 item 2)
 
