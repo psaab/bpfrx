@@ -4085,3 +4085,279 @@ fn gre_decapped_nat64_icmp_error_reads_the_inner_frame_8271() {
          wrong or absent if the outer frame was parsed"
     );
 }
+
+/// #9030: a PURE-DNAT flow must reach the embedded-ICMP NAT reversal.
+///
+/// Closed #3112 landed the destination-side reversal builders, their struct
+/// fields and their regression tests, and the production caller could not
+/// reach any of it: the gate in `try_reverse_embedded_icmp_error` tested
+/// `rewrite_src.is_none()`, and a pure-DNAT decision is
+/// `rewrite_dst: Some(_), rewrite_src: None`. The existing #3112 cells call the
+/// builders DIRECTLY, so they stayed green over an unreachable path -- which is
+/// why this cell drives `poll_binding_process_descriptor`, the real call site.
+///
+/// Fail-on-revert: restore the gate to `rewrite_src.is_none()` and nothing is
+/// queued, so `scratch_forwards` is empty and this test goes RED.
+#[test]
+fn poll_descriptor_embedded_icmp_reversal_reachable_for_pure_dnat_9030() {
+    let router_ip = Ipv4Addr::new(10, 0, 0, 1);
+    let vip_ip = Ipv4Addr::new(172, 16, 80, 8);
+    let client_ip = Ipv4Addr::new(10, 0, 61, 102);
+    let server_ip = Ipv4Addr::new(1, 1, 1, 1);
+    let client_port: u16 = 12345;
+
+    // Outer: router -> CLIENT (an ICMP error travels back to the original
+    // source); embedded quoted: client:client_port -> server:80, i.e. the
+    // POST-DNAT tuple as it appeared on the wire toward the real server.
+    let frame = build_icmp_te_frame_v4(router_ip, client_ip, server_ip, client_port, 80, PROTO_TCP);
+
+    // allow_embedded_icmp gates the poll-path reversal — enable it.
+    let mut snapshot = nat_snapshot();
+    snapshot.flow.allow_embedded_icmp = true;
+    let forwarding = build_forwarding_state(&snapshot);
+
+    // The error ingresses on the WAN (reth0.80, ifindex 12) since it is
+    // addressed to the SNAT address; the reversal resolves egress toward the
+    // client on the LAN (reth1.0, ifindex 24), so learn the client neighbor.
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 12, 0);
+    binding.interface = Arc::<str>::from("reth0.80");
+
+    let meta_len = std::mem::size_of::<UserspaceDpMeta>();
+    let frame_offset = 128;
+    let meta_offset = frame_offset - meta_len;
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: meta_len as u16,
+        ingress_ifindex: 12,
+        l3_offset: 14,
+        l4_offset: 34,
+        payload_offset: 42,
+        pkt_len: frame.len() as u16,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        tcp_flags: 0,
+        dscp: 0,
+        config_generation: 7,
+        fib_generation: 9,
+        ..UserspaceDpMeta::default()
+    };
+    let meta_bytes = unsafe {
+        std::slice::from_raw_parts((&meta as *const UserspaceDpMeta).cast::<u8>(), meta_len)
+    };
+    unsafe {
+        binding
+            .umem
+            .area()
+            .slice_mut_unchecked(meta_offset, meta_len)
+            .expect("meta slice")
+            .copy_from_slice(meta_bytes);
+        binding
+            .umem
+            .area()
+            .slice_mut_unchecked(frame_offset, frame.len())
+            .expect("frame slice")
+            .copy_from_slice(&frame);
+    }
+    binding.xsk.rx.push_for_test(XdpDesc {
+        addr: frame_offset as u64,
+        len: frame.len() as u32,
+        options: 0,
+    });
+
+    let ident = binding.identity();
+    let binding_lookup = WorkerBindingLookup::from_bindings(std::slice::from_ref(&binding));
+    let mirror_targets = MirrorTargetMap::default();
+    let ha_state = BTreeMap::new();
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::default());
+    // Neighbor toward the client on the LAN unit so the reversed error resolves
+    // a tx interface + MAC (egress ifindex 24).
+    learn_dynamic_neighbor(
+        &forwarding,
+        &dynamic_neighbors,
+        24,
+        0,
+        IpAddr::V4(client_ip),
+        [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+    );
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let ike_exchanges = Arc::new(crate::afxdp::forwarding::IkeExchangeTable::new());
+    let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
+    let last_resolution = Arc::new(Mutex::new(None));
+    let peer_worker_commands = Vec::new();
+    let dnat_fds = DnatTableFds::default();
+    let rg_epochs = std::array::from_fn(|_| AtomicU32::new(0));
+    let (event_handle, _event_rx) = crate::event_stream::test_worker_handle(
+        8,
+        crate::event_stream::DataplaneEventRateLimitConfig {
+            events_per_second: 0,
+            burst: 0,
+        },
+    );
+    let __pptp_control_7699 = std::sync::Arc::new(crate::session::pptp_control::PptpControlInbox::default());
+    let worker_ctx = WorkerContext {
+        pptp_control: &__pptp_control_7699,
+        ident: &ident,
+        binding_lookup: &binding_lookup,
+        mirror_targets: &mirror_targets,
+        forwarding: &forwarding,
+        ha_state: &ha_state,
+        dynamic_neighbors: &dynamic_neighbors,
+        neighbor_resolver: None,
+        shared_sessions: &shared_sessions,
+        shared_nat_sessions: &shared_nat_sessions,
+        shared_forward_wire_sessions: &shared_forward_wire_sessions,
+        shared_owner_rg_indexes: &shared_owner_rg_indexes,
+        ike_exchanges: &ike_exchanges,
+        slow_path: None,
+        event_stream: Some(&event_handle),
+        local_tunnel_deliveries: &local_tunnel_deliveries,
+        recent_exceptions: &recent_exceptions,
+        last_resolution: &last_resolution,
+        peer_worker_commands: &peer_worker_commands,
+        worker_commands_by_id: crate::afxdp::empty_worker_commands_by_id(),
+        dnat_fds: &dnat_fds,
+        rg_epochs: &rg_epochs,
+        cold_path_sample_mask: 0xff,
+    };
+
+    // Install the forward NAT session (client:client_port -> server:80 SNAT'd
+    // to snat_ip:snat_port) so the embedded reversal can recover the client.
+    let mut sessions = SessionTable::new();
+    assert!(sessions.install_with_protocol(
+        SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(client_ip),
+            dst_ip: IpAddr::V4(vip_ip),
+            src_port: client_port,
+            dst_port: 80,
+                    discriminator: Default::default(),
+                    routing_domain: 0,
+        },
+        SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 12,
+                tx_ifindex: 12,
+                tunnel_endpoint_id: 0,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 1))),
+                neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
+                src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+                tx_vlan_id: 80,
+            },
+            nat: NatDecision {
+                // PURE DNAT: no source rewrite at all. This is the decision
+                // shape the #9030 gate declined.
+                rewrite_src: None,
+                rewrite_dst: Some(IpAddr::V4(server_ip)),
+                rewrite_src_port: None,
+                rewrite_dst_port: None,
+                nat64: false,
+                nptv6: false,
+            },
+        },
+        SessionMetadata {
+            ingress_zone: TEST_LAN_ZONE_ID,
+            egress_zone: TEST_WAN_ZONE_ID,
+            ingress_ifindex: 0,
+            ingress_vlan_id: 0,
+            owner_rg_id: 0,
+            fabric_ingress: false,
+            is_reverse: false,
+            nat64_reverse: None,
+            log_session_init: false,
+            log_session_close: false,
+            policy_id: 0,
+            inactivity_timeout_ns: None,
+            policy_counter_idx: 0,
+            policy_counter: None,
+        },
+        123_000_000_000,
+        PROTO_TCP,
+        0x18,
+    ));
+    let sessions_before = sessions.len();
+
+    let mut screen = ScreenState::new();
+    let mut batch = BatchCounters::default();
+    let mut dbg = DebugPollCounters::default();
+    let mut telemetry = TelemetryContext {
+        dbg: &mut dbg,
+        counters: &mut batch,
+    };
+    let area_ptr = binding.umem.area() as *const MmapArea;
+
+    poll_binding_process_descriptor(
+        &mut binding,
+        0,
+        area_ptr,
+        1,
+        &mut sessions,
+        &mut screen,
+        ValidationState {
+            snapshot_installed: true,
+            config_generation: 7,
+            fib_generation: 9,
+        },
+        123_000_000_000,
+        123,
+        0,
+        0,
+        -1,
+        -1,
+        &worker_ctx,
+        &mut telemetry,
+    );
+
+    // The load-bearing #9030 assertion: a PURE-DNAT flow reaches the reversal at
+    // all. Before the gate was widened, `rewrite_src.is_none()` returned
+    // NotHandled here and nothing was queued.
+    assert_eq!(
+        binding.scratch.scratch_forwards.len(),
+        1,
+        "a pure-DNAT flow must reach the embedded-ICMP reversal on the real poll \
+         path -- the SNAT-only gate declined it, which made every builder #3112 \
+         landed unreachable from production (#9030)"
+    );
+    let fwd = &binding.scratch.scratch_forwards[0];
+    let reversed = match &fwd.frame {
+        PendingForwardFrame::Prebuilt(bytes) => bytes,
+        _ => panic!("embedded-ICMP reversal must queue a PREBUILT reversed frame"),
+    };
+    assert_eq!(reversed[34], 11, "reversed frame stays an ICMP Time Exceeded");
+    let outer_dst = Ipv4Addr::new(reversed[30], reversed[31], reversed[32], reversed[33]);
+    assert_eq!(outer_dst, client_ip, "the error still travels to the client");
+    // Embedded IP at eth(14)+outerIP(20)+ICMP(8)=42; inner DST at +16 = 58.
+    // THIS is what #3112 built and #9030 makes reachable: the client's PMTUD
+    // matches on the quote, so the quoted destination must be the VIP it
+    // actually addressed, not the internal server it was DNAT'd to.
+    let embedded_dst = Ipv4Addr::new(reversed[58], reversed[59], reversed[60], reversed[61]);
+    assert_eq!(
+        embedded_dst, vip_ip,
+        "embedded inner DESTINATION must be reverse-translated from the internal \
+         server back to the VIP the client addressed -- otherwise the client sees \
+         an error quoting a packet it never sent and PMTUD to the VIP is broken"
+    );
+    // The inner SOURCE is the client and was never translated: it must be left
+    // alone. A reversal that rewrote it would corrupt the quote.
+    let embedded_src = Ipv4Addr::new(reversed[54], reversed[55], reversed[56], reversed[57]);
+    assert_eq!(
+        embedded_src, client_ip,
+        "a pure-DNAT flow has no source translation; the inner source must be untouched"
+    );
+    assert!(
+        fwd.flow_key.is_none(),
+        "reversed ICMP error must carry flow_key=None (never seeds a session)"
+    );
+    assert_eq!(
+        sessions.len(),
+        sessions_before,
+        "the ICMP error must not seed a new session"
+    );
+}

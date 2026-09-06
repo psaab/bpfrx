@@ -104,13 +104,32 @@ pub(super) fn try_reverse_embedded_icmp_error(
             icmp_match.resolution.neighbor_mac,
         );
     }
-    // Preserve the historical gate: reverse only when a source rewrite (SNAT)
-    // was recorded. A flow with no source translation leaves the inner quoted
-    // source unchanged, so no reversal is required — fall through to normal
-    // flowless handling. (Kept byte-identical to the previously-unreachable
-    // block so this fix stays a pure reachability change; widening the gate to
-    // DNAT-only / port-only is tracked separately.)
-    if icmp_match.nat.rewrite_src.is_none() {
+    // Reverse whenever the forward flow recorded ANY translation. Decline only
+    // a genuinely untranslated flow, whose inner quote already matches what the
+    // client sent.
+    //
+    // #9030: this gate used to read `rewrite_src.is_none()` — SNAT-only — and
+    // the comment it carried ("a flow with no source translation leaves the
+    // inner quoted source unchanged, so no reversal is required") is true of
+    // the SOURCE and says nothing about the destination. For a pure-DNAT flow
+    // the decision is `rewrite_dst: Some(_), rewrite_src: None`, so the gate
+    // fired and returned NotHandled — which made every builder, struct field
+    // and regression test #3112 landed for exactly that case unreachable from
+    // production. `build_nat_reversed_icmp_error_v4/v6` have one production
+    // caller each, below this line.
+    //
+    // The builders were already complete for the widened set, which is why this
+    // is a pure reachability change and touches no builder: the destination
+    // ADDRESS restore is guarded by `had_dst_nat` (rewrite_dst), the
+    // destination PORT restore by `rewrite_dst_port || rewrite_dst`, and the
+    // source restores by `rewrite_src_port || rewrite_src`. Each arm tests its
+    // own field, so admitting DNAT-only, port-only or static-NAT flows cannot
+    // half-restore a quote — an arm whose field is None simply does not fire.
+    if icmp_match.nat.rewrite_src.is_none()
+        && icmp_match.nat.rewrite_dst.is_none()
+        && icmp_match.nat.rewrite_src_port.is_none()
+        && icmp_match.nat.rewrite_dst_port.is_none()
+    {
         #[cfg(feature = "debug-log")]
         if icmpv6_trace {
             debug_log!("ICMPV6_EMBED: no_rewrite nat={:?}", icmp_match.nat);
