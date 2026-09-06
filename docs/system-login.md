@@ -474,6 +474,36 @@ Matching is **partial**, not anchored: `allow-commands "show interfaces"` admits
 is only coherent if the default is partial, and the anchored spelling works
 too.
 
+> **An anchor cuts in OPPOSITE directions for allow and for deny, and only the
+> allow direction is illustrated above (#9022).**
+>
+> Partial matching makes an **allow** wider than its text — `allow-commands
+> "show interfaces"` admits `show interfaces terse`, which is the permissive
+> direction and is the one operators notice.
+>
+> It makes an **anchored deny narrower** than operators generally intend, and
+> that is the direction nobody notices, because the command still runs:
+>
+> ```
+> deny-commands "^show log$"
+>
+>   show log        canonical "show log"       DENIED
+>   show log 100    canonical "show log 100"   ALLOWED   <- same journalctl command
+>   show log messages                          ALLOWED
+> ```
+>
+> `show log` accepts arguments (`AcceptsArgs` in the operational tree), so the
+> canonical string carries them and the `$` no longer matches. `show log 100`
+> runs the very command the rule denies. **Write the deny unanchored** —
+> `deny-commands "show log"` — unless you specifically mean to deny only the
+> bare form and permit every argument form of the same command.
+>
+> This is distinct from the #8289 case, which is covered: appending a *sibling
+> keyword* rather than an argument (`show version configuration` under
+> `deny-commands "^show version$"`) yields an unresolvable canonical command and
+> **fails closed**. The hole is confined to nodes that legitimately accept
+> arguments.
+
 #### An EMPTY pattern is not an absent one
 
 `deny-commands ""` and a valueless `deny-commands` both flatten to the empty
