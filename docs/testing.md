@@ -121,6 +121,64 @@ firewalls share the gateway.
 
 ---
 
+## What a green run did NOT examine (#9052)
+
+A gate that reports a clean board for a subject it never looked at is worse
+than no gate, because it retires the question. Four of them did, and the fixes
+are here rather than in a tracker because a procedure that lives only in an
+issue is not read before the next gate is written.
+
+### `make test` is not the whole board
+
+`go test ./...` prints `ok` for a package whose cells all **skipped**: the
+summary line for "everything passed" and "nothing ran" is byte-identical, and
+no leg passes `-v`. So:
+
+| Command | What it examines that nothing else does |
+|---|---|
+| `sudo make test-root` | the XDP shim's behavioural cells. They SKIP unprivileged, and the #1864 verifier gate does **not** substitute — two distinct WRONG fixes of the #7494 fragment bug both pass it. `make test` now prints a line saying it did not examine them. |
+| `make go-skip-census` | every Go `t.Skip` in the tree, counted per bucket and ratcheted |
+| `make ignored-cell-census` | every Rust `#[ignore]`, including the third crate outside both workspaces |
+| `make test-cold-path-flooder` | 44 `#[test]`s in `test/incus/cold-path-flooder`, which was reached by nothing |
+| `make harness-census` | every runnable shell harness under `test/incus/` |
+| `make selftest` | the self-test layer, including all four censuses |
+
+### The go-skip census, and the thing it found
+
+`make go-skip-census` counts skip call sites into four **named** buckets and
+ratchets each against a floor in `scripts/go-skip-census.floors`. It reds in
+both directions: a growth is a subject the suite stopped examining, and a
+shrink is good news that must be banked, because a loose floor is exactly that
+much room for the next regression to hide in.
+
+The buckets are the point:
+
+- **`priv-absent`** — shed when privilege is absent (26 at last census).
+- **`priv-present`** — shed when privilege is **present** (10). This direction
+  is why the split exists: **no single run examines all 36.** Running the suite
+  as root does not close the gap, it swaps which subjects go unexamined — and
+  folded into one "root-gated" total that is invisible, making the obvious
+  remedy look like a fix when it is a trade.
+- **`other`** — environment-, tool- and fixture-gated skips.
+- **`unparsed`** — sites the census counted but could not classify:
+  `t.SkipNow()` (no message by construction) and non-literal messages. It is a
+  **reported** bucket with its own floor, deliberately, rather than a silent
+  drop. A census that quietly shrinks its own population is blind exactly where
+  somebody wrote something unusual, and "unusual" correlates with "worth
+  looking at" — the #9088 lesson, applied ahead of time.
+
+It does **not** judge whether a skip is justified. There is no marker
+convention on Go skips, so such a verdict would be a guess off message prose,
+and a census whose verdict is a guess trains people to argue with it.
+
+### There is no CI
+
+`.github/` contains only `instructions/`, and the Makefile says so twice. Every
+gate above is developer-invoked and chained from no default target. The merge
+criterion in `docs/engineering-style.md` used to read "squash merge once CI is
+green", which was **vacuously satisfiable**; it now names the gates and when to
+run each.
+
 ## Build & Deploy Workflow
 
 ```bash
