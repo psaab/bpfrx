@@ -526,3 +526,80 @@ fn inspect_walkers_traverse_exotic_length_prefixed_ext_headers() {
     );
 }
 
+
+/// #9032: a native-GRE LOCAL-ORIGIN session must be published with the tunnel's
+/// routing domain, not 0.
+///
+/// #7160 made `routing_domain` part of session identity and stamped it at what
+/// its own comment calls "THE single site that populates
+/// `SessionKey.routing_domain` for a received frame" — inside the AF_XDP
+/// descriptor loop. This producer reads packets off the TUN and never reaches
+/// that site, so `parse_session_flow_from_bytes` left the domain at 0 and the
+/// session went onto the HA sync wire under domain 0, a different identity from
+/// the one the SAME flow gets when it arrives on a wire.
+#[test]
+fn local_origin_tunnel_session_carries_the_routing_domain_9032() {
+    let mut snapshot = native_gre_snapshot(true);
+    for iface in snapshot.interfaces.iter_mut() {
+        iface.routing_domain = 7;
+    }
+    let state = build_forwarding_state(&snapshot);
+    let ha_state = BTreeMap::from([(1, active_ha_runtime(monotonic_nanos() / 1_000_000_000))]);
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+    let packet = build_icmp_echo_frame_v4(
+        Ipv4Addr::new(10, 255, 192, 42),
+        Ipv4Addr::new(10, 255, 192, 41),
+        64,
+    );
+    let ike_exchanges = crate::afxdp::forwarding::IkeExchangeTable::new();
+    let plan = build_local_origin_tunnel_tx_request(
+        &packet[14..],
+        1,
+        &state,
+        &ha_state,
+        &dynamic_neighbors,
+        &ike_exchanges,
+    )
+    .expect("local-origin plan");
+
+    assert_eq!(
+        plan.session_entry.key.routing_domain, 7,
+        "the PUBLISHED local-origin session key must carry the tunnel's routing \
+         domain. Publishing it under 0 gives the same flow a different identity \
+         from the wire path, which stamps the real domain (#9032/#7160)"
+    );
+}
+
+/// CONTROL: a deployment with NO routing instances must stay bit-identical.
+///
+/// `ingress_routing_domain` short-circuits on `!has_routing_domains`, so the
+/// stamp must be a no-op here. Without this row, a stamp that hard-coded any
+/// non-zero value would satisfy the cell above while changing the published key
+/// on every ordinary box.
+#[test]
+fn local_origin_tunnel_session_domain_is_zero_without_routing_instances_9032() {
+    let state = build_forwarding_state(&native_gre_snapshot(true));
+    let ha_state = BTreeMap::from([(1, active_ha_runtime(monotonic_nanos() / 1_000_000_000))]);
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+    let packet = build_icmp_echo_frame_v4(
+        Ipv4Addr::new(10, 255, 192, 42),
+        Ipv4Addr::new(10, 255, 192, 41),
+        64,
+    );
+    let ike_exchanges = crate::afxdp::forwarding::IkeExchangeTable::new();
+    let plan = build_local_origin_tunnel_tx_request(
+        &packet[14..],
+        1,
+        &state,
+        &ha_state,
+        &dynamic_neighbors,
+        &ike_exchanges,
+    )
+    .expect("local-origin plan");
+
+    assert_eq!(
+        plan.session_entry.key.routing_domain, 0,
+        "with no routing-instance membership the published key must stay at \
+         domain 0 — pre-#7160 bit-identical"
+    );
+}
