@@ -24,7 +24,6 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
-	"github.com/psaab/xpf/pkg/routing"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -153,20 +152,13 @@ func (m *Manager) probeICMP(ctx context.Context, test *config.RPMTest, opts prob
 	// HOLDING state, breaking the #1960 hold-state doctrine. Only a real
 	// destination-interface satisfies the link-local scope; with neither
 	// we fail closed with ErrProbeSetup so the test HOLDS.
-	if isV6 && dst.IsLinkLocalUnicast() {
-		if zone != "" {
-			zone = config.LinuxIfName(zone)
-		} else {
-			m.mu.RLock()
-			rethMap := m.rethMap
-			m.mu.RUnlock()
-			zone = routing.ResolveProbeInterface(test.DestinationInterface, rethMap)
-		}
-		if zone == "" {
-			return 0, fmt.Errorf("%w: icmp link-local target %s needs a zone "+
-				"(%%zone or destination-interface; a routing-instance VRF is not an egress link)",
-				ErrProbeSetup, dst)
-		}
+	// #9026: shared with probeTCP rather than written here. The two probe
+	// types disagreed about the same target — this one HELD, tcp-ping counted
+	// PATH LOSS — because the guard existed once and was never given to the
+	// other.
+	zone, err = m.resolveLinkLocalZone9026("icmp", dst, zone, test.DestinationInterface)
+	if err != nil {
+		return 0, err
 	}
 
 	network := "ip4:icmp"
