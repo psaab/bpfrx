@@ -1867,7 +1867,12 @@ func compileDHCPRelay(node *Node, fo *ForwardingOptionsConfig) error {
 				// maximum-hop-count (value). Each may appear as a child node
 				// OR ride in Keys[1:] when the override block collapses to
 				// inline values.
-				for _, oc := range prop.Children {
+				// #8939: split a packed run first. `overrides always-broadcast
+				// forward-only maximum-hop-count 4` is ONE child node carrying
+				// all three on its Keys, so this loop read the first and
+				// dropped the rest — a relay that broadcasts but does not
+				// forward-only, with no error to notice.
+				for _, oc := range expandFlatRun(prop.Children, dhcpRelayOverridesSchema8939()) {
 					switch oc.Name() {
 					case "always-broadcast":
 						g.AlwaysBroadcast = true
