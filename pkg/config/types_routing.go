@@ -309,7 +309,19 @@ type StaticRoute struct {
 	// already carries HasPreference and HasMetric for exactly this reason; this
 	// is the same bit at the route level, and the sibling's existence is why
 	// the omission was invisible -- the pattern was in the file, one type over.
-	HasPreference bool
+	//
+	// `json:"-"` IS LOAD-BEARING. ConfigSnapshot embeds the whole typed Config,
+	// so every exported field on a config struct is on the HELPER WIRE and moves
+	// the #8892 shape digest. This bit is compiler-internal: it exists to let
+	// the merge of two `route <p> { }` blocks tell an authored `preference 5`
+	// from an absent one, and the helper reads Preference. Serializing it would
+	// have forced a ProtocolVersion bump for a value no helper reads --
+	// the same choice LifetimeSecondsInvalidSpec (#9008) made for the same
+	// reason.
+	//
+	// Nothing is lost by not persisting it: the config DB stores the TREE, and
+	// the bit is recomputed by the compiler on every load.
+	HasPreference bool   `json:"-"`
 	NextTable     string // routing instance name for inter-VRF route leaking (e.g. "Comcast.inet.0" → "Comcast")
 	// NextTableRaw preserves the operator's original next-table token
 	// (e.g. "Comcast.inet.0") before parseNextTableInstance strips the
