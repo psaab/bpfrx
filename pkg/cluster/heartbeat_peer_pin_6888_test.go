@@ -168,7 +168,7 @@ func TestStartHeartbeatWiresThePeerIntoTheReceiver6888(t *testing.T) {
 	m := keyedEpochManager(t, filepath.Join(t.TempDir(), "ha-peer-pin"))
 
 	const peer = "127.0.0.2"
-	if err := m.StartHeartbeat("127.0.0.1", peer, ""); err != nil {
+	if err := m.StartHeartbeat("127.0.0.1", peer, "", "em0"); err != nil {
 		t.Fatalf("StartHeartbeat: %v", err)
 	}
 	t.Cleanup(m.StopHeartbeat)

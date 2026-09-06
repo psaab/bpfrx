@@ -898,7 +898,7 @@ func TestSecondStopIsANoOp_6669(t *testing.T) {
 	t.Cleanup(func() { bootEpochPath = orig })
 
 	m := NewManager(0, 1)
-	if err := m.StartHeartbeat("127.0.0.1", "127.0.0.1", ""); err != nil {
+	if err := m.StartHeartbeat("127.0.0.1", "127.0.0.1", "", "em0"); err != nil {
 		t.Fatalf("StartHeartbeat: %v", err)
 	}
 	m.mu.RLock()

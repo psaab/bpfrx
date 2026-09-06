@@ -54,7 +54,7 @@ func TestStartHeartbeatIPv6ControlLink(t *testing.T) {
 	defer m.StopHeartbeat()
 
 	// SO_REUSEADDR+SO_REUSEPORT (vrfListenConfig) allows the loopback rebind.
-	if err := m.StartHeartbeat("::1", "::1", ""); err != nil {
+	if err := m.StartHeartbeat("::1", "::1", "", "em0"); err != nil {
 		t.Fatalf("StartHeartbeat with IPv6 control link: %v", err)
 	}
 
@@ -86,7 +86,7 @@ func TestStartHeartbeatIPv4ControlLinkUnchanged(t *testing.T) {
 	m := NewManager(0, 1)
 	defer m.StopHeartbeat()
 
-	if err := m.StartHeartbeat("127.0.0.1", "127.0.0.1", ""); err != nil {
+	if err := m.StartHeartbeat("127.0.0.1", "127.0.0.1", "", "em0"); err != nil {
 		t.Fatalf("StartHeartbeat with IPv4 control link: %v", err)
 	}
 

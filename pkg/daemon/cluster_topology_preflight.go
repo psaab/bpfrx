@@ -263,3 +263,93 @@ func controlEndpointMoveRefusal8965(have, want string) error {
 		"change on each node separately while both are running — that produces the "+
 		"same partition by hand", have, want)
 }
+
+// clusterControlInterfaceCommitPreflight refuses a LIVE move of the cluster
+// control-link INTERFACE (#8987).
+//
+// THE SAME PARTITION, BY THE OTHER HALF OF THE TUPLE. #8965 gated the peer
+// ADDRESS and recorded, in its own SCOPE paragraph, that `control-interface`
+// has the identical shape and was left uncovered. The mechanism is unchanged:
+// applyConfigLocked's step 20 stops cluster comms and restarts them on the new
+// interface, and only then does the push to the peer run -- over a transport
+// just rebuilt somewhere the peer is not listening. QueueConfig no-ops on a nil
+// connection so the push fails SILENTLY, the #5863 reconciler returns early on
+// !syncPeerConnected, and that flag is set in exactly one place (the
+// session-sync connect callback), so nothing bootstraps a mismatch in which
+// nothing is connected. Both nodes end up durably configured on different
+// interfaces, and retry and reboot REPRODUCE the split rather than repair it.
+//
+// WHY IT COULD NOT BE FIXED WITH THE ADDRESS HALF, and what changed. #8965
+// stated the blocker exactly: the manager kept no RUNNING value for
+// control-interface, so a gate would have had to compare config to config --
+// unable to tell "the operator is changing it" from "this is what it already
+// was". The plumbing now exists: Manager.HeartbeatControlInterface() returns
+// the interface the RUNNING heartbeat was started on, recorded from the same
+// StartHeartbeat call that records hbLocalAddr and hbPeerAddr.
+//
+// It is deliberately NOT m.controlInterface. That field is also an interface
+// name and would have been the natural-looking mistake -- UpdateConfig
+// overwrites it on every config apply, so it tracks the CONFIG and a gate on it
+// is the config-to-config comparison #8965 refused to ship. Nor is hbLocalAddr
+// a proxy: an operator who moves the control link to another interface and
+// carries the same address across leaves it unchanged, so a gate keyed on it
+// would wave through exactly the move that partitions the cluster.
+//
+// PEER-SYNC IS SAFE, and MEASURED rather than inherited from #8965 -- the
+// address gate's argument does NOT transfer, which is the trap this had to get
+// out of. #8965 is safe because PeerAddress is PER-NODE: each node's config
+// names the other node's address, so a synced text compiles to the local node's
+// own value and the gate no-ops. control-interface is safe for a DIFFERENT and
+// stronger reason: in the shipped cluster config
+// (docs/ha-cluster-userspace.conf) `peer-address` sits INSIDE `groups node0` /
+// `groups node1` while `control-interface em0` sits OUTSIDE them -- it is one
+// shared value, not a per-node one. A synced text therefore carries the
+// IDENTICAL string, candidate equals running trivially, and the gate is a
+// no-op. Both leaves are read by the same `nodeVal` call in the same container
+// (compiler_system.go), so a config that DOES scope control-interface per node
+// still expands for the LOCAL node exactly as peer-address does. The property
+// holds either way; the reason differs, and asserting #8965's reason here
+// would have been an unearned transfer.
+func clusterControlInterfaceCommitPreflight(running *cluster.Manager, newCfg *config.Config) error {
+	if running == nil || !clusterTopologyConfigured(newCfg) {
+		return nil
+	}
+	return controlInterfaceDecision8987(running.HeartbeatControlInterface(),
+		newCfg.Chassis.Cluster.ControlInterface)
+}
+
+// controlInterfaceDecision8987 is the DECISION, split from the accessor
+// plumbing for the reason #8965's split records: its own first version exposed
+// only the message builder, so the cell asserted the operator-facing TEXT while
+// "when to refuse at all" went unexercised and neutering the gate to `return
+// nil` left the cell GREEN. This seam is the decision itself, so that mutation
+// reds.
+func controlInterfaceDecision8987(have, want string) error {
+	if want == "" || have == "" || want == have {
+		// Unset on either side means there is no live control link to strand --
+		// the heartbeat has not started, or the candidate leaves it to the
+		// runtime default. Equal means this is not a move.
+		return nil
+	}
+	return controlInterfaceMoveRefusal8987(have, want)
+}
+
+// controlInterfaceMoveRefusal8987 is the operator-facing text, factored so the
+// cell asserting it and the gate producing it cannot drift apart.
+//
+// It NAMES THE PROCEDURE, which #8987 lists as something a fix owes: a refusal
+// without a path sends the operator to the workaround that reproduces the
+// defect -- committing on each node separately, which is the same partition by
+// hand.
+func controlInterfaceMoveRefusal8987(have, want string) error {
+	return fmt.Errorf("commit rejected: changing the chassis cluster control-link "+
+		"interface from %s to %s cannot be done on a running cluster — applying it "+
+		"restarts this node's cluster comms on the NEW interface before the config "+
+		"can be pushed to the peer, which is still reachable only over the OLD one, "+
+		"so the peer never receives the change and the two nodes are durably "+
+		"partitioned.\n"+
+		"To move the control link: set the new interface on BOTH nodes and restart "+
+		"xpfd on both, or take the cluster down before the move. Do NOT commit the "+
+		"change on each node separately while both are running — that produces the "+
+		"same partition by hand", have, want)
+}

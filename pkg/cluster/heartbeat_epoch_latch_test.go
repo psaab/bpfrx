@@ -777,7 +777,7 @@ func TestStartHeartbeatReturnsWithAUsableEpoch_6169(t *testing.T) {
 	})
 
 	start := time.Now()
-	if err := m.StartHeartbeat("127.0.0.1", "127.0.0.1", ""); err != nil {
+	if err := m.StartHeartbeat("127.0.0.1", "127.0.0.1", "", "em0"); err != nil {
 		t.Fatalf("StartHeartbeat: %v", err)
 	}
 	elapsed := time.Since(start)

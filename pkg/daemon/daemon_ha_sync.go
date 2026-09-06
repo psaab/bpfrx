@@ -1214,7 +1214,7 @@ func (d *Daemon) startHeartbeatWithRetry(ctx context.Context, controlIface, peer
 			}
 			continue
 		}
-		if err := d.cluster.StartHeartbeat(localIP, peerAddr, vrfDevice); err != nil {
+		if err := d.cluster.StartHeartbeat(localIP, peerAddr, vrfDevice, controlIface); err != nil {
 			// #7257: a start the teardown superseded is terminal, not a bind
 			// failure. Retrying would race the same teardown again and, on
 			// success, resurrect the heartbeat stopClusterComms exists to

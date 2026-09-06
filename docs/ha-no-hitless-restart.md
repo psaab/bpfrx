@@ -160,6 +160,15 @@ path — reconciles **only the redundancy groups**
 identity *is* reconciled live — `daemon_apply.go`, #87 — so only the
 node-id / cluster-id **identity** is boot-baked.)
 
+**That parenthetical is true and was reassuring for the wrong reason,
+which #8965 and #8987 corrected.** "Reconciled live" describes the
+mechanism, not its safety: the live reconcile stops cluster comms and
+restarts them on the NEW control endpoint, and only then pushes the
+config to a peer that is still on the OLD one. Being reconcilable live
+is precisely what makes the control tuple dangerous, not what makes it
+safe — so both halves of it are now refused at commit rather than
+reconciled. See "Live control-link moves" below.
+
 So a day-2 commit that changes the node-id or cluster-id used to be
 accepted and promoted, while the running manager kept its **old**
 identity — heartbeat `NodeID`/`ClusterID`, the RETH virtual MAC
@@ -184,6 +193,65 @@ clustered; the standalone<->cluster flip (either direction, including the
 An **intra-identity** edit (same node-id **and** cluster-id — a
 redundancy-group / interface / policy change) passes untouched and
 reconciles live.
+
+### Live control-link moves are refused (#8965 address, #8987 interface)
+
+Changing either half of the cluster control tuple on a **running** pair
+partitions it, and the two halves fail identically.
+
+`applyConfigLocked`'s step 20 stops cluster comms and restarts them on
+the new endpoint; only then does the push to the peer run, over a
+transport just rebuilt somewhere the peer is not listening.
+**Nothing heals it:** `QueueConfig` no-ops on a nil connection so the
+push fails *silently* rather than erroring the commit, the #5863
+reconciler returns early on `!syncPeerConnected`, and that flag is set in
+exactly one place — the session-sync connect callback — so it cannot
+bootstrap a mismatch in which nothing is connected. Heartbeats carry no
+config. Both nodes are durably configured, so **retry and reboot
+reproduce the split rather than repair it**: the standby eventually
+promotes on the stale tuple while this node stays primary on the new one,
+and fencing cannot traverse the severed channel either. A commit whose
+purpose was to preserve HA is what removes it.
+
+Both are refused by a preflight rather than staged, and the reason is
+structural: three apply paths reach `applyConfigLocked`
+(`commitAndApply`, `syncAndApply`, `commitConfirmedAndApply`), so a
+make-before-break would have to be correct at each and a version landed
+at one would leave the others silently broken. **You cannot move both
+ends of a point-to-point control link atomically from one end of it.**
+
+- `clusterControlEndpointCommitPreflight` — the peer **address** (#8965).
+- `clusterControlInterfaceCommitPreflight` — the control **interface**
+  (#8987). #8965 shipped without this half and recorded why: the manager
+  kept no *running* value for `control-interface`, so a gate would have
+  compared config to config and could not tell "the operator is changing
+  it" from "this is what it already was". `Manager.HeartbeatControlInterface()`
+  now returns the interface the running heartbeat was started on,
+  recorded from the same `StartHeartbeat` call that records
+  `hbLocalAddr` / `hbPeerAddr`, and carried across a restart.
+
+  It is deliberately **not** `m.controlInterface`: that field is also an
+  interface name, but `UpdateConfig` overwrites it on every config apply,
+  so it tracks the config and a gate reading it compares the candidate
+  against itself. Nor is `hbLocalAddr` a proxy — an operator who moves
+  the control link to another interface and carries the same address
+  across leaves it unchanged.
+
+**Peer-sync is a no-op for both, for *different* reasons**, and the
+distinction matters because assuming #8965's reason transferred would
+have refused legitimate syncs. `peer-address` is **per-node** — each
+node's config names the other's address, so a synced text compiles to
+the local node's own value. `control-interface` is not per-node at all:
+in the shipped cluster config (`docs/ha-cluster-userspace.conf`)
+`peer-address` sits *inside* `groups node0` / `groups node1` while
+`control-interface em0` sits *outside* them, one shared value, so a
+synced text carries the identical string.
+
+Each refusal **names the procedure** — set the new value on both nodes
+and restart `xpfd` on both, or take the cluster down first — and warns
+explicitly against committing on each node separately while both run,
+which is the same partition by hand. A refusal without a path sends the
+operator to the workaround that reproduces the defect.
 
 ### Acceptance criteria (identity change, #6192)
 

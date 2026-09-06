@@ -217,6 +217,13 @@ func (d *Daemon) commitAndApply(ctx context.Context, authority configstore.Commi
 			if eerr := clusterControlEndpointCommitPreflight(d.cluster, cand); eerr != nil {
 				return eerr
 			}
+			// #8987: and the INTERFACE half of the same tuple, which strands the
+			// peer identically. Wired at all three apply paths beside its
+			// sibling — a gate at one is the partial-fix shape on a row whose
+			// remaining half is silent.
+			if ierr := clusterControlInterfaceCommitPreflight(d.cluster, cand); ierr != nil {
+				return ierr
+			}
 			// #6650: refuse a config the cluster PEER cannot represent, before
 			// the store promotes anything. Ordered last among the cluster
 			// preflights: the topology/identity gates above decide whether this
@@ -501,6 +508,25 @@ func (d *Daemon) syncAndApply(ctx context.Context, configText string, chassisPre
 		return nil, eerr
 	}
 
+	// #8987: the INTERFACE half of the same tuple, on the peer-sync path.
+	//
+	// Safe here for a MEASURED reason, not an inherited one. The sibling above
+	// is safe because PeerAddress is per-node, so a synced text compiles to this
+	// node's own value and the gate no-ops. control-interface is not per-node at
+	// all — in the shipped cluster config `peer-address` sits inside
+	// `groups node0`/`node1` while `control-interface` sits outside them, one
+	// shared value — so a synced text carries the identical string and the
+	// comparison is trivially equal. Refusing a legitimate sync was the specific
+	// risk #8987 named for this path, and this is why it does not materialise.
+	if ferr := clusterControlInterfaceCommitPreflight(d.cluster, compiled); ferr != nil {
+		slog.Error("cluster: refusing to apply a peer-synced control-INTERFACE "+
+			"move live; applying it would restart cluster comms on an interface "+
+			"the peer is not reachable over and durably partition the pair",
+			"err", ferr)
+		d.reconcileManagementAfterPromotion(compiled, "peer-synced control-interface move refused")
+		return nil, ferr
+	}
+
 	// #5564: SyncApply (above) has ALREADY promoted the peer config to active,
 	// and once applyConfigLocked arms the dataplane snapshot this node is
 	// forwarding under it. The three session invalidators
@@ -679,6 +705,13 @@ func (d *Daemon) commitConfirmedAndApply(ctx context.Context, authority configst
 			// comms on the new address before the peer can be told about it.
 			if eerr := clusterControlEndpointCommitPreflight(d.cluster, cand); eerr != nil {
 				return eerr
+			}
+			// #8987: and the INTERFACE half of the same tuple, which strands the
+			// peer identically. Wired at all three apply paths beside its
+			// sibling — a gate at one is the partial-fix shape on a row whose
+			// remaining half is silent.
+			if ierr := clusterControlInterfaceCommitPreflight(d.cluster, cand); ierr != nil {
+				return ierr
 			}
 			// #6707: the rollback target must be APPLIABLE, not merely
 			// device-map safe. The timeout path applies it unconditionally

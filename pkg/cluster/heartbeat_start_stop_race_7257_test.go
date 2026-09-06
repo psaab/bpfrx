@@ -182,12 +182,12 @@ func measureStartCost(t *testing.T, samples int) time.Duration {
 	// the mean biases the pacing high — the safe direction for publishing, but
 	// it would make the measurement a claim about startup rather than about
 	// steady-state cost.
-	_ = m.StartHeartbeat("127.0.0.1", "127.0.0.1", "")
+	_ = m.StartHeartbeat("127.0.0.1", "127.0.0.1", "", "em0")
 	m.StopHeartbeat()
 
 	start := time.Now()
 	for i := 0; i < samples; i++ {
-		if err := m.StartHeartbeat("127.0.0.1", "127.0.0.1", ""); err != nil {
+		if err := m.StartHeartbeat("127.0.0.1", "127.0.0.1", "", "em0"); err != nil {
 			t.Fatalf("calibration start %d failed: %v — the pacing below cannot "+
 				"be derived and the probe would silently fall back to an "+
 				"idle-box constant", i, err)
@@ -339,7 +339,7 @@ func runHeartbeatRaceProbe7257(t *testing.T) heartbeatProbeResult {
 			// before the publish and carries no race to detect. Lumping them
 			// into one counter is what let this probe report 60 healthy starts
 			// while reaching the publish ZERO times.
-			err := m.StartHeartbeat("127.0.0.1", "127.0.0.1", "")
+			err := m.StartHeartbeat("127.0.0.1", "127.0.0.1", "", "em0")
 			switch {
 			case err == nil:
 				published.Add(1)
@@ -505,7 +505,7 @@ func TestStartHeartbeatSupersededByStopDoesNotPublish7257(t *testing.T) {
 	}
 	m.mu.Unlock()
 
-	err := m.StartHeartbeat("127.0.0.1", "127.0.0.1", "")
+	err := m.StartHeartbeat("127.0.0.1", "127.0.0.1", "", "em0")
 	if fired.Load() == 0 {
 		t.Fatal("setup: the in-window hook never fired, so no teardown was landed in the window")
 	}
@@ -528,7 +528,7 @@ func TestStartHeartbeatStillPublishesWithoutAContendingStop7257(t *testing.T) {
 	m := NewManager(0, 1)
 	t.Cleanup(m.StopHeartbeat)
 
-	if err := m.StartHeartbeat("127.0.0.1", "127.0.0.1", ""); err != nil {
+	if err := m.StartHeartbeat("127.0.0.1", "127.0.0.1", "", "em0"); err != nil {
 		t.Fatalf("StartHeartbeat() = %v, want nil with no contending teardown", err)
 	}
 	if !m.HeartbeatRunning() {
@@ -552,7 +552,7 @@ func TestRestartHeartbeatSurvivesTheEpochGuard7257(t *testing.T) {
 	m := NewManager(0, 1)
 	t.Cleanup(m.StopHeartbeat)
 
-	if err := m.StartHeartbeat("127.0.0.1", "127.0.0.1", ""); err != nil {
+	if err := m.StartHeartbeat("127.0.0.1", "127.0.0.1", "", "em0"); err != nil {
 		t.Fatalf("setup StartHeartbeat: %v", err)
 	}
 	if !m.RestartHeartbeat() {
