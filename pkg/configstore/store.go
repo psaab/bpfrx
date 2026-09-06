@@ -212,6 +212,23 @@ type Store struct {
 	// performAutoRollback rejects mismatches.
 	confirmGen      uint64
 	confirmTimer    *time.Timer
+	// confirmArmDegraded records that the ARM write (confirm.json) failed, so
+	// the pending auto-rollback would not survive a crash (#9014). It was the
+	// ONE confirm-durability leg with no health state: the write logged a
+	// single slog.Warn and returned, CommitConfirmed still reported success,
+	// and /health stayed 200 while a crash inside the window would leave the
+	// unconfirmed configuration standing permanently. Its two neighbours --
+	// confirmRecoveryReadFailed (#8566) and confirmRemoveDegraded (#5835) --
+	// both raise health, journal, and (for the removal) self-heal.
+	//
+	// confirmArmGen pins WHICH window the debt belongs to. Re-driving the write
+	// after the window was confirmed or rolled back would RESURRECT a
+	// crash-recovery record for a window that no longer exists -- the mirror of
+	// the #7675 hazard on the removal side, where re-driving a delete would have
+	// removed a LIVE window's record.
+	confirmArmDegraded bool
+	confirmArmRec      *confirmRecord
+	confirmArmGen      uint64
 	confirmPrevTree *config.ConfigTree // active tree before confirmed commit
 	confirmPrevCfg  *config.Config     // compiled config before confirmed commit
 	// confirmPrevFirst records whether confirmPrevTree is the EMPTY BOOTSTRAP

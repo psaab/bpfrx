@@ -632,14 +632,61 @@ func (s *Store) writeConfirmState(prevTree *config.ConfigTree, deadline time.Tim
 		GuardedHash: guardedConfigHash(s.active),
 	}
 	if err := s.db.WriteConfirm(rec); err != nil {
-		slog.Warn("failed to persist commit-confirmed state; auto-rollback will not "+
-			"survive a crash within the confirm window", "err", err, "issue", "#4577")
+		s.noteConfirmArmFailureLocked(rec, err)
 		return
 	}
 	// #8566: a readable record now exists again, so the "boot lost the window"
 	// state is over. It clears on operator action rather than on its own
 	// because nothing else can heal it — the lost window cannot be recovered.
 	s.confirmRecoveryReadFailed = false
+	// #9014: this write IS the debt. A successful arm — whether the first try
+	// or a re-arm by a later `commit confirmed` — discharges any outstanding
+	// arm-write debt, because the record on disk is now current.
+	s.confirmArmDegraded = false
+	s.confirmArmRec = nil
+}
+
+// noteConfirmArmFailureLocked records that the ARM write establishing a
+// commit-confirmed window did not become durable, and starts the self-healing
+// retry (#9014).
+//
+// THIS WAS THE ONE CONFIRM-DURABILITY LEG THAT RAISED NOTHING. It logged a
+// single slog.Warn and returned; CommitConfirmed still reported success and
+// /health stayed 200, so a crash or reboot inside the confirm window found no
+// record, the unconfirmed configuration stood permanently, and nothing had
+// alerted. Its two neighbours already did the opposite:
+//
+//	confirm READ at boot      confirmRecoveryReadFailed  journal  —      degraded
+//	confirm REMOVAL           confirmRemoveDegraded      journal  retry  degraded
+//	confirm ARM (this)        none                       none     none   200 OK
+//
+// The invariant it broke is written down in the same package, in #8566's own
+// rationale: "Every OTHER way the store ends a boot unsafe raises degraded
+// health; this one did not, so nothing alerted on it."
+//
+// The commit is NOT failed. That matches both neighbours and the #1960
+// no-brick doctrine: the configuration is applied and correct, only its
+// crash-recovery record is missing, and refusing the commit would turn a
+// durability problem into an availability one. Health, the journal and the
+// retry are what make it legible.
+//
+// Caller holds s.mu (write lock).
+func (s *Store) noteConfirmArmFailureLocked(rec *confirmRecord, err error) {
+	slog.Error("failed to persist commit-confirmed state; the auto-rollback will not "+
+		"survive a crash within the confirm window, so a restart would leave the "+
+		"UNCONFIRMED configuration standing permanently — configuration persistence "+
+		"is degraded until the retry lands or the window is resolved",
+		"err", err, "issue", "#9014")
+	s.confirmArmDegraded = true
+	s.confirmArmRec = rec
+	// Pin the window this debt belongs to, so the retry cannot resurrect a
+	// record for a window that has since been confirmed or rolled back.
+	s.confirmArmGen = s.confirmGen
+	s.journalLog(&JournalEntry{
+		Action: "confirm_arm_error",
+		Detail: fmt.Sprintf("durable write of the pending commit-confirmed record failed; auto-rollback would not survive a crash: %v", err),
+	})
+	s.ensurePersistRetryLoopLocked()
 }
 
 // removeConfirmState deletes the persisted pending commit-confirmed state
