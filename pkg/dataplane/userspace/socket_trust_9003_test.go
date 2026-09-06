@@ -396,11 +396,23 @@ func TestEveryHelperResponseDecodeIsBounded9003(t *testing.T) {
 		"../../dhcpserver/lease_sync.go": {"keaControl"},
 	}
 	decodeRe := regexp.MustCompile(`json\.NewDecoder\(([^)]*)`)
+	// #9322: a site may now bind the bounded reader to a local first, because
+	// the caller has to INSPECT it (`bounded.truncated`) to tell a cap
+	// truncation from a helper that died mid-write. Accept such an identifier
+	// ONLY when this same file assigns it from boundedResponseReader — the
+	// guard still refuses any decoder fed from something it cannot trace to the
+	// bound. Matching on the bare word "bounded" would have loosened the census
+	// into accepting any variable somebody chose to name that.
+	boundRe := regexp.MustCompile(`(\w+)\s*:?=\s*(?:boundedResponseReader|io\.LimitReader)\(`)
 	total := 0
 	for rel := range sites {
 		src, err := os.ReadFile(rel)
 		if err != nil {
 			t.Fatalf("read %s: %v", rel, err)
+		}
+		boundIdents := map[string]bool{}
+		for _, m := range boundRe.FindAllStringSubmatch(string(src), -1) {
+			boundIdents[m[1]] = true
 		}
 		matches := decodeRe.FindAllStringSubmatch(string(src), -1)
 		if len(matches) == 0 {
@@ -410,7 +422,16 @@ func TestEveryHelperResponseDecodeIsBounded9003(t *testing.T) {
 		for _, m := range matches {
 			total++
 			arg := m[1]
-			if !strings.Contains(arg, "boundedResponseReader") && !strings.Contains(arg, "io.LimitReader") {
+			ok := strings.Contains(arg, "boundedResponseReader") || strings.Contains(arg, "io.LimitReader")
+			if !ok {
+				for ident := range boundIdents {
+					if regexp.MustCompile(`\b` + regexp.QuoteMeta(ident) + `\b`).MatchString(arg) {
+						ok = true
+						break
+					}
+				}
+			}
+			if !ok {
 				t.Errorf("%s: json.NewDecoder(%s) is byte-unbounded — a hostile peer on this "+
 					"socket can stream until the daemon OOMs inside the connection deadline", rel, arg)
 			}

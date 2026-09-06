@@ -290,15 +290,84 @@ func peerCredTrustError(kind, path string, cred *unix.Ucred, self uint32) error 
 const MaxControlResponseBytes = MaxControlRequestBytes
 
 // boundedResponseReader wraps a helper connection so a decode cannot allocate
-// past MaxControlResponseBytes no matter how long the peer streams.
+// past MaxControlResponseBytes no matter how long the peer streams, and RECORDS
+// whether the cap was the thing that ended the read.
 //
-// A LimitReader ends in io.EOF at the cap, which json.Decoder reports as
-// io.ErrUnexpectedEOF for a truncated body — indistinguishable from a helper
-// that died mid-write. That is the right shape here: both are "no usable
-// response", both fail closed at the caller, and neither is worth a distinct
-// error path. The cap being reached at all is not a reachable state for the real
-// helper (it is bounded by the same MaxControlRequestBytes ceiling on what it
-// can be asked to produce), so the case this discriminates is a hostile peer.
-func boundedResponseReader(r io.Reader) io.Reader {
-	return io.LimitReader(r, MaxControlResponseBytes)
+// #9322 corrected the premise this used to rest on. The original comment said
+// the cap "being reached at all is not a reachable state for the real helper (it
+// is bounded by the same MaxControlRequestBytes ceiling on what it can be asked
+// to produce), so the case this discriminates is a hostile peer" — and therefore
+// that a truncation and a mid-write death were not worth telling apart.
+//
+// THAT PREMISE IS FALSE, and the counter-example is an ordinary HA path.
+// MaxControlRequestBytes bounds what can be ASKED; it says nothing about the
+// answer. `export_owner_rg_sessions` is asked with a ~60-byte request and
+// answered with the UNBOUNDED owner-RG session set: the Go callers pass max=0
+// deliberately (daemon_ha_userspace_export.go — "a capped export would silently
+// truncate the window and delete the remainder on the peer"), the helper honours
+// it (`remaining = if self.max == 0 { usize::MAX }`, afxdp/ha/export.rs), and one
+// worker alone can hold DEFAULT_MAX_SESSIONS = 131072 live sessions. The
+// response side was unbounded on both sides while the reader capped it at the
+// REQUEST ceiling.
+//
+// So the two cases must be told apart, because they send the operator to
+// different places: a mid-write death is a helper fault to be found in the
+// helper log, and a truncation is OUR cap refusing the helper's legitimate
+// answer, which no helper log will ever mention. Whether the cap is the RIGHT
+// SIZE for that answer is a separate question, tracked separately; this type
+// only makes the difference nameable.
+func boundedResponseReader(r io.Reader) *limitedResponseReader {
+	return &limitedResponseReader{r: r, remaining: MaxControlResponseBytes}
+}
+
+// limitedResponseReader is io.LimitReader plus a truncated flag.
+//
+// `io.LimitReader` reports the cap as a plain io.EOF, which json.Decoder turns
+// into io.ErrUnexpectedEOF for a partial body — byte-identical to a peer that
+// died mid-write, which is exactly the conflation #9322 is about.
+type limitedResponseReader struct {
+	r         io.Reader
+	remaining int64
+	// truncated is set only when the underlying reader still had data at the
+	// moment the budget ran out. That distinction is not pedantry: a response
+	// that ends EXACTLY at the cap is complete, and reporting it as truncated
+	// would be the same class of wrong diagnostic in the other direction.
+	truncated bool
+}
+
+func (l *limitedResponseReader) Read(p []byte) (int, error) {
+	if l.remaining <= 0 {
+		// Budget exhausted. One-byte probe to tell "the body ended exactly at
+		// the cap" (complete) from "the body is larger than the cap"
+		// (truncated). The probed byte is discarded — the caller is failing
+		// either way — so this costs one read, on an error path only.
+		var probe [1]byte
+		if n, err := l.r.Read(probe[:]); n > 0 || (err != nil && !errors.Is(err, io.EOF)) {
+			l.truncated = true
+		}
+		return 0, io.EOF
+	}
+	if int64(len(p)) > l.remaining {
+		p = p[:l.remaining]
+	}
+	n, err := l.r.Read(p)
+	l.remaining -= int64(n)
+	return n, err
+}
+
+// responseCapError wraps a decode failure that was caused by
+// MaxControlResponseBytes rather than by the helper.
+//
+// It NAMES the cap, the verb and the byte ceiling, because the sentence it
+// replaces ("the helper rejected it before replying — check the helper log")
+// names the wrong component: there is nothing in the helper log to find, the
+// helper answered, and the answer did not fit. Per docs/engineering-style.md a
+// wrong diagnostic is worse than a missing one.
+func responseCapError(verb string, err error) error {
+	return fmt.Errorf(
+		"helper response to %q request exceeded the %d-byte control-response cap "+
+			"(MaxControlResponseBytes) and was truncated; the helper ANSWERED and "+
+			"the answer did not fit — this is not a helper rejection and the helper "+
+			"log will not mention it: %w",
+		verb, int64(MaxControlResponseBytes), err)
 }
