@@ -126,6 +126,26 @@ type Daemon struct {
 	// not proof of an armed forwarding path.
 	dataplaneArmed atomic.Bool
 
+	// #9239: whether the LAST DHCP lease-change pass saw a delegated prefix
+	// mapped to an RA interface.
+	//
+	// The recompile predicate asks `len(DelegatedPrefixesForRA()) > 0`, and the
+	// lease-change callback runs AFTER commitLease has already deleted a
+	// withdrawn prefix. So the post-state of "the last PD was just withdrawn"
+	// and "this box never had one" is the same empty set, and the one event
+	// that most needs a re-apply is the one that reads as needing none.
+	//
+	// Remembering the previous pass makes the TRANSITION visible. It is written
+	// only by onDHCPAddressChange, which runs once per lease-change event, so
+	// the predicate itself stays pure and testable.
+	//
+	// A config commit that removes the DHCPv6 client can leave this true with
+	// no callback to clear it; the cost is one conservative full apply on the
+	// next lease change, which then clears it. Erring toward an extra apply is
+	// the right direction here — the failure it guards is a box advertising a
+	// prefix upstream has withdrawn.
+	pdForRAPresent atomic.Bool
+
 	// #7437 route-listener observability. The PAIR is the point: marks counts
 	// kernel route events that warranted a refresh, republishes counts the
 	// coalesced actuations, and marks >> republishes is the evidence that

@@ -83,7 +83,14 @@ func (d *Daemon) onDHCPAddressChange() {
 	// (RestartHeartbeat), RETH MAC is set live (no XSK rebind), and
 	// BPF compile skips reconcile when the binding plan is unchanged.
 	if activeCfg := d.store.ActiveConfig(); activeCfg != nil {
-		if d.dhcpLeaseChangeRequiresRecompile(activeCfg) {
+		// #9239: record whether a PD-for-RA existed BEFORE this pass and hand the
+		// previous value to the predicate. commitLease has already removed a
+		// withdrawn prefix by the time this callback runs, so the predicate's own
+		// `len(...) > 0` cannot tell a final withdrawal from a box that never had
+		// one. This is the only writer, and it runs once per lease-change event.
+		hadPDForRA := d.pdForRAPresent.Swap(
+			d.dhcp != nil && len(d.dhcp.DelegatedPrefixesForRA()) > 0)
+		if d.dhcpLeaseChangeRequiresRecompile(activeCfg, hadPDForRA) {
 			slog.Info("DHCP address changed, recompiling dataplane")
 			// applyActiveConfig runs reconcileDNSLocked, so DNS is
 			// reconciled with the new lease set on this path.
@@ -221,13 +228,31 @@ func (d *Daemon) resolveDHCPNextHop(leaseIface string) (string, bool) {
 	return lease.Gateway.String(), true
 }
 
-func (d *Daemon) dhcpLeaseChangeRequiresRecompile(cfg *config.Config) bool {
+// hadPDForRA is whether the PREVIOUS pass saw a delegated prefix mapped to an
+// RA interface (#9239). It is a parameter rather than a field read so this
+// predicate stays pure: the state transition is recorded by the single caller
+// that owns the event.
+func (d *Daemon) dhcpLeaseChangeRequiresRecompile(cfg *config.Config, hadPDForRA bool) bool {
 	if cfg == nil {
 		return false
 	}
 	// Prefix delegation can affect downstream addressing/RA and still needs
 	// a full re-apply.
 	if d.dhcp != nil && len(d.dhcp.DelegatedPrefixesForRA()) > 0 {
+		return true
+	}
+	// #9239: ...and so does LOSING the last one. The withdrawal is the event
+	// that most needs RA re-applied, because in standalone mode this full-apply
+	// path is the ONLY RA applier -- reconcileClusterRAServices is explicitly a
+	// no-op off-cluster, and the 30s sender loop retries only DEAD senders, not
+	// live ones holding stale desired state. Without this the sender keeps
+	// refreshing a prefix upstream has withdrawn until an unrelated apply or a
+	// restart, while downstream hosts keep autoconfiguring from it.
+	//
+	// ra.Manager.Apply with an empty set is already the graceful path: it
+	// removes the sender and emits a router-lifetime-zero goodbye so the last
+	// PIO ages out. The defect was never reaching it.
+	if hadPDForRA {
 		return true
 	}
 	// If management VRF bindings are unavailable, stay conservative. Read a

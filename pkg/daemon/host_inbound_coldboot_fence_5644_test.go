@@ -271,7 +271,7 @@ func TestColdBootZeroDropFenceRetriesAfterAddressAppears5759(t *testing.T) {
 
 	d := &Daemon{}
 	d.publishMgmtVRFIfaces(map[string]bool{"fxp0": true, "fab0": true, "em0": true})
-	if !d.dhcpLeaseChangeRequiresRecompile(cfg) {
+	if !d.dhcpLeaseChangeRequiresRecompile(cfg, false) {
 		t.Fatal("fixture must be classified for full recompile; this does not prove the apply reaches host authorization")
 	}
 

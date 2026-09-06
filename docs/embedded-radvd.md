@@ -488,6 +488,26 @@ PD-derived prefixes into `RAInterfaceConfig` before passing to the RA manager. T
 works identically with the embedded implementation — the Manager receives complete
 configs and doesn't need to know where prefixes came from.
 
+**Withdrawal is a distinct event from a change (#9239).** `buildRAConfigs()` only
+runs on the full-apply path, and in STANDALONE mode that path is the *only* RA
+applier — `reconcileClusterRAServices` is explicitly a no-op off-cluster, and the
+30-second sender loop retries only DEAD senders, never a live one holding stale
+desired state. So RA correctness after a PD change depends entirely on whether the
+DHCP lease-change callback classified the event as needing a full apply.
+
+That classifier reads the PD set *after* `commitLease` has already removed a
+withdrawn prefix, which makes "the last prefix was just withdrawn" and "this box
+never had one" the same empty set. `onDHCPAddressChange` therefore remembers
+whether the previous pass saw a PD-for-RA (`Daemon.pdForRAPresent`) and forces the
+apply on the falling edge as well as the rising one.
+
+Without it, the sender keeps refreshing a prefix the upstream has withdrawn until
+an unrelated apply or a restart, while downstream hosts keep autoconfiguring from
+it — and the resulting drops appear off-box, far from the daemon that caused them.
+`ra.Manager.Apply` with an empty set is already the graceful path (it removes the
+sender and emits a router-lifetime-zero goodbye so the last PIO ages out); the
+defect was only ever in reaching it.
+
 ### 4.5 RETH Interface Resolution
 
 The `buildRAConfigs()` function already resolves RETH names to Linux interface names
