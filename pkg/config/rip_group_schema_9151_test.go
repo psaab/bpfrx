@@ -55,9 +55,111 @@ func TestRipGroupSchemaMatchesCompiler9151(t *testing.T) {
 // When someone closes #9151 -- by flipping the container closed-world, or by
 // teaching the compiler to walk the run -- THIS CELL WILL FAIL, and that
 // failure is the signal to delete it rather than a regression.
-func TestRipGroupPackedRunStillAdmitted9151(t *testing.T) {
+// TestRipGroupRefusesUndeclaredStatements9151 replaces
+// TestRipGroupPackedRunStillAdmitted9151, which existed only to keep the open
+// gap visible and carried an instruction to delete itself once the gate began
+// refusing. It does now.
+//
+// Declaring the two children was NECESSARY AND NOT SUFFICIENT: the container
+// stayed OPEN-WORLD, so an undeclared trailing statement was accepted and
+// silently discarded --
+//
+//	set protocols rip group g1 authentication-key secret1
+//	  gate=ACCEPT  compile=nil  ifaces=[] redist=[] authKey=""
+//
+// -- which is the #9148 conjunction (a flat run is accepted iff the container
+// is open-world AND the leaf it starts at is untyped). Closing the container
+// breaks it here.
+//
+// THE MATRIX IS THE POINT, not the single fixed row. `closedWorld` INHERITS, so
+// arming it is only safe where the subtree is shallow; the ACCEPT rows below are
+// what say it did not close more than intended. On #9017 the same flag armed one
+// level up began rejecting `from source-prefix-list trusted`, valid shipped
+// configuration, and only a full-package gate caught it.
+func TestRipGroupRefusesUndeclaredStatements9151(t *testing.T) {
+	const G = "set protocols rip group g1 "
+	for _, tc := range []struct {
+		name   string
+		lines  []string
+		accept bool
+		ifaces []string
+		redist []string
+	}{
+		// MUST STILL WORK. Over-denying here breaks RIP groups outright, and
+		// every one of these is a spelling an operator legitimately writes.
+		{"neighbor", []string{G + "neighbor ge-0/0/0"}, true, []string{"ge-0/0/0"}, nil},
+		{"neighbor bracketed list", []string{G + "neighbor [ ge-0/0/0 ge-0/0/1 ]"}, true,
+			[]string{"ge-0/0/0", "ge-0/0/1"}, nil},
+		{"export", []string{G + "export static"}, true, nil, []string{"static"}},
+		{"export bracketed list", []string{G + "export [ static direct ]"}, true, nil,
+			[]string{"static", "direct"}},
+		{"both on separate lines", []string{G + "neighbor ge-0/0/0", G + "export static"}, true,
+			[]string{"ge-0/0/0"}, []string{"static"}},
+		{"packed run of the two DECLARED children", []string{G + "neighbor ge-0/0/0 export static"},
+			true, []string{"ge-0/0/0"}, []string{"static"}},
+
+		// MUST NOW REFUSE — the reported defect.
+		{"undeclared trailing statement", []string{G + "authentication-key secret1"}, false, nil, nil},
+		{"typo'd child", []string{G + "neighbour ge-0/0/0"}, false, nil, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := &ConfigTree{}
+			for _, l := range tc.lines {
+				toks, err := ParseSetCommand(l)
+				if err != nil {
+					t.Fatalf("ParseSetCommand(%q): %v", l, err)
+				}
+				if err := tr.SetPath(toks); err != nil {
+					t.Fatalf("SetPath: %v", err)
+				}
+			}
+			err := SchemaValidateWithDefinitions(tr, tr, nil)
+			if (err == nil) != tc.accept {
+				t.Fatalf("commit gate accepted=%v, want %v (err=%v)", err == nil, tc.accept, err)
+			}
+			if !tc.accept {
+				return
+			}
+			cfg, cerr := CompileConfig(tr)
+			if cerr != nil {
+				t.Fatalf("compile: %v", cerr)
+			}
+			r := cfg.Protocols.RIP
+			if r == nil {
+				t.Fatal("no RIP config compiled")
+			}
+			if !equalStrs9151(r.Interfaces, tc.ifaces) {
+				t.Errorf("Interfaces = %v, want %v", r.Interfaces, tc.ifaces)
+			}
+			if !equalStrs9151(r.Redistribute, tc.redist) {
+				t.Errorf("Redistribute = %v, want %v", r.Redistribute, tc.redist)
+			}
+		})
+	}
+}
+
+// TestRipGroupMultiLeafStillAbsorbs9151 PINS A RESIDUAL THAT THIS FIX DOES NOT
+// CLOSE, so the gap stays visible rather than being implied away by the issue
+// closing.
+//
+// `neighbor` is a multi leaf, so it absorbs every trailing token as a VALUE
+// (the #2419 contract) BEFORE the closed-world walk could see any of them as
+// keywords. The undeclared statement is therefore not refused here — it is
+// injected as bogus interface names:
+//
+//	set protocols rip group g1 neighbor ge-0/0/0 authentication-key secret1
+//	  -> ifaces=[ge-0/0/0 authentication-key secret1]
+//
+// MEASURED PRE-EXISTING, not introduced by the #9183 declaration: the same
+// input produces the same interface list on a tree where `rip group` still had
+// `children: nil`. Closing it needs a value validator strict enough to reject
+// `authentication-key` as an interface name, which is a different change with
+// its own risk of rejecting legitimate names.
+//
+// This cell asserts the CURRENT behaviour so a future fix reds it deliberately.
+func TestRipGroupMultiLeafStillAbsorbs9151(t *testing.T) {
 	tr := &ConfigTree{}
-	toks, err := ParseSetCommand("set protocols rip group g1 authentication-key secret1")
+	toks, err := ParseSetCommand("set protocols rip group g1 neighbor ge-0/0/0 authentication-key secret1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,16 +167,29 @@ func TestRipGroupPackedRunStillAdmitted9151(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := SchemaValidateWithDefinitions(tr, tr, nil); err != nil {
-		t.Skipf("#9151 IS NOW REFUSED AT THE SCHEMA GATE (%v).\n"+
-			"That is the fix landing. Delete this cell and #9151 with it -- it exists "+
-			"only to keep the open gap visible while the declaration is in place.", err)
+		t.Skipf("the multi-leaf absorption residual is now REFUSED (%v) — good news. "+
+			"Delete this cell and the note on the issue it pins.", err)
 	}
-	cfg, err := CompileConfig(tr)
-	if err != nil {
-		t.Fatalf("compile: %v", err)
+	cfg, cerr := CompileConfig(tr)
+	if cerr != nil {
+		t.Fatalf("compile: %v", cerr)
 	}
-	if r := cfg.Protocols.RIP; r != nil && (len(r.Interfaces) > 0 || r.AuthKey.Reveal() != "") {
-		t.Errorf("#9151 appears FIXED at the compiler (ifaces=%v authKey=%q). "+
-			"Delete this cell and close the issue.", r.Interfaces, r.AuthKey.Reveal())
+	got := cfg.Protocols.RIP.Interfaces
+	want := []string{"ge-0/0/0", "authentication-key", "secret1"}
+	if !equalStrs9151(got, want) {
+		t.Errorf("the pinned residual changed shape: Interfaces = %v, want %v. "+
+			"If this is a FIX, delete this cell; if it is a new drift, adjudicate it.", got, want)
 	}
+}
+
+func equalStrs9151(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

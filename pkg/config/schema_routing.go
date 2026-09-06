@@ -490,7 +490,27 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 		// bracket list `export [ a b ]` is not truncated to its first entry
 		// (#3904). Declaring them `multi: true` keeps the schema's account of
 		// the leaf and the compiler's read of it in agreement.
-		"group": {desc: "Group", args: 1, placeholder: "<group-name>", children: map[string]*schemaNode{
+		// #9151 (second half): CLOSED-WORLD. Declaring the two children was
+		// necessary and NOT sufficient -- the container stayed open-world, so
+		// an UNDECLARED trailing statement was still accepted and silently
+		// discarded:
+		//
+		//	set protocols rip group g1 authentication-key secret1
+		//	  schema gate = ACCEPT   compile = nil   ifaces=[] redist=[] authKey=""
+		//
+		// which is the #9148 conjunction: a flat run is accepted iff the
+		// container is OPEN-WORLD and the leaf it starts at is UNTYPED. Closing
+		// the container breaks the conjunction here.
+		//
+		// SAFE TO ARM AT THIS NODE, and that is a measured claim rather than a
+		// general one. `closedWorld` INHERITS, so arming it on a container with
+		// a deep grammar beneath closes all of it -- that is what happened on
+		// #9017, where arming it at `firewall family` began rejecting
+		// `from source-prefix-list trusted`, valid shipped configuration. Here
+		// the subtree is exactly ONE level: both children are leaves with
+		// `children: nil`, so inheritance has nowhere to spread. The matrix in
+		// TestRipGroupRefusesUndeclaredStatements9151 is what holds that true.
+		"group": {desc: "Group", args: 1, placeholder: "<group-name>", closedWorld: true, children: map[string]*schemaNode{
 			"neighbor": {desc: "Neighbor interface in this group", args: 1, multi: true,
 				valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: nil},
 			"export": {desc: "Protocols redistributed into this group", args: 1, multi: true,
