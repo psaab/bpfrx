@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 	"testing"
@@ -59,6 +60,108 @@ func recordScopeKeys8690(text string, admitAll bool) map[[2]string]bool {
 // look separable here can share a key at a shallower packing. That is a real
 // limit and the reason this reports rather than proves separability: a red is a
 // definite hazard, a green is "not at this packing".
+// TestCensusGreensAreFlatPackingOnly8946 turns the limit the census above
+// states in prose -- "a green is not-at-this-packing" -- into a measured,
+// falsifiable fact.
+//
+// WHY THIS IS NOT THE LEAF-CONTINGENCY REMEDY, which is the point of the cell.
+//
+// #8946's remedy for a census that synthesises ONE value per site is: measure
+// every site, collapse only on agreement, publish the disagreement as its own
+// verdict (sweepPairVerdicts8859). That remedy assumes the measurements it is
+// collapsing are all VALID and merely disagree.
+//
+// Applied here, it does not hold, and the difference is measured rather than
+// argued. Across every register site, the census's flat packing records at
+// least one scope key and the SAME CONTENT braced records ZERO -- and the
+// braced fixtures PARSE, so "recorded nothing" is the pass asking nothing
+// (#8763), not a malformed probe. Collapsing {some keys} against {} on
+// disagreement would publish CONTINGENT, which reads as "the answer depends
+// on the spelling" when the truth is "the second probe observed nothing at
+// all". A vacuous measurement is not a dissenting one.
+//
+// So the honest bound is stated as a bound: the class assignments above hold
+// AT THE FLAT PACKING, and nothing here measures the braced one.
+//
+// RED means one of two good things happened and both require re-deriving the
+// census rather than editing this cell:
+//   - the braced form started recording keys (#8763 fixed) -- the census can
+//     and must now be measured at both packings; or
+//   - the flat form stopped recording them -- the census went vacuous and its
+//     greens mean nothing.
+func TestCensusGreensAreFlatPackingOnly8946(t *testing.T) {
+	reg := readPermanentExclusions8690(t)
+	var measured, flatRecorded, bracedRecorded, parseFail int
+	var offenders []string
+	for _, site := range collectCompactSites() {
+		if len(site.container) == 0 || strings.HasPrefix(site.container[0], "groups") {
+			continue
+		}
+		parent := site.container[:len(site.container)-1]
+		stanza := site.container[len(site.container)-1]
+		v1, _, ok := synthPair(site.node)
+		if !ok {
+			continue
+		}
+		siteKey := strings.Join(site.container, " ") + " " + site.leaf
+		if _, inReg := reg[siteKey]; !inReg {
+			continue
+		}
+		measured++
+		ctx := contextFor(parent)
+		flatText := nest(parent, ctx+stanza+" "+site.leaf+" "+v1+";")
+		bracedText := nest(parent, ctx+stanza+" { "+site.leaf+" "+v1+"; }")
+
+		// The braced arm must PARSE. Without this, an empty key set from a
+		// malformed fixture is indistinguishable from the pass asking nothing,
+		// and this cell would "prove" the bound by being broken.
+		if _, perrs := NewParser(bracedText).Parse(); len(perrs) > 0 {
+			parseFail++
+			if len(offenders) < 5 {
+				offenders = append(offenders, "UNPARSEABLE braced fixture: "+siteKey)
+			}
+			continue
+		}
+		if len(recordScopeKeys8690(flatText, true)) > 0 {
+			flatRecorded++
+		}
+		if n := len(recordScopeKeys8690(bracedText, true)); n > 0 {
+			bracedRecorded++
+			if len(offenders) < 5 {
+				offenders = append(offenders, fmt.Sprintf(
+					"braced packing now records %d key(s): %s", n, siteKey))
+			}
+		}
+	}
+	if measured == 0 {
+		t.Fatal("#8946: measured ZERO register sites — this cell is vacuous and " +
+			"proves nothing about the packing bound")
+	}
+	if parseFail > 0 {
+		t.Errorf("#8946: %d of %d braced fixtures did not parse, so the "+
+			"zero-keys result below would be a property of the FIXTURE rather "+
+			"than of the pass:\n  %s",
+			parseFail, measured, strings.Join(offenders, "\n  "))
+	}
+	if flatRecorded != measured {
+		t.Errorf("#8946: the flat packing recorded keys for only %d of %d register "+
+			"sites. The census above builds its class assignments from exactly "+
+			"this packing, so any site it cannot observe is a site it classifies "+
+			"on no evidence.", flatRecorded, measured)
+	}
+	if bracedRecorded != 0 {
+		t.Errorf("#8946: the braced packing now records keys for %d of %d sites "+
+			"(was 0 for all of them — #8763, the pass asks nothing of a braced "+
+			"stanza).\n  %s\n"+
+			"This is GOOD NEWS and it invalidates the census above: its greens "+
+			"were 'separable AT THE FLAT PACKING' precisely because the braced "+
+			"packing was unobservable. Re-derive it across both packings and "+
+			"collapse only on agreement (the #8859 remedy now APPLIES, which it "+
+			"did not while one arm measured nothing).",
+			bracedRecorded, measured, strings.Join(offenders, "\n  "))
+	}
+}
+
 func TestSitesThatCannotBeSeparatedShareAClass8690(t *testing.T) {
 	reg := readPermanentExclusions8690(t)
 
