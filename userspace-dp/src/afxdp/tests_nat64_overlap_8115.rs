@@ -280,3 +280,150 @@ fn a_deterministic_nat64_mint_is_refused_and_leaves_no_reservation_8115() {
          is skipped strands {PORT} in an allocator no session will ever free"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #9021 — the SYNCED NAT64 import was the one arm of four that never asked
+// ---------------------------------------------------------------------------
+//
+// Both SNAT synced arms call `peer_owns_wire_identity`; the local NAT64 mint
+// calls `nat64_refuse_if_peer_owns` (the cells above). The HA-synced NAT64
+// import returned `reserve_nat64_pool_port` DIRECTLY on both of its routes.
+//
+// The refusal was not one level down: `reserve_nat64_pool_port` ends at
+// `allocator.reserve_flow`, and `PortAllocator` carries no `PoolAddressOwners`
+// logic at all — so nothing on that path could have asked.
+//
+// Consequence: a peer-synced import reserves against the NAT64 prefix's OWN
+// bitmap only. With a local source-NAT flow already holding (X, P) in the
+// overlapping pool, the import SUCCEEDS, the coordinator publishes, and the
+// reverse (1:N) index carries two live flows on one translated identity — the
+// exact split #8115 R2/R3 closed for the other three arms.
+//
+// The two consumers are why the bool has to be right HERE: the coordinator
+// (`afxdp/ha/session_import.rs`) uses it as its ONLY refusal point, and the
+// worker twin (`upsert_synced.rs`) discards it entirely, so nothing downstream
+// re-checks.
+
+/// A peer-synced NAT64 forward flow, keyed on the ORIGINAL IPv6 5-tuple — which
+/// is what `reserve_synced_nat64_allocation` narrows on (`match_ipv6_dest`
+/// against `key.dst_ip`), so this key exercises the NARROWED route.
+fn synced_nat64_key_9021(client: &str) -> crate::session::SessionKey {
+    crate::session::SessionKey {
+        addr_family: libc::AF_INET6 as u8,
+        protocol: crate::ip_proto::PROTO_TCP,
+        src_ip: IpAddr::V6(client.parse().expect("v6 client")),
+        dst_ip: IpAddr::V6("64:ff9b::0808:0808".parse().expect("v6 dst")),
+        src_port: 5000,
+        dst_port: 443,
+        discriminator: Default::default(),
+        routing_domain: 0,
+    }
+}
+
+/// A v4-keyed synced flow, which cannot narrow and therefore takes the FALLBACK
+/// SCAN route. Both routes needed the refusal; wiring only the narrowed one
+/// would be the partial-fix shape on the path whose entire purpose is to keep
+/// working when the narrowed pick cannot.
+fn synced_nat64_v4keyed_9021(client: &str) -> crate::session::SessionKey {
+    crate::session::SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: crate::ip_proto::PROTO_TCP,
+        src_ip: IpAddr::V4(client.parse().expect("v4 client")),
+        dst_ip: IpAddr::V4("8.8.8.8".parse().expect("v4 dst")),
+        src_port: 5000,
+        dst_port: 443,
+        discriminator: Default::default(),
+        routing_domain: 0,
+    }
+}
+
+fn import_synced_9021(state: &ForwardingState, key: &crate::session::SessionKey) -> bool {
+    let decision = crate::nat64::Nat64State::forward_decision(
+        SHARED_V4.parse::<Ipv4Addr>().expect("shared v4"),
+        "8.8.8.8".parse::<Ipv4Addr>().expect("v4 dst"),
+        PORT,
+    );
+    crate::nat64::reserve_synced_nat64_allocation(&state.nat64, key, decision, false, 0)
+}
+
+/// THE DEFECT, narrowed route: a source-NAT flow owns the identity and the
+/// peer-synced NAT64 import must refuse it.
+#[test]
+fn a_synced_nat64_import_is_refused_when_a_source_pool_owns_the_identity_9021() {
+    let state = build_forwarding_state(&snapshot_with(SHARED_V4, SHARED_V4));
+
+    let local = snat_mint(&state, "10.0.61.7");
+    assert_eq!(
+        snat_identity(&local),
+        Some((SHARED_V4.parse::<IpAddr>().unwrap(), Some(PORT))),
+        "fixture: the source-NAT flow must own {SHARED_V4}:{PORT}, or this cell \
+         measures nothing"
+    );
+
+    assert!(
+        !import_synced_9021(&state, &synced_nat64_key_9021("2001:db8::7")),
+        "the peer-synced NAT64 import must REFUSE an identity a source-NAT pool \
+         already holds for a LIVE local flow. Each feature owns a separate bitmap \
+         over {SHARED_V4}, so without the peer query the import reserves against \
+         the NAT64 bitmap only, returns true, and the coordinator publishes — two \
+         live flows on one translated identity, which the reverse (1:N) index \
+         cannot attribute (#9021)"
+    );
+}
+
+/// THE DEFECT, fallback-scan route. A v4-keyed synced key cannot narrow, so it
+/// reaches the pool scan — a separate `return` that needed the same refusal.
+#[test]
+fn the_synced_nat64_fallback_scan_is_also_refused_9021() {
+    let state = build_forwarding_state(&snapshot_with(SHARED_V4, SHARED_V4));
+
+    let local = snat_mint(&state, "10.0.61.8");
+    assert_eq!(
+        snat_identity(&local),
+        Some((SHARED_V4.parse::<IpAddr>().unwrap(), Some(PORT))),
+        "fixture: the source-NAT flow must own the identity"
+    );
+
+    assert!(
+        !import_synced_9021(&state, &synced_nat64_v4keyed_9021("10.0.61.9")),
+        "the FALLBACK SCAN route must refuse too. It is the route a v4-keyed or \
+         prefix-less key takes (config drift between nodes, an old peer), so \
+         wiring the refusal into the narrowed arm alone leaves the defect live on \
+         exactly the path that exists for when narrowing fails (#9021)"
+    );
+}
+
+/// CONTROL — and it is load-bearing, because a "fix" that refused every synced
+/// import would satisfy both cells above while breaking HA session sync
+/// entirely: the standby would reserve nothing and a post-failover local flow
+/// could reuse a live translated identity, which is the #4512 defect this whole
+/// path exists to prevent.
+#[test]
+fn a_synced_nat64_import_still_succeeds_when_nothing_owns_the_identity_9021() {
+    let state = build_forwarding_state(&snapshot_with(SHARED_V4, SHARED_V4));
+
+    // No local mint: nothing holds (SHARED_V4, PORT).
+    assert!(
+        import_synced_9021(&state, &synced_nat64_key_9021("2001:db8::7")),
+        "an unowned identity must still be RESERVED — refusing it would leave the \
+         standby with no record of the peer's translation (#4512)"
+    );
+}
+
+/// CONTROL — disjoint pools must not consult a peer index at all, keeping the
+/// `Option::is_none` fast path and proving the refusals above are attributable
+/// to the OVERLAP rather than to the import path being broken generally.
+#[test]
+fn a_synced_nat64_import_over_disjoint_pools_is_unaffected_9021() {
+    let state = build_forwarding_state(&snapshot_with("172.16.80.51", SHARED_V4));
+    assert!(
+        state.nat64.prefixes[0].overlap_owners.is_none(),
+        "fixture: disjoint pools register no index"
+    );
+    let _ = snat_mint(&state, "10.0.61.7");
+    assert!(
+        import_synced_9021(&state, &synced_nat64_key_9021("2001:db8::7")),
+        "with no shared address there is no contention and the import must \
+         proceed exactly as before"
+    );
+}

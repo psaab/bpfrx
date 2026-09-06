@@ -1132,7 +1132,21 @@ the NAT module applies it:
   `forwarding_build` once both are assigned, replacing the source-only index
   with a combined one (a strict superset) and handing it to both features. Both
   directions are closed: the NAT64 mint refuses an identity a source pool holds,
-  and the source-NAT mint refuses one a prefix holds. Two source-NAT pools whose
+  and the source-NAT mint refuses one a prefix holds.
+  **And the HA-SYNCED NAT64 import asks too, on both of its routes (#9021).**
+  That arm was the one of four that never did, and this paragraph naming only
+  the two MINT directions is part of why it stayed invisible: the sentence was
+  true and its silence read as completeness. The refusal was not one level down
+  either — `reserve_nat64_pool_port` ends at `allocator.reserve_flow`, and
+  `PortAllocator` carries no `PoolAddressOwners` logic at all, so nothing on
+  that path could have asked. A peer-synced import therefore reserved against
+  the prefix's OWN bitmap only: with a live local source-NAT flow holding the
+  identity the import succeeded, the coordinator published, and the reverse
+  (1:N) index carried two live flows on one translated identity. Both routes
+  needed it — the `match_ipv6_dest` narrowed arm AND the fallback pool scan,
+  which is what a v4-keyed or prefix-less key takes — and the returned bool has
+  to be right there, because the coordinator uses it as its ONLY refusal point
+  and the worker twin discards it entirely. Two source-NAT pools whose
   addresses overlap are two independent occupancy bitmaps — the allocator key
   carries the pool NAME — so each is blind to the other's live translations and
   both would publish one `(pool address, port)` for two live flows. One

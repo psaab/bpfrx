@@ -1650,6 +1650,71 @@ pub(crate) fn reserve_synced_nat64_allocation_for_worker(
     )
 }
 
+/// #9021: reserve a synced NAT64 translation, then apply the SAME peer-ownership
+/// refusal the other three arms apply.
+///
+/// `reserve_synced_nat64_allocation_with_holder` was the one arm of four that
+/// never asked whether a PEER allocator already owns the translated identity.
+/// Both SNAT synced arms call `peer_owns_wire_identity`, and the local NAT64
+/// mint calls `nat64_refuse_if_peer_owns` — this path returned
+/// `reserve_nat64_pool_port` directly on BOTH of its routes.
+///
+/// The refusal was not one level down: `reserve_nat64_pool_port` ends at
+/// `allocator.reserve_flow`, and `PortAllocator` has no `PoolAddressOwners`
+/// logic at all. A NAT64 prefix is its own occupancy domain, so a source-NAT
+/// pool sharing one of these addresses can already hold this identity for a
+/// LIVE flow: the import then succeeded, the coordinator published, and the
+/// reverse (1:N) index carried TWO LIVE FLOWS ON ONE TRANSLATED IDENTITY —
+/// exactly the split #8115 R2/R3 closed for the other three.
+///
+/// The two consumers are why the returned bool has to be right here rather than
+/// being re-checked downstream: the coordinator (`afxdp/ha/session_import.rs`)
+/// uses it as its ONLY refusal point, and the worker twin
+/// (`upsert_synced.rs`) discards it entirely.
+///
+/// ONE function rather than a copy in each of the two routes, for the reason
+/// `nat64_refuse_if_peer_owns` itself gives: the routes differ in how they
+/// CHOOSE the prefix, not in what makes the tuple a duplicate, and a check
+/// duplicated into both is free to drift — a drifted copy still answers, just
+/// about a different question.
+///
+/// Rollback is the helper's job (`rollback_flow`, not `release_flow`): the
+/// activation is being WITHDRAWN, and the deterministic arm's block port must go
+/// back through `free_no_recycle` rather than onto a recycle ring the
+/// deterministic mapping never draws from.
+#[allow(clippy::too_many_arguments)]
+fn reserve_synced_nat64_port_unless_peer_owns(
+    prefix: &Nat64Prefix,
+    flow: crate::nat::SourceNatFlowKey,
+    snat_v4: std::net::Ipv4Addr,
+    port: u16,
+    addr_index: usize,
+    now_ns: u64,
+    holder: crate::nat::NatHolder,
+) -> bool {
+    if !reserve_nat64_pool_port(
+        &prefix.port_allocator,
+        flow,
+        snat_v4,
+        port,
+        addr_index,
+        prefix.deterministic_v6.is_some(),
+        now_ns,
+        holder,
+    ) {
+        return false;
+    }
+    crate::nat::nat64_refuse_if_peer_owns(
+        &prefix.port_allocator,
+        prefix.overlap_owners.as_deref(),
+        flow,
+        (snat_v4, port),
+        now_ns,
+        holder,
+    )
+    .is_ok()
+}
+
 fn reserve_synced_nat64_allocation_with_holder(
     nat64: &Nat64State,
     key: &crate::session::SessionKey,
@@ -1709,15 +1774,9 @@ fn reserve_synced_nat64_allocation_with_holder(
     };
     if let Some(prefix) = narrowed.and_then(|idx| nat64.prefixes.get(idx)) {
         if let Some(addr_index) = prefix.pool_v4.iter().position(|a| *a == snat_v4) {
-            return reserve_nat64_pool_port(
-                &prefix.port_allocator,
-                flow,
-                snat_v4,
-                port,
-                addr_index,
-                prefix.deterministic_v6.is_some(),
-                now_ns,
-                holder,
+            // #9021: peer-ownership refusal applies here too.
+            return reserve_synced_nat64_port_unless_peer_owns(
+                prefix, flow, snat_v4, port, addr_index, now_ns, holder,
             );
         }
     }
@@ -1735,15 +1794,12 @@ fn reserve_synced_nat64_allocation_with_holder(
         // `allocate_deterministic_v6` — otherwise a deterministic pool's synced
         // churn leaks ports into a recycle queue the deterministic path never
         // drains (unbounded standby memory).
-        if reserve_nat64_pool_port(
-            &prefix.port_allocator,
-            flow,
-            snat_v4,
-            port,
-            addr_index,
-            prefix.deterministic_v6.is_some(),
-            now_ns,
-            holder,
+        // #9021: and on the fallback scan, which is the route a v4-keyed or
+        // prefix-less key takes. Leaving it out here would be the partial-fix
+        // shape on a path whose whole purpose is to keep working when the
+        // narrowed pick cannot.
+        if reserve_synced_nat64_port_unless_peer_owns(
+            prefix, flow, snat_v4, port, addr_index, now_ns, holder,
         ) {
             return true;
         }
