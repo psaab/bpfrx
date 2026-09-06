@@ -560,6 +560,18 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig, opts compileOp
 	// #8436 find-or-create — see the schedulers loop above for the rule and for
 	// why the different-names case is preserved.
 	for _, inst := range namedInstances(node.FindChildren("traffic-control-profiles")) {
+		// #8939: split a packed run before any lookup. This block asks
+		// inst.node.FindChild(...) once per option, and `traffic-control-profiles
+		// TCP delay-buffer-rate 100000 guaranteed-rate 200000 scheduler-map M`
+		// is ONE child node carrying all three on its Keys — so the first
+		// matched and the rest were dropped. A shaper missing its
+		// guaranteed-rate or its scheduler-map does not fail; it shapes
+		// differently from what the operator wrote.
+		if expanded := expandFlatRun(inst.node.Children, cosTrafficControlProfileSchema8939()); len(expanded) != len(inst.node.Children) {
+			clone := *inst.node
+			clone.Children = expanded
+			inst.node = &clone
+		}
 		tcp := cos.TrafficControlProfiles[inst.name]
 		if tcp == nil {
 			tcp = &CoSTrafficControlProfile{Name: inst.name}
