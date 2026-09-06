@@ -176,6 +176,37 @@ func (s *Store) EnterConfigureExclusive(holder string) error {
 		return err
 	}
 	if s.configDir {
+		// #9119: allow re-entry by the SAME exclusive holder, and treat it as
+		// activity, exactly as EnterConfigureSession has done since #4476.
+		//
+		// Without this arm the exclusive path was asymmetric with its shared
+		// sibling in two ways, and the second is the damaging one. Measured:
+		//
+		//	fresh lease, same holder   -> ErrConfigLocked, staged edits kept
+		//	stale lease, same holder   -> nil, and IsDirty() flips true -> FALSE
+		//	shared-mode control        -> nil, staged edits kept
+		//
+		// So an automation client holding the exclusive lock could not
+		// idempotently re-assert it, and if it re-asserted after a stall past
+		// the idle lease it silently DESTROYED its own staged candidate --
+		// reclaimStaleLockLocked discards the candidate for any entrant by
+		// #4476's design, and here the entrant is the holder itself.
+		//
+		// MUST SIT BEFORE reclaimStaleLockLocked, or the stale-lease case
+		// reclaims (and wipes) before the self-check can spare it. That
+		// ordering is the whole fix for the second row above.
+		//
+		// AND IT MATCHES ON exclusiveHolder, NOT effectiveHolderLocked(). Using
+		// the effective holder would make a SHARED-mode holder's call to this
+		// function return nil while leaving the lock shared: the caller would
+		// believe it had upgraded to exclusive and would not have. A silent
+		// failure to acquire the stronger lock is worse than a refusal, so a
+		// shared holder asking for exclusive falls through and is refused --
+		// which is what it already did before this change.
+		if holder != "" && s.exclusiveHolder == holder {
+			s.configLockAt = time.Now()
+			return nil
+		}
 		// #4476: reclaim a stale lease before rejecting, same idle-lease
 		// contract as EnterConfigureSession.
 		if !s.reclaimStaleLockLocked() {
