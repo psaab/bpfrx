@@ -128,6 +128,22 @@ func runUniformGatesClusterZone(tree *ConfigTree, cfg *Config, opts compileOpts)
 		}
 	}
 
+	// #9039 reth-advertise-interval wire-width gate, the MILLISECONDS sibling
+	// of the #8483 seconds gate immediately above. Same 12-bit centisecond
+	// field, same silent-aliasing consequence, and it had no compiled-Config
+	// gate at all -- admission is a bare strconv.Atoi and the only bound was a
+	// schema bound, which duration_bound_8642.go already explains does not hold
+	// on the tolerant ingress. Lenient on load / peer-sync (#1960 no-brick),
+	// like every sibling gate here.
+	if err := validateRethAdvertiseIntervalStrict(cfg); err != nil {
+		if opts.lenientVRRPGroupTimers {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("reth-advertise-interval (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #4826 reth-derived VRRP VRID wire-width gate. Strict on commit /
 	// commit-check (hard-reject a `redundant-ether-options
 	// redundancy-group <id>` whose id would push the reth-derived VRRP
