@@ -77,7 +77,12 @@ cd "$ROOT" || { echo "FATAL: cannot cd to $ROOT" >&2; exit 2; }
 
 # Directories scanned for Rust cells. Env-overridable so the self-test can point
 # the census at a fixture tree.
-SCAN_DIRS=${IGN_CENSUS_DIRS:-"userspace-dp userspace-xdp"}
+# #9052 item 2: test/incus/cold-path-flooder is a THIRD Rust crate, outside
+# both dataplane workspaces, and it carried a bare `#[ignore]` that this census
+# could not see BY CONSTRUCTION — the scan list named only the two dataplane
+# crates, so the census reported a clean board over a population it had never
+# looked at. Widened here rather than left to the next crate to rediscover.
+SCAN_DIRS=${IGN_CENSUS_DIRS:-"userspace-dp userspace-xdp test/incus/cold-path-flooder"}
 # The command used to ask whether an issue is open. Overridable so the self-test
 # can drive the CLOSED branch without a network.
 GH_STATE_CMD=${IGN_CENSUS_GH_STATE:-}

@@ -2294,7 +2294,14 @@ mod tests {
     ///   sudo -E cargo test --release \
     ///     -- --ignored test_open_af_packet_raw_smoke
     #[test]
-    #[ignore]
+    // #9052: the reason is DECLARED rather than left to the doc comment above.
+    // A census cannot read prose — the marker is the machine-readable half, and
+    // a bare `#[ignore]` says nothing about why the cell is off or when it
+    // should come back. MEASUREMENT is the correct kind here: this needs
+    // CAP_NET_RAW and a real interface, so it is environment-gated forever
+    // rather than fail-until-fixed, and there is no issue whose closure should
+    // reactivate it.
+    #[ignore = "MEASUREMENT: needs CAP_NET_RAW and a real interface; see the doc comment above for the invocation"]
     fn test_open_af_packet_raw_smoke() {
         if std::env::var("XPF_RUN_RAW_SOCKET_TESTS").as_deref() != Ok("1") {
             eprintln!("Skipped: set XPF_RUN_RAW_SOCKET_TESTS=1 to run.");
