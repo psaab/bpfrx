@@ -417,6 +417,16 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 				MaxArchives: 10,
 			}
 			if cfgNode := child.FindChild("configuration"); cfgNode != nil {
+				// #8939: split a packed run. `archival configuration
+				// transfer-on-commit transfer-interval 30` is ONE child node
+				// carrying both on its Keys, so the first FindChild matched and
+				// the interval was dropped — an archive that uploads on commit
+				// but never on a schedule, or the reverse.
+				if expanded := expandFlatRun(cfgNode.Children, archivalConfigurationSchema8939()); len(expanded) != len(cfgNode.Children) {
+					clone := *cfgNode
+					clone.Children = expanded
+					cfgNode = &clone
+				}
 				if cfgNode.FindChild("transfer-on-commit") != nil {
 					sys.Archival.TransferOnCommit = true
 				}
