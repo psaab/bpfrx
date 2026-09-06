@@ -34,6 +34,15 @@ func deriveUserspaceConfig(cfg *config.Config) config.UserspaceConfig {
 		StateFile:     DefaultStateFile,
 	}
 	if cfg != nil && cfg.System.UserspaceDataplane != nil {
+		// SHALLOW copy of a struct reached from the shared active config. Safe
+		// ONLY because every field written below (Workers, RingEntries,
+		// ControlSocket, StateFile, EventSocket) is a SCALAR — the one reference
+		// field, SharedUMEM *SharedUMEMConfig, is carried along and never
+		// written. Writing through a reference field here would land on the
+		// daemon's live committed config, which is the #9141 defect
+		// (resolveDHCPRethInterfaces rewrote a group's Interfaces slice through
+		// exactly this kind of "copy"). Adding a write to a pointer/map/slice
+		// field means deep-copying it first.
 		out = *cfg.System.UserspaceDataplane
 	}
 	if out.Workers <= 0 {

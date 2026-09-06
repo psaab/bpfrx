@@ -1061,6 +1061,9 @@ reports the last COMPLETED attempt failed, and the manager spaces retries
 **Single-sourced desired state.** `desiredClusterDHCPConfig` is the one place
 that derives the Kea desired state from (active config, current master-RG
 set); the commit path, both transition edges, and the converger all call it.
+`desiredStandaloneDHCPConfig` is its non-cluster sibling (#9141) — the
+committed stanza with RETH names resolved, no RG filtering. Both RETURN a
+desired config; neither edits one in place.
 This is single-sourced rather than bound with an agreement test because a
 divergence between the converger and an edge is ALWAYS a bug — the converger
 runs every pass and would fight the edge indefinitely.
@@ -1076,6 +1079,32 @@ must re-drive it, and a third that must NOT) and
 `filterDHCPConfigForMasterRGs` decides which members of each
 `dhcp-local-server` / `dhcpv6-local-server` group this node serves. Two
 properties, both wrong before #6520.
+
+**It does not mutate the active config (#9141).** RETH logical names are
+translated to physical member Linux names by `resolveDHCPRethInterfaces`, which
+RETURNS a copy. It used to take a `*config.DHCPServerConfig` and rewrite
+`group.Interfaces[i]` in place, and every call site reached that slice from the
+daemon's shared active config: `dhcpCfg := cfg.System.DHCPServer` LOOKS like a
+copy but is a shallow struct copy over a pointer (`DHCPLocalServer`), a map of
+pointers (`Groups`) and a slice (`Interfaces`), so the rewrite landed on the
+live config. `desiredClusterDHCPConfig`'s comment even claimed the function
+"copies the config", which is what kept the defect invisible.
+
+The harm was not in DHCP — it was in DDNS, one subsystem over.
+`rgForInterfaces` (`daemon_ddns.go`) looks a group member up in
+`cfg.Interfaces.Interfaces`, keyed by JUNOS names, so after the rewrite
+(`reth1.0` → `ge-0-0-1.0`) the lookup missed and the pool scored RG 0 = "not
+HA-owned". `buildLeaseSubnetRGMap` then reported no RG-owned pool at all,
+`ddnsReconcileOptions` saw `anyRGOwnedPool` false, and the unattributable-lease
+branch flipped from FAIL-CLOSED to admit — disarming the #2664 per-lease
+double-write / stale-memfile guard, ORDER-DEPENDENTLY (different behaviour
+before and after the first apply in a process lifetime, repaired only by a
+restart, which recompiles the config from text). The operator-visible
+`show dhcp server` also rendered `ge-0-0-1.0` where `reth1.0` was configured.
+The PEER was never affected: config sync ships TEXT (`ShowActive` → the
+ConfigTree AST), not the compiled struct.
+
+Guards: `dhcp_reth_resolve_nomutate_9141_test.go`.
 
 **Mastership scopes only RG-scoped members.** The keep-set used to be built
 exclusively from `rethInterfacesForRG` over the currently-MASTER RGs, and that
