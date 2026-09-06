@@ -1,4 +1,4 @@
-# counts: losers=27 walked=77 vacuous=44 unmeasured=76
+# counts: losers=23 walked=80 vacuous=45 unmeasured=76
 # collector reach: 369 containers walked, 135 reached the census (137 dropped: no eligible leaf, 97 dropped: only one)
 firewall policer arg1 if-exceeding  [bandwidth-limit | burst-size-limit]  total  lenient-only
 forwarding-options sampling instance arg1 family inet output  [inline-jflow | source-address]  differs  OPERATOR
@@ -19,11 +19,7 @@ services flow-monitoring version-ipfix template arg1  [flow-active-timeout | flo
 services flow-monitoring version9 template arg1  [flow-active-timeout | flow-inactive-timeout]  total  lenient-only
 services rpm probe arg1 test arg1 target  [address | url]  total  OPERATOR
 system archival configuration  [transfer-interval | transfer-on-commit]  total  OPERATOR
-system dataplane  [binary | claim-host-tunables | control-socket]  total  OPERATOR
-system dataplane  [binary | claim-host-tunables]  total  OPERATOR
 system dataplane coalescence  [adaptive | rx-usecs | tx-usecs]  total  lenient-only
 system dataplane coalescence  [adaptive | rx-usecs]  total  lenient-only
-system dataplane shared-umem  [artifact-file | mode | phase0-artifact-file]  total  OPERATOR
-system dataplane shared-umem  [artifact-file | mode]  total  OPERATOR
 system services dhcp-local-server group arg1 pool arg1 static-binding arg1  [fixed-address | host-name]  total  lenient-only
 system services ssh  [client-alive-count-max | client-alive-interval | connection-limit]  total  lenient-only
