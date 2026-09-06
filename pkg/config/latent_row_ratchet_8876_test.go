@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -65,12 +66,28 @@ import (
 //     Recorded here rather than dropped silently, so the exclusion is a decision
 //     someone can reverse rather than an omission they have to rediscover.
 //
-// # WHY A COUNT AND NOT A SET
+// # IT WAS A COUNT. THE ARGUMENT FOR THAT WAS WRONG, AND HERE IS WHY.
 //
-// The failure enumerates the actual leaves, so the diff is readable. The
-// ASSERTION is on the count because that is what cannot be satisfied by editing
-// the expectation to match a mistake: a set literal invites "add the new name
-// and move on", which is precisely the non-adjudication this guard is for.
+// This table held an INT per edge, justified as: "a set literal invites `add the
+// new name and move on', which is precisely the non-adjudication this guard is
+// for." That reasoning does not survive being stated next to its alternative.
+// Bumping `4` to `5` is exactly as cheap as appending a name -- the thing that
+// actually resists a lazy edit is the failure TEXT and the adjudication it
+// demands, not the data type. The count bought nothing on the axis it was
+// chosen for.
+//
+// AND IT PAID FOR THAT NOTHING WITH A BLIND SPOT: a SWAP. Lose `filter`, gain
+// `policer`, and the count is still 4 -- a new value-carrying leaf appears under
+// an unadmitted edge, exactly the event this ratchet exists to catch, and it
+// passes in silence. A rename is the ordinary way that happens.
+//
+// Found while repairing a DIFFERENT ratchet (#8807) whose good-news branch --
+// "unmeasured rows FELL, tighten the constant" -- would have banked a coverage
+// loss as progress. The lesson generalised: A RATCHET KEYED ON A COUNT CANNOT
+// SEE A SUBSTITUTION, and the direction that looks like nothing happened is the
+// one nobody audits. Recorded as a falsified argument rather than quietly
+// rewritten, because the next person to prefer a count over a set deserves the
+// counterexample and not just the conclusion.
 // MEMBERSHIP IS BY MEASUREMENT, NOT BY THE CENSUS'S LATENT LABEL. Five rows
 // were adjudicated LATENT; only two survive the premise check below.
 //
@@ -95,9 +112,9 @@ import (
 // Keeping those three would have made this guard assert something FALSE in its
 // own failure text ("drops values SILENTLY"), and a wrong diagnostic is worse
 // than a missing one -- the reader trusts it and stops looking.
-var latentRows8876 = map[string]int{
-	"family inet":         4,
-	"pool persistent-nat": 2,
+var latentRows8876 = map[string][]string{
+	"family inet":         {"address", "filter", "mtu", "unnumbered-address"},
+	"pool persistent-nat": {"inactivity-timeout", "permit"},
 }
 
 func TestLatentRowsHaveNotGainedALeaf8876(t *testing.T) {
@@ -142,14 +159,35 @@ func TestLatentRowsHaveNotGainedALeaf8876(t *testing.T) {
 			names = append(names, l)
 		}
 		sort.Strings(names)
-		if len(names) == latentRows8876[k] {
+		want := append([]string(nil), latentRows8876[k]...)
+		sort.Strings(want)
+		if slices.Equal(names, want) {
 			continue
 		}
-		verb := "GAINED"
-		if len(names) < latentRows8876[k] {
-			verb = "LOST"
+		var gained, lost []string
+		for _, n := range names {
+			if !slices.Contains(want, n) {
+				gained = append(gained, n)
+			}
 		}
-		t.Errorf("LATENT ROW %q %s a value-carrying leaf: expected %d, found %d "+
+		for _, n := range want {
+			if !slices.Contains(names, n) {
+				lost = append(lost, n)
+			}
+		}
+		// A SWAP -- equal counts, different members -- is the case the old
+		// count-keyed assertion could not see at all.
+		verb := "CHANGED"
+		switch {
+		case len(gained) > 0 && len(lost) == 0:
+			verb = "GAINED " + strings.Join(gained, " ")
+		case len(lost) > 0 && len(gained) == 0:
+			verb = "LOST " + strings.Join(lost, " ")
+		case len(gained) > 0 && len(lost) > 0:
+			verb = "SWAPPED (lost " + strings.Join(lost, " ") +
+				", gained " + strings.Join(gained, " ") + ")"
+		}
+		t.Errorf("LATENT ROW %q %s its value-carrying leaves: expected %v, found %v "+
 			"across %d site(s).\n  leaves now: %s\n"+
 			"  This edge is UNADMITTED by compactNormalizeInScope, so its "+
 			"brace-elided spelling drops values SILENTLY -- it was filed NOT A "+
@@ -161,15 +199,15 @@ func TestLatentRowsHaveNotGainedALeaf8876(t *testing.T) {
 			"  and compare with ConfigFingerprint. If the value is lost, this is a "+
 			"live silent-drop defect and the fix is to admit the pair, not to "+
 			"update the number here.\n"+
-			"  DO NOT simply edit latentRows8876 to match. A count updated without "+
-			"that comparison converts a caught defect into a filed one, which is "+
-			"the single failure this guard exists to prevent (#8876).",
-			k, verb, latentRows8876[k], len(names), len(sites[k]), strings.Join(names, " "))
+			"  DO NOT simply edit latentRows8876 to match. A membership list "+
+			"updated without that comparison converts a caught defect into a filed "+
+			"one, which is the single failure this guard exists to prevent (#8876).",
+			k, verb, want, names, len(sites[k]), strings.Join(names, " "))
 	}
 
 	total := 0
 	for _, n := range latentRows8876 {
-		total += n
+		total += len(n)
 	}
 	t.Logf("#8876 latent ratchet: %d edges, %d value-carrying leaves, stable. "+
 		"`chassis -> cluster` (17 leaves) is deliberately excluded -- see the "+
