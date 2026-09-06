@@ -1505,6 +1505,18 @@ Scope of the fallback:
   manufactures a claim about a different identity, since the base netdev is
   shared with the sibling units the operator said nothing about.
 
+  **The same fan-down is what routing-instance membership was missing (#9132).**
+  `buildInterfaceRoutingInstances` and `buildInterfaceRouteTables` keyed a BARE
+  `routing-instances <ri> interface ge-0/0/0` on the bare name alone, so it
+  reached no addressed unit row and the VRF's connected prefix installed into
+  `inet.0`. All three binders in `CanonicalInterfaceUnitRef`'s documented family
+  now share ONE rule, `config.InterfaceUnitRefKeys`. What did NOT move into that
+  helper is the zone binder's extra fan-UP (`out[base]` for a unit reference):
+  it is right for zones and wrong for routing, because the base snapshot row
+  inherits the kernel netdev's addresses, which are unit 0's — the same
+  direction this paragraph already calls out as manufacturing a claim about a
+  different identity.
+
   Omitting the fan-down was measured as a blackhole in its own right: a unit that
   lands on its OWN netdev (any VLAN unit, any non-zero unit) is reached by
   neither rule 2 — no reference names its row — nor rule 3, which is skipped

@@ -1982,7 +1982,24 @@ unit name, so each binder now stores its map key on the canonical unit:
     while the detector still saw `.01` and `.1` as distinct keys, silently
     reopening the multi-zone fail-open #3072 closed.
   - **Routing-instance membership** — `buildInterfaceRoutingInstances` and
-    `buildInterfaceRouteTables` (`routes.go`).
+    `buildInterfaceRouteTables` (`routes.go`). **#9132 added the missing
+    bare→units FAN-DOWN to both.** Canonicalization alone was not enough: a
+    BARE `routing-instances <ri> interface ge-0/0/0` produced only the key
+    `ge-0/0/0`, while the addressed rows the per-unit snapshot consumer looks up
+    are named `ge-0/0/0.0` / `ge-0/0/0.<unit>` — so the reference bound no
+    addressed unit at all, the interface reported as a VRF member on every show
+    surface, and its connected prefix installed into `inet.0` with a working
+    egress ifindex (the #2388 Rust-side table scoping is derived purely from
+    `InterfaceSnapshot.RoutingInstance`, which stayed empty, so #2388 was
+    rendered inert rather than wrong). The zone binder in the same documented
+    family already fanned bare references down; two of the three did not. The
+    rule now lives in ONE place, `config.InterfaceUnitRefKeys`
+    (`host_inbound_effective_view.go`), which all three use. A UNIT reference is
+    still NOT fanned UP to its base in the routing binders — the base snapshot
+    row inherits the kernel netdev's addresses, which belong to unit 0, so
+    binding it from a `ge-0/0/0.1` reference would move unit 0's prefix into
+    unit 1's instance. The zone binder's own fan-UP stays at its call site,
+    where it is correct, rather than being levelled into the shared helper.
   - **Per-interface host-inbound override** — `buildInterfaceHostInboundMap`
     (`zones_override.go`), plus the operator-facing lookups in
     `ClassifyHostInboundForInterface` / `ResolveHostInboundIngressInterface`
@@ -2014,7 +2031,14 @@ unit name, so each binder now stores its map key on the canonical unit:
 
   Covered by `pkg/dataplane/userspace/unit_canonical_refbind_5878_test.go` (zone /
   routing-instance / host-inbound `.01`→canonical-unit-1 binding, RED on revert of
-  each binder), `pkg/config/unit_canonical_refkey_5878_test.go`
+  each binder),
+  `pkg/dataplane/userspace/bare_ri_iface_fandown_9132_test.go` (the #9132
+  bare→units fan-down: the defect with the unit spelling as its in-run control,
+  a three-binder agreement cell scoped to BARE references, the unit-ref-must-not-
+  fan-UP guard, the explicit-beats-fanned-down ordering rule in both authoring
+  orders, and a purely-additive property asserted against the pre-#9132 loop
+  re-implemented verbatim as the oracle),
+  `pkg/config/unit_canonical_refkey_5878_test.go`
   (`CanonicalInterfaceUnitRef` matrix, `zoneIfaceLogicalKeys` canonical claim, and
   a two-zone `.01`/`.1` duplicate-membership reject), and
   `pkg/daemon/ri_member_canonical_5878_test.go` (netlink `.01`→canonical device
