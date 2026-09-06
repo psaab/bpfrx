@@ -11,12 +11,25 @@ import (
 )
 
 // flexMatchStartUnrepresentable is the sentinel match-start emitted for a term
-// whose flexible-match-range is UNREPRESENTABLE on the wire (#5823: more than
-// one range named for a single term). It is deliberately NOT "layer-3" /
-// "layer-4", so the Rust filter compiler lowers it to
+// whose flexible-match-range is UNREPRESENTABLE on the wire. It is deliberately
+// NOT "layer-3" / "layer-4", so the Rust filter compiler lowers it to
 // FlexMatchStart::Unsupported and flex_matches() returns false — the term
-// matches NOTHING (fail-closed) rather than enforcing only the first range.
-const flexMatchStartUnrepresentable = "unrepresentable-multi-range"
+// matches NOTHING (fail-closed) rather than enforcing something the operator
+// did not write.
+//
+// TWO CAUSES REACH IT:
+//   - #5823: more than one range named for a single term.
+//   - #9020: parameters the compiler could not represent (UnknownFlexMatch) —
+//     a bad byte-offset, an unparseable match-value, a match-start outside
+//     {layer-3, layer-4}.
+//
+// The value was "unrepresentable-multi-range" while #5823 was the only cause.
+// It is renamed because it reaches `show firewall ... effective`, and telling
+// an operator with ONE range that their term has multiple is the
+// misdirecting-diagnostic shape this tree has been repeatedly bitten by. The
+// exact string carries no wire contract: the Rust side matches "layer-3" and
+// "layer-4" and treats everything else as Unsupported.
+const flexMatchStartUnrepresentable = "unrepresentable"
 
 // BuildFirewallFilterSnapshots returns the effective (compiled) firewall-filter
 // snapshots the userspace dataplane actually receives for cfg — the same value
@@ -316,7 +329,7 @@ func buildFilterTermSnapshots(filterName string, filter *config.FirewallFilter, 
 		// byte offset is L3-relative (match-start layer-3, the only start point
 		// the compiler emits). A zero effective length is dropped (no
 		// constraint) rather than emitted as a degenerate always-fail match.
-		if len(term.FlexMatchRangeNames) > 1 {
+		if len(term.FlexMatchRangeNames) > 1 || len(term.UnknownFlexMatch) > 0 {
 			// #5823: the term names more than one flexible-match-range range;
 			// the wire matcher supports exactly one. The strict commit gate
 			// (validateFilterFlexMatchStrict) already rejects this, so a term
@@ -333,12 +346,28 @@ func buildFilterTermSnapshots(filterName string, filter *config.FirewallFilter, 
 			// 1..=4 so flex_enabled is true (a length outside that range would
 			// instead reject the WHOLE snapshot); Value/Mask are unread once the
 			// start is Unsupported.
-			slog.Warn("firewall filter term names multiple flexible-match-range ranges; "+
-				"the dataplane supports one — poisoning the term to match nothing "+
-				"(fail-closed) until the config is split into separate terms",
+			// #9020: the SAME fail-closed channel now also covers a term whose
+			// flexible-match-range parameters could not be represented.
+			//
+			// The compiler records those in UnknownFlexMatch and then assigns
+			// term.FlexMatch anyway, so the tolerant load / peer-sync path
+			// shipped a DEFAULTED live match: `byte-offset 999` became offset 0,
+			// an unparseable `match-value` became 0, and a non-{layer-3,layer-4}
+			// `match-start` was evaluated at the L3 base. A discard term then
+			// enforced "the first bytes at offset 0 equal zero" instead of the
+			// pattern the operator wrote -- dropping traffic it should not and
+			// admitting the traffic it was written to drop.
+			//
+			// The nftables sibling has always checked BOTH conditions
+			// (daemon_nft.go:2248, daemon_nft_netlink.go:231); only this path
+			// checked one. Same defect class as the multi-range case above and
+			// the same remedy, so it reuses the channel rather than adding one.
+			slog.Warn("firewall filter term has an unrepresentable flexible-match-range; "+
+				"poisoning the term to match nothing (fail-closed) until the config is corrected",
 				"filter_term", term.Name,
 				"ranges", strings.Join(term.FlexMatchRangeNames, ","),
-				"issue", "#5823")
+				"unrepresentable", strings.Join(term.UnknownFlexMatch, ","),
+				"issue", "#5823/#9020")
 			snap.FlexMatch = &FlexMatchSnapshot{
 				Offset:     0,
 				Length:     1,
