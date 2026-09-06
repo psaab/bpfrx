@@ -63,6 +63,21 @@ func (c *xpfCollector) initGlobalDescriptors() {
 			"including at zero (#9042).",
 		[]string{"surface"}, nil,
 	)
+	c.napiProbeTargetSkipsTotal = prometheus.NewDesc(
+		"xpf_napi_probe_target_skips_total",
+		"Total NAPI-bootstrap interface probes skipped because no probe "+
+			"target could be derived; those queues got no synthetic hardware "+
+			"RX event and no other signal reports it. Always emitted, "+
+			"including at zero (#9019).",
+		nil, nil,
+	)
+	c.learnedRouteCapHitsTotal = prometheus.NewDesc(
+		"xpf_learned_route_cap_hits_total",
+		"Total snapshot builds that declined learned routes at the cap, i.e. "+
+			"forwarded on a route set known to be incomplete. Always emitted, "+
+			"including at zero (#9019).",
+		nil, nil,
+	)
 	c.sessionsCreatedTotal = prometheus.NewDesc(
 		"xpf_sessions_created_total",
 		"Total sessions created.",
