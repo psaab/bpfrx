@@ -40,6 +40,36 @@ package config
 var dupBlockMergeSites9023 = []struct{ parent, keyword string }{
 	{"snmp", "trap-group"},
 	{"sampling", "instance"},
+
+	// Issue 9209. These four became visible when #9024 taught the #8436 census
+	// to build a NESTED fixture: each has only container children, so no
+	// two-leaf fixture could be built, each left the population before any
+	// verdict was formed, and the census reported "SILENT: 0" over a set that
+	// excluded them. They are the same defect as the two above, at containers
+	// that pass did not reach.
+	//
+	// EACH WAS CHECKED FOR AN EXISTING GATE BEFORE BEING ADDED, because
+	// merging first destroys a diagnostic where one exists -- the reason #8752
+	// folds only on the tolerant path:
+	//
+	//	firewall policer                        ACCEPTS the duplicate, silent
+	//	protocols ospf area                     ACCEPTS the duplicate, silent
+	//	system services dhcp-local-server group ACCEPTS the duplicate, silent
+	//	security ipsec policy                   REJECTS -- but see below
+	//
+	// `security ipsec policy` is the `snmp trap-group` shape again, and it is
+	// the reason this list is checked per site rather than in aggregate. The
+	// gate that fires says `ipsec policy "p1" has no resolvable ipsec
+	// proposals` -- a true statement about the SECOND block, which the operator
+	// never intended to exist on its own, describing a symptom of the
+	// duplication rather than the duplication. Merging first makes that gate
+	// see the policy the operator actually described, so it stops firing on a
+	// config that is not missing its proposals. No diagnostic is lost; a
+	// misdirecting one is.
+	{"firewall", "policer"},
+	{"ospf", "area"},
+	{"ipsec", "policy"},
+	{"dhcp-local-server", "group"},
 }
 
 // mergeDuplicateBlocks9023 folds repeated named blocks into the first
