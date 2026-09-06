@@ -323,14 +323,41 @@ func (b *cloudflareBackend) UpsertLease(ctx context.Context, rec LeaseDNSRecord)
 		prevContent = rec.PrevAddr.Unmap().String()
 	}
 	prevID := ""
+	// #9067: the row whose CONTENT already matches but whose TTL does not. The
+	// pre-#9067 loop returned on a content match alone, so a TTL-ONLY change was
+	// never propagated — not delayed, NEVER. Every later refresh, including the
+	// operator's explicit `request system dynamic-dns update` force latch,
+	// re-entered the same early return. Route 53's sibling comparison has always
+	// been `live.found && live.ttl == ttl && sameValueSet(...)`
+	// (backend_route53.go), and `cfRecord.TTL` was already parsed here — the
+	// datum was available and simply unread.
+	//
+	// The harm lands later and silently: no error, no warning, and `show`
+	// reports the CONFIGURED TTL. An operator who lowers TTL before a planned
+	// renumber gets no propagation — precisely the case the shorter TTL was
+	// bought for.
+	sameContentID := ""
 	for _, r := range recs {
 		if r.Content == content {
-			// Already correct — no write.
-			return nil
+			if r.TTL == ttl {
+				// Already correct — no write.
+				return nil
+			}
+			// Content right, TTL wrong: PATCH THIS row. Falling through to the
+			// POST below would create a DUPLICATE at the same name rather than
+			// correcting the existing one.
+			sameContentID = r.ID
+			continue
 		}
 		if prevContent != "" && r.Content == prevContent {
 			prevID = r.ID
 		}
+	}
+	if sameContentID != "" {
+		// Prefer the content-matching row over a prev-address row: it is the
+		// one carrying the wrong TTL, and the payload below already holds the
+		// desired content, so one PATCH converges both fields.
+		prevID = sameContentID
 	}
 	payload := map[string]any{
 		"type":    rec.ForwardType,

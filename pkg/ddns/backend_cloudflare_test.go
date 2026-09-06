@@ -91,6 +91,13 @@ func (f *cfFakeAPI) handler() http.Handler {
 			_ = json.NewDecoder(r.Body).Decode(&upd)
 			cur := f.records[id]
 			cur.Content = upd.Content
+			// #9067: apply the TTL too. The fake used to drop it, so a cell
+			// asserting the propagated TTL would have measured the FAKE rather
+			// than the backend — and would have failed even against a correct
+			// fix. Real Cloudflare applies every field in the PATCH payload.
+			if upd.TTL != 0 {
+				cur.TTL = upd.TTL
+			}
 			f.records[id] = cur
 			f.ok(w, cur)
 		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/zones/"+f.zoneID+"/dns_records/"):
@@ -276,6 +283,17 @@ func TestCloudflareDelete(t *testing.T) {
 // seedRecord injects a record directly into the fake (bypassing POST) so a test
 // can stage the multi-record / wrong-content states the real Cloudflare API can
 // hold but the backend's own POST path would never create on its own.
+// seedRecordTTL seeds a record WITH a TTL (#9067). seedRecord leaves TTL zero,
+// which is fine for the content-only cells but useless for a TTL comparison: a
+// foreign row at TTL 0 cannot show that xpf left its TTL alone.
+func (f *cfFakeAPI) seedRecordTTL(rtype, name, content string, ttl int) string {
+	id := f.seedRecord(rtype, name, content)
+	rec := f.records[id]
+	rec.TTL = ttl
+	f.records[id] = rec
+	return id
+}
+
 func (f *cfFakeAPI) seedRecord(rtype, name, content string) string {
 	id := "seed" + itoa(f.nextID)
 	f.nextID++
@@ -374,5 +392,152 @@ func TestCloudflareMissingCredsConstructError(t *testing.T) {
 	}
 	if _, err := newCloudflareBackend(&config.DDNSProvider{Name: "cf", Backend: "cloudflare", APIToken: config.Secret("t")}, nil); err == nil {
 		t.Fatal("missing zone must error")
+	}
+}
+
+// hostRecordTTL is hostRecord with an explicit TTL, so a cell can vary the ONE
+// field #9067 is about (#9067). The existing helper hard-codes 300 and every
+// pre-#9067 cell used it, which is why the omission was untested in BOTH
+// directions: no cell could distinguish a backend that compares TTL from one
+// that ignores it.
+func hostRecordTTL(t *testing.T, fqdn, addr string, ttl int) LeaseDNSRecord {
+	t.Helper()
+	rec, err := buildHostRecord(fqdn, netip.MustParseAddr(addr), ttl)
+	if err != nil {
+		t.Fatalf("buildHostRecord: %v", err)
+	}
+	return rec
+}
+
+// #9067: a TTL-only change must propagate.
+//
+// The pre-#9067 loop returned on a CONTENT match alone, so a TTL-only edit was
+// never written — not delayed, NEVER. Every later refresh, including the
+// operator's explicit `request system dynamic-dns update` force latch, re-entered
+// the same early return. Route 53's sibling has always compared both
+// (`live.found && live.ttl == ttl && sameValueSet(...)`), and `cfRecord.TTL` was
+// already parsed here: the datum was available and simply unread.
+//
+// It is silent — no error, no warning, and `show` reports the CONFIGURED TTL —
+// and the harm lands later: an operator who lowers TTL before a planned renumber
+// gets no propagation, which is exactly what the shorter TTL was bought for.
+func TestCloudflareTTLOnlyChangePropagates9067(t *testing.T) {
+	fake := newCFFakeAPI(t)
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+	b := newCFTestBackend(t, srv, fake)
+
+	if err := b.UpsertLease(context.Background(),
+		hostRecordTTL(t, "wan.example.net", "203.0.113.5", 3600)); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if fake.posted != 1 {
+		t.Fatalf("fixture: first publish must create, posted=%d", fake.posted)
+	}
+	postedPatches := fake.patched
+
+	// SAME address, DIFFERENT TTL — the operator lowering TTL before a renumber.
+	if err := b.UpsertLease(context.Background(),
+		hostRecordTTL(t, "wan.example.net", "203.0.113.5", 60)); err != nil {
+		t.Fatalf("ttl-only change: %v", err)
+	}
+	if fake.patched == postedPatches {
+		t.Fatalf("#9067: a TTL-only change issued NO write (patched=%d, posted=%d). "+
+			"The backend returned on a content match alone, so the new TTL never "+
+			"reaches the provider — and never will, because every later refresh "+
+			"re-enters the same early return", fake.patched, fake.posted)
+	}
+	if fake.posted != 1 {
+		t.Errorf("#9067: the TTL fix must PATCH the existing row, not POST a second "+
+			"one (posted=%d). A duplicate at the same name is worse than the "+
+			"un-propagated TTL it replaces", fake.posted)
+	}
+
+	// The live record must carry BOTH the address and the new TTL.
+	var live cfRecord
+	for _, r := range fake.records {
+		live = r
+	}
+	if live.TTL != 60 {
+		t.Errorf("#9067: live TTL = %d, want 60 — the write happened but did not "+
+			"carry the new TTL", live.TTL)
+	}
+	if live.Content != "203.0.113.5" {
+		t.Errorf("#9067: the TTL update must not disturb the content: %q", live.Content)
+	}
+	if len(fake.records) != 1 {
+		t.Errorf("#9067: expected exactly one record at the name, got %d", len(fake.records))
+	}
+}
+
+// CONTROL, and it is load-bearing: with content AND TTL both already correct the
+// backend must still issue NO write. Without this a "fix" that simply deleted the
+// early return would satisfy the cell above while writing on every single
+// refresh — turning an idempotent no-op path into unconditional provider traffic
+// (and, on a rate-limited API, into failures).
+func TestCloudflareUnchangedContentAndTTLStillSkips9067(t *testing.T) {
+	fake := newCFFakeAPI(t)
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+	b := newCFTestBackend(t, srv, fake)
+
+	rec := hostRecordTTL(t, "wan.example.net", "203.0.113.5", 3600)
+	if err := b.UpsertLease(context.Background(), rec); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	posted, patched := fake.posted, fake.patched
+
+	for i := 0; i < 3; i++ {
+		if err := b.UpsertLease(context.Background(), rec); err != nil {
+			t.Fatalf("noop refresh %d: %v", i, err)
+		}
+	}
+	if fake.posted != posted || fake.patched != patched {
+		t.Errorf("#9067: content and TTL both unchanged must issue NO write, got "+
+			"posted %d->%d patched %d->%d. Deleting the early return instead of "+
+			"widening it makes every refresh a write", posted, fake.posted, patched, fake.patched)
+	}
+}
+
+// A TTL-only change on a SHARED name must still patch only xpf's own row — the
+// #3739 H11 property, re-asserted for the new fall-through path. The foreign row
+// is seeded FIRST so it is recs[0]: a fix that patched recs[0] would rewrite the
+// foreign value.
+func TestCloudflareTTLOnlyChangeLeavesForeignRowAlone9067(t *testing.T) {
+	fake := newCFFakeAPI(t)
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+	b := newCFTestBackend(t, srv, fake)
+
+	// A human's record at the same name, seeded first.
+	fake.seedRecordTTL("A", "wan.example.net", "198.51.100.7", 300)
+	if err := b.UpsertLease(context.Background(),
+		hostRecordTTL(t, "wan.example.net", "203.0.113.5", 3600)); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := b.UpsertLease(context.Background(),
+		hostRecordTTL(t, "wan.example.net", "203.0.113.5", 60)); err != nil {
+		t.Fatalf("ttl-only change: %v", err)
+	}
+
+	var foreign, own *cfRecord
+	for id := range fake.records {
+		r := fake.records[id]
+		switch r.Content {
+		case "198.51.100.7":
+			foreign = &r
+		case "203.0.113.5":
+			own = &r
+		}
+	}
+	if foreign == nil {
+		t.Fatal("#9067: the FOREIGN row was destroyed by the TTL-only update")
+	}
+	if foreign.TTL != 300 {
+		t.Errorf("#9067: the foreign row's TTL was rewritten to %d — xpf must "+
+			"never touch a record it does not own", foreign.TTL)
+	}
+	if own == nil || own.TTL != 60 {
+		t.Errorf("#9067: xpf's own row did not get the new TTL: %+v", own)
 	}
 }
