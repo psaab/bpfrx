@@ -80,6 +80,9 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 			"session scan concurrency limit reached; retry shortly")
 	}
 	defer release()
+	// #9041: publish the local slot so the peer fan-out can hand off to the
+	// REMOTE budget before the RTT instead of pinning a local scan slot.
+	ctx = withLocalWalkRelease(ctx, release)
 
 	// req.Offset is a signed int32; a negative value made the legacy
 	// path's `idx >= offset` test true for the first row (silently
@@ -712,6 +715,16 @@ func (s *Server) fetchPeerSessions(ctx context.Context, req *pb.GetSessionsReque
 		resp.PeerStatus = pb.PeerFetchStatus_PEER_FETCH_STATUS_NOT_APPLICABLE
 		return
 	}
+	// #9041: the local walk is done; everything below is remote. Hand the
+	// request off to the remote budget so a slow peer cannot pin a local scan
+	// slot for the dial + RPC (up to ~7s).
+	ctx, donePeerLeg, err := beginPeerLeg(ctx)
+	if err != nil {
+		resp.PeerStatus = peerFetchErrorStatus(err)
+		resp.PeerError = err.Error()
+		return
+	}
+	defer donePeerLeg()
 	conn, err := s.dialPeer()
 	if err != nil {
 		slog.Warn("failed to dial peer for sessions", "err", err)
@@ -937,6 +950,9 @@ func (s *Server) GetSessionSummary(ctx context.Context, req *pb.GetSessionSummar
 			"session scan concurrency limit reached; retry shortly")
 	}
 	defer release()
+	// #9041: publish the local slot so the peer fan-out can hand off to the
+	// REMOTE budget before the RTT instead of pinning a local scan slot.
+	ctx = withLocalWalkRelease(ctx, release)
 
 	resp := &pb.GetSessionSummaryResponse{}
 
@@ -1039,6 +1055,12 @@ func (s *Server) proxyPeerSessionSummary(ctx context.Context) (*pb.GetSessionSum
 	if s.cluster == nil || !s.cluster.PeerAlive() {
 		return nil, nil
 	}
+	// #9041: hand off to the remote budget before the dial (see beginPeerLeg).
+	ctx, donePeerLeg, err := beginPeerLeg(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer donePeerLeg()
 	conn, err := s.dialPeer()
 	if err != nil {
 		return nil, err
@@ -1085,6 +1107,9 @@ func (s *Server) GetZonePairSummary(ctx context.Context, req *pb.GetZonePairSumm
 			"session scan concurrency limit reached; retry shortly")
 	}
 	defer release()
+	// #9041: publish the local slot so the peer fan-out can hand off to the
+	// REMOTE budget before the RTT instead of pinning a local scan slot.
+	ctx = withLocalWalkRelease(ctx, release)
 
 	resp := &pb.GetZonePairSummaryResponse{}
 	if s.cluster != nil {
@@ -1204,6 +1229,14 @@ func (s *Server) proxyPeerZonePairSummary(ctx context.Context, req *pb.GetZonePa
 	if s.cluster == nil || !s.cluster.PeerAlive() {
 		return nil, nil
 	}
+	// #9041: hand off to the remote budget before the dial (see beginPeerLeg).
+	// peerCtx is already derived from ctx above, so the deadline is unaffected;
+	// only the ADMISSION budget moves.
+	_, donePeerLeg, err := beginPeerLeg(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer donePeerLeg()
 	conn, err := s.dialPeer()
 	if err != nil {
 		return nil, err
@@ -1235,6 +1268,9 @@ func (s *Server) ClearSessions(ctx context.Context, req *pb.ClearSessionsRequest
 			"session scan concurrency limit reached; retry shortly")
 	}
 	defer release()
+	// #9041: publish the local slot so the peer fan-out can hand off to the
+	// REMOTE budget before the RTT instead of pinning a local scan slot.
+	ctx = withLocalWalkRelease(ctx, release)
 
 	// Check if this is a forwarded request from a peer (prevent recursion).
 	//
@@ -1683,6 +1719,14 @@ func (s *Server) clearPeerSessions(ctx context.Context, req *pb.ClearSessionsReq
 		return nil
 	}
 	peerID := s.peerNodeIDForMsg()
+	// #9041 part 2: the local clear is finished; the dial + 5s peer RPC below is
+	// the longest peer leg on this surface. Hand off to the remote budget so it
+	// cannot pin a local scan slot for ~9s (see beginPeerLeg).
+	ctx, donePeerLeg, err := beginPeerLeg(ctx)
+	if err != nil {
+		return fmt.Errorf("peer node %d ClearSessions: %w", peerID, err)
+	}
+	defer donePeerLeg()
 	conn, err := s.dialPeer()
 	if err != nil {
 		return fmt.Errorf("dial peer node %d: %w", peerID, err)
