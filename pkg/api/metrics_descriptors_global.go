@@ -78,6 +78,15 @@ func (c *xpfCollector) initGlobalDescriptors() {
 			"including at zero (#9019).",
 		nil, nil,
 	)
+	c.degradedPathTotal = prometheus.NewDesc(
+		"xpf_dataplane_degraded_path_total",
+		"Packets the dataplane handled on a DEGRADED path, by reason "+
+			"(e.g. binding_missing, where an RX queue above the per-interface "+
+			"binding cap has no binding and transit on it is dropped). Sparse: "+
+			"a reason that has never fired has no series, and the whole family "+
+			"is absent on a scrape that could not read the helper status (#9040).",
+		[]string{"reason"}, nil,
+	)
 	c.sessionsCreatedTotal = prometheus.NewDesc(
 		"xpf_sessions_created_total",
 		"Total sessions created.",
