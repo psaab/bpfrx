@@ -139,6 +139,67 @@ sanitizer's allocation-free fast path means an already-clean record — every
 ordinary one — pays a scan and no allocation, which is what keeps this
 acceptable on the shared dataplane event path described below.
 
+## RFC 5424 SD-PARAM values are escaped at the interpolation (#9321)
+
+`formatStructuredMsg` builds the Junos `[junos@2636.1.1.1.2.129 …]`
+STRUCTURED-DATA element and interpolates operator- and config-derived
+names into `param="%s"`: policy, source/destination zone, application,
+`service-name`, `packet-incoming-interface`, plus the close/deny reason.
+RFC 5424 §6.3.3 requires `"` (%d34), `\` (%d92) and `]` (%d93) to be
+escaped with a backslash inside a PARAM-VALUE. Until #9321 none of the
+three was.
+
+`escapeSDParamValue` now escapes all three, applied ONCE per value in
+`formatStructuredMsg` — after the empty-value fallbacks (a fallback is
+itself a param value) and before the type switch (several values are
+interpolated twice in one record; `appName` is both `service-name` and
+`application`).
+
+**The value is legal; the interpolation was not.** Junos permits these
+characters in a quoted name, and this tree's #1798 commit gate correctly
+accepts them — measured on both the braced and the flat-set channel, with
+a newline as the positive control that the gate's *control-byte*
+validator does fire. Rejecting them at commit would be a behaviour change
+on a supported spelling, so the fix is at the render side, which is where
+`pkg/config/freetext.go`'s own three-layer doctrine puts it. That
+doctrine's layer-3 enumeration named `pkg/networkd`, `pkg/frr` and
+`pkg/ipsec`; `pkg/logging` was a fourth interpolation sink outside it.
+
+**Two consequences, and the second is the one operators feel:**
+
+1. **Audit integrity.** A login class whose `allow-configuration` covers
+   `security policies` could forge a second SD-PARAM in records shipped
+   off-box — attributing a deny to a different zone in the collector. The
+   record leaves the box precisely because the on-box actor is not trusted
+   to curate it, so "privileged actor" is not a mitigation.
+2. **Audit availability.** A `]` closed the element early, so a strict
+   RFC 5424 collector read the remainder as MSG. Every deny record for
+   that policy was then silently lost at the SIEM.
+
+**This is NOT a widening of the #6585 sanitizer, deliberately.**
+`termsafe.SanitizeForDisplay` is scoped to control bytes because #6585's
+own third acceptance criterion is an over-reach guard — "ordinary
+multi-word and UTF-8 attribute values are unchanged on the wire" — and
+because it protects the RFC 3164 FRAME, which these three printable bytes
+cannot damage. Widening it would mangle every other consumer of that
+sanitizer (gRPC show output, IPsec error text) for a property only the SD
+element has. #6585 closed frame integrity; #9321 closes SD-element
+integrity. Two boundaries, both needed.
+
+**Cost.** Allocation-free fast path for the already-clean case — every
+ordinary record — because this runs on the shared dataplane event path
+(#2283), once per firewall event per structured client. An ordinary
+record is byte-identical to its pre-#9321 output, pinned against golden
+strings captured by running the unmodified formatter at `77240ec4e`.
+
+**Coverage is by reflection, not by a hand-kept field list.**
+`TestEveryStringFieldIsSDParamSafe9321` walks every exported string field
+of `EventRecord`, poisons each in turn with `a"b\c]d`, and asserts the
+emitted element keeps its exact param-name list and closes at the very
+end — so a string field added later is poisoned automatically. A
+hand-written list would be an inventory built by reading today's format
+strings, blind by construction to tomorrow's field.
+
 ## `then log` does not reach the syslog clients (#6859)
 
 Junos routes the two firewall-filter logging actions to different sinks: `then
