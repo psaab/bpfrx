@@ -118,3 +118,37 @@ func AuthTypeUnrecognized(raw string) bool {
 	_, ok := CanonicalAuthType(raw)
 	return !ok
 }
+
+// AuthTypeAbsent reports whether no `authentication-type` was authored at all.
+//
+// #9105: AN ABSENT TYPE AND A CHOSEN PLAINTEXT TYPE WERE THE SAME STATE at the
+// render sites, and the renderers could not tell them apart:
+//
+//	AuthType=""        Unrecognized=false  IsMD5=false  -> renders CLEAR  (SILENT)
+//	AuthType="simple"  Unrecognized=false  IsMD5=false  -> renders CLEAR  (SILENT)
+//	AuthType="md5"     Unrecognized=false  IsMD5=true   -> renders md5    (SILENT)
+//	AuthType="bogus"   Unrecognized=true   IsMD5=false  -> renders CLEAR  (warned)
+//
+// Look at the `simple` row: it renders `clear` silently and that is CORRECT --
+// the operator asked for plaintext. The empty string takes the identical path,
+// so "the operator chose plaintext" and "the type was dropped upstream" are
+// indistinguishable at the point of decision. No amount of care at the render
+// site could have caught it; the information was destroyed before the renderer
+// ran.
+//
+// WHY IT IS A DOWNGRADE AND NOT A LOSS. Authentication stays ON -- the
+// area/domain password is still emitted and adjacencies still authenticate,
+// with the key in cleartext in every PDU. An operator verifying that
+// adjacencies are authenticated sees exactly that, and `show configuration`
+// echoes back the `md5` they wrote. A dropped-authentication defect is noisy:
+// adjacencies fail. This one succeeds.
+//
+// This predicate does NOT change what an absent type MEANS -- CanonicalAuthType
+// still canonicalizes "" to DefaultAuthType, and the tolerant path still
+// renders plaintext rather than flipping a running adjacency to md5 on upgrade
+// (the reasoning AuthTypeIsMD5 records). It only lets a caller ASK whether a
+// type was authored, which is the question the render sites needed and could
+// not put.
+func AuthTypeAbsent(raw string) bool {
+	return strings.TrimSpace(raw) == ""
+}
