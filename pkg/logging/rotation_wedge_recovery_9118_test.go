@@ -190,6 +190,8 @@ func TestWedgedTraceWriterRecoversOnTheNextWrite9118(t *testing.T) {
 
 	// REFERENCE ARM: an ordinary record reaches the file.
 	tw.HandleEvent(rec, nil)
+	// #9025: HandleEvent enqueues; drain before asserting on the file/counters.
+	tw.SyncForTest()
 	before, err := os.ReadFile(filepath.Join(dir, "trace.log"))
 	if err != nil {
 		t.Fatalf("read back: %v", err)
@@ -204,6 +206,8 @@ func TestWedgedTraceWriterRecoversOnTheNextWrite9118(t *testing.T) {
 	tw.mu.Unlock()
 
 	tw.HandleEvent(rec, nil)
+	// #9025: HandleEvent enqueues; drain before asserting on the file/counters.
+	tw.SyncForTest()
 	if got := tw.RecoveredWrites(); got != 1 {
 		t.Fatalf("RecoveredWrites = %d, want 1: the trace writer stayed wedged, so "+
 			"`traceoptions` is silent until the next config commit", got)

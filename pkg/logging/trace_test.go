@@ -306,6 +306,8 @@ func TestTraceWriter_WriteFailureObservable(t *testing.T) {
 		t.Fatal(err)
 	}
 	tw.HandleEvent(EventRecord{Type: "SESSION_OPEN"}, nil)
+	// #9025: HandleEvent enqueues; drain before asserting on the file/counters.
+	tw.SyncForTest()
 
 	if got := tw.DroppedWrites(); got != 1 {
 		t.Fatalf("DroppedWrites = %d, want 1 (trace write failure not observable)", got)
@@ -428,6 +430,8 @@ func TestTraceWriter_NilFileDropObservable(t *testing.T) {
 	tw.Close() // file = nil
 
 	tw.HandleEvent(EventRecord{Type: "SESSION_OPEN"}, nil)
+	// #9025: HandleEvent enqueues; drain before asserting on the file/counters.
+	tw.SyncForTest()
 	if got := tw.DroppedWrites(); got != 1 {
 		t.Fatalf("DroppedWrites = %d, want 1 (nil-file drop not observable)", got)
 	}

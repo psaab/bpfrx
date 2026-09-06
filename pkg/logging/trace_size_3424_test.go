@@ -88,6 +88,9 @@ func TestTraceWriter_SubMinimumSizeNoPerLineRotation(t *testing.T) {
 
 	for i := 0; i < 8; i++ {
 		tw.HandleEvent(EventRecord{Type: "SESSION_OPEN", SrcAddr: "10.0.1.5:1000", DstAddr: "10.0.2.5:80", Protocol: "TCP"}, nil)
+		// #9025: the write is now handed to a queue; drain it so this cell keeps
+		// measuring rotation cost rather than accidentally measuring the handoff.
+		tw.SyncForTest()
 	}
 	if _, err := os.Stat(filepath.Join(dir, "rot.log.1")); err == nil {
 		t.Fatalf("rot.log.1 exists: sub-minimum size rotated per-line (clamp not enforced, CPU storm)")
@@ -120,6 +123,9 @@ func TestTraceWriter_RotationEnforcesSizeAndFiles(t *testing.T) {
 	// lines. 2000 lines forces many rotations.
 	for i := 0; i < 2000; i++ {
 		tw.HandleEvent(EventRecord{Type: "SESSION_OPEN", SrcAddr: "10.0.1.5:1000", DstAddr: "10.0.2.5:80", Protocol: "TCP"}, nil)
+		// #9025: the write is now handed to a queue; drain it so this cell keeps
+		// measuring rotation cost rather than accidentally measuring the handoff.
+		tw.SyncForTest()
 	}
 
 	// The files cap (2) retains generations .1 and .2; .3 and beyond must be
