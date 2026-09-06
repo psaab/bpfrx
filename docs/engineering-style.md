@@ -93,6 +93,46 @@ So:
   the population it measures cannot detect a coverage loss, because the
   population is what moved.
 
+### The gate that RAN and the claim being MADE must be about the same subject
+
+Three variants of one error, all of them hit in a single campaign day. Each
+produces a result that reads as authoritative about something it never examined.
+
+**Merging on a gate that could not have failed.** Three PRs were merged on a red
+repo-wide gate because the merge command was not *conditioned* on the gate's
+result -- a success path and a failure path invoking the same next action. The
+red happened to be flaky, so the outcome was benign; the process would have
+shipped a real break.
+
+**Holding a change on a red that was not about it.** The inverse, the same day: a
+docs PR's merge was conditioned on a *different* PR's gate. Clean change, red
+that could not have concerned it, held anyway.
+
+**Measuring a tree that changed underneath the measurement.** A background gate
+was started in a worktree, and a `git checkout` of another branch ran in that
+same worktree while it was in flight. The result was red, correctly not merged
+on, and meaningless -- an isolated re-run came back clean.
+
+> Gate in a DEDICATED WORKTREE with nothing else running in it, and condition
+> the merge on that gate's own result.
+
+Two more in the same family, from stacked work:
+
+**The stale-head trap.** Retargeting a PR's base without force-pushing the
+rebase first leaves it showing already-merged commits against the new base. It
+reads clean and is not. **Base change and force-push are one operation, not
+two.**
+
+**Rebasing onto an AMENDED head.** `git rebase <newbase>` where the new base
+contains an *amended* version of a commit your branch already carries: git
+cannot recognise the superseded commit as already applied, because the amend
+changed its content, so it replays the OLD version over the better one. Use
+`git rebase --onto <newbase> <old-base-commit>` so only the commits after the
+superseded one replay.
+
+All five reduce to the same sentence: **the thing that ran, or was replayed, was
+not the thing the claim is about.**
+
 ### When you CORRECT someone, ask whether you are CONJOINING or REPLACING
 
 A lane held the container-level half of a discriminator. A second lane found the
