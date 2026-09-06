@@ -88,7 +88,14 @@ func elidedNodeIsExactlyOneStatement(n *Node, root *schemaNode) bool {
 // with path and which encodes exactly one statement, or -1.
 func findElidedNodeForPath(nodes []*Node, path []string, root *schemaNode) int {
 	for idx, n := range nodes {
-		if n == nil || len(n.Keys) <= len(path) {
+		// #8997: `<` not `<=`. A BARE FLAG elides to a node whose Keys are
+		// exactly the path -- `chassis cluster strict-session-auth;` against
+		// path [chassis cluster strict-session-auth] -- so requiring the Keys
+		// to be strictly LONGER excluded every valueless leaf. #8992 was
+		// written against a VALUED leaf, where the value makes Keys longer, so
+		// the bound was invisible: correct for every case that existed and
+		// wrong for the class next to it.
+		if n == nil || len(n.Keys) < len(path) {
 			continue
 		}
 		match := true
@@ -108,6 +115,45 @@ func findElidedNodeForPath(nodes []*Node, path []string, root *schemaNode) int {
 	return -1
 }
 
+// elidedPathIsMultiLeafValues reports whether path, resolved from root, lands
+// on a MULTI leaf -- in which case a node carrying extra trailing keys is a
+// value LIST, not a packed run of statements.
+//
+// #8997: THESE TWO SHAPES ARE INDISTINGUISHABLE BY KEY COUNT AND HAVE OPPOSITE
+// CORRECT ANSWERS.
+//
+//	protocol tcp udp icmp                 ONE statement, a multi leaf whose
+//	                                      trailing tokens are VALUES (#2419).
+//	                                      Deleting the `tcp` member is legal and
+//	                                      #3846/#3872 own it.
+//	cluster strict-session-auth foo       TWO statements packed onto one node by
+//	                                      the flat-set chain. Deleting one would
+//	                                      silently take the other (#3846's
+//	                                      fail-wide), so it must be refused.
+//
+// #8992 ran its check only at the TOP level, where no multi leaf lives, so the
+// ambiguity never arose and nothing recorded that it existed. Extending the
+// check to every level surfaced it as four red cells that were asserting a
+// PRIOR DECISION, not a stale expectation.
+func elidedPathIsMultiLeafValues(path []string, root *schemaNode) bool {
+	if root == nil || len(path) == 0 {
+		return false
+	}
+	cur := root
+	for i := 0; i < len(path); i++ {
+		child := resolveSchemaChild(cur, path[i])
+		if child == nil {
+			return false
+		}
+		if child.multi {
+			return true
+		}
+		i += child.args
+		cur = child
+	}
+	return false
+}
+
 // elidedPackedRunCarrying reports the full Keys of a node that BEGINS with
 // path but carries a packed run of more than one statement, or nil.
 //
@@ -117,7 +163,14 @@ func findElidedNodeForPath(nodes []*Node, path []string, root *schemaNode) int {
 // to re-check a spelling that is correct and visible in `show configuration`.
 func elidedPackedRunCarrying(nodes []*Node, path []string, root *schemaNode) []string {
 	for _, n := range nodes {
-		if n == nil || len(n.Keys) <= len(path) {
+		// #8997: `<` not `<=`. A BARE FLAG elides to a node whose Keys are
+		// exactly the path -- `chassis cluster strict-session-auth;` against
+		// path [chassis cluster strict-session-auth] -- so requiring the Keys
+		// to be strictly LONGER excluded every valueless leaf. #8992 was
+		// written against a VALUED leaf, where the value makes Keys longer, so
+		// the bound was invisible: correct for every case that existed and
+		// wrong for the class next to it.
+		if n == nil || len(n.Keys) < len(path) {
 			continue
 		}
 		match := true
@@ -128,6 +181,12 @@ func elidedPackedRunCarrying(nodes []*Node, path []string, root *schemaNode) []s
 			}
 		}
 		if match && !elidedNodeIsExactlyOneStatement(n, root) {
+			// #8997: a multi leaf's trailing keys are VALUES, not a second
+			// statement. Claiming them here would refuse every legal
+			// member-delete (#3846 `protocol tcp`, #3872 `next-hop <ip>`).
+			if elidedPathIsMultiLeafValues(path, root) {
+				continue
+			}
 			return n.Keys
 		}
 	}
