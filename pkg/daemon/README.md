@@ -332,6 +332,45 @@ startup-phase and shutdown ordering is untouched:
 - `daemon_run_shutdown.go` — ordered teardown: `applyCloseoutDrainTimeout`,
   `runShutdownSequence`, `runHAShutdownUpdate`.
 
+  **The fail-closed actions run FIRST (#9035).** `TimeoutStopSec=20`, and
+  systemd SIGKILLs there wherever the teardown has got to. Exactly TWO actions
+  must have completed by then, because only they are fail-closed — everything
+  else is best-effort cleanup whose loss costs telemetry, not correctness:
+
+  1. **`rg_active` cleared**, so this node stops forwarding; and
+  2. **the Kea units stopped** (#6787), so it stops answering DHCP.
+
+  Miss either and the peer promotes onto a segment this node is still serving:
+  duplicate OFFERs from two lease databases with neither aware of the other.
+
+  Both now run immediately after `stop(); wg.Wait()`, ahead of every teardown
+  that can block. They used to sit ~90 lines lower, after the telemetry, feeds,
+  RPM, SNMP, FRR and LLDP teardowns. The block's own comment already stated the
+  intent — *"clear rg_active BEFORE stopping subsystems that may hang"* — but it
+  was positioned relative to the two subsystems anyone had worried about (VRRP,
+  sync), so **every teardown added above it silently moved ownership-release
+  later in the budget**. #9035 measured the flow-export drain alone reaching
+  22 s (serial, 2 s per collector, uncapped cardinality, untimed join) — over
+  budget before either action ran.
+
+  Bounding that drain is necessary and is done (`telemetryDrainBudget`,
+  `joinWithBudget` in `daemon_flowexport.go`), but it is **not sufficient and
+  never could be**: it fixes the one subsystem that was measured and leaves the
+  next slow one to re-break the same invariant. The ORDER is what makes it
+  structural — nothing added after that point can push the fail-closed actions
+  past the budget, because they have already happened.
+
+  It cannot move earlier than `wg.Wait()`. `desired = clusterPri ||
+  allVrrpMaster` (`rg_state.go`), so a live reconcile goroutine would re-drive
+  `rg_active` back to true after the clear — the #6530 retry doing its job
+  against a clear it cannot distinguish from a spurious revert. Residual, stated
+  rather than implied: `wg.Wait()` is itself unbounded.
+
+  Bound by `TestFailClosedShutdownActionsPrecedeBlockingTeardowns9035` (source
+  order) and `TestExporterTeardownsJoinThroughTheBudget9035` (the call sites —
+  restoring a bare `flowWg.Wait()` leaves a cell that only exercises
+  `joinWithBudget` directly GREEN, which is why the wiring is bound separately).
+
   **Background-apply fence (#6788).** The first thing `runShutdownSequence`
   does — before it cancels the in-flight apply and before the single apply
   drain — is latch `Daemon.applyFenced` and quiesce the DHCP client's
