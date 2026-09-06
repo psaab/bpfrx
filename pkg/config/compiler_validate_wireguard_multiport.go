@@ -102,16 +102,41 @@ func validateWireguardSingleSteeredPort(cfg *Config) []string {
 	if len(strandedPorts) > 1 {
 		strandedNoun, strandedVerb, strandedSubject = "listen-ports", "are", "those tunnels"
 	}
+	// #9016: this text previously said the unsteered tunnel was "dead while
+	// appearing configured", that "no inbound WireGuard transport reaches" it
+	// and that "no handshake ever completes". That is false, and falsely
+	// reassuring: the host-inbound filter admits EVERY configured listen-port
+	// (config.WireGuardListenPorts feeds emitHostInboundWireGuardAcceptNetlink,
+	// the production netlink installer, not just the nft text renderer), and the
+	// helper spawns a control thread with its own bound socket for every
+	// wireguard endpoint. What the unsteered port does NOT get is the AF_XDP
+	// WireGuard fast path: snapshotWgListenPort returns the FIRST wireguard
+	// endpoint's port and the shim compares against that one scalar, so the port
+	// is handled by the kernel path instead.
+	//
+	// An operator told a live tunnel is dead will leave it in place. The honest
+	// statement is that it is unsteered, not that it is down.
+	//
+	// Deliberately NOT claimed here: that the unsteered tunnel's plaintext is
+	// uniquely unadjudicated. It is not — NO WireGuard tunnel's decapsulated
+	// plaintext is zone-adjudicated, steered or not, and the separate #5618
+	// advisory says so for every tunnel in the config (with an acute variant for
+	// one assigned a zone). Repeating it here would imply the steered tunnel is
+	// adjudicated, which is the same class of false reassurance in the other
+	// direction.
 	return []string{fmt.Sprintf(
 		"wireguard: %d distinct listen-ports are configured, but the dataplane "+
 			"steers inbound WireGuard transport for only ONE of them. "+
-			"listen-port %d (%s) IS steered and works. %s %s %s NOT steered — no "+
-			"inbound WireGuard transport reaches %s, so no handshake ever "+
-			"completes and no return traffic arrives: dead while appearing "+
-			"configured. Only one WireGuard listen-port can receive inbound "+
-			"transport until multi-port steering lands (#1434 Increment 2, "+
-			"deferred); remove or re-point the unsteered tunnel(s) rather than "+
-			"leaving them silently down.",
+			"listen-port %d (%s) IS steered onto the AF_XDP WireGuard path. "+
+			"%s %s %s NOT steered: %s still receives inbound transport (the "+
+			"host-inbound filter admits every configured listen-port and each "+
+			"tunnel binds its own socket), but it is served by the KERNEL path "+
+			"rather than the dataplane's, so it is not counted or handled there. "+
+			"Only one WireGuard listen-port can be steered until multi-port "+
+			"steering lands (#1434 Increment 2, deferred). Note this is about "+
+			"STEERING only: no WireGuard tunnel's decapsulated plaintext is "+
+			"zone-adjudicated today, steered or not — see the separate tunnel "+
+			"plaintext advisory, which covers every tunnel in this config.",
 		len(strandedPorts)+1, steered.port, steered.name,
 		strandedNoun, strings.Join(stranded, ", "), strandedVerb, strandedSubject)}
 }

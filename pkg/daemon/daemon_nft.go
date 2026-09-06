@@ -1447,11 +1447,17 @@ func emitHostInboundICMPAccepts(rules *[]string) {
 //
 // The port set is the compile-time SSOT config.WireGuardListenPorts() (all
 // configured WG tunnels). The shim's single-port WG-RX steering (S2a) only
-// steers the FIRST configured listen port today, so for a config with a second
-// WG tunnel on a different port that second rule is currently a no-op at the
-// kernel (nothing steers that port up), but admitting all configured ports keeps
-// the kernel filter correct-in-intent and ready for the deferred multi-tunnel
-// steering (#1434 Increment 2). No-op when WG is not configured.
+// steers the FIRST configured listen port today.
+//
+// #9016: this comment previously called the second port's rule "a no-op at the
+// kernel (nothing steers that port up)". It is NOT a no-op. The rule is what
+// ADMITS that port's traffic to the host, where the second tunnel's own bound
+// socket (the helper spawns a control thread per wireguard endpoint) receives
+// and decapsulates it. Unsteered means "not on the AF_XDP fast path", not
+// "inert" — and reading it as inert is what let a live path look dead. Admitting
+// all configured ports is therefore load-bearing today, as well as ready for the
+// deferred multi-tunnel steering (#1434 Increment 2). No-op when WG is not
+// configured.
 func emitHostInboundWireGuardAccept(rules *[]string, wgListenPorts []uint16) {
 	if len(wgListenPorts) == 0 {
 		return
