@@ -1352,6 +1352,27 @@ func compileFilterThen(node *Node, term *FirewallFilterTerm) {
 	// leave the LENIENT path (boot load, HA SyncApply) untouched, which is
 	// exactly where already-stored configs are.
 	for _, child := range flattenThenChain8939(node.Children) {
+		// #8971: A TRAILING TOKEN ON A `then` ACTION WAS SILENTLY DISCARDED.
+		//
+		//	then { count c1 c2; }      count="c1"       c2 DISCARDED, warnings=0
+		//	then { dscp af11 af21; }   dscp="af11"      af21 DISCARDED
+		//	then { accept extra1; }    action="accept"  extra1 DISCARDED
+		//
+		// Each arm below reads child.Keys[1] and ignores Keys[2:], so a token
+		// the operator typed vanished with no rejection and no warning. The
+		// LEAF path already recorded an unrecognised token in UnknownActions
+		// (#2399) precisely so the strict gate could refuse the typo; the
+		// CHILDREN path did not, so which of the two you got depended on the
+		// spelling.
+		//
+		// Recorded here rather than rejected inline: validateFilterActionsStrict
+		// already turns UnknownActions into a commit refusal with a message
+		// naming the token, and the tolerant path already warns. Reusing that
+		// keeps ONE answer for "the operator typed something we do not know"
+		// instead of a second one that only this spelling reaches.
+		if extras := thenActionExtras8971(child); len(extras) > 0 {
+			term.UnknownActions = append(term.UnknownActions, extras...)
+		}
 		switch child.Name() {
 		case "accept":
 			term.Action = "accept"
@@ -1505,4 +1526,63 @@ func flattenThenChain8939(children []*Node) []*Node {
 	// as another leaf, which is exactly this. It is arity-aware since #9124, so
 	// `count c1` is not cut at its VALUE.
 	return expandFlatRun(out, thenSchema)
+}
+
+// thenActionExtras8971 returns the tokens a `then` action carries beyond its
+// declared arity — the ones every arm of the children walk reads past.
+//
+// #8971: the arity comes from the SCHEMA rather than a hand-kept list, so a new
+// `then` action is covered the day it is declared. A keyword the schema does not
+// know is left alone: the switch's own default arm reports that, and reporting
+// it twice would name the same token in two messages.
+func thenActionExtras8971(child *Node) []string {
+	if child == nil || len(child.Keys) < 2 {
+		return nil
+	}
+	thenSchema := filterThenSchema8971()
+	if thenSchema == nil {
+		return nil
+	}
+	act := resolveSchemaChild(thenSchema, child.Keys[0])
+	if act == nil || act.multi || len(act.children) > 0 || act.wildcard != nil {
+		// Unknown keyword, a value list, or a container: not this gate's
+		// business.
+		return nil
+	}
+	start := 1 + act.args
+	if start >= len(child.Keys) {
+		return nil
+	}
+	return append([]string(nil), child.Keys[start:]...)
+}
+
+// filterThenSchema8971 resolves the firewall filter term `then` container.
+func filterThenSchema8971() *schemaNode {
+	fw := resolveSchemaChild(setSchema, "firewall")
+	if fw == nil {
+		return nil
+	}
+	fam := resolveSchemaChild(fw, "family")
+	if fam == nil {
+		return nil
+	}
+	inet := resolveSchemaChild(fam, "inet")
+	if inet == nil {
+		return nil
+	}
+	filt := resolveSchemaChild(inet, "filter")
+	if filt == nil {
+		return nil
+	}
+	if filt.wildcard != nil {
+		filt = filt.wildcard
+	}
+	tm := resolveSchemaChild(filt, "term")
+	if tm == nil {
+		return nil
+	}
+	if tm.wildcard != nil {
+		tm = tm.wildcard
+	}
+	return resolveSchemaChild(tm, "then")
 }
