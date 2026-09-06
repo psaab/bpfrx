@@ -23,6 +23,7 @@ use super::strategies::{
 };
 use super::*;
 
+const TCP_FIN: u8 = 0x01;
 const TCP_PSH: u8 = 0x08;
 // #5191: the two flags software segmentation must NOT clone verbatim.
 const TCP_URG: u8 = 0x20;
@@ -178,7 +179,11 @@ fn check_segments(
         // first byte. Every other flag is kept verbatim.
         let mut want_flags = orig_flags;
         if !is_last {
-            want_flags &= !TCP_PSH;
+            // #9116: FIN, like PSH, belongs on the LAST segment only. Enforcing
+            // it in the shared oracle means every property that segments a
+            // FIN-bearing frame checks the placement, not just the one cell
+            // that introduced it.
+            want_flags &= !(TCP_PSH | TCP_FIN);
         }
         if idx > 0 {
             want_flags &= !TCP_CWR;
@@ -320,14 +325,22 @@ proptest! {
         }
     }
 
-    /// P-T3 precondition gate: SYN/FIN/RST oversized frames are
-    /// declined (`None`), never split (tcp_segmentation.rs:79).
+    /// P-T3 precondition gate: SYN/RST oversized frames are declined
+    /// (`None`), never split.
+    ///
+    /// #9116 REMOVED FIN FROM THIS PROPERTY DELIBERATELY. This cell pinned the
+    /// decision rather than detecting a defect, and the decision was wrong for
+    /// FIN: declining sent the frame to `compute_forwarded_egress_ptb`, which
+    /// returns `Forward` on an IPv4 path with DF clear, so the oversized frame
+    /// was submitted and dropped downstream — the connection close black-holed.
+    /// FIN now segments, with the flag on the last segment only; see
+    /// `segmentation_splits_fin_and_keeps_it_on_the_last_segment_9116`. SYN and
+    /// RST still decline.
     #[test]
-    fn segmentation_declines_syn_fin_rst(
+    fn segmentation_declines_syn_rst(
         (mut pkt, mtu) in arb_seg_packet(),
         flag in prop_oneof![
             Just(TCP_FLAG_SYN),
-            Just(TCP_FLAG_FIN),
             Just(TCP_FLAG_RST),
         ],
         tx_vlan in arb_vlan(),
@@ -342,6 +355,42 @@ proptest! {
             ),
             None
         );
+    }
+
+    /// #9116: a FIN-bearing oversized frame SEGMENTS, and the FIN lands on the
+    /// LAST segment only.
+    ///
+    /// The placement half is enforced by `check_segments`' shared flag oracle,
+    /// which now clears FIN on every non-last segment exactly as it does PSH —
+    /// so this property fails both if the frame is declined (the old defect)
+    /// and if FIN is smeared across the segments (the obvious wrong fix).
+    #[test]
+    fn segmentation_splits_fin_and_keeps_it_on_the_last_segment_9116(
+        (mut pkt, mtu) in arb_seg_packet(),
+        tx_vlan in arb_vlan(),
+    ) {
+        let flags_off = pkt.l4() + 13;
+        pkt.frame[flags_off] |= TCP_FLAG_FIN;
+        // SYN/RST must not ride along: they still decline, which would make
+        // this property vacuous.
+        pkt.frame[flags_off] &= !(TCP_FLAG_SYN | TCP_FLAG_RST);
+        let forwarding = seg_fixture(mtu, tx_vlan);
+        let nat = NatDecision::default();
+        let decision = seg_decision(pkt.dst_ip, tx_vlan, nat);
+        let want = expected_tuple(&pkt, nat);
+        let result = segment_forwarded_tcp_frames_from_frame(
+            &pkt.frame, pkt.meta, &decision, &forwarding, false, None,
+        );
+        if is_any_fragment(&pkt.frame[pkt.l3..], pkt.addr_family) {
+            prop_assert_eq!(result, None);
+        } else {
+            let segs = result.expect(
+                "an oversized FIN-bearing TCP frame must SEGMENT (#9116): declining it \
+                 forwards the oversized frame on an IPv4 DF-clear path and black-holes \
+                 the close",
+            );
+            check_segments(&segs, &pkt, mtu, tx_vlan, &want)?;
+        }
     }
 }
 

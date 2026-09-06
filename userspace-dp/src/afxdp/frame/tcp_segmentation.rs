@@ -82,7 +82,14 @@ pub(in crate::afxdp) fn finalize_tcp_segment_headers(
     let seq = original_seq.wrapping_add(data_offset as u32);
     tcp.get_mut(4..8)?.copy_from_slice(&seq.to_be_bytes());
     if !is_last {
-        *tcp.get_mut(13)? &= !TCP_FLAG_PSH;
+        // #9116: FIN, like PSH, belongs on the LAST segment only. A FIN means
+        // "no more data from me"; repeating it on every segment would close the
+        // half-connection at the first one and leave the rest of the payload
+        // outside the sequence space the peer will accept. Clearing it here is
+        // what makes admitting a FIN-bearing oversized segment correct rather
+        // than merely permitted — the admission gates below now allow FIN, and
+        // this is the other half of that change.
+        *tcp.get_mut(13)? &= !(TCP_FLAG_PSH | TCP_FLAG_FIN);
     }
     if segment_index == 0 {
         // Segment 0 keeps the original CWR and the original urgent pointer:
@@ -245,7 +252,22 @@ pub(in crate::afxdp) fn segment_forwarded_tcp_frames_from_frame(
         return None;
     }
     let tcp_flags = *payload.get(tcp_offset + 13)?;
-    if (tcp_flags & (TCP_FLAG_SYN | TCP_FLAG_FIN | TCP_FLAG_RST)) != 0 {
+    // #9116: SYN and RST still decline; FIN does NOT.
+    //
+    // An oversized segment carrying FIN is an ordinary data segment that also
+    // closes the sender's half. Declining it sent the frame to
+    // `compute_forwarded_egress_ptb`, and on an IPv4 path with DF CLEAR that
+    // returns `Forward` — so the original oversized frame was submitted and
+    // dropped downstream, black-holing the connection close. There is no IPv4
+    // transit fragmentation engine to catch it.
+    //
+    // SYN carries no bulk payload and its options are per-connection, so
+    // splitting one is never right. RST is terminal and payload-bearing RSTs
+    // are exotic; declining stays the conservative answer for both.
+    //
+    // FIN is carried on the LAST segment only — `finalize_tcp_segment_headers`
+    // clears it on the others, next to the identical PSH rule.
+    if (tcp_flags & (TCP_FLAG_SYN | TCP_FLAG_RST)) != 0 {
         return None;
     }
     let Some(segment_payload_max) = mtu.checked_sub(ip_header_len + tcp_header_len) else {
