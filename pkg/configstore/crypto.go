@@ -121,6 +121,32 @@ func masterPasswordConfigured(tree *config.ConfigTree) bool {
 	if tree == nil {
 		return false
 	}
+	// #9152: FOLD ADMITTED COMPACT STANZAS FIRST, exactly as
+	// effectiveMasterPasswordPRF does. Without this the two questions
+	// DISAGREED ABOUT THE SAME TREE:
+	//
+	//	                  Q1 configured   Q2 effective PRF   result
+	//	braced            true            juniper-prf1       encrypted
+	//	stanza elided     FALSE           juniper-prf1       PLAINTEXT
+	//	fully elided      FALSE           juniper-prf1       PLAINTEXT
+	//
+	// masterPasswordPRFOfNode reads `pseudorandom-function` as a CHILD of
+	// `master-password`, and in a packed spelling the token sits on the
+	// parent's Keys instead. #8898 fixed Q2 and its comment says exactly why
+	// the fold is needed; Q1 was left raw-scanning, so `masterPasswordPRF`
+	// returned "" and active.json and confirm.json were written in CLEARTEXT
+	// -- including IKE pre-shared keys -- on a clean commit with no warning at
+	// any level, while `show configuration` rendered the stanza back.
+	//
+	// This is not "the wrong KDF was chosen". It is no encryption at all, and
+	// the only observable is reading the raw DB file.
+	//
+	// The broad fail-closed scope is UNCHANGED: this folds spellings, it does
+	// not strip inactive nodes or restrict to applied groups, so a dormant or
+	// wildcard master-password still forces encryption. NormalizeCompactForScan
+	// returns the original tree when nothing folds and never mutates its
+	// argument, which callers persist.
+	tree = config.NormalizeCompactForScan(tree)
 	// Surface 1: every top-level `system { ... }` stanza (#4705).
 	if masterPasswordPRFInSystems(systemBlocksOf(tree)) != "" {
 		return true
