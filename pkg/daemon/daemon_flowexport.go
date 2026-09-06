@@ -39,6 +39,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/flowexport"
@@ -304,6 +305,62 @@ func (d *Daemon) reconcileV9Exporter(cfg *config.Config) bool {
 // caller MUST hold flowReconMu and MUST unpublish d.flowBundle first (the
 // removal path swaps it to empty) so a session-close callback can no longer
 // queue into an exporter this tears down (#3742). Nil-safe / idempotent.
+// telemetryDrainBudget bounds a flow-exporter generation join at shutdown
+// (#9035).
+//
+// The join it bounds was UNTIMED, and the work behind it is serial with a
+// per-collector deadline and no cardinality cap: collectorWriteTimeout is 2 s
+// per collector in `collectorConns.writeAll`, so eleven blocked collectors in
+// one group is 22 s against `TimeoutStopSec=20`. The source comment claiming
+// 2 s is "well within the 20s systemd stop timeout even for several hung
+// collectors" is true for "several" and false at eleven, and nothing enforced
+// the boundary between the two.
+//
+// The number is NOT tuned to today's cardinality, deliberately. A constant
+// picked to make eleven collectors fit drifts the moment collectorWriteTimeout
+// or TimeoutStopSec changes, which is precisely the failure the issue's own
+// acceptance rules out ("a bare constant drifts"). It is instead sized as the
+// share of the stop budget telemetry may spend AT MOST, chosen so that the
+// fail-closed actions — which now run BEFORE this join, see the #9035 block in
+// daemon_run_shutdown.go — plus this bound plus the remaining teardown stay
+// inside the budget for ANY collector count. The bound is what makes the drain
+// count-independent; the ORDERING is what makes exceeding it survivable.
+//
+// A drain that hits this bound LOSES the final flush for the collectors that
+// had not been written yet. That is the correct trade at shutdown: the flush is
+// telemetry, and the thing it would otherwise delay is this node relinquishing
+// ownership of a segment its peer is about to serve.
+const telemetryDrainBudget = 3 * time.Second
+
+// joinWithBudget waits for wg, or gives up after telemetryDrainBudget and says
+// so. It returns whether the join completed.
+//
+// It does NOT abandon a goroutine that is still writing — the exporters are
+// closed by the caller either way, which unblocks the write — it abandons only
+// the WAIT. The distinction matters: the leak is bounded by the collectors'
+// own deadlines, while the wait was not bounded by anything.
+func joinWithBudget(wg *sync.WaitGroup, what string) bool {
+	if wg == nil {
+		return true
+	}
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(telemetryDrainBudget):
+		slog.Warn("shutdown: telemetry drain exceeded its budget; abandoning the "+
+			"join so the stop budget is not spent here. The final flush for the "+
+			"collectors not yet written is LOST, which is the intended trade — "+
+			"the fail-closed HA and DHCP actions already ran ahead of this "+
+			"point (#9035)", "exporter", what, "budget", telemetryDrainBudget)
+		return false
+	}
+}
+
 func (d *Daemon) teardownV9Locked() {
 	// #4963: retire (drain in-flight admits, then reject-and-count late ones)
 	// before cancelling Run's final flush, matching the swap path.
@@ -313,9 +370,7 @@ func (d *Daemon) teardownV9Locked() {
 	if d.flowCancel != nil {
 		d.flowCancel()
 	}
-	if d.flowWg != nil {
-		d.flowWg.Wait()
-	}
+	joinWithBudget(d.flowWg, "netflow-v9")
 	for _, exp := range d.flowExporters {
 		exp.Close()
 	}
@@ -448,9 +503,7 @@ func (d *Daemon) teardownIPFIXLocked() {
 	if d.ipfixCancel != nil {
 		d.ipfixCancel()
 	}
-	if d.ipfixWg != nil {
-		d.ipfixWg.Wait()
-	}
+	joinWithBudget(d.ipfixWg, "ipfix")
 	for _, exp := range d.ipfixExporters {
 		exp.Close()
 	}

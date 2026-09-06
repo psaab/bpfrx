@@ -139,6 +139,117 @@ func (d *Daemon) runShutdownSequence(wg *sync.WaitGroup, stop func(), runErr err
 	stop()
 	wg.Wait()
 
+	// ── THE FAIL-CLOSED ACTIONS RUN FIRST (#9035) ──────────────────────
+	//
+	// This block used to sit ~90 lines below, after the telemetry, feeds, RPM,
+	// SNMP, FRR and LLDP teardowns. Its own comment already stated the intent
+	// exactly — "clear rg_active BEFORE stopping subsystems that may hang" —
+	// but it was positioned relative to only the two subsystems anyone had
+	// worried about (VRRP, sync), so every teardown added above it silently
+	// moved ownership-release later in the budget.
+	//
+	// WHAT MUST BE TRUE BEFORE THE BUDGET IS GONE. `TimeoutStopSec=20`, and
+	// systemd SIGKILLs at that point wherever we are. Exactly two actions must
+	// have completed by then, because only they are FAIL-CLOSED — everything
+	// else is best-effort cleanup whose loss costs telemetry, not correctness:
+	//
+	//   1. rg_active cleared, so this node stops forwarding; and
+	//   2. the Kea units stopped, so it stops answering DHCP (#6787).
+	//
+	// Miss either and the peer promotes onto a segment this node is still
+	// serving: duplicate OFFERs from two lease databases, which is the exact
+	// outcome #6787 exists to prevent.
+	//
+	// #9035 showed the flow-export drain reaching 22 s on its own (serial,
+	// 2 s per collector, uncapped cardinality, untimed join) — over budget
+	// before either action ran. Bounding that drain is necessary and is done
+	// below, but it is NOT sufficient and never could be: it fixes the one
+	// subsystem that was measured, and leaves the next slow one to re-break
+	// the same invariant. Ordering makes it STRUCTURAL — no teardown added
+	// after this point can push the fail-closed actions past the budget,
+	// because they have already happened.
+	//
+	// WHY HERE AND NOT EARLIER. It must follow `stop(); wg.Wait()` above.
+	// `desired = clusterPri || allVrrpMaster` (rg_state.go), and a live
+	// reconcile goroutine observing desired=true would re-drive rg_active
+	// back to TRUE after this clear — the #6530 retry, doing exactly its job
+	// against a clear it cannot distinguish from a spurious revert. The
+	// goroutines must be joined first for the clear to stick.
+	//
+	// RESIDUAL, stated rather than left implicit: `wg.Wait()` above is itself
+	// unbounded. Nothing in this issue's evidence points at it, and bounding a
+	// join whose goroutines are context-cancelled is a different change with a
+	// different risk, so it is recorded here rather than folded in.
+	cfg := d.store.ActiveConfig()
+	haMode := cfg != nil && cfg.Chassis.Cluster != nil
+	hitless := !haMode // standalone = hitless by default
+	if haMode && cfg.Chassis.Cluster.HitlessRestart {
+		hitless = true // operator explicitly opted in
+	}
+
+	// In HA fail-closed mode, clear rg_active and watchdog immediately so
+	// BPF stops forwarding traffic even if subsequent cleanup steps hang.
+	// #2114: one snapshot for the whole HA-clear block (plan §5.3 rule 5).
+	if rt := d.dataplane(); !hitless && rt != nil && cfg.Chassis.Cluster != nil {
+		slog.Info("HA shutdown: clearing rg_active for all RGs")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
+			err := runHAShutdownUpdate(shutdownCtx, func(ctx context.Context) error {
+				return rt.HA().SetRGActive(ctx, rg.ID, false)
+			})
+			if err != nil {
+				slog.Warn("failed to clear rg_active on shutdown", "rg", rg.ID, "err", err)
+			}
+			err = runHAShutdownUpdate(shutdownCtx, func(ctx context.Context) error {
+				return rt.HA().SetHAWatchdog(ctx, rg.ID, 0)
+			})
+			if err != nil {
+				slog.Warn("failed to clear ha_watchdog on shutdown", "rg", rg.ID, "err", err)
+			}
+		}
+	}
+
+	// #6787: STOP THE KEA UNITS BEFORE RELINQUISHING OWNERSHIP.
+	//
+	// Everything below this point hands the segment to the peer: the RA
+	// goodbye, the VIP removal, VRRP's priority-0 burst, and the heartbeat
+	// stop. None of them touched the DHCP server, and Kea runs as SEPARATE
+	// systemd units that outlive xpfd. So an orderly HA shutdown promoted the
+	// peer — which starts ITS Kea on the same segment — while this node's Kea
+	// kept answering: duplicate OFFERs, and two lease databases handing out
+	// addresses from one pool with neither aware of the other. The units also
+	// survived the whole xpfd downtime, so the condition persisted until the
+	// operator noticed.
+	//
+	// Placed BEFORE the withdrawal, not after, so there is never a moment when
+	// both nodes serve. #9035 moved it FURTHER forward, to here: it is the
+	// second of the two fail-closed actions, so it belongs beside the first
+	// and ahead of every best-effort teardown, not merely ahead of the
+	// withdrawal. The invariant it protects is unchanged and strictly better
+	// served — a stop that systemd SIGKILLs before it runs is a stop that did
+	// not happen. Synchronous, because ApplyAsync's mailbox is drained by
+	// a worker goroutine and a stop enqueued during shutdown races process exit
+	// — a fix that is present and does nothing looks exactly like a fix that
+	// works. Manager.Shutdown also LATCHES, so a VRRP MASTER transition racing
+	// this window cannot re-arm the units with a newer generation.
+	//
+	// CLUSTER MODE ONLY. In standalone there is no peer to hand the segment to,
+	// and Kea deliberately survives an xpfd restart today; stopping it here
+	// would turn every daemon restart into a DHCP outage. haMode is the
+	// discriminator, not `hitless`: VRRP sends its priority-0 burst even on a
+	// hitless HA restart, so the peer takes over and this node must stop
+	// serving either way.
+	if haMode && d.dhcpServer != nil {
+		if err := d.dhcpServer.Shutdown(); err != nil {
+			slog.Warn("shutdown: failed to stop the DHCP server units — this "+
+				"node may keep answering DHCP while the peer serves the same "+
+				"segment", "err", err)
+		} else {
+			slog.Info("shutdown: DHCP server stopped before relinquishing ownership")
+		}
+	}
+
 	// #5308: cancel + join the two long-lived loops that bind to d.daemonCtx
 	// (never cancelled in production) rather than the run WaitGroup above, so
 	// wg.Wait does NOT cover them. Both call into subsystems torn down further
@@ -221,73 +332,6 @@ func (d *Daemon) runShutdownSequence(wg *sync.WaitGroup, stop func(), runErr err
 	// Clean up LLDP.
 	if d.lldpMgr != nil {
 		d.lldpMgr.Stop()
-	}
-
-	// Determine shutdown mode early so we can clear rg_active BEFORE
-	// stopping subsystems (VRRP, sync) that may hang.
-	cfg := d.store.ActiveConfig()
-	haMode := cfg != nil && cfg.Chassis.Cluster != nil
-	hitless := !haMode // standalone = hitless by default
-	if haMode && cfg.Chassis.Cluster.HitlessRestart {
-		hitless = true // operator explicitly opted in
-	}
-
-	// In HA fail-closed mode, clear rg_active and watchdog immediately so
-	// BPF stops forwarding traffic even if subsequent cleanup steps hang.
-	// #2114: one snapshot for the whole HA-clear block (plan §5.3 rule 5).
-	if rt := d.dataplane(); !hitless && rt != nil && cfg.Chassis.Cluster != nil {
-		slog.Info("HA shutdown: clearing rg_active for all RGs")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
-			err := runHAShutdownUpdate(shutdownCtx, func(ctx context.Context) error {
-				return rt.HA().SetRGActive(ctx, rg.ID, false)
-			})
-			if err != nil {
-				slog.Warn("failed to clear rg_active on shutdown", "rg", rg.ID, "err", err)
-			}
-			err = runHAShutdownUpdate(shutdownCtx, func(ctx context.Context) error {
-				return rt.HA().SetHAWatchdog(ctx, rg.ID, 0)
-			})
-			if err != nil {
-				slog.Warn("failed to clear ha_watchdog on shutdown", "rg", rg.ID, "err", err)
-			}
-		}
-	}
-
-	// #6787: STOP THE KEA UNITS BEFORE RELINQUISHING OWNERSHIP.
-	//
-	// Everything below this point hands the segment to the peer: the RA
-	// goodbye, the VIP removal, VRRP's priority-0 burst, and the heartbeat
-	// stop. None of them touched the DHCP server, and Kea runs as SEPARATE
-	// systemd units that outlive xpfd. So an orderly HA shutdown promoted the
-	// peer — which starts ITS Kea on the same segment — while this node's Kea
-	// kept answering: duplicate OFFERs, and two lease databases handing out
-	// addresses from one pool with neither aware of the other. The units also
-	// survived the whole xpfd downtime, so the condition persisted until the
-	// operator noticed.
-	//
-	// Placed BEFORE the withdrawal, not after, so there is never a moment when
-	// both nodes serve. Synchronous, because ApplyAsync's mailbox is drained by
-	// a worker goroutine and a stop enqueued during shutdown races process exit
-	// — a fix that is present and does nothing looks exactly like a fix that
-	// works. Manager.Shutdown also LATCHES, so a VRRP MASTER transition racing
-	// this window cannot re-arm the units with a newer generation.
-	//
-	// CLUSTER MODE ONLY. In standalone there is no peer to hand the segment to,
-	// and Kea deliberately survives an xpfd restart today; stopping it here
-	// would turn every daemon restart into a DHCP outage. haMode is the
-	// discriminator, not `hitless`: VRRP sends its priority-0 burst even on a
-	// hitless HA restart, so the peer takes over and this node must stop
-	// serving either way.
-	if haMode && d.dhcpServer != nil {
-		if err := d.dhcpServer.Shutdown(); err != nil {
-			slog.Warn("shutdown: failed to stop the DHCP server units — this "+
-				"node may keep answering DHCP while the peer serves the same "+
-				"segment", "err", err)
-		} else {
-			slog.Info("shutdown: DHCP server stopped before relinquishing ownership")
-		}
 	}
 
 	// Withdraw RA senders (sends goodbye RAs with lifetime=0) before VRRP
