@@ -112,6 +112,17 @@ const (
 	// relative path is rejected at commit rather than resolved at runtime
 	// against a working directory the operator never named (#5839).
 	ValueUnixSocketPath
+	// ValueInterfaceName is a Junos or kernel interface name, optionally with
+	// a unit suffix: `ge-0/0/0`, `ge-0-0-0.0`, `reth0.50`, `st0.1`, `fab0`,
+	// `irb`, `enp5s0`. Validated by ValidateRIPNeighborInterface.
+	//
+	// It exists because a validator ALONE does not run: the schema walk's
+	// typed-leaf branch is a CONJUNCTION, `isTypedLeaf() && validator != nil`,
+	// and isTypedLeaf() is `valueType != ValueAny`. A leaf carrying only a
+	// validator is silently never checked -- which is how #9206's absorbed
+	// tokens reached the neighbour list past a validator that had been wired
+	// on but not typed.
+	ValueInterfaceName
 )
 
 // Placeholder returns the angle-bracket placeholder name shown in `?`
@@ -156,6 +167,8 @@ func (v ValueType) Placeholder() string {
 		return "<YYYY-MM-DD>"
 	case ValueTimeZone:
 		return "<timezone>"
+	case ValueInterfaceName:
+		return "<interface-name>"
 	case ValueSecureTunnelIf:
 		return "<st-interface>"
 	case ValueUnixSocketPath:

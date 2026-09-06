@@ -512,7 +512,9 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 		// TestRipGroupRefusesUndeclaredStatements9151 is what holds that true.
 		"group": {desc: "Group", args: 1, placeholder: "<group-name>", closedWorld: true, children: map[string]*schemaNode{
 			"neighbor": {desc: "Neighbor interface in this group", args: 1, multi: true,
-				valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: nil},
+				valueHint: ValueHintInterfaceName, placeholder: "<interface-name>",
+				valueType: ValueInterfaceName, valueDesc: "interface name (ge-0/0/0, reth0.50, st0.1)",
+				validator: ValidateRIPNeighborInterface, children: nil},
 			"export": {desc: "Protocols redistributed into this group", args: 1, multi: true,
 				placeholder: "<protocol>", children: nil},
 		}},
