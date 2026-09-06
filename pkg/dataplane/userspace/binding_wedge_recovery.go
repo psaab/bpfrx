@@ -161,6 +161,9 @@ func (m *Manager) shouldAutoRebindBusyBindingsLocked(now time.Time, repaired boo
 			// if automatic recovery stops there is no other signal that
 			// anything is wrong.
 			m.consecutiveFailedAutoRebinds++
+			// #9043: count it in the SAME branch as the message, so the
+			// counter and the log can never describe different conditions.
+			noteBindingWedgeGiveup()
 			slog.Error("userspace: auto-rebind GAVE UP on stuck XSK bindings",
 				"attempts", maxConsecutiveAutoRebinds,
 				"wedged_bindings", m.countWedgedBindingsLocked(),

@@ -104,6 +104,7 @@ type xpfCollector struct {
 	// #9019: work the dataplane DECLINED to do. Both counters existed with no
 	// reader; see metrics_dataplane_silent_skips_9019.go.
 	napiProbeTargetSkipsTotal *prometheus.Desc
+	bindingWedgeGiveupsTotal  *prometheus.Desc
 	learnedRouteCapHitsTotal  *prometheus.Desc
 
 	// #9040: dataplane drops taken on a degraded path, by reason. Sparse and

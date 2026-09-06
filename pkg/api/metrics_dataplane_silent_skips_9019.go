@@ -33,6 +33,14 @@ import (
 //     may be silently dropping redirected traffic on a path the shim believes
 //     is healthy.
 //
+//   - binding_wedge_giveups_total: bounded auto-rebind exhausted its budget
+//     and stopped trying to recover a wedged XSK binding (#9043). Its own
+//     give-up message records that "the affected queues will not forward and
+//     no readiness signal reports them" -- so before this counter, a single
+//     once-per-wedge log line was the entire signal, and a log line that fires
+//     once is the hardest kind to alert on. Non-zero means a box is forwarding
+//     with queues nobody is trying to repair any more.
+//
 //   - learned_route_cap_hits_total: a snapshot build that declined learned
 //     routes at the cap. Steady non-zero means the box is forwarding on a route
 //     set it knows is incomplete.
@@ -54,12 +62,15 @@ import (
 // Prometheus counter contract, handled by rate() at query time.
 func (c *xpfCollector) describeDataplaneSilentSkips(ch chan<- *prometheus.Desc) {
 	ch <- c.napiProbeTargetSkipsTotal
+	ch <- c.bindingWedgeGiveupsTotal
 	ch <- c.learnedRouteCapHitsTotal
 }
 
 func (c *xpfCollector) emitDataplaneSilentSkips(ch chan<- prometheus.Metric) {
 	ch <- prometheus.MustNewConstMetric(c.napiProbeTargetSkipsTotal,
 		prometheus.CounterValue, float64(userspace.NAPIProbeTargetSkips()))
+	ch <- prometheus.MustNewConstMetric(c.bindingWedgeGiveupsTotal,
+		prometheus.CounterValue, float64(userspace.BindingWedgeGiveups()))
 	ch <- prometheus.MustNewConstMetric(c.learnedRouteCapHitsTotal,
 		prometheus.CounterValue, float64(userspace.LearnedRouteCapHits()))
 }
