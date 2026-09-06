@@ -133,7 +133,7 @@ func compileIKE(node *Node, sec *SecurityConfig) error {
 		if gw == nil {
 			gw = &IPsecGateway{Name: inst.name}
 		}
-		for _, p := range inst.node.Children {
+		for _, p := range expandFlatRun(inst.node.Children, gatewayLeafSchema8939(node)) {
 			v := nodeVal(p)
 			switch p.Name() {
 			case "address":
@@ -378,7 +378,7 @@ func compileIPsec(node *Node, sec *SecurityConfig) error {
 		if gw == nil {
 			gw = &IPsecGateway{Name: inst.name}
 		}
-		for _, p := range inst.node.Children {
+		for _, p := range expandFlatRun(inst.node.Children, gatewayLeafSchema8939(node)) {
 			v := nodeVal(p)
 			switch p.Name() {
 			case "address":
@@ -728,4 +728,26 @@ func isPlausibleHostname(s string) bool {
 		return false
 	}
 	return true
+}
+
+// gatewayLeafSchema8939 resolves the `gateway` container under whichever
+// security parent is being compiled, so expandFlatRun can tell one of its
+// leaves from a value token. `security ike gateway` and `security ipsec
+// gateway` are DISTINCT schema nodes with distinct leaf sets -- they share the
+// IPsecGateway struct and duplicate the reader, which is why both loops need
+// this rather than one of them covering the other.
+func gatewayLeafSchema8939(parent *Node) *schemaNode {
+	if parent == nil || len(parent.Keys) == 0 {
+		return nil
+	}
+	sec := resolveSchemaChild(setSchema, "security")
+	branch := resolveSchemaChild(sec, parent.Keys[0])
+	gw := resolveSchemaChild(branch, "gateway")
+	if gw == nil {
+		return nil
+	}
+	if gw.wildcard != nil {
+		return gw.wildcard
+	}
+	return gw
 }

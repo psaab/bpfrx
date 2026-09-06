@@ -1,4 +1,4 @@
-# counts: losers=74 walked=19 vacuous=51 unmeasured=77
+# counts: losers=70 walked=23 vacuous=51 unmeasured=77
 class-of-service traffic-control-profiles arg1  [delay-buffer-rate | guaranteed-rate | scheduler-map]  total
 firewall policer arg1 if-exceeding  [bandwidth-limit | burst-size-limit]  total
 forwarding-options dhcp-relay group arg1 overrides  [always-broadcast | forward-only | maximum-hop-count]  total
@@ -46,14 +46,10 @@ security flow  [allow-dns-reply | allow-embedded-icmp | force-ip-reassembly]  to
 security flow  [allow-dns-reply | allow-embedded-icmp]  total
 security flow tcp-session  [closing-timeout | established-timeout | initial-timeout]  total
 security flow tcp-session  [closing-timeout | established-timeout]  total
-security ike gateway arg1  [address | external-interface | ike-policy]  total
-security ike gateway arg1  [address | external-interface]  total
 security ike gateway arg1 dead-peer-detection  [always-send | interval | optimized]  total
 security ike policy arg1  [mode | pre-shared-key | proposal-set]  total
 security ike proposal arg1  [authentication-algorithm | authentication-method | description]  total
 security ike proposal arg1  [authentication-algorithm | authentication-method]  total
-security ipsec gateway arg1  [address | external-interface | ike-policy]  total
-security ipsec gateway arg1  [address | external-interface]  total
 security ipsec gateway arg1 dead-peer-detection  [always-send | interval | optimized]  total
 security ipsec vpn arg1 ike  [gateway | ipsec-policy]  total
 security ipsec vpn arg1 vpn-monitor  [destination-ip | optimized | source-interface]  total
