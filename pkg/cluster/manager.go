@@ -711,6 +711,23 @@ func (m *Manager) NodeID() int { return m.nodeID }
 // ClusterID returns the cluster ID.
 func (m *Manager) ClusterID() int { return m.clusterID }
 
+// HeartbeatPeerAddr returns the peer control-link address the RUNNING heartbeat
+// is using -- the value last handed to StartHeartbeat, which is what the node
+// actually dials, as distinct from whatever the candidate config says.
+//
+// It exists for the #8965 commit preflight: moving the control endpoint live
+// restarts local comms on the new address and only then tries to push the
+// config to a peer still listening on the old one, so the two nodes are
+// durably partitioned. Deciding that at commit time needs the RUNNING value,
+// not the active config, for the same reason the identity gate uses NodeID() /
+// ClusterID(): the transport was built from what the manager was given, and
+// the config can have moved on.
+func (m *Manager) HeartbeatPeerAddr() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.hbPeerAddr
+}
+
 // controlLinkAuthKey returns the configured cluster control-channel PSK (raw
 // bytes), or nil when no key is configured. The value is a secret and must
 // never be logged. The slice is only ever replaced (never mutated in place),
