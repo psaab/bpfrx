@@ -1,14 +1,10 @@
 package ipsec
 
 import (
-	"bytes"
-	"context"
 	"errors"
 	"fmt"
 	"log/slog"
-	"os/exec"
 	"strings"
-	"time"
 
 	"github.com/psaab/xpf/pkg/config"
 
@@ -671,25 +667,21 @@ func (m *Manager) InitiateConnection(name string) error {
 
 // GetSAStatus queries strongSwan for active SAs.
 func (m *Manager) GetSAStatus() ([]SAStatus, error) {
-	// Inline ctx (not runSwanctl): the parser needs stdout alone, and the
-	// historical error message carries stderr alone.
-	ctx, cancel := context.WithTimeout(context.Background(), swanctlTimeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "swanctl", "--list-sas")
-	// Buffer-backed Stdout/Stderr are pipe-fed by the runtime, so the
-	// post-SIGKILL drain window applies here too.
-	cmd.WaitDelay = 5 * time.Second
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	// #9068: the shared stdout-only exec, not a second inline copy of it.
+	// This function's own comment — "the parser needs stdout alone" — was
+	// right, and liveConnNames was fed CombinedOutput by a different channel
+	// for the same parser. Two spellings of one exec discipline is how that
+	// divergence happened; there is now one.
+	stdoutB, stderrB, runErr := runSwanctlSplit("--list-sas")
+	stdout, stderr := string(stdoutB), string(stderrB)
+	if err := runErr; err != nil {
 		// #6584: the error string reaches a terminal on both renderers
 		// (pkg/cli prints "error: %v", the gRPC status is re-wrapped and
 		// printed by cmd/cli), so raw swanctl stderr is the same class.
-		return nil, fmt.Errorf("swanctl --list-sas: %w: %s", err, termsafe.SanitizeForDisplay(stderr.String()))
+		return nil, fmt.Errorf("swanctl --list-sas: %w: %s", err, termsafe.SanitizeForDisplay(stderr))
 	}
 
-	sas := parseSAOutput(stdout.String())
+	sas := parseSAOutput(stdout)
 	// #6584: sanitize once, here, so every renderer (local CLI, gRPC mirror,
 	// and any future one) is covered by construction.
 	for i := range sas {

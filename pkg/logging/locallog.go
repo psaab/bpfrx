@@ -2,6 +2,7 @@ package logging
 
 import (
 	"fmt"
+	"github.com/psaab/xpf/pkg/fsatomic"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -324,6 +325,20 @@ func (lw *LocalLogWriter) rotate() error {
 		}
 	}
 	renameErr := os.Rename(lw.path, lw.path+".1")
+	// #9057: ONE directory fsync covering the whole generational shift. Every
+	// rename above lands in the same directory, so a per-rename
+	// fsatomic.RenameDurable would issue N fsyncs where one suffices. Without
+	// it the renames are atomic but the ENTRIES are not durable, and an
+	// unclean shutdown can lose which generation a name points at. Rotation
+	// fires once per maxSize (10 MB default), so the cost is negligible.
+	//
+	// Best-effort by design: a rotation that shifted correctly must not fail
+	// because the directory fsync did — the log keeps working, and the failure
+	// is counted and logged like the shift failures above.
+	if err := fsatomic.SyncDir(filepath.Dir(lw.path)); err != nil {
+		slog.Debug("local log rotate directory fsync failed", "dir", filepath.Dir(lw.path), "err", err)
+		lw.failedRotations.Add(1)
+	}
 	excess := fmt.Sprintf("%s.%d", lw.path, lw.maxFiles+1)
 	if err := os.Remove(excess); err != nil && !os.IsNotExist(err) {
 		slog.Debug("local log rotate excess removal failed", "path", excess, "err", err)

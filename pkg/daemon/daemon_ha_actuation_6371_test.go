@@ -248,18 +248,50 @@ func TestFailoverActuation_ParkedWaiterSeesFailure(t *testing.T) {
 	}
 }
 
-// TestFailoverActuation_UnarmedRGIsNoop pins the unchanged contract for RGs
-// that never armed a barrier (every ordinary demotion): resolving is a no-op
-// and a wait returns immediately with no error.
+// TestFailoverActuation_UnarmedRGIsNoop pins the RESOLVE-side contract for RGs
+// that never armed a barrier: every ordinary local demotion resolves an RG with
+// no barrier, and that must stay a no-op rather than panicking or blocking.
+//
+// #9259 SPLIT THIS CELL, and the split is the point. Its rationale used to read
+// "resolving is a no-op AND a wait returns immediately with no error", as if the
+// second followed from the first. It does not, and they are different subjects:
+// "every ordinary demotion" is true of RESOLVING and false of WAITING — an
+// ordinary local demotion never calls waitFailoverActuated at all. The wait-side
+// half was #9036's final link (absence of a barrier read as proof of fencing)
+// and is now pinned, inverted, by the sibling below.
 func TestFailoverActuation_UnarmedRGIsNoop(t *testing.T) {
 	ha := &actuationHA{err: errRGActiveRejected}
 	d := newActuationDaemon(t, ha)
 	primeRG1Primary(t, d)
 
-	// No armFailoverActuation: this is an ordinary local demotion.
+	// No armFailoverActuation: this is an ordinary local demotion. It must not
+	// panic, block, or disturb anything — that is the whole assertion.
 	demoteRG1(t, d)
 
-	if err := d.waitFailoverActuated(1, actuationReqID); err != nil {
-		t.Fatalf("waitFailoverActuated on an unarmed RG = %v, want nil", err)
+	if n := len(d.failoverActuateWait); n != 0 {
+		t.Fatalf("resolving an unarmed RG created %d barrier(s); it must be a no-op", n)
+	}
+}
+
+// #9259: the wait-side half, inverted. Absence of a barrier is NOT evidence
+// that this node fenced, and sync_failover.go sends failoverAckApplied exactly
+// when this returns nil — so a nil here promoted the peer on no evidence.
+func TestFailoverActuation_UnarmedWaitIsNotProofOfFence9259(t *testing.T) {
+	ha := &actuationHA{err: errRGActiveRejected}
+	d := newActuationDaemon(t, ha)
+	primeRG1Primary(t, d)
+	demoteRG1(t, d)
+
+	err := d.waitFailoverActuated(1, actuationReqID)
+	if err == nil {
+		t.Fatal("#9259: waitFailoverActuated returned nil for a request that never " +
+			"armed a barrier. sync_failover.go sends failoverAckApplied exactly when " +
+			"this returns nil, so the peer promotes on no evidence that this node " +
+			"fenced — #5640's invariant, reached by a route PR #9247 did not close.")
+	}
+	if !errors.Is(err, ErrFailoverNeverArmed) {
+		t.Errorf("#9259: verdict = %v, want ErrFailoverNeverArmed. The reason must "+
+			"name WHICH route it took; 'never armed' and 'verdict already consumed' "+
+			"send an operator to different places.", err)
 	}
 }

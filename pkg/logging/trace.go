@@ -15,6 +15,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/fsatomic"
 )
 
 // errFileUnavailable is the cause attributed to a dropped audit-log line when
@@ -587,6 +588,20 @@ func (tw *TraceWriter) rotate() error {
 		}
 	}
 	renameErr := os.Rename(tw.path, tw.path+".1")
+
+	// #9057: ONE directory fsync covering the whole generational shift, the
+	// near-verbatim sibling of locallog.go's. The two writers were hardened
+	// TOGETHER for symlink safety (#3477) and APART for durability, which is
+	// how this one ended up in no review report — it was found by sweeping the
+	// OPERATION rather than by reading the file a finding pointed at.
+	//
+	// Best-effort by design, matching the shift-failure policy above: a
+	// rotation that shifted correctly must not fail because the directory
+	// fsync did.
+	if err := fsatomic.SyncDir(filepath.Dir(tw.path)); err != nil {
+		slog.Debug("trace rotate directory fsync failed", "dir", filepath.Dir(tw.path), "err", err)
+		tw.failedRotations.Add(1)
+	}
 
 	// Remove excess files (best-effort).
 	excess := fmt.Sprintf("%s.%d", tw.path, tw.maxFiles+1)

@@ -159,6 +159,29 @@ all files stay in `package ipsec`, so the public API is unchanged.
   reload-success gate is preserved (a FAILED reload still tears nothing —
   the old config is still effective) and #3941 genuine-deletion teardown is
   unchanged. Covered by `unrenderable_terminate_5494_test.go`.
+- **`parseSAOutput` is fed STDOUT ALONE, on both of its call paths (#9068).**
+  One parser was reached through two different exec channels: `GetSAStatus`
+  used a stdout-only buffer with the comment *"the parser needs stdout alone"*,
+  while `liveConnNames` — on the security-critical TEARDOWN path — routed
+  through `CombinedOutput`, justified in place by *"parseSAOutput ignores any
+  unrecognized stderr lines CombinedOutput may fold in"*. That justification
+  was asserted and never tested, and it is true for WHOLE stderr lines and
+  false in the one direction that matters: a mid-line splice into an IKE header
+  renames the connection (`vpn-corp` → `vpn-cowarning`).
+  A lost name is a **fail-open**, not a cosmetic error. `terminateRemovedConns`
+  iterates `for name := range live`, so a removed connection absent from `live`
+  is neither terminated nor entered into `pendingTerminate` — and
+  `prevConnNames` has already advanced past it, so the teardown-debt record
+  #6542 exists to keep is never created and a deleted VPN's SA keeps forwarding
+  under an unloaded configuration with no retry.
+  Whether swanctl can splice mid-line on a *successful* listing was never
+  established (stdout to a pipe is block-buffered, stderr unbuffered, so it
+  needs a large listing plus a concurrent stderr write). `runSwanctlSplit`
+  **removes the question rather than answering it**, and both callers now share
+  it, so the two cannot drift again. The NON-parsed calls (`--load-all`,
+  `--terminate --ike`) deliberately keep `runSwanctl`/`CombinedOutput`: their
+  only consumer is an error message, and folding stderr in is what makes it
+  useful.
 - **SA-status parsing must match the real `swanctl --list-sas` layout
   (#3937).** `GetSAStatus` shells out to `swanctl --list-sas` and feeds the
   stdout to `parseSAOutput`. The real strongSwan output is

@@ -800,3 +800,153 @@ func TestSortSurfaceAStatusViewsTotalOrder(t *testing.T) {
 		}
 	}
 }
+
+// #9067 (the second, backend-independent half): a TTL-only edit must republish
+// PROMPTLY, not at the 24h forced-refresh floor.
+//
+// Change detection was `changed := addr != rt.lastAddr`, so a TTL change was not
+// a change on ANY backend — including Route 53, whose backend comparison is
+// correct. The Cloudflare early return made it permanent; this made it slow
+// everywhere. Both defeat the same operator intent: a shorter TTL is bought
+// precisely so the NEXT change propagates soon, and waiting a day for the TTL
+// itself to land inverts that.
+func TestSurfaceATTLOnlyChangeRepublishesPromptly9067(t *testing.T) {
+	fu := newFakeUpdater()
+	now := time.Unix(1_700_000_000, 0)
+	m := newSurfaceATestManager(t, fu, func() time.Time { return now })
+	obs := fixedObserver("203.0.113.5")
+
+	sc := surfaceAScope("wan.example.net", FamilyV4, 0)
+	sc.TTL = 3600
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, obs, nil, nil); err != nil {
+		t.Fatalf("Reconcile1: %v", err)
+	}
+	if got := len(fu.upserts); got != 1 {
+		t.Fatalf("fixture: first publish must write, got %d", got)
+	}
+
+	// SAME address, LOWER TTL, still deep inside the forced-refresh floor.
+	now = now.Add(time.Minute)
+	lower := surfaceAScope("wan.example.net", FamilyV4, 0)
+	lower.TTL = 60
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{lower}, obs, nil, nil); err != nil {
+		t.Fatalf("Reconcile2: %v", err)
+	}
+	if got := len(fu.upserts); got != 2 {
+		t.Fatalf("#9067: a TTL-only change did not republish (%d upserts). Change "+
+			"detection compared only the address, so nothing republished until the "+
+			"24h forced-refresh floor — on EVERY backend, including the one whose "+
+			"own comparison is correct", got)
+	}
+}
+
+// CONTROL: with the TTL unchanged the skip must still fire. Without this, a
+// "fix" that simply set changed=true unconditionally would satisfy the cell
+// above while turning every reconcile into wire traffic — the exact cost the
+// forced-refresh floor exists to avoid, and on a rate-limited provider a
+// self-inflicted outage.
+func TestSurfaceAUnchangedTTLStillSkips9067(t *testing.T) {
+	fu := newFakeUpdater()
+	now := time.Unix(1_700_000_000, 0)
+	m := newSurfaceATestManager(t, fu, func() time.Time { return now })
+	obs := fixedObserver("203.0.113.5")
+
+	sc := surfaceAScope("wan.example.net", FamilyV4, 0)
+	sc.TTL = 3600
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, obs, nil, nil); err != nil {
+		t.Fatalf("Reconcile1: %v", err)
+	}
+	now = now.Add(time.Minute)
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, obs, nil, nil); err != nil {
+		t.Fatalf("Reconcile2: %v", err)
+	}
+	if got := len(fu.upserts); got != 1 {
+		t.Errorf("#9067: address AND TTL unchanged must still skip inside the "+
+			"forced-refresh floor; got %d upserts", got)
+	}
+	if st := m.Stats(); st.Skipped != 1 {
+		t.Errorf("#9067: expected the unchanged pass to be a COUNTED skip, got %+v", st)
+	}
+}
+
+// The comparison must be on the NORMALISED TTL. `TTL <= 0` means "use
+// defaultDDNSTTL", so an explicit-to-unset edit at that same value is NOT a
+// change — and comparing the raw configured field would report one, republishing
+// on a no-op edit. This is the "compared the wrong property" direction of the
+// same defect.
+func TestSurfaceATTLComparisonIsNormalized9067(t *testing.T) {
+	fu := newFakeUpdater()
+	now := time.Unix(1_700_000_000, 0)
+	m := newSurfaceATestManager(t, fu, func() time.Time { return now })
+	obs := fixedObserver("203.0.113.5")
+
+	explicit := surfaceAScope("wan.example.net", FamilyV4, 0)
+	explicit.TTL = defaultDDNSTTL
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{explicit}, obs, nil, nil); err != nil {
+		t.Fatalf("Reconcile1: %v", err)
+	}
+	// The operator deletes the explicit `ttl` leaf: 0 means "default", which is
+	// the value already published. Nothing changed.
+	now = now.Add(time.Minute)
+	unset := surfaceAScope("wan.example.net", FamilyV4, 0)
+	unset.TTL = 0
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{unset}, obs, nil, nil); err != nil {
+		t.Fatalf("Reconcile2: %v", err)
+	}
+	if got := len(fu.upserts); got != 1 {
+		t.Errorf("#9067: unset resolves to defaultDDNSTTL (%d), which is what was "+
+			"already published — comparing the RAW field reports a change that did "+
+			"not happen and republishes on a no-op edit; got %d upserts",
+			defaultDDNSTTL, got)
+	}
+}
+
+// #9067: what is STORED must be the NORMALISED (published) TTL, not the raw
+// configured field.
+//
+// This is the direction the other cells miss, and it is reachable by the most
+// ordinary edit there is: a scope that never set a TTL, then does.
+//
+// `lastTTL == 0` means "not published in this process" and suppresses the
+// comparison (so a scope re-adopted after restart, whose TTL the durable store
+// does not record, is not republished spuriously). If the publish stores the RAW
+// field, a scope first published with the TTL leaf UNSET stores 0 — which is
+// indistinguishable from "never published" — and the comparison is then disabled
+// FOREVER for that scope. The operator later sets `ttl 60` and nothing
+// republishes until the 24h floor, which is the very defect #9067 is about,
+// re-entered through the fix.
+func TestSurfaceAUnsetThenExplicitTTLRepublishes9067(t *testing.T) {
+	fu := newFakeUpdater()
+	now := time.Unix(1_700_000_000, 0)
+	m := newSurfaceATestManager(t, fu, func() time.Time { return now })
+	obs := fixedObserver("203.0.113.5")
+
+	// First publish with NO explicit TTL — the common starting configuration.
+	unset := surfaceAScope("wan.example.net", FamilyV4, 0)
+	unset.TTL = 0
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{unset}, obs, nil, nil); err != nil {
+		t.Fatalf("Reconcile1: %v", err)
+	}
+	if got := len(fu.upserts); got != 1 {
+		t.Fatalf("fixture: first publish must write, got %d", got)
+	}
+
+	// The operator now sets an explicit, DIFFERENT TTL.
+	now = now.Add(time.Minute)
+	explicit := surfaceAScope("wan.example.net", FamilyV4, 0)
+	explicit.TTL = 60
+	if explicit.TTL == defaultDDNSTTL {
+		t.Fatalf("fixture: the explicit TTL must differ from the default (%d), or "+
+			"this cell cannot observe a change", defaultDDNSTTL)
+	}
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{explicit}, obs, nil, nil); err != nil {
+		t.Fatalf("Reconcile2: %v", err)
+	}
+	if got := len(fu.upserts); got != 2 {
+		t.Errorf("#9067: setting an explicit TTL on a scope first published with the "+
+			"TTL leaf UNSET did not republish (%d upserts). The publish must store "+
+			"the NORMALISED TTL: storing the raw 0 is indistinguishable from "+
+			"\"never published\", which permanently disables the comparison for "+
+			"that scope", got)
+	}
+}
