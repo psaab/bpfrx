@@ -59,7 +59,9 @@ gateway local-identity	security/ike/gateway,security/ipsec/gateway
 gateway nat-traversal	security/ike/gateway,security/ipsec/gateway
 gateway remote-identity	security/ike/gateway,security/ipsec/gateway
 gateway version	security/ike/gateway,security/ipsec/gateway
+group export	protocols/bgp/group,protocols/rip/group
 group interface	forwarding-options/dhcp-relay/group,system/services/dhcp-local-server/group,system/services/dhcpv6-local-server/group
+group neighbor	protocols/bgp/group,protocols/rip/group
 group pool	system/services/dhcp-local-server/group,system/services/dhcpv6-local-server/group
 host-inbound-traffic protocols	security/zones/security-zone/host-inbound-traffic,security/zones/security-zone/interfaces/*/host-inbound-traffic
 host-inbound-traffic system-services	security/zones/security-zone/host-inbound-traffic,security/zones/security-zone/interfaces/*/host-inbound-traffic

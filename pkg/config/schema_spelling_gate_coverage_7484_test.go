@@ -297,7 +297,7 @@ func gateLeafChangesWarnings(g gateLeaf, pre string, epath []string) bool {
 // and read as value-less flags -- are now compared. `enumerated` is unchanged
 // at 1098, which is what says the movement is spelling coverage rather than a
 // change in the population.
-const gateCoverageFloor = 692
+const gateCoverageFloor = 694
 
 var gateBlindCeiling = map[gateBlindClass]int{
 	// #7492 moved leaves out of `unreachable` in two rounds. The parent
@@ -417,7 +417,18 @@ var gateBlindCeiling = map[gateBlindClass]int{
 	// PREDICTED BEFORE MEASURING, so the number is falsifiable rather than
 	// confirmatory: `perfect-forward-secrecy` is NOT one of the seven, so
 	// the two changes are disjoint and 140 - 7 = 133 was expected.
-	gateBlindUnreachable: 133,
+	//
+	//   #9151 moves ONE leaf out of `unreachable`, 133 -> 132. The schema
+	//   now declares `protocols rip group { neighbor, export }`, which
+	//   compiler_protocols.go was already reading. Before the declaration
+	//   the container had NO declared children, so the spelling walker
+	//   found nothing under it that could change output and the site
+	//   counted as unreachable. Declaring the children did not change any
+	//   compiler behaviour -- it made an already-read leaf VISIBLE to the
+	//   enumeration. A leaf leaving `unreachable` for `compared` is the
+	//   good direction, and it is why gateCoverageFloor rises 692 -> 694
+	//   in the same change: two new spellings became comparable.
+	gateBlindUnreachable: 132,
 	// #8830: read, value deliberately ignored, advisory says so. Measured at
 	// this head: vrrp-group track-interface priority-cost (inet and inet6),
 	// security log stream transport tls-profile, system dataplane
