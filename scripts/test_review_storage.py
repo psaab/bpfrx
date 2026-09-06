@@ -151,6 +151,73 @@ class ReviewStorageTests(unittest.TestCase):
         self.assertEqual(len(matches), 1)
         self.assertEqual(matches[0][:3], (Path(NEW_REPORT).name, title, 1.0))
 
+    def test_result_prefixes_are_not_scanned_as_discoveries(self):
+        for paths in self.discovered.values():
+            for prefix in ("report-", "result-"):
+                result = str(Path(paths[0]).with_name(prefix + Path(paths[0]).name))
+                paths.append(result)
+                self.files[result] = "Title: Derivative finding\n"
+        self.files[NEW_REPORT] = "Title: Original finding\n"
+        self.assertEqual(dedup.load_review_titles(), [
+            (Path(NEW_REPORT).name, "Original finding"),
+        ])
+
+    def test_cached_result_basenames_and_full_paths_are_not_discoveries(self):
+        for index in (NEW_INDEX, OLD_INDEX):
+            with self.subTest(index=index):
+                entries = [{"filename": Path(NEW_REPORT).name, "titles": ["Original"]}]
+                for prefix in ("report-", "result-"):
+                    basename = prefix + Path(NEW_REPORT).name
+                    for name in (basename, "/var/tmp/deep-review-reports/" + basename):
+                        entries.append({"filename": name, "titles": ["Derivative"]})
+                self.files = {index: json.dumps(entries)}
+                self.assertEqual(dedup.load_review_titles(), [
+                    (Path(NEW_REPORT).name, "Original"),
+                ])
+
+    def test_research_result_header_is_not_a_discovery(self):
+        self.files = {
+            NEW_REPORT: "Artifact kind: research-result\nTitle: Derivative\n",
+            OLD_REPORT: "Title: Original\n",
+        }
+        self.assertEqual(dedup.load_review_titles(), [(Path(OLD_REPORT).name, "Original")])
+
+    def test_cached_titles_cannot_override_a_research_result_header(self):
+        for filename in (Path(NEW_REPORT).name, NEW_REPORT):
+            with self.subTest(filename=filename):
+                self.files = {
+                    NEW_INDEX: json.dumps([{"filename": filename, "titles": ["Cached derivative"]}]),
+                    NEW_REPORT: "Artifact kind: research-result\nTitle: Derivative\n",
+                }
+                self.assertEqual(dedup.load_review_titles(), [])
+
+    def test_derivative_does_not_hide_same_named_original_in_another_root(self):
+        legacy_original = "/tmp/" + Path(NEW_REPORT).name
+        self.discovered["/tmp/*-review*.md"] = [legacy_original]
+        self.files = {
+            NEW_INDEX: json.dumps([
+                {"filename": NEW_REPORT, "titles": ["Derivative"]},
+                {"filename": Path(NEW_REPORT).name, "titles": ["Ambiguous cache row"]},
+                {"filename": legacy_original, "titles": ["Original cached evidence"]},
+            ]),
+            NEW_REPORT: "Artifact kind: research-result\nTitle: Derivative\n",
+            legacy_original: "Title: Original finding\n",
+        }
+        self.assertEqual(dedup.load_review_titles(), [
+            (legacy_original, "Original cached evidence"),
+            (Path(legacy_original).name, "Original finding"),
+        ])
+
+    def test_matching_does_not_attribute_a_derivative_as_discovery(self):
+        title = "Review storage layout changed"
+        result = str(Path(NEW_REPORT).with_name("report-" + Path(NEW_REPORT).name))
+        self.discovered["/var/tmp/deep-review-reports/*-review*.md"].append(result)
+        self.files = {
+            NEW_INDEX: json.dumps([{"filename": result, "titles": [title]}]),
+            result: "Title: " + title + "\n",
+        }
+        self.assertEqual(dedup.check_finding(title), [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -22,7 +22,11 @@ Shared review/issue indexes belong directly under `/var/tmp/deep-review-work/`;
 per-report state and locks use its `state/` and `locks/` subdirectories. Follow
 the shared contract's filing-mutex path and migration gate so older workers do
 not file under a different lock. Never place shared coordination files inside a
-disposable run directory. Standalone research report/workspace paths are unchanged.
+disposable run directory. Research of a deep-review publishes a sibling
+`report-<original filename>`; see
+[research report storage](../../research/references/report-storage.md) for its
+workspace, later snapshots and multi-input handling. Standalone research paths
+are unchanged. `report-` and `result-` derivatives are not new discovery inputs.
 
 ## Atomic publication
 

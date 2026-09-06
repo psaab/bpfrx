@@ -36,7 +36,7 @@ Reconcile source identity and prior results/markers across both layouts; a
 copied report must not become new work merely because its directory changed.
 Exclude result/
 report derivatives and intermediate files from new input selection. In particular,
-exclude every `result-` basename and `Artifact kind: research-result`, even when
+exclude every `report-` or `result-` basename and `Artifact kind: research-result`, even when
 the model or research slug contains `-review` and matches the broad glob. Prefer the
 named final `<WHOAMI>-review-<REVIEW_SLUG>-<digits>.md` form and also accept legacy
 `<WHOAMI>-review-<digits>.md` finals. Validate the header's identity, review
@@ -180,7 +180,9 @@ publication, rechecking processed/result state after acquiring it to avoid
 duplicate external writes. Never delete a
 shared lock file or another worker's artifacts.
 Reconcile later research snapshots and original source/finding keys before any
-filing. A new filename or revalidation run is not a new discovery; all workflows
+filing, including adjacent `report-<source-filename>` research results and their
+later snapshots. Read derivatives as status evidence, never as new discoveries.
+A new filename or revalidation run is not a new discovery; all workflows
 must share the mutex and account for its host/filesystem coordination limits.
 
 Write the compatibility processed marker only after every input finding has a

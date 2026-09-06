@@ -5,6 +5,13 @@ Keep the established Codex + AGY + Claude subject-matter-review (SMR) gate. This
 is plan review, not implementation review; Copilot joins later on actual code
 through `/engineer`. Do not open a draft PR just to obtain a fourth plan verdict.
 
+Finding/conclusion validation has its own
+[three-way adversarial gate](adversarial-review.md). The same reviewers may handle
+both stages with separate verdicts and evidence/plan revisions. File already
+validated defects under research's default before waiting for plan convergence;
+a missing plan reviewer or PLAN-KILL cannot hold those issues back. Automatic
+defect filing does not authorize publishing planning branches or issue comments.
+
 ## Prepare the plan
 
 For issue-linked plans, use `research/<issue>-<slug>` and
@@ -86,7 +93,7 @@ with the actual reviewers' verdicts (verbatim except disclosed harness-tag/secre
 redaction), plan revision/link, recommended option and why, and unresolved work.
 Otherwise include those comments as drafts in the local research result.
 
-STOP at PLAN-READY, PLAN-KILL, or BLOCKED; do not implement, open a PR, deploy, or
+STOP at PLAN-READY, PLAN-KILLED, or BLOCKED; do not implement, open a PR, deploy, or
 merge. PLAN-READY ends with: "Awaiting manual approval — type `/engineer <issue>`
 to proceed to implementation; Copilot joins on the implementation PR." With no
 issue, request an explicit implementation instruction instead of creating one.
