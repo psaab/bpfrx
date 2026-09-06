@@ -221,7 +221,13 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 					lc = &LoginClass{Name: classInst.name}
 					sys.Login.Classes = append(sys.Login.Classes, lc)
 				}
-				for _, prop := range classInst.node.Children {
+				// #8939: `set system login class ops allow-commands "a"
+				// allow-configuration "c"` nests the second leaf UNDER the
+				// first, so this loop saw ONE child and the class silently lost
+				// an ENFORCED allowlist -- and with it the AllowLeavesPresent
+				// entry that #7172 keys enforcement on, which turns "restrict
+				// this family" into "no rule for this family at all".
+				for _, prop := range expandFlatRun(classInst.node.Children, loginClassSchema8939()) {
 					// #5831: record RESTRICTIVE leaf PRESENCE from the
 					// classification table (compiler_login_deny.go), NOT from
 					// the case arms below. Presence, not value: a
@@ -3660,4 +3666,25 @@ func sshKeyValues(node *Node) []string {
 		}
 	}
 	return out
+}
+
+// loginClassSchema8939 resolves `system login class <name>` so expandFlatRun
+// can tell one of the class's leaves from a value token.
+//
+// `permissions` is a MULTI leaf and its values must NOT be split: they are
+// permission names, not statements. expandFlatRun cuts only at a token that
+// resolves as a schema SIBLING, and no permission name is also a login-class
+// leaf name -- asserted, not assumed, by the bracketed-list and
+// `permissions all allow-configuration ...` arms of the #8939 cell.
+func loginClassSchema8939() *schemaNode {
+	sys := resolveSchemaChild(setSchema, "system")
+	login := resolveSchemaChild(sys, "login")
+	cls := resolveSchemaChild(login, "class")
+	if cls == nil {
+		return nil
+	}
+	if cls.wildcard != nil {
+		return cls.wildcard
+	}
+	return cls
 }

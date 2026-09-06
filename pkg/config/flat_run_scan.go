@@ -25,11 +25,49 @@ package config
 // `keyword value` node, so every caller sees the uniform shape it already
 // iterates.
 //
-// GATED ON THE SCHEMA. A token is only treated as a new leaf when the container
-// declares it; anything else stays with the leaf it follows, so a multi-token
-// value is not chopped into keywords that happen to collide. A leaf that
-// DECLARES CHILDREN keeps its subtree — its body belongs to it, and hoisting
-// that would turn a nested block into sibling statements of the container.
+// GATED ON THE SCHEMA, IN BOTH DIRECTIONS. A token is only treated as a new
+// leaf when the container declares it; anything else stays with the leaf it
+// follows, so a multi-token value is not chopped into keywords that happen to
+// collide. A leaf that DECLARES CHILDREN keeps its subtree — its body belongs
+// to it, and hoisting that would turn a nested block into sibling statements of
+// the container.
+//
+// AND A NESTED NODE IS HOISTED ONLY IF IT NAMES A SIBLING. The first version
+// hoisted every child of a terminating leaf, on the reasoning that a leaf
+// declaring no children can have no body — so anything under it must be the
+// next link of the chain. THAT IS FALSE FOR A `multi` LEAF, and #2419 already
+// said so: in the BLOCK spelling `permissions { view; configure; }` the
+// children are VALUES, not statements, and hoisting them turned a read leaf
+// into an unread one. The shipped spelling-differential gate caught it —
+// `system login class <*> permissions` went `inert` in one spelling and
+// `drop` in another — where the loser fixture could not, because an
+// already-walking container leaving the loser list looks like nothing
+// happened. Hoisting only a child that RESOLVES as another leaf of the
+// container keeps every chain link (they all begin with a keyword) and leaves
+// every value list attached to the leaf that owns it.
+//
+// A `multi` leaf's own Keys are never cut either: by the #2419 absorb rule a
+// sibling token is never absorbed onto them in the first place, so a cut there
+// could only ever chop a VALUE that happens to share a sibling's spelling.
+//
+// THE TWO GUARDS ARE NOT REDUNDANT, THOUGH THE MEASURED DEFECT NEEDED ONLY
+// ONE. Mutation matrix against TestSchemaSpellingDifferentialGate, which is
+// what caught the regression:
+//
+//	multi guard  sibling-gated hoist   verdict
+//	present      REMOVED               ok
+//	REMOVED      present               ok
+//	REMOVED      REMOVED               FAIL, A=keep B=inert … F=drop
+//
+// Either alone clears `permissions`, because that leaf is both multi AND
+// block-spelled. They guard DIFFERENT operations and diverge elsewhere: the
+// hoist gate also covers a NON-multi `blockValue` leaf, whose children are
+// likewise values (#6774's `default-policy { deny-all; }`), and the multi
+// guard also covers CUTTING a value list at a token that happens to spell a
+// sibling — a case with no instance in today's schema, so it encodes #2419's
+// contract rather than a reproduced defect. Recorded rather than trimmed to
+// the minimum, because "either one suffices" is a property of the ONE example
+// that exists, not of the rule.
 //
 // WHY EXPAND RATHER THAN REJECT. The chain is a SUPPORTED spelling —
 // `set applications application a1 protocol tcp destination-port 80` is tested
@@ -52,6 +90,11 @@ func expandFlatRun(children []*Node, container *schemaNode) []*Node {
 		// Not a leaf of this container, or one that owns a body: leave it and
 		// its subtree exactly as authored.
 		if leaf == nil || len(leaf.children) > 0 || leaf.wildcard != nil {
+			out = append(out, n)
+			return
+		}
+		// A multi-value leaf owns everything under and after it (#2419).
+		if leaf.multi {
 			out = append(out, n)
 			return
 		}
@@ -85,9 +128,27 @@ func expandFlatRun(children []*Node, container *schemaNode) []*Node {
 			}
 			out = append(out, seg)
 		}
-		// Anything nested under a terminating leaf is the next link of the
-		// chain, never that leaf's body — it declares no children.
+		// A nested node is the next link of the chain only if it NAMES another
+		// leaf of this container. Anything else is a value the authored
+		// spelling put there, and it stays with the segment it was written
+		// under.
+		var keep []*Node
+		var hoist []*Node
 		for _, c := range n.Children {
+			if len(c.Keys) > 0 && resolveSchemaChild(container, c.Keys[0]) != nil {
+				hoist = append(hoist, c)
+				continue
+			}
+			keep = append(keep, c)
+		}
+		if len(keep) > 0 && len(out) > 0 {
+			last := out[len(out)-1]
+			if last != n {
+				last.Children = append(append([]*Node(nil), last.Children...), keep...)
+				last.IsLeaf = false
+			}
+		}
+		for _, c := range hoist {
 			changed = true
 			visit(c)
 		}
