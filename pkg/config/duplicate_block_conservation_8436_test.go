@@ -42,6 +42,15 @@ type dupSite8436 struct {
 	valA      string
 	leafB     string // second distinct leaf child
 	valB      string
+	// #9024: complete STATEMENTS, which may be nested. A container whose
+	// children are all containers (`forwarding-options sampling instance`,
+	// whose only children are `input` and `family`) has no scalar leaf to put
+	// in a two-leaf fixture, and used to leave the population before any
+	// verdict was formed -- which is how the census reported "SILENT: 0" while
+	// two proven silent drops sat inside it. These carry `input { rate 100; }`
+	// where the leaf fields carried `rate` and `100`.
+	stmtA string
+	stmtB string
 	// unprobeable is non-empty when the container is ELIGIBLE (a named
 	// container with children) but no two-block fixture can be built for it.
 	//
@@ -86,6 +95,15 @@ func collectDupSites8436() []dupSite8436 {
 						keyword:   name, node: ch,
 						leafA: la, valA: va, leafB: lb, valB: vb,
 					}
+					if ok {
+						site.stmtA = la + " " + va + ";"
+						site.stmtB = lb + " " + vb + ";"
+					} else if sa, sb, ok2 := twoStatements8436(ch); ok2 {
+						// #9024: no two DIRECT scalar leaves, but a nested
+						// fixture reaches one. This is the container-only case
+						// the census used to drop.
+						site.stmtA, site.stmtB, ok = sa, sb, true
+					}
 					if !ok {
 						// Issue 9024: record WHY rather than dropping it. The
 						// two reasons are different facts: a container whose
@@ -126,6 +144,97 @@ func collectDupSites8436() []dupSite8436 {
 // each. Two different leaves, not two values of one leaf: a multi-value leaf
 // legitimately accumulates, so using one would measure the leaf's own list
 // semantics rather than the BLOCK's reduction.
+// nestedStatement8436 returns a complete Junos STATEMENT that reaches a scalar
+// leaf under c, descending through container-only children, or ok=false.
+//
+// #9024: THE CENSUS SKIPPED EVERY CONTAINER-ONLY CHILD, AND THAT IS EXACTLY THE
+// CASE THAT NEEDS A NESTED FIXTURE RATHER THAN A SKIP. `forwarding-options
+// sampling instance` has no scalar leaf children at all -- only the containers
+// `input` and `family` -- so no two-leaf fixture could be built and the site
+// left the population before any verdict was formed. It was a CONFIRMED silent
+// drop at the time (#9023), and the census reported "SILENT: 0".
+//
+// Descending is bounded and deterministic: sorted names, first scalar leaf wins,
+// depth capped. The cap is a guard against a cyclic schema (`groups` mirrors the
+// top-level children), not an expected limit.
+func nestedStatement8436(c *schemaNode, depth int) (stmt string, ok bool) {
+	if c == nil || depth > 6 {
+		return "", false
+	}
+	names := make([]string, 0, len(c.children))
+	for name := range c.children {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	// A scalar leaf directly here is always preferred: the shallower the
+	// fixture, the fewer unrelated validators it can trip.
+	for _, name := range names {
+		ch := c.children[name]
+		if ch == nil || ch.children != nil || ch.wildcard != nil || ch.args != 1 || ch.multi {
+			continue
+		}
+		if v, _, got := synthPair(ch); got {
+			return name + " " + v + ";", true
+		}
+	}
+	// Otherwise descend into the first container child that yields one.
+	for _, name := range names {
+		ch := c.children[name]
+		if ch == nil || ch.children == nil {
+			continue
+		}
+		inner, got := nestedStatement8436(ch, depth+1)
+		if !got {
+			continue
+		}
+		head := name
+		if ch.args == 1 {
+			// A named container needs an instance name before its body.
+			head = name + " xpfinner"
+		}
+		return head + " { " + inner + " }", true
+	}
+	return "", false
+}
+
+// twoStatements8436 returns two statements under DISTINCT children of c, so a
+// duplicate-block fixture can put one in each block and both in the merged one.
+//
+// It supersedes twoLeaves8436, which required two DIRECT scalar leaves and
+// therefore could not fixture a container whose children are all containers.
+func twoStatements8436(c *schemaNode) (stmtA, stmtB string, ok bool) {
+	names := make([]string, 0, len(c.children))
+	for name := range c.children {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var got []string
+	for _, name := range names {
+		ch := c.children[name]
+		if ch == nil {
+			continue
+		}
+		if ch.children == nil && ch.wildcard == nil && ch.args == 1 && !ch.multi {
+			if v, _, ok2 := synthPair(ch); ok2 {
+				got = append(got, name+" "+v+";")
+			}
+		} else if ch.children != nil {
+			if inner, ok2 := nestedStatement8436(ch, 1); ok2 {
+				head := name
+				if ch.args == 1 {
+					head = name + " xpfinner"
+				}
+				got = append(got, head+" { "+inner+" }")
+			}
+		}
+		if len(got) == 2 {
+			return got[0], got[1], true
+		}
+	}
+	return "", "", false
+}
+
 func twoLeaves8436(c *schemaNode) (leafA, valA, leafB, valB string, ok bool) {
 	names := make([]string, 0, len(c.children))
 	for name := range c.children {
@@ -189,10 +298,10 @@ func runDupConservationCensus8436(t *testing.T) dupCensusResult8436 {
 		named := s.keyword + " xpfname"
 		ctx := contextFor(s.container)
 		dup := nest(s.container, ctx+
-			named+" { "+s.leafA+" "+s.valA+"; } "+
-			named+" { "+s.leafB+" "+s.valB+"; }")
+			named+" { "+s.stmtA+" } "+
+			named+" { "+s.stmtB+" }")
 		merged := nest(s.container, ctx+
-			named+" { "+s.leafA+" "+s.valA+"; "+s.leafB+" "+s.valB+"; }")
+			named+" { "+s.stmtA+" "+s.stmtB+" }")
 
 		cd, cm := compileText(t, dup), compileText(t, merged)
 		if cd == nil || cm == nil {
@@ -202,7 +311,7 @@ func runDupConservationCensus8436(t *testing.T) dupCensusResult8436 {
 		// VACUITY GUARD. If the MERGED form compiles the same as a block
 		// carrying only leafA, then leafB is not observable in the typed config
 		// and this site cannot show a loss either way.
-		onlyA := compileText(t, nest(s.container, ctx+named+" { "+s.leafA+" "+s.valA+"; }"))
+		onlyA := compileText(t, nest(s.container, ctx+named+" { "+s.stmtA+" }"))
 		if onlyA == nil || cfgEqual(cm, onlyA) {
 			note("second leaf not observable in the typed config")
 			continue

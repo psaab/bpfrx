@@ -29,19 +29,76 @@ package config
 // reading the verdict column: a pinned list nobody reads is a list of defects
 // with a checkmark next to it.
 var dupConservationInventory8436 = []string{
+	// #9024: THESE BECAME VISIBLE WHEN THE CENSUS LEARNED TO BUILD A NESTED
+	// FIXTURE. Every one was in the SKIP list before — "no two synthesizable
+	// single-value leaf children" — so the census formed no verdict about any
+	// of them and reported a clean board. They are not new defects; they are
+	// defects that were never inspected.
+	//
+	// FOUR ARE SILENT (no commit gate at all) and two were verified by hand
+	// away from the census, because a widened instrument reporting new findings
+	// is a claim about the instrument first:
+	//
+	//	firewall policer   two blocks -> bw=0 burst=15000
+	//	                   merged     -> bw=125000 burst=15000
+	//	                   The bandwidth limit is LOST: a rate limiter with no
+	//	                   rate, which admits everything it was written to cap.
+	//
+	//	protocols ospf area  two blocks -> TWO area entries, same ID, 1 iface each
+	//	                     merged     -> ONE area, 2 interfaces
+	//	                     Not a loss but a DUPLICATE: two `area 0.0.0.0`
+	//	                     stanzas reach FRR.
+	//
+	// The other two SILENT sites are `security ipsec policy` and `system
+	// services dhcp-local-server group`. The remaining rows are
+	// `rejected-at-commit` — conservation BY REFUSAL, a different and
+	// acceptable disposition that the census reports separately.
+	"firewall family any filter xpfname term",
+	"firewall family inet filter xpfname term",
+	"firewall family inet6 filter xpfname term",
+	"firewall policer",
+	"protocols ospf area",
+	"security ipsec policy",
+	"security screen ids-option",
+	"system services dhcp-local-server group",
+	"system services dhcpv6-local-server group",
 	// ---- SILENT: no commit gate at all. ----
 	//
-	// EMPTY, as of #8436's last batch — and read the qualifier, because it
-	// carries almost everything: every container the census COULD REACH that
-	// lost configuration silently has been fixed.
+	// NOT EMPTY. Four containers lose configuration silently, and the reason
+	// this section said "EMPTY" for so long is the point of #9024: the census
+	// could not REACH them.
 	//
-	// Issue 9024 measured the reach. The census CHECKS 9 containers and lists
-	// 104 more as UNPROBED by name in dupConservationSkipped8436 (139 are
-	// eligible; the remainder are the `groups` re-host bucket, counted
-	// separately). So "SILENT: 0" is a statement about 9 containers, and two
-	// CONFIRMED silent drops sit in the unprobed set today
-	// (`forwarding-options sampling instance` and `snmp trap-group`, proven
-	// end-to-end in #9023).
+	//	firewall policer
+	//	protocols ospf area
+	//	security ipsec policy
+	//	system services dhcp-local-server group
+	//
+	// #9024 widened the fixture builder to descend through container-only
+	// children (nestedStatement8436). Before that, a container whose children
+	// are all containers had no two-leaf fixture, left the population BEFORE
+	// any verdict was formed, and was reported as neither conserving nor
+	// divergent. The census CHECKED 30 containers and called the silent set
+	// empty; it now checks 44 and finds 18 divergent, 4 of them silent.
+	//
+	// SO THESE ARE NOT NEW DEFECTS. They are defects that were never
+	// inspected, and the census's own clean board was the reason nobody
+	// looked. That is the shape worth remembering: an instrument that filters
+	// its population before measuring reports the health of what survived the
+	// filter, and reports it as the health of the whole.
+	//
+	// Two were verified BY HAND, away from the census, because a widened
+	// instrument reporting new findings is a claim about the instrument first:
+	//
+	//	firewall policer      two blocks -> bw=0      burst=15000
+	//	                      merged     -> bw=125000 burst=15000
+	//	protocols ospf area   two blocks -> TWO areas, same ID, 1 iface each
+	//	                      merged     -> ONE area, 2 interfaces
+	//
+	// THE CENSUS CAN NOW FAIL, proven against PRODUCTION code rather than by
+	// deleting the census (which is a no-op by design and proves nothing):
+	// disabling mergeDuplicateBlocks9023's fold flips `forwarding-options
+	// sampling instance` to non-conserving. Before #9024 that mutation
+	// produced no change at all, because the site was not in the population.
 	//
 	// The hedge was true when written and did all the work of the sentence,
 	// which is how a reader arrives at "this class is handled". An empty
@@ -102,7 +159,6 @@ var dupConservationSkipped8436 = []string{
 	// omission. Fixing the fixture so they become CHECKED is the follow-on.
 	"applications application-set",
 	"chassis cluster control-ports fpc",
-	"chassis cluster redundancy-group",
 	"chassis cluster redundancy-group xpfname node",
 	"class-of-service classifiers dscp",
 	"class-of-service classifiers dscp xpfname forwarding-class",
@@ -141,22 +197,15 @@ var dupConservationSkipped8436 = []string{
 	// `set firewall family any filter ... then discard` stops committing
 	// clean and minting zero filters.
 	"firewall family any filter",
-	"firewall family any filter xpfname term",
 	"firewall family inet6 filter",
-	"firewall family inet6 filter xpfname term",
 	"firewall family inet filter",
-	"firewall family inet filter xpfname term",
-	"firewall policer",
 	"firewall three-color-policer",
-	"forwarding-options dhcp-relay group",
 	"forwarding-options port-mirroring instance",
-	"forwarding-options sampling instance",
 	"policy-options community",
 	"policy-options policy-statement",
 	"policy-options policy-statement xpfname term",
 	"protocols lldp interface",
 	"protocols ospf3 area",
-	"protocols ospf area",
 	"protocols ospf area xpfname interface xpfname authentication md5",
 	"protocols ospf area xpfname virtual-link",
 	"protocols router-advertisement interface xpfname nat64prefix",
@@ -168,8 +217,6 @@ var dupConservationSkipped8436 = []string{
 	"security address-book global address-set",
 	"security dynamic-address address-name",
 	"security dynamic-address feed-server xpfname feed-name",
-	"security ipsec policy",
-	"security log profile",
 	"security nat destination pool",
 	"security nat destination rule-set",
 	"security nat destination rule-set xpfname rule",
@@ -179,19 +226,15 @@ var dupConservationSkipped8436 = []string{
 	"security nat static rule-set",
 	"security nat static rule-set xpfname rule",
 	"security policies from-zone",
-	"security screen ids-option",
 	"security zones security-zone xpfname address-book address-set",
 	"services ip-monitoring policy",
 	"services ip-monitoring policy xpfname then preferred-route routing-instance",
 	"services rpm probe",
 	"snmp community",
 	"snmp trap-group",
-	"snmp v3 usm local-engine user",
 	"system backup-router",
 	"system ntp threshold",
-	"system services dhcp-local-server group",
 	"system services dhcp-local-server group xpfname pool",
-	"system services dhcpv6-local-server group",
 	"system services dhcpv6-local-server group xpfname pool",
 
 	// ---- "a spelling did not parse or compile" (5). ----
