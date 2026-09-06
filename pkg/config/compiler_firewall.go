@@ -1486,7 +1486,23 @@ func flattenThenChain8939(children []*Node) []*Node {
 		visit(c)
 	}
 	if !changed {
-		return children
+		// #9153: even with no CHAIN to hoist, a single node can carry a packed
+		// RUN of actions on its own Keys.
+		return expandFlatRun(children, thenSchema)
 	}
-	return out
+	// #9153: HOISTING THE CHAIN IS NOT ENOUGH -- THE LAST LINK CARRIES A RUN.
+	//
+	//	set ... term t1 then count c1 log discard
+	//	  then > [count c1] > [log discard]        <- one node, TWO actions
+	//
+	// flattenThenChain8939 lifts each nested node out of the chain, but a node
+	// whose Keys are `[log discard]` is still one node, and compileFilterThen
+	// reads its first key and drops the rest. The terminating `discard` was
+	// therefore LOST while `count` and `log` survived, so the term fell through
+	// to whatever followed -- a FAIL-OPEN, on a clean commit with no warnings.
+	//
+	// expandFlatRun splits a node's Keys at every token the container declares
+	// as another leaf, which is exactly this. It is arity-aware since #9124, so
+	// `count c1` is not cut at its VALUE.
+	return expandFlatRun(out, thenSchema)
 }
