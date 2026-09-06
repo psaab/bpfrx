@@ -43,6 +43,30 @@ import (
 // WALK to LOSE without this test failing, because that is a silent
 // configuration-loss regression on an accepted spelling.
 //
+// WHAT THIS INSTRUMENT STRUCTURALLY CANNOT SEE, AND WHICH ONE CAN.
+//
+// AN AGGREGATE RATCHET CANNOT SEE A FIX THAT BREAKS A NEIGHBOUR INSIDE THE
+// SAME ROW. A row records one container and two or three of its leaves. A
+// change that makes the container start walking AND simultaneously stops it
+// reading a DIFFERENT leaf produces exactly the same fixture delta as a clean
+// fix: the row leaves the loser list either way.
+//
+// That is not hypothetical. Fixing `system login class` hoisted the children
+// of every terminating leaf, which is wrong for a `multi` leaf whose children
+// are VALUES (#2419: `permissions { view; configure; }`). The container began
+// walking and `permissions` went inert in the same change, and THIS FILE
+// REPORTED IT AS 53 -> 52 WITH NO OTHER ROW MOVING.
+//
+// `TestSchemaSpellingDifferentialGate` caught it, because it reports
+// PER-SPELLING verdicts -- "read here, inert there" surfaces there as a
+// disagreement rather than collapsing into one number. That is the same shape
+// as #9077 deleting the #8807 predicate's container recovery while every
+// aggregate stayed green: an instrument reporting a single number per subject
+// cannot distinguish a fix from a fix-plus-a-break.
+//
+// So a green delta HERE is necessary and not sufficient. Land a container fix
+// only with the differential gate green too.
+//
 // WHAT THIS INSTRUMENT DOES NOT SEE, stated because the count will be quoted:
 //   - one pair per container (the two alphabetically-first eligible leaves),
 //     so a container recorded as WALK may still lose a DIFFERENT pair;
@@ -263,6 +287,46 @@ func flatSetChainPairs() []flatSetChainRow {
 // census fixtures carry no `groups` and no `inactive:` nodes, so the
 // expansion and stripping that wrapper performs are identity here; if a
 // fixture ever gains either, this approximation stops being one.
+// flatSetAdmittedAnyOrder reports whether ANY leaf order is admitted.
+//
+// #9100: the channel column tested the ALPHABETICAL order only, which is not
+// what an operator is constrained to. lane-8388 established that a flat run is
+// rejected iff the leaf it STARTS at declares a type/validator -- a validated
+// leaf routes to the typed-leaf branch, whose modifier-child check refuses the
+// trailing tokens, while an untyped `args:1` leaf falls through to the
+// container branch that by #3332's compiler-faithful contract deliberately
+// ignores leftover Keys. So REACHABILITY IS ORDER-DEPENDENT WITHIN ONE
+// CONTAINER:
+//
+//	ike gateway   address A external-interface E   ACCEPTED
+//	ike gateway   version v2-only address A        SCHEMA-REJECT
+//	login class   allow-commands "x" idle-timeout 30   ACCEPTED
+//	login class   idle-timeout 30 allow-commands "x"   SCHEMA-REJECT
+//
+// Testing one order therefore makes `lenient-only` unsound: it means "not
+// reachable in the order I happened to synthesize", and an operator types
+// whichever order they like. Measured: 21 rows flip to OPERATOR once every
+// first-leaf position is tried -- among them `chassis cluster
+// redundancy-group` and `protocols bgp`.
+//
+// OPERATOR is the dangerous verdict, so the column must take the union. A
+// false `lenient-only` hides an operator-reachable silent drop; a false
+// OPERATOR only over-warns.
+func flatSetAdmittedAnyOrder(base string, leaves []flatSetLeaf) bool {
+	for i := range leaves {
+		reordered := append([]flatSetLeaf{leaves[i]},
+			append(append([]flatSetLeaf{}, leaves[:i]...), leaves[i+1:]...)...)
+		line := base
+		for _, lf := range reordered {
+			line += " " + lf.spell()
+		}
+		if flatSetAdmitted([]string{line}) {
+			return true
+		}
+	}
+	return false
+}
+
 func flatSetAdmitted(lines []string) bool {
 	tr := &ConfigTree{}
 	for _, l := range lines {
@@ -410,7 +474,7 @@ func TestFlatSetChainWalkRatchet8939(t *testing.T) {
 		// #9088: the ADMISSION CHANNEL, because a row an operator can type is
 		// a different defect from one only boot and HA sync can reach.
 		channel := "lenient-only"
-		if flatSetAdmitted([]string{packedLine}) {
+		if flatSetAdmittedAnyOrder(base, leaves) {
 			channel = "OPERATOR"
 		}
 		losers = append(losers, strings.Join(cont, " ")+"  ["+
