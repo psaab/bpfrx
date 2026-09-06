@@ -409,10 +409,31 @@ all files stay in `package ipsec`, so the public API is unchanged.
       more than one interface carries an `fe80::` address. When the selected
       source is link-local, the resolver appends the IPv6 zone
       (`%<iface>`) — e.g. `fe80::1%ge-0-0-3` — using the kernel interface
-      name it already has in scope (`config.LinuxIfName(base)` for the
-      configured path, the looked-up interface name for the kernel path).
+      name it already has in scope (the looked-up interface name for the
+      kernel path; see the reth note below for the configured path).
       Global and IPv4 sources are emitted bare; an address already carrying
       a zone is left unchanged.
+    - **The zone must name a KERNEL netdev, so reth is resolved (#9137).**
+      The configured path derived the zone as `config.LinuxIfName(base)`,
+      which for `external-interface reth0.0` yields `reth0` — and under
+      bondless RETH, the shipped HA model, `reth0` is not a kernel device
+      at all: xpfd programs the VRRP VIP and virtual MAC on the PHYSICAL
+      member and creates no reth netdev (`pkg/dataplane/compiler_iface.go`
+      skips reth for the same reason). charon could not
+      `if_nametoindex("reth0")`, so the IKE SA never bound and the tunnel
+      never established, from a config that commits clean. The zone is now
+      `config.LinuxIfName(cfg.ResolveReth(base))`, which also makes the
+      function agree with its own sibling — the kernel-lookup fallback in
+      `resolveInterfaceAddressFamily` has resolved reth since it was
+      written, so the asymmetry lived inside one function pair. `ResolveReth`
+      returns a non-reth ref unchanged, so nothing else moves. The result is
+      guarded against being EMPTY: a member carrying `RedundantParent` but no
+      `Name` makes `RethToPhysical` map `reth0` to `""`, and an unqualified
+      `fe80::` is strictly worse than a wrongly-qualified one — it loses the
+      #2885 disambiguation entirely.
+      The real bound on the defect is `selectFamilyAddress` being global-wins:
+      the link-local branch is only reached when the reth unit has no global
+      IPv6 address.
 - **Runtime re-bind on interface IP change (#2884).** A gateway with an
   `external-interface` and no explicit `local-address` resolves
   `local_addrs` from the interface's CURRENT address at `PrepareConfig`
