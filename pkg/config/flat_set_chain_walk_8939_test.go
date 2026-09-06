@@ -193,6 +193,53 @@ func flatSetChainPairs() []flatSetChainRow {
 	return out
 }
 
+// flatSetAdmitted reports whether the CLOSED-WORLD typed-leaf gate accepts
+// these lines -- i.e. whether an operator could commit them.
+//
+// #9088: THIS COLUMN WAS MISSING AND ITS ABSENCE CONFLATED TWO DEFECT CLASSES
+// WITH DIFFERENT SEVERITIES. This census calls CompileConfig, but the operator
+// path is `Store.Commit -> compileTree -> compileTreeStrict`, which runs
+// `schemaValidateExpandedTreeForNode` FIRST. So every row here has been
+// measuring the TOLERANT channel and being reported as the operator channel.
+//
+//	rejected by the gate   the packed spelling cannot be typed. The compiler
+//	                       defect is real but reachable only through
+//	                       `Store.Load` (boot from the persisted DB) and
+//	                       `Store.SyncApply` (HA config sync from the peer),
+//	                       which use compileTreeLenient and downgrade the same
+//	                       gate to a slog.Warn -- so the value is truncated
+//	                       where no operator is watching.
+//
+//	accepted by the gate   operator-reachable. Commits clean, renders in `show
+//	                       configuration`, enforces less than it says.
+//
+// The discriminator is NOT the container: it is whether the schema DECLARES
+// the leaves. A fully declared container catches the packed run on its own
+// arity check; one whose leaves the compiler reads but `setSchema` never
+// declared has no closed-world check to fail, so the run sails through. THE
+// SCHEMA BEING BEHIND THE COMPILER IS WHAT MAKES A SITE OPERATOR-REACHABLE --
+// the class is a property of the (container, declaration) pair, not of the
+// container. Found by lane-8388.
+//
+// This calls SchemaValidateWithDefinitions directly rather than
+// configstore.compileTreeStrict, because configstore imports config. The
+// census fixtures carry no `groups` and no `inactive:` nodes, so the
+// expansion and stripping that wrapper performs are identity here; if a
+// fixture ever gains either, this approximation stops being one.
+func flatSetAdmitted(lines []string) bool {
+	tr := &ConfigTree{}
+	for _, l := range lines {
+		toks, err := ParseSetCommand(l)
+		if err != nil {
+			return false
+		}
+		if err := tr.SetPath(toks); err != nil {
+			return false
+		}
+	}
+	return SchemaValidateWithDefinitions(tr, tr, nil) == nil
+}
+
 func flatSetCompile(lines []string) (*Config, error) {
 	tr := &ConfigTree{}
 	for _, l := range lines {
@@ -323,8 +370,14 @@ func TestFlatSetChainWalkRatchet8939(t *testing.T) {
 		for _, lf := range leaves {
 			names = append(names, lf.name)
 		}
+		// #9088: the ADMISSION CHANNEL, because a row an operator can type is
+		// a different defect from one only boot and HA sync can reach.
+		channel := "lenient-only"
+		if flatSetAdmitted([]string{packedLine}) {
+			channel = "OPERATOR"
+		}
 		losers = append(losers, strings.Join(cont, " ")+"  ["+
-			strings.Join(names, " | ")+"]  "+kind)
+			strings.Join(names, " | ")+"]  "+kind+"  "+channel)
 	}
 	sort.Strings(losers)
 
