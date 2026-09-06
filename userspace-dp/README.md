@@ -137,9 +137,21 @@ logging rules, not these specific hot-path constants.
 - `TX_BATCH_SIZE = 64` is paired with the CoS guarantee quantum in
   `userspace-dp/src/afxdp/mod.rs`. Changing requires re-running the
   `guarantee_phase_*` tests.
-- Generic-XDP fallback consumes UMEM frames permanently on mlx5; the
-  XDP shim redirects `XDP_PASS` to a cpumap stage that frees the frame
-  immediately.
+- **(#9043, corrected)** This line used to read *"Generic-XDP fallback
+  consumes UMEM frames permanently on mlx5"*. That is wrong twice over,
+  and the tree itself settles it: a generic-XDP interface binds
+  **`COPY_ONLY_BIND_FLAGS`** (`afxdp/bind.rs`, the `interface_uses_generic_xdp`
+  branch — virtio_net is the one exception, taking AUTO), and
+  `afxdp/umem/README.md` states that in copy mode `XDP_PASS` "operates on
+  kernel DMA buffers, not UMEM frames". So the generic fallback cannot
+  consume a UMEM frame at all. "On mlx5" is incoherent besides: mlx5
+  supports native XDP and does not take the generic fallback.
+
+  What is true and worth keeping: the XDP shim redirects `XDP_PASS` to a
+  cpumap stage (`USERSPACE_CPUMAP`) that frees the XSK frame immediately.
+  That mitigation is shipped and is unaffected by this correction — see
+  `afxdp/umem/README.md` for what it is a mitigation *for*, and for why
+  that premise is now marked unverified.
 - Producer-ring writers (`WriteTx` / `WriteFill` in
   `userspace-dp/src/xsk_ffi.rs`) are **append-safe across multiple
   `insert()` calls on one reservation**: each `insert()` writes at
