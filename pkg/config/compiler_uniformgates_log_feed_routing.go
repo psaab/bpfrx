@@ -328,6 +328,23 @@ func runUniformGatesLogFeedRouting(tree *ConfigTree, cfg *Config, opts compileOp
 		}
 	}
 
+	// #9007 duplicate BGP neighbor across groups. One address renders once per
+	// group that names it, so FRR receives two divergent definitions -- two
+	// `password` lines included -- for one peer and resolves them by render
+	// order, silently, while `show` reports both groups as authored. Strict on
+	// commit (Junos rejects it too); warn on the tolerant path (#1960
+	// fail-closed-on-load class). Fires only for DIFFERENT groups -- repeats
+	// within one group are the compiler's per-AST-node artifact, not an
+	// operator error.
+	if err := validateBGPDuplicateNeighborStrict(cfg); err != nil {
+		if opts.lenientBGPDuplicateNeighbor {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("BGP duplicate neighbor (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #2980: OSPF/OSPFv3/BGP router-id gate. router-id is parsed as a raw
 	// string with no validation, so a malformed value (not a 32-bit IPv4
 	// dotted-quad) flowed verbatim into frr.conf. FRR/vtysh requires an IPv4
