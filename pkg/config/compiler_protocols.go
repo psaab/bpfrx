@@ -387,8 +387,16 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 			// the neighbor block below (unchanged precedence). Works for both
 			// the hierarchical and flat-set AST shapes; multi-value list leaves
 			// (export/import, #2419/#2702) accumulate fully in pass 0.
+			// #9181: expand ONCE, before the two-pass loop, so both passes see
+			// the same segmentation. A packed run whose TAIL is a container
+			// loses everything silently --
+			//   `group G peer-as 65001 neighbor 10.0.0.1` -> neighbors=0, no
+			// error -- because `neighbor` nests under `peer-as` and pass 1
+			// never sees a child named `neighbor`. The group is then
+			// configured with NOBODY IN IT, which reads as intentional.
+			groupChildren := expandFlatRun(groupInst.node.Children, bgpGroupSchema9181())
 			for pass := 0; pass < 2; pass++ {
-				for _, child := range groupInst.node.Children {
+				for _, child := range groupChildren {
 					isNeighbor := child.Name() == "neighbor"
 					if pass == 0 && isNeighbor {
 						// Pass 0: collect group-level defaults only; defer
