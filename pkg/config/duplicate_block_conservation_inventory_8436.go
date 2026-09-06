@@ -298,16 +298,24 @@ var dupConservationSkipped8436 = []string{
 	// here rather than deleted. It said the second leaf "is invisible to the
 	// typed config and the site cannot show a loss either way". The first
 	// clause is a true observation about THE FIXTURE; the second is a claim
-	// about the SITE, and it is wrong for all three entries below. Each shows
-	// a real loss once the fixture can express what the site needs, and each
-	// needs a DIFFERENT thing — which is why one shared sentence covered them
+	// about the SITE, and it was wrong for all three entries below. Each SHOWED
+	// a real loss once the fixture could express what the site needs, and each
+	// needed a DIFFERENT thing — which is why one shared sentence covered them
 	// and was wrong about every one:
 	//
-	//	protocols bgp group      needs a SIBLING (`neighbor`) plus that
+	//	protocols bgp group      needed a SIBLING (`neighbor`) plus that
 	//	                         sibling's own prerequisite (`peer-as`, required
 	//	                         by the compiler and not declared in the schema).
 	//	                         Group settings fold into BGPNeighbor, so with no
-	//	                         neighbor there is nothing for them to land in.
+	//	                         neighbor there was nothing for them to land in.
+	//	                         THE LOSS ITSELF IS NOW FIXED (#9199): the packed
+	//	                         and split spellings both yield one neighbor,
+	//	                         measured. The entry stays skipped because the
+	//	                         FIXTURE still cannot express the prerequisite —
+	//	                         which is the distinction this comment exists to
+	//	                         draw, now demonstrated by a site that is
+	//	                         unmeasurable AND correct rather than
+	//	                         unmeasurable and broken.
 	//	cos interfaces .. unit   needs the referenced object DEFINED: a
 	//	                         `scheduler-map` reference to an undefined map is
 	//	                         rejected outright, so the fixture never compiles.
