@@ -336,7 +336,12 @@ var OperationalTree = map[string]*Node{
 		// services, interfaces ge-0/0/0, firewall filter f1 — were
 		// CanonicalUnknown, so a restricted class was refused all of them.
 		"configuration": {Desc: "Show active configuration", Children: map[string]*Node{
-			"applications":       {Desc: "Application protocol definitions", AcceptsArgs: true},
+			"applications": {Desc: "Application protocol definitions", AcceptsArgs: true},
+			// #9064: `groups` and `apply-groups` are real config stanzas and were
+			// absent from this map entirely, so `show configuration groups` was
+			// CanonicalUnknown rather than merely arg-less.
+			"apply-groups":       {Desc: "Applied configuration groups", AcceptsArgs: true},
+			"groups":             {Desc: "Configuration groups", AcceptsArgs: true},
 			"chassis":            {Desc: "Chassis configuration", AcceptsArgs: true},
 			"class-of-service":   {Desc: "Class-of-service configuration", AcceptsArgs: true},
 			"event-options":      {Desc: "Event processing configuration", AcceptsArgs: true},
@@ -554,7 +559,8 @@ var OperationalTree = map[string]*Node{
 					"rule": {Desc: "Show source NAT rules", Children: map[string]*Node{
 						"detail": {Desc: "Show detailed source NAT rules"},
 					}},
-					"rule-set": {Desc: "Show source NAT rule sets"},
+					// #9064: takes a rule-set NAME.
+					"rule-set": {Desc: "Show source NAT rule sets", AcceptsArgs: true},
 					"deterministic-nat": {Desc: "Resolve deterministic CGNAT/NAPT64 mappings (applied generation)", Children: map[string]*Node{
 						"internal-host": {Desc: "Forward: map an internal subscriber to its translated IP + port block", Children: map[string]*Node{
 							"<address>": {Desc: "Internal subscriber IP (IPv4 mode 1, or IPv6 mode 2 NAPT64)", Children: map[string]*Node{
@@ -578,7 +584,8 @@ var OperationalTree = map[string]*Node{
 					"rule": {Desc: "Show destination NAT rules", Children: map[string]*Node{
 						"detail": {Desc: "Show detailed destination NAT rules"},
 					}},
-					"rule-set": {Desc: "Show destination NAT rule sets"},
+					// #9064: takes a rule-set NAME.
+					"rule-set": {Desc: "Show destination NAT rule sets", AcceptsArgs: true},
 				}},
 				"static": {Desc: "Show static NAT", Children: map[string]*Node{
 					"rule": {Desc: "Show static NAT rules", Children: map[string]*Node{
@@ -734,8 +741,12 @@ var OperationalTree = map[string]*Node{
 			}},
 			"connections": {Desc: "Show system connection activity"},
 			"core-dumps":  {Desc: "Show system core dumps"},
-			"rollback": {Desc: "Show rolled back configuration", Children: map[string]*Node{
-				"compare": {Desc: "Compare rollback with active config"},
+			// #9064: `show system rollback 1` and `show system rollback compare 1`
+			// both take a rollback INDEX. The parent needs AcceptsArgs for the
+			// bare form and the child for the compare form -- declaring only one
+			// leaves the other CanonicalUnknown.
+			"rollback": {Desc: "Show rolled back configuration", AcceptsArgs: true, Children: map[string]*Node{
+				"compare": {Desc: "Compare rollback with active config", AcceptsArgs: true},
 			}},
 			"backup-router":    {Desc: "Show backup router configuration"},
 			"bootstrap-import": {Desc: "Show the day-0 / bootstrap configuration import outcome"},
@@ -938,7 +949,8 @@ var OperationalTree = map[string]*Node{
 			"all": {Desc: "Clear all firewall filter counters"},
 		}},
 		"dhcp": {Desc: "Clear DHCP information", Children: map[string]*Node{
-			"client-identifier": {Desc: "Clear DHCPv6 DUID(s)"},
+			// #9064: takes `interface <name>`.
+			"client-identifier": {Desc: "Clear DHCPv6 DUID(s)", AcceptsArgs: true},
 		}},
 	}},
 	"request": {Desc: "Make system-level requests", Children: map[string]*Node{
@@ -1145,16 +1157,21 @@ var OperationalTree = map[string]*Node{
 	}},
 	"ping": {Desc: "Ping remote host", Children: map[string]*Node{
 		"<host>": {Desc: "Hostname or IP address of remote host"},
-		"count":  {Desc: "Number of ping requests to send"},
-		"source": {Desc: "Source address to use"},
-		"size":   {Desc: "Request data size in bytes"},
+		// #9064: each takes a real dispatcher-read VALUE (cli_request_ping.go
+		// reads count/source/size), so a bare leaf made the whole command
+		// CanonicalUnknown and a restricted login class was refused a command
+		// the CLI's own `usage:` string documents.
+		"count":  {Desc: "Number of ping requests to send", AcceptsArgs: true},
+		"source": {Desc: "Source address to use", AcceptsArgs: true},
+		"size":   {Desc: "Request data size in bytes", AcceptsArgs: true},
 		"routing-instance": {Desc: "Routing instance for route lookup", DynamicFn: func(cfg *config.Config) []string {
 			return routingInstanceNames(cfg) // #4866: nil-skip tolerated entries
 		}},
 	}},
 	"traceroute": {Desc: "Trace route to remote host", Children: map[string]*Node{
 		"<host>": {Desc: "Hostname or IP address of remote host"},
-		"source": {Desc: "Source address to use"},
+		// #9064: takes a value, like ping's.
+		"source": {Desc: "Source address to use", AcceptsArgs: true},
 		"routing-instance": {Desc: "Routing instance for route lookup", DynamicFn: func(cfg *config.Config) []string {
 			return routingInstanceNames(cfg) // #4866: nil-skip tolerated entries
 		}},

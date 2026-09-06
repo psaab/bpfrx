@@ -1,4 +1,6 @@
 use super::*;
+use crate::afxdp::gre_discriminator::gre_transit_discriminator;
+use crate::session::TunnelDiscriminator;
 
 /// Parsed embedded inner IPv4 header + first 8 bytes of L4 (enough to
 /// recover ports / icmp echo id). IP address octets are recovered
@@ -7,6 +9,20 @@ use super::*;
 /// comparison and key construction.
 pub(in crate::afxdp::icmp_embed) struct EmbeddedV4Header {
     pub proto: u8,
+    /// #9031: the QUOTED packet's GRE discriminator.
+    ///
+    /// `SessionKey` derives Hash/Eq INCLUDING the discriminator (#7188), and a
+    /// live accelerated GRE session carries `Unkeyed`/`Keyed(k)`/`Pptp(handle)`.
+    /// Every embedded lookup key used to hard-code `Default::default()` —
+    /// `None` — so every exact index probe for a GRE quote missed, and an ICMP
+    /// error for a translated accelerated tunnel found no NAT state: the outer
+    /// destination and quoted source could not be restored and no usable signal
+    /// reached the endpoint. GRE carries bulk payload, so small probes stay
+    /// healthy while large traffic stalls after an MTU reduction.
+    ///
+    /// `None` for every non-GRE protocol, which is exactly what those sessions
+    /// carry — so this field leaves every other protocol's identity unchanged.
+    pub discriminator: TunnelDiscriminator,
     pub src: Ipv4Addr,
     pub dst: Ipv4Addr,
     pub l4_off: usize,
@@ -24,6 +40,8 @@ pub(in crate::afxdp::icmp_embed) struct EmbeddedV4Header {
 /// `EmbeddedV4Header`.
 pub(in crate::afxdp::icmp_embed) struct EmbeddedV6Header {
     pub proto: u8,
+    /// #9031: see EmbeddedV4Header::discriminator.
+    pub discriminator: TunnelDiscriminator,
     pub src_wire: Ipv6Addr,
     pub dst: IpAddr,
     pub l4_off: usize,
@@ -104,8 +122,30 @@ pub(in crate::afxdp::icmp_embed) fn parse_embedded_v4(
     } else {
         (0, 0)
     };
+    // #9031: the QUOTED GRE discriminator. `gre_transit_discriminator` is the
+    // SAME extractor the transit path uses, reused rather than re-spelled — a
+    // second parser for one wire format is where two readings of the same bytes
+    // silently diverge, which is exactly the class #8103 was still cleaning up.
+    //
+    // Bounded by `inner_declared_end`, the QUOTED datagram's declared end, not
+    // by the backing frame: the #2361 rule the extractor already enforces for
+    // transit, applied to the quote. Outer L2 pad or attacker-supplied slack
+    // beyond the quoted datagram must not be read as a Key.
+    //
+    // FAIL-CLOSED BY CONSTRUCTION: every failure path in the extractor returns
+    // `Unparseable`, which is a DISTINCT class from `Unkeyed` (#7188 decision
+    // 6) and equal to no live session's discriminator — so a truncated or
+    // malformed quote MISSES rather than wildcarding across tunnels. That is
+    // the acceptance's requirement, and it is met by the type rather than by a
+    // check anyone could forget.
+    let discriminator = if proto == PROTO_GRE {
+        gre_transit_discriminator(frame, l4_off, inner_declared_end)
+    } else {
+        TunnelDiscriminator::None
+    };
     Some(EmbeddedV4Header {
         proto,
+        discriminator,
         src,
         dst,
         l4_off,
@@ -208,8 +248,30 @@ pub(in crate::afxdp::icmp_embed) fn parse_embedded_v6(
     } else {
         (0, 0)
     };
+    // #9031: the QUOTED GRE discriminator. `gre_transit_discriminator` is the
+    // SAME extractor the transit path uses, reused rather than re-spelled — a
+    // second parser for one wire format is where two readings of the same bytes
+    // silently diverge, which is exactly the class #8103 was still cleaning up.
+    //
+    // Bounded by `inner_declared_end`, the QUOTED datagram's declared end, not
+    // by the backing frame: the #2361 rule the extractor already enforces for
+    // transit, applied to the quote. Outer L2 pad or attacker-supplied slack
+    // beyond the quoted datagram must not be read as a Key.
+    //
+    // FAIL-CLOSED BY CONSTRUCTION: every failure path in the extractor returns
+    // `Unparseable`, which is a DISTINCT class from `Unkeyed` (#7188 decision
+    // 6) and equal to no live session's discriminator — so a truncated or
+    // malformed quote MISSES rather than wildcarding across tunnels. That is
+    // the acceptance's requirement, and it is met by the type rather than by a
+    // check anyone could forget.
+    let discriminator = if proto == PROTO_GRE {
+        gre_transit_discriminator(frame, l4_off, inner_declared_end)
+    } else {
+        TunnelDiscriminator::None
+    };
     Some(EmbeddedV6Header {
         proto,
+        discriminator,
         src_wire,
         dst,
         l4_off,
@@ -228,6 +290,11 @@ pub(in crate::afxdp::icmp_embed) fn embedded_reply_key(
     dst_ip: IpAddr,
     src_port: u16,
     dst_port: u16,
+    // #9031: the quoted tunnel's discriminator. The REVERSE companion of a GRE
+    // session carries the same discriminator as its forward key — the tunnel
+    // identity is a property of the tunnel, not of the direction — so this is
+    // passed through unchanged rather than transformed, unlike the ports.
+    discriminator: TunnelDiscriminator,
 ) -> SessionKey {
     let (reply_src_port, reply_dst_port) = embedded_reply_ports(protocol, src_port, dst_port);
     SessionKey {
@@ -237,7 +304,7 @@ pub(in crate::afxdp::icmp_embed) fn embedded_reply_key(
         dst_ip: src_ip,
         src_port: reply_src_port,
         dst_port: reply_dst_port,
-        discriminator: Default::default(),
+        discriminator,
         // #7160 (#2387): a REVERSE-direction key, so domain 0 is the correct
         // value and not an omission — the reverse-match transforms and index
         // are domain-agnostic by construction (session/key.rs). The forward
@@ -603,6 +670,374 @@ mod embedded_v4_fragment_tests {
             (hdr.src_port, hdr.dst_port),
             (0x1111, 0x2222),
             "the quoted ports are within the (large) declared length → read them"
+        );
+    }
+}
+
+/// #9031: the QUOTED GRE discriminator must reach the lookup key.
+///
+/// `SessionKey` derives Hash/Eq INCLUDING `discriminator` (#7188), and a live
+/// accelerated GRE session carries `Unkeyed`/`Keyed(k)`/`Pptp(handle)`. Every
+/// embedded lookup key hard-coded `Default::default()` — `None` — so every
+/// exact index probe for a GRE quote MISSED: an ICMP error for a translated
+/// accelerated tunnel found no NAT state, the outer destination and quoted
+/// source could not be restored, and no usable signal reached the endpoint.
+/// GRE carries bulk payload, so small probes stay healthy while large traffic
+/// stalls after an MTU reduction.
+///
+/// #8103 threaded the discriminator through the five TRANSFORM helpers and
+/// pinned them; those cover transforms of an EXISTING key. This is a key
+/// PRODUCED FROM A QUOTED PACKET, which is the gap.
+#[cfg(test)]
+mod embedded_gre_discriminator_9031_tests {
+    use super::*;
+
+    /// A quoted IPv4 datagram carrying a GRE header with `flags`, plus the
+    /// optional trailing 4-byte fields those flags declare, then encapsulated
+    /// payload.
+    ///
+    /// The payload is not decoration: `parse_embedded_v4` requires a quote of at
+    /// least 28 bytes (the RFC 792 minimum, 20 IP + 8 L4), so a bare 4-byte GRE
+    /// header is refused before the discriminator is ever read. A fixture short
+    /// of that would make these cells assert about a parse that never happened.
+    /// The declared total-length COVERS the payload, so it is inside the quote.
+    fn quoted_v4_gre(flags_version: u16, tail: &[u8]) -> Vec<u8> {
+        let mut p = vec![0u8; 20];
+        p[0] = 0x45; // IPv4, IHL 5
+        p[9] = PROTO_GRE;
+        p[12..16].copy_from_slice(&[10, 0, 1, 7]); // src
+        p[16..20].copy_from_slice(&[10, 0, 2, 8]); // dst
+        p.extend_from_slice(&flags_version.to_be_bytes());
+        p.extend_from_slice(&[0x08, 0x00]); // protocol type
+        p.extend_from_slice(tail);
+        while p.len() < 28 {
+            p.push(0x5A); // encapsulated payload, inside the declared quote
+        }
+        let total = p.len() as u16;
+        p[2..4].copy_from_slice(&total.to_be_bytes());
+        p
+    }
+
+    /// A quote whose DECLARED total-length stops after `declared_extra` bytes of
+    /// GRE header, with `slack` appended beyond it. Models outer L2 pad or
+    /// attacker-supplied bytes that the quoted datagram does not cover.
+    fn quoted_v4_gre_with_slack(flags_version: u16, declared_extra: &[u8], slack: &[u8]) -> Vec<u8> {
+        let mut p = vec![0u8; 20];
+        p[0] = 0x45;
+        p[9] = PROTO_GRE;
+        p[12..16].copy_from_slice(&[10, 0, 1, 7]);
+        p[16..20].copy_from_slice(&[10, 0, 2, 8]);
+        p.extend_from_slice(&flags_version.to_be_bytes());
+        p.extend_from_slice(&[0x08, 0x00]);
+        p.extend_from_slice(declared_extra);
+        let total = p.len() as u16; // the quote ENDS here
+        p[2..4].copy_from_slice(&total.to_be_bytes());
+        p.extend_from_slice(slack);
+        while p.len() < 28 {
+            p.push(0x5A); // more slack, so the 28-byte parser minimum is met
+        }
+        p
+    }
+
+    fn quoted_v6_gre(flags_version: u16, tail: &[u8]) -> Vec<u8> {
+        let mut p = vec![0u8; 40];
+        p[0] = 0x60;
+        p[6] = PROTO_GRE;
+        p[7] = 64;
+        p[8..24].copy_from_slice(&[0x20; 16]);
+        p[24..40].copy_from_slice(&[0x30; 16]);
+        p.extend_from_slice(&flags_version.to_be_bytes());
+        p.extend_from_slice(&[0x08, 0x00]);
+        p.extend_from_slice(tail);
+        while p.len() < 48 {
+            p.push(0x5A); // encapsulated payload, inside the declared quote
+        }
+        let plen = (p.len() - 40) as u16;
+        p[4..6].copy_from_slice(&plen.to_be_bytes());
+        p
+    }
+
+    const KEY_FLAG: u16 = 0x2000;
+    const CKSUM_FLAG: u16 = 0x8000;
+    const ROUTING_FLAG: u16 = 0x4000;
+
+    #[test]
+    fn a_quoted_unkeyed_gre_yields_unkeyed_not_none_9031() {
+        let p = quoted_v4_gre(0, &[]);
+        let hdr = parse_embedded_v4(&p, 0).expect("parse");
+        assert_eq!(hdr.proto, PROTO_GRE);
+        assert_eq!(
+            hdr.discriminator,
+            TunnelDiscriminator::Unkeyed,
+            "#9031: an unkeyed GRE quote must carry Unkeyed. `None` is what every \
+             NON-GRE session carries, so it equals no live GRE session's \
+             discriminator and every exact index probe misses"
+        );
+    }
+
+    #[test]
+    fn a_quoted_keyed_gre_yields_that_key_9031() {
+        for key in [1u32, 0xDEAD_BEEF, u32::MAX] {
+            let p = quoted_v4_gre(KEY_FLAG, &key.to_be_bytes());
+            let hdr = parse_embedded_v4(&p, 0).expect("parse");
+            assert_eq!(
+                hdr.discriminator,
+                TunnelDiscriminator::Keyed(key),
+                "#9031: quoted key {key:#x} must reach the lookup key"
+            );
+        }
+    }
+
+    /// KEYED-ZERO is not UNKEYED (#7188 decision 6). RFC 2890 permits both and
+    /// they are different tunnels; collapsing them would let an unkeyed tunnel
+    /// join a keyed-zero session.
+    #[test]
+    fn a_quoted_keyed_zero_gre_is_not_unkeyed_9031() {
+        let keyed_zero = parse_embedded_v4(&quoted_v4_gre(KEY_FLAG, &0u32.to_be_bytes()), 0)
+            .expect("parse")
+            .discriminator;
+        let unkeyed = parse_embedded_v4(&quoted_v4_gre(0, &[]), 0)
+            .expect("parse")
+            .discriminator;
+        assert_eq!(keyed_zero, TunnelDiscriminator::Keyed(0));
+        assert_ne!(
+            keyed_zero, unkeyed,
+            "#9031: a Key of literally zero and no Key at all are DIFFERENT \
+             tunnels (#7188 decision 6)"
+        );
+    }
+
+    /// MULTIPLE KEYS must not collide: two tunnels differing only in Key must
+    /// produce different lookup keys, which is the whole point of the field.
+    #[test]
+    fn quotes_differing_only_in_key_do_not_collide_9031() {
+        let a = parse_embedded_v4(&quoted_v4_gre(KEY_FLAG, &7u32.to_be_bytes()), 0)
+            .expect("parse");
+        let b = parse_embedded_v4(&quoted_v4_gre(KEY_FLAG, &8u32.to_be_bytes()), 0)
+            .expect("parse");
+        let ka = embedded_reply_key(
+            libc::AF_INET as u8, a.proto,
+            IpAddr::V4(a.src), IpAddr::V4(a.dst), a.src_port, a.dst_port, a.discriminator,
+        );
+        let kb = embedded_reply_key(
+            libc::AF_INET as u8, b.proto,
+            IpAddr::V4(b.src), IpAddr::V4(b.dst), b.src_port, b.dst_port, b.discriminator,
+        );
+        assert_ne!(
+            ka, kb,
+            "#9031: two GRE tunnels differing only in Key produced the SAME \
+             lookup key. GRE has no L4 ports, so the discriminator is the only \
+             thing separating them — without it one tunnel's ICMP error resolves \
+             against another's session"
+        );
+    }
+
+    /// The checksum field is SKIPPED, not validated, and the Key sits AFTER it.
+    /// Reading at the wrong offset would yield a plausible-looking wrong key.
+    #[test]
+    fn a_checksummed_quote_reads_the_key_past_the_checksum_9031() {
+        let mut tail = vec![0xAA, 0xBB, 0x00, 0x00]; // checksum + reserved1
+        tail.extend_from_slice(&0x1234_5678u32.to_be_bytes());
+        let hdr = parse_embedded_v4(&quoted_v4_gre(CKSUM_FLAG | KEY_FLAG, &tail), 0).expect("parse");
+        assert_eq!(
+            hdr.discriminator,
+            TunnelDiscriminator::Keyed(0x1234_5678),
+            "#9031: with the checksum bit set the Key is 4 bytes further in; \
+             reading at the unchecksummed offset yields 0xAABB0000"
+        );
+    }
+
+    /// FAIL-CLOSED. A quote we could not read must MISS, never wildcard across
+    /// tunnels. `Unparseable` is a distinct class from `Unkeyed` (#7188
+    /// decision 6) and equals no live session's discriminator.
+    #[test]
+    fn an_unreadable_quote_is_unparseable_not_unkeyed_9031() {
+        let cases: [(&str, Vec<u8>); 3] = [
+            // Version 1 = PPTP enhanced GRE: the 32 bits after the flags word
+            // are Payload Length | Call ID, NOT a Key.
+            ("pptp version 1", quoted_v4_gre(0x0001, &0u32.to_be_bytes())),
+            // Source Route Entries have no fixed offset, so nothing behind them
+            // can be located.
+            ("source routing", quoted_v4_gre(ROUTING_FLAG | KEY_FLAG, &7u32.to_be_bytes())),
+            // K bit set but the DECLARED quote ends before the Key.
+            ("truncated key", quoted_v4_gre_with_slack(KEY_FLAG, &[], &[])),
+        ];
+        for (name, p) in cases {
+            let hdr = parse_embedded_v4(&p, 0).expect("parse");
+            assert_eq!(
+                hdr.discriminator,
+                TunnelDiscriminator::Unparseable,
+                "#9031 ({name}): an unreadable quote must be Unparseable. \
+                 Falling back to Unkeyed would let a malformed header merge into \
+                 a legitimate unkeyed session — the failure a fail-closed class \
+                 exists to prevent"
+            );
+            assert_ne!(hdr.discriminator, TunnelDiscriminator::Unkeyed);
+        }
+    }
+
+    /// BOUNDED BY THE DECLARED QUOTE, not the backing frame (#2361). Outer L2
+    /// pad or attacker-supplied slack past the quoted datagram must not be read
+    /// as a Key.
+    #[test]
+    fn a_key_in_slack_past_the_declared_quote_is_not_read_9031() {
+        // K bit set; the declared quote ends immediately after the 4-byte GRE
+        // header, and a Key-shaped value sits in the slack beyond it.
+        let p = quoted_v4_gre_with_slack(KEY_FLAG, &[], &0xCAFE_BABEu32.to_be_bytes());
+        let declared =
+            u16::from_be_bytes([p[2], p[3]]) as usize;
+        assert!(
+            p.len() > declared,
+            "fixture: the slack must lie OUTSIDE the declared quote, or this \
+             cell is not about slack at all"
+        );
+
+        let hdr = parse_embedded_v4(&p, 0).expect("parse");
+        assert_eq!(
+            hdr.discriminator,
+            TunnelDiscriminator::Unparseable,
+            "#9031: bytes BEYOND the quoted datagram's declared total-length were \
+             read as a GRE Key. That is a manufactured tunnel identity from \
+             attacker-supplied slack — the #2361 rule, applied to the quote"
+        );
+        assert_ne!(hdr.discriminator, TunnelDiscriminator::Keyed(0xCAFE_BABE));
+    }
+
+    /// NON-GRE COMPATIBILITY CONTROL. Every other protocol must still carry
+    /// `None`, or this change would alter identity for every existing session.
+    #[test]
+    fn non_gre_quotes_still_carry_none_9031() {
+        for proto in [PROTO_TCP, PROTO_UDP, PROTO_ICMP] {
+            let mut p = vec![0u8; 20];
+            p[0] = 0x45;
+            p[9] = proto;
+            p[12..16].copy_from_slice(&[10, 0, 1, 7]);
+            p[16..20].copy_from_slice(&[10, 0, 2, 8]);
+            p.extend_from_slice(&[0x11, 0x11, 0x22, 0x22, 0, 0, 0, 1]);
+            let total = p.len() as u16;
+            p[2..4].copy_from_slice(&total.to_be_bytes());
+            let hdr = parse_embedded_v4(&p, 0).expect("parse");
+            assert_eq!(
+                hdr.discriminator,
+                TunnelDiscriminator::None,
+                "#9031: protocol {proto} must keep None — adding this field must \
+                 leave every non-GRE protocol's identity unchanged"
+            );
+        }
+    }
+
+    /// IPv6 (the PTB direction) parses the quoted discriminator too. A fix
+    /// wired only into the v4 parser leaves every IPv6 PTB for a GRE tunnel
+    /// still missing.
+    #[test]
+    fn the_ipv6_quote_parser_reads_the_discriminator_too_9031() {
+        let keyed = parse_embedded_v6(&quoted_v6_gre(KEY_FLAG, &99u32.to_be_bytes()), 0)
+            .expect("parse v6");
+        assert_eq!(keyed.proto, PROTO_GRE);
+        assert_eq!(
+            keyed.discriminator,
+            TunnelDiscriminator::Keyed(99),
+            "#9031: the IPv6 embedded parser must read the quoted Key as well — \
+             IPv6 PTB is the MTU-reduction signal for a v6 GRE tunnel, which is \
+             the case this defect suppresses most visibly"
+        );
+        let unkeyed = parse_embedded_v6(&quoted_v6_gre(0, &[]), 0).expect("parse v6");
+        assert_eq!(unkeyed.discriminator, TunnelDiscriminator::Unkeyed);
+    }
+
+    /// The REVERSE companion carries the SAME discriminator: tunnel identity is
+    /// a property of the tunnel, not of the direction. Ports swap; this does not.
+    #[test]
+    fn the_reply_key_carries_the_same_discriminator_9031() {
+        let hdr = parse_embedded_v4(&quoted_v4_gre(KEY_FLAG, &42u32.to_be_bytes()), 0)
+            .expect("parse");
+        let reply = embedded_reply_key(
+            libc::AF_INET as u8, hdr.proto,
+            IpAddr::V4(hdr.src), IpAddr::V4(hdr.dst), hdr.src_port, hdr.dst_port,
+            hdr.discriminator,
+        );
+        assert_eq!(
+            reply.discriminator,
+            TunnelDiscriminator::Keyed(42),
+            "#9031: the reverse companion of a GRE session carries the same \
+             discriminator as its forward key; a reply key built with None \
+             matches no stored companion"
+        );
+    }
+}
+
+/// #9031 STRUCTURAL: no same-family embedded lookup key may be built with
+/// `discriminator: Default::default()`.
+///
+/// WHY STRUCTURAL, stated rather than implied. The behavioural cells above and
+/// in `tests_embedded_poll_filter` bind the PARSER and the REPLY key. They do
+/// NOT bind the four FORWARD-key constructors, and the reason is a property of
+/// the session table rather than a gap in the fixtures: `install_with_protocol`
+/// publishes a REVERSE COMPANION, and `embedded_reply_key` — which is wired —
+/// matches that companion. So every fixture that resolves at all resolves
+/// through the reply key, and reverting a forward constructor to
+/// `Default::default()` leaves every behavioural cell GREEN. I verified that by
+/// mutation before writing this guard, rather than assuming it.
+///
+/// The forward key is still not redundant: an AS-IS hit and a REPLY-KEY hit
+/// produce different direction bookkeeping (#6474 `outbound_snat`), so a
+/// forward key built with `None` silently shifts which branch classifies the
+/// error. That is a real behaviour change with no match/no-match signal, which
+/// is exactly the kind of thing a structural guard is for.
+///
+/// #9031's acceptance asks that "reverting any one constructor to
+/// `Default::default()` must red". This is what makes that true.
+#[cfg(test)]
+mod embedded_discriminator_wiring_9031_tests {
+    /// The same-family embedded modules. `nat64_match.rs` is deliberately
+    /// EXCLUDED: NAT64 translates the protocol across address families, so a
+    /// quoted GRE header on one side names no tunnel identity the other side's
+    /// session carries, and `TunnelDiscriminator::None` is correct there. It is
+    /// excluded by name with that reason rather than by the pattern happening
+    /// not to match, so a future edit cannot quietly enrol it.
+    const SAME_FAMILY_SOURCES: [(&str, &str); 4] = [
+        ("nat_match_v4.rs", include_str!("nat_match_v4.rs")),
+        ("nat_match_v6.rs", include_str!("nat_match_v6.rs")),
+        ("session_match.rs", include_str!("session_match.rs")),
+        ("parse.rs", include_str!("parse.rs")),
+    ];
+
+    #[test]
+    fn no_same_family_embedded_key_defaults_its_discriminator_9031() {
+        let mut offenders = Vec::new();
+        let mut wired = 0usize;
+        for (name, src) in SAME_FAMILY_SOURCES {
+            for (i, line) in src.lines().enumerate() {
+                let t = line.trim();
+                if t.starts_with("discriminator: Default::default()") {
+                    offenders.push(format!("{name}:{}", i + 1));
+                }
+                if t.starts_with("discriminator: hdr.discriminator")
+                    || t == "discriminator,"
+                {
+                    wired += 1;
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "#9031: {offenders:?} build an embedded lookup key with \
+             `discriminator: Default::default()` — i.e. `None`. SessionKey's \
+             Hash/Eq include the discriminator (#7188), and a live accelerated \
+             GRE session carries Unkeyed/Keyed(k)/Pptp(handle), so such a key can \
+             never match one: the ICMP error finds no NAT state, the outer \
+             destination and quoted source cannot be restored, and PMTUD and \
+             unreachable signalling are deterministically suppressed for the \
+             tunnel. Pass the QUOTED discriminator (hdr.discriminator)."
+        );
+        // NON-VACUITY: an empty scan passes the assertion above for free. This
+        // is the count that would have caught a guard reading the wrong files.
+        assert!(
+            wired >= 5,
+            "#9031: only {wired} wired discriminator sites found across the \
+             same-family embedded sources; expected at least 5 (four forward \
+             keys plus embedded_reply_key's field init). A guard that scans \
+             nothing reports no offenders."
         );
     }
 }
