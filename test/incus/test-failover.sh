@@ -181,6 +181,61 @@ wait_for_instance() {
 	return 1
 }
 
+# #9087: the #8297 proxy-ARP ownership check, EXTRACTED so it can run after
+# every ownership change instead of only in the preflight.
+#
+# It used to run exactly once, before any failover happened. The run then
+# crash-failed fw0 -> fw1, rejoined, and manually failed back fw1 -> fw0, and
+# never re-read the entries. So a demotion that LEAKS the entry was invisible
+# to a clean run BY CONSTRUCTION — the only observation point preceded every
+# transition — and surfaced only as the NEXT run's preflight failing against
+# the same binaries. A cell that can only observe the state that precedes every
+# transition cannot see a transition defect.
+#
+# $1 is the phase label, so a failure names WHICH transition leaked rather than
+# leaving the reader to guess which of three observation points fired.
+check_proxy_arp_ownership() {
+	local phase="$1"
+	fw0_proxy=$(incus exec "$FW0" -- ip neigh show proxy 2>/dev/null | grep -c "$POOL_NAT_ADDR" || true)
+	fw1_proxy=$(incus exec "$FW1" -- ip neigh show proxy 2>/dev/null | grep -c "$POOL_NAT_ADDR" || true)
+	if [[ "$fw0_proxy" -ge 1 && "$fw1_proxy" -ge 1 ]]; then
+		# The #8297 defect. Was a tracked known_gap until #8646 closed it; now a
+		# plain failure, because a regression here is a regression and not a gap.
+		fail "both nodes answer proxy-ARP for $POOL_NAT_ADDR after ${phase} (fw0=$fw0_proxy fw1=$fw1_proxy); the upstream sees one IP at two RETH virtual MACs, which is the #8297 defect returning"
+	elif [[ "$fw0_proxy" -ge 1 && "$fw1_proxy" -eq 0 ]]; then
+		# PROMOTED from known_gap by #8646, which moved proxy-ARP ownership off
+		# VRRP events and onto the cluster. Measured before promoting: ten probes
+		# 6s apart on a settled cluster, fw0=1 fw1=0 on all ten. One sample was
+		# not enough — it cannot distinguish "the gate selected the owner" from
+		# "both answered and the owner's reply landed last", which is the error
+		# #8640 made on this same address.
+		pass "only the RG owner answers proxy-ARP for $POOL_NAT_ADDR (${phase})"
+	else
+		# THIS BRANCH IS NOT LEFTOVER SCAFFOLDING, and it is the reason this
+		# cell has three states rather than two. Do not collapse it.
+		#
+		# Reading the two branches above as "known_gap became pass/fail" invites
+		# simplifying the whole block to `if fw1 == 0: pass` — which would delete
+		# this arm, and this arm is the only thing that distinguishes "the owner
+		# answers and the standby does not" from "NOBODY answers". Those look
+		# identical to any assertion phrased about the standby alone.
+		#
+		# It is a state that actually happened: #8314 gated proxy-ARP on RG
+		# ownership, was merged, and was REVERTED by #8342 because
+		# `ip neigh show proxy` came back EMPTY ON BOTH NODES — the failure moved
+		# from two answerers to zero, which breaks pool-mode NAT outright rather
+		# than merely duplicating an answer. The cause was borrowing
+		# `isRethMasterState`, whose own doc says it returns false when no
+		# instances exist for the RG: safe for the DHCP relay it came from, an
+		# outage here.
+		#
+		# So the assertion above is deliberately two-sided — the owner MUST
+		# answer (fw0 >= 1), not merely "the standby must not" — and this arm
+		# catches the half that a one-sided phrasing would pass.
+		fail "the RG OWNER does not answer proxy-ARP for $POOL_NAT_ADDR after ${phase} (fw0=$fw0_proxy fw1=$fw1_proxy). Gating the owner is the OPPOSITE failure and breaks pool-mode NAT outright — this is the #8314 over-correction, not the #8297 defect"
+	fi
+}
+
 # ── Preflight ────────────────────────────────────────────────────────
 
 info "Preflight checks"
@@ -478,44 +533,7 @@ else
 	# Read from the kernel (`ip neigh show proxy`), not from config: the config
 	# said the same thing on both nodes throughout, and it was the installed
 	# NTF_PROXY entry that differed from what ownership required.
-	fw0_proxy=$(incus exec "$FW0" -- ip neigh show proxy 2>/dev/null | grep -c "$POOL_NAT_ADDR" || true)
-	fw1_proxy=$(incus exec "$FW1" -- ip neigh show proxy 2>/dev/null | grep -c "$POOL_NAT_ADDR" || true)
-	if [[ "$fw0_proxy" -ge 1 && "$fw1_proxy" -ge 1 ]]; then
-		# The #8297 defect. Was a tracked known_gap until #8646 closed it; now a
-		# plain failure, because a regression here is a regression and not a gap.
-		fail "both nodes answer proxy-ARP for $POOL_NAT_ADDR (fw0=$fw0_proxy fw1=$fw1_proxy); the upstream sees one IP at two RETH virtual MACs, which is the #8297 defect returning"
-	elif [[ "$fw0_proxy" -ge 1 && "$fw1_proxy" -eq 0 ]]; then
-		# PROMOTED from known_gap by #8646, which moved proxy-ARP ownership off
-		# VRRP events and onto the cluster. Measured before promoting: ten probes
-		# 6s apart on a settled cluster, fw0=1 fw1=0 on all ten. One sample was
-		# not enough — it cannot distinguish "the gate selected the owner" from
-		# "both answered and the owner's reply landed last", which is the error
-		# #8640 made on this same address.
-		pass "only the RG owner answers proxy-ARP for $POOL_NAT_ADDR"
-	else
-		# THIS BRANCH IS NOT LEFTOVER SCAFFOLDING, and it is the reason this
-		# cell has three states rather than two. Do not collapse it.
-		#
-		# Reading the two branches above as "known_gap became pass/fail" invites
-		# simplifying the whole block to `if fw1 == 0: pass` — which would delete
-		# this arm, and this arm is the only thing that distinguishes "the owner
-		# answers and the standby does not" from "NOBODY answers". Those look
-		# identical to any assertion phrased about the standby alone.
-		#
-		# It is a state that actually happened: #8314 gated proxy-ARP on RG
-		# ownership, was merged, and was REVERTED by #8342 because
-		# `ip neigh show proxy` came back EMPTY ON BOTH NODES — the failure moved
-		# from two answerers to zero, which breaks pool-mode NAT outright rather
-		# than merely duplicating an answer. The cause was borrowing
-		# `isRethMasterState`, whose own doc says it returns false when no
-		# instances exist for the RG: safe for the DHCP relay it came from, an
-		# outage here.
-		#
-		# So the assertion above is deliberately two-sided — the owner MUST
-		# answer (fw0 >= 1), not merely "the standby must not" — and this arm
-		# catches the half that a one-sided phrasing would pass.
-		fail "the RG OWNER does not answer proxy-ARP for $POOL_NAT_ADDR (fw0=$fw0_proxy fw1=$fw1_proxy). Gating the owner is the OPPOSITE failure and breaks pool-mode NAT outright — this is the #8314 over-correction, not the #8297 defect"
-	fi
+	check_proxy_arp_ownership "preflight, before any failover"
 
 	pool_fw1=$(pool_session_count "$FW1")
 	if [[ "$pool_fw1" == VOID ]]; then
@@ -671,6 +689,12 @@ else
 		fail "iperf3 DIED during manual failover"
 	fi
 fi
+
+# #9087: re-read ownership AFTER the full crash-failover + manual-failback
+# cycle. This is the state the NEXT run's preflight observes, and it is the one
+# that was leaking: fw1 installs the entry while primary during the crash
+# phase, steps back down at the failback, and used to keep it.
+check_proxy_arp_ownership "after the crash failover AND the manual failback"
 
 # ── #8280: the allocator still works AFTER a full role-change cycle ──
 #

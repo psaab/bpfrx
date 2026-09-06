@@ -238,9 +238,34 @@ func (d *Daemon) reconcileProxyARP(cfg *config.Config) {
 	ifaceMap := map[string]int{}
 	ifaceNames := map[int]string{}
 	var unresolved []string
+	// #9087: the interfaces this pass SUPPRESSED, kept so the sweep does not
+	// lose sight of them.
+	//
+	// proxyARPIfaceMapFiltered's own doc says a suppressed entry "must be
+	// actively torn down by the reconcile sweep rather than retained" — and the
+	// sweep can only reach an interface that is in `ifaceMap` or in
+	// `priorIfaceMap`. A suppressed entry is in neither after the FIRST
+	// suppressed pass, because that pass writes an `enabled` set with the
+	// interface gone, so `priorNames` is empty on every pass after it. The
+	// teardown therefore had exactly ONE chance to happen, on the pass that ran
+	// during demotion — which is precisely when programRethMAC's link DOWN/UP
+	// makes the netdev hardest to resolve.
+	//
+	// Measured on the loss cluster: fw1 in secondary-hold, logging
+	// "suppressing responder for an interface this node does not own" every 30s
+	// AND still holding the kernel NTF_PROXY entry for the pool address, with
+	// fw0 holding it too — the #8297 two-MAC state, indefinitely, not for a
+	// 30-second window.
+	var suppressed []string
 	if hasEntries {
 		ifaceMap, ifaceNames, unresolved = proxyARPIfaceMapFiltered(cfg, func(ref string) bool {
-			return d.proxyARPEntrySuppressed(cfg, ref)
+			if !d.proxyARPEntrySuppressed(cfg, ref) {
+				return false
+			}
+			if linux := cfg.ResolveKernelIfName(ref); linux != "" {
+				suppressed = append(suppressed, linux)
+			}
+			return true
 		})
 	}
 	// #7685: retain the debt this pass observed. Set on EVERY completing pass,
@@ -272,6 +297,17 @@ func (d *Daemon) reconcileProxyARP(cfg *config.Config) {
 	// and the interface is forgotten, so the #4955 orphan sweep loses it too.
 	d.proxyARPEnabledMu.Lock()
 	enabled = retainUnresolvedProxyResponders(enabled, d.proxyARPEnabled, unresolved)
+	// #9087: a SUPPRESSED interface stays in the remembered set for as long as
+	// the config names it, so every later pass still carries it in
+	// priorIfaceMap and the sweep keeps deleting any NTF_PROXY entry that
+	// reappears there. Without this the teardown is a ONE-SHOT it can miss.
+	//
+	// This is not the #6536 retention above and must not be folded into it:
+	// that one retains an UNRESOLVED interface so its responder is not
+	// disabled, i.e. it protects a live responder. This one retains a
+	// SUPPRESSED interface so its entry keeps being SWEPT — the opposite
+	// intent, on interfaces whose responder must stay off.
+	enabled = retainSuppressedProxySweepTargets(enabled, d.proxyARPEnabled, suppressed)
 	stale := diffProxyResponders(d.proxyARPEnabled, enabled)
 	d.proxyARPEnabled = enabled
 	d.proxyARPEnabledMu.Unlock()
@@ -326,6 +362,38 @@ func proxyARPResponderTargets(cfg *config.Config) map[string]string {
 // An unresolved interface with no prior state contributes nothing: there is no
 // responder to preserve and nothing was forgotten. enabled is returned
 // unmodified in that case, and is never aliased to prior.
+// retainSuppressedProxySweepTargets keeps a SUPPRESSED interface in the
+// remembered proxy-responder set so the next reconcile still sweeps it (#9087).
+//
+// The families are carried from the prior set when there is one; an interface
+// suppressed before it was ever installed contributes nothing and is skipped,
+// because there is no entry of ours to sweep.
+//
+// The entry it preserves is a SWEEP TARGET, not an enabled responder: the same
+// pass that records it also computed an empty desired set for it, so the
+// dataplane reconcile deletes rather than installs. The distinction matters
+// because the map is named for the enabled set — see the call site.
+func retainSuppressedProxySweepTargets(enabled, prior map[string]map[int]struct{}, suppressed []string) map[string]map[int]struct{} {
+	for _, iface := range suppressed {
+		priorFams := prior[iface]
+		if len(priorFams) == 0 {
+			continue
+		}
+		if _, ok := enabled[iface]; ok {
+			continue
+		}
+		if enabled == nil {
+			enabled = make(map[string]map[int]struct{}, 1)
+		}
+		retained := make(map[int]struct{}, len(priorFams))
+		for family := range priorFams {
+			retained[family] = struct{}{}
+		}
+		enabled[iface] = retained
+	}
+	return enabled
+}
+
 func retainUnresolvedProxyResponders(enabled, prior map[string]map[int]struct{}, unresolved []string) map[string]map[int]struct{} {
 	for _, iface := range unresolved {
 		priorFams := prior[iface]

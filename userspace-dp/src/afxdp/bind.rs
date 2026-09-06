@@ -1023,3 +1023,40 @@ mod umem_sizing_contract_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod bind_flags_9043_tests {
+    use super::*;
+
+    /// #9043: a generic-XDP interface binds COPY-ONLY, so `XDP_PASS` there
+    /// cannot consume a UMEM frame at all.
+    ///
+    /// This is the in-repo fact that settles one of the two mutually
+    /// inconsistent README claims: `userspace-dp/README.md` said "Generic-XDP
+    /// fallback consumes UMEM frames permanently on mlx5", and the umem README
+    /// says copy mode "operates on kernel DMA buffers, not UMEM frames". Both
+    /// cannot be right, and the bind decision is what makes the second one the
+    /// true one.
+    ///
+    /// Pinned as a cell because the correction is now DOCUMENTATION, and a
+    /// documented fact with nothing asserting it is how the wrong version got
+    /// written in the first place. If this bind ever stops being copy-only, the
+    /// corrected README sentence becomes false and this fails.
+    #[test]
+    fn generic_xdp_binds_copy_only_9043() {
+        assert_eq!(
+            COPY_ONLY_BIND_FLAGS,
+            [XSK_BIND_FLAGS_COPY],
+            "the copy-only bind must actually request copy mode; the README \
+             correction in #9043 rests on this"
+        );
+        // And AUTO must NOT be copy-only, or the distinction the branch draws
+        // is vacuous and the assertion above says nothing.
+        assert_ne!(
+            AUTO_BIND_FLAGS.first(),
+            Some(&XSK_BIND_FLAGS_COPY),
+            "AUTO and COPY_ONLY must differ, or the generic-XDP branch is not \
+             choosing anything"
+        );
+    }
+}

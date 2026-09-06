@@ -312,7 +312,19 @@ func ReconcileProxyARP(cfg *config.Config, ifaceMap, priorIfaceMap map[string]in
 	for _, entry := range cfgEntries {
 		ifindex, ok := ifaceMap[entry.Interface]
 		if !ok {
-			slog.Warn("proxy-arp: interface not found", "iface", entry.Interface)
+			// #9087: this fires for TWO different reasons and used to name only
+			// one of them. "Not found" is true when the netdev did not resolve;
+			// it is FALSE and misleading when the caller deliberately dropped
+			// the interface because this node must not answer for it (#8297
+			// ownership suppression) — the interface was found, and the entry
+			// is expected to be swept, not installed. A reader chasing a
+			// "not found" warning on a healthy standby is chasing the wrong
+			// thing, and the sweep that should follow is in priorIfaceMap's
+			// hands, not this loop's.
+			slog.Debug("proxy-arp: no ifindex for a configured entry on this pass; "+
+				"either the netdev did not resolve or this node is not the owner "+
+				"and the entry is a sweep target rather than an install",
+				"iface", entry.Interface, "issue", "#9087")
 			continue
 		}
 		managedIfindexes = append(managedIfindexes, ifindex)

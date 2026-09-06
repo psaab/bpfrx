@@ -57,10 +57,29 @@ drop-in for xdpilone), and tracks frame budgets per binding.
   unit tests can exercise worker-owned drain paths without creating
   kernel AF_XDP sockets; production UMEM construction remains
   `WorkerUmem::new`.
-- In **zero-copy mode on mlx5**, an `XDP_PASS` action permanently
-  consumes a fill-ring frame: the kernel holds the UMEM buffer in
-  an SKB and never returns it. Sustained traffic drains all 12K+ RX
-  frames within seconds. The mitigation (#209): the XDP shim
+- **UNVERIFIED PREMISE (#9043), stated as fact until now.** In
+  **zero-copy mode on mlx5**, an `XDP_PASS` action was claimed to
+  permanently consume a fill-ring frame — the kernel holding the UMEM
+  buffer in an SKB and never returning it — draining all 12K+ RX frames
+  within seconds under sustained traffic.
+
+  **Nothing in this tree corroborates that, and two independent readings
+  contradict it.** `mlx5e_xsk_skb_from_cqe_linear` copies into a fresh
+  SKB and reuses the UMEM frame on `XDP_PASS`; a verifier checking a
+  neighbouring claim reached the same conclusion by a different route
+  ("the driver builds an skb by copying out of the UMEM and then
+  recycles the frame; there is no descriptor leak").
+
+  It is left in place, marked, rather than deleted, because it cannot be
+  settled from inside the repo — the decisive check is one flood test on
+  a zero-copy mlx5 bind, or one read of the running kernel's
+  `mlx5e_xsk_*` path. **Do not build a new argument on this sentence
+  until that is done.** A claim that is steering a design decision and
+  has never been measured is the reason #9043 exists; the harm is not the
+  mitigation below, which is cheap and shipped, but the next decision
+  someone makes on the strength of an unverified premise.
+
+  The mitigation (#209), which stands either way: the XDP shim
   replaces every `XDP_PASS` path with a cpumap redirect
   (`USERSPACE_CPUMAP`), which frees the XSK frame immediately while
   still delivering the packet to the kernel stack. Bind flags try
