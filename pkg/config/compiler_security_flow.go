@@ -569,7 +569,18 @@ func compileFlow(node *Node, sec *SecurityConfig) error {
 	tcpNode := node.FindChild("tcp-session")
 	if tcpNode != nil {
 		sec.Flow.TCPSession = &TCPSessionConfig{}
-		for _, opt := range tcpNode.Children {
+		// #8939: a flat `set` command naming several tcp-session leaves is ONE
+		// command, and SetPath nests them rather than making them siblings, so
+		// this loop saw the first and nothing else. Measured: `closing-timeout
+		// 10 established-timeout 20 initial-timeout 30` compiled to
+		// closing=10 established=0 initial=0.
+		//
+		// `initial-timeout` is the sharp one (#8971): a dropped value turns the
+		// half-open window from its configured bound back to the default, and a
+		// large configured value exists precisely to pin sessions the operator
+		// wants held -- so losing it is a resource-exhaustion surface rather
+		// than a cosmetic loss.
+		for _, opt := range expandFlatRun(tcpNode.Children, flowTCPSessionSchema8939()) {
 			// Handle leaf flags (no value)
 			switch opt.Name() {
 			case "no-syn-check":
@@ -791,4 +802,12 @@ func compileFlow(node *Node, sec *SecurityConfig) error {
 	}
 
 	return nil
+}
+
+// flowTCPSessionSchema8939 resolves the `security flow tcp-session` leaf set so
+// expandFlatRun can tell one of its leaves from a value token.
+func flowTCPSessionSchema8939() *schemaNode {
+	sec := resolveSchemaChild(setSchema, "security")
+	flow := resolveSchemaChild(sec, "flow")
+	return resolveSchemaChild(flow, "tcp-session")
 }

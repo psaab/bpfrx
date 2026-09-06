@@ -1,4 +1,4 @@
-# counts: losers=55 walked=40 vacuous=51 unmeasured=75
+# counts: losers=53 walked=42 vacuous=51 unmeasured=75
 class-of-service traffic-control-profiles arg1  [delay-buffer-rate | guaranteed-rate | scheduler-map]  total
 firewall policer arg1 if-exceeding  [bandwidth-limit | burst-size-limit]  total
 forwarding-options dhcp-relay group arg1 overrides  [always-broadcast | forward-only | maximum-hop-count]  total
@@ -29,8 +29,6 @@ schedulers scheduler arg1  [start-date | start-time | stop-date]  total
 schedulers scheduler arg1  [start-date | start-time]  total
 security flow  [allow-dns-reply | allow-embedded-icmp | force-ip-reassembly]  total
 security flow  [allow-dns-reply | allow-embedded-icmp]  total
-security flow tcp-session  [closing-timeout | established-timeout | initial-timeout]  total
-security flow tcp-session  [closing-timeout | established-timeout]  total
 security ike gateway arg1 dead-peer-detection  [always-send | interval | optimized]  total
 security ike policy arg1  [mode | pre-shared-key | proposal-set]  total
 security ike proposal arg1  [authentication-algorithm | authentication-method | description]  total
