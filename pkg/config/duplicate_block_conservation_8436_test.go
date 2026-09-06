@@ -42,6 +42,17 @@ type dupSite8436 struct {
 	valA      string
 	leafB     string // second distinct leaf child
 	valB      string
+	// unprobeable is non-empty when the container is ELIGIBLE (a named
+	// container with children) but no two-block fixture can be built for it.
+	//
+	// Issue 9024: these used to be dropped by the collector, before the
+	// census ever saw them -- so they landed in NEITHER the population nor
+	// the named skip list, and the skip ratchet could not guard them because
+	// the ratchet guards the population and the population was filtered first.
+	// Measured at the time: 85 of 139 eligible containers, 61%, invisible.
+	// Among them `forwarding-options sampling instance`, `security policies
+	// from-zone` and both `security nat ... rule-set` containers.
+	unprobeable string
 }
 
 // collectDupSites8436 finds every NAMED container (args >= 1, has children)
@@ -66,16 +77,33 @@ func collectDupSites8436() []dupSite8436 {
 				continue
 			}
 			if ch.args >= 1 && ch.children != nil && len(path) >= 1 {
-				if la, va, lb, vb, ok := twoLeaves8436(ch); ok {
-					key := strings.Join(path, "/") + "|" + name
-					if !seen[key] {
-						seen[key] = true
-						out = append(out, dupSite8436{
-							container: append([]string(nil), path...),
-							keyword:   name, node: ch,
-							leafA: la, valA: va, leafB: lb, valB: vb,
-						})
+				key := strings.Join(path, "/") + "|" + name
+				if !seen[key] {
+					seen[key] = true
+					la, va, lb, vb, ok := twoLeaves8436(ch)
+					site := dupSite8436{
+						container: append([]string(nil), path...),
+						keyword:   name, node: ch,
+						leafA: la, valA: va, leafB: lb, valB: vb,
 					}
+					if !ok {
+						// Issue 9024: record WHY rather than dropping it. The
+						// two reasons are different facts: a container whose
+						// children are all containers has no scalar pair to
+						// write twice, while one with too few synthesizable
+						// leaves might gain one when the schema grows.
+						site.unprobeable = "no two synthesizable single-value leaf children"
+						allContainers := len(ch.children) > 0
+						for _, g := range ch.children {
+							if g == nil || g.children == nil {
+								allContainers = false
+							}
+						}
+						if allContainers {
+							site.unprobeable = "container-only children (no scalar leaf to duplicate)"
+						}
+					}
+					out = append(out, site)
 				}
 			}
 			elem := name
@@ -150,6 +178,14 @@ func runDupConservationCensus8436(t *testing.T) dupCensusResult8436 {
 			res.skipped[reason]++
 			res.skippedSites = append(res.skippedSites, siteKey)
 		}
+		// Issue 9024: an eligible container the collector could not build a
+		// fixture for is a RECORDED skip, not an absence. Before this it left
+		// the census upstream of every bucket, so "SILENT: 0" was a statement
+		// about 9 containers while 139 were eligible.
+		if s.unprobeable != "" {
+			note(s.unprobeable)
+			continue
+		}
 		named := s.keyword + " xpfname"
 		ctx := contextFor(s.container)
 		dup := nest(s.container, ctx+
@@ -218,6 +254,11 @@ func TestDuplicateBlockConservationCensus8436(t *testing.T) {
 		t.Logf("    NOT CONSERVED [%-18s] %s", res.verdict[d], d)
 	}
 	t.Logf("  of those, SILENT (no commit gate at all):    %d", silent)
+	// Issue 9024: print the DENOMINATOR beside the verdict. "SILENT: 0" over a
+	// population of 9 reads identically to "SILENT: 0" over a population of
+	// 139, and the difference is the whole finding.
+	t.Logf("  ...over a CHECKED population of %d; %d eligible containers are UNPROBED and named in dupConservationSkipped8436",
+		len(res.verdict), len(res.skippedSites))
 	if res.checked < 20 {
 		t.Fatalf("only %d containers checked — the walk is not reaching the schema, "+
 			"and a census that inspects nothing reports a clean sheet", res.checked)
