@@ -2,6 +2,7 @@
 package ipsec
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
@@ -28,9 +29,58 @@ import (
 // (pkg/frr/manager.go reloadTimeout). #1794/#1800.
 const swanctlTimeout = 15 * time.Second
 
+// runSwanctlSplit runs `swanctl <args...>` under swanctlTimeout and returns
+// stdout and stderr SEPARATELY (#9068).
+//
+// It exists because one parser was fed by two different exec channels.
+// `GetSAStatus` (ike.go) has always used a stdout-only buffer, with the comment
+// "the parser needs stdout alone"; `liveConnNames` routed through
+// CombinedOutput on the security-critical TEARDOWN path, and its in-place
+// justification — "parseSAOutput ignores any unrecognized stderr lines
+// CombinedOutput may fold in" — was asserted, never tested.
+//
+// The assertion is true for WHOLE stderr lines and false in the one direction
+// that matters. An executed tolerance matrix on parseSAOutput: a whole stderr
+// line before the IKE header preserves the name; a stderr line containing `": #"`
+// yields a spurious extra name (harmless — it is not in removedSet); CRLF is
+// tolerated; and a MID-LINE SPLICE into the IKE header LOSES the real name
+// (`vpn-corp` becomes `vpn-cowarning`).
+//
+// A lost name is a fail-open, not a cosmetic error: terminateRemovedConns
+// iterates `for name := range live`, so a removed connection ABSENT from `live`
+// is neither terminated nor entered into pendingTerminate — and prevConnNames
+// has already advanced past it, so the debt record that #6542 exists to keep is
+// never created. A deleted VPN's SA keeps forwarding under an unloaded
+// configuration with no retry.
+//
+// Whether swanctl can actually splice mid-line on a successful listing is NOT
+// established (stdout to a pipe is block-buffered, stderr unbuffered, so it
+// needs a large SA listing plus a concurrent stderr write). This removes the
+// question rather than answering it: giving the parser the same stdout-only
+// channel its sibling already uses costs less than the experiment and does not
+// depend on its outcome.
+func runSwanctlSplit(args ...string) (stdout, stderr []byte, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), swanctlTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "swanctl", args...)
+	// Buffer-backed Stdout/Stderr are pipe-fed by the runtime, so the
+	// post-SIGKILL drain window applies here too.
+	cmd.WaitDelay = 5 * time.Second
+	var out, errb bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &errb
+	err = cmd.Run()
+	return out.Bytes(), errb.Bytes(), err
+}
+
 // runSwanctl runs `swanctl <args...>` under swanctlTimeout and returns
 // CombinedOutput, preserving the historical error-message shape at the
 // call sites.
+//
+// #9068: this stays the channel for the NON-PARSED calls (`--load-all`,
+// `--terminate --ike`), whose only consumer is an error message — folding
+// stderr in is what makes those diagnostics useful. Only the call whose output
+// is PARSED moved to runSwanctlSplit.
 func runSwanctl(args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), swanctlTimeout)
 	defer cancel()
@@ -87,6 +137,29 @@ type Manager struct {
 	// swanctl invocations (e.g. the removed-connection terminate in #3941)
 	// set this to a recording double.
 	swanctl func(args ...string) ([]byte, error)
+
+	// swanctlSplit is the stdout/stderr-separated exec seam (#9068), used by
+	// the one call whose output is PARSED. Nil in production and in every
+	// pre-#9068 test; scSplit then falls back to `swanctl` (treating its
+	// output as stdout) or to runSwanctlSplit.
+	swanctlSplit func(args ...string) (stdout, stderr []byte, err error)
+}
+
+// scSplit is the STDOUT-ONLY exec used by the parsed call (#9068).
+//
+// It falls back to the combined `swanctl` seam when only that one is set, and
+// treats the double's output as STDOUT — which is what a double returns: canned
+// listing text with no stderr to fold. That keeps every existing test double
+// working unchanged while production stops mixing the two streams.
+func (m *Manager) scSplit(args ...string) (stdout, stderr []byte, err error) {
+	if m.swanctlSplit != nil {
+		return m.swanctlSplit(args...)
+	}
+	if m.swanctl != nil {
+		out, err := m.swanctl(args...)
+		return out, nil, err
+	}
+	return runSwanctlSplit(args...)
 }
 
 // sc returns the swanctl exec function, defaulting to the package-level
@@ -403,9 +476,15 @@ func (m *Manager) terminateIKE(name string) bool {
 // (unlike GetSAStatus, which uses stdout only); parseSAOutput ignores any
 // unrecognized stderr lines CombinedOutput may fold in.
 func (m *Manager) liveConnNames() (map[string]bool, error) {
-	out, err := m.sc("--list-sas")
+	// #9068: STDOUT ONLY. parseSAOutput must never see stderr — a mid-line
+	// splice into an IKE header silently renames the connection, and a name
+	// this function fails to report is one terminateRemovedConns cannot tear
+	// down and cannot record as debt.
+	out, errOut, err := m.scSplit("--list-sas")
 	if err != nil {
-		return nil, fmt.Errorf("swanctl --list-sas: %w: %s", err, termsafe.SanitizeForDisplay(string(out)))
+		// stderr alone in the diagnostic, matching GetSAStatus: it is where the
+		// failure is described, and stdout on a failed listing is noise.
+		return nil, fmt.Errorf("swanctl --list-sas: %w: %s", err, termsafe.SanitizeForDisplay(string(errOut)))
 	}
 	names := make(map[string]bool)
 	for _, sa := range parseSAOutput(string(out)) {
