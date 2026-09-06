@@ -1,5 +1,7 @@
 package config
 
+import "strings"
+
 // #8752: fold a repeated named-instance statement into the FIRST occurrence, on
 // the TOLERANT compile path.
 //
@@ -105,10 +107,69 @@ func mergeInstancesUnder(parent *Node, keyword string) []string {
 		}
 		prev.Children = append(prev.Children, child.Children...)
 		prev.IsLeaf = false
+		// Issue 9209: FOLD THE UNNAMED CONTAINERS TOO. Appending the second
+		// block's children leaves the merged node carrying two `if-exceeding`
+		// blocks, and the compiler reads the first -- so
+		//
+		//	policer p1 { if-exceeding { bandwidth-limit 1000000; } }
+		//	policer p1 { if-exceeding { burst-size-limit 15000; } }
+		//
+		// folded to bw=125000 burst=0, recovering the bandwidth-limit that was
+		// lost before and losing the burst-size-limit instead. Within ONE named
+		// block two identical container heads are the same stanza, so they are
+		// merged as well. Scoped to the folded node: this runs only where a
+		// duplicate was actually collapsed, never across a config that had no
+		// repeats.
+		mergeSiblingContainers9209(prev, 0)
 		names = append(names, keyword+" "+name)
 	}
 	if len(names) > 0 {
 		parent.Children = kept
 	}
 	return names
+}
+
+
+// mergeSiblingContainers9209 folds sibling CONTAINERS that share identical Keys
+// into the first of them, recursively.
+//
+// Issue 9209. It runs only on a node that mergeInstancesUnder has just folded a
+// duplicate into, so it cannot change a config that contained no repeated block.
+//
+// LEAVES ARE LEFT ALONE, deliberately. Two leaves with the same key are a
+// value-level question -- replace, accumulate, or reject -- already answered
+// per leaf by `multi` and by the compilers, and re-answering it here would
+// override those decisions from a layer that cannot see them. Only containers,
+// where "the same stanza written twice" has one Junos meaning, are merged.
+func mergeSiblingContainers9209(n *Node, depth int) {
+	if n == nil || depth > 8 || len(n.Children) < 2 {
+		return
+	}
+	first := map[string]*Node{}
+	var kept []*Node
+	changed := false
+	for _, ch := range n.Children {
+		if ch == nil {
+			continue
+		}
+		if ch.IsLeaf || ch.Children == nil {
+			kept = append(kept, ch)
+			continue
+		}
+		key := strings.Join(ch.Keys, "\x00")
+		prev, seen := first[key]
+		if !seen {
+			first[key] = ch
+			kept = append(kept, ch)
+			continue
+		}
+		prev.Children = append(prev.Children, ch.Children...)
+		changed = true
+	}
+	if changed {
+		n.Children = kept
+	}
+	for _, ch := range n.Children {
+		mergeSiblingContainers9209(ch, depth+1)
+	}
 }

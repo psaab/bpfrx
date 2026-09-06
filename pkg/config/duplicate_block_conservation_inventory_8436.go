@@ -56,49 +56,34 @@ var dupConservationInventory8436 = []string{
 	"firewall family any filter xpfname term",
 	"firewall family inet filter xpfname term",
 	"firewall family inet6 filter xpfname term",
-	"firewall policer",
-	"protocols ospf area",
-	"security ipsec policy",
 	"security screen ids-option",
-	"system services dhcp-local-server group",
 	"system services dhcpv6-local-server group",
 	// ---- SILENT: no commit gate at all. ----
 	//
-	// NOT EMPTY. Four containers lose configuration silently, and the reason
-	// this section said "EMPTY" for so long is the point of #9024: the census
-	// could not REACH them.
+	// EMPTY — and this time the sentence is load-bearing rather than an
+	// artefact of what the census could reach.
 	//
-	//	firewall policer
-	//	protocols ospf area
-	//	security ipsec policy
+	// It said EMPTY for a long time because the census could not REACH the
+	// containers that were losing configuration. #9024 taught the fixture
+	// builder to descend through container-only children, the population went
+	// 30 -> 44, and four SILENT sites appeared at once:
+	//
+	//	firewall policer                        bandwidth-limit LOST
+	//	protocols ospf area                     area DUPLICATED, not merged
+	//	security ipsec policy                   rejected with a MISDIRECTING
+	//	                                        message about missing proposals
 	//	system services dhcp-local-server group
 	//
-	// #9024 widened the fixture builder to descend through container-only
-	// children (nestedStatement8436). Before that, a container whose children
-	// are all containers had no two-leaf fixture, left the population BEFORE
-	// any verdict was formed, and was reported as neither conserving nor
-	// divergent. The census CHECKED 30 containers and called the silent set
-	// empty; it now checks 44 and finds 18 divergent, 4 of them silent.
+	// Issue 9209 fixed all four by extending mergeDuplicateBlocks9023's site
+	// list, so the set is empty again for the reason the sentence claims. What
+	// the episode is worth remembering for:
 	//
-	// SO THESE ARE NOT NEW DEFECTS. They are defects that were never
-	// inspected, and the census's own clean board was the reason nobody
-	// looked. That is the shape worth remembering: an instrument that filters
-	// its population before measuring reports the health of what survived the
-	// filter, and reports it as the health of the whole.
+	//	AN INSTRUMENT THAT FILTERS ITS POPULATION BEFORE MEASURING REPORTS THE
+	//	HEALTH OF WHAT SURVIVED THE FILTER, AND REPORTS IT AS THE HEALTH OF THE
+	//	WHOLE.
 	//
-	// Two were verified BY HAND, away from the census, because a widened
-	// instrument reporting new findings is a claim about the instrument first:
-	//
-	//	firewall policer      two blocks -> bw=0      burst=15000
-	//	                      merged     -> bw=125000 burst=15000
-	//	protocols ospf area   two blocks -> TWO areas, same ID, 1 iface each
-	//	                      merged     -> ONE area, 2 interfaces
-	//
-	// THE CENSUS CAN NOW FAIL, proven against PRODUCTION code rather than by
-	// deleting the census (which is a no-op by design and proves nothing):
-	// disabling mergeDuplicateBlocks9023's fold flips `forwarding-options
-	// sampling instance` to non-conserving. Before #9024 that mutation
-	// produced no change at all, because the site was not in the population.
+	// The reader who needs this is the one about to conclude that this class
+	// is handled. Ask what the census cannot reach before believing a zero.
 	//
 	// The hedge was true when written and did all the work of the sentence,
 	// which is how a reader arrives at "this class is handled". An empty
