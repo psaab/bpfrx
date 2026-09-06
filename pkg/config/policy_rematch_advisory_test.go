@@ -11,12 +11,20 @@ import (
 // policy's sessions dropped at commit, independent of the knob), then the
 // modified-policy re-evaluation gated on `policy-rematch` (a surviving policy
 // whose match/action changed has its live sessions cleared,
-// clearSessionsForModifiedPolicies). With the core enforced, the BARE knob no
-// longer warns; only `extensive` — Junos re-evaluates sessions of UNCHANGED
-// policies when a referenced object changes, which xpf does not do — keeps an
-// advisory. These tests pin that contract. RED on revert: the bare-knob case
-// flips back to expecting an advisory, and the extensive advisory loses its
-// wording.
+// clearSessionsForModifiedPolicies). With the core enforced, the BARE knob
+// stopped warning.
+//
+// #8993 then shipped `extensive` as well: changedPolicyRuntimeIDs compares the
+// RESOLVED form of each policy, so tightening an address-set or redefining an
+// address or application re-evaluates the sessions of every policy that
+// references it, even with no policy text changed. So NEITHER knob warns now,
+// and this file pins that.
+//
+// THE EXTENSIVE CELL WAS INVERTED, NOT DELETED, and deliberately so. It used to
+// assert the advisory EXISTS; asserting it is ABSENT keeps the same contract
+// under measurement rather than dropping the case once it stopped failing. That
+// is the same move the bare-knob cell made when its own core landed, one step
+// below in this file.
 
 // findPolicyRematchExtensiveAdvisory returns the #4234 policy-rematch extensive
 // advisory, or "" if none was emitted.
@@ -50,8 +58,13 @@ func TestPolicyRematchAdvisory_BareEnforcedNoWarn(t *testing.T) {
 	}
 }
 
-// The extensive sub-mode compiles onto the flag AND still warns: only the
-// unchanged-policy-object re-eval remains unenforced.
+// The extensive sub-mode compiles onto BOTH flags and — since #8993 shipped the
+// referenced-object re-evaluation — emits NO advisory.
+//
+// The two flag assertions are the load-bearing half now. Without them this cell
+// would pass on a config where `extensive` was never recorded at all: "no
+// advisory" is also what an unparsed stanza produces, so the absence of a
+// warning proves nothing on its own.
 func TestPolicyRematchAdvisory_Extensive(t *testing.T) {
 	cfg := compileSetLines(t, []string{
 		"set security policies policy-rematch extensive",
@@ -62,12 +75,11 @@ func TestPolicyRematchAdvisory_Extensive(t *testing.T) {
 	if !cfg.Security.PolicyRematchExtensive {
 		t.Fatal("policy-rematch extensive did not set Security.PolicyRematchExtensive")
 	}
-	adv := findPolicyRematchExtensiveAdvisory(cfg)
-	if adv == "" {
-		t.Fatalf("policy-rematch extensive did not emit the #4234 advisory; warnings=%v", cfg.Warnings)
-	}
-	if !strings.Contains(adv, "extensive") {
-		t.Fatalf("extensive advisory does not name the extensive sub-mode: %q", adv)
+	if adv := findPolicyRematchExtensiveAdvisory(cfg); adv != "" {
+		t.Fatalf("#8993: `extensive` still warns %q, but the referenced-object "+
+			"re-evaluation it said was missing now ships (changedPolicyRuntimeIDs "+
+			"-> policyReferencedObjectChanged). An advisory naming a gap that is "+
+			"closed tells an operator a capability is absent when it exists.", adv)
 	}
 }
 

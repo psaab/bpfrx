@@ -669,20 +669,20 @@ func ValidateConfig(cfg *Config) []string {
 	// MATCH or ACTION later changed is dropped at commit so the tightened policy
 	// re-evaluates live traffic. What remains unenforced is `extensive`: Junos
 	// re-evaluates even sessions of an UNCHANGED policy when a referenced
-	// address-book / application object changes; xpf clears only the policies
-	// whose own match/action text changed. Warn on `extensive` so an operator is
-	// not misled; a plain `policy-rematch` needs no advisory now that its core is
-	// enforced. The `extensive` gap outlived #4234, which is CLOSED; it is
-	// tracked on #8993.
-	if cfg.Security.PolicyRematchExtensive {
-		warnings = append(warnings,
-			"security policies policy-rematch extensive configured but only "+
-				"partially enforced — xpf re-evaluates live sessions of a policy "+
-				"whose own match/action changed, but does NOT re-evaluate sessions "+
-				"of an UNCHANGED policy when a referenced address-book / application "+
-				"object changes (the `extensive` case); those sessions keep "+
-				"forwarding until idle timeout (#4234; tracked on #8993)")
-	}
+	// address-book / application object changes.
+	//
+	// #8993: `extensive` NOW SHIPS TOO, so its advisory is gone the same way
+	// the plain knob's went when its core landed. changedPolicyRuntimeIDs
+	// gained a third arm comparing the RESOLVED form of each policy
+	// (dpuserspace.PolicyResolvedFingerprints) rather than its match/action
+	// text, so tightening an address-set or redefining an address or
+	// application re-evaluates the sessions of every policy that references it,
+	// even though no policy's own text moved.
+	//
+	// NO ADVISORY IS EMITTED FOR EITHER KNOB NOW. Leaving the old one would
+	// tell an operator a capability is missing when it exists -- the failure
+	// this campaign catalogued on #8942 -- and would do it in operator-facing
+	// text rather than in a comment.
 
 	// #4231 (fable-167 P-3): five `security flow` knobs are now typed +
 	// committed (schema leaves + compileFlow) but the userspace AF_XDP
