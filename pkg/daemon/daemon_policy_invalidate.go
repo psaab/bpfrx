@@ -623,6 +623,20 @@ func changedPolicyRuntimeIDs(oldCfg, newCfg *config.Config, oldSched, newSched m
 	oldPolicies := dpuserspace.PoliciesByStableKey(oldCfg)
 	newPolicies := dpuserspace.PoliciesByStableKey(newCfg)
 
+	// #8993: `policy-rematch extensive` also re-evaluates sessions of an
+	// UNCHANGED policy when a referenced object's DEFINITION changes. Computed
+	// ONCE for the whole diff rather than per policy -- each call builds the
+	// address-book table and the full policy snapshot set, so doing it inside
+	// the loop would be quadratic in policy count on every commit.
+	//
+	// Both maps are nil unless `extensive` is configured, so the plain
+	// `policy-rematch` path does no extra work at all.
+	var oldResolved, newResolved map[string]string
+	if newCfg.Security.PolicyRematchExtensive {
+		oldResolved = dpuserspace.PolicyResolvedFingerprints(oldCfg)
+		newResolved = dpuserspace.PolicyResolvedFingerprints(newCfg)
+	}
+
 	var changed map[uint32]struct{}
 	for key, id := range oldIDs {
 		if id == 0 {
@@ -639,7 +653,8 @@ func changedPolicyRuntimeIDs(oldCfg, newCfg *config.Config, oldSched, newSched m
 			continue
 		}
 		if !policyMatchOrActionChanged(oldPol, newPol) &&
-			!policySchedulerBecameInactive(oldPol, newPol, oldSched, newSched) {
+			!policySchedulerBecameInactive(oldPol, newPol, oldSched, newSched) &&
+			!policyReferencedObjectChanged(newCfg, key, oldResolved, newResolved) {
 			continue
 		}
 		if changed == nil {
@@ -685,6 +700,34 @@ func policySchedulerBecameInactive(oldPol, newPol *config.Policy, oldSched, newS
 // transition is handled separately by policySchedulerBecameInactive (#4343),
 // which needs the runtime scheduler active-state and so cannot be decided from
 // the two Policy structs alone.
+// policyReferencedObjectChanged reports whether the RESOLVED form of a policy
+// changed while its own match/action text did not -- the `extensive` case
+// (#8993). It is the third arm of the modified-policy test and fires only when
+// `policy-rematch extensive` is configured, because only then are the
+// fingerprint maps built.
+//
+// FAIL-QUIET, DELIBERATELY. A nil map means the fingerprint could not be
+// computed (an address book that does not build, a config the commit path
+// rejects anyway). Reporting "changed" there would clear every session on a
+// config that is about to be refused; reporting "unchanged" falls back to the
+// name-level comparison, which is exactly today's behaviour. A missing KEY is
+// likewise not a change: a policy absent from one side is an add or a delete,
+// and both are handled by their own paths.
+func policyReferencedObjectChanged(newCfg *config.Config, key string, oldResolved, newResolved map[string]string) bool {
+	if newCfg == nil || !newCfg.Security.PolicyRematchExtensive {
+		return false
+	}
+	if oldResolved == nil || newResolved == nil {
+		return false
+	}
+	oldFP, okOld := oldResolved[key]
+	newFP, okNew := newResolved[key]
+	if !okOld || !okNew {
+		return false
+	}
+	return oldFP != newFP
+}
+
 func policyMatchOrActionChanged(oldPol, newPol *config.Policy) bool {
 	if oldPol.Action != newPol.Action {
 		return true
