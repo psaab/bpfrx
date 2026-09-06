@@ -14,6 +14,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/psaab/xpf/pkg/fsatomic"
 	"github.com/psaab/xpf/pkg/logging"
 )
 
@@ -160,6 +161,16 @@ func rotateTraceFile(cur *os.File, name string, maxFiles int) (*os.File, error) 
 	// reopening and resetting `written` on top of an un-rotated, over-cap file.
 	if err := os.Rename(base, base+".1"); err != nil {
 		return nil, fmt.Errorf("trace rotate: rolling active file: %w", err)
+	}
+	// #9057: ONE directory fsync covering the whole shift — the renames are
+	// atomic but the ENTRIES are not durable until the directory is synced.
+	// Surfaced rather than swallowed, matching this function's own policy:
+	// every other rotation failure here returns, because a caller that keeps
+	// writing on top of an un-rotated file is the failure this rotate exists
+	// to prevent.
+	if err := fsatomic.SyncDir(filepath.Dir(base)); err != nil {
+		return nil, fmt.Errorf("trace rotate: syncing the directory after the "+
+			"generation shift: %w", err)
 	}
 	f, _, err := openTraceFile(name)
 	return f, err

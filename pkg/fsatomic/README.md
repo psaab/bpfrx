@@ -13,6 +13,19 @@ The project's single source of truth for replace-a-file-on-disk writes
 - `SyncDir(dir)` — one directory fsync covering previously-completed
   renames/unlinks; lets multi-file shuffles (configstore rollback slots)
   batch namespace durability into a single fsync.
+- `RenameDurable(old, new)` — rename plus the directory fsync that makes the
+  new ENTRY durable (#9057). This is the **DurableNamespace** class: the
+  artifact is the directory entry, not a file's contents. A rename is atomic
+  for the entry and the entry is not durable until the directory is synced, so
+  a power cut can lose which generation a name points at.
+
+  **Do not use it in a shift loop.** Rotating N generations through it issues N
+  directory fsyncs where one suffices, because every rename lands in the same
+  directory — do the renames, then call `SyncDir` once. The `TestNoUnsyncedRename`
+  canary accepts a bare `os.Rename` in a function that also reaches `SyncDir`
+  for exactly that reason. A cross-directory move syncs BOTH directories,
+  because syncing one of two looks like a durable move and is half of one.
+
 - `MkdirAllDurable(dir, perm)` — `os.MkdirAll` plus an fsync of every
   newly-created level and of the deepest pre-existing ancestor. Required
   when a DurableState file lives in a directory the writer itself

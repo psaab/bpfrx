@@ -131,6 +131,12 @@ type Journal struct {
 	// does not stall behind it (#4829); production always uses
 	// (*os.File).Sync. Called with j.mu RELEASED.
 	syncFile func(*os.File) error
+	// syncDir fsyncs the directory after a create or rotation, so the
+	// NAMESPACE change is durable. A seam for the same reason syncFile is one:
+	// #9057's defect was that this call was SKIPPED when syncFile failed, and
+	// an outcome-only assertion cannot see a directory fsync that did not
+	// happen — fsync leaves no artifact. Defaults to fsatomic.SyncDir.
+	syncDir func(string) error
 	// inflight counts appends whose bytes are written but whose fsync has
 	// not completed yet, keyed by the INODE they were written to (#7174
 	// C06). Guarded by j.mu. Key 0 is the sentinel for "inode could not be
@@ -172,6 +178,7 @@ func New(path string, opts ...Option) *Journal {
 		maxSegmentBytes: DefaultMaxSegmentBytes,
 		maxSegments:     DefaultMaxSegments,
 		syncFile:        (*os.File).Sync,
+		syncDir:         fsatomic.SyncDir,
 		inflight:        make(map[uint64]int),
 	}
 	for _, o := range opts {
@@ -301,13 +308,29 @@ func (j *Journal) Log(entry *Entry) error {
 	if sync == nil {
 		sync = (*os.File).Sync
 	}
-	if err := sync(f); err != nil {
-		return fmt.Errorf("sync journal: %w", err)
+	// #9057: the NAMESPACE fsync runs even when the file sync failed. It used
+	// to sit after an early `return` on sync(f), so a data-sync failure also
+	// skipped the directory fsync — and those are independent durability
+	// facts. The rotation renamed x -> x.1; losing that entry across an
+	// unclean shutdown is a separate loss from losing the tail of the file,
+	// and the site knew about the helper and skipped it on an error path,
+	// which is why an outcome-only assertion could not see it.
+	syncErr := sync(f)
+	syncdir := j.syncDir
+	if syncdir == nil {
+		syncdir = fsatomic.SyncDir
 	}
 	if created || rotated {
-		if err := fsatomic.SyncDir(filepath.Dir(j.path)); err != nil {
+		if err := syncdir(filepath.Dir(j.path)); err != nil {
+			if syncErr != nil {
+				return fmt.Errorf("sync journal: %w (and the journal directory fsync "+
+					"also failed: %v)", syncErr, err)
+			}
 			return fmt.Errorf("sync journal dir: %w", err)
 		}
+	}
+	if syncErr != nil {
+		return fmt.Errorf("sync journal: %w", syncErr)
 	}
 	return nil
 }
