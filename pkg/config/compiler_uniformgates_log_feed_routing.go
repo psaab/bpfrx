@@ -10,6 +10,16 @@ import "fmt"
 // strict ordering (invariant #6) and the tolerant warning-accumulation
 // order (invariant #7) are preserved. See runUniformGates.
 func runUniformGatesLogFeedRouting(tree *ConfigTree, cfg *Config, opts compileOpts) error {
+
+	// #9105: an `authentication-key` with no `authentication-type` renders the
+	// key in PLAINTEXT, and an ABSENT type is indistinguishable at the render
+	// site from a CHOSEN plaintext one. Strict refuses so the operator states
+	// their intent; lenient warns so an already-persisted config still boots.
+	if w, err := validateAuthTypePresenceStrict(cfg, opts.lenientAuthTypeAbsent); err != nil {
+		return err
+	} else {
+		cfg.Warnings = append(cfg.Warnings, w...)
+	}
 	// #2008 H7 security log profile -> stream cross-reference. A
 	// `security log profile <name> stream-name <stream>` that names a
 	// stream which is not configured would route to nowhere — the operator

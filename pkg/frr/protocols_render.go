@@ -622,6 +622,17 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				// boot). Render what we always rendered, but say so: silently
 				// downgrading md5 to plaintext is the defect, and the operator has
 				// no other signal because `show configuration` echoes their value.
+				// #9105: an ABSENT type is not `unrecognized`, so this warning could not
+				// fire for it -- and it renders the key in CLEARTEXT exactly as a
+				// chosen `simple` does. Warn on both: the commit gate stops every NEW
+				// instance, this tells the operator about an existing one arriving
+				// through the tolerant load path.
+				if config.AuthTypeAbsent(rip.AuthType) {
+					slog.Warn("frr: rip authentication-key is set with NO authentication-type; "+
+						"rendering PLAINTEXT -- the key travels in clear in every PDU. Set "+
+						"authentication-type md5 to authenticate with a digest (#9105)",
+						"accepted", config.AuthTypeSpellings())
+				}
 				if config.AuthTypeUnrecognized(rip.AuthType) {
 					slog.Warn("frr: unrecognized rip authentication-type; rendering PLAINTEXT authentication",
 						"interface", iface, "authentication_type", rip.AuthType,
@@ -681,6 +692,17 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 			b.WriteString(" set-overload-bit\n")
 		}
 		if isis.AuthKey != "" {
+			// #9105: an ABSENT type is not `unrecognized`, so this warning could not
+			// fire for it -- and it renders the key in CLEARTEXT exactly as a
+			// chosen `simple` does. Warn on both: the commit gate stops every NEW
+			// instance, this tells the operator about an existing one arriving
+			// through the tolerant load path.
+			if config.AuthTypeAbsent(isis.AuthType) {
+				slog.Warn("frr: isis authentication-key is set with NO authentication-type; "+
+					"rendering PLAINTEXT -- the key travels in clear in every PDU. Set "+
+					"authentication-type md5 to authenticate with a digest (#9105)",
+					"accepted", config.AuthTypeSpellings())
+			}
 			if config.AuthTypeUnrecognized(isis.AuthType) {
 				slog.Warn("frr: unrecognized isis authentication-type; rendering PLAINTEXT area/domain password",
 					"authentication_type", isis.AuthType,
@@ -729,6 +751,17 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				fmt.Fprintf(&b, " isis metric %d\n", iface.Metric)
 			}
 			if iface.AuthKey != "" {
+				// #9105: an ABSENT type is not `unrecognized`, so this warning could not
+				// fire for it -- and it renders the key in CLEARTEXT exactly as a
+				// chosen `simple` does. Warn on both: the commit gate stops every NEW
+				// instance, this tells the operator about an existing one arriving
+				// through the tolerant load path.
+				if config.AuthTypeAbsent(iface.AuthType) {
+					slog.Warn("frr: isis interface authentication-key is set with NO authentication-type; "+
+						"rendering PLAINTEXT -- the key travels in clear in every PDU. Set "+
+						"authentication-type md5 to authenticate with a digest (#9105)",
+						"accepted", config.AuthTypeSpellings())
+				}
 				if config.AuthTypeUnrecognized(iface.AuthType) {
 					slog.Warn("frr: unrecognized isis interface authentication-type; rendering PLAINTEXT password",
 						"interface", iface.Name, "authentication_type", iface.AuthType,

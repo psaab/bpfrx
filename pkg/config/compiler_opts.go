@@ -534,6 +534,13 @@ type compileOpts struct {
 	// silently never fire) is rejected. Same doctrine as
 	// lenientIPsecPolicyProposalRef.
 	lenientLogProfileStreamRef bool
+	// lenientAuthTypeAbsent downgrades the #9105 "authentication-key with no
+	// authentication-type" rejection to a warning on the tolerant paths
+	// (Store.Load, Store.SyncApply). A config an older binary accepted must
+	// still BOOT: refusing it here would turn a silent plaintext downgrade into
+	// a failure to load, on the path whose whole purpose is that a persisted
+	// config comes up (#1960). The render site warns in both directions.
+	lenientAuthTypeAbsent bool
 
 	// lenientDynamicAddressFeedRef (#3300) downgrades the
 	// `security dynamic-address address-name <addr> profile feed-name <feed>`
@@ -2620,6 +2627,7 @@ func lenientCompileOpts() compileOpts {
 		lenientIPsecProposalProtocol:           true,
 		lenientIPsecManualKey:                  true,
 		lenientLogProfileStreamRef:             true,
+		lenientAuthTypeAbsent:                  true,
 		lenientDynamicAddressFeedRef:           true,
 		lenientDuplicateNamedBlock:             true,
 		lenientDuplicateNATRuleName:            true,
