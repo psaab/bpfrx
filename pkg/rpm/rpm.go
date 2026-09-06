@@ -896,18 +896,62 @@ func (m *Manager) probeHTTP(ctx context.Context, test *config.RPMTest, opts prob
 		}
 		return 0, fmt.Errorf("HTTP GET failed: %w", err)
 	}
-	// Drain then close the body on every path — including a bodyless 204 — so
-	// the connection is fully consumed before close and never lingers
-	// half-read (#4912).
-	_, _ = io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
+	// #9049: RTT is TIME TO RESPONSE, not time to drain.
+	//
+	// It used to be measured after the body drain, so a fast server with a slow
+	// or stalled body reported its transfer time as its round-trip time. In one
+	// measured case 704 us of true responsiveness was reported as 2.0 s -- a
+	// ~2800x distortion folded straight into MinRTT / MaxRTT / AvgRTT and the
+	// jitter figure an operator reads to judge a path.
+	//
+	// client.Do has returned, which means the status line and headers are in
+	// hand; that is what "round trip" means to the operator reading this
+	// number, and it matches what every other probe in this file measures.
 	rtt := time.Since(start)
+
+	// Drain then close the body on every path -- including a bodyless 204 -- so
+	// the connection is fully consumed before close and never lingers half-read
+	// (#4912).
+	//
+	// #9049: THE DRAIN ERROR IS NO LONGER DISCARDED. It was `_, _ =`, so a body
+	// read that hit http.Client.Timeout returned `rtt ~= 10s, err = nil` and the
+	// caller scored the probe a SUCCESS. A timed-out response was
+	// indistinguishable, in the probe's own verdict, from a fast complete one --
+	// the probe reported the path healthy precisely when it was not, which is
+	// the direction that matters.
+	//
+	// The drain is bounded twice over: http.Client{Timeout: 10s} covers body
+	// reads, and the LimitReader below stops a large but healthy body from
+	// dominating the probe window inside that ceiling. Hitting the limit is NOT
+	// an error -- the response arrived and was readable, which is what the probe
+	// asked; only a read FAILURE is.
+	_, drainErr := io.Copy(io.Discard, io.LimitReader(resp.Body, maxProbeBodyBytes9049))
+	resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
 		return rtt, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
+	if drainErr != nil {
+		// Reported with the header RTT, not a zero: the round trip really did
+		// take that long and the caller's loss accounting is separate from its
+		// timing accounting.
+		return rtt, fmt.Errorf("HTTP response body read failed: %w", drainErr)
+	}
 	return rtt, nil
 }
+
+// maxProbeBodyBytes9049 bounds how much of a probe response body is drained.
+//
+// A health endpoint's body is a few bytes; anything large is not what the probe
+// is measuring, and reading it bills transfer time to a window meant for
+// reachability. 1 MiB is far above any plausible health response and far below
+// anything that would keep a 10-second probe busy on a working link.
+//
+// Reaching the limit is deliberately NOT a failure. io.LimitReader returns EOF
+// at the boundary, so a body larger than this drains to the limit and the probe
+// succeeds -- the server answered. Treating a big body as a failed probe would
+// score a healthy path down for a property the probe does not measure.
+const maxProbeBodyBytes9049 = 1 << 20
 
 // probeMeasurementIdentity renders the RESOLVED measurement a verdict is about
 // (#6561): everything that determines WHAT is being probed and BY WHICH PATH.
