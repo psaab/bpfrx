@@ -292,6 +292,26 @@ var dupConservationSkipped8436 = []string{
 	"class-of-service interfaces xpfname unit",
 	"protocols bgp group",
 	"protocols router-advertisement interface xpfname prefix",
+
+	// Issue 9151: `protocols rip group` gained its two real children
+	// (`neighbor`, `export`) when the schema was corrected to declare what
+	// compiler_protocols.go actually reads. BOTH are `multi: true`, so
+	// `twoLeaves8436` finds no two SINGLE-VALUE leaves and cannot synthesize a
+	// duplicate fixture. The skip is structural, not a coverage regression.
+	//
+	// A SKIP IS NOT A PASS, so this one was checked BY HAND before being
+	// recorded, in both spellings:
+	//
+	//	set ... group g1 neighbor ge-0/0/0        ifaces=[ge-0/0/0 ge-0/0/1]
+	//	set ... group g1 neighbor ge-0/0/1        redist=[static direct]
+	//	group g1 { neighbor ge-0/0/0; }           ifaces=[ge-0/0/0 ge-0/0/1]
+	//	group g1 { neighbor ge-0/0/1; }
+	//
+	// The site CONSERVES. Note also that "conservation" means something
+	// different for a multi leaf than for a single-value one -- multi
+	// ACCUMULATES where single-value REPLACES -- so this census's model does
+	// not apply here even if a fixture could be built.
+	"protocols rip group",
 	"routing-options rib xpfname static route",
 	"routing-options rib xpfname static route xpfname qualified-next-hop",
 	"routing-options static route",
