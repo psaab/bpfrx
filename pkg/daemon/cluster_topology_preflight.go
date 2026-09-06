@@ -353,3 +353,144 @@ func controlInterfaceMoveRefusal8987(have, want string) error {
 		"change on each node separately while both are running — that produces the "+
 		"same partition by hand", have, want)
 }
+
+// clusterSyncEndpointCommitPreflight refuses a LIVE move of the endpoint that
+// carries the CONFIG PUSH (#9121) — the third member of the #8965/#8987 family,
+// and the one that establishes which set of fields the family should have been
+// keyed on all along.
+//
+// WHICH SET IS AUTHORITATIVE. Three sets exist in this daemon and they answer
+// three different questions. Getting the wrong one is how #8965 and #8987 came
+// to miss a whole cluster shape:
+//
+//   - clusterTransportKey (6 fields, daemon_ha_sync.go) answers "does step 20
+//     RESTART cluster comms?". It is deliberately wide and it is correct for
+//     that question. It is NOT the set to gate on: a fabric1-only change
+//     restarts comms, but fab1 is a REDUNDANT secondary path (sync_conn.go
+//     logs "secondary fabric listen failed, using primary only") — the push
+//     still lands over fab0, so refusing it would be a FALSE REJECTION.
+//     #9121's own suggested fix direction named Fabric1PeerAddress; that is
+//     the over-gate, and it is why the set had to be derived rather than
+//     copied.
+//   - the HEARTBEAT pair {ControlInterface, PeerAddress} is what #8965 and
+//     #8987 actually read, via Manager.HeartbeatPeerAddr /
+//     HeartbeatControlInterface. It answers "is the heartbeat running, and
+//     where?".
+//   - clusterSyncTransport's SELECTED PAIR answers "which endpoint carries the
+//     config push?" — and the push is what a partition strands
+//     (pushCommittedConfigToPeer -> syncConfigToPeer -> QueueConfig). **That is
+//     the authoritative set for this family.**
+//
+// The heartbeat pair is a PROXY for the sync pair, and it is an exact one in
+// control-link mode — which is the only mode the shipped fixtures configure
+// (docs/ha-cluster-userspace.conf and test/incus/loss-userspace-cluster.env
+// both set control-interface), so nothing measured the divergence. In FABRIC
+// transport mode the two come apart completely: clusterSyncTransport falls back
+// to {FabricInterface, FabricPeerAddress} when either control field is empty,
+// and the heartbeat does not start at all in that shape
+// (daemon_ha_sync.go: "if cc.ControlInterface != "" && cc.PeerAddress != """),
+// so HeartbeatPeerAddr() is empty, controlEndpointDecision8965's have=="" arm
+// returns nil, and BOTH existing gates no-op on the very commit that
+// partitions the pair. A proxy that coincides in the measured mode and diverges
+// in the unmeasured one is the shape this gate exists to remove.
+//
+// SO THIS GATE COMPARES SYNC ENDPOINTS, NOT FIELDS. It runs clusterSyncTransport
+// over the RUNNING transport key and over the CANDIDATE config and refuses when
+// the selected endpoint moves. Using the same selector on both sides is
+// structural rather than stylistic: a hand-copied fallback rule would drift
+// from the one that actually picks the transport, and this family's whole
+// history is gates keyed on a set that had drifted from the mechanism.
+//
+// It therefore also covers, for free, a shape #9121 did not name and no gate
+// held: a commit that ADDS a control link to a fabric-transport cluster (or
+// removes one) moves sync from fabric to control-link while the peer is still
+// on the fabric — the same durable partition by a transport-TYPE change rather
+// than an address change. #8965's gate cannot see it (have=="") and #8987's
+// cannot either.
+//
+// WHAT IT DOES NOT DO, deliberately. A control-link-to-control-link move is
+// left to #8965/#8987, which run FIRST at all three call sites and produce the
+// specific operator text for that move. The explicit defer arm below keeps this
+// decision total instead of relying on that ordering.
+//
+// PEER-SYNC IS SAFE, MEASURED not inherited. In the shipped cluster config
+// (docs/ha-cluster-userspace.conf) `fabric-peer-address` sits INSIDE
+// `groups node0` / `groups node1` — lines 10 and 39, directly beside the
+// per-node `peer-address` — so it is per-node exactly as #8965's field is: a
+// synced text compiles for the LOCAL node, candidate equals running, and the
+// gate no-ops. `fabric-interface` is safe for #8987's reason instead: it is
+// auto-derived from the local fabric member (compiler_derivations.go keys on
+// SlotToNodeID(slot) == cc.NodeID) or set outside the groups, so both nodes
+// carry the identical name. Both halves are safe; the reasons differ, and
+// asserting one of them for the other would be the unearned transfer #8987
+// records.
+func clusterSyncEndpointCommitPreflight(active clusterTransportKey, newCfg *config.Config) error {
+	if active == (clusterTransportKey{}) || !clusterTopologyConfigured(newCfg) {
+		// Comms never started (boot applies run before startClusterComms — the
+		// same `active != zero` guard step 20 relies on), or the candidate is
+		// not clustered: the topology gate owns those cases.
+		return nil
+	}
+	haveIf, haveAddr, haveMode := clusterSyncTransport(&config.ClusterConfig{
+		ControlInterface:  active.ControlInterface,
+		PeerAddress:       active.PeerAddress,
+		FabricInterface:   active.FabricInterface,
+		FabricPeerAddress: active.FabricPeerAddress,
+	})
+	wantIf, wantAddr, wantMode := clusterSyncTransport(newCfg.Chassis.Cluster)
+	return syncEndpointDecision9121(
+		syncEndpoint9121{haveIf, haveAddr, haveMode},
+		syncEndpoint9121{wantIf, wantAddr, wantMode})
+}
+
+// syncEndpoint9121 is one resolved config-sync endpoint: the interface and peer
+// address clusterSyncTransport selected, plus which arm of it selected them.
+type syncEndpoint9121 struct {
+	iface string
+	addr  string
+	mode  string
+}
+
+// syncEndpointDecision9121 is the DECISION, split from the accessor plumbing
+// for the reason controlEndpointDecision8965's own doc records: the first
+// version of that split exposed only the message builder, so the cell asserted
+// the operator-facing TEXT while "when to refuse at all" went unexercised and
+// neutering the gate to `return nil` left it GREEN. This seam is the decision,
+// so that mutation reds.
+func syncEndpointDecision9121(have, want syncEndpoint9121) error {
+	if have.addr == "" || want.addr == "" {
+		// Nothing live to strand, or the candidate names no sync endpoint at
+		// all — the same empty-side reading the two sibling gates take, and the
+		// topology gate owns a candidate that stops being clustered.
+		return nil
+	}
+	if have == want {
+		return nil
+	}
+	if have.mode == "control-link" && want.mode == "control-link" {
+		// Owned by #8965 (address) and #8987 (interface), which run first at
+		// every call site and say the specific thing about a control-link move.
+		// Stated rather than left to that ordering, so a reordering cannot turn
+		// this into a second, differently-worded refusal of the same commit.
+		return nil
+	}
+	return syncEndpointMoveRefusal9121(have, want)
+}
+
+// syncEndpointMoveRefusal9121 is the operator-facing text, factored so the cell
+// asserting it and the gate producing it cannot drift apart. It NAMES THE
+// PROCEDURE for the reason #8987 records: a refusal without a path sends the
+// operator to the workaround that reproduces the defect.
+func syncEndpointMoveRefusal9121(have, want syncEndpoint9121) error {
+	return fmt.Errorf("commit rejected: changing the chassis cluster config-sync "+
+		"endpoint from %s on %s (%s transport) to %s on %s (%s transport) cannot be "+
+		"done on a running cluster — applying it restarts this node's cluster comms "+
+		"on the NEW endpoint before the config can be pushed to the peer, which is "+
+		"still on the OLD one, so the peer never receives the change and the two "+
+		"nodes are durably partitioned.\n"+
+		"To move the config-sync endpoint: set the new values on BOTH nodes and "+
+		"restart xpfd on both, or take the cluster down before the move. Do NOT "+
+		"commit the change on each node separately while both are running — that "+
+		"produces the same partition by hand",
+		have.addr, have.iface, have.mode, want.addr, want.iface, want.mode)
+}

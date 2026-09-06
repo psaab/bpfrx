@@ -253,6 +253,60 @@ explicitly against committing on each node separately while both run,
 which is the same partition by hand. A refusal without a path sends the
 operator to the workaround that reproduces the defect.
 
+### And the set those two were keyed on was the wrong one (#9121)
+
+Both gates above read the **heartbeat** pair — `HeartbeatPeerAddr()` and
+`HeartbeatControlInterface()`. What a partition strands is the **config
+push**, and the push rides the *config-sync* endpoint, which
+`clusterSyncTransport` selects: the control link when
+`control-interface` **and** `peer-address` are both set, else the
+**fabric** (`fabric-interface` / `fabric-peer-address`, the legacy
+shape).
+
+In control-link mode those two sets coincide exactly, and control-link
+mode is the only shape the shipped fixtures configure
+(`docs/ha-cluster-userspace.conf`, `test/incus/loss-userspace-cluster.env`),
+so nothing measured the divergence. On a **fabric-transport** cluster
+they come apart completely: the heartbeat does not start at all in that
+shape, so the running value both gates compare against is empty, both
+take their "nothing live to strand" arm, and both return no-op **on the
+very commit that partitions the pair**. The gate misses twice.
+
+`clusterSyncEndpointCommitPreflight` (#9121) closes it by comparing
+resolved **endpoints** rather than fields: it runs `clusterSyncTransport`
+over the running transport key and over the candidate config and refuses
+when the selected endpoint moves. Using the same selector on both sides
+is structural — a hand-copied fallback rule would drift from the one that
+actually picks the transport, which is this family's entire history.
+
+Three consequences worth stating, because two of them are not obvious:
+
+- **`fabric1` is deliberately NOT gated.** `clusterTransportKey` includes
+  `fabric1-interface` / `fabric1-peer-address` and is right to — it
+  answers "does step 20 restart comms?". But fab1 is a *redundant*
+  secondary sync path (`pkg/cluster/sync_conn.go` falls back with
+  "secondary fabric listen failed, using primary only"), so a fab1-only
+  change restarts comms while the push still lands over fab0. Refusing it
+  would be a **false rejection**. The gated set has to be derived from
+  the transport *selector*, not copied from the restart *trigger*.
+- **A transport-TYPE switch is covered for free.** Adding a control link
+  to a running fabric-transport cluster, or removing one, moves sync from
+  one transport to the other while the peer is still on the first — the
+  same durable partition by a different edit. Neither #8965 nor #8987 can
+  see it (their running value is empty on one side of the switch).
+- **A control-link-to-control-link move stays with #8965/#8987**, which
+  run first at all three apply paths and produce the specific text for
+  it. Two refusals in different words for one commit is worse than one.
+
+**Peer-sync is a no-op here too, per arm and for different reasons.**
+`fabric-peer-address` is safe for #8965's reason — it sits *inside*
+`groups node0` / `groups node1` in the shipped cluster config, directly
+beside the per-node `peer-address`, so a synced text compiles to the
+local node's own value. `fabric-interface` is safe for #8987's reason
+instead — it is auto-derived from the local fabric member
+(`compiler_derivations.go` keys on `SlotToNodeID(slot) == cc.NodeID`), so
+both nodes carry the identical name.
+
 ### Acceptance criteria (identity change, #6192)
 
 - A day-2 commit that changes `chassis cluster node-id` or `cluster-id`

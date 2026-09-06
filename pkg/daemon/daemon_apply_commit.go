@@ -224,6 +224,14 @@ func (d *Daemon) commitAndApply(ctx context.Context, authority configstore.Commi
 			if ierr := clusterControlInterfaceCommitPreflight(d.cluster, cand); ierr != nil {
 				return ierr
 			}
+			// #9121: and the CONFIG-SYNC endpoint, which is the field set the
+			// two gates above should have been keyed on. They read the
+			// HEARTBEAT pair, an exact proxy in control-link mode and no proxy
+			// at all in fabric-transport mode, where the heartbeat never starts
+			// and both of them no-op on the commit that partitions the pair.
+			if serr := clusterSyncEndpointCommitPreflight(d.activeTransport(), cand); serr != nil {
+				return serr
+			}
 			// #6650: refuse a config the cluster PEER cannot represent, before
 			// the store promotes anything. Ordered last among the cluster
 			// preflights: the topology/identity gates above decide whether this
@@ -527,6 +535,24 @@ func (d *Daemon) syncAndApply(ctx context.Context, configText string, chassisPre
 		return nil, ferr
 	}
 
+	// #9121: the CONFIG-SYNC endpoint half, on the peer-sync path.
+	//
+	// Safe here for a MEASURED reason, as its siblings' comments are. The
+	// fabric arm is safe for #8965's reason: `fabric-peer-address` sits inside
+	// `groups node0`/`node1` in the shipped cluster config, directly beside the
+	// per-node `peer-address`, so a synced text compiles to this node's own
+	// value and the comparison is equal. The interface arm is safe for #8987's
+	// reason instead: `fabric-interface` is auto-derived from the LOCAL fabric
+	// member, so both nodes carry the identical name.
+	if serr := clusterSyncEndpointCommitPreflight(d.activeTransport(), compiled); serr != nil {
+		slog.Error("cluster: refusing to apply a peer-synced config-sync endpoint "+
+			"move live; applying it would restart cluster comms on an endpoint the "+
+			"peer is not reachable over and durably partition the pair",
+			"err", serr)
+		d.reconcileManagementAfterPromotion(compiled, "peer-synced sync-endpoint move refused")
+		return nil, serr
+	}
+
 	// #5564: SyncApply (above) has ALREADY promoted the peer config to active,
 	// and once applyConfigLocked arms the dataplane snapshot this node is
 	// forwarding under it. The three session invalidators
@@ -712,6 +738,14 @@ func (d *Daemon) commitConfirmedAndApply(ctx context.Context, authority configst
 			// remaining half is silent.
 			if ierr := clusterControlInterfaceCommitPreflight(d.cluster, cand); ierr != nil {
 				return ierr
+			}
+			// #9121: and the CONFIG-SYNC endpoint, which is the field set the
+			// two gates above should have been keyed on. They read the
+			// HEARTBEAT pair, an exact proxy in control-link mode and no proxy
+			// at all in fabric-transport mode, where the heartbeat never starts
+			// and both of them no-op on the commit that partitions the pair.
+			if serr := clusterSyncEndpointCommitPreflight(d.activeTransport(), cand); serr != nil {
+				return serr
 			}
 			// #6707: the rollback target must be APPLIABLE, not merely
 			// device-map safe. The timeout path applies it unconditionally
