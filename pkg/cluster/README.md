@@ -3388,6 +3388,39 @@ outside the monitor loop:
   check→Put→record apply sequence is not held under one `recvGenMu` acquisition;
   it is safe because the per-peer receive path is single-threaded over the single
   active fabric (#2198 F3).
+- **The generation guards are REORDERING guards, not ownership guards (#9048)**:
+  and reading them as the latter is the natural mistake, because on a
+  dual-primary split they are the thing standing where an ownership guard
+  should be. `stored == 0` means *"I have no ordering information for this
+  key"*, not *"this delta is safe"* — `recvGenV4/V6` is populated solely by
+  `recordInstalledGenV4/V6`, i.e. prior PEER installs, so a session this node
+  created ITSELF has no stored generation and both guards admit anything for
+  it. That is correct for the question they ask: with no prior peer install
+  there is nothing to order, and refusing on gen-0 would break every
+  legitimate first install and every legacy sender — which is what the
+  `gen == 0` arms above are for. *"May this peer touch a session this node
+  owns and is forwarding for?"* is a different question with different inputs
+  (local origin + local HA state), and it is answered one layer down in the
+  dataplane helper where both facts live:
+  - **install** — `SessionTable::upsert_synced_with_origin` refuses to clobber
+    a local-origin entry unless `synced_entry_allows_local_replace` says the
+    incoming entry's owner RG is not locally forwarding-active.
+  - **delete** — `handle_delete_synced` refuses to tear down a local-origin
+    entry whose owner RG **is** locally forwarding-active, counting
+    `peer_delete_refused_local_owned` (#9048). Before that, only the INSTALL
+    verb had a guard; the asymmetry was invisible because the two verbs are
+    guarded in different files at different layers, and the delete is the more
+    damaging half — a wrongful delete kills a live flow outright, where a
+    wrongful install at least leaves a session installed.
+
+  Both are inert in normal operation: the delta EMITTER is gated on
+  `IsPrimaryForRGFn`, so exactly one node emits and the receiver's entries at
+  those keys carry a peer-synced origin. They fire only when both nodes are
+  primary for the same RG, which is what makes
+  `peer_delete_refused_local_owned` a **split-brain indicator** rather than a
+  tuning knob — a nonzero value is the condition, not the guard being noisy.
+  The refusal is otherwise silent by design, because the shape that produces
+  it produces one per closing flow.
 - **Config-epoch guard (#5274)**: distinct from the per-key install generation,
   every session install carries a `ConfigEpoch` — the #3931 config-sync
   generation (`configGenCounter`) the sender held when it queued the session

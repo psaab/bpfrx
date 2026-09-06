@@ -429,6 +429,21 @@ pub(crate) struct ProcessStatus {
     pub session_delete_replica_dropped: u64,
     #[serde(rename = "session_delete_replica_drop_repaired", default)]
     pub session_delete_replica_drop_repaired: u64,
+    /// #9048: peer `DeleteSynced` commands REFUSED because the key named a
+    /// LIVE LOCAL session this node is actively forwarding for — the
+    /// delete-side mirror of the install-side clobber guard in
+    /// `upsert_synced_with_origin`.
+    ///
+    /// Non-zero means the cluster is, or recently was, DUAL-PRIMARY for some
+    /// redundancy group. The delta emitter is gated on `IsPrimaryForRGFn`, so
+    /// in normal operation exactly one node emits deletes and the receiver's
+    /// entries at those keys carry a peer-synced origin — the guard is inert
+    /// and this stays flat at zero. It is the ONLY surface that reports the
+    /// refusal, which is otherwise silent by design: the condition that
+    /// produces it produces one per closing flow, so a log line would be a
+    /// storm exactly when the cluster is already in trouble.
+    #[serde(rename = "peer_delete_refused_local_owned", default)]
+    pub peer_delete_refused_local_owned: u64,
     /// #2402/#6641: total shared-session mutex poison recoveries (a
     /// worker thread panicked while holding a shared-session or
     /// owner-RG-index mutex; the committed map was recovered and the

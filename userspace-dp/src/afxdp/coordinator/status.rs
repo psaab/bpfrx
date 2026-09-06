@@ -488,6 +488,21 @@ impl super::Coordinator {
         crate::afxdp::SESSION_DELETE_REPLICA_DROP_REPAIRED.load(Ordering::Relaxed)
     }
 
+    /// #9048: peer `DeleteSynced` commands REFUSED because the key named a
+    /// live session this node created itself and is actively forwarding for.
+    ///
+    /// Non-zero means the cluster is, or recently was, DUAL-PRIMARY for some
+    /// redundancy group. The delta emitter is gated on `IsPrimaryForRGFn`, so
+    /// in normal operation exactly one node emits deletes and the receiver's
+    /// entries at those keys carry a peer-synced origin — the guard is inert
+    /// and this stays flat at zero. A climbing count is a split-brain
+    /// indicator, and it is the ONLY surface that reports the condition: the
+    /// refusal itself is silent by design, because the shape that produces it
+    /// produces one per closing flow.
+    pub fn peer_delete_refused_local_owned_total(&self) -> u64 {
+        crate::afxdp::PEER_DELETE_REFUSED_LOCAL_OWNED.load(Ordering::Relaxed)
+    }
+
     /// #2402/#6641: total shared-session mutex poison recoveries across
     /// every shared-session and owner-RG-index site (publish, remove,
     /// lookups, index maintenance, and the #5154 HA import

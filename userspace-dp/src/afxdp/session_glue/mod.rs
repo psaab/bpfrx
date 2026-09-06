@@ -945,8 +945,10 @@ pub(super) fn apply_worker_commands(
                     sessions,
                     session_map_fd,
                     forwarding,
+                    ha_state,
                     key,
                     now_ns,
+                    now_secs,
                     &mut deleted_synced_keys,
                     worker_id,
                 );
@@ -1110,6 +1112,21 @@ pub(super) fn replicate_session_upsert(
 /// session that no longer exists, AND keeps its NAT holder bit, so the
 /// reservation is held for the life of the allocator.
 pub(crate) static SESSION_DELETE_REPLICA_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// #9048: a peer `DeleteSynced` REFUSED because the key named a live session
+/// this node created itself and is actively forwarding for.
+///
+/// Non-zero means the cluster is, or recently was, DUAL-PRIMARY for some
+/// redundancy group: the delta emitter is gated on `IsPrimaryForRGFn`, so in
+/// normal operation exactly one node emits deletes and the receiver's entries
+/// at those keys carry a peer-synced origin, leaving the guard inert. A
+/// climbing count is therefore a split-brain indicator, not a tuning knob —
+/// and it is deliberately a COUNTER rather than a log line, because the
+/// condition that produces it produces one per closing flow.
+///
+/// The refusal is the conservative side of the trade: a session that lingers
+/// until it ages out, against a live flow torn down mid-transfer.
+pub(crate) static PEER_DELETE_REFUSED_LOCAL_OWNED: AtomicU64 = AtomicU64::new(0);
 
 /// #8114 item 4: refused deletes whose owning worker was IDENTIFIED and whose
 /// NAT teardown was therefore run on its behalf.

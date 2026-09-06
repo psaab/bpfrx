@@ -177,6 +177,11 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
         state.afxdp.session_delete_replica_dropped_total();
     state.status.session_delete_replica_drop_repaired =
         state.afxdp.session_delete_replica_drop_repaired_total();
+    // #9048: the split-brain indicator. Surfaced here rather than parked in
+    // UNSURFACED for the reason that allowlist documents — a counter nothing
+    // assigns reaches no operator through status, gRPC or Prometheus.
+    state.status.peer_delete_refused_local_owned =
+        state.afxdp.peer_delete_refused_local_owned_total();
     state.status.shared_session_poison_recoveries =
         state.afxdp.shared_session_poison_recoveries_total();
     // #7398: the three counters below were computed, unit-tested and never

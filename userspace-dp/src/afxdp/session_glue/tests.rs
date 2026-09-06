@@ -1947,6 +1947,154 @@ fn apply_worker_commands_preserves_local_session_for_active_owner_rg() {
     assert_eq!(hit.decision, live_decision);
 }
 
+// ── #9048: the DELETE-side mirror of the clobber guard above ────────
+//
+// `apply_worker_commands_preserves_local_session_for_active_owner_rg`
+// (directly above) pins the INSTALL half: a peer UpsertSynced cannot clobber
+// a live local session whose owner RG is locally active. Until #9048 the
+// DELETE half had no such guard at any layer, and the asymmetry was invisible
+// because the two verbs are guarded in different files.
+//
+// The Go-side generation guard does not cover it and looking there is the
+// natural mistake: `deleteGenGuardV4` refuses only when the STORED generation
+// is non-zero, and `recvGenV4` is populated solely by prior PEER installs, so
+// a session this node created itself has no stored generation and the delete
+// is admitted. That is correct for the question that guard asks — it is a
+// per-key REORDERING guard for one sender's stream (#2170), and gen-0 means
+// "I cannot order this", not "this is safe". Ownership is a different guard.
+//
+// These three cells are a set: the first is the refusal, and the other two
+// are the arms that prove the predicate is a CONJUNCTION rather than either
+// half doing all the work by itself.
+fn drive_delete_synced_9048(
+    sessions: &mut SessionTable,
+    key: &SessionKey,
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
+) {
+    let commands = Arc::new(Mutex::new(VecDeque::new()));
+    commands
+        .lock()
+        .expect("commands lock")
+        .push_back(WorkerCommand::DeleteSynced(key.clone()));
+    let forwarding = test_forwarding_state();
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+    apply_worker_commands(
+        &commands,
+        sessions,
+        -1,
+        -1,
+        -1,
+        &forwarding,
+        ha_state,
+        &dynamic_neighbors,
+        0,
+        &mut VecDeque::new(),
+    );
+}
+
+fn install_live_local_9048(sessions: &mut SessionTable, key: &SessionKey) {
+    assert!(sessions.install_with_protocol(
+        key.clone(),
+        test_decision(),
+        test_metadata(),
+        1_000_000,
+        PROTO_TCP,
+        0x10,
+    ));
+}
+
+#[test]
+fn apply_worker_commands_refuses_peer_delete_of_live_local_session_9048() {
+    let mut sessions = SessionTable::new();
+    let key = test_key();
+    install_live_local_9048(&mut sessions, &key);
+
+    let mut ha_state = BTreeMap::new();
+    ha_state.insert(1, active_ha_runtime(monotonic_nanos() / 1_000_000_000));
+
+    let before = PEER_DELETE_REFUSED_LOCAL_OWNED.load(Ordering::Relaxed);
+    drive_delete_synced_9048(&mut sessions, &key, &ha_state);
+
+    let hit = sessions.lookup(&key, 2_000_000, 0x10);
+    assert!(
+        hit.is_some(),
+        "#9048: a peer DeleteSynced tore down a LIVE LOCAL session whose owner \
+         RG is locally active. In a dual-primary split both nodes create local \
+         sessions under the same 5-tuples, so either node closing its copy \
+         kills the other's live flow mid-transfer."
+    );
+    assert!(
+        PEER_DELETE_REFUSED_LOCAL_OWNED.load(Ordering::Relaxed) > before,
+        "#9048: the session survived but the refusal was not counted. The \
+         refusal is silent by design, so this counter is the ONLY surface that \
+         reports a dual-primary split to an operator."
+    );
+}
+
+// ARM 1 of the conjunction: a PEER-SYNCED entry is deleted normally. Without
+// this, a guard that simply refused every delete would pass the cell above —
+// and refusing a legitimate delete leaks a session and strands its NAT pool
+// port for the life of the allocator.
+#[test]
+fn apply_worker_commands_still_deletes_peer_synced_session_9048() {
+    let mut sessions = SessionTable::new();
+    let key = test_key();
+    assert!(sessions.upsert_synced_with_origin(
+        SessionInstall {
+            key: key.clone(),
+            decision: test_decision(),
+            metadata: test_metadata(),
+            origin: SessionOrigin::SyncImport,
+            now_ns: 1_000_000,
+            protocol: PROTO_TCP,
+            tcp_flags: 0x10,
+            session_id: 0,
+        },
+        /* allow_replace_local = */ true,
+    ));
+
+    let mut ha_state = BTreeMap::new();
+    ha_state.insert(1, active_ha_runtime(monotonic_nanos() / 1_000_000_000));
+
+    drive_delete_synced_9048(&mut sessions, &key, &ha_state);
+
+    assert!(
+        sessions.lookup(&key, 2_000_000, 0x10).is_none(),
+        "#9048: the guard refused a delete for a PEER-SYNCED entry. That is \
+         the ordinary standby path — every session at a synced key carries a \
+         sync-family origin — so refusing there would leak a session on every \
+         closing flow and hold its NAT reservation for the life of the \
+         allocator."
+    );
+}
+
+// ARM 2 of the conjunction: a LOCAL entry whose owner RG is NOT locally active
+// is deleted normally. Without this, the origin half alone could be doing all
+// the work and the HA predicate would be untested — the shape where a cell
+// reads as coverage for a condition it never varies.
+#[test]
+fn apply_worker_commands_still_deletes_local_session_when_rg_inactive_9048() {
+    let mut sessions = SessionTable::new();
+    let key = test_key();
+    install_live_local_9048(&mut sessions, &key);
+
+    // Same fixture as the refusal cell, ONE input changed: RG1 is not
+    // forwarding-active here, so this node is not the one serving the flow.
+    let mut ha_state = BTreeMap::new();
+    ha_state.insert(1, inactive_ha_runtime(monotonic_nanos() / 1_000_000_000));
+
+    drive_delete_synced_9048(&mut sessions, &key, &ha_state);
+
+    assert!(
+        sessions.lookup(&key, 2_000_000, 0x10).is_none(),
+        "#9048: the guard refused a delete for a local-origin entry whose \
+         owner RG this node is NOT forwarding for. The predicate is a \
+         CONJUNCTION — local origin AND locally active — and dropping the \
+         second half would refuse deletes on a standby that happens to hold \
+         a local entry."
+    );
+}
+
 #[test]
 fn worker_synced_local_delivery_forces_live_redirect_on_standby() {
     assert!(force_live_redirect_for_worker_synced_entry(
@@ -7335,8 +7483,13 @@ fn delete_synced_records_key_for_flow_cache_invalidation() {
         &mut sessions,
         -1,
         &forwarding,
+        // #9048: an EMPTY HA view keeps the new ownership guard inert (no RG
+        // is forwarding-active), so this cell keeps measuring the delete
+        // contract it was written for rather than the guard.
+        &BTreeMap::new(),
         key.clone(),
         2_000_000,
+        0,
         &mut deleted_keys,
         0,
     );
@@ -7370,8 +7523,13 @@ fn delete_synced_records_key_even_when_session_already_absent() {
         &mut sessions,
         -1,
         &forwarding,
+        // #9048: an EMPTY HA view keeps the new ownership guard inert (no RG
+        // is forwarding-active), so this cell keeps measuring the delete
+        // contract it was written for rather than the guard.
+        &BTreeMap::new(),
         key.clone(),
         2_000_000,
+        0,
         &mut deleted_keys,
         0,
     );
@@ -7625,8 +7783,11 @@ fn delete_synced_frees_both_allocators_end_to_end_6211() {
         &mut sessions,
         -1,
         &forwarding_after_zone_drop,
+        // #9048: empty HA view — see the note at the sibling call sites.
+        &BTreeMap::new(),
         key.clone(),
         3_000,
+        0,
         &mut deleted_keys,
         0,
     );
