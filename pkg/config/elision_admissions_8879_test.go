@@ -1373,12 +1373,19 @@ func TestDepth2UnadmittedPopulation8929(t *testing.T) {
 	// reds this cell and forces its removal — a list that outlives its reason
 	// is the failure this campaign keeps finding.
 	knownDropping := []string{}
-	// 50 UNIQUE pairs. #8929 said 51 by counting a slice that double-counted
-	// `family inet6`, which appears under two different top-level stanzas.
-	// The predicate is keyed on (mid, head) and knows nothing about the
-	// stanza, so the same pair reached by two routes is ONE pair — counting
-	// sites where the population is pairs is the unit mismatch this campaign
-	// already hit once, on the 320-sites / 95-pairs reconciliation.
+	// UNIT: PAIRS, not sites. #8929 first said 51 by counting a slice that
+	// double-counted `family inet6`, which appears under two different
+	// top-level stanzas. The predicate is keyed on (mid, head) and knows
+	// nothing about the stanza, so the same pair reached by two routes is ONE
+	// pair — counting sites where the population is pairs is the unit mismatch
+	// this campaign already hit on the 320-sites / 95-pairs reconciliation.
+	//
+	// The corrected figure was 50 UN-ADMITTED pairs. It is 24 now because the
+	// `nat` and `flow` families and the batch-of-13 were admitted since; the
+	// population SHRINKS as pairs are admitted, which is the direction that
+	// means progress. (#8942: this comment said "50 UNIQUE pairs" beside a
+	// constant reading 24 — a stale claim sitting next to the measurement that
+	// contradicted it.)
 	const wantPopulation = 24
 
 	parentAdmitted := func(mid string) bool {
@@ -1422,12 +1429,16 @@ func TestDepth2UnadmittedPopulation8929(t *testing.T) {
 	// was removed silently (a bad merge, a tidy-up). Measured: deleting an
 	// entry left this cell green until this assertion was added.
 	if len(knownDropping) != 0 {
-		t.Errorf("knownDropping has %d entries, want 13. #8938 measured 26 of "+
-			"the 50 dropping; the `nat` and `flow` families were admitted in "+
-			"#8943, leaving 13. Removing one is only correct if the pair was "+
-			"ADMITTED — in which case the membership check below fires too and "+
-			"BOTH numbers move together. A count change on its own means the "+
-			"record was edited without a measurement.", len(knownDropping))
+		t.Errorf("knownDropping has %d entries, want 0. #8938 measured 26 of the "+
+			"50 dropping; the `nat` and `flow` families went in with #8943 and "+
+			"the remaining 13 landed after, so the list is now EMPTY and every "+
+			"measured drop has been admitted. ADDING one is only correct if a "+
+			"pair was measured to drop and NOT admitted — in which case the "+
+			"membership check below must also see it in the population, so both "+
+			"move together. A count change on its own means the record was "+
+			"edited without a measurement. (#8942: this message read \"want "+
+			"13\" while the assertion beside it required 0 — the message "+
+			"documented a state the code had already left.)", len(knownDropping))
 	}
 	// Every known-dropping pair must still be IN the population. One leaving it
 	// means it was admitted — good news that must be reflected here, because a
