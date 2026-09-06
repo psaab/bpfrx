@@ -207,6 +207,73 @@ func rewriteRetiredLeavesIn(system *config.Node, caller retireRewriteCaller) int
 	if rewrites > 0 {
 		system.Children = filtered
 	}
+	// #8964: THE PACKED SPELLING PUTS THE VALUE ON THE STANZA'S OWN KEYS, where
+	// the children walk above cannot reach it.
+	//
+	//	braced   Keys=[system]                       Children=[[dataplane-type ebpf]]
+	//	packed   Keys=[system dataplane-type ebpf]   Children=[]
+	//
+	// `systemBlocksOf` FINDS the packed stanza either way -- measured,
+	// systemBlocks=1 for both -- so this is not a walk that misses the node. It
+	// is a lookup that cannot see half the spellings of the thing it exists to
+	// neutralise, which is the whole job: the compiler HARD-REJECTS a retired
+	// value (ErrEBPFDataplaneRetired), so a token this rewriter leaves behind
+	// fails Store.Load and boots the node with ActiveConfig()==nil.
+	//
+	// Inert today only because `system dataplane-type` is not an admitted
+	// compact pair, so the compiler drops the packed tail anyway -- the same
+	// outcome by a different route. It stops being inert the moment the
+	// admission campaign reaches this container, which is one line in
+	// compactNormalizeInScope.
+	//
+	// FIXED HERE RATHER THAN BY FOLDING FIRST. Normalising ahead of the
+	// rewriter would change which tree continues down Store.Load for EVERY
+	// config, not just this container -- and lane-8015 measured that the naive
+	// form is a SILENT NO-OP, because config.NormalizeCompactForScan returns a
+	// CLONE when it folds while this function mutates in place: the rewrite
+	// lands on the clone, the caller keeps the original, and the count still
+	// says 1. A local lookup needs no ordering change and no decision about
+	// which tree survives, and it is correct whether or not the pair is ever
+	// admitted.
+	rewrites += rewriteRetiredPackedTail(system, caller)
+	return rewrites
+}
+
+// rewriteRetiredPackedTail neutralises a retired `dataplane-type <value>`
+// carried on the stanza node's OWN Keys rather than in a child, and reports
+// how many it removed.
+//
+// It trims the pair out of Keys instead of blanking the value, so the result is
+// the same shape the braced path produces: the leaf is GONE, not present with
+// an empty value. A `dataplane-type` with no value would reach the compiler as
+// a different malformed input rather than as an absent statement.
+func rewriteRetiredPackedTail(system *config.Node, caller retireRewriteCaller) int {
+	if system == nil || len(system.Keys) < 3 {
+		return 0
+	}
+	rewrites := 0
+	keys := system.Keys
+	out := append([]string(nil), keys[:1]...)
+	for i := 1; i < len(keys); i++ {
+		if keys[i] == "dataplane-type" && i+1 < len(keys) {
+			if rationale, ok := retiredDataplaneTypes[keys[i+1]]; ok {
+				slog.Warn(
+					caller.warnMessage(),
+					"dataplane_type", keys[i+1],
+					"rationale", rationale,
+					"remediation", caller.remediation(),
+					"spelling", "packed",
+				)
+				rewrites++
+				i++ // consume the value too
+				continue
+			}
+		}
+		out = append(out, keys[i])
+	}
+	if rewrites > 0 {
+		system.Keys = out
+	}
 	return rewrites
 }
 
