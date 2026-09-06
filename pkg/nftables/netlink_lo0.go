@@ -234,17 +234,44 @@ func buildLo0TermNetlink(p *nlPlan, t Lo0FilterTerm, f nlFamily) {
 
 	// reject (#3445 H10): a TCP RST plus a family-agnostic ICMP/ICMPv6
 	// admin-prohibited reply — two mutually-exclusive rules.
+	//
+	// #9072: emit only the rules the term's PROTOCOL can actually reach.
+	//
+	// `applyMatches` latches `l4Val` from the term's own protocol, so
+	// `needL4proto(protoTCP)` on a non-TCP term saw `l4Val != 6` and appended a
+	// SECOND, contradictory `meta l4proto` compare — `l4proto==11 &&
+	// l4proto==06`. Dead by construction, and operator-visible in
+	// `nft list ruleset`, where a self-contradictory rule invites misdiagnosis.
+	//
+	// ENFORCEMENT WAS NEVER AFFECTED and this does not claim otherwise: the
+	// icmpx rule always carried the correct family-agnostic reject for the
+	// specified protocols in every case, including the mixed `[tcp udp]` one.
+	// The change is which rules are EMITTED, never which packets are rejected —
+	// asserted by the cells rather than argued here.
 	if t.Action == "reject" {
-		a1 := p.rule()
-		applyMatches(a1)
-		a1.needL4proto(protoTCP)
-		applyMods(a1)
-		a1.emit(rejectTCPReset()...)
+		tcpReachable, tcpOnly := lo0RejectTCPReach(t)
 
-		a2 := p.rule()
-		applyMatches(a2)
-		applyMods(a2)
-		a2.emit(rejectICMPXAdminProhibited()...)
+		// The TCP-RST rule is reachable only if TCP is among the term's
+		// protocols (or the term names none, matching every protocol).
+		if tcpReachable {
+			a1 := p.rule()
+			applyMatches(a1)
+			a1.needL4proto(protoTCP)
+			applyMods(a1)
+			a1.emit(rejectTCPReset()...)
+		}
+
+		// The icmpx rule is DEAD for a TCP-ONLY term: the rule above already
+		// matches every packet this one could, and rejects it. Symmetric with
+		// the arm above rather than an afterthought — the table in #9072 shows
+		// the dead rule moving between r00 and r01 depending on the protocol,
+		// so fixing one end only would leave the other.
+		if !tcpOnly {
+			a2 := p.rule()
+			applyMatches(a2)
+			applyMods(a2)
+			a2.emit(rejectICMPXAdminProhibited()...)
+		}
 		return
 	}
 
@@ -352,6 +379,46 @@ func filterFamilyAddrs(f nlFamily, addrs []string) ([]string, error) {
 		return nil, fmt.Errorf("malformed address %q (neither an IP nor a CIDR prefix)", a)
 	}
 	return out, nil
+}
+
+// lo0RejectTCPReach reports, for a reject term, whether the TCP-RST rule is
+// REACHABLE and whether the term is TCP-ONLY (#9072).
+//
+// A term naming no protocol matches every protocol, so TCP is reachable and the
+// term is not TCP-only — that is the pre-#9072 shape and both rules are emitted,
+// unchanged.
+//
+// An UNRESOLVABLE protocol token is deliberately treated as "reachable, not
+// TCP-only", i.e. emit both rules exactly as before. `applyMatches` fails the
+// plan CLOSED on that token (#6806), so the rules are never installed; deciding
+// emission on a set this function could not resolve would be reasoning from a
+// value the caller is about to reject anyway, and the failure must come from
+// there rather than from a silently narrower ruleset here.
+func lo0RejectTCPReach(t Lo0FilterTerm) (tcpReachable, tcpOnly bool) {
+	if len(t.Protocols) == 0 {
+		return true, false
+	}
+	protos, err := lo0Protocols(t.Protocols)
+	// The `len(protos) == 0` arm is DEFENSIVE and unreachable today:
+	// lo0Protocols returns one entry per token or a non-nil error, and
+	// len(t.Protocols) > 0 is already established above. It is kept so a future
+	// lo0Protocols that can legitimately resolve to nothing degrades to the
+	// pre-#9072 both-rules shape rather than silently narrowing the ruleset —
+	// and it is labelled rather than left to look load-bearing, because a
+	// mutant that flips it SURVIVES and that survival is correct.
+	if err != nil || len(protos) == 0 {
+		return true, false
+	}
+	hasTCP := false
+	other := false
+	for _, pr := range protos {
+		if pr == protoTCP {
+			hasTCP = true
+		} else {
+			other = true
+		}
+	}
+	return hasTCP, hasTCP && !other
 }
 
 // lo0Protocols mirrors the #3436 numeric protocol lowering: resolve each Junos
