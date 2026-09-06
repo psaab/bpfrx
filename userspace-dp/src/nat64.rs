@@ -158,6 +158,7 @@
 //! reconstructible from `NatDecision` — to ride the sync payload; that is a
 //! separate wire-field follow-up (`ha.rs` sets `nat64_reverse: None`).
 
+use crate::afxdp::frame::checksum::{adjust_zero_checksum_illegal, ChecksumFamily};
 use crate::NAT64RuleSnapshot;
 // #2844: shared SSOT in-place Ethernet-header writer (one writer for
 // the whole dataplane). Re-exported `pub(crate)` from `crate::afxdp`
@@ -3503,8 +3504,8 @@ fn recompute_l4_checksum_after_nat64_v6_to_v4(packet: &mut [u8], protocol: u8) -
             // receiver still validates it. `checksum16_ipv4_pseudo` returns the
             // final one's-complement value, so a 0x0000 here is a real computed
             // checksum, not an internal sentinel. Mirrors the v4->v6 UDP arm.
-            let final_sum = if sum == 0 { 0xFFFF } else { sum };
-            l4[6..8].copy_from_slice(&final_sum.to_be_bytes());
+            let sum = canonicalize_zero_checksum(sum, protocol, ChecksumFamily::V4);
+            l4[6..8].copy_from_slice(&sum.to_be_bytes());
         }
         PROTO_ICMP => {
             if l4.len() < 4 {
@@ -3521,6 +3522,40 @@ fn recompute_l4_checksum_after_nat64_v6_to_v4(packet: &mut [u8], protocol: u8) -
 }
 
 /// Recompute L4 checksum after IPv4→IPv6 translation.
+/// Apply the codebase's ONE zero-checksum rule to a freshly computed sum
+/// (#9069).
+///
+/// `adjust_zero_checksum_illegal` (afxdp/frame/checksum.rs, #1839) is the
+/// declared single source of truth for which (protocol, family) pairs may not
+/// carry 0x0000: V4 UDP, and V6 UDP or ICMPv6. Every NAT64 recompute arm now
+/// consults it instead of hand-rolling `if sum == 0 { 0xFFFF }` per arm.
+///
+/// THE DEFECT THIS CLOSES. The `PROTO_ICMPV6` arm of the v4->v6 recompute wrote
+/// `sum` raw while its own UDP sibling ten lines above canonicalised — so a
+/// translated ICMPv6 message whose checksum folded to zero was emitted as
+/// 0x0000, which the SSOT says is illegal and which the afxdp-side
+/// `recompute_l4_checksum_ipv6` canonicalises. The zero is PRODUCIBLE, not
+/// theoretical: an Echo Reply payload ending (0xa1, 0x2a) folds to it.
+///
+/// WHAT THIS IS AND IS NOT. It is an internal consistency fix against a declared
+/// SSOT. It is NOT a wire-correctness fix: the originating report cited RFC 4443
+/// §2.3 and RFC 8200 §8.1 for a mandatory all-ones substitution on ICMPv6, and
+/// that rule is UDP-SPECIFIC in RFC 8200 §8.1 while RFC 4443 §2.3 contains no
+/// such sentence. A 0x0000 ICMPv6 checksum verifies correctly at a compliant
+/// receiver — there is no "no checksum" sentinel for ICMPv6 — so the claimed
+/// drop does not follow and is not claimed here.
+///
+/// The rule must NOT over-apply. A computed TCP 0x0000 is legal on the wire in
+/// both families, and V4 ICMP has no pseudo-header and no sentinel; both fall
+/// out of `adjust_zero_checksum_illegal` returning false, which is exactly why
+/// consulting it beats writing the condition again.
+fn canonicalize_zero_checksum(sum: u16, protocol: u8, family: ChecksumFamily) -> u16 {
+    if sum == 0 && adjust_zero_checksum_illegal(protocol, family) {
+        return 0xFFFF;
+    }
+    sum
+}
+
 fn recompute_l4_checksum_after_nat64_v4_to_v6(packet: &mut [u8], next_header: u8) -> Option<()> {
     let src = Ipv6Addr::from(<[u8; 16]>::try_from(packet.get(8..24)?).ok()?);
     let dst = Ipv6Addr::from(<[u8; 16]>::try_from(packet.get(24..40)?).ok()?);
@@ -3532,6 +3567,7 @@ fn recompute_l4_checksum_after_nat64_v4_to_v6(packet: &mut [u8], next_header: u8
             }
             l4[16..18].copy_from_slice(&[0, 0]);
             let sum = checksum16_ipv6_pseudo(src, dst, next_header, l4);
+            let sum = canonicalize_zero_checksum(sum, next_header, ChecksumFamily::V6);
             l4[16..18].copy_from_slice(&sum.to_be_bytes());
         }
         PROTO_UDP => {
@@ -3540,10 +3576,10 @@ fn recompute_l4_checksum_after_nat64_v4_to_v6(packet: &mut [u8], next_header: u8
             }
             l4[6..8].copy_from_slice(&[0, 0]);
             let sum = checksum16_ipv6_pseudo(src, dst, next_header, l4);
-            // UDP over IPv6: zero checksum is illegal, but if it computes to 0
-            // the standard says use 0xFFFF.
-            let final_sum = if sum == 0 { 0xFFFF } else { sum };
-            l4[6..8].copy_from_slice(&final_sum.to_be_bytes());
+            // UDP over IPv6: zero is illegal; the SSOT says so, and #9069 routes
+            // this through it rather than restating it.
+            let sum = canonicalize_zero_checksum(sum, next_header, ChecksumFamily::V6);
+            l4[6..8].copy_from_slice(&sum.to_be_bytes());
         }
         PROTO_ICMPV6 => {
             if l4.len() < 4 {
@@ -3552,6 +3588,8 @@ fn recompute_l4_checksum_after_nat64_v4_to_v6(packet: &mut [u8], next_header: u8
             // ICMPv6 DOES use pseudo-header.
             l4[2..4].copy_from_slice(&[0, 0]);
             let sum = checksum16_ipv6_pseudo(src, dst, next_header, l4);
+            // #9069: THE arm that was missing the canonicalisation.
+            let sum = canonicalize_zero_checksum(sum, next_header, ChecksumFamily::V6);
             l4[2..4].copy_from_slice(&sum.to_be_bytes());
         }
         _ => {}
@@ -4115,3 +4153,162 @@ fn frame_l3_offset(frame: &[u8]) -> Option<usize> {
 #[cfg(test)]
 #[path = "nat64_tests.rs"]
 mod tests;
+
+/// #9069: every NAT64 recompute arm applies the codebase's ONE zero-checksum
+/// rule, and applies it only where that rule says to.
+///
+/// The `PROTO_ICMPV6` arm of the v4->v6 recompute wrote `sum` raw while its own
+/// UDP sibling ten lines above canonicalised, and while
+/// `adjust_zero_checksum_illegal` — this codebase's declared SSOT (#1839) — says
+/// V6 zero is illegal for UDP *and ICMPv6*. The afxdp-side
+/// `recompute_l4_checksum_ipv6` canonicalises its ICMPv6 arm; the NAT64
+/// translator diverged from the rule its sibling path enforces.
+///
+/// SCOPE, stated because the originating report's stated consequence was
+/// REFUTED: it cited RFC 4443 §2.3 and RFC 8200 §8.1 for a mandatory all-ones
+/// substitution on ICMPv6, and that rule is UDP-specific in RFC 8200 §8.1 while
+/// RFC 4443 §2.3 contains no such sentence. A 0x0000 ICMPv6 checksum verifies
+/// correctly at a compliant receiver. This is an internal SSOT-consistency fix,
+/// not a wire-correctness one, and these cells assert consistency accordingly.
+#[cfg(test)]
+mod nat64_zero_checksum_ssot_9069_tests {
+    use super::*;
+
+    /// A minimal IPv6 + ICMPv6 Echo Reply whose last two payload bytes are
+    /// caller-chosen, so a cell can drive the checksum to a specific value.
+    fn icmpv6_echo_reply_9069(tail: [u8; 2]) -> Vec<u8> {
+        let mut p = vec![0u8; 40];
+        p[0] = 0x60;
+        p[6] = PROTO_ICMPV6;
+        p[7] = 64;
+        // src = 64:ff9b::/96 mapped, dst = a client address; the exact values
+        // only matter in that both cells use the SAME ones.
+        p[0..1].copy_from_slice(&[0x60]);
+        p[8..24].copy_from_slice(&[
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+        ]);
+        p[24..40].copy_from_slice(&[
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02,
+        ]);
+        // ICMPv6 Echo Reply: type 129, code 0, checksum (filled), id, seq, payload.
+        let mut l4 = vec![129u8, 0, 0, 0, 0x12, 0x34, 0x00, 0x01];
+        l4.extend_from_slice(&tail);
+        p[4..6].copy_from_slice(&(l4.len() as u16).to_be_bytes());
+        p.extend_from_slice(&l4);
+        p
+    }
+
+    /// Brute-force the two-byte tail that makes the ICMPv6 checksum fold to
+    /// zero, so the cell below cannot silently stop being about a zero.
+    ///
+    /// The issue reports (0xa1, 0x2a) for ITS packet; this one differs, so the
+    /// value is DERIVED here rather than copied. A hard-coded tail from another
+    /// fixture would be the shape where a cell passes while testing nothing —
+    /// the checksum would simply be non-zero and the canonicalisation never
+    /// exercised.
+    fn tail_that_folds_to_zero_9069() -> [u8; 2] {
+        for a in 0u16..=255 {
+            for b in 0u16..=255 {
+                let mut p = icmpv6_echo_reply_9069([a as u8, b as u8]);
+                let src = Ipv6Addr::from(<[u8; 16]>::try_from(&p[8..24]).unwrap());
+                let dst = Ipv6Addr::from(<[u8; 16]>::try_from(&p[24..40]).unwrap());
+                p[42..44].copy_from_slice(&[0, 0]);
+                if checksum16_ipv6_pseudo(src, dst, PROTO_ICMPV6, &p[40..]) == 0 {
+                    return [a as u8, b as u8];
+                }
+            }
+        }
+        panic!("no two-byte tail folds this packet's ICMPv6 checksum to zero — the \
+                fixture changed and the cell below would assert nothing");
+    }
+
+    /// THE DEFECT: a translated ICMPv6 message whose checksum folds to zero must
+    /// be emitted as 0xFFFF, matching the UDP sibling and the SSOT.
+    #[test]
+    fn a_zero_folding_icmpv6_checksum_is_canonicalised_9069() {
+        let tail = tail_that_folds_to_zero_9069();
+        let mut pkt = icmpv6_echo_reply_9069(tail);
+
+        recompute_l4_checksum_after_nat64_v4_to_v6(&mut pkt, PROTO_ICMPV6)
+            .expect("recompute must succeed on a well-formed packet");
+
+        let written = u16::from_be_bytes([pkt[42], pkt[43]]);
+        assert_ne!(
+            written, 0x0000,
+            "#9069: the ICMPv6 arm emitted 0x0000. Its own UDP sibling ten lines \
+             above canonicalises, and adjust_zero_checksum_illegal — the declared \
+             SSOT — says V6 zero is illegal for ICMPv6, which the afxdp-side \
+             recompute_l4_checksum_ipv6 already honours. The translator diverged \
+             from the rule its sibling path enforces"
+        );
+        assert_eq!(
+            written, 0xFFFF,
+            "#9069: a zero-folding checksum must become all-ones, not some other \
+             value"
+        );
+    }
+
+    /// MUST NOT OVER-APPLY — TCP. A computed TCP 0x0000 is LEGAL on the wire in
+    /// both families (this is why the sibling finding GEMINI-050-009 was
+    /// refuted), so the canonicalisation must leave it alone. Without this cell a
+    /// "fix" that canonicalised unconditionally would satisfy the one above while
+    /// corrupting every TCP checksum that legitimately computes to zero.
+    #[test]
+    fn a_zero_tcp_checksum_is_left_alone_9069() {
+        assert_eq!(
+            canonicalize_zero_checksum(0, PROTO_TCP, ChecksumFamily::V6),
+            0,
+            "#9069: a computed TCP 0x0000 is valid on the wire and must survive \
+             the canonicalisation untouched"
+        );
+        assert_eq!(
+            canonicalize_zero_checksum(0, PROTO_TCP, ChecksumFamily::V4),
+            0,
+            "#9069: same for v4 TCP"
+        );
+    }
+
+    /// MUST NOT OVER-APPLY — v4 ICMP. It carries no pseudo-header and has no
+    /// zero sentinel, so V4/ICMP is deliberately absent from the SSOT's matrix.
+    /// A fix that keyed on "is it ICMP-ish" rather than on the (protocol, family)
+    /// PAIR would corrupt it.
+    #[test]
+    fn a_zero_v4_icmp_checksum_is_left_alone_9069() {
+        assert_eq!(
+            canonicalize_zero_checksum(0, PROTO_ICMP, ChecksumFamily::V4),
+            0,
+            "#9069: v4 ICMP has no pseudo-header and no zero sentinel — the rule \
+             is keyed on the (protocol, family) PAIR, not on the protocol alone"
+        );
+    }
+
+    /// The pairs the SSOT DOES cover must canonicalise, in both families.
+    #[test]
+    fn the_ssot_pairs_canonicalise_9069() {
+        for (proto, fam, name) in [
+            (PROTO_UDP, ChecksumFamily::V4, "v4 UDP"),
+            (PROTO_UDP, ChecksumFamily::V6, "v6 UDP"),
+            (PROTO_ICMPV6, ChecksumFamily::V6, "v6 ICMPv6"),
+        ] {
+            assert_eq!(
+                canonicalize_zero_checksum(0, proto, fam),
+                0xFFFF,
+                "#9069: {name} carries a zero sentinel and must canonicalise"
+            );
+        }
+    }
+
+    /// A NON-zero sum must pass through untouched for every pair — otherwise the
+    /// cells above could be satisfied by a function that always returns 0xFFFF.
+    #[test]
+    fn a_nonzero_checksum_is_never_rewritten_9069() {
+        for (proto, fam) in [
+            (PROTO_UDP, ChecksumFamily::V6),
+            (PROTO_ICMPV6, ChecksumFamily::V6),
+            (PROTO_TCP, ChecksumFamily::V6),
+            (PROTO_UDP, ChecksumFamily::V4),
+        ] {
+            assert_eq!(canonicalize_zero_checksum(0x1234, proto, fam), 0x1234);
+        }
+    }
+}

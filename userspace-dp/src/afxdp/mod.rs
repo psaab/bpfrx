@@ -82,7 +82,7 @@ mod flow_cache;
 mod forwarding;
 mod forwarding_build;
 #[path = "frame/mod.rs"]
-mod frame;
+pub(crate) mod frame;
 #[path = "gre.rs"]
 mod gre;
 mod logical_ingress;
