@@ -1021,7 +1021,17 @@ func compileRouterAdvertisement(node *Node, proto *ProtocolsConfig) error {
 			}
 		}
 
-		for _, prop := range inst.node.Children {
+		// #8939: `set … interface ge-0/0/0 managed-configuration
+		// default-lifetime 0` nests each leaf under the previous one, so this
+		// loop saw only the flag. That RE-CREATES #4119 BY A DIFFERENT ROUTE:
+		// DefaultLifetimeSet stays false, and pkg/ra/sender.go falls back to
+		// defaultRouterLifetime (1800) -- so an EXPLICIT `default-lifetime 0`,
+		// which RFC 4861 6.2.1 defines as "this router is NOT a default
+		// router", is advertised as 1800 and the router hijacks host
+		// default-route selection on a multi-router LAN. #4119 fixed the
+		// `lifetime <= 0` coercion in the sender; the flat spelling reaches the
+		// identical outcome by never setting the flag at all.
+		for _, prop := range expandFlatRun(inst.node.Children, raInterfaceSchema8939()) {
 			switch prop.Name() {
 			case "managed-configuration":
 				ra.ManagedConfig = true
