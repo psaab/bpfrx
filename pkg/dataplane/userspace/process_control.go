@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"path/filepath"
 	"strings"
 	"time"
@@ -151,7 +150,14 @@ func (m *Manager) requestDetailedLocked(req ControlRequest) (ControlResponse, er
 				"request before applying it)",
 			req.Type, len(body), MaxControlRequestBytes)
 	}
-	conn, err := net.DialTimeout("unix", m.cfg.ControlSocket, 2*time.Second)
+	// #9003: SO_PEERCRED before a single byte is written. `apply_snapshot`
+	// carries the WireGuard local private key and every per-peer preshared key
+	// in CLEARTEXT (tunnels.go), so "whoever holds this path" is not an
+	// acceptable answer to "who am I talking to". The check is race-free where a
+	// path check is not: the kernel answers for the socket THIS connection is
+	// attached to, so swapping the path between a stat and the connect defeats
+	// nothing.
+	conn, err := dialTrustedHelperSocket("control socket", m.cfg.ControlSocket, 2*time.Second)
 	if err != nil {
 		return ControlResponse{}, err
 	}
@@ -180,7 +186,10 @@ func (m *Manager) requestDetailedLocked(req ControlRequest) (ControlResponse, er
 		return ControlResponse{}, err
 	}
 	var resp ControlResponse
-	if err := json.NewDecoder(bufio.NewReader(conn)).Decode(&resp); err != nil {
+	// #9003: byte-bounded, not merely deadline-bounded. Over AF_UNIX a 3 s
+	// deadline still admits GB-scale allocation at memory bandwidth, and
+	// ControlResponse retains four unbounded slice fields.
+	if err := json.NewDecoder(bufio.NewReader(boundedResponseReader(conn))).Decode(&resp); err != nil {
 		// A bare EOF here means the helper closed the socket without writing a
 		// response — it rejected the request before replying (e.g. a request
 		// that failed to decode, like the #1961 wire-type mismatch). Surface an
@@ -275,7 +284,10 @@ func (m *Manager) requestSessionSyncLocked(req ControlRequest) error {
 	// wrapped with errSessionHelperUnreachable so a bulk caller can abort the
 	// rest of the batch instead of paying this deadline once per request
 	// (#5380).
-	conn, err := net.DialTimeout("unix", sockPath, sessionSyncDialTimeout)
+	// #9003: same peer check as the control socket. The session socket sits in
+	// the same directory, is bound by the same helper, and reaches the same
+	// handler dispatch — a squatter on it installs and reads sessions.
+	conn, err := dialTrustedHelperSocket("session socket", sockPath, sessionSyncDialTimeout)
 	if err != nil {
 		return fmt.Errorf("%w: dial session socket: %w", errSessionHelperUnreachable, err)
 	}
@@ -285,7 +297,8 @@ func (m *Manager) requestSessionSyncLocked(req ControlRequest) error {
 		return fmt.Errorf("%w: write session request: %w", errSessionHelperUnreachable, err)
 	}
 	var resp ControlResponse
-	if err := json.NewDecoder(bufio.NewReader(conn)).Decode(&resp); err != nil {
+	// #9003: byte-bounded as well as deadline-bounded — see requestDetailedLocked.
+	if err := json.NewDecoder(bufio.NewReader(boundedResponseReader(conn))).Decode(&resp); err != nil {
 		return fmt.Errorf("%w: read session response: %w", errSessionHelperUnreachable, err)
 	}
 	if !resp.OK {

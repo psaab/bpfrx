@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"encoding/json"
 	"errors"
-	"net"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -80,7 +79,13 @@ func ProbeStatus(controlSocket string, timeout time.Duration) (*ProcessStatus, e
 	if timeout <= 0 {
 		timeout = 2 * time.Second
 	}
-	conn, err := net.DialTimeout("unix", controlSocket, timeout)
+	// #9003: this is the EARLIEST dial of the control socket — it runs before
+	// any helper spawn (pkg/daemon/bootstrap.go), so removeStaleUnixSocket's
+	// fail-closed guard has not run and no path check has happened yet. Whoever
+	// answers here decides the #1993 fail-closed boot decision and the #5286
+	// upgrade-readiness gate, so a squatter could LIE about Enabled /
+	// ForwardingArmed. SO_PEERCRED is what makes that answer attributable.
+	conn, err := dialTrustedHelperSocket("control socket", controlSocket, timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -91,7 +96,8 @@ func ProbeStatus(controlSocket string, timeout time.Duration) (*ProcessStatus, e
 		return nil, err
 	}
 	var resp ControlResponse
-	if err := json.NewDecoder(bufio.NewReader(conn)).Decode(&resp); err != nil {
+	// #9003: byte-bounded as well as deadline-bounded.
+	if err := json.NewDecoder(bufio.NewReader(boundedResponseReader(conn))).Decode(&resp); err != nil {
 		return nil, err
 	}
 	if !resp.OK {
