@@ -145,14 +145,56 @@ pub(in crate::afxdp) fn try_wg_decap_from_frame(
     let (endpoint, engine) = wg_endpoint_for_listen_port(forwarding, dst_port)?;
 
     let mut decap_buf = scratch.decap_out.borrow_mut();
-    let outcome = engine.try_decap(record, &mut decap_buf).ok()?;
+    // #9018: `.ok()?` used to collapse EVERY error arm here, and two of them
+    // carry the proven peer public key on purpose: `Keepalive` (#7230) and
+    // `MalformedInner` (#7686) were both given a `[u8; 32]` payload precisely
+    // so the identity would stop dying with the error. Both are POST-AEAD —
+    // `try_decap` demuxes the session from `hdr.receiver_index` before any AEAD
+    // work and the record is authenticated by the time either is constructed —
+    // so the peer they name is proven, not guessed. That is the same basis the
+    // success arm's roam report stands on a few dozen lines below.
+    //
+    // A keepalive is the case that matters. It is a type-4 transport record, so
+    // `wg_worker_claims_record` claims it for the worker and the shim declines
+    // `cpumap_or_pass`; the socket path in wg_control/dispatch.rs, which DOES
+    // map both arms to `InboundOutcome::Authenticated(pk)`, never sees it. So a
+    // keepalive from a NAT-rebound or roaming endpoint — the exact situation
+    // WireGuard keepalives exist for — moved nothing.
+    //
+    // Scope: the endpoint is observed and the frame is then declined exactly as
+    // before. There is no inner packet to adjudicate on either arm, so the "no
+    // delivery" contract is unchanged; this is a cold path with no fast-path
+    // cost.
+    let outcome = match engine.try_decap(record, &mut decap_buf) {
+        Ok(outcome) => outcome,
+        Err(super::engine::DecapError::Keepalive(peer_pubkey))
+        | Err(super::engine::DecapError::MalformedInner(peer_pubkey)) => {
+            if let Some(src_ip) = outer_source_ip(outer, meta) {
+                engine.note_worker_observed_endpoint(
+                    &peer_pubkey,
+                    std::net::SocketAddr::new(src_ip, src_port),
+                );
+            }
+            return None;
+        }
+        // Every other arm is unauthenticated or carries no identity. An
+        // unauthenticated datagram must never move a peer's endpoint, or anyone
+        // who can reach the listen port could redirect a tunnel's egress.
+        Err(_) => return None,
+    };
     // The contract on `try_decap` is that `out` MUST NOT be inspected on Err —
     // every post-AEAD error arm zeroes it — which the `?` above honours by not
     // reaching this line.
     let inner = decap_buf.get(..outcome.len)?;
-    // A keepalive is a zero-length payload and decodes to an empty inner. It
-    // authenticated, so the control thread's endpoint learning still wants it,
-    // but there is no inner packet to adjudicate and nothing to forward.
+    // Defensive only. A keepalive does NOT arrive here: `try_decap` returns
+    // `Err(DecapError::Keepalive(..))` for a zero-length plaintext before it can
+    // produce an `Ok`, so `outcome.len` is never 0 today and this branch is
+    // unreachable. It used to carry a comment saying the control thread's
+    // endpoint learning "still wants it" — describing, on an unreachable arm,
+    // the very work the `.ok()?` above was throwing away (#9018). The endpoint
+    // observation now happens on the real keepalive arm; this stays as a guard
+    // against a future `Ok` with an empty plaintext rather than as a claim about
+    // what keepalives do.
     if inner.is_empty() {
         return None;
     }
