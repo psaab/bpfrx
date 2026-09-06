@@ -6,6 +6,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"time"
@@ -317,6 +318,52 @@ func (b *route53Backend) change(ctx context.Context, action, name, rtype string,
 // empty (first publish / prior value lost) the merge is ADDITIVE — it coexists
 // with any foreign member; a genuinely-unknown prior xpf value leaks a stale row
 // rather than clobbering a foreign one (mirrors the Cloudflare / RFC 2136 fix).
+
+// canonicalRRValueKey9147 is the COMPARISON KEY for an RRset value: an IP is
+// normalized through netip so two spellings of one address compare equal, and
+// anything unparseable is kept verbatim.
+//
+// #9147: mergeUpsertValues, removeValue and sameValueSet compared raw strings,
+// so an AAAA written expanded (`2001:0db8:0000:...:0001`) and the same address
+// written compressed (`2001:db8::1`) were two different values. AWS's own
+// "Supported DNS record types" page gives the AAAA example in the expanded form
+// -- so an operator pre-seeding the FQDN by following that documentation
+// produces a string that can never byte-equal what xpf writes, and
+// mergeUpsertValues then puts BOTH into one ChangeBatch. Its own comment says
+// "Route 53 rejects a duplicate value in one RRset", so that publish 400s on
+// every tick and the record never converges.
+//
+// WHY THIS LANDS WITHOUT SETTLING THE EXTERNAL QUESTION. The issue is filed
+// UNRESOLVED because whether Route 53 echoes AAAA values verbatim or
+// normalized cannot be observed from inside the repo, and it gated the fix on
+// that answer. The fix does not actually depend on it, for two reasons:
+//
+//   - Comparing IP VALUES byte-exactly is wrong on its face. Two spellings of
+//     one address are one address, whatever any particular server echoes.
+//   - THE REPO ALREADY HOLDS THIS POSITION. wireRRClaim (pkg/ddns/state.go)
+//     normalizes rdata through netip "so the two ownership surfaces ... compare
+//     EQUAL for the same address even if their textual forms differ (e.g. an
+//     IPv6 address written expanded vs compressed)". That is this exact
+//     argument, already made and already shipped, on a path that reaches the
+//     same data. This one did not use it.
+//
+// If Route 53 does normalize on storage, this is INERT rather than wrong: every
+// value read back is already canonical and the key equals the string. So the
+// unmeasurable premise decides whether the defect is reachable today, not
+// whether the comparison is correct.
+//
+// KEY-ONLY, deliberately. The normalized form is never emitted for a value xpf
+// does not own: rewriting a foreign member's spelling on write-back would edit
+// someone else's record to suit our comparison, which is the same
+// sole-delete-authority boundary DeleteLease's doc comment draws. Output keeps
+// the ORIGINAL string.
+func canonicalRRValueKey9147(v string) string {
+	if a, err := netip.ParseAddr(strings.TrimSpace(v)); err == nil {
+		return a.Unmap().String()
+	}
+	return v
+}
+
 func mergeUpsertValues(current []string, prevVal, newVal string) []string {
 	out := make([]string, 0, len(current)+1)
 	seen := make(map[string]struct{}, len(current)+1)
@@ -324,14 +371,17 @@ func mergeUpsertValues(current []string, prevVal, newVal string) []string {
 		if v == "" {
 			return
 		}
-		if _, ok := seen[v]; ok {
+		// #9147: dedup on the canonical KEY, emit the ORIGINAL string.
+		k := canonicalRRValueKey9147(v)
+		if _, ok := seen[k]; ok {
 			return
 		}
-		seen[v] = struct{}{}
+		seen[k] = struct{}{}
 		out = append(out, v)
 	}
+	prevKey := canonicalRRValueKey9147(prevVal)
 	for _, v := range current {
-		if prevVal != "" && v == prevVal {
+		if prevVal != "" && canonicalRRValueKey9147(v) == prevKey {
 			continue // drop xpf's OWN prior value (renumber in place)
 		}
 		add(v)
@@ -344,8 +394,11 @@ func mergeUpsertValues(current []string, prevVal, newVal string) []string {
 // reports whether anything was removed.
 func removeValue(current []string, owned string) (out []string, removed bool) {
 	out = make([]string, 0, len(current))
+	ownedKey := canonicalRRValueKey9147(owned)
 	for _, v := range current {
-		if v == owned {
+		// #9147: match on the canonical key, so an owned value that AWS echoed
+		// in a different spelling is still recognised as ours.
+		if canonicalRRValueKey9147(v) == ownedKey {
 			removed = true
 			continue
 		}
@@ -357,13 +410,15 @@ func removeValue(current []string, owned string) (out []string, removed bool) {
 // sameValueSet reports whether a and b hold the same values (order-independent,
 // de-duplicated) — the idempotency gate that skips a no-op UPSERT.
 func sameValueSet(a, b []string) bool {
+	// #9147: compare on canonical keys, or a no-op upsert whose only difference
+	// is an address spelling is published every tick.
 	sa := make(map[string]struct{}, len(a))
 	for _, v := range a {
-		sa[v] = struct{}{}
+		sa[canonicalRRValueKey9147(v)] = struct{}{}
 	}
 	sb := make(map[string]struct{}, len(b))
 	for _, v := range b {
-		sb[v] = struct{}{}
+		sb[canonicalRRValueKey9147(v)] = struct{}{}
 	}
 	if len(sa) != len(sb) {
 		return false
