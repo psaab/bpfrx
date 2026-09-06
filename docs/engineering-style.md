@@ -677,11 +677,40 @@ walks EVERY production `.go` file under `pkg/` (#1916, repo-wide — not a
 package allowlist) and fails the suite when a direct `os.WriteFile` lands
 in a function that is not on the receiver-aware allowlist.
 
+**The first three classes are all defined over REPLACE-A-FILE writes.** A
+fourth operation exists and had no row here until #9057, which is why four
+sites got it wrong the same way — see `DurableNamespace` below.
+
 | Class | Writer | Meaning | Examples |
 |---|---|---|---|
 | DurableState | `fsatomic.WriteFileDurable` | Must survive power loss: temp + fsync + rename + parent-dir fsync. | active config (`.configdb`), rollback slot 1, rescue config, `master.key`, DHCPv6 DUID, `frr.conf`, `/etc/hostname`, sudoers drop-in, user + root `authorized_keys`, TLS cert + key (`/etc/xpf/tls/*`), lifeline record, provisioned-users / -passwords / -keys markers (#5841) |
 | AtomicGeneratedConfig | `fsatomic.WriteFileAtomic` | Regenerated on boot/apply; a torn file is unacceptable, a lost-on-power-cut update is fine. **No fsync — this class exists so hot apply paths never pay one.** | swanctl conf, Kea configs, networkd `.link`/`.network`, rollback slots 2..N, sshd drop-in, rsyslog drop-in, chrony drop-in, `ssh_known_hosts`, `/etc/timezone`, `/etc/resolv.conf` |
 | BestEffortKernelKnob | direct `os.WriteFile` | procfs/sysfs: rename does not exist there, the atomic writers are impossible by construction. Also the `/etc/resolv.conf` bind-mount in-place fallback (rename onto a bind mount is EXDEV/EBUSY). | `rp_filter`, `accept_dad`/`addr_gen_mode`, RPS/RFS/XPS, `fib_multipath_hash_policy`, socket-buffer sysctls |
+| **DurableNamespace** (#9057) | `fsatomic.RenameDurable`, or the renames followed by ONE `fsatomic.SyncDir` | The durable artifact is the DIRECTORY ENTRY, not a file's contents: rotating a generation set (`x` → `x.1` → `x.2`), or any rename whose new name must survive a power cut. A rename is atomic for the entry and the entry is **not durable until the containing directory is fsynced**. | audit-journal segment rotation, local-log and flow-trace rotation, CLI monitor trace rotation |
+
+**Why DurableNamespace needed its own row rather than a note under
+DurableState.** Four sites rotated generations without a directory fsync, and
+they did not do it because four authors were careless — the operation had no
+row in this table and no primitive in `pkg/fsatomic` to reach for, and the
+canary that enforces the table only ever looked at `os.WriteFile`. That is what
+a missing class looks like from below: not one bug repeated, but the same gap
+found four times. **Two of the four were in no review report**; they were found
+by sweeping the OPERATION rather than by reading the file a finding pointed at,
+and one of them is a near-verbatim sibling of another that was hardened
+*alongside* it for symlink safety and *apart* from it for durability.
+
+`TestNoUnsyncedRename` (the #9057 sibling canary) enforces the row. It accepts a
+bare `os.Rename` in a function that also reaches `fsatomic.SyncDir` or
+`RenameDurable` — which is what a correct rotation looks like: N renames into
+one directory, then ONE `SyncDir`. **Keying on the function's behaviour rather
+than on a list of blessed paths** is deliberate: every `pkg/upgrade` staged
+promotion already syncs in-function and therefore needs no allowlist entry at
+all, so the list stays short and cannot rot as files move.
+
+The honest consequence bound, because the class name sounds worse than it is:
+the observable window is an **unclean shutdown only** (power cut / panic), and
+what is lost is the newest seconds of lines plus possibly the generation
+numbering. It is **not** corruption, and no file contents are destroyed.
 
 Special cases:
 
