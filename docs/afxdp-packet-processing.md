@@ -122,9 +122,35 @@ The shim checks several conditions before redirecting a packet to userspace:
    the coordinate back into range would still steer to a wrong slot, which is
    the #5173 defect in another form. A NIC exposing more than 16 RX queues
    therefore requires reducing its channel count (`ethtool -L`) or a
-   coordinated stride bump; the helper planner
-   (`replan_bindings_from_candidates`) does not cap the queue count, so the
-   Go boundary is the enforcement point for what gets published.
+   coordinated stride bump.
+
+   **The planner DOES cap the queue count (#7497), and the cap is not a
+   mitigation (#9040).** `replan_bindings_from_candidates` binds
+   `min(rx, BINDING_QUEUES_PER_IFACE)` per interface. That keeps a wide NIC
+   usable on its first 16 queues; it does nothing about the other `Q-16`,
+   because RSS keeps hashing across all of them. A packet steered to an unbound
+   queue has no binding, so the shim passes local/control traffic to the kernel
+   and takes `drop_degraded_transit` on transit — a steady loss of roughly
+   `(Q-16)/Q` on that interface while it reads up.
+
+   RSS is reshaped to fit the bound set (`computeWeightVector`, which clamps
+   `active` to `min(queues, BindingQueuesPerIface)`) **only on `mlx5_core`** —
+   `pkg/daemon/rss_indirection.go` guards on the driver and skips everything
+   else. So an mlx5 NIC is protected by that clamp and a virtio-net / i40e /
+   ice / bnxt NIC with more than 16 queues is not. There is no `ethtool -L`
+   anywhere in this tree, so nothing reduces the channel count on the box's
+   behalf.
+
+   Since #9040 the cap logs a named warning at bring-up, and the resulting
+   drops are exported as
+   `xpf_dataplane_degraded_path_total{reason="binding_missing"}`. **The
+   operator remedy is still `ethtool -L <iface> combined 16`** (or a coordinated
+   stride bump); whether the planner should instead REFUSE such a plan — the
+   doctrine its own slot-cap sibling states, *"a partial plan is an
+   availability failure indistinguishable from healthy"* — is the open question
+   on #9040.
+
+   The Go boundary remains the enforcement point for what gets published.
 
    **The slot axis is a SEPARATE bound, and is not covered by any of the
    above (#7497).** The composed index `ifindex * 16 + queue` addresses
