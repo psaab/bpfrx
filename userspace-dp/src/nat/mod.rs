@@ -158,6 +158,11 @@ mod tests_aggregate_budget;
 #[path = "tests_newflow_lock.rs"]
 mod tests_newflow_lock;
 
+// #9130: the deterministic-CGNAT allocator's mutex SCOPE around the block probe.
+#[cfg(test)]
+#[path = "tests_det_lock_scope_9130.rs"]
+mod tests_det_lock_scope_9130;
+
 /// #3096: per-flow interface / routing-instance identity passed into the NAT
 /// match path so an interface- or routing-instance-scoped rule-set matches
 /// only its named traffic. The forwarding layer resolves each ifindex to its
