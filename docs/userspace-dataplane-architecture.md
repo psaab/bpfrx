@@ -1075,8 +1075,22 @@ the NAT module applies it:
   so any unrelated flow advancing it could land a later flow on an owned
   address. An `address-persistent` pool keeps its single-probe contract (the
   sticky address is intentional, not round-robin); the deterministic-CGNAT
-  (#5341) and address-only persistent-NAT (#6041) branches likewise single-probe
-  their chosen address. With global source
+  (#5341) branch likewise single-probes its chosen address, and has nowhere else
+  to go by construction — a subscriber's block is a pure function of its
+  address. The address-only PERSISTENT-NAT branch (#6041,
+  `reserve_address_only_persistent`) single-probed too until **#9131**, which
+  gave it the same rotation for the one case where rotating is legitimate: a
+  FRESH lease on a pool with `address-persistent` OFF. The refusal is kept — it
+  is the fail-CLOSED direction — for the two PINNED cases, an
+  `address-persistent` pool (the address is `sticky_pool_index(src_ip)`, a pure
+  function of the source) and an EXISTING lease (the address is pinned by
+  `persistent-nat` for the permit scope's lifetime, and two flows sharing one
+  public reverse identity are genuinely ambiguous on the return path). The
+  motivating shape is a port-less protocol: for GRE(47)/ESP(50)/ICMP the
+  identity degenerates to `(proto, translated_ip, 0, dst_ip, 0)`, so two tunnels
+  from different subscribers to the same popular remote — a VPN concentrator, a
+  cloud SASE endpoint — collided on whichever pool address they landed on, and
+  the second was denied while other pool addresses sat idle. With global source
   NAT `address-persistent`, the userspace dataplane hashes a domain-tag seed,
   address family, and canonical source IP bytes with a seeded non-cryptographic
   FxHash (`rustc_hash`) to choose a stable pool index (userspace-v2; #2349
