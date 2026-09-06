@@ -71,6 +71,15 @@ func (c *xpfCollector) initGlobalDescriptors() {
 			"including at zero (#9019).",
 		nil, nil,
 	)
+	c.bindingWedgeGiveupsTotal = prometheus.NewDesc(
+		"xpf_binding_wedge_giveups_total",
+		"Total times bounded auto-rebind exhausted its budget and STOPPED "+
+			"trying to recover a wedged XSK binding. Those queues do not "+
+			"forward and binding readiness cannot see them (#8384), so this "+
+			"is the only standing signal that a box is in that state. Always "+
+			"emitted, including at zero (#9043).",
+		nil, nil,
+	)
 	c.learnedRouteCapHitsTotal = prometheus.NewDesc(
 		"xpf_learned_route_cap_hits_total",
 		"Total snapshot builds that declined learned routes at the cap, i.e. "+
