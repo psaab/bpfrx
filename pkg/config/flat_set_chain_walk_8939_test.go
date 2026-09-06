@@ -139,6 +139,35 @@ type flatSetChainRow struct {
 type flatSetLeaf struct {
 	name string
 	args int
+	// example is the schema's OWN illustrative value for this slot
+	// (`valueExamples[0]`), empty when the schema declares none.
+	//
+	// #9108: the generator used to derive every value from the leaf's NAME.
+	// For a TYPED slot that is a guess against a validator, and it loses:
+	// measured, 57 of the 530 leaves in census rows declare a valueType and
+	// 42 of those received the bare placeholder `xpfval`, which their
+	// validator rejects. `isis authentication-type` -- the leaf in the
+	// MD5-downgrade finding -- was one of them, with the schema sitting on
+	// the literal string `md5` the whole time.
+	//
+	// The consequence is worse than the args:0 defect, because it lands in
+	// `vacuous` rather than `unmeasured`. `unmeasured` is honest about being
+	// a non-result; VACUOUS READS AS A VERDICT -- "the last leaf is not
+	// observable in the typed config at all" -- and that is a confident claim
+	// about the compiler produced by a defect in the harness. Controlled by
+	// lane-8388 at three containers:
+	//
+	//	lldp  transmit-interval  placeholder -> observable=false
+	//	lldp  transmit-interval  REAL VALUE  -> observable=TRUE
+	//	aging low-watermark      placeholder -> observable=false
+	//	aging low-watermark      REAL VALUE  -> observable=TRUE
+	//
+	// And a `vacuous` row is EXCLUDED FROM THE LOSER LIST, so a container
+	// whose third leaf is typed can never produce a three-leaf loser row --
+	// which silently removes the two-versus-three discrimination #9078/#9079
+	// exist to provide, at exactly the containers a typed third leaf makes
+	// interesting.
+	example string
 }
 
 // spell renders the leaf as an operator would write it: a flag alone, a
@@ -146,6 +175,9 @@ type flatSetLeaf struct {
 func (l flatSetLeaf) spell() string {
 	if l.args == 0 {
 		return l.name
+	}
+	if l.example != "" {
+		return l.name + " " + l.example
 	}
 	return l.name + " " + flatSetSyntheticValue(l.name)
 }
@@ -186,7 +218,11 @@ func flatSetChainPairs() []flatSetChainRow {
 		var leaves []flatSetLeaf
 		for k, c := range n.children {
 			if c != nil && c.children == nil && c.wildcard == nil && !c.multi {
-				leaves = append(leaves, flatSetLeaf{name: k, args: c.args})
+				lf := flatSetLeaf{name: k, args: c.args}
+				if len(c.valueExamples) > 0 {
+					lf.example = c.valueExamples[0]
+				}
+				leaves = append(leaves, lf)
 			}
 		}
 		sort.Slice(leaves, func(i, j int) bool { return leaves[i].name < leaves[j].name })

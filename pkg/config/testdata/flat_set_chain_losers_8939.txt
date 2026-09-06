@@ -1,6 +1,7 @@
-# counts: losers=47 walked=48 vacuous=51 unmeasured=75
+# counts: losers=53 walked=52 vacuous=43 unmeasured=73
 # collector reach: 363 containers walked, 133 reached the census (134 dropped: no eligible leaf, 96 dropped: only one)
 class-of-service traffic-control-profiles arg1  [delay-buffer-rate | guaranteed-rate | scheduler-map]  total  OPERATOR
+class-of-service traffic-control-profiles arg1  [delay-buffer-rate | guaranteed-rate]  total  lenient-only
 firewall policer arg1 if-exceeding  [bandwidth-limit | burst-size-limit]  total  lenient-only
 forwarding-options dhcp-relay group arg1 overrides  [always-broadcast | forward-only | maximum-hop-count]  total  OPERATOR
 forwarding-options dhcp-relay group arg1 overrides  [always-broadcast | forward-only]  total  OPERATOR
@@ -30,17 +31,22 @@ schedulers scheduler arg1  [start-date | start-time | stop-date]  total  lenient
 schedulers scheduler arg1  [start-date | start-time]  total  lenient-only
 security flow  [allow-dns-reply | allow-embedded-icmp | force-ip-reassembly]  total  OPERATOR
 security flow  [allow-dns-reply | allow-embedded-icmp]  total  OPERATOR
+security flow aging  [early-ageout | high-watermark | low-watermark]  total  lenient-only
+security flow aging  [early-ageout | high-watermark]  total  lenient-only
 security ike policy arg1  [mode | pre-shared-key | proposal-set]  total  OPERATOR
 security ike proposal arg1  [authentication-algorithm | authentication-method | description]  total  lenient-only
 security ike proposal arg1  [authentication-algorithm | authentication-method]  total  lenient-only
+security ipsec proposal arg1  [authentication-algorithm | description | dh-group]  total  lenient-only
 security log  [format | mode | source-interface]  total  lenient-only
 security log  [format | mode]  total  lenient-only
 security nat source pool arg1  [port-overloading-factor | routing-instance]  total  OPERATOR
+security nat source pool arg1 persistent-nat  [inactivity-timeout | permit]  total  lenient-only
 services flow-monitoring version-ipfix template arg1  [flow-active-timeout | flow-inactive-timeout]  total  lenient-only
 services flow-monitoring version9 template arg1  [flow-active-timeout | flow-inactive-timeout]  total  lenient-only
 services rpm probe arg1 test arg1 target  [address | url]  total  OPERATOR
 system archival configuration  [transfer-interval | transfer-on-commit]  total  OPERATOR
 system dataplane  [binary | claim-host-tunables | control-socket]  total  OPERATOR
+system dataplane  [binary | claim-host-tunables]  total  OPERATOR
 system dataplane coalescence  [adaptive | rx-usecs | tx-usecs]  total  lenient-only
 system dataplane coalescence  [adaptive | rx-usecs]  total  lenient-only
 system dataplane shared-umem  [artifact-file | mode | phase0-artifact-file]  total  OPERATOR
