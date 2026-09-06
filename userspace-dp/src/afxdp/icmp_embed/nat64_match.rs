@@ -141,6 +141,32 @@ fn match_v4_error(
     if hdr.src != outer_dst_v4 {
         return None;
     }
+    // #9162: the routing domain of the interface the error arrived on, the way
+    // the same-family arms (`nat_match_v4.rs` / `nat_match_v6.rs`) resolve it.
+    // This file carried ZERO `routing_domain` references while both siblings
+    // carried one, and that asymmetry was the whole defect: the quote's reply
+    // key resolves an INSTALLED NAT64 session half through
+    // `lookup_session_across_scopes`, whose four probes are every one
+    // domain-PRESERVING, so a domain-0 key could not reach a session in a
+    // routing instance and the error was DROPPED by flowless enforcement --
+    // PMTUD and traceroute dead across the NAT64 boundary in every VRF.
+    //
+    // The arriving interface is the right source for the same reason
+    // `nat_match_v4.rs` gives: an ICMP error about a flow comes back on that
+    // flow's EGRESS side, so for a flow contained in one routing instance this
+    // resolves the flow's own domain. Unlike the same-family arms there is NO
+    // domain-agnostic fallback here, and that is deliberate rather than an
+    // omission -- the only fallback available would be a retry at domain 0,
+    // which is not "domain-agnostic" but "the DEFAULT instance", i.e. a
+    // different tenant's sessions. A non-contained flow therefore declines to
+    // the same-family arm and then to ordinary flowless enforcement, exactly
+    // as it did before this stamp existed; it never matches across tenants.
+    let embedded_routing_domain = crate::afxdp::forwarding::ingress_routing_domain(
+        ctx.forwarding,
+        meta.ingress_ifindex as i32,
+        meta.ingress_vlan_id,
+        None,
+    );
     // The quote is the forward wire packet (pool:xlated → server:port); its
     // reply key is the installed v4 reverse companion's primary key.
     let reply_key = embedded_reply_key(
@@ -156,6 +182,7 @@ fn match_v4_error(
         // not an omission -- the constructors #9031 names are the same-family
         // ones. Stated so the next reader does not "fix" it into a mismatch.
         TunnelDiscriminator::None,
+        embedded_routing_domain,
     );
     let resolved = lookup_session_across_scopes(
         ctx.sessions,
@@ -211,6 +238,18 @@ fn match_v6_error(
     if hdr.src_wire != outer_dst_v6 {
         return None;
     }
+    // #9162: see the twin derivation in `match_v4_error`. This arm resolves the
+    // installed FORWARD session, whose key has been domain-stamped since #7160
+    // (`poll_descriptor/mod.rs`, "THE single site that populates
+    // `SessionKey.routing_domain`"), so this direction has been dead in a VRF
+    // since #7160 -- longer than the v4->v6 arm, which #9271 broke by stamping
+    // the installed reverse companion while this probe still asked for 0.
+    let embedded_routing_domain = crate::afxdp::forwarding::ingress_routing_domain(
+        ctx.forwarding,
+        meta.ingress_ifindex as i32,
+        meta.ingress_vlan_id,
+        None,
+    );
     // The quote is the translated reply (Pref64::server:port → client:port);
     // its reply key is the installed forward session's primary key.
     let forward_key = embedded_reply_key(
@@ -226,6 +265,7 @@ fn match_v6_error(
         // not an omission -- the constructors #9031 names are the same-family
         // ones. Stated so the next reader does not "fix" it into a mismatch.
         TunnelDiscriminator::None,
+        embedded_routing_domain,
     );
     let resolved = lookup_session_across_scopes(
         ctx.sessions,

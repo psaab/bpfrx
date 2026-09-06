@@ -94,9 +94,17 @@ pub(super) fn try_embedded_icmp_session_match(
     meta: UserspaceDpMeta,
     sessions: &mut SessionTable,
     now_ns: u64,
+    // #9162: the arriving interface's routing domain — see the child's doc.
+    routing_domain: u32,
 ) -> Option<SessionLookup> {
     let frame = area.slice(desc.addr as usize, desc.len as usize)?;
-    session_match::try_embedded_icmp_session_match_from_frame(frame, meta, sessions, now_ns)
+    session_match::try_embedded_icmp_session_match_from_frame(
+        frame,
+        meta,
+        sessions,
+        now_ns,
+        routing_domain,
+    )
 }
 
 /// Core embedded ICMP session match logic operating on a frame slice.
@@ -105,8 +113,16 @@ pub(super) fn try_embedded_icmp_session_match_from_frame(
     meta: UserspaceDpMeta,
     sessions: &mut SessionTable,
     now_ns: u64,
+    // #9162: the arriving interface's routing domain — see the child's doc.
+    routing_domain: u32,
 ) -> Option<SessionLookup> {
-    session_match::try_embedded_icmp_session_match_from_frame(frame, meta, sessions, now_ns)
+    session_match::try_embedded_icmp_session_match_from_frame(
+        frame,
+        meta,
+        sessions,
+        now_ns,
+        routing_domain,
+    )
 }
 
 // #8271: `try_embedded_icmp_nat_match` -- the `(area, desc)` wrapper that

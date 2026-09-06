@@ -110,6 +110,11 @@ pub(in crate::afxdp::icmp_embed) fn match_outer_v6(
         hdr.src_port,
         hdr.dst_port,
         hdr.discriminator,
+        // #9162: the same domain the forward `embedded_key` carries. See the
+        // twin call in `nat_match_v4.rs` and `embedded_reply_key` for why a
+        // real domain is correct in BOTH the exact and the reverse-match
+        // index.
+        embedded_routing_domain,
     );
 
     if let Some(fwd) =
@@ -186,6 +191,12 @@ pub(in crate::afxdp::icmp_embed) fn match_outer_v6(
             hdr.src_port,
             hdr.dst_port,
             hdr.discriminator,
+            // #9162: this one feeds an EXACT `lookup_session_across_scopes`
+            // only, which is domain-preserving on all four of its probes — so
+            // a hardcoded 0 could not reach a session installed in a routing
+            // instance, and the #6474 outbound-SNAT (SNAT66/NPTv6) reply-key
+            // arm was dead for every VRF flow.
+            embedded_routing_domain,
         );
         lookup_session_across_scopes(
             ctx.sessions,

@@ -5,11 +5,29 @@ use super::parse::{embedded_reply_key, parse_embedded_v4, parse_embedded_v6};
 /// Returns the session lookup if found. Unlike the NAT variant, this
 /// path does not extract NAT reversal info — it only confirms a match
 /// exists. Used by callers that need plain session presence.
+///
+/// `routing_domain` is the domain of the interface the ICMP error arrived on
+/// — `crate::afxdp::forwarding::ingress_routing_domain(forwarding,
+/// meta.ingress_ifindex as i32, meta.ingress_vlan_id, None)`, exactly as
+/// `nat_match_v4` / `nat_match_v6` / `nat64_match` derive it. It is a
+/// PARAMETER rather than a derivation because this function is handed no
+/// `ForwardingState`: it has no non-test caller today
+/// (`afxdp/mod.rs` imports it under `#[cfg(test)]`), so plumbing a whole
+/// forwarding borrow through a path nothing runs would be churn.
+///
+/// #9162: it is also not allowed to be a hardcoded 0 any more. Both keys below
+/// go into EXACT lookups, and every index behind `SessionTable::lookup` is
+/// domain-preserving — so the old literals meant this path could never match a
+/// session in a routing instance, and whoever wired it into production would
+/// have inherited that silently. Making the domain an argument means the
+/// wiring has to answer the question at its call site, the way the three
+/// production arms do.
 pub(in crate::afxdp::icmp_embed) fn try_embedded_icmp_session_match_from_frame(
     frame: &[u8],
     meta: UserspaceDpMeta,
     sessions: &mut SessionTable,
     now_ns: u64,
+    routing_domain: u32,
 ) -> Option<SessionLookup> {
     let l4 = meta.l4_offset as usize;
 
@@ -36,7 +54,9 @@ pub(in crate::afxdp::icmp_embed) fn try_embedded_icmp_session_match_from_frame(
         // Hash/Eq include it (#7188), so a hard-coded None made every
         // exact index probe for a GRE quote MISS.
         discriminator: hdr.discriminator,
-                            routing_domain: 0,
+                            // #9162: the arriving interface's domain, not 0. See
+                            // the doc comment above.
+                            routing_domain,
             };
             let reverse_key = embedded_reply_key(
                 libc::AF_INET as u8,
@@ -46,6 +66,7 @@ pub(in crate::afxdp::icmp_embed) fn try_embedded_icmp_session_match_from_frame(
                 hdr.src_port,
                 hdr.dst_port,
                 hdr.discriminator,
+                routing_domain,
             );
             lookup_embedded_session(sessions, &embedded_key, &reverse_key, now_ns)
         }
@@ -63,7 +84,9 @@ pub(in crate::afxdp::icmp_embed) fn try_embedded_icmp_session_match_from_frame(
         // Hash/Eq include it (#7188), so a hard-coded None made every
         // exact index probe for a GRE quote MISS.
         discriminator: hdr.discriminator,
-                            routing_domain: 0,
+                            // #9162: the arriving interface's domain, not 0. See
+                            // the doc comment above.
+                            routing_domain,
             };
             let reverse_key = embedded_reply_key(
                 libc::AF_INET6 as u8,
@@ -73,6 +96,7 @@ pub(in crate::afxdp::icmp_embed) fn try_embedded_icmp_session_match_from_frame(
                 hdr.src_port,
                 hdr.dst_port,
                 hdr.discriminator,
+                routing_domain,
             );
             lookup_embedded_session(sessions, &embedded_key, &reverse_key, now_ns)
         }
