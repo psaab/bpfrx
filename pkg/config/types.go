@@ -211,11 +211,18 @@ func (c *Config) ResolveFab(ref string) string {
 // NOTE: Keep in sync with snapshotLinuxName in
 // pkg/dataplane/userspace/interfaces.go and resolveJunosIfName in
 // pkg/daemon/daemon_dhcp.go. Migration to centralize all callers was
-// tracked as a follow-up to #1565, which is CLOSED while the three
-// resolvers are still kept in step by this note rather than by
-// construction — #8994 tracks the residual. Keeping them in sync is
-// therefore a live obligation on anyone editing any of the three, not
+// tracked as a follow-up to #1565, which is CLOSED, so keeping them in step
+// is a live obligation on anyone editing any of the three rather than
 // something a pending migration is about to remove.
+//
+// #8994 MEASURED that obligation instead of restating it, and it is now
+// enforced rather than requested: TestResolverAgreement8994 asserts these
+// resolvers name the SAME kernel device for every declared interface in a
+// corpus that includes the case they used to disagree on. Two of the three
+// turned out not to be independent derivations at all — resolveJunosIfName
+// is literally LinuxIfName(ResolveReth(x)), and a tunnel unit's name comes
+// from TunnelNameMap on both sides — so what the guard actually protects is
+// the arms below against snapshotLinuxName's VLAN/reth/unit-0 rules.
 // resolveBareKernelIfName is the BARE-ref arm of ResolveKernelIfName, split out
 // so callers that already know structurally that they hold an interface name —
 // not a unit ref — can reach it without round-tripping through the dotted
@@ -258,6 +265,29 @@ func (c *Config) ResolveKernelIfName(ref string) string {
 // returns a non-nil EMPTY map for a config with no tunnels, so nil would be a
 // sentinel that collides with a legitimate value.
 func (c *Config) resolveKernelIfNameWith(ref string, tunMap map[string]string) string {
+	// #8994: A REF THAT NAMES A DECLARED INTERFACE IS THAT INTERFACE, even when
+	// it contains a dot. This arm is placed FIRST because everything below
+	// decides what the ref MEANS by parsing it, and an explicit declaration
+	// outranks a parse -- the same precedence the secure-tunnel arm already
+	// applies when an authored `bind-interface` outranks the tunnel-name map.
+	//
+	// Without it, `ResolveKernelIfName` split on "." and read a declared
+	// interface named `gr-0/0/0.0` as unit 0 of `gr-0/0/0`, so when that unit
+	// carried a tunnel the dotted arm returned the TUNNEL's device
+	// (`gr-0-0-0`) while the dataplane's snapshotLinuxName returned the
+	// interface's own (`gr-0-0-0.0`). Two subsystems named one configured
+	// interface differently, and the config COMPILES, so it is operator-
+	// reachable. Measured in TestResolverAgreement8994, which now expects an
+	// EMPTY divergence set.
+	//
+	// The blast radius is narrower than this function's 15 callers suggest: a
+	// ref with no dot already took the bare arm, and a genuine unit ref
+	// (`ge-0/0/0.0` where only `ge-0/0/0` is declared) is not a key in
+	// Interfaces, so neither changes. Only a config that DECLARES a dotted
+	// interface name behaves differently, which is the defect case itself.
+	if ifc, ok := c.Interfaces.Interfaces[ref]; ok && ifc != nil {
+		return c.resolveBareKernelIfName(ref)
+	}
 	parts := strings.SplitN(ref, ".", 2)
 	base := parts[0]
 
