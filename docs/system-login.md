@@ -396,8 +396,32 @@ outright (#5831, see the next section):
 
 All four — `allow-commands`, `deny-commands`, `allow-configuration`,
 `deny-configuration` — are evaluated on every dispatch surface: the on-box CLI's
-operational and configuration paths, and the gRPC listener the remote `cli`
-speaks to.
+operational and configuration paths, the gRPC listener the remote `cli` speaks
+to, and the REST API.
+
+> **This sentence was a LIVE OVERCLAIM until #9154, and the shape of the error
+> is worth keeping.** It said "every dispatch surface" and then enumerated two,
+> and the `*-configuration` pair was in force on exactly ONE of them — the
+> console. The gRPC listener the shipped `cli` binary speaks to, and the REST
+> API, both mutated configuration without consulting them, so an operator who
+> gave someone broad `permissions` while withholding specific configuration
+> authority had that withholding enforced only if the person happened to log in
+> at the console. **The documented way to administer the box was the way around
+> the restriction**, and an operator reading this page had no way to discover it.
+>
+> The three surfaces now share ONE decision — `config.AuthorizeConfigMutation`
+> — rather than three callers of a common resolver. #7172 cut 6 had already
+> moved the RESOLUTION into `pkg/config` for exactly this reason ("so this gate,
+> the operational gate and the gRPC gate all read one implementation"); the
+> DECISION stayed behind in `pkg/cli`, where the other two could not reach it.
+> A rule enforced by whichever caller remembers to call it is the shape that
+> produced the gap.
+>
+> **`load` remains a stated gap on every surface.** It applies arbitrary content
+> whose paths are not known until parsed, so enforcing a path regex against it
+> means matching every path the loaded content touches — a different mechanism
+> from a verb gate, not something these gates quietly cover. `commit` and
+> `rollback` act on the candidate as a whole and carry no path to match.
 
 > **UPGRADE NOTE — read this before upgrading if any class carries these
 > statements. Two behaviours change in opposite directions.**
