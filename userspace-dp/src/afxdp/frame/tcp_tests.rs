@@ -1340,3 +1340,77 @@ fn parse_tcp_reply_source_still_accepts_unfragmented_tcp_8597_k37() {
         .expect("a FIRST fragment has a real TCP header and must still parse");
     assert_eq!(pf.seq, 0x5555_6666);
 }
+
+// ---------------------------------------------------------------------------
+// #9111: #3204's L2 group/broadcast refusal, on the two SYN-cookie reply legs
+// it was never given.
+// ---------------------------------------------------------------------------
+
+/// #9111: the SYN-cookie SYN-ACK must be suppressed for an L2 broadcast
+/// destination.
+///
+/// #3204 established that `write_reply_eth_header` copies the inbound L2
+/// DESTINATION into the reply's own L2 SOURCE, so answering a group-addressed
+/// frame egresses a group/broadcast SOURCE MAC — switches learn it against this
+/// port or MAC-flap and err-disable it. #3204 guarded ONE of the three reply
+/// builders. This is the leg an unauthenticated host on the segment can drive
+/// at will, because it is armed exactly when SYN-flood cookies are active.
+///
+/// Fail-on-revert: remove the guard from `parse_tcp_reply_source` and this
+/// returns `Some(..)`.
+#[test]
+fn syn_cookie_syn_ack_suppressed_for_l2_broadcast_dst_9111() {
+    let mut frame = reject_v4_tcp_frame(TCP_FLAG_SYN, 0x1111_2222, 0);
+    frame[0..6].copy_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+    assert!(
+        build_syn_cookie_syn_ack_frame(&frame, 0xdead_beef, 1460).is_none(),
+        "must not answer a broadcast-dst SYN with a cookie SYN-ACK (would source \
+         a broadcast MAC)"
+    );
+}
+
+/// #9111: same for an L2 multicast destination on the SYN-ACK leg.
+#[test]
+fn syn_cookie_syn_ack_suppressed_for_l2_multicast_dst_9111() {
+    let mut frame = reject_v6_tcp_frame(TCP_FLAG_SYN, 7, 0);
+    frame[0..6].copy_from_slice(&[0x33, 0x33, 0x00, 0x00, 0x00, 0x01]);
+    assert!(
+        build_syn_cookie_syn_ack_frame(&frame, 0xdead_beef, 1460).is_none(),
+        "must not answer a multicast-dst SYN with a cookie SYN-ACK"
+    );
+}
+
+/// #9111: the SYN-cookie ACK-RST leg, the third builder.
+#[test]
+fn syn_cookie_ack_rst_suppressed_for_l2_group_dst_9111() {
+    let mut frame = reject_v4_tcp_frame(TCP_FLAG_ACK, 0x1111_2222, 0x3333_4444);
+    frame[0..6].copy_from_slice(&[0x01, 0x00, 0x5e, 0x00, 0x00, 0x01]);
+    assert!(
+        build_syn_cookie_ack_rst_frame(&frame).is_none(),
+        "must not answer a multicast-dst ACK with a cookie RST"
+    );
+}
+
+/// CONTROL: both SYN-cookie legs still build for an ordinary UNICAST
+/// destination, and the reply's SOURCE MAC is that unicast address.
+///
+/// Without this row a guard that refused everything would satisfy all three
+/// assertions above while disabling the SYN-cookie challenge entirely — which
+/// is the feature the defect is reachable through, so breaking it is the worse
+/// outcome.
+#[test]
+fn syn_cookie_legs_still_build_for_l2_unicast_dst_9111() {
+    let syn = reject_v4_tcp_frame(TCP_FLAG_SYN, 0x1111_2222, 0);
+    assert_eq!(syn[0] & 0x01, 0, "fixture dst MAC must be unicast");
+    let sa = build_syn_cookie_syn_ack_frame(&syn, 0xdead_beef, 1460)
+        .expect("cookie SYN-ACK for a unicast SYN");
+    assert_eq!(
+        &sa[6..12],
+        &[0x02, 0, 0, 0, 0, 0xdd],
+        "reply SOURCE MAC is the inbound unicast destination"
+    );
+
+    let ack = reject_v4_tcp_frame(TCP_FLAG_ACK, 0x1111_2222, 0x3333_4444);
+    let rst = build_syn_cookie_ack_rst_frame(&ack).expect("cookie RST for a unicast ACK");
+    assert_eq!(&rst[6..12], &[0x02, 0, 0, 0, 0, 0xdd]);
+}
