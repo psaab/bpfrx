@@ -26,7 +26,10 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 /// (`rewrite/ipv6.rs`) and the port-rewrite path (`frame/mod.rs`)
 /// route their zero-checksum decisions through the same predicates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::afxdp::frame) enum ChecksumFamily {
+// #9069: crate-visible so the NAT64 translator can consult THE rule rather
+// than re-implementing the matrix. It was frame-private, which is why a second
+// implementation grew outside this module and then diverged.
+pub(crate) enum ChecksumFamily {
     V4,
     V6,
 }
@@ -114,7 +117,7 @@ pub(in crate::afxdp::frame) fn checksum_family_of(addr_family: u8) -> Option<Che
 /// does not: a computed TCP 0x0000 is valid on the wire and matches v4
 /// TCP behavior).
 #[inline(always)]
-pub(in crate::afxdp::frame) fn adjust_zero_checksum_illegal(
+pub(crate) fn adjust_zero_checksum_illegal(
     protocol: u8,
     family: ChecksumFamily,
 ) -> bool {

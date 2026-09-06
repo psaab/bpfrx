@@ -1,7 +1,7 @@
 use super::*;
 
 mod byte_writes;
-mod checksum;
+pub(crate) mod checksum;
 mod generated;
 mod headers;
 mod addr_class;
