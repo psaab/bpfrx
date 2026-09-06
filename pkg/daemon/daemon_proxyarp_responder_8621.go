@@ -4,6 +4,8 @@ import (
 	"context"
 	"log/slog"
 	"net"
+	"sort"
+	"strings"
 	"sync"
 
 	"github.com/psaab/xpf/pkg/cluster"
@@ -232,6 +234,66 @@ func (d *Daemon) syncProxyARPResponders(cfg *config.Config, want map[string]stri
 
 	d.arpResponders.mu.Lock()
 	defer d.arpResponders.mu.Unlock()
+
+	// #9237: EVICT RESPONDERS THAT ARE NO LONGER RUNNING, before anything below
+	// consults the map.
+	//
+	// The entry is published BEFORE the goroutine opens its socket, so an open
+	// or bind failure leaves a `running` member that owns nothing. The branch
+	// below then takes the running path -- swapping the address snapshot rather
+	// than restarting, on the correct reasoning that a restart would drop
+	// requests during a socket rebuild -- and the map cannot distinguish a
+	// responder that is answering from one that never opened. So recovery was
+	// not merely missing, it was suppressed by an optimisation whose
+	// precondition was unchecked, and neither the apply path nor the 30s
+	// reassert owner could recover it: config removal or a daemon restart was
+	// the only exit.
+	//
+	// The signal was already being produced. runProxyARPResponder does
+	// `defer close(r.done)` and nothing in production read it; this is that
+	// consumer. A non-blocking check once per reconcile is enough, because the
+	// close is permanent.
+	//
+	// GENERATION-SCOPED ON THE EXACT POINTER, and honestly labelled: the
+	// identity comparison below is DEFENSIVE and is NOT reachable as written.
+	// The sweep re-reads the same map it is iterating, under the mutex it
+	// already holds, so `cur` cannot differ from `r`. A mutation test dropping
+	// the comparison therefore survives, and that is correct rather than a gap
+	// in the cells.
+	//
+	// It stays because the invariant is what matters and the locking that
+	// currently provides it is incidental: if eviction ever moves off this
+	// path -- into the responder goroutine itself, or behind a shorter critical
+	// section -- a dead responder deleting a REPLACEMENT installed under the
+	// same name becomes reachable immediately, and it is the kind of race that
+	// presents as an intermittently missing responder rather than as a crash.
+	//
+	// An INTENTIONAL teardown never reaches this sweep: both the !keep branch
+	// below and the empty-address branch delete the entry synchronously when
+	// they cancel it. So a `done` observed here is always an unintended death,
+	// and treating it as retry debt cannot re-arm a responder the config no
+	// longer wants -- the want-loop decides that, one pass later.
+	var died []string
+	for name, r := range d.arpResponders.running {
+		select {
+		case <-r.done:
+			if cur, ok := d.arpResponders.running[name]; ok && cur == r {
+				delete(d.arpResponders.running, name)
+				died = append(died, name)
+			}
+		default:
+		}
+	}
+	if len(died) > 0 {
+		// AGGREGATE, not per-responder: this runs every 30s from the reassert
+		// owner, and a persistently unopenable interface would otherwise log on
+		// every tick. The count is what an operator needs; the per-interface
+		// reason was already logged once by the responder itself.
+		sort.Strings(died)
+		slog.Warn("proxy-arp responder: evicting responders that exited without being "+
+			"stopped; they owned no socket and answered nothing. Restarting them below "+
+			"(#9237)", "count", len(died), "ifaces", strings.Join(died, ","))
+	}
 
 	for name, r := range d.arpResponders.running {
 		if _, keep := want[name]; !keep {
