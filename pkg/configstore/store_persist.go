@@ -492,14 +492,18 @@ func canonicalizeTree(tree *config.ConfigTree) *config.ConfigTree {
 // performAutoRollback) and the background retry has not yet succeeded
 // (#1799), OR a resolved commit-confirmed window's confirm.json removal is not
 // yet durable (#5835), OR boot recovery could not READ confirm.json and the
-// pending rollback window was lost (#8566). While true, a daemon restart would
-// load a STALE config or resurrect a resolved rollback — or, for #8566, an
-// UNCONFIRMED config is already standing with no rollback; /health returns 503
-// and xpf_daemon_config_persist_degraded reads 1.
+// pending rollback window was lost (#8566), OR the ARM write that establishes a
+// commit-confirmed window did not become durable (#9014). While true, a daemon
+// restart would load a STALE config or resurrect a resolved rollback — or, for
+// #8566, an UNCONFIRMED config is already standing with no rollback, and for
+// #9014 a crash inside the window would leave one standing permanently because
+// no record exists to recover; /health returns 503 and
+// xpf_daemon_config_persist_degraded reads 1.
 func (s *Store) ConfigPersistDegraded() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.persistDegraded || s.confirmRemoveDegraded || s.confirmRecoveryReadFailed
+	return s.persistDegraded || s.confirmRemoveDegraded || s.confirmRecoveryReadFailed ||
+		s.confirmArmDegraded
 }
 
 // ConfirmRecoveryReadFailed reports specifically whether boot recovery could not
@@ -565,12 +569,56 @@ func (s *Store) persistRetryLoop(backoff, maxBackoff time.Duration) {
 	for {
 		time.Sleep(backoff)
 		s.mu.Lock()
-		if !s.persistDegraded && !s.confirmRemoveDegraded {
+		if !s.persistDegraded && !s.confirmRemoveDegraded && !s.confirmArmDegraded {
 			// A successful write on a commit/sync path already persisted the
-			// current active config and no stale confirm.json removal is owed.
+			// current active config, no stale confirm.json removal is owed, and
+			// no armed window is missing its durable record.
 			s.persistRetryActive = false
 			s.mu.Unlock()
 			return
+		}
+
+		if s.confirmArmDegraded {
+			switch {
+			case s.confirmTimer == nil || s.confirmArmGen != s.confirmGen:
+				// #9014: THE WINDOW THIS DEBT BELONGS TO IS GONE. It was
+				// confirmed, superseded by a newer arm, or rolled back while the
+				// write was still owed. Re-driving WriteConfirm here would write
+				// a crash-recovery record for a window that no longer exists, so
+				// a restart would resurrect a rollback the operator already
+				// resolved — the mirror of #7675 on the removal side, where
+				// re-driving a delete would have removed a LIVE window's record.
+				s.confirmArmDegraded = false
+				s.confirmArmRec = nil
+				s.journalLog(&JournalEntry{
+					Action: "confirm_arm_superseded",
+					Detail: "pending commit-confirmed arm-write debt cleared: the window it was owed for was resolved or replaced",
+				})
+				slog.Info("pending commit-confirmed arm-write debt cleared: the window it was "+
+					"owed for is no longer pending", "issue", "#9014")
+			case s.confirmArmRec == nil:
+				// Nothing to re-drive; do not hold health down on a debt that
+				// cannot be paid.
+				s.confirmArmDegraded = false
+			default:
+				if err := s.db.WriteConfirm(s.confirmArmRec); err == nil {
+					s.confirmArmDegraded = false
+					s.confirmArmRec = nil
+					// A readable record exists again, so #8566's "boot lost the
+					// window" state is over for the same reason writeConfirmState
+					// clears it on a first-try success.
+					s.confirmRecoveryReadFailed = false
+					s.journalLog(&JournalEntry{
+						Action: "confirm_arm_recovered",
+						Detail: "commit-confirmed record persisted after an earlier arm-write failure",
+					})
+					slog.Info("commit-confirmed record persisted after an earlier arm-write "+
+						"failure; the auto-rollback would now survive a crash", "issue", "#9014")
+				} else {
+					slog.Warn("commit-confirmed arm-write retry failed", "err", err,
+						"retry_in", backoff*2, "issue", "#9014")
+				}
+			}
 		}
 
 		if s.persistDegraded {
