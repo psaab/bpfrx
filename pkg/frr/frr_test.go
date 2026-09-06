@@ -5150,8 +5150,20 @@ func TestGenerateProtocols_NewlineFreeTextDoesNotInject(t *testing.T) {
 	if !strings.Contains(got, " neighbor 10.0.0.1 description peer no router bgp 65000\n") {
 		t.Errorf("sanitized description missing:\n%s", got)
 	}
-	if !strings.Contains(got, " neighbor 10.0.0.1 password pw agentx\n") {
-		t.Errorf("sanitized password missing:\n%s", got)
+	// #9050 REVISED THIS ASSERTION, and the revision is the point.
+	//
+	// It used to require that the sanitized password WAS emitted as
+	// `password pw agentx`. That satisfied #1798 -- no injected line -- while
+	// leaving a value that vtysh reads as TWO tokens. The belt collapsed a
+	// newline into a space and thereby manufactured, for an auth secret, the
+	// very splittable line #9050 is about. For a DESCRIPTION or an as-path
+	// regex a space is legitimate and the assertion above still holds; for an
+	// auth secret it is not, and the render now omits the line rather than
+	// emitting a token FRR would either truncate to `pw` (a silently weakened
+	// secret) or refuse -- and a refused line fails the whole frr-reload, which
+	// takes down every protocol on the box rather than one adjacency.
+	if strings.Contains(got, " neighbor 10.0.0.1 password ") {
+		t.Errorf("a password that is not a single vtysh token was emitted:\n%s", got)
 	}
 }
 

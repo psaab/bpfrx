@@ -145,10 +145,14 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 					if keyID == 0 {
 						keyID = 1
 					}
-					fmt.Fprintf(&b, " ip ospf message-digest-key %d md5 %s\n", keyID, sanitizeFRRValue(iface.AuthKey.Reveal()))
+					if tok, ok := authTokenOrOmit("ospf-md5", iface.AuthKey.Reveal()); ok {
+						fmt.Fprintf(&b, " ip ospf message-digest-key %d md5 %s\n", keyID, tok)
+					}
 				} else if iface.AuthKey != "" && iface.AuthType == "simple" {
 					b.WriteString(" ip ospf authentication\n")
-					fmt.Fprintf(&b, " ip ospf authentication-key %s\n", sanitizeFRRValue(iface.AuthKey.Reveal()))
+					if tok, ok := authTokenOrOmit("ospf-simple", iface.AuthKey.Reveal()); ok {
+						fmt.Fprintf(&b, " ip ospf authentication-key %s\n", tok)
+					}
 				}
 				if iface.BFD {
 					if iface.BFDInterval > 0 || iface.BFDMultiplier > 0 {
@@ -347,7 +351,9 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				fmt.Fprintf(&b, " neighbor %s ebgp-multihop %d\n", n.Address, n.MultihopTTL)
 			}
 			if n.AuthPassword != "" {
-				fmt.Fprintf(&b, " neighbor %s password %s\n", n.Address, sanitizeFRRValue(n.AuthPassword.Reveal()))
+				if tok, ok := authTokenOrOmit("bgp", n.AuthPassword.Reveal()); ok {
+					fmt.Fprintf(&b, " neighbor %s password %s\n", n.Address, tok)
+				}
 			}
 			if n.BFD {
 				fmt.Fprintf(&b, " neighbor %s bfd\n", n.Address)
@@ -643,7 +649,9 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				} else {
 					b.WriteString(" ip rip authentication mode text\n")
 				}
-				fmt.Fprintf(&b, " ip rip authentication string %s\n", sanitizeFRRValue(rip.AuthKey.Reveal()))
+				if tok, ok := authTokenOrOmit("rip", rip.AuthKey.Reveal()); ok {
+					fmt.Fprintf(&b, " ip rip authentication string %s\n", tok)
+				}
 				b.WriteString("exit\n!\n")
 			}
 		}
@@ -709,11 +717,19 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 					"accepted", config.AuthTypeSpellings())
 			}
 			if config.AuthTypeIsMD5(isis.AuthType) {
-				fmt.Fprintf(&b, " area-password md5 %s\n", sanitizeFRRValue(isis.AuthKey.Reveal()))
-				fmt.Fprintf(&b, " domain-password md5 %s\n", sanitizeFRRValue(isis.AuthKey.Reveal()))
+				if tok, ok := authTokenOrOmit("isis-area-md5", isis.AuthKey.Reveal()); ok {
+					fmt.Fprintf(&b, " area-password md5 %s\n", tok)
+				}
+				if tok, ok := authTokenOrOmit("isis-domain-md5", isis.AuthKey.Reveal()); ok {
+					fmt.Fprintf(&b, " domain-password md5 %s\n", tok)
+				}
 			} else {
-				fmt.Fprintf(&b, " area-password clear %s\n", sanitizeFRRValue(isis.AuthKey.Reveal()))
-				fmt.Fprintf(&b, " domain-password clear %s\n", sanitizeFRRValue(isis.AuthKey.Reveal()))
+				if tok, ok := authTokenOrOmit("isis-area-clear", isis.AuthKey.Reveal()); ok {
+					fmt.Fprintf(&b, " area-password clear %s\n", tok)
+				}
+				if tok, ok := authTokenOrOmit("isis-domain-clear", isis.AuthKey.Reveal()); ok {
+					fmt.Fprintf(&b, " domain-password clear %s\n", tok)
+				}
 			}
 		}
 		b.WriteString("exit\n!\n")
