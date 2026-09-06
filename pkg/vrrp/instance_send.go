@@ -60,10 +60,33 @@ func (vi *vrrpInstance) sendAdvert(priority int) {
 	// The value is milliseconds; the /10 below converts to the centiseconds
 	// RFC 5798 puts on the wire.
 	advertMS := vi.advertiseIntervalMS()
+	// #9039: SATURATE rather than alias. packet.go writes this field under an
+	// 0x0FFF mask, so an over-range value does not merely lose precision -- it
+	// wraps to a SMALL number, and a small Max Advert Int tells the peer to
+	// expect adverts far more often than this instance sends them. The peer
+	// then derives a master-down window that expires while a healthy master is
+	// simply between adverts.
+	//
+	// Saturating is the safe direction and aliasing is the dangerous one. Too
+	// LARGE a value on the wire makes a peer wait longer than necessary to
+	// notice a real failure -- slow, and recovered by the next advert. Too
+	// SMALL a value makes it declare a live master dead. Between "converges
+	// late" and "fails over against a healthy peer", the first is the one to
+	// pick when the config is already out of range.
+	//
+	// #9039 also bounds this at commit (validateRethAdvertiseIntervalStrict),
+	// which is the primary fix. This clamp is not redundant with it: that gate
+	// is deliberately LENIENT on Store.Load and Store.SyncApply (#1960
+	// no-brick), so a config from disk or from an HA peer still arrives here
+	// out of range -- warned about, and applied.
+	advertCS := advertMS / 10
+	if advertCS > maxAdvertIntCentiseconds9039 {
+		advertCS = maxAdvertIntCentiseconds9039
+	}
 
 	// Send IPv4 advertisement if we have any IPv4 VIPs.
 	if len(v4Addrs) > 0 {
-		maxAdvert := uint16(advertMS / 10) // milliseconds → centiseconds
+		maxAdvert := uint16(advertCS) // milliseconds → centiseconds
 		pkt := &VRRPPacket{
 			VRID:         uint8(vi.cfg.GroupID),
 			Priority:     uint8(priority),
@@ -78,7 +101,7 @@ func (vi *vrrpInstance) sendAdvert(priority int) {
 
 	// Send IPv6 advertisement if we have any IPv6 VIPs.
 	if len(v6Addrs) > 0 {
-		maxAdvert := uint16(advertMS / 10) // ms → centiseconds
+		maxAdvert := uint16(advertCS) // ms → centiseconds
 		pkt := &VRRPPacket{
 			VRID:         uint8(vi.cfg.GroupID),
 			Priority:     uint8(priority),
@@ -247,3 +270,8 @@ func (vi *vrrpInstance) sendPacketIPv6(pkt *VRRPPacket) error {
 
 	return nil
 }
+
+// maxAdvertIntCentiseconds9039 is the largest value the VRRPv3 Max Advert Int
+// field can carry: it is 12 bits of centiseconds, masked with 0x0FFF by
+// packet.go. Spelled once here so the clamp and the mask cannot drift apart.
+const maxAdvertIntCentiseconds9039 = 0x0FFF
