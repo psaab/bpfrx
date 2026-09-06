@@ -19,6 +19,7 @@ use crate::{
     SourceNATRuleSnapshot, StaticNATRuleSnapshot, ThreeColorPolicerSnapshot, ZoneSnapshot,
 };
 use super::tests_support::*;
+use crate::session::TunnelDiscriminator;
 
 #[test]
 fn no_match_embedded_icmp_returns_none() {
@@ -4359,5 +4360,472 @@ fn poll_descriptor_embedded_icmp_reversal_reachable_for_pure_dnat_9030() {
         sessions.len(),
         sessions_before,
         "the ICMP error must not seed a new session"
+    );
+}
+
+/// #9031 END-TO-END: an ICMP error quoting a TRANSLATED GRE tunnel must resolve
+/// against the live session — through the real
+/// `try_embedded_icmp_nat_match_from_frame` path, not a key comparison.
+///
+/// This is the cell the parser-level ones cannot be: the four forward-key
+/// constructors in `nat_match_v4`/`nat_match_v6`/`session_match` are simple
+/// pass-throughs of `hdr.discriminator`, so reverting any one of them to
+/// `Default::default()` leaves every parser cell GREEN. Only a lookup that
+/// actually goes through a constructor can red them, which is why #9031's
+/// acceptance asks for a rewritten-frame observation rather than a key hit.
+///
+/// The session is published as a SYNC IMPORT, so this is also the HA-imported
+/// row: synchronization correctly preserves the discriminator, so an imported
+/// GRE session inherited exactly the same mismatch.
+#[test]
+fn embedded_icmp_resolves_a_translated_gre_tunnel_9031() {
+    let router_ip = Ipv4Addr::new(10, 0, 0, 1);
+    let snat_ip = Ipv4Addr::new(172, 16, 80, 8);
+    let client_ip = Ipv4Addr::new(10, 0, 61, 102);
+    let server_ip = Ipv4Addr::new(1, 1, 1, 1);
+    // GRE has no L4 ports, so this slot carries the RFC 2890 KEY. It is the
+    // whole identity of the tunnel and the only thing separating two tunnels
+    // between the same pair of addresses.
+    let gre_key: u16 = 40000;
+
+    let frame = build_icmp_te_frame_v4(router_ip, snat_ip, server_ip, gre_key, 0, PROTO_GRE);
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        l4_offset: 34,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        ..UserspaceDpMeta::default()
+    };
+
+    let mut sessions = SessionTable::new();
+    let forwarding = build_forwarding_state(&nat_snapshot());
+    let neighbors = Arc::new(ShardedNeighborMap::new());
+    learn_dynamic_neighbor(
+        &forwarding,
+        &neighbors,
+        24,
+        0,
+        IpAddr::V4(client_ip),
+        [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+    );
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+
+    let entry = SyncedSessionEntry {
+        key: SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_GRE,
+            src_ip: IpAddr::V4(client_ip),
+            dst_ip: IpAddr::V4(server_ip),
+            src_port: 0,
+            dst_port: 0,
+            // The live session carries the tunnel's real identity. Before
+            // #9031 the embedded lookup key hard-coded None, and SessionKey's
+            // Eq includes this field, so the probe could never equal this.
+            discriminator: TunnelDiscriminator::Keyed(gre_key as u32),
+            routing_domain: 0,
+        },
+        decision: SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 12,
+                tx_ifindex: 12,
+                tunnel_endpoint_id: 0,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 1))),
+                neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
+                src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]),
+                tx_vlan_id: 80,
+            },
+            nat: NatDecision {
+                // ADDRESS-ONLY source NAT: `match_rules.rs` routes a protocol
+                // with no L4 ports to `reserve_address_only`, which is how GRE
+                // genuinely reaches same-family SNAT and is what makes this
+                // reachable at all.
+                rewrite_src: Some(IpAddr::V4(snat_ip)),
+                rewrite_dst: None,
+                rewrite_src_port: None,
+                rewrite_dst_port: None,
+                nat64: false,
+                nptv6: false,
+            },
+        },
+        metadata: SessionMetadata {
+            ingress_zone: TEST_LAN_ZONE_ID,
+            egress_zone: TEST_WAN_ZONE_ID,
+            ingress_ifindex: 0,
+            ingress_vlan_id: 0,
+            owner_rg_id: 0,
+            fabric_ingress: false,
+            is_reverse: false,
+            nat64_reverse: None,
+            log_session_init: false,
+            log_session_close: false,
+            policy_id: 0,
+            inactivity_timeout_ns: None,
+            policy_counter_idx: 0,
+            policy_counter: None,
+        },
+        origin: SessionOrigin::SyncImport,
+        protocol: PROTO_GRE,
+        tcp_flags: 0,
+        generation: 0,
+        session_id: 0,
+    };
+    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    publish_shared_session(
+        &shared_sessions,
+        &shared_nat_sessions,
+        &shared_forward_wire_sessions,
+        &shared_owner_rg_indexes,
+        &entry,
+    );
+
+    let icmp_match = try_embedded_icmp_nat_match_from_frame(
+        &frame,
+        meta,
+        &mut sessions,
+        &forwarding,
+        &neighbors,
+        &shared_sessions,
+        &shared_nat_sessions,
+        &shared_forward_wire_sessions,
+        1_000_000,
+    )
+    .expect(
+        "#9031: the ICMP error quoting a translated GRE tunnel found NO session. \
+         Every embedded lookup key hard-coded discriminator: None while the live \
+         session carries Keyed(k), and SessionKey's Eq includes that field, so \
+         every exact index probe missed. The outer destination and quoted source \
+         cannot be restored and no usable signal reaches the endpoint — PMTUD and \
+         unreachable/traceroute signalling are deterministically suppressed for \
+         the tunnel",
+    );
+
+    // THE REWRITTEN FRAME, not just a key hit: the original (pre-translation)
+    // source must be recovered, which is the thing the endpoint needs.
+    assert_eq!(
+        icmp_match.original_src,
+        IpAddr::V4(client_ip),
+        "#9031: the quoted source must be un-translated back to the client"
+    );
+    assert_eq!(icmp_match.nat.rewrite_src, Some(IpAddr::V4(snat_ip)));
+    assert_eq!(icmp_match.resolution.egress_ifindex, 24);
+    assert_eq!(
+        icmp_match.resolution.neighbor_mac,
+        Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
+    );
+}
+
+/// CONTROL: a quote naming a DIFFERENT tunnel key must NOT resolve against this
+/// session. Without this, a "fix" that wildcarded the discriminator would pass
+/// the cell above while letting one tunnel's ICMP error resolve against
+/// another's session — the fail-open direction.
+#[test]
+fn embedded_icmp_does_not_resolve_a_different_gre_tunnel_9031() {
+    let router_ip = Ipv4Addr::new(10, 0, 0, 1);
+    let snat_ip = Ipv4Addr::new(172, 16, 80, 8);
+    let client_ip = Ipv4Addr::new(10, 0, 61, 102);
+    let server_ip = Ipv4Addr::new(1, 1, 1, 1);
+    let session_key_value: u16 = 40000;
+    let quoted_key_value: u16 = 40001; // a DIFFERENT tunnel
+
+    let frame =
+        build_icmp_te_frame_v4(router_ip, snat_ip, server_ip, quoted_key_value, 0, PROTO_GRE);
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        l4_offset: 34,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        ..UserspaceDpMeta::default()
+    };
+
+    let mut sessions = SessionTable::new();
+    let forwarding = build_forwarding_state(&nat_snapshot());
+    let neighbors = Arc::new(ShardedNeighborMap::new());
+    learn_dynamic_neighbor(
+        &forwarding,
+        &neighbors,
+        24,
+        0,
+        IpAddr::V4(client_ip),
+        [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+    );
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+
+    let mut entry = SyncedSessionEntry {
+        key: SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_GRE,
+            src_ip: IpAddr::V4(client_ip),
+            dst_ip: IpAddr::V4(server_ip),
+            src_port: 0,
+            dst_port: 0,
+            discriminator: TunnelDiscriminator::Keyed(session_key_value as u32),
+            routing_domain: 0,
+        },
+        decision: SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 12,
+                tx_ifindex: 12,
+                tunnel_endpoint_id: 0,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 1))),
+                neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
+                src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]),
+                tx_vlan_id: 80,
+            },
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(snat_ip)),
+                rewrite_dst: None,
+                rewrite_src_port: None,
+                rewrite_dst_port: None,
+                nat64: false,
+                nptv6: false,
+            },
+        },
+        metadata: SessionMetadata {
+            ingress_zone: TEST_LAN_ZONE_ID,
+            egress_zone: TEST_WAN_ZONE_ID,
+            ingress_ifindex: 0,
+            ingress_vlan_id: 0,
+            owner_rg_id: 0,
+            fabric_ingress: false,
+            is_reverse: false,
+            nat64_reverse: None,
+            log_session_init: false,
+            log_session_close: false,
+            policy_id: 0,
+            inactivity_timeout_ns: None,
+            policy_counter_idx: 0,
+            policy_counter: None,
+        },
+        origin: SessionOrigin::SyncImport,
+        protocol: PROTO_GRE,
+        tcp_flags: 0,
+        generation: 0,
+        session_id: 0,
+    };
+    entry.key.discriminator = TunnelDiscriminator::Keyed(session_key_value as u32);
+    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    publish_shared_session(
+        &shared_sessions,
+        &shared_nat_sessions,
+        &shared_forward_wire_sessions,
+        &shared_owner_rg_indexes,
+        &entry,
+    );
+
+    assert!(
+        try_embedded_icmp_nat_match_from_frame(
+            &frame,
+            meta,
+            &mut sessions,
+            &forwarding,
+            &neighbors,
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            1_000_000,
+        )
+        .is_none(),
+        "#9031: an ICMP error quoting tunnel key {quoted_key_value} resolved \
+         against the session for tunnel key {session_key_value}. GRE has no L4 \
+         ports, so the discriminator is the ONLY thing separating two tunnels \
+         between the same pair of addresses — a wildcarding fix would satisfy the \
+         positive cell and cross tunnels here"
+    );
+}
+
+/// #9031: the FORWARD `embedded_key` — the quote looked up AS-IS — must carry
+/// the discriminator too.
+///
+/// The two cells above resolve through the reply key
+/// (`lookup_forward_nat_across_scopes`), so reverting the four FORWARD-key
+/// constructors to `Default::default()` left them green. That is the mutant
+/// #9031's acceptance names, and it needed a fixture where the SESSION-FALLBACK
+/// path is the one that hits: a session whose key IS the quoted tuple, which is
+/// how an untranslated (or already-wire-form) GRE flow is matched.
+///
+/// Without this, a fix could wire the reply key alone and every GRE ICMP error
+/// for a non-forward-NAT session would still miss.
+#[test]
+fn the_as_is_embedded_key_carries_the_discriminator_9031() {
+    let router_ip = Ipv4Addr::new(10, 0, 0, 1);
+    let tunnel_src = Ipv4Addr::new(172, 16, 80, 8);
+    let tunnel_dst = Ipv4Addr::new(1, 1, 1, 1);
+    let gre_key: u16 = 40000;
+
+    // The quote names tunnel_src -> tunnel_dst with this GRE key.
+    let frame = build_icmp_te_frame_v4(router_ip, tunnel_src, tunnel_dst, gre_key, 0, PROTO_GRE);
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        l4_offset: 34,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        ..UserspaceDpMeta::default()
+    };
+
+    // A session keyed EXACTLY on the quoted tuple, carrying the tunnel's real
+    // identity — so only the as-is `embedded_key` can find it.
+    let mut sessions = SessionTable::new();
+    assert!(sessions.install_with_protocol(
+        SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_GRE,
+            src_ip: IpAddr::V4(tunnel_src),
+            dst_ip: IpAddr::V4(tunnel_dst),
+            src_port: 0,
+            dst_port: 0,
+            discriminator: TunnelDiscriminator::Keyed(gre_key as u32),
+            routing_domain: 0,
+        },
+        SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 12,
+                tx_ifindex: 12,
+                tunnel_endpoint_id: 0,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 1))),
+                neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
+                src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+                tx_vlan_id: 80,
+            },
+            nat: NatDecision {
+                rewrite_src: None,
+                rewrite_dst: None,
+                rewrite_src_port: None,
+                rewrite_dst_port: None,
+                nat64: false,
+                nptv6: false,
+            },
+        },
+        SessionMetadata {
+            ingress_zone: TEST_LAN_ZONE_ID,
+            egress_zone: TEST_WAN_ZONE_ID,
+            ingress_ifindex: 0,
+            ingress_vlan_id: 0,
+            owner_rg_id: 0,
+            fabric_ingress: false,
+            is_reverse: false,
+            nat64_reverse: None,
+            log_session_init: false,
+            log_session_close: false,
+            policy_id: 0,
+            inactivity_timeout_ns: None,
+            policy_counter_idx: 0,
+            policy_counter: None,
+        },
+        123_000_000_000,
+        PROTO_GRE,
+        0,
+    ));
+
+    assert!(
+        try_embedded_icmp_session_match_from_frame(&frame, meta, &mut sessions, 123_100_000_000)
+            .is_some(),
+        "#9031: the as-is embedded key found no session for a quoted GRE tunnel \
+         whose session is keyed on exactly that tuple. SessionKey's Eq includes \
+         the discriminator, so a forward key built with None can never equal a \
+         session carrying Keyed({gre_key})"
+    );
+}
+
+/// CONTROL for the cell above: the same lookup must MISS when the quoted key
+/// names a different tunnel, so the assertion there is attributable to the
+/// discriminator matching rather than to the tuple alone.
+#[test]
+fn the_as_is_embedded_key_does_not_cross_tunnels_9031() {
+    let router_ip = Ipv4Addr::new(10, 0, 0, 1);
+    let tunnel_src = Ipv4Addr::new(172, 16, 80, 8);
+    let tunnel_dst = Ipv4Addr::new(1, 1, 1, 1);
+
+    let frame = build_icmp_te_frame_v4(router_ip, tunnel_src, tunnel_dst, 40001, 0, PROTO_GRE);
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        l4_offset: 34,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        ..UserspaceDpMeta::default()
+    };
+
+    let mut sessions = SessionTable::new();
+    assert!(sessions.install_with_protocol(
+        SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_GRE,
+            src_ip: IpAddr::V4(tunnel_src),
+            dst_ip: IpAddr::V4(tunnel_dst),
+            src_port: 0,
+            dst_port: 0,
+            discriminator: TunnelDiscriminator::Keyed(40000),
+            routing_domain: 0,
+        },
+        SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 12,
+                tx_ifindex: 12,
+                tunnel_endpoint_id: 0,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 1))),
+                neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
+                src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+                tx_vlan_id: 80,
+            },
+            nat: NatDecision {
+                rewrite_src: None,
+                rewrite_dst: None,
+                rewrite_src_port: None,
+                rewrite_dst_port: None,
+                nat64: false,
+                nptv6: false,
+            },
+        },
+        SessionMetadata {
+            ingress_zone: TEST_LAN_ZONE_ID,
+            egress_zone: TEST_WAN_ZONE_ID,
+            ingress_ifindex: 0,
+            ingress_vlan_id: 0,
+            owner_rg_id: 0,
+            fabric_ingress: false,
+            is_reverse: false,
+            nat64_reverse: None,
+            log_session_init: false,
+            log_session_close: false,
+            policy_id: 0,
+            inactivity_timeout_ns: None,
+            policy_counter_idx: 0,
+            policy_counter: None,
+        },
+        123_000_000_000,
+        PROTO_GRE,
+        0,
+    ));
+
+    assert!(
+        try_embedded_icmp_session_match_from_frame(&frame, meta, &mut sessions, 123_100_000_000)
+            .is_none(),
+        "#9031: a quote naming tunnel key 40001 matched the session for tunnel \
+         key 40000. GRE has no L4 ports, so without the discriminator the two \
+         tunnels are indistinguishable and one tunnel's error resolves against \
+         the other's session"
     );
 }
