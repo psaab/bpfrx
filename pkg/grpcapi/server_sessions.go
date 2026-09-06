@@ -867,7 +867,15 @@ func (s *Server) getSessionsLegacy(ctx context.Context, req *pb.GetSessionsReque
 	// A backend iterator error (e.g. helper restart mid-scan) must fail
 	// the RPC rather than returning a partial session list as success —
 	// matching the cursor path above (#2469).
+	// #9060: abort the walk when the caller has gone. Both callbacks used to
+	// `return true` unconditionally, so once started the walk ran to EOF holding
+	// one of four session-walk slots that REST shares.
+	cancelled := newSessionWalkCancelSampler(ctx, sessionWalkCancelInterval9060)
+
 	if err := s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+		if cancelled() {
+			return false
+		}
 		if !filter.matchV4(key, val) {
 			return true
 		}
@@ -894,6 +902,9 @@ func (s *Server) getSessionsLegacy(ctx context.Context, req *pb.GetSessionsReque
 	}
 
 	if err := s.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+		if cancelled() {
+			return false
+		}
 		if !filter.matchV6(key, val) {
 			return true
 		}
@@ -916,6 +927,19 @@ func (s *Server) getSessionsLegacy(ctx context.Context, req *pb.GetSessionsReque
 		return true
 	}); err != nil {
 		return nil, status.Errorf(codes.Internal, "v6 session iteration: %v", err)
+	}
+
+	// #9060: an aborted walk must NOT return its partial result as a success.
+	// `Total` counts matching rows seen so far, so a cancelled walk yields a
+	// truncated list AND a Total that understates the table -- and a client
+	// reading that as an answer would conclude sessions had disappeared. Same
+	// reasoning as the iterator-error arms above (#2469): a partial list is
+	// never returned as success.
+	//
+	// The context error is returned rather than Internal, so a caller can tell
+	// "you went away" from "the walk broke".
+	if err := ctx.Err(); err != nil {
+		return nil, status.FromContextError(err).Err()
 	}
 
 	resp := &pb.GetSessionsResponse{
