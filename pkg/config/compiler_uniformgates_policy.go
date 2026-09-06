@@ -40,6 +40,25 @@ func runUniformGatesPolicy(tree *ConfigTree, cfg *Config, opts compileOpts) erro
 	// `match from-zone`/`match to-zone` context. Runs AFTER the policy match-address gate so a
 	// structural CoS/policer/device-map error and a bad match-address still
 	// win the first-error slot before a zone-reference error.
+	// #9246: a bracketed zone list on from-zone/to-zone. Runs BEFORE the
+	// undefined-zone gate, because the from-zone form otherwise surfaces there
+	// as an undefined zone literally named "to-zone" -- loud, but blaming the
+	// wrong thing, and telling the operator to define a zone rather than to fix
+	// the bracket. Same lenient downgrade as its neighbour (#1960): an
+	// already-persisted or peer-synced config an older binary accepted must
+	// still boot, and on that path the operator is told rather than locked out.
+	if len(cfg.Security.MalformedZonePairs) > 0 {
+		err := fmt.Errorf("security policies %s", cfg.Security.MalformedZonePairs[0])
+		if opts.lenientPolicyZoneRefs {
+			for _, m := range cfg.Security.MalformedZonePairs {
+				cfg.Warnings = append(cfg.Warnings,
+					fmt.Sprintf("security policies %s (downgraded to warning on tolerant path)", m))
+			}
+		} else {
+			return err
+		}
+	}
+
 	if err := validatePolicyZoneReferencesStrict(cfg); err != nil {
 		if opts.lenientPolicyZoneRefs {
 			cfg.Warnings = append(cfg.Warnings,

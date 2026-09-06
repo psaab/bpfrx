@@ -92,6 +92,34 @@ func compilePolicies(node *Node, sec *SecurityConfig) error {
 
 			if len(child.Keys) >= 4 {
 				// Hierarchical: Keys=["from-zone", "trust", "to-zone", "untrust"]
+				//
+				// #9246: a BRACKETED zone list lands here too, and silently.
+				// `to-zone [ untrust dmz ]` lexes to exactly this 4-key shape
+				// with the residue swallowing the whole rule onto one leaf:
+				//
+				//	[from-zone trust to-zone untrust]
+				//	  [dmz policy p1 then permit]
+				//
+				// so FindChildren("policy") below matches nothing and the pair
+				// compiles with ZERO policies -- the authored rule exists
+				// nowhere. `from-zone [ trust dmz ]` shifts the keys instead:
+				//
+				//	[from-zone trust dmz to-zone]
+				//	  [untrust policy p1 then permit]
+				//
+				// making Keys[3] the literal string "to-zone", which today is
+				// caught only by accident, as an undefined zone named
+				// "to-zone".
+				//
+				// Junos accepts no bracketed list on from-zone/to-zone -- a
+				// policy context is ONE zone pair -- so this is refused rather
+				// than expanded. Expanding would invent a semantics the
+				// platform does not have and would owe an answer about what a
+				// single policy NAME means once it exists in several contexts.
+				if bad := malformedZonePairShape9246(child); bad != "" {
+					sec.MalformedZonePairs = append(sec.MalformedZonePairs, bad)
+					continue
+				}
 				pairs = append(pairs, zonePair{child.Keys[1], child.Keys[3], child})
 			} else {
 				// Flat set: from-zone → <name> → to-zone → <name> → policy ...
