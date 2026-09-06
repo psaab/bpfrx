@@ -210,7 +210,65 @@ dataplane builds).
 
 ## Running it on the loss userspace cluster
 
-**Not yet performed.** The steps below are the owed procedure.
+**Attempted 2026-09-06 and BLOCKED. Three preconditions are not satisfiable on
+the loss cluster as configured (#9053), and each was verified at source rather
+than inferred.** The steps below remain the owed procedure; what follows is why
+running them today produces refusals rather than a number.
+
+Off-cluster, everything passes: `newflow_ceiling_analyze_test` OK,
+`newflow-gen` 13/13, and the harness `--dry-run` resolves every host, the target
+and the analyzer. The blockers are all in the cluster's committed state.
+
+**1. The client cannot source from the prefix the pool rule matches.** The
+committed rule is `rule pool-snat` in rule-set `lan-to-wan`, matching
+`source-address 10.0.61.240/28`. The LAN host is `10.0.61.102` — outside that
+/28 — so its traffic takes the sibling `rule snat` (interface mode) instead, and
+the pool sees ZERO allocations, which is the harness's first named refusal
+condition. `newflow-gen` has no client source-address option: `--bind` (main.rs
+:79/:341) is the SINK's, and the client calls `TcpStream::connect_timeout`
+(:296) with no local bind. Read at source, not inferred from `--help`.
+
+**2. The pool holds 1000 ports.** `pool-snat-pool` is `172.16.80.7/32` with
+`port range 30000 to 30999`. The documented sweep is 5000–80000 flows/sec; a
+sustained rate R with hold time H needs R x H concurrent ports, so this pool
+caps out roughly two orders of magnitude below the interesting range. The
+harness names port exhaustion explicitly as a refusal ("a capacity ceiling, not
+a lock ceiling"), so this would not silently corrupt a number — it would refuse
+every cell. **That is the failure mode to want**, and it is why no figure is
+quoted here.
+
+**3. The default WAN target is not an instance on this cluster.**
+`IPERF_TARGET4=172.16.80.200` answers from the wire (fw0 pings it, neighbour
+`f6:f0:06:10:77:d5`) but is not an incus instance on `loss:`, so the sink cannot
+be started on it. This one is surmountable: `loss:xpf-mouse-target` holds
+`172.16.80.201` on the same VLAN-80 subnet and `TARGET_IP` is overridable.
+
+Blockers 1 and 2 both require changing the SHARED cluster's committed
+configuration — a wider pool and a rule that matches the generator's source —
+which affects every other lane's smokes and is a decision for whoever owns that
+cluster, not something a measurement run should do to itself.
+
+### What this harness can and cannot attribute
+
+Stated because the #9053 cohort lists **seven** cost sites, and a run of this
+harness would speak to two of them plus one that has no row of its own. A
+measurement reported against all seven would be the #4800-class trap the
+harness's own header warns about.
+
+| Site | This harness |
+|---|---|
+| NAT allocator `live` mutex | **attributed** (the pool path is the driven path) |
+| `replicate_session_upsert` fan-out | **attributed** (`session_replication_upserts_total`) |
+| `publish_shared_session` | **attributed** (`shared_session_publishes_total`) |
+| `publish_live_session_entry` (up to 6 serial `bpf()` per install) | not attributed — no per-syscall counter |
+| `remove_shared_session` (3 nested map mutexes) | not attributed — it is on the CLOSE path, and the sweep drives opens |
+| `snapshot_shared_session_entries` + `replay_synced_sessions` | not attributed — a reconcile/bring-up path this sweep never enters |
+| source-NAT `matches` O(R) scan | not attributed — one rule-set of 2 rules here; R is not varied |
+| bulk HA import | not attributed — no peer bulk transfer during the sweep |
+
+So even an unblocked run answers **which of three synchronization sites
+saturates first**, which is what #2852 Phase-2 is gated on. It is not a
+per-connection cost for the other five, and nothing should cite it as one.
 
 The loss cluster is shared and lock-protected. The harness sources the
 `cluster-cell.sh` preamble, so it queues behind another agent's deploy or
@@ -317,6 +375,29 @@ no `VALID` cells has no ceiling and must be reported as such.
 * If nothing saturates at the highest sustainable offered rate, the install
   path is not lock-bound at rates this cluster can generate, and the honest
   report is the generator's ceiling plus "no saturation observed below it".
+
+## Signals that already exist, so a cost review does not re-propose them (#9053)
+
+A review of the per-new-flow cost path proposed an "O(1)-per-worker
+bulk-invalidation signal" for `DeleteSynced` storms as a missing mechanism. It
+is not missing — it ships, and it is discoverable only from the source today,
+which is how a reviewer reached the opposite conclusion. Named here because
+this is the document that reader reaches first.
+
+- **`SESSION_DELETE_DROP_EPOCH` (#8586)** is that signal. It is deliberately
+  keyed on refused **deletes** rather than on queue depth: upsert-driven cap
+  pressure "would fire continuously through normal traffic and reconcile
+  nothing", so a depth-keyed signal would be noise exactly when the dataplane
+  is busy.
+- **`replicate_session_delete_repairing` (#8114/#8576)** already resolves the
+  refused worker's id and runs its NAT teardown on its behalf. Measured
+  remainder: **0 repaired-drops across 30,786 refusals.**
+- The residual those two leave is the window between a refusal and the refused
+  worker's next epoch read, and that is stated at the site.
+
+The general point for anyone costing this path: check for a shipped counter
+before proposing one. A proposal that duplicates a mechanism costs more than
+the gap it claims to close, because it also retires the question.
 
 ## Related
 
