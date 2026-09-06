@@ -113,13 +113,34 @@ func hoistAndSplitRun8939(children []*Node, container *schemaNode) []*Node {
 // leaf that owns a body is left alone by that bound -- correctly, its children
 // are its own -- but SetPath will still nest a LATER statement underneath it,
 // and that statement belongs to the enclosing container.
+//
+// AMBIGUITY IS NOT HOISTABLE, and this is the precondition the caller cannot
+// check for itself. "resolves under the enclosing container" only identifies a
+// FOREIGN statement when the name is not ALSO legal where it currently sits.
+// `forwarding-options sampling instance I family inet output` declares
+// source-address, and so does its own `flow-server` child:
+//
+//	output { flow-server 10.0.0.9 { source-address 10.1.1.1; } }
+//	                                ^ resolves under BOTH
+//
+// That source-address is the per-collector export source, authored exactly
+// where it means what it says. Lifting it makes it the instance-wide source and
+// silently rewrites which address every OTHER collector sees the device as --
+// and a collector keys device identity on it. So when a head resolves in both
+// places the authored nesting wins and nothing is lifted. Only an
+// UNAMBIGUOUSLY foreign head -- legal in the container, illegal here -- can be
+// a statement that SetPath misplaced.
 func splitNestedForeignRun8939(n *Node, container *schemaNode) (*Node, []*Node) {
 	if n == nil {
 		return n, nil
 	}
 	var lifted []*Node
-	var prune func(node *Node, depth int) *Node
-	prune = func(node *Node, depth int) *Node {
+	// local is the schema position of `node` itself, or nil once the walk
+	// leaves the declared schema. A nil local cannot vouch for a name, so it
+	// disables lifting rather than permitting it -- an undeclared body is
+	// exactly where an unrecognised name is most likely to be someone's value.
+	var prune func(node *Node, local *schemaNode, depth int) *Node
+	prune = func(node *Node, local *schemaNode, depth int) *Node {
 		if node == nil || depth > 8 {
 			return node
 		}
@@ -128,12 +149,14 @@ func splitNestedForeignRun8939(n *Node, container *schemaNode) (*Node, []*Node) 
 			if c == nil || len(c.Keys) == 0 {
 				continue
 			}
-			if resolveSchemaChild(container, c.Keys[0]) != nil {
-				// Belongs to the ENCLOSING container: lift it out whole.
+			sub := localSchemaChild8939(local, c.Keys[0])
+			if local != nil && sub == nil && resolveSchemaChild(container, c.Keys[0]) != nil {
+				// Legal in the ENCLOSING container and illegal HERE: the only
+				// reading is a statement SetPath nested by accident.
 				lifted = append(lifted, c)
 				continue
 			}
-			kept = append(kept, prune(c, depth+1))
+			kept = append(kept, prune(c, sub, depth+1))
 		}
 		if len(kept) == len(node.Children) {
 			return node
@@ -142,6 +165,31 @@ func splitNestedForeignRun8939(n *Node, container *schemaNode) (*Node, []*Node) 
 		clone.Children = kept
 		return &clone
 	}
-	pruned := prune(n, 0)
+	pruned := prune(n, localSchemaFor8939(n, container), 0)
 	return pruned, lifted
+}
+
+// localSchemaFor8939 resolves n's own schema position under container, so the
+// prune walk can ask whether a nested head is legal WHERE IT SITS.
+func localSchemaFor8939(n *Node, container *schemaNode) *schemaNode {
+	if n == nil || len(n.Keys) == 0 {
+		return nil
+	}
+	return resolveSchemaChild(container, n.Keys[0])
+}
+
+// localSchemaChild8939 descends one level, tolerating a wildcard slot (an
+// instance name such as the flow-server's address) which declares the body the
+// next key must be read against.
+func localSchemaChild8939(local *schemaNode, key string) *schemaNode {
+	if local == nil {
+		return nil
+	}
+	if c := resolveSchemaChild(local, key); c != nil {
+		return c
+	}
+	if local.wildcard != nil {
+		return resolveSchemaChild(local.wildcard, key)
+	}
+	return nil
 }

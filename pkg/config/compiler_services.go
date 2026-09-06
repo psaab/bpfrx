@@ -1657,7 +1657,12 @@ func compileSamplingFamily(node *Node) *SamplingFamily {
 	// nested sources both bound the last one in AST order.
 	var outputLevelSrc string
 
-	for _, child := range outputNode.Children {
+	// #8939: split a packed run. `output inline-jflow source-address 10.0.0.1`
+	// is ONE child node, so this switch read `inline-jflow` and dropped the
+	// export source-address with it — flow records then leave with whatever
+	// source the stack picks, which is what a collector keys its device
+	// identity on.
+	for _, child := range hoistAndSplitRun8939(outputNode.Children, samplingOutputSchema8939()) {
 		switch child.Name() {
 		case "source-address":
 			// Output-level default: the source-address sibling of
