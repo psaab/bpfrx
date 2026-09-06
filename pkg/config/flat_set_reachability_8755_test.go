@@ -222,7 +222,9 @@ func TestEveryOpenSiteSurvivesTheFlatSetSpelling_8755(t *testing.T) {
 			"is 'no losses found' only because nothing was looked at", len(sites), unmeasurable)
 	}
 	if len(unmeasurable) > 0 {
-		t.Logf("%d/%d unmeasurable, reported rather than counted as clean: %v",
+		t.Logf("%d/%d SITES unmeasurable (unit: sites, not pairs — several sites "+
+			"can share one (container, head) pair), reported rather than "+
+			"counted as clean: %v",
 			len(unmeasurable), len(sites), unmeasurable)
 	}
 	// THE COMPARISON MUST BE ABLE TO REPORT A LOSS. Every surviving site's
