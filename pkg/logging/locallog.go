@@ -20,6 +20,10 @@ type LocalLogWriter struct {
 	maxFiles int
 	written  int64
 
+	// #9118 recovery bookkeeping for a writer wedged by a failed rotation
+	// reopen. See locallog_reopen_9118.go.
+	wedge wedgeState9118
+
 	// Filtering (same as SyslogClient)
 	MinSeverity int
 	Categories  uint8
@@ -150,10 +154,14 @@ func (lw *LocalLogWriter) Send(severity int, msg string) error {
 	lw.mu.Lock()
 	defer lw.mu.Unlock()
 
-	if lw.file == nil {
-		// #3478 item 1/4: a nil file (closed, or a prior rotation reopen
-		// failed) drops the line. Count it on EVERY failure path — not just a
-		// write error — so a wedged writer is observable, and return the error.
+	// #9118: a nil handle may be a WEDGE (a prior rotation reopen failed) rather
+	// than a deliberate close. Nothing else ever reopens it -- rotate() is
+	// reached only from `written >= maxSize`, which needs a successful write --
+	// so the recovery attempt has to live on the write path itself.
+	if !lw.ensureOpenLocked() {
+		// #3478 item 1/4: a nil file (closed, or a reopen that could not be
+		// retried yet) drops the line. Count it on EVERY failure path — not just
+		// a write error — so a wedged writer is observable, and return the error.
 		lw.droppedWrites.Add(1)
 		lw.warnRateLimited(&lw.lastDropWarn, "local security-log write dropped: file unavailable", errFileUnavailable)
 		return fmt.Errorf("log file closed")
@@ -185,8 +193,10 @@ func (lw *LocalLogWriter) SendBinary(data []byte) error {
 	lw.mu.Lock()
 	defer lw.mu.Unlock()
 
-	if lw.file == nil {
-		// #3478 item 1/4: count the dropped binary record on the nil-file path.
+	if !lw.ensureOpenLocked() {
+		// #3478 item 1/4: count the dropped binary record on the nil-file path
+		// (#9118: after a reopen attempt, so a wedge is recovered rather than
+		// merely counted).
 		lw.droppedWrites.Add(1)
 		lw.warnRateLimited(&lw.lastDropWarn, "local security-log binary write dropped: file unavailable", errFileUnavailable)
 		return fmt.Errorf("log file closed")
@@ -220,6 +230,11 @@ func (lw *LocalLogWriter) ShouldSendEvent(severity int, categoryBit uint8) bool 
 func (lw *LocalLogWriter) Close() error {
 	lw.mu.Lock()
 	defer lw.mu.Unlock()
+	// #9118: record that this nil handle is DELIBERATE. Send/SendBinary now
+	// try to reopen a nil handle, and without this flag they could not tell a
+	// wedged writer from a retired one and would recreate the audit file after
+	// shutdown.
+	lw.wedge.closed = true
 	if lw.file != nil {
 		err := lw.file.Close()
 		lw.file = nil
