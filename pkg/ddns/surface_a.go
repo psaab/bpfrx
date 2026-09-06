@@ -159,8 +159,39 @@ type AddressObserver func(ctx context.Context, scope SurfaceAScope) (AddressObse
 // error-backoff schedule. It is kept in memory alongside the durable ownership
 // record (the durable store proves ownership for cleanup; this drives the wire
 // cadence). lastErr surfaces the last failure for observability.
+// normalizeDDNSTTL resolves a configured TTL to the value actually published
+// (#9067). `<= 0` means "unset" and resolves to defaultDDNSTTL, which is what
+// every publish path already does inline. It exists so change-detection and the
+// publish cannot disagree about what the TTL IS — two spellings of one
+// normalisation is exactly how a comparison ends up checking a property the
+// system does not act on.
+func normalizeDDNSTTL(ttl int) int {
+	if ttl <= 0 {
+		return defaultDDNSTTL
+	}
+	return ttl
+}
+
 type surfaceAState struct {
-	lastAddr      netip.Addr
+	lastAddr netip.Addr
+	// lastTTL is the TTL of the last SUCCESSFUL publish (#9067).
+	//
+	// Change detection compared only the address, so a TTL-ONLY edit was not a
+	// change on ANY backend and nothing republished until the forced-refresh
+	// floor — 24h by default. That is a delay rather than the permanent block
+	// the Cloudflare early return was, but it defeats the same operator intent:
+	// lowering TTL ahead of a planned renumber is bought precisely so the change
+	// propagates SOON.
+	//
+	// Zero means "not yet published in this process". It is deliberately NOT
+	// seeded by the restart re-adoption below: the durable store records the
+	// published ADDRESS, not the TTL it was published with, so seeding a guess
+	// would either suppress a genuine TTL change (if it guessed the new value)
+	// or force a republish of every scope on every restart (if it guessed
+	// wrong). Leaving it zero means the first post-restart reconcile of an
+	// unchanged scope stays a counted skip, exactly as before, because the
+	// comparison below is gated on a non-zero lastTTL.
+	lastTTL       int
 	lastPublished time.Time
 	// nextEligible is the earliest time the scope may attempt a wire op again
 	// after a failure (error backoff). Zero ⇒ eligible now.
@@ -1117,6 +1148,21 @@ func (m *SurfaceAManager) reconcileScopeLocked(ctx context.Context, sc SurfaceAS
 		forced = defaultForcedRefresh
 	}
 	changed := addr != rt.lastAddr
+	// #9067: a TTL-only edit is a change too.
+	//
+	// Compared on the NORMALISED value, not the configured one. `sc.TTL <= 0`
+	// means "use defaultDDNSTTL", and the publish path below normalises it that
+	// way — so comparing the raw field would miss the explicit-to-unset edit
+	// (e.g. 60 -> unset, which really does change the published TTL) while
+	// reporting a spurious change for unset-to-explicit-default. Both sides go
+	// through the same normalisation the wire op uses.
+	//
+	// Gated on a non-zero lastTTL so a scope re-adopted after restart (address
+	// seeded from the durable store, TTL unknown) is not republished
+	// spuriously — see surfaceAState.lastTTL.
+	if rt.lastTTL != 0 && normalizeDDNSTTL(sc.TTL) != rt.lastTTL {
+		changed = true
+	}
 	// Ownership is keyed on the scope INCLUDING the published FQDN (#2903), so a
 	// hostname-only change (same address) yields a new effectiveKey for which no
 	// record is owned yet → owned==false → the skip below does not fire and the
@@ -1173,6 +1219,7 @@ func (m *SurfaceAManager) reconcileScopeLocked(ctx context.Context, sc SurfaceAS
 	}
 	// Success: clear backoff, update the last-published cache.
 	rt.lastAddr = addr
+	rt.lastTTL = normalizeDDNSTTL(sc.TTL) // #9067: store what was PUBLISHED
 	rt.lastPublished = now
 	rt.nextEligible = time.Time{}
 	rt.backoff = 0
