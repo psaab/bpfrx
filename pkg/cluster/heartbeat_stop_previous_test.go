@@ -48,7 +48,7 @@ func TestStartHeartbeatStopsPreviousHeartbeat(t *testing.T) {
 	for i := 0; i < restarts; i++ {
 		// SO_REUSEADDR+SO_REUSEPORT (vrfListenConfig) lets each restart rebind
 		// the same 127.0.0.1:HeartbeatPort address.
-		if err := m.StartHeartbeat("127.0.0.1", "127.0.0.1", ""); err != nil {
+		if err := m.StartHeartbeat("127.0.0.1", "127.0.0.1", "", "em0"); err != nil {
 			t.Fatalf("StartHeartbeat #%d: %v", i, err)
 		}
 		m.mu.RLock()
@@ -95,7 +95,7 @@ func TestStartHeartbeatStopsPreviousHeartbeat(t *testing.T) {
 // against a fix that over-eagerly stops the heartbeat it just installed.
 func TestStartHeartbeatSingleStartRuns(t *testing.T) {
 	m := NewManager(0, 1)
-	if err := m.StartHeartbeat("127.0.0.1", "127.0.0.1", ""); err != nil {
+	if err := m.StartHeartbeat("127.0.0.1", "127.0.0.1", "", "em0"); err != nil {
 		t.Fatalf("StartHeartbeat: %v", err)
 	}
 	m.mu.RLock()

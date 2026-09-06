@@ -416,6 +416,11 @@ type Manager struct {
 	hbLocalAddr      string // last StartHeartbeat localAddr (for restart)
 	hbPeerAddr       string // last StartHeartbeat peerAddr (for restart)
 	hbVRFDevice      string // last StartHeartbeat vrfDevice (for restart)
+	// hbControlIface is the control INTERFACE this heartbeat was started on
+	// (#8987). Recorded alongside the other StartHeartbeat args so a restart
+	// carries it unchanged and it can never describe a different heartbeat than
+	// hbLocalAddr/hbPeerAddr do.
+	hbControlIface string // last StartHeartbeat controlIface (for restart)
 
 	// Sync stats provider (set by daemon after sessionSync creation).
 	syncStats SyncStatsProvider
@@ -726,6 +731,28 @@ func (m *Manager) HeartbeatPeerAddr() string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.hbPeerAddr
+}
+
+// HeartbeatControlInterface returns the control-link INTERFACE the RUNNING
+// heartbeat was started on -- the value last handed to StartHeartbeat, as
+// distinct from whatever the candidate config, or the last UpdateConfig, says.
+//
+// It exists for the #8987 commit preflight, and the distinction is the whole
+// point of it. m.controlInterface is ALSO an interface name, and using that
+// would have been the natural-looking mistake: UpdateConfig overwrites it on
+// every config apply, so it tracks the CONFIG rather than the running bind and
+// a gate on it would compare config to config -- exactly the trap #8987 records
+// as the reason the interface half was not fixed with the address half.
+//
+// hbLocalAddr is not a substitute either. It is the address resolved ON the
+// control interface, so it usually moves when the interface does -- but an
+// operator who moves the control link to another interface and carries the same
+// address across leaves hbLocalAddr unchanged, and a gate keyed on it would
+// wave through precisely the move that partitions the cluster.
+func (m *Manager) HeartbeatControlInterface() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.hbControlIface
 }
 
 // controlLinkAuthKey returns the configured cluster control-channel PSK (raw

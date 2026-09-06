@@ -294,7 +294,7 @@ func TestStartHeartbeatResolvesTheBootEpoch_6669(t *testing.T) {
 			"start unresolved or this test cannot observe the call", got)
 	}
 
-	if err := m.StartHeartbeat("127.0.0.1", "127.0.0.1", ""); err != nil {
+	if err := m.StartHeartbeat("127.0.0.1", "127.0.0.1", "", "em0"); err != nil {
 		t.Fatalf("StartHeartbeat: %v", err)
 	}
 	t.Cleanup(m.StopHeartbeat)

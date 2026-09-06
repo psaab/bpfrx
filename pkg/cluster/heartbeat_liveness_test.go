@@ -98,7 +98,7 @@ func TestLastPeerReceiveAgeMonotonic(t *testing.T) {
 // startup grace (startedAt) re-arms.
 func TestRestartHeartbeatSeedsLastSeenAndRearmsGrace(t *testing.T) {
 	m := NewManager(0, 1)
-	if err := m.StartHeartbeat("127.0.0.1", "127.0.0.1", ""); err != nil {
+	if err := m.StartHeartbeat("127.0.0.1", "127.0.0.1", "", "em0"); err != nil {
 		t.Fatalf("StartHeartbeat: %v", err)
 	}
 	defer m.StopHeartbeat()

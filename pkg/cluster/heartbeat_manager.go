@@ -51,7 +51,7 @@ func heartbeatUDPNetwork(addr string) string {
 // racing RestartHeartbeat) would overwrite m.hbSender/m.hbReceiver and leak
 // the previous goroutines — their stopCh is never closed, so N restarts leak
 // N heartbeat goroutines and duplicate the on-wire heartbeat rate (#4033).
-func (m *Manager) StartHeartbeat(localAddr, peerAddr, vrfDevice string) error {
+func (m *Manager) StartHeartbeat(localAddr, peerAddr, vrfDevice, controlIface string) error {
 	// Serialize the whole stop-previous + create + install sequence so
 	// concurrent callers cannot interleave and both install a heartbeat.
 	// hbStartMu is distinct from m.mu: StopHeartbeat below takes m.mu and
@@ -156,6 +156,7 @@ func (m *Manager) StartHeartbeat(localAddr, peerAddr, vrfDevice string) error {
 	m.hbLocalAddr = localAddr
 	m.hbPeerAddr = peerAddr
 	m.hbVRFDevice = vrfDevice
+	m.hbControlIface = controlIface
 	// Start the LOCALS, and start them INSIDE the critical section (#7257).
 	// Locals because the pre-#7257 code re-read m.hbReceiver/m.hbSender after
 	// unlocking, which raced StopHeartbeat nilling them — a nil-deref panic if
@@ -334,6 +335,7 @@ func (m *Manager) RestartHeartbeat() bool {
 	localAddr := m.hbLocalAddr
 	peerAddr := m.hbPeerAddr
 	vrfDevice := m.hbVRFDevice
+	controlIface := m.hbControlIface
 	notify := m.hbRestartNotifyFn
 	receiver := m.hbReceiver
 	m.mu.RUnlock()
@@ -361,7 +363,7 @@ func (m *Manager) RestartHeartbeat() bool {
 	m.StopHeartbeat()
 
 	for i := 0; i < 5; i++ {
-		if err := m.StartHeartbeat(localAddr, peerAddr, vrfDevice); err != nil {
+		if err := m.StartHeartbeat(localAddr, peerAddr, vrfDevice, controlIface); err != nil {
 			slog.Warn("cluster: heartbeat restart bind failed, retrying",
 				"err", err, "attempt", i+1)
 			// Keep the peer's suppression guard fed (2s recency window)
