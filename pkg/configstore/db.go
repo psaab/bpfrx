@@ -235,7 +235,11 @@ func (db *DB) WriteConfirm(rec *confirmRecord) error {
 	if err != nil {
 		return fmt.Errorf("encrypt confirm state: %w", err)
 	}
-	if err := fsatomic.WriteFileDurable(db.confirmPath(), data, 0600); err != nil {
+	// #9014: through the rbWriteFileDurable seam, not fsatomic directly, so a
+	// test can fail the ARM write. Until this issue there was no way to
+	// exercise the failure path at all, which is part of why it was the one
+	// confirm-durability leg with no health state — nothing could reach it.
+	if err := rbWriteFileDurable(db.confirmPath(), data, 0600); err != nil {
 		return fmt.Errorf("persist confirm state: %w", err)
 	}
 	return nil

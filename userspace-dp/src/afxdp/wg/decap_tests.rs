@@ -490,3 +490,210 @@ fn poll_loop_denies_wg_inner_plaintext_with_no_permitting_policy_8274() {
          code path's shape"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #9018: the worker's declined-but-AUTHENTICATED arms must still roam the peer.
+// ---------------------------------------------------------------------------
+
+/// A NAT-rebound / roaming peer's new outer endpoint. Deliberately a different
+/// address AND a different source port from `PEER_OUTER`/`PEER_SPORT`: a NAT
+/// rebind usually moves the port, and a fixture that changed only the address
+/// would stay green against a fix that ignored the port.
+const ROAMED_OUTER: [u8; 4] = [198, 51, 100, 22];
+const ROAMED_SPORT: u16 = 41001;
+
+/// `outer_frame` with a caller-chosen source endpoint, so a cell can present
+/// the SAME authenticated record arriving from somewhere new.
+fn outer_frame_from(record: &[u8], dst_port: u16, src_ip: [u8; 4], src_port: u16) -> Vec<u8> {
+    let mut f = outer_frame(record, dst_port);
+    f[26..30].copy_from_slice(&src_ip);
+    f[34..36].copy_from_slice(&src_port.to_be_bytes());
+    f
+}
+
+/// A KEEPALIVE from a changed endpoint must roam the peer.
+///
+/// This is the NAT-traversal case WireGuard keepalives exist for, and before
+/// #9018 it moved nothing. `try_decap` returns `Err(DecapError::Keepalive(pk))`
+/// carrying the proven peer — added by #7230 for exactly this — and the worker
+/// collapsed it with `.ok()?`. The socket path in wg_control/dispatch.rs does
+/// map that arm to `Authenticated(pk)`, but it never sees these records: a
+/// keepalive is a type-4 transport record, so `wg_worker_claims_record` claims
+/// it for the worker and the shim declines `cpumap_or_pass`.
+#[test]
+fn worker_decap_roams_endpoint_on_keepalive_9018() {
+    let allowed: Vec<ipnet::IpNet> = vec!["10.123.0.0/24".parse().unwrap()];
+    let (init, resp, init_pub, resp_pub) = established_pair(allowed.clone(), allowed);
+    let (forwarding, id) = forwarding_with_engine(resp);
+    let engine = std::sync::Arc::clone(&forwarding.wg_engines[&id]);
+
+    let mut wire = vec![0u8; 2048];
+    let enc = init
+        .create_keepalive(&resp_pub, &mut wire)
+        .expect("initiator keepalive");
+    let frame = outer_frame_from(&wire[..enc.len], WG_PORT, ROAMED_OUTER, ROAMED_SPORT);
+    let meta = outer_meta(frame.len());
+
+    let scratch = WgWorkerScratch::new(4096);
+    let decapped = super::decap::try_wg_decap_from_frame(&frame, meta, &forwarding, &scratch);
+    assert!(
+        decapped.is_none(),
+        "a keepalive carries no inner packet, so the stage must still decline \
+         the frame — #9018 adds endpoint learning, it does not make a keepalive \
+         deliverable"
+    );
+
+    assert_eq!(
+        engine.take_worker_observed_endpoint(&init_pub),
+        Some(std::net::SocketAddr::from((ROAMED_OUTER, ROAMED_SPORT))),
+        "an AUTHENTICATED keepalive from a new endpoint must roam the peer. \
+         Before #9018 `.ok()?` discarded DecapError::Keepalive(pk) and the \
+         endpoint stayed stale until the peer's next handshake — which is the \
+         only reason the tunnel recovered at all"
+    );
+    // Drained, not merely readable: a second take must be empty, or the control
+    // thread re-adopts the same roam on every pass.
+    assert_eq!(engine.take_worker_observed_endpoint(&init_pub), None);
+    // It is still counted as a keepalive, not as a drop.
+    assert_eq!(
+        engine.counters().decap_keepalives.load(Ordering::Relaxed),
+        1,
+        "the keepalive counter is unchanged by #9018"
+    );
+}
+
+/// The same for MALFORMED INNER: authenticated, undeliverable, still roams.
+///
+/// #7686 gave this arm the peer identity for the same reason #7230 gave it to
+/// keepalives, and the worker discarded both with the one `.ok()?`.
+#[test]
+fn worker_decap_roams_endpoint_on_malformed_inner_9018() {
+    let allowed: Vec<ipnet::IpNet> = vec!["10.123.0.0/24".parse().unwrap()];
+    let (init, resp, init_pub, resp_pub) = established_pair(allowed.clone(), allowed);
+    let (forwarding, id) = forwarding_with_engine(resp);
+    let engine = std::sync::Arc::clone(&forwarding.wg_engines[&id]);
+
+    // A non-empty plaintext whose first nibble is neither 4 nor 6 does not
+    // parse as an inner packet, so try_decap returns MalformedInner(pk).
+    let junk = [0xffu8; 32];
+    let mut wire = vec![0u8; 2048];
+    let enc = init
+        .try_encap(&resp_pub, &junk, &mut wire)
+        .expect("initiator encap");
+    let frame = outer_frame_from(&wire[..enc.len], WG_PORT, ROAMED_OUTER, ROAMED_SPORT);
+    let meta = outer_meta(frame.len());
+
+    let scratch = WgWorkerScratch::new(4096);
+    assert!(
+        super::decap::try_wg_decap_from_frame(&frame, meta, &forwarding, &scratch).is_none(),
+        "a malformed inner is not deliverable"
+    );
+    assert_eq!(
+        engine.take_worker_observed_endpoint(&init_pub),
+        Some(std::net::SocketAddr::from((ROAMED_OUTER, ROAMED_SPORT))),
+        "an authenticated record with an unparseable inner still proves the \
+         peer is at this endpoint (#7686 + #9018)"
+    );
+}
+
+/// CONTROL: an UNAUTHENTICATED datagram must never move an endpoint.
+///
+/// This is the arm that makes the two cells above safe rather than merely
+/// convenient. If the roam report were hoisted above the crypto — or the
+/// catch-all `Err(_)` arm were widened — anyone who can reach the listen port
+/// could redirect a tunnel's egress. Every cell above would still pass.
+#[test]
+fn worker_decap_does_not_roam_on_unauthenticated_record_9018() {
+    let allowed: Vec<ipnet::IpNet> = vec!["10.123.0.0/24".parse().unwrap()];
+    let (init, resp, init_pub, resp_pub) = established_pair(allowed.clone(), allowed);
+    let (forwarding, id) = forwarding_with_engine(resp);
+    let engine = std::sync::Arc::clone(&forwarding.wg_engines[&id]);
+
+    let inner = inner_v4([10, 123, 0, 5], [10, 0, 61, 102]);
+    let mut wire = vec![0u8; 2048];
+    let enc = init
+        .try_encap(&resp_pub, &inner, &mut wire)
+        .expect("initiator encap");
+    // Corrupt the ciphertext so the AEAD tag check fails: same session, same
+    // receiver_index, so it is demuxed to a peer and then REJECTED.
+    let mut record = wire[..enc.len].to_vec();
+    let last = record.len() - 1;
+    record[last] ^= 0xff;
+    let frame = outer_frame_from(&record, WG_PORT, ROAMED_OUTER, ROAMED_SPORT);
+    let meta = outer_meta(frame.len());
+
+    let scratch = WgWorkerScratch::new(4096);
+    assert!(
+        super::decap::try_wg_decap_from_frame(&frame, meta, &forwarding, &scratch).is_none(),
+        "a record that fails AEAD is not deliverable"
+    );
+    assert_eq!(
+        engine.take_worker_observed_endpoint(&init_pub),
+        None,
+        "an UNAUTHENTICATED datagram must never move a peer's endpoint — \
+         otherwise anyone who can send to the listen port redirects the \
+         tunnel's egress. Only post-AEAD arms may roam"
+    );
+    assert!(
+        engine.counters().decap_drops_crypto.load(Ordering::Relaxed) >= 1,
+        "the corrupted record must be counted as a crypto failure, or this \
+         cell is asserting about a record that never reached try_decap"
+    );
+}
+
+/// #9018: the T7 no-reply arm and the endpoint update now move TOGETHER.
+///
+/// `note_authenticated_recv` clears `t7_armed_send_ns` from a received
+/// keepalive, and it runs INSIDE `try_decap` — before the caller can do
+/// anything with the error. Before this change the worker then discarded the
+/// identity, so the session was refreshed as alive while its endpoint stayed
+/// stale, and the reinit arm that would have forced an earlier re-handshake was
+/// disarmed by the very packet that should have roamed the peer.
+///
+/// The report suggests not clearing T7 when the endpoint could not be applied.
+/// That is deliberately NOT done: with the endpoint applied, "the peer is
+/// alive" is now accurate, and the no-reply reinit arm is the wrong mechanism
+/// to compensate for a stale endpoint — changing it is a protocol-timing change
+/// with a far wider blast radius. This cell PINS the pairing instead, so a
+/// future change to either half is deliberate rather than incidental.
+#[test]
+fn worker_decap_keepalive_clears_t7_and_roams_together_9018() {
+    let allowed: Vec<ipnet::IpNet> = vec!["10.123.0.0/24".parse().unwrap()];
+    let (init, resp, init_pub, resp_pub) = established_pair(allowed.clone(), allowed);
+    let (forwarding, id) = forwarding_with_engine(resp);
+    let engine = std::sync::Arc::clone(&forwarding.wg_engines[&id]);
+
+    // ARM T7 first, or the assertion below is vacuous: an unarmed peer reads
+    // 0 whether or not the keepalive cleared anything.
+    let peer = engine.peer_arc(&init_pub).expect("responder knows the peer");
+    peer.note_data_send(1_000);
+    assert_ne!(
+        peer.t7_armed_send_ns.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "fixture precondition: T7 must be armed before the keepalive arrives, \
+         or this cell cannot observe it being cleared"
+    );
+
+    let mut wire = vec![0u8; 2048];
+    let enc = init
+        .create_keepalive(&resp_pub, &mut wire)
+        .expect("initiator keepalive");
+    let frame = outer_frame_from(&wire[..enc.len], WG_PORT, ROAMED_OUTER, ROAMED_SPORT);
+    let meta = outer_meta(frame.len());
+    let scratch = WgWorkerScratch::new(4096);
+    assert!(super::decap::try_wg_decap_from_frame(&frame, meta, &forwarding, &scratch).is_none());
+
+    assert_eq!(
+        peer.t7_armed_send_ns.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a received keepalive still clears the T7 no-reply arm (unchanged by \
+         #9018 — see this cell's doc comment for why that is deliberate)"
+    );
+    assert_eq!(
+        engine.take_worker_observed_endpoint(&init_pub),
+        Some(std::net::SocketAddr::from((ROAMED_OUTER, ROAMED_SPORT))),
+        "...and the endpoint moves in the SAME pass. That pairing is the whole \
+         justification for leaving T7 alone: before #9018 the session was \
+         marked alive while its endpoint stayed stale"
+    );
+}

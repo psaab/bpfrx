@@ -853,6 +853,52 @@ per-path:
     — both mean the window is resolved — and differ only in how long
     `ConfigPersistDegraded()` keeps reporting the undeleted record.
   - **A boot read failure is REPORTED, not swallowed (#8566).**
+*   **#9014 — the ARM write was the LAST confirm-durability leg with no
+    health state.** `writeConfirmState` logged one `slog.Warn` and returned:
+    no flag, no journal entry, no retry, and `CommitConfirmed` still returned
+    `(compiled, nil)`. A crash or reboot inside the confirm window then found
+    no record, the unconfirmed configuration stood permanently, and /health
+    returned 200 throughout. The asymmetry was the decisive evidence, because
+    the invariant it broke is written down in this same package, in #8566's
+    own rationale directly below:
+
+    | failure | flag | journal | retry | health |
+    | --- | --- | --- | --- | --- |
+    | confirm **read** at boot | `confirmRecoveryReadFailed` (#8566) | yes | — | degraded |
+    | confirm **removal** | `confirmRemoveDegraded` (#5835) | yes | yes | degraded |
+    | confirm **arm/write** (before #9014) | **none** | **none** | **none** | **200 OK** |
+
+    It now logs at ERROR, journals `confirm_arm_error`, sets
+    `confirmArmDegraded` (folded into `ConfigPersistDegraded()`), and takes
+    retry debt in the singleton persist-retry loop, which re-drives
+    `WriteConfirm` until it lands and journals `confirm_arm_recovered`.
+
+    **The commit is deliberately NOT failed.** That matches both neighbours
+    and the #1960 no-brick posture: the configuration is applied and correct,
+    only its crash-recovery record is missing, and refusing the commit would
+    turn a durability problem into an availability one.
+
+    **The retry is generation-pinned, and this is the part that is easy to get
+    wrong.** `confirmArmGen` records which window the debt belongs to. If the
+    window is confirmed, superseded or rolled back while the write is still
+    owed, re-driving it would create a crash-recovery record for a window that
+    no longer exists — a restart would then resurrect a rollback the operator
+    had already resolved. That is the exact mirror of #7675 on the removal
+    side, where re-driving a delete would have removed a LIVE window's record.
+    The debt is instead dropped with a `confirm_arm_superseded` journal entry.
+    `TestArmWriteDebtIsNotResurrectedAfterResolution9014` pins it, and removing
+    the generation guard reproduces the resurrection deterministically.
+
+    A SUCCESSFUL arm — first try or a later re-arm — discharges any outstanding
+    debt, because the record on disk is then current; holding health down
+    behind a satisfied debt would misreport a durable window as unsafe.
+
+    `DB.WriteConfirm` now goes through the `rbWriteFileDurable` seam rather
+    than calling `fsatomic` directly. Until #9014 there was no way to fail the
+    arm write in a test at all, which is part of why this was the leg with no
+    guard: nothing could reach the failure path.
+
+*   **#8566 — a failed confirm READ at boot lost the window silently.**
     `recoverPendingConfirmLocked` logged a WARN and returned nil when
     `ReadConfirm` failed, so `Load` succeeded and the daemon came up with the
     rollback window GONE — no timer, no debt, and `ConfigPersistDegraded()`
