@@ -356,7 +356,23 @@ func inferIPv6StaticNextHopInterfaces(cfg *config.Config, overlay []config.Route
 		if entries, ok := connectedByLogical[normalized]; ok {
 			prefixes = append(prefixes, entries...)
 		}
-		if !strings.Contains(normalized, ".") {
+		// #9063: expand to every sub-unit ONLY for a WHOLE-DEVICE reference.
+		//
+		// The test used to be on the NORMALIZED key, and `logicalUnitDeviceKey`
+		// collapses a unit with no vlan-id and unit number 0 to the bare base --
+		// correctly, because `ge-0-0-0` IS the kernel device name for that unit.
+		// So `ge-0/0/0.0` and the whole-port `ge-0/0/0` produced the same key,
+		// and a routine
+		//
+		//	routing-instances blue { interface ge-0/0/0.0; }
+		//
+		// pulled every `ge-0-0-0.<vlan>` prefix into the VRF pool as well.
+		//
+		// The raw REFERENCE keeps the distinction the key cannot: a reference
+		// with a unit suffix names one unit, and one without names the port.
+		// Both readings are legitimate and the config text is what separates
+		// them.
+		if !strings.Contains(ifName, ".") {
 			prefixNames := make([]string, 0, len(connectedByLogical))
 			for logical := range connectedByLogical {
 				if strings.HasPrefix(logical, normalized+".") {
@@ -400,7 +416,10 @@ func inferIPv6StaticNextHopInterfaces(cfg *config.Config, overlay []config.Route
 		}
 	}
 
-	claimedByVRF := make(map[string]struct{})
+	// #9063: the value records whether the claim named the WHOLE DEVICE
+	// (`ge-0/0/0`) rather than one unit (`ge-0/0/0.0`). Both normalize to the
+	// same key, and only the first may exclude a port's other sub-units.
+	claimedByVRF := make(map[string]bool)
 	for _, ri := range cfg.RoutingInstances {
 		vrfName := "vrf-" + ri.Name
 		if ri.InstanceType == "forwarding" {
@@ -417,7 +436,12 @@ func inferIPv6StaticNextHopInterfaces(cfg *config.Config, overlay []config.Route
 				// K84 nor K85. claimedByVRF is compared against producer-keyed
 				// names below, so it must use the producer's rule too.
 				normalized := logicalUnitDeviceKeyForRef(cfg, ifName)
-				claimedByVRF[normalized] = struct{}{}
+				// #9063: record WHICH READING this claim is. The normalized key
+				// cannot say -- `ge-0/0/0` and `ge-0/0/0.0` both key to
+				// `ge-0-0-0` -- and the two mean different things to the
+				// base-match exclusion below. The raw reference is the only
+				// place the distinction survives.
+				claimedByVRF[normalized] = !strings.Contains(ifName, ".")
 			}
 		}
 	}
@@ -431,7 +455,22 @@ func inferIPv6StaticNextHopInterfaces(cfg *config.Config, overlay []config.Route
 			if _, claimed := claimedByVRF[prefix.ifName]; claimed {
 				continue
 			}
-			if _, claimed := claimedByVRF[base]; claimed {
+			// #9063: a BASE match excludes every sub-unit of that port, so it
+			// may only fire for a claim that named the whole DEVICE.
+			//
+			// It used to fire for any claim whose key was bare -- and
+			// `ge-0/0/0.0` has a bare key, because `ge-0-0-0` is the kernel
+			// device name for unit 0. So a VRF holding one unit-0 member
+			// discarded every `ge-0-0-0.<vlan>` prefix from the DEFAULT pool.
+			//
+			// For a global-unicast next-hop that is harmless: the render emits a
+			// scopeless `ipv6 route <p> <gw>` and FRR resolves it recursively.
+			// For a LINK-LOCAL next-hop it is not -- FRR rejects a scopeless
+			// `ipv6 route <p> fe80::1`, so the static route never installs and
+			// the prefix blackholes. A dual-tenant trunk (VRF on unit 0, a
+			// tagged unit on the same port in the default table) is the routine
+			// layout that reaches it.
+			if wholeDevice, claimed := claimedByVRF[base]; claimed && wholeDevice {
 				continue
 			}
 			filtered = append(filtered, prefix)
