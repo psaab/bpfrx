@@ -113,8 +113,15 @@ func validatePolicyMatchAddressesStrict(cfg *Config) error {
 		if zpp == nil {
 			continue
 		}
+		// #9127: NAME THE ZONE PAIR. Policy names are unique per zone pair, not
+		// globally, so an error carrying only the policy name does not identify
+		// the stanza the operator has to go and edit -- two `allow-dns`
+		// policies under different pairs are ordinary configuration.
+		// validatePolicyLoggingStrict already supplied this scope; these four
+		// are the consistency change, not a new convention.
+		scope := fmt.Sprintf("from-zone %s to-zone %s", zpp.FromZone, zpp.ToZone)
 		for _, pol := range zpp.Policies {
-			if err := check("", pol); err != nil {
+			if err := check(scope, pol); err != nil {
 				return err
 			}
 		}
@@ -222,8 +229,15 @@ func validatePolicyMatchApplicationsStrict(cfg *Config) error {
 		if zpp == nil {
 			continue
 		}
+		// #9127: NAME THE ZONE PAIR. Policy names are unique per zone pair, not
+		// globally, so an error carrying only the policy name does not identify
+		// the stanza the operator has to go and edit -- two `allow-dns`
+		// policies under different pairs are ordinary configuration.
+		// validatePolicyLoggingStrict already supplied this scope; these four
+		// are the consistency change, not a new convention.
+		scope := fmt.Sprintf("from-zone %s to-zone %s", zpp.FromZone, zpp.ToZone)
 		for _, pol := range zpp.Policies {
-			if err := check("", pol); err != nil {
+			if err := check(scope, pol); err != nil {
 				return err
 			}
 		}
@@ -465,8 +479,15 @@ func validatePolicyMatchAddressSetMembersStrict(cfg *Config) error {
 		if zpp == nil {
 			continue
 		}
+		// #9127: NAME THE ZONE PAIR. Policy names are unique per zone pair, not
+		// globally, so an error carrying only the policy name does not identify
+		// the stanza the operator has to go and edit -- two `allow-dns`
+		// policies under different pairs are ordinary configuration.
+		// validatePolicyLoggingStrict already supplied this scope; these four
+		// are the consistency change, not a new convention.
+		scope := fmt.Sprintf("from-zone %s to-zone %s", zpp.FromZone, zpp.ToZone)
 		for _, pol := range zpp.Policies {
-			if err := check("", pol); err != nil {
+			if err := check(scope, pol); err != nil {
 				return err
 			}
 		}
@@ -901,8 +922,15 @@ func validatePolicyLogActionStrict(cfg *Config) error {
 		if zpp == nil {
 			continue
 		}
+		// #9127: NAME THE ZONE PAIR. Policy names are unique per zone pair, not
+		// globally, so an error carrying only the policy name does not identify
+		// the stanza the operator has to go and edit -- two `allow-dns`
+		// policies under different pairs are ordinary configuration.
+		// validatePolicyLoggingStrict already supplied this scope; these four
+		// are the consistency change, not a new convention.
+		scope := fmt.Sprintf("from-zone %s to-zone %s", zpp.FromZone, zpp.ToZone)
 		for _, pol := range zpp.Policies {
-			if err := check("", pol); err != nil {
+			if err := check(scope, pol); err != nil {
 				return err
 			}
 		}
