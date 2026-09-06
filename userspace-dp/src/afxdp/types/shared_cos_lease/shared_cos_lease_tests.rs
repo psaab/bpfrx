@@ -2731,3 +2731,127 @@ fn concurrent_reset_and_refill_stay_bounded_7206_f4() {
         "tokens survived a completed reset"
     );
 }
+
+// === #9117: a worker going idle -> active MID-EPOCH ===
+//
+// The FOURTH shape, absent from publish_equal_flow_epoch_v8's own three-case
+// enumeration. Such a worker has a usable sample, demanded, and was granted —
+// everything that makes a case-1 sample-set member — but its share was
+// published as 0 at the last rotation because its buckets were empty then. It
+// used to trip case 2's UnsampledActiveWorker fail-open, and fail_open resets
+// valid_streak and smoothed_target_per_flow, so with
+// EQUAL_FLOW_VALID_STREAK_REQUIRED = 2 one activation cost ~3 epochs of
+// enforcement ACROSS THE WHOLE CLASS (one lease serves every worker on it).
+//
+// These two cells are a PAIR and the control is load-bearing: without it,
+// "not enforced" is the state at every early epoch, so the subject would pass
+// against code that never enforces at all.
+
+/// Three workers, so the newcomer (1) is distinct from the two established
+/// ones (0 and 2). new_equal_flow_lease caps max_worker_id at 1.
+fn new_equal_flow_lease_3w_9117() -> SharedCoSQueueLease {
+    SharedCoSQueueLease::new_v8_with_rate_mode(
+        50_000_000,
+        256 * 1024,
+        8,
+        2,
+        V8RateMode::EqualFlowSuppress,
+    )
+}
+
+#[test]
+fn control_established_workers_reach_enforcement_9117() {
+    let lease = new_equal_flow_lease_3w_9117();
+    lease.rehydrate_worker_active_count(0, 4);
+    lease.rehydrate_worker_active_count(2, 1);
+
+    for epoch in 1..=2u64 {
+        let _ = lease.acquire_v8(0, epoch * EPOCH_DURATION_NS, 8_000);
+        let _ = lease.acquire_v8(2, epoch * EPOCH_DURATION_NS, 1_800);
+    }
+    let _ = lease.acquire_v8(2, 3 * EPOCH_DURATION_NS, 1);
+    assert!(
+        lease.v8_equal_flow_enforced(),
+        "#9117 control: two established workers must reach enforcement by the \
+         third rotation. If this fails, the SUBJECT cell below proves nothing — \
+         'not enforced' would be the state at every early epoch regardless."
+    );
+}
+
+#[test]
+fn newly_active_worker_is_excluded_not_class_wide_fail_open_9117() {
+    let lease = new_equal_flow_lease_3w_9117();
+    lease.rehydrate_worker_active_count(0, 4);
+    lease.rehydrate_worker_active_count(2, 1);
+
+    for epoch in 1..=2u64 {
+        let _ = lease.acquire_v8(0, epoch * EPOCH_DURATION_NS, 8_000);
+        let _ = lease.acquire_v8(2, epoch * EPOCH_DURATION_NS, 1_800);
+    }
+
+    // Worker 1 wakes MID-EPOCH-2: it had no buckets at the last rotation, so
+    // its share was published as 0, and it now demands and is granted.
+    lease.rehydrate_worker_active_count(1, 1);
+    let _ = lease.acquire_v8(1, 2 * EPOCH_DURATION_NS + 1_000, 1_800);
+
+    // Assert the PRECONDITION directly, so a future change that stops
+    // constructing this shape fails loudly instead of passing vacuously.
+    assert_eq!(
+        lease.v8_worker_fair_share_for_test(1),
+        0,
+        "#9117 fixture: worker 1 must have a published share of 0 — that is the \
+         shape under test. A non-zero share means the setup no longer creates a \
+         mid-epoch newcomer and every assertion below is measuring something else."
+    );
+    assert_ne!(
+        lease.v8_worker_fair_share_for_test(0),
+        0,
+        "#9117 fixture: worker 0 must have a real share, else 'share == 0' is not \
+         discriminating anything"
+    );
+
+    let excluded_before = lease.v8_newly_active_excluded_count();
+    let _ = lease.acquire_v8(2, 3 * EPOCH_DURATION_NS, 1);
+
+    assert!(
+        lease.v8_equal_flow_enforced(),
+        "#9117 [reason={:?} excluded={}] one worker waking mid-epoch disarmed equal-flow enforcement for the \
+         WHOLE CLASS. fail_open resets valid_streak and smoothed_target_per_flow, so \
+         with EQUAL_FLOW_VALID_STREAK_REQUIRED = 2 that costs ~3 epochs of \
+         enforcement on every worker sharing the lease. The newcomer's sample is \
+         PARTIAL, not unusable: exclude it for one epoch, exactly as the \
+         idle-at-rotation case already does, rather than using it to disarm the \
+         comparison.",
+        lease.v8_equal_flow_fail_open_reason(),
+        lease.v8_newly_active_excluded_count()
+    );
+    assert!(
+        lease.v8_newly_active_excluded_count() > excluded_before,
+        "#9117: enforcement survived but nothing recorded that a worker was \
+         excluded. The exclusion must be observable — otherwise 'the class kept \
+         enforcing' cannot be told apart from 'the newcomer was silently included \
+         and dragged the target down'."
+    );
+}
+
+// #9117 KNOWN COVERAGE BOUND, recorded rather than left for someone to
+// rediscover as a survivor.
+//
+// The pair above is ALSO satisfied by "exclude EVERY unsampled participant" —
+// a mutation that replaced the `published_share == Some(0)` discriminator with
+// an unconditional exclusion passed both cells. That mutation would delete the
+// genuine case-2 safety fail-open, so the gap is real.
+//
+// The cell that would close it needs an ESTABLISHED worker (non-zero published
+// share) that is ACTIVE but UNSAMPLED, and that state is not constructible
+// through this API: `rehydrate_worker_active_count(id, 0)` clears
+// `active_by_worker` as well as the sampled flow count, so such a worker is
+// skipped by the `!active_by_worker[id]` guard before it ever reaches the
+// participation arm — the attempt produced `reason=None` with enforcement ON,
+// i.e. the shape never occurred. Closing it needs a seam that sets the sampled
+// flow count independently of the active flag, which is a change to the
+// production type for a test's benefit and is not obviously worth it.
+//
+// What DOES bound the mutation today: the discriminator is one line, it is
+// commented with its reason, and the fail-open it narrows is still reached by
+// every worker whose share is non-zero or absent.

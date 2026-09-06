@@ -67,6 +67,11 @@ pub(super) fn publish_equal_flow_epoch_v8(
     //       legitimately sent nothing this epoch.
     let mut active_workers = 0u32;
     let mut sampled_workers = 0u32;
+    // #9117: workers excluded because they woke mid-epoch and so carry only a
+    // partial-epoch sample. Counted rather than silently dropped: if every
+    // sampled worker is a newcomer the set is empty, and the existing
+    // empty-set handling below must be the thing that decides, not this loop.
+    let mut newly_active_excluded = 0u32;
     for id in 0..n_workers {
         if !active_by_worker[id] {
             continue;
@@ -77,6 +82,50 @@ pub(super) fn publish_equal_flow_epoch_v8(
         if has_sample {
             sampled_workers = sampled_workers.saturating_add(1);
         } else if demanded_by_worker[id] || prev_grants[id] > 0 {
+            // #9117: TWO different situations reach here and only one of them
+            // justifies disarming the whole class.
+            //
+            // A worker whose share was published as 0 at the last rotation had
+            // NO flow buckets then — it went idle -> active MID-EPOCH, after the
+            // sampler snapshot was taken. It participated (demanded, granted)
+            // and legitimately has no sample, because there was nothing to
+            // sample when the sample was taken. That is a FOURTH shape, absent
+            // from the three-case enumeration above: not "a participant we
+            // failed to sample" but "a participant that did not exist yet".
+            //
+            // EXCLUDE it for one epoch, exactly as the idle-at-rotation case on
+            // the next line already does, and for the same reason: a worker we
+            // cannot fairly compare is left OUT of the comparison rather than
+            // used to disarm it. Its next epoch is fully sampled and it rejoins.
+            //
+            // What the old behaviour cost: fail_open resets `valid_streak` and
+            // `smoothed_target_per_flow`, and EQUAL_FLOW_VALID_STREAK_REQUIRED
+            // is 2, so ONE mid-epoch activation suppressed enforcement for ~3
+            // epochs ACROSS THE WHOLE CLASS — one lease serves every worker on
+            // it. Bounded (~600 us at EPOCH_DURATION_NS = 200_000, and opt-in
+            // via `equal-flow-enforcement`) but entirely avoidable.
+            //
+            // MEASURED HERE, not inferred: the originating issue located this
+            // fail-open at the `prior_share == 0` check further down and a fix
+            // placed there did nothing — the probe reported
+            // `reason=UnsampledActiveWorker excluded=0`, i.e. the class was
+            // disarmed before that check was ever reached. This is the site.
+            //
+            // A worker whose share is genuinely MISSING (id outside the
+            // published vector) is not this case: that is an inconsistency
+            // between the worker set and the share table, and it still fails
+            // open below.
+            let published_share = v8
+                .worker_fair_share
+                .get(id)
+                .map(|share| share.load(Ordering::Acquire));
+            if published_share == Some(0) {
+                newly_active_excluded += 1;
+                v8.equal_flow
+                    .newly_active_excluded_count
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             // Real participant we could not sample cleanly: fail open
             // rather than set the class target from an incomplete set.
             v8.equal_flow
@@ -122,16 +171,21 @@ pub(super) fn publish_equal_flow_epoch_v8(
                 .fail_open(new_tag, V8EqualFlowFailOpenReason::ZeroTarget);
             return;
         }
-        let prior_share = v8
-            .worker_fair_share
-            .get(id)
-            .map(|share| share.load(Ordering::Acquire))
-            .unwrap_or(0);
-        if prior_share == 0 {
-            v8.equal_flow
-                .fail_open(new_tag, V8EqualFlowFailOpenReason::UnsampledActiveWorker);
-            return;
-        }
+        // #9117: `.get(id)` returning None and `Some(0)` were collapsed by
+        // `unwrap_or(0)`. None means the id is outside the published vector — an
+        // inconsistency between the worker set and the share table, where
+        // failing open is honest. Some(0) is the mid-epoch newcomer, and it is
+        // handled at its real site in the FIRST loop above; a worker reaching
+        // here with a published 0 AND a usable sample is neither, so it keeps
+        // the original fail-open.
+        let prior_share = match v8.worker_fair_share.get(id).map(|s| s.load(Ordering::Acquire)) {
+            Some(share) if share > 0 => share,
+            _ => {
+                v8.equal_flow
+                    .fail_open(new_tag, V8EqualFlowFailOpenReason::UnsampledActiveWorker);
+                return;
+            }
+        };
         // Equal-flow suppression is safe only when the sample is demand
         // saturated enough to represent a real slow per-flow rate. A
         // quiet worker, or a rotation-boundary worker-grant sample that
@@ -185,8 +239,18 @@ pub(super) fn publish_equal_flow_epoch_v8(
     };
 
     if candidate_target == u64::MAX || candidate_target == 0 {
-        v8.equal_flow
-            .fail_open(new_tag, V8EqualFlowFailOpenReason::ZeroTarget);
+        // #9117: a target of "nothing" when the only thing that emptied the
+        // sample set was mid-epoch newcomers is a DIFFERENT fact from a genuine
+        // zero target, and the reason code should not claim otherwise. Both
+        // fail open — the class has no comparable sample either way — but the
+        // reason names which, so an operator reading a fail-open storm can tell
+        // "workers keep waking" from "the arithmetic collapsed".
+        let reason = if newly_active_excluded > 0 && sampled_workers == 0 {
+            V8EqualFlowFailOpenReason::UnsampledActiveWorker
+        } else {
+            V8EqualFlowFailOpenReason::ZeroTarget
+        };
+        v8.equal_flow.fail_open(new_tag, reason);
         return;
     }
 
