@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"sort"
-	"strconv"
 	"strings"
 	"testing"
 )
@@ -34,14 +33,36 @@ import (
 // done by hand because someone remembered to; this cell is that check as a
 // mechanism.
 
-func multisiteRegistry8921(t *testing.T) map[string]int {
+// multisitePath8921 is the recorded population.
+const multisitePath8921 = "testdata/multisite_admissions_8921.txt"
+
+// multisiteRegistry8921 reads the registry as pair -> SITE PATHS.
+//
+// IT USED TO STORE A COUNT, AND THAT WAS A REAL BLIND SPOT rather than a
+// tidiness question. #8921 exists to record WHICH schema sites an admission is
+// effective at -- the whole finding is that a pair adjudicated at one site is
+// live at every site declaring that keyword. A count cannot see a
+// SUBSTITUTION: a pair that loses one declaring site and gains another holds
+// its count, and the ratchet says nothing, while the thing the issue is about
+// has changed completely.
+//
+// lane-8388 found this shape in two of their own ratchets on the same day and
+// asked whether mine had it. It did. Their sentence is the general form:
+//
+//	A ratchet keyed on a COUNT cannot see a SUBSTITUTION, and the direction
+//	that looks like nothing happened is the one nobody audits.
+//
+// The membership form costs one comma-joined field and reports the swap by
+// name. It also makes the registry self-documenting: a reader can see where an
+// admission lands without re-running the walk.
+func multisiteRegistry8921(t *testing.T) map[string][]string {
 	t.Helper()
-	f, err := os.Open("testdata/multisite_admissions_8921.txt")
+	f, err := os.Open(multisitePath8921)
 	if err != nil {
 		t.Fatalf("cannot read the #8921 registry: %v -- this cell is blind without it", err)
 	}
 	defer f.Close()
-	out := map[string]int{}
+	out := map[string][]string{}
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		line := sc.Text()
@@ -52,13 +73,24 @@ func multisiteRegistry8921(t *testing.T) map[string]int {
 		if len(parts) != 2 {
 			t.Fatalf("malformed registry row %q", line)
 		}
-		n, err := strconv.Atoi(parts[1])
-		if err != nil {
-			t.Fatalf("malformed count in row %q: %v", line, err)
-		}
-		out[parts[0]] = n
+		siteList := strings.Split(parts[1], ",")
+		sort.Strings(siteList)
+		out[parts[0]] = siteList
 	}
 	return out
+}
+
+// sameSites8921 compares two site lists as SETS.
+func sameSites8921(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // admittedDeclaringSites8921 walks the schema and, for every admitted
@@ -122,10 +154,12 @@ func TestMultisiteAdmissionsAreRecorded8921(t *testing.T) {
 	}
 
 	sites := admittedDeclaringSites8921()
-	measured := map[string]int{}
+	measured := map[string][]string{}
 	for pair, paths := range sites {
 		if len(paths) > 1 {
-			measured[pair] = len(paths)
+			cp := append([]string{}, paths...)
+			sort.Strings(cp)
+			measured[pair] = cp
 		}
 	}
 	if len(measured) == 0 {
@@ -134,19 +168,84 @@ func TestMultisiteAdmissionsAreRecorded8921(t *testing.T) {
 			"either way this cell is reporting agreement it did not check")
 	}
 
-	var added, removed, changed []string
-	for pair, n := range measured {
-		if was, ok := reg[pair]; !ok {
-			added = append(added, fmt.Sprintf("%s (live at %d sites: %s)",
-				pair, n, strings.Join(sites[pair], ", ")))
-		} else if was != n {
-			changed = append(changed, fmt.Sprintf("%s: recorded %d, now %d (%s)",
-				pair, was, n, strings.Join(sites[pair], ", ")))
+	// REGENERATION. The registry moved from counts to site lists (#9094) and
+	// 210 rows cannot be hand-migrated. This writes the CURRENT measurement,
+	// so it must never be run to make a failure go away -- the error text
+	// below says what to check first.
+	if os.Getenv("UPDATE_8921") != "" {
+		var keys []string
+		for k := range measured {
+			keys = append(keys, k)
 		}
+		sort.Strings(keys)
+		var b strings.Builder
+		b.WriteString("# #8921: admitted brace-elision pairs that are EFFECTIVE AT MORE THAN ONE\n")
+		b.WriteString("# declaring schema site, and WHERE.\n")
+		b.WriteString("#\n")
+		b.WriteString("# Site LISTS, not counts (#9094): a count cannot see a SUBSTITUTION -- a\n")
+		b.WriteString("# pair that loses one declaring site and gains another holds its count\n")
+		b.WriteString("# while the thing this issue is about has changed completely.\n")
+		b.WriteString("#\n")
+		for _, k := range keys {
+			fmt.Fprintf(&b, "%s\t%s\n", k, strings.Join(measured[k], ","))
+		}
+		if err := os.WriteFile(multisitePath8921, []byte(b.String()), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("regenerated %s with %d multi-site pairs", multisitePath8921, len(keys))
+		return
+	}
+
+	var added, removed, changed []string
+	for pair, now := range measured {
+		was, ok := reg[pair]
+		if !ok {
+			added = append(added, fmt.Sprintf("%s (live at %d sites: %s)",
+				pair, len(now), strings.Join(now, ", ")))
+			continue
+		}
+		if sameSites8921(was, now) {
+			continue
+		}
+		// Name the SITES that moved, not just the counts. A substitution --
+		// same count, different sites -- is invisible to a count and is the
+		// reason this compares membership.
+		var gained, lost []string
+		inWas := map[string]bool{}
+		for _, x := range was {
+			inWas[x] = true
+		}
+		inNow := map[string]bool{}
+		for _, x := range now {
+			inNow[x] = true
+		}
+		for _, x := range now {
+			if !inWas[x] {
+				gained = append(gained, x)
+			}
+		}
+		for _, x := range was {
+			if !inNow[x] {
+				lost = append(lost, x)
+			}
+		}
+		desc := fmt.Sprintf("%s: %d -> %d site(s)", pair, len(was), len(now))
+		if len(was) == len(now) {
+			desc = fmt.Sprintf("%s: SUBSTITUTION (still %d sites, different ones)",
+				pair, len(now))
+		}
+		if len(gained) > 0 {
+			desc += "\n      + " + strings.Join(gained, "\n      + ")
+		}
+		if len(lost) > 0 {
+			desc += "\n      - " + strings.Join(lost, "\n      - ")
+		}
+		changed = append(changed, desc)
 	}
 	for pair, was := range reg {
 		if _, ok := measured[pair]; !ok {
-			removed = append(removed, fmt.Sprintf("%s (was %d)", pair, was))
+			removed = append(removed, fmt.Sprintf("%s (was %d sites: %s)",
+				pair, len(was), strings.Join(was, ", ")))
 		}
 	}
 	sort.Strings(added)

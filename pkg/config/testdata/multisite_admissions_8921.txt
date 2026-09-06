@@ -1,210 +1,173 @@
 # #8921: admitted brace-elision pairs that are EFFECTIVE AT MORE THAN ONE
-# declaring schema site.
+# declaring schema site, and WHERE.
 #
-# `compactNormalizeInScope(containerKeyword, head)` takes NO PARENT CONTEXT. It
-# is keyed on a (container keyword, head) string pair, so an admission applies
-# at EVERY site where a container of that keyword declares that head -- not at
-# the site it was adjudicated on. Every row below was adjudicated by measuring
-# one fixture at one site and is live at the number of sites in column 2.
+# Site LISTS, not counts (#9094): a count cannot see a SUBSTITUTION -- a
+# pair that loses one declaring site and gains another holds its count
+# while the thing this issue is about has changed completely.
 #
-# FORMAT: <container> <head>\t<declaring site count>
-#
-# WHAT "DECLARING SITE" MEANS, because #8921 reports a different headline and
-# the difference is the whole point:
-#
-#   A pair is EFFECTIVE at a site when a container of that keyword declares
-#   that head there. Where the container exists but does NOT declare the head,
-#   the admission has no effect -- the predicate is never consulted for a pair
-#   that cannot form.
-#
-# #8921's headline of 223 is not reproducible: its probe was a throwaway file,
-# run and removed. Measured here at 575 admitted pairs (it had 547):
-#
-#     declaring sites > 1                                 163   <- this file
-#     container keyword occurs > 1, head may not declare  327
-#
-# 223 falls between the two, so it used a third variant. What DOES reproduce
-# exactly is #8921's per-pair table -- all ten of its named rows match this
-# instrument to the count (bfd minimum-interval 8, multiplier 8,
-# forwarding-class loss-priority 7, loss-priority code-points 7, route
-# next-hop 6, match destination-address 5, match source-address 5, then log 5,
-# interface cost 4, hello-interval 4). The argument in that issue rests on the
-# per-row data, which holds; only the aggregate is unreproducible.
-#
-# `groups` is EXCLUDED. It mirrors the entire schema, so counting it makes
-# every pair multi-site by construction (measured: 575 of 575) and the
-# distinction this file exists to draw disappears.
-#
-# THIS FILE IS A RATCHET, NOT AN ALLOWLIST. A row here is not adjudicated at
-# its extra sites -- it is RECORDED as being live at them, which is the debt
-# #8921 says is currently unpaid. Adding a row means a new admission is
-# effective somewhere nobody measured it; removing one means an admission
-# narrowed. Both directions must move deliberately.
-#
-address-set address	2
-address-set address	2
-address-set address-set	2
-address-set description	2
-area interface	4
-area virtual-link	2
-bfd-liveness-detection minimum-interval	8
-bfd-liveness-detection multiplier	8
-bgp damping	2
-bgp group	2
-classifiers dscp	3
-classifiers ieee-802.1	3
-classifiers inet-precedence	2
-damping half-life	2
-damping max-suppress	2
-damping reuse	2
-damping suppress	2
-dead-peer-detection interval	2
-dead-peer-detection threshold	2
-deny log	2
-dscp forwarding-class	2
-filter input	2
-filter output	2
-filter term	2
-flexible-match-range range	2
-flood threshold	2
-flow-server port	2
-flow-server source-address	2
-flow-server version-ipfix-template	2
-flow-server version9-template	2
-forwarding-class loss-priority	7
-from destination-address	2
-from destination-port	2
-from destination-port-except	2
-from dscp	2
-from icmp-code	2
-from icmp-type	2
-from interface	3
-from protocol	3
-from routing-instance	3
-from source-address	2
-from source-port	2
-from source-port-except	2
-from tcp-flags	2
-from traffic-class	2
-from zone	3
-gateway address	2
-gateway external-interface	2
-gateway ike-policy	2
-gateway local-address	2
-gateway local-certificate	2
-gateway local-identity	2
-gateway nat-traversal	2
-gateway remote-identity	2
-gateway version	2
-group interface	3
-group pool	2
-host-inbound-traffic protocols	2
-host-inbound-traffic system-services	2
-ieee-802.1 forwarding-class	2
-ike gateway	2
-inet filter	2
-inet-precedence forwarding-class	2
-inet6 filter	2
-interface authentication-key	2
-interface authentication-type	4
-interface cost	4
-interface dead-interval	4
-interface hello-interval	4
-interface interface-type	2
-interface level	2
-interface metric	2
-interface priority	4
-interface retransmit-interval	4
-interface-routes rib-group	2
-interfaces unit	2
-isis authentication-key	2
-isis authentication-type	2
-isis export	2
-isis interface	2
-isis is-type	2
-isis level	2
-isis net	2
-loss-priority code-point	4
-loss-priority code-points	7
-match application	4
-match destination-address	5
-match destination-address-excluded	2
-match destination-address-name	2
-match destination-port	3
-match source-address	5
-match source-address-excluded	2
-match source-address-name	2
-md5 key	2
-next-hop interface	4
-ospf area	2
-ospf reference-bandwidth	2
-ospf3 area	2
-ospf3 export	2
-ospf3 router-id	2
-output flow-server	2
-output source-address	2
-oversubscription-policy guarantee-rate	2
-peer allowed-ips	2
-peer endpoint	2
-peer persistent-keepalive	2
-peer preshared-key	2
-policy description	2
-policy proposal-set	2
-policy proposals	2
-policy then	4
-pool address	2
-pool dns-server	2
-pool static-binding	2
-prefix-limit maximum	4
-proposal authentication-algorithm	2
-proposal description	2
-proposal dh-group	2
-proposal encryption-algorithm	2
-proposal lifetime-seconds	2
-protocols bgp	2
-protocols isis	2
-protocols ospf	2
-protocols ospf3	2
-qualified-next-hop interface	4
-qualified-next-hop metric	4
-qualified-next-hop preference	4
-rewrite-rules dscp	3
-rewrite-rules ieee-802.1	3
-rib static	2
-rib-group inet	2
-rib-group inet6	2
-route next-hop	6
-route next-table	4
-route preference	4
-route qualified-next-hop	4
-routing-options interface-routes	2
-routing-options rib	2
-routing-options static	2
-rule-set rule	3
-shaping-rate burst-size	2
-static route	4
-static-binding fixed-address	2
-static-binding host-name	2
-template flow-active-timeout	2
-template flow-inactive-timeout	2
-template-refresh-rate seconds	2
-then count	4
-then dscp	2
-then forwarding-class	2
-then log	5
-then loss-priority	4
-then policer	2
-then routing-instance	2
-then traffic-class	2
-tunnel destination	2
-tunnel keepalive-retry	2
-tunnel key	2
-tunnel mode	2
-tunnel source	2
-tunnel ttl	2
-version-ipfix template	3
-version9 template	3
-virtual-link transit-area	2
-wireguard listen-port	2
-wireguard peer	2
-wireguard private-key	2
+address-set address	security/address-book/global/address-set,security/zones/security-zone/address-book/address-set
+address-set address-set	security/address-book/global/address-set,security/zones/security-zone/address-book/address-set
+address-set description	security/address-book/global/address-set,security/zones/security-zone/address-book/address-set
+area interface	protocols/ospf/area,protocols/ospf3/area,routing-instances/*/protocols/ospf/area,routing-instances/*/protocols/ospf3/area
+area virtual-link	protocols/ospf/area,routing-instances/*/protocols/ospf/area
+bfd-liveness-detection minimum-interval	protocols/bgp/group/bfd-liveness-detection,protocols/bgp/group/neighbor/bfd-liveness-detection,protocols/isis/interface/bfd-liveness-detection,protocols/ospf/area/interface/bfd-liveness-detection,protocols/ospf3/area/interface/bfd-liveness-detection,routing-instances/*/protocols/isis/interface/bfd-liveness-detection,routing-instances/*/protocols/ospf/area/interface/bfd-liveness-detection,routing-instances/*/protocols/ospf3/area/interface/bfd-liveness-detection
+bfd-liveness-detection multiplier	protocols/bgp/group/bfd-liveness-detection,protocols/bgp/group/neighbor/bfd-liveness-detection,protocols/isis/interface/bfd-liveness-detection,protocols/ospf/area/interface/bfd-liveness-detection,protocols/ospf3/area/interface/bfd-liveness-detection,routing-instances/*/protocols/isis/interface/bfd-liveness-detection,routing-instances/*/protocols/ospf/area/interface/bfd-liveness-detection,routing-instances/*/protocols/ospf3/area/interface/bfd-liveness-detection
+bgp damping	protocols/bgp,routing-instances/*/protocols/bgp
+bgp group	protocols/bgp,routing-instances/*/protocols/bgp
+classifiers dscp	class-of-service/classifiers,class-of-service/interfaces/classifiers,class-of-service/interfaces/unit/classifiers
+classifiers ieee-802.1	class-of-service/classifiers,class-of-service/interfaces/classifiers,class-of-service/interfaces/unit/classifiers
+classifiers inet-precedence	class-of-service/classifiers,class-of-service/interfaces/unit/classifiers
+damping half-life	protocols/bgp/damping,routing-instances/*/protocols/bgp/damping
+damping max-suppress	protocols/bgp/damping,routing-instances/*/protocols/bgp/damping
+damping reuse	protocols/bgp/damping,routing-instances/*/protocols/bgp/damping
+damping suppress	protocols/bgp/damping,routing-instances/*/protocols/bgp/damping
+dead-peer-detection interval	security/ike/gateway/dead-peer-detection,security/ipsec/gateway/dead-peer-detection
+dead-peer-detection threshold	security/ike/gateway/dead-peer-detection,security/ipsec/gateway/dead-peer-detection
+deny log	security/policies/from-zone/policy/then/deny,security/policies/global/policy/then/deny
+dscp forwarding-class	class-of-service/classifiers/dscp,class-of-service/rewrite-rules/dscp
+filter input	interfaces/*/unit/family/inet/filter,interfaces/*/unit/family/inet6/filter
+filter output	interfaces/*/unit/family/inet/filter,interfaces/*/unit/family/inet6/filter
+filter term	firewall/family/inet/filter,firewall/family/inet6/filter
+flexible-match-range range	firewall/family/inet/filter/term/from/flexible-match-range,firewall/family/inet6/filter/term/from/flexible-match-range
+flood threshold	security/screen/ids-option/icmp/flood,security/screen/ids-option/udp/flood
+flow-server port	forwarding-options/sampling/instance/family/inet/output/flow-server,forwarding-options/sampling/instance/family/inet6/output/flow-server
+flow-server source-address	forwarding-options/sampling/instance/family/inet/output/flow-server,forwarding-options/sampling/instance/family/inet6/output/flow-server
+flow-server version-ipfix-template	forwarding-options/sampling/instance/family/inet/output/flow-server,forwarding-options/sampling/instance/family/inet6/output/flow-server
+flow-server version9-template	forwarding-options/sampling/instance/family/inet/output/flow-server,forwarding-options/sampling/instance/family/inet6/output/flow-server
+forwarding-class loss-priority	class-of-service/classifiers/dscp/forwarding-class,class-of-service/classifiers/ieee-802.1/forwarding-class,class-of-service/classifiers/inet-precedence/forwarding-class,class-of-service/rewrite-rules/dscp/forwarding-class,class-of-service/rewrite-rules/exp/forwarding-class,class-of-service/rewrite-rules/ieee-802.1/forwarding-class,class-of-service/rewrite-rules/inet-precedence/forwarding-class
+from destination-address	firewall/family/inet/filter/term/from,firewall/family/inet6/filter/term/from
+from destination-port	firewall/family/inet/filter/term/from,firewall/family/inet6/filter/term/from
+from destination-port-except	firewall/family/inet/filter/term/from,firewall/family/inet6/filter/term/from
+from dscp	firewall/family/inet/filter/term/from,firewall/family/inet6/filter/term/from
+from icmp-code	firewall/family/inet/filter/term/from,firewall/family/inet6/filter/term/from
+from icmp-type	firewall/family/inet/filter/term/from,firewall/family/inet6/filter/term/from
+from interface	security/nat/destination/rule-set/from,security/nat/source/rule-set/from,security/nat/static/rule-set/from
+from protocol	firewall/family/inet/filter/term/from,firewall/family/inet6/filter/term/from,policy-options/policy-statement/term/from
+from routing-instance	security/nat/destination/rule-set/from,security/nat/source/rule-set/from,security/nat/static/rule-set/from
+from source-address	firewall/family/inet/filter/term/from,firewall/family/inet6/filter/term/from
+from source-port	firewall/family/inet/filter/term/from,firewall/family/inet6/filter/term/from
+from source-port-except	firewall/family/inet/filter/term/from,firewall/family/inet6/filter/term/from
+from tcp-flags	firewall/family/inet/filter/term/from,firewall/family/inet6/filter/term/from
+from traffic-class	firewall/family/inet/filter/term/from,firewall/family/inet6/filter/term/from
+from zone	security/nat/destination/rule-set/from,security/nat/source/rule-set/from,security/nat/static/rule-set/from
+gateway address	security/ike/gateway,security/ipsec/gateway
+gateway external-interface	security/ike/gateway,security/ipsec/gateway
+gateway ike-policy	security/ike/gateway,security/ipsec/gateway
+gateway local-address	security/ike/gateway,security/ipsec/gateway
+gateway local-certificate	security/ike/gateway,security/ipsec/gateway
+gateway local-identity	security/ike/gateway,security/ipsec/gateway
+gateway nat-traversal	security/ike/gateway,security/ipsec/gateway
+gateway remote-identity	security/ike/gateway,security/ipsec/gateway
+gateway version	security/ike/gateway,security/ipsec/gateway
+group interface	forwarding-options/dhcp-relay/group,system/services/dhcp-local-server/group,system/services/dhcpv6-local-server/group
+group pool	system/services/dhcp-local-server/group,system/services/dhcpv6-local-server/group
+host-inbound-traffic protocols	security/zones/security-zone/host-inbound-traffic,security/zones/security-zone/interfaces/*/host-inbound-traffic
+host-inbound-traffic system-services	security/zones/security-zone/host-inbound-traffic,security/zones/security-zone/interfaces/*/host-inbound-traffic
+ieee-802.1 forwarding-class	class-of-service/classifiers/ieee-802.1,class-of-service/rewrite-rules/ieee-802.1
+ike gateway	security/ike,security/ipsec/vpn/ike
+inet filter	firewall/family/inet,interfaces/*/unit/family/inet
+inet-precedence forwarding-class	class-of-service/classifiers/inet-precedence,class-of-service/rewrite-rules/inet-precedence
+inet6 filter	firewall/family/inet6,interfaces/*/unit/family/inet6
+interface authentication-key	protocols/isis/interface,routing-instances/*/protocols/isis/interface
+interface authentication-type	protocols/isis/interface,protocols/ospf/area/interface,routing-instances/*/protocols/isis/interface,routing-instances/*/protocols/ospf/area/interface
+interface cost	protocols/ospf/area/interface,protocols/ospf3/area/interface,routing-instances/*/protocols/ospf/area/interface,routing-instances/*/protocols/ospf3/area/interface
+interface dead-interval	protocols/ospf/area/interface,protocols/ospf3/area/interface,routing-instances/*/protocols/ospf/area/interface,routing-instances/*/protocols/ospf3/area/interface
+interface hello-interval	protocols/ospf/area/interface,protocols/ospf3/area/interface,routing-instances/*/protocols/ospf/area/interface,routing-instances/*/protocols/ospf3/area/interface
+interface interface-type	protocols/ospf/area/interface,routing-instances/*/protocols/ospf/area/interface
+interface level	protocols/isis/interface,routing-instances/*/protocols/isis/interface
+interface metric	protocols/isis/interface,routing-instances/*/protocols/isis/interface
+interface priority	protocols/ospf/area/interface,protocols/ospf3/area/interface,routing-instances/*/protocols/ospf/area/interface,routing-instances/*/protocols/ospf3/area/interface
+interface retransmit-interval	protocols/ospf/area/interface,protocols/ospf3/area/interface,routing-instances/*/protocols/ospf/area/interface,routing-instances/*/protocols/ospf3/area/interface
+interface-routes rib-group	routing-instances/*/routing-options/interface-routes,routing-options/interface-routes
+interfaces unit	class-of-service/interfaces,interfaces/*
+isis authentication-key	protocols/isis,routing-instances/*/protocols/isis
+isis authentication-type	protocols/isis,routing-instances/*/protocols/isis
+isis export	protocols/isis,routing-instances/*/protocols/isis
+isis interface	protocols/isis,routing-instances/*/protocols/isis
+isis is-type	protocols/isis,routing-instances/*/protocols/isis
+isis level	protocols/isis,routing-instances/*/protocols/isis
+isis net	protocols/isis,routing-instances/*/protocols/isis
+loss-priority code-point	class-of-service/rewrite-rules/dscp/forwarding-class/loss-priority,class-of-service/rewrite-rules/exp/forwarding-class/loss-priority,class-of-service/rewrite-rules/ieee-802.1/forwarding-class/loss-priority,class-of-service/rewrite-rules/inet-precedence/forwarding-class/loss-priority
+loss-priority code-points	class-of-service/classifiers/dscp/forwarding-class/loss-priority,class-of-service/classifiers/ieee-802.1/forwarding-class/loss-priority,class-of-service/classifiers/inet-precedence/forwarding-class/loss-priority,class-of-service/rewrite-rules/dscp/forwarding-class/loss-priority,class-of-service/rewrite-rules/exp/forwarding-class/loss-priority,class-of-service/rewrite-rules/ieee-802.1/forwarding-class/loss-priority,class-of-service/rewrite-rules/inet-precedence/forwarding-class/loss-priority
+match application	security/nat/destination/rule-set/rule/match,security/nat/source/rule-set/rule/match,security/policies/from-zone/policy/match,security/policies/global/policy/match
+match destination-address	security/nat/destination/rule-set/rule/match,security/nat/source/rule-set/rule/match,security/nat/static/rule-set/rule/match,security/policies/from-zone/policy/match,security/policies/global/policy/match
+match destination-address-excluded	security/policies/from-zone/policy/match,security/policies/global/policy/match
+match destination-address-name	security/nat/destination/rule-set/rule/match,security/nat/source/rule-set/rule/match
+match destination-port	security/nat/destination/rule-set/rule/match,security/nat/source/rule-set/rule/match,security/nat/static/rule-set/rule/match
+match source-address	security/nat/destination/rule-set/rule/match,security/nat/source/rule-set/rule/match,security/nat/static/rule-set/rule/match,security/policies/from-zone/policy/match,security/policies/global/policy/match
+match source-address-excluded	security/policies/from-zone/policy/match,security/policies/global/policy/match
+match source-address-name	security/nat/destination/rule-set/rule/match,security/nat/source/rule-set/rule/match
+md5 key	protocols/ospf/area/interface/authentication/md5,routing-instances/*/protocols/ospf/area/interface/authentication/md5
+next-hop interface	routing-instances/*/routing-options/rib/static/route/next-hop,routing-instances/*/routing-options/static/route/next-hop,routing-options/rib/static/route/next-hop,routing-options/static/route/next-hop
+ospf area	protocols/ospf,routing-instances/*/protocols/ospf
+ospf reference-bandwidth	protocols/ospf,routing-instances/*/protocols/ospf
+ospf3 area	protocols/ospf3,routing-instances/*/protocols/ospf3
+ospf3 export	protocols/ospf3,routing-instances/*/protocols/ospf3
+ospf3 router-id	protocols/ospf3,routing-instances/*/protocols/ospf3
+output flow-server	forwarding-options/sampling/instance/family/inet/output,forwarding-options/sampling/instance/family/inet6/output
+output source-address	forwarding-options/sampling/instance/family/inet/output,forwarding-options/sampling/instance/family/inet6/output
+oversubscription-policy guarantee-rate	class-of-service/interfaces/oversubscription-policy,class-of-service/interfaces/unit/oversubscription-policy
+peer allowed-ips	interfaces/*/tunnel/wireguard/peer,interfaces/*/unit/tunnel/wireguard/peer
+peer endpoint	interfaces/*/tunnel/wireguard/peer,interfaces/*/unit/tunnel/wireguard/peer
+peer persistent-keepalive	interfaces/*/tunnel/wireguard/peer,interfaces/*/unit/tunnel/wireguard/peer
+peer preshared-key	interfaces/*/tunnel/wireguard/peer,interfaces/*/unit/tunnel/wireguard/peer
+policy description	security/policies/from-zone/policy,security/policies/global/policy
+policy proposal-set	security/ike/policy,security/ipsec/policy
+policy proposals	security/ike/policy,security/ipsec/policy
+policy then	event-options/policy,security/policies/from-zone/policy,security/policies/global/policy,services/ip-monitoring/policy
+pool address	security/nat/destination/pool,security/nat/source/pool
+pool dns-server	system/services/dhcp-local-server/group/pool,system/services/dhcpv6-local-server/group/pool
+pool static-binding	system/services/dhcp-local-server/group/pool,system/services/dhcpv6-local-server/group/pool
+prefix-limit maximum	protocols/bgp/group/family/inet/unicast/prefix-limit,protocols/bgp/group/family/inet6/unicast/prefix-limit,protocols/bgp/group/neighbor/family/inet/unicast/prefix-limit,protocols/bgp/group/neighbor/family/inet6/unicast/prefix-limit
+proposal authentication-algorithm	security/ike/proposal,security/ipsec/proposal
+proposal description	security/ike/proposal,security/ipsec/proposal
+proposal dh-group	security/ike/proposal,security/ipsec/proposal
+proposal encryption-algorithm	security/ike/proposal,security/ipsec/proposal
+proposal lifetime-seconds	security/ike/proposal,security/ipsec/proposal
+protocols bgp	protocols,routing-instances/*/protocols
+protocols isis	protocols,routing-instances/*/protocols
+protocols ospf	protocols,routing-instances/*/protocols
+protocols ospf3	protocols,routing-instances/*/protocols
+qualified-next-hop interface	routing-instances/*/routing-options/rib/static/route/qualified-next-hop,routing-instances/*/routing-options/static/route/qualified-next-hop,routing-options/rib/static/route/qualified-next-hop,routing-options/static/route/qualified-next-hop
+qualified-next-hop metric	routing-instances/*/routing-options/rib/static/route/qualified-next-hop,routing-instances/*/routing-options/static/route/qualified-next-hop,routing-options/rib/static/route/qualified-next-hop,routing-options/static/route/qualified-next-hop
+qualified-next-hop preference	routing-instances/*/routing-options/rib/static/route/qualified-next-hop,routing-instances/*/routing-options/static/route/qualified-next-hop,routing-options/rib/static/route/qualified-next-hop,routing-options/static/route/qualified-next-hop
+rewrite-rules dscp	class-of-service/interfaces/rewrite-rules,class-of-service/interfaces/unit/rewrite-rules,class-of-service/rewrite-rules
+rewrite-rules ieee-802.1	class-of-service/interfaces/rewrite-rules,class-of-service/interfaces/unit/rewrite-rules,class-of-service/rewrite-rules
+rib static	routing-instances/*/routing-options/rib,routing-options/rib
+rib-group inet	routing-instances/*/routing-options/interface-routes/rib-group,routing-options/interface-routes/rib-group
+rib-group inet6	routing-instances/*/routing-options/interface-routes/rib-group,routing-options/interface-routes/rib-group
+route next-hop	routing-instances/*/routing-options/rib/static/route,routing-instances/*/routing-options/static/route,routing-options/rib/static/route,routing-options/static/route,services/ip-monitoring/policy/then/preferred-route/route,services/ip-monitoring/policy/then/preferred-route/routing-instance/route
+route next-table	routing-instances/*/routing-options/rib/static/route,routing-instances/*/routing-options/static/route,routing-options/rib/static/route,routing-options/static/route
+route preference	routing-instances/*/routing-options/rib/static/route,routing-instances/*/routing-options/static/route,routing-options/rib/static/route,routing-options/static/route
+route qualified-next-hop	routing-instances/*/routing-options/rib/static/route,routing-instances/*/routing-options/static/route,routing-options/rib/static/route,routing-options/static/route
+routing-options interface-routes	routing-instances/*/routing-options,routing-options
+routing-options rib	routing-instances/*/routing-options,routing-options
+routing-options static	routing-instances/*/routing-options,routing-options
+rule-set rule	security/nat/destination/rule-set,security/nat/source/rule-set,security/nat/static/rule-set
+shaping-rate burst-size	class-of-service/interfaces/shaping-rate,class-of-service/interfaces/unit/shaping-rate
+static route	routing-instances/*/routing-options/rib/static,routing-instances/*/routing-options/static,routing-options/rib/static,routing-options/static
+static-binding fixed-address	system/services/dhcp-local-server/group/pool/static-binding,system/services/dhcpv6-local-server/group/pool/static-binding
+static-binding host-name	system/services/dhcp-local-server/group/pool/static-binding,system/services/dhcpv6-local-server/group/pool/static-binding
+template flow-active-timeout	services/flow-monitoring/version-ipfix/template,services/flow-monitoring/version9/template
+template flow-inactive-timeout	services/flow-monitoring/version-ipfix/template,services/flow-monitoring/version9/template
+template-refresh-rate seconds	services/flow-monitoring/version-ipfix/template/template-refresh-rate,services/flow-monitoring/version9/template/template-refresh-rate
+then count	firewall/family/inet/filter/term/then,firewall/family/inet6/filter/term/then,security/policies/from-zone/policy/then,security/policies/global/policy/then
+then dscp	firewall/family/inet/filter/term/then,firewall/family/inet6/filter/term/then
+then forwarding-class	firewall/family/inet/filter/term/then,firewall/family/inet6/filter/term/then
+then log	firewall/family/inet/filter/term/then,firewall/family/inet6/filter/term/then,security/policies/from-zone/policy/then,security/policies/global/policy/then,security/pre-id-default-policy/then
+then loss-priority	firewall/family/inet/filter/term/then,firewall/family/inet6/filter/term/then,firewall/policer/then,firewall/three-color-policer/then
+then policer	firewall/family/inet/filter/term/then,firewall/family/inet6/filter/term/then
+then routing-instance	firewall/family/inet/filter/term/then,firewall/family/inet6/filter/term/then
+then traffic-class	firewall/family/inet/filter/term/then,firewall/family/inet6/filter/term/then
+tunnel destination	interfaces/*/tunnel,interfaces/*/unit/tunnel
+tunnel keepalive-retry	interfaces/*/tunnel,interfaces/*/unit/tunnel
+tunnel key	interfaces/*/tunnel,interfaces/*/unit/tunnel
+tunnel mode	interfaces/*/tunnel,interfaces/*/unit/tunnel
+tunnel source	interfaces/*/tunnel,interfaces/*/unit/tunnel
+tunnel ttl	interfaces/*/tunnel,interfaces/*/unit/tunnel
+version-ipfix template	forwarding-options/sampling/instance/family/inet/output/flow-server/version-ipfix,forwarding-options/sampling/instance/family/inet6/output/flow-server/version-ipfix,services/flow-monitoring/version-ipfix
+version9 template	forwarding-options/sampling/instance/family/inet/output/flow-server/version9,forwarding-options/sampling/instance/family/inet6/output/flow-server/version9,services/flow-monitoring/version9
+virtual-link transit-area	protocols/ospf/area/virtual-link,routing-instances/*/protocols/ospf/area/virtual-link
+wireguard listen-port	interfaces/*/tunnel/wireguard,interfaces/*/unit/tunnel/wireguard
+wireguard peer	interfaces/*/tunnel/wireguard,interfaces/*/unit/tunnel/wireguard
+wireguard private-key	interfaces/*/tunnel/wireguard,interfaces/*/unit/tunnel/wireguard
