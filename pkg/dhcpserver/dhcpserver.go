@@ -1302,6 +1302,36 @@ func (m *Manager) generateKea6Config(cfg *config.DHCPServerConfig) error {
 			if len(group.Interfaces) > 1 {
 				return fmt.Errorf("DHCPv6 group spanning interfaces %v: Kea subnet6 requires a single interface selector — split the group per interface", group.Interfaces)
 			}
+			// #9122: a group NARROWED by the RG member filter must be refused
+			// too, and it is a DIFFERENT state from the one above with a
+			// different remedy, so it gets its own message rather than being
+			// folded into that one.
+			//
+			// `subnetInterface` returns "" first on MembersFiltered, so the
+			// check above no longer trips — it sees the FILTERED list, which is
+			// a singleton — and the subnet renders with NO interface selector,
+			// contradicting the invariant three lines up. Kea then cannot select
+			// the subnet for a link-local SOLICIT: a silent, total DHCPv6 outage
+			// for that group with no error anywhere.
+			//
+			// This is the STEADY STATE, not a failover transient.
+			// filterDHCPConfigForMasterRGs is driven by the 2s periodic
+			// converger as well as by RG edges, so for a v6 group spanning two
+			// RGs in an active/active cluster BOTH nodes render it this way
+			// continuously.
+			//
+			// #6520's remedy — fall back to address-based selection — is valid
+			// for v4 and INVALID for v6 by this file's own comment: v6 clients
+			// talk from link-local sources, so there is no address to match on.
+			// The v4 suppression is deliberately left untouched.
+			//
+			// Emphatically NOT `group.Interfaces[0]`: that binds the REMOVED
+			// member's pool to the survivor's interface, which is exactly the
+			// cross-bind #6520 was filed to stop, re-opened for v6. Kea would
+			// lease a foreign prefix on that link.
+			if group.MembersFiltered {
+				return fmt.Errorf("DHCPv6 group %q was narrowed to interfaces %v by redundancy-group membership: Kea subnet6 requires an interface selector and v6 has no address-based fallback, so the subnet would be unselectable — author one DHCPv6 group per redundancy group instead of one spanning several", group.Name, group.Interfaces)
+			}
 			sub.Interface = subnetInterface(group)
 			if len(pool.DNSServers) > 0 {
 				sub.OptionData = append(sub.OptionData, keaOpt{

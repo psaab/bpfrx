@@ -1026,6 +1026,28 @@ impl SharedCoSQueueLease {
             .map(|v| v.equal_flow.fail_open_count.load(Ordering::Relaxed))
             .unwrap_or(0)
     }
+    /// #9117: the per-worker fair share this lease last published. Test-only
+    /// accessor so a cell can assert the PRECONDITION of the mid-epoch-newcomer
+    /// shape (share published as 0) rather than assuming its setup produced it.
+    #[cfg(test)]
+    pub(in crate::afxdp) fn v8_worker_fair_share_for_test(&self, id: usize) -> u64 {
+        self.v8
+            .as_ref()
+            .and_then(|v| v.worker_fair_share.get(id))
+            .map(|s| s.load(Ordering::Acquire))
+            .unwrap_or(0)
+    }
+
+    /// #9117: workers excluded for one epoch as mid-epoch newcomers. A flat
+    /// fail-open count beside a climbing exclusion count is the fix working:
+    /// the class keeps enforcing while the un-comparable worker sits out.
+    pub(in crate::afxdp) fn v8_newly_active_excluded_count(&self) -> u64 {
+        self.v8
+            .as_ref()
+            .map(|v| v.equal_flow.newly_active_excluded_count.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
 
     pub(in crate::afxdp) fn consume(&self, bytes: u64) {
         shared_cos_lease_consume(&self.state, bytes);

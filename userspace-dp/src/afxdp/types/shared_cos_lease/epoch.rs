@@ -490,6 +490,18 @@ pub(super) struct V8EqualFlowSuppressState {
     pub(super) stale_or_tag_mismatch_events: AtomicU64,
     pub(super) fail_open_reason: AtomicU32,
     pub(super) fail_open_count: AtomicU64,
+    /// #9117: workers EXCLUDED from the sample set for one epoch because they
+    /// went idle -> active mid-epoch, so their share was published as 0 at the
+    /// last rotation and their sample covers only part of this one.
+    ///
+    /// Counted rather than left as a local, because the exclusion is otherwise
+    /// invisible: it is the difference between "the class target was computed
+    /// from every active worker" and "from every active worker except the ones
+    /// that had just woken", and those are different measurements. It also
+    /// distinguishes this shape from the fail-open it replaced — a flat
+    /// fail_open_count with a climbing exclusion count is exactly the fix
+    /// working.
+    pub(super) newly_active_excluded_count: AtomicU64,
 }
 
 impl V8EqualFlowSuppressState {
@@ -507,6 +519,7 @@ impl V8EqualFlowSuppressState {
             stale_or_tag_mismatch_events: AtomicU64::new(0),
             fail_open_reason: AtomicU32::new(V8EqualFlowFailOpenReason::Disabled as u32),
             fail_open_count: AtomicU64::new(0),
+            newly_active_excluded_count: AtomicU64::new(0),
         }
     }
 
