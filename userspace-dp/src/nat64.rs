@@ -3175,8 +3175,35 @@ fn translate_embedded_v6_to_v4(
     out[0] = 0x45;
     out[1] = traffic_class;
     out[2..4].copy_from_slice(&(total as u16).to_be_bytes());
-    out[4..6].copy_from_slice(&[0, 0]); // identification (quoted header)
-    out[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // DF
+    // #9128: carry the quoted packet's fragmentation fields instead of pinning
+    // ID=0 / DF=1 unconditionally. RFC 7915 §5.2 defers to §5.1 for the
+    // embedded header, and §5.1 requires -- when a Fragment Header is present
+    // -- the Identification from its low 16 bits, DF cleared, and the M flag
+    // and fragment offset copied. The OUTER v6->v4 translator has always done
+    // this (see the `frag_word` computation in write_v6_to_v4_translate); only
+    // the embedded twin pinned the fields.
+    //
+    // Scope is narrow by construction: `ipv6_is_non_first_fragment` above
+    // already drops an offset != 0 quote (#2290), so the only quote that
+    // reaches here with a Fragment Header is a FIRST fragment -- offset 0,
+    // M=1. Copying the offset anyway keeps this arm correct rather than
+    // correct-only-because-of-a-guard-elsewhere.
+    //
+    // The unfragmented case is byte-identical to before (0x4000, ID 0), and
+    // deliberately does NOT borrow the outer translator's `next_frag_id()`
+    // arm: that mints a fresh Identification for a datagram this box is about
+    // to send, whereas a quote describes a packet that already exists on the
+    // wire. Inventing an ID for it would be a fabrication, not a translation.
+    let (embedded_frag_word, embedded_ident): (u16, u16) =
+        match ipv6_fragment_header(quote_in) {
+            Some(info) => {
+                let mf = if info.more { 0x2000u16 } else { 0 };
+                (mf | (info.offset_units & 0x1FFF), (info.ident & 0xFFFF) as u16)
+            }
+            None => (0x4000, 0),
+        };
+    out[4..6].copy_from_slice(&embedded_ident.to_be_bytes()); // identification
+    out[6..8].copy_from_slice(&embedded_frag_word.to_be_bytes()); // flags+offset
     out[8] = hop_limit; // embedded hop limit copied verbatim (NOT decremented)
     out[9] = ipv4_protocol;
     out[10..12].copy_from_slice(&[0, 0]); // header checksum (computed below)
@@ -3241,27 +3268,75 @@ fn translate_embedded_v4_to_v6(
         _ => return None,
     };
 
+    // #9129 Half B: a fragmented quote needs an IPv6 Fragment Header, or its
+    // Identification and M flag are simply lost -- this function never read
+    // quote_in[4..8] and set `out[6] = next_header` unconditionally, so the
+    // translated quote described an unfragmented datagram that was never sent.
+    // The OUTER v4->v6 translator already emits the header (#2488); this is the
+    // embedded twin of that code, and RFC 7915 §5.2 asks for the same thing.
+    //
+    // Only a FIRST fragment reaches here: `parse_embedded_v4` (#1852) refuses a
+    // quote whose offset is non-zero, because it has no L4 header to read. It
+    // filters on OFFSET ONLY, so an `MF=1, offset=0` quote passes -- which is
+    // exactly the case that was losing its fields. The offset is copied anyway
+    // so this arm does not depend on that upstream guard for its correctness.
+    let v4_frag_word = u16::from_be_bytes([quote_in[6], quote_in[7]]);
+    let v4_more = (v4_frag_word & 0x2000) != 0;
+    let v4_offset_units = v4_frag_word & 0x1FFF;
+    let v4_ident = u16::from_be_bytes([quote_in[4], quote_in[5]]);
+    let is_fragment = v4_more || v4_offset_units != 0;
+    let frag_hdr_len = if is_fragment { 8 } else { 0 };
+
     // Quoted L4 bytes after the IPv4 header, capped by the advertised total
     // length and what was actually quoted.
     let end = total_len_field.clamp(ihl, quote_in.len());
-    let l4 = quote_in.get(ihl..end)?;
+    let mut l4 = quote_in.get(ihl..end)?;
+
+    // The Fragment Header costs 8 bytes the caller's scratch was not sized
+    // for: quote_in is already clamped to MAX_EMBEDDED_LEN - NAT64_HEADER_DELTA
+    // so that `40 + l4_len` lands exactly on MAX_EMBEDDED_LEN at the maximum.
+    // Growing past that would make `dst.get_mut(..total)` return None and turn
+    // an unfaithful translation into a DROPPED ICMP error, which is a worse
+    // outcome than the defect. Shorten the quote instead -- truncating a quote
+    // is always legal for an ICMP error, and the receiver's demux keys on the
+    // leading tuple, which is retained.
+    let max_l4 = dst.len().saturating_sub(40 + frag_hdr_len);
+    if l4.len() > max_l4 {
+        l4 = &l4[..max_l4];
+    }
     let l4_len = l4.len();
 
-    let total = 40 + l4_len;
+    let total = 40 + frag_hdr_len + l4_len;
     let out = dst.get_mut(..total)?;
     out[0] = 0x60 | (tos >> 4);
     out[1] = (tos & 0x0f) << 4;
     out[2] = 0;
     out[3] = 0;
-    out[4..6].copy_from_slice(&(l4_len as u16).to_be_bytes());
-    out[6] = next_header;
+    // Payload length counts the Fragment Header too, when present.
+    out[4..6].copy_from_slice(&((frag_hdr_len + l4_len) as u16).to_be_bytes());
+    // A fragmented datagram chains a Fragment Header (44) after the base
+    // header; the base next-header points at it and the Fragment Header carries
+    // the real upper-layer protocol.
+    out[6] = if is_fragment { 44 } else { next_header };
     out[7] = ttl; // embedded hop limit copied verbatim (NOT decremented)
     // Embedded src (our SNAT pool v4) -> original v6 client.
     out[8..24].copy_from_slice(&map.mapped_embedded_src.octets());
     // Embedded dst (the v4 server) -> NAT64 prefix :: dst-v4.
     out[24..36].copy_from_slice(&map.prefix_bytes);
     out[36..40].copy_from_slice(&quote_in[16..20]);
-    out[40..total].copy_from_slice(l4);
+    // #9129: the 8-byte Fragment Header (RFC 8200 §4.5). Offset is copied
+    // verbatim (both fields count 8-byte units), M mirrors IPv4 MF, and the
+    // Identification is the IPv4 16-bit value zero-extended to 32 bits
+    // (RFC 7915 §4) -- identical to the outer translator's #2488 emission.
+    if is_fragment {
+        out[40] = next_header;
+        out[41] = 0; // reserved
+        let frag_word = (v4_offset_units << 3) | u16::from(v4_more);
+        out[42..44].copy_from_slice(&frag_word.to_be_bytes());
+        out[44..48].copy_from_slice(&u32::from(v4_ident).to_be_bytes());
+    }
+    let l4_start = 40 + frag_hdr_len;
+    out[l4_start..total].copy_from_slice(l4);
 
     // #6472: restore the quoted L4 source port / echo identifier to the
     // ORIGINAL v6 client value. The quote carries the TRANSLATED (pool)
@@ -3270,18 +3345,22 @@ fn translate_embedded_v4_to_v6(
     // L4 checksum is left unchanged (informational — same policy as the
     // address rewrite above); the outer ICMPv6 checksum recompute covers
     // these bytes. A truncated quote skips the rewrite.
+    //
+    // #9129: these offsets are relative to the L4 region, which a Fragment
+    // Header shifts by 8. They were absolute before, because the L4 always
+    // began at 40.
     if let Some(port) = map.mapped_embedded_src_port {
         if matches!(protocol, PROTO_TCP | PROTO_UDP) && l4_len >= 2 {
-            out[40..42].copy_from_slice(&port.to_be_bytes());
+            out[l4_start..l4_start + 2].copy_from_slice(&port.to_be_bytes());
         } else if protocol == PROTO_ICMP && l4_len >= 6 {
-            out[44..46].copy_from_slice(&port.to_be_bytes());
+            out[l4_start + 4..l4_start + 6].copy_from_slice(&port.to_be_bytes());
         }
     }
 
     if protocol == PROTO_ICMP && l4_len >= 2 {
-        if let Some((t, c)) = embedded_icmpv4_type_to_icmpv6(out[40]) {
-            out[40] = t;
-            out[41] = c;
+        if let Some((t, c)) = embedded_icmpv4_type_to_icmpv6(out[l4_start]) {
+            out[l4_start] = t;
+            out[l4_start + 1] = c;
         }
     }
     Some(total)
