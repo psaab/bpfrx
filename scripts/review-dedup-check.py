@@ -40,9 +40,11 @@ def load_review_titles():
                     cached_titles.append((entry['filename'], t))
         except:
             pass
-    # Always scan both report roots: an older cached index may not include a
-    # newly published report. Retain legacy inputs without creating aliases.
-    paths = glob.glob('/var/tmp/deep-review-reports/*-review*.md') + glob.glob('/tmp/*-review*.md')
+    # Always scan active, finished and legacy history: an older cached index may
+    # miss a newly published or archived report. Do not create discovery aliases.
+    paths = (glob.glob('/var/tmp/deep-review-reports/*-review*.md')
+             + glob.glob('/var/tmp/deep-review-finished/*-review*.md')
+             + glob.glob('/tmp/*-review*.md'))
     titles = []
     paths_by_basename = defaultdict(set)
     derivatives = set()
@@ -63,7 +65,7 @@ def load_review_titles():
     for filename, title in cached_titles:
         candidates = ({os.path.abspath(filename)} if os.path.dirname(filename)
                       else paths_by_basename.get(filename, set()))
-        # A basename-only cache cannot distinguish equal names in two roots.
+        # A basename-only cache cannot distinguish equal names across roots.
         # If one is a known derivative, rely on fresh original-source rows;
         # do not guess that the cached title belongs to the other root.
         if candidates & derivatives:

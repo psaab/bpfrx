@@ -16,8 +16,10 @@ defect filing does not authorize publishing planning branches or issue comments.
 
 For issue-linked plans, use `research/<issue>-<slug>` and
 `docs/research/<issue>-<slug>/plan.md` in an owned documentation worktree under
-`.claude/worktrees/<issue>-research-<slug>`, based on the pinned intended comparison
-revision. Follow `AGENTS.md`; verify path, base SHA and write scope. Never reuse
+`<run-dir>/worktrees/<issue>-research-<slug>`, where `<run-dir>` is this run's
+`/var/tmp/deep-review-work/research-work.<unique-id>` directory. Base it on the
+pinned intended comparison revision. Follow `AGENTS.md`; verify path, base SHA
+and write scope. Never reuse
 an occupied worktree by force. Without an issue, use the research run ID instead
 of inventing an issue number. Local-only plans may stay in the owned run directory.
 Commit/push the research docs and post issue comments only within actual scope;

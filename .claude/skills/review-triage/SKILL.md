@@ -34,6 +34,10 @@ is the source report stem without its final `.md`. Continue reading established
 legacy `/tmp/result-<basename>.md` and `/tmp/.researched-<source-filename>` paths.
 Reconcile source identity and prior results/markers across both layouts; a
 copied report must not become new work merely because its directory changed.
+Also consult `/var/tmp/deep-review-finished/` for original reviews and their
+research results before deduplication or filing. It is historical input, not a
+new watcher queue. Read [finished-review archival](../deep-review/references/finished-archive.md)
+for relocation-ledger validation and reconciliation of partial active/archive copies.
 Exclude result/
 report derivatives and intermediate files from new input selection. In particular,
 exclude every `report-` or `result-` basename and `Artifact kind: research-result`, even when
@@ -174,7 +178,8 @@ For result naming, `<basename>` is the source report stem without the final
 Freeze the draft once linked. If a result already exists, verify its report
 identity and reconcile the prior work; never overwrite another run's result.
 Concurrent authorized filing workers must hold one exclusive per-report lock
-in addition to the shared contract's repository filing mutex. Acquire the
+using the shared contract's canonical report key in addition to its repository
+filing mutex. Acquire the
 repository mutex first and hold both from preflight through filing and result
 publication, rechecking processed/result state after acquiring it to avoid
 duplicate external writes. Never delete a

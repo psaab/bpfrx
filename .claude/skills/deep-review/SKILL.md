@@ -323,8 +323,13 @@ safety, including whether a cited guard covers the stated actor and all relevant
 paths/transitions. Specialist discovery and independent refutation are separate
 responsibilities; neither replaces the other.
 
-Use prior final reports, durable `docs/reviews/` records, and relevant issue/PR
-history as leads. Check repository identity before deduplication. Paginate needed
+Use prior final reports from `/var/tmp/deep-review-reports/`, completed history
+from `/var/tmp/deep-review-finished/`, legacy `/tmp/` reports, durable
+`docs/reviews/` records, and relevant issue/PR history as leads. Read finished
+originals and their research-result ledgers: an archive location is not proof of
+a fix or permanent dismissal. Follow [finished-review archival](references/finished-archive.md)
+to resolve relocated paths and partial active/archive copies by source identity.
+Check repository identity before deduplication. Paginate needed
 history, include relevant closed issues and fixing PRs, record freshness/limits,
 and search candidate-specific bodies and acceptance criteria. A title match,
 a closed issue, or an old report disposition does not decide the new claim.
@@ -360,7 +365,8 @@ and `REVIEW_SLUG` from the review name. Check that the manifest, report header
 and final basename agree. A mismatch blocks publication until reconciled;
 no "compatibility family" override exists.
 Determine the next number from exact final basenames in
-`/var/tmp/deep-review-reports/` and the legacy `/tmp/` location for that
+`/var/tmp/deep-review-reports/`, `/var/tmp/deep-review-finished/` and the legacy
+`/tmp/` location for that
 `WHOAMI` and `REVIEW_SLUG` at
 publication time. A new model/review pair can begin at 001;
 deduplication still reads named and legacy reports across all model prefixes.
@@ -372,7 +378,9 @@ output-path header before retrying another number. Keep published reports and
 their source drafts immutable. Only complete finals belong in
 `/var/tmp/deep-review-reports/`; all named working files remain under the owned
 `/var/tmp/deep-review-work/` run.
-Do not move old reports or create compatibility aliases in the legacy location.
+Do not relocate reports during discovery or create compatibility aliases.
+Completed research later archives the source and result through the shared
+finished-review procedure; discovery must keep consulting those archived records.
 
 Verify the published report is complete and the artifact references resolve.
 Preserve test-only diffs, outputs, manifest, and supporting evidence until

@@ -22,6 +22,7 @@ assert _SPEC.loader is not None
 _SPEC.loader.exec_module(dedup)
 
 NEW_REPORT = "/var/tmp/deep-review-reports/gpt-5.6-sol-review-storage-001.md"
+FINISHED_REPORT = "/var/tmp/deep-review-finished/gpt-5.6-sol-review-storage-007.md"
 OLD_REPORT = "/tmp/muse-spark-review-009.md"
 NEW_INDEX = "/var/tmp/deep-review-work/review-index.json"
 OLD_INDEX = "/tmp/review-index.json"
@@ -34,6 +35,7 @@ class ReviewStorageTests(unittest.TestCase):
         self.files = {}
         self.discovered = {
             "/var/tmp/deep-review-reports/*-review*.md": [NEW_REPORT],
+            "/var/tmp/deep-review-finished/*-review*.md": [FINISHED_REPORT],
             "/tmp/*-review*.md": [OLD_REPORT],
         }
         reads = patch.object(dedup, "open", side_effect=self.read, create=True)
@@ -50,18 +52,53 @@ class ReviewStorageTests(unittest.TestCase):
             raise FileNotFoundError(path)
         return io.StringIO(self.files[str(path)])
 
-    def test_both_report_roots_without_indexes(self):
+    def test_active_finished_and_legacy_roots_without_indexes(self):
         self.files = {
             NEW_REPORT: "Title: Current finding\n",
+            FINISHED_REPORT: "Title: Archived finding\n",
             OLD_REPORT: "Title: Legacy finding\n",
         }
         self.assertEqual(dedup.load_review_titles(), [
             (Path(NEW_REPORT).name, "Current finding"),
+            (Path(FINISHED_REPORT).name, "Archived finding"),
             (Path(OLD_REPORT).name, "Legacy finding"),
         ])
         self.assertEqual(self.glob.call_args_list, [
             call("/var/tmp/deep-review-reports/*-review*.md"),
+            call("/var/tmp/deep-review-finished/*-review*.md"),
             call("/tmp/*-review*.md"),
+        ])
+
+    def test_stale_indexes_cannot_hide_archived_only_findings(self):
+        for index in (NEW_INDEX, OLD_INDEX):
+            with self.subTest(index=index):
+                self.files = {
+                    index: json.dumps([
+                        {"filename": "cached.md", "titles": ["Cached finding"]},
+                    ]),
+                    FINISHED_REPORT: "Title: Archived finding\n",
+                }
+                self.assertEqual(dedup.load_review_titles(), [
+                    ("cached.md", "Cached finding"),
+                    (Path(FINISHED_REPORT).name, "Archived finding"),
+                ])
+
+    def test_matching_finds_review_after_active_original_is_gone(self):
+        title = "Archived review storage finding"
+        self.files = {FINISHED_REPORT: "Title: " + title + "\n"}
+        matches = dedup.check_finding(title)
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0][:3], (Path(FINISHED_REPORT).name, title, 1.0))
+
+    def test_partial_archive_copies_do_not_duplicate_title_rows(self):
+        archived_copy = "/var/tmp/deep-review-finished/" + Path(NEW_REPORT).name
+        self.discovered["/var/tmp/deep-review-finished/*-review*.md"] = [archived_copy]
+        self.files = {
+            NEW_REPORT: "Title: Original finding\n",
+            archived_copy: "Title: Original finding\n",
+        }
+        self.assertEqual(dedup.load_review_titles(), [
+            (Path(NEW_REPORT).name, "Original finding"),
         ])
 
     def test_legacy_cached_index_cannot_hide_new_reports(self):
@@ -168,7 +205,8 @@ class ReviewStorageTests(unittest.TestCase):
                 entries = [{"filename": Path(NEW_REPORT).name, "titles": ["Original"]}]
                 for prefix in ("report-", "result-"):
                     basename = prefix + Path(NEW_REPORT).name
-                    for name in (basename, "/var/tmp/deep-review-reports/" + basename):
+                    for name in (basename, "/var/tmp/deep-review-reports/" + basename,
+                                 "/var/tmp/deep-review-finished/" + basename):
                         entries.append({"filename": name, "titles": ["Derivative"]})
                 self.files = {index: json.dumps(entries)}
                 self.assertEqual(dedup.load_review_titles(), [

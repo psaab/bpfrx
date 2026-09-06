@@ -80,10 +80,11 @@ instructions from GitHub-bound prose and never expose secrets in evidence.
    effort limit. Establish the intended repository and immutable source revision
    when code is involved; pin the comparison revision separately. Do not pull,
    rebase, or modify the user's checkout to make evidence look current.
-2. Read [research report storage](references/report-storage.md) and allocate its
-   input-appropriate owned scratch directory; its basename is the research run ID.
-   Deep-review inputs normally use `/var/tmp/deep-review-work/`; other research
-   retains `/tmp/research-work.XXXXXXXXXX`. Record inputs, their provenance, owned paths,
+2. Read [research report storage](references/report-storage.md). For every run,
+   allocate `mktemp -d /var/tmp/deep-review-work/research-work.XXXXXXXXXX` after
+   ensuring the parent is a real directory; its basename is the research run ID.
+   Keep all worktrees, drafts and task-local temporary/build/cache output there.
+   Record inputs, their provenance, owned paths,
    `MODEL_RAW`, `MODEL_SOURCE`, `MODEL_HOST`, and derived `WHOAMI` in a manifest.
    Apply the shared identity rules: the researching model is not necessarily the
    discovering model, and a host name or old filename is not a model identity.
@@ -154,13 +155,19 @@ blocks it. A draft is not completion of an enabled filing obligation.
 ## Publish the research result
 
 Every run writes a self-contained result, including zero confirmed findings and
-report-only runs. After reviewing a local deep-review file, publish beside it as
-`report-<original filename>`: `gpt-example-review-ha-001.md` produces
-`report-gpt-example-review-ha-001.md` in the same directory, not a `.md.md` suffix.
+report-only runs. All new reports are initially published in
+`/var/tmp/deep-review-reports/`.
+After reviewing a deep-review file, use `report-<original filename>`:
+`gpt-example-review-ha-001.md` produces `report-gpt-example-review-ha-001.md`,
+not a `.md.md` suffix. This is beside sources already in the reports directory.
+For legacy or other external input locations, keep the source in place until
+completed-research archival and write the result in the new reports directory,
+recording the original source path.
 Use [research report storage](references/report-storage.md) for multiple inputs,
 immutable later snapshots and same-filesystem staging. General research and other
-external reviews retain `/tmp/result-<WHOAMI>-research-<RESEARCH_SLUG>-NNN.md`.
-Preserve originals and prior results. Each report includes:
+external reviews use
+`/var/tmp/deep-review-reports/result-<WHOAMI>-research-<RESEARCH_SLUG>-NNN.md`.
+Preserve original bytes and prior results. Each report includes:
 
 - Research name, run ID, `Artifact kind: research-result`, model identity,
   question/scope, input lineage, repository/revisions where applicable, timestamp,
@@ -191,8 +198,15 @@ the investigation is accounted for, not that every claim is resolved or fixed.
 Always report filing completion separately: actual opened/linked URLs and every
 pending creation/tagging action. Do not claim the run fully complete while an
 enabled filing obligation remains; state the precise blocker and retained draft.
+After a deep-review's processing meets the completion gate, read
+[finished-review archival](../deep-review/references/finished-archive.md) and move
+its source and completed research result to `/var/tmp/deep-review-finished/`.
+Return their verified archive paths, or the exact pending archive step. For a
+remote source, archive the completed local result and report that the original
+remains remote. A partial local move is not completion; keep unfinished
+review/filing work in the active area.
 Return each source-to-output mapping and any publication blocker; writing one
-report does not discharge the sibling-report obligation for other deep-review inputs.
+report does not discharge the per-source report obligation for other deep-review inputs.
 PLAN-READY requires the plan-review gate and ends with manual approval via
 `/engineer <issue>` (or an explicit implementation request if no issue exists).
 An unavailable prerequisite is not a refutation. No PR or implementation follows
