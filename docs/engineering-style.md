@@ -93,6 +93,46 @@ So:
   the population it measures cannot detect a coverage loss, because the
   population is what moved.
 
+### When you CORRECT someone, ask whether you are CONJOINING or REPLACING
+
+A lane held the container-level half of a discriminator. A second lane found the
+leaf-level half while correcting them -- and named their own half as *the*
+discriminator rather than conjoining the two. The corrected rule was as wrong as
+the one it replaced, in the same direction, and it propagated into an issue body
+and a test file's comment before measurement caught it.
+
+Measured, the rule is a CONJUNCTION:
+
+```
+container                    unknown-kw   run@untyped   run@typed
+system login class           ACCEPT       ACCEPT        REJECT
+security ike gateway         ACCEPT       ACCEPT        REJECT
+security ipsec proposal      REJECT       REJECT        REJECT
+security flow tcp-session    REJECT       --            REJECT
+```
+
+> A flat run is ACCEPTED iff the container is OPEN-WORLD **and** the leaf it
+> starts at is UNTYPED. Either condition alone rejects it.
+
+`security ipsec proposal` falsifies the leaf-only form: its starting leaf is
+untyped and the run is rejected anyway, because that container is closed-world.
+
+**This is not ordinary over-generalisation.** Correcting someone puts you in a
+frame where their account is the thing being replaced, and a newly-measured half
+arrives feeling like the whole. You have just demonstrated that their claim was
+incomplete -- which is the worst state in which to test your own for the same
+property. The lane who did it said it exactly: *"I shipped a rule with the exact
+defect I had just diagnosed in theirs, in the same message."*
+
+Ask it explicitly: **is the thing I just measured a REPLACEMENT for their
+account, or a CONJUNCT with it?** A replacement needs the old account to be
+FALSE, not merely partial -- and if their evidence still holds where they
+measured it, it is a conjunct.
+
+Corollary for the receiving side: a correction arrives carrying the authority of
+its measurement, and that authority covers the half that was measured, not the
+scope claimed for it.
+
 ### Hand over a MECHANISM, not a count — and gate a shared helper with a DIFFERENTLY-FILTERED instrument
 
 Two rules that came out of the same afternoon, both about what a finding does to
