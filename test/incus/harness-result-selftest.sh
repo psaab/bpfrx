@@ -596,6 +596,121 @@ else
 fi
 unset -f incus
 
+# ── 10d-g. #9044: the attestation must cover BOTH nodes of a cluster gate ──
+#
+# The readback used to read node 0 only, on the ground that "both nodes carry
+# the same build after a cluster-deploy". That is a property of ONE way of
+# invoking the deploy, not of the system: `make cluster-deploy NODE=0` is a
+# plain Makefile override, and an HA smoke FAILS OVER BY DEFINITION, so the
+# node the attestation skipped is the node the result depends on.
+#
+# The mock answers per node, which is the only shape in which a single-node
+# readback and a two-node readback give different verdicts — a mock returning
+# one sha for every node would pass both the old and the new code.
+_peer_incus_mock() {
+	# `deploy_running_xpfd_sha256 <node>` puts the node in the argv; match on
+	# it rather than on call order, so a changed retry count cannot silently
+	# re-target which answer goes to which node.
+	local arg
+	for arg in "$@"; do
+		case "$arg" in
+		*fw1*) echo "$PEER_SHA  /proc/1234/exe"; return 0 ;;
+		esac
+	done
+	echo "$fake_sha  /proc/1234/exe"
+}
+
+# 10d. THE FINDING. Node 0 matches; the peer runs a DIFFERENT build. Before
+#      #9044 this row was a clean MATCH/PASS for a gate that failed over onto
+#      the unattested node.
+PEER_SHA=$(printf 'a%.0s' {1..64})
+incus() { _peer_incus_mock "$@"; }
+(harness_result_run --ledger "$LEDGER" --cluster --env testenv --gate fake-peer-stale \
+	--adapter ha-smoke --node fake:fw0 --node-peer fake:fw1 --build-exe "$WORK/xpfd" \
+	-- "$WORK/fake-gate.sh" >/dev/null 2>&1)
+if [[ "$(last_row_field verdict)" == "VOID" && "$(last_row_field exe_check)" == "MISMATCH" ]]; then
+	ok "#9044: a peer running a DIFFERENT build makes the row VOID, not a clean MATCH"
+else
+	bad "#9044: peer-stale run gave verdict=$(last_row_field verdict) exe_check=$(last_row_field exe_check) — this is the shape 'cluster-deploy NODE=0 && test-failover' produces, and it must not record a clean MATCH"
+fi
+if [[ "$(last_row_field running_exe_sha256_peer)" == "$PEER_SHA" ]]; then
+	ok "#9044: the row carries the PEER's running_exe_sha256, so what fw1 was running is recoverable"
+else
+	bad "#9044: running_exe_sha256_peer is '$(last_row_field running_exe_sha256_peer)', expected $PEER_SHA"
+fi
+if [[ "$(last_row_field void_reason)" == *"peer_running_exe_sha256"* ]]; then
+	ok "#9044: the VOID reason names the peer, so the row says WHICH node was unattributable"
+else
+	bad "#9044: VOID reason does not name the peer: $(last_row_field void_reason)"
+fi
+
+# 10e. THE CONTROL, and it is the one that matters: a properly deployed cluster
+#      (NODE=all) must still be a clean MATCH. A guard that voided every
+#      cluster gate would satisfy 10d perfectly and be worthless.
+PEER_SHA="$fake_sha"
+incus() { _peer_incus_mock "$@"; }
+(harness_result_run --ledger "$LEDGER" --cluster --env testenv --gate fake-peer-ok \
+	--adapter ha-smoke --node fake:fw0 --node-peer fake:fw1 --build-exe "$WORK/xpfd" \
+	-- "$WORK/fake-gate.sh" >/dev/null 2>&1)
+if [[ "$(last_row_field verdict)" == "PASS" && "$(last_row_field exe_check)" == "MATCH" ]]; then
+	ok "#9044: both nodes on the build under test is still a clean MATCH/PASS (the NODE=all path)"
+else
+	bad "#9044: a correctly deployed cluster gave verdict=$(last_row_field verdict) exe_check=$(last_row_field exe_check) — the guard reds the ordinary path"
+fi
+if [[ "$(last_row_field exe_scope)" == "both" ]]; then
+	ok "#9044: a two-node readback records exe_scope=both"
+else
+	bad "#9044: exe_scope is '$(last_row_field exe_scope)', expected both"
+fi
+
+# 10f. The peer is UNREADABLE. This must NOT be a void: test-ha-crash,
+#      test-chained-crash and test-double-failover force-stop a node and may
+#      leave it down when the gate ends, so voiding here would red exactly the
+#      gates whose job is to kill a node. It is recorded as a SCOPE instead —
+#      the fact ("I attested one of the two nodes") the row previously could
+#      not express at all.
+incus() {
+	local arg
+	for arg in "$@"; do
+		case "$arg" in
+		*fw1*) return 1 ;;
+		esac
+	done
+	echo "$fake_sha  /proc/1234/exe"
+}
+(harness_result_run --ledger "$LEDGER" --cluster --env testenv --gate fake-peer-down \
+	--adapter ha-smoke --node fake:fw0 --node-peer fake:fw1 --build-exe "$WORK/xpfd" \
+	-- "$WORK/fake-gate.sh" >/dev/null 2>&1)
+if [[ "$(last_row_field verdict)" == "PASS" && "$(last_row_field exe_check)" == "MATCH" ]]; then
+	ok "#9044: an unreadable peer does NOT void the row (the crash gates leave a node down on purpose)"
+else
+	bad "#9044: an unreadable peer gave verdict=$(last_row_field verdict) — this reds every gate that force-stops a node"
+fi
+if [[ "$(last_row_field exe_scope)" == "local-only" ]]; then
+	ok "#9044: an unreadable peer records exe_scope=local-only, so a partial attestation is visibly partial"
+else
+	bad "#9044: exe_scope is '$(last_row_field exe_scope)', expected local-only — without it this row is indistinguishable from a whole-cluster MATCH, which IS the finding"
+fi
+unset -f incus _peer_incus_mock
+
+# 10g. harness_exe_scope as a table. The three cells above drive it through the
+#      wrapper; this pins the function so a wrapper change cannot quietly make
+#      every row read `both`.
+scope_is() {
+	local got
+	got=$(harness_exe_scope "$1" "$2" "$3")
+	if [[ "$got" == "$4" ]]; then
+		ok "exe_scope($1,'$2','$3') = $4"
+	else
+		bad "exe_scope($1,'$2','$3'): want $4 got $got"
+	fi
+}
+scope_is hermetic "" "" "n/a"
+scope_is hermetic "fake:fw1" "abc" "n/a"
+scope_is cluster "fake:fw1" "abc" "both"
+scope_is cluster "fake:fw1" "" "local-only"
+scope_is cluster "" "" "local-only"
+
 # A hermetic run records NOT-APPLICABLE -- distinct from UNAVAILABLE, because
 # "there is no deployed binary" and "we could not read the deployed binary" are
 # different facts.
