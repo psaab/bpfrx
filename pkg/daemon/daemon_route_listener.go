@@ -105,6 +105,28 @@ func (d *Daemon) runOneRouteSubscription(ctx context.Context, loop *coalesce.Loo
 	}); err != nil {
 		return err
 	}
+	// #9010: THE SUBSCRIPTION IS LIVE AGAIN, WHICH IS ITSELF A REFRESH EDGE.
+	//
+	// This options set passes ListExisting:false, so a new subscription
+	// replays nothing: every route that changed while there was no
+	// subscription is invisible to `updates` forever. The outer loop's
+	// resubscribe therefore closes the socket gap and not the DATA gap.
+	//
+	// #8915 marks from the ErrorCallback, which covers a fault DURING a live
+	// subscription. It cannot cover this: a subscribe that FAILS never
+	// installs a callback, so the 2-second retry path marks nothing at all,
+	// and a subscription that simply ends returns before any error is raised.
+	//
+	// The mark is what the coalescer reads to decide whether to actuate --
+	// "an unmarked loop sweeps forever and actuates never" (#8915, measured:
+	// 0 actuations across 50 sweeps). So without this the helper FIB stays
+	// stale until the next route event that happens to arrive.
+	//
+	// Marking on the FIRST subscription too is deliberate: a refresh is
+	// idempotent and the coalescer debounces, so the cost is one actuation at
+	// startup, and special-casing "not the first" would make the recovery
+	// depend on counting rather than on the invariant.
+	d.routeListenerCatchUp(loop)
 
 	for {
 		select {
@@ -123,6 +145,19 @@ func (d *Daemon) runOneRouteSubscription(ctx context.Context, loop *coalesce.Loo
 			loop.Mark()
 		}
 	}
+}
+
+// routeListenerCatchUp marks the coalescer for a post-gap refresh.
+//
+// Named rather than inlined for the same reason as routeListenerErrorCallback:
+// a cell must drive the function PRODUCTION calls, not a re-implementation of
+// it (#8915). The counter is what a caller can observe.
+func (d *Daemon) routeListenerCatchUp(loop *coalesce.Loop) {
+	if loop == nil {
+		return
+	}
+	d.routeListenerCatchUps.Add(1)
+	loop.Mark()
 }
 
 // routeListenerErrorCallback is the subscription's ErrorCallback, named rather

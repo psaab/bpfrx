@@ -138,7 +138,13 @@ type Daemon struct {
 	// forces a coalescer mark, because the bounded update channel means an
 	// overflow drops the only refresh edge the daemon has.
 	routeListenerErrors atomic.Uint64
-	routeListenerLoop   atomic.Pointer[coalesce.Loop]
+	// routeListenerCatchUps counts catch-up marks issued when a route
+	// subscription is (re-)established (#9010). A gap between subscriptions is
+	// invisible to the update stream -- the new subscription uses
+	// ListExisting:false and replays nothing -- so re-establishment is itself
+	// a refresh edge.
+	routeListenerCatchUps atomic.Uint64
+	routeListenerLoop     atomic.Pointer[coalesce.Loop]
 
 	// #7194: last session-delta schema fingerprint advertised by the RUNNING
 	// helper, recorded from the ProcessStatus that DrainSessionDeltas returns.
