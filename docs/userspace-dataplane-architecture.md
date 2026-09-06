@@ -2656,8 +2656,9 @@ system {
 | workers | 1 | Number of AF_XDP worker threads |
 | ring-entries | 1024 | RX/TX/fill/completion ring size per binding |
 | binary | — | Path to Rust binary |
-| control-socket | — | Unix socket for control protocol (typed leaf: absolute, no `.`/`..` component, ≤107 octets — see below) |
-| state-file | — | JSON state persistence path |
+| control-socket | `/run/xpf/userspace-dp.sock` | Unix socket for control protocol (typed leaf: absolute, no `.`/`..` component, ≤107 octets — see below) |
+| state-file | `/run/xpf/userspace-dp.json` | JSON state persistence path |
+| (event socket) | derived beside `control-socket` | Helper→daemon session-event push socket; not separately configurable |
 
 ### Socket path handling (#5273, #5839, #7139)
 
@@ -2719,9 +2720,80 @@ the socket's own inode in sockfs are different objects (measured: 23374170 vs
 773414179 for one live socket), so that comparison matches nothing and would
 judge every live socket stale.
 
-*Still open:* pinning both sockets under an xpfd-owned `/run/xpf` and dropping
-the arbitrary path. That subsumes the class but is an operator-visible config
-change needing its own #1960 no-brick analysis.
+*Partly closed by #9003, and the remaining half is named below.* The compiled-in
+DEFAULT is now `/run/xpf` (see "Socket trust" immediately below), and an
+untrusted directory is refused at bring-up regardless of how the path was
+reached. What is still open is dropping the arbitrary path ENTIRELY — refusing a
+committed `control-socket` outside `/run/xpf` — which remains an
+operator-visible config change needing its own #1960 no-brick analysis, and
+which the trust check makes unnecessary for the confidentiality property.
+
+### Socket trust: the default path, the adopted directory, and the peer (#9003)
+
+The `apply_snapshot` body carries the **WireGuard local private key and every
+per-peer preshared key in cleartext** (`WgLocalPrivkeyHex`,
+`WgPresharedKeyHex`, `pkg/dataplane/userspace/tunnels.go`). The ON-DISK half of
+that was already handled — `snapshot.rs` marks both fields `skip_serializing`
+with a redacting `Debug` impl, so `state.json` cannot carry them — and the
+SOCKET half was gated by nothing but an inherited umask. Three defects composed:
+
+1. **The compiled-in default was under `os.TempDir()`.** A deployment that
+   omitted `control-socket` got `${TMPDIR}/xpf-userspace-dp/control.sock`. The
+   shipped reference configs pin `/run/xpf`, which is exactly the shape where
+   "the shipped config is fine" stops being a defence — the defect is in the
+   default, i.e. in every deployment that takes it.
+2. **`os.MkdirAll(dir, 0755)` ADOPTS.** It returns `nil` for a pre-existing
+   directory of any owner and any mode. An unprivileged local user who won the
+   race to `mkdir /tmp/xpf-userspace-dp` owned the directory the root helper
+   then bound inside, and could unlink that socket and bind their own.
+3. **Neither end identified the peer.** `handlers/mod.rs` dispatches `ping` /
+   `status` / `apply_snapshot` / `set_forwarding_state` / `update_ha_state` with
+   no caller check, so a connectable socket is dataplane TAKEOVER, not merely
+   key readback. The earliest reachable instance is `boot_probe.go`, which dials
+   BEFORE any helper spawn (`pkg/daemon/bootstrap.go`) — so a squatter could lie
+   about `Enabled` / `ForwardingArmed` to the #1993 fail-closed boot decision and
+   to the #5286 upgrade-readiness gate. That is an integrity defect independent
+   of the keys.
+
+Four mechanisms close it, in `pkg/dataplane/userspace/socket_trust_9003.go` and
+`userspace-dp/src/server/lifecycle.rs`:
+
+- **Defaults moved to `/run/xpf`** on BOTH sides (`DefaultControlSocket` /
+  `DefaultStateFile` in Go, `DEFAULT_CONTROL_SOCKET` / `DEFAULT_STATE_FILE` in
+  Rust), pinned to each other by
+  `TestHelperDefaultPathsAreInLockstepWithRust9003`. They must not skew: the
+  #1993 probe dials the path the DAEMON derived while a surviving helper listens
+  on the path the HELPER chose.
+- **`ensureTrustedRuntimeDir` creates and then PROVES.** After `MkdirAll` the
+  directory must be owned by root (or by this daemon, so a non-root test binary
+  can drive the real path) and must not be world-writable without the sticky
+  bit; and no ANCESTOR may be world-writable without sticky, since such an
+  ancestor lets a non-owner rename the whole subtree aside. **This deliberately
+  still accepts `/tmp` itself** (1777, root-owned): a deployment that committed
+  `control-socket /tmp/xpf.sock` keeps booting. What is refused is the
+  SUBDIRECTORY shape, which is the one an unprivileged user can own.
+- **SO_PEERCRED on every dial and every accept.** `dialTrustedHelperSocket`
+  reads the peer's credentials before writing a byte, on the control socket, the
+  session socket and the boot probe; `EventStream.acceptLoop` does the same
+  before letting a connection DISPLACE the current helper. The helper refuses a
+  non-root peer on both its listeners
+  (`reject_unprivileged_peer`). This is the check that does not RACE: a path
+  check answers a question about a name at some earlier instant, while
+  SO_PEERCRED is answered by the kernel for the socket this connection is
+  attached to.
+- **Explicit socket modes.** The helper `chmod`s both its sockets to 0600 after
+  bind and creates its runtime directory 0750; the daemon does the same for the
+  event socket. Previously the mode was `0777 &^ umask` — under the documented
+  `/run/xpf` config and systemd's default umask that lands 0755 and an
+  unprivileged `connect()` gets EACCES, but a `UMask=0000` in the unit converts
+  it silently to full disclosure. An unasserted umask is not a control, so the
+  mode is now asserted by
+  `TestEventStreamSocketIsOwnerOnly9003` and `a_bound_socket_is_owner_only_9003`.
+
+Note on framing, because the originating report got it backwards: a Unix
+socket's mode gates **connect**, not reading bytes in flight. A third party can
+never read AF_UNIX traffic regardless of mode, so "eavesdropping in transit" is
+not the exposure; **impersonating the endpoint** is.
 
 `EventStream.Start` additionally holds a sidecar `flock` across the call, which
 serializes daemon-side owners of the socket it binds. The control socket has no
@@ -3323,6 +3395,20 @@ bound a single request to a fixed ceiling, **in lockstep**:
   request and, if it would exceed the cap, returns an actionable
   operator-facing config error **at apply time** instead of letting the
   helper reject it silently after the config is already committed.
+
+**The RESPONSE direction was byte-unbounded until #9003, and this section used
+to be silent about it.** Four sites decoded a helper (or Kea) reply with a bare
+`json.Decoder` — `boot_probe.go`, both round trips in `process_control.go`, and
+`pkg/dhcpserver/lease_sync.go`. All four set an absolute connection deadline, so
+the accurate description was **byte-unbounded, deadline-bounded**; over AF_UNIX
+a 3 s deadline still admits GB-scale allocation at memory bandwidth, and
+`ControlResponse` carries four unbounded slice fields (`SessionDeltas`,
+`IdleLeases`, `DisplayLeases`, `SessionCounters`) whose contents are RETAINED
+rather than transiently buffered. Each decode now runs through a
+`LimitReader` at `MaxControlResponseBytes` (= `MaxControlRequestBytes`) or, for
+Kea, `maxKeaResponseBytes`. The census
+`TestEveryHelperResponseDecodeIsBounded9003` asserts all four rather than
+sampling one — the originating report counted three and missed the fourth.
 
 **Sizing (#2744):** the dominant scaling dimension is NOT policy/NAT/route
 count (a hand-authored config is a few MB) but **dynamic-feed-backed

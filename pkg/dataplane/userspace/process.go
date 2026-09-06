@@ -122,11 +122,19 @@ func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(cfg.ControlSocket), 0755); err != nil {
-		return fmt.Errorf("mkdir control socket dir: %w", err)
+	// #9003: create-and-PROVE, not create-and-assume. os.MkdirAll returns nil
+	// for a directory that already exists and never looks at its owner or mode,
+	// so the previous `os.MkdirAll(dir, 0755)` adopted whatever was there —
+	// including a directory an unprivileged local user created first, inside
+	// which they can unlink the socket the root helper binds and substitute
+	// their own. ensureTrustedRuntimeDir refuses a directory this daemon cannot
+	// vouch for, BEFORE the helper is spawned, so the failure costs nothing
+	// beyond the generation that was already stopped.
+	if err := ensureTrustedRuntimeDir("control socket", filepath.Dir(cfg.ControlSocket)); err != nil {
+		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(cfg.StateFile), 0755); err != nil {
-		return fmt.Errorf("mkdir state dir: %w", err)
+	if err := ensureTrustedRuntimeDir("state file", filepath.Dir(cfg.StateFile)); err != nil {
+		return err
 	}
 	// The control socket is named by operator configuration and xpfd runs as
 	// root, so the stale-socket unlink is guarded rather than fire-and-forget:

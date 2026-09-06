@@ -121,6 +121,115 @@ fn remove_stale_socket(path: &str) -> std::io::Result<()> {
     }
 }
 
+/// #9003: the compiled-in default control-socket / state-file locations.
+///
+/// They MUST agree with the Go control plane's `DefaultControlSocket` /
+/// `DefaultStateFile` (`pkg/dataplane/userspace/socket_trust_9003.go`) — the
+/// daemon resolves the same defaults when the operator omits
+/// `system dataplane control-socket`, and the #1993 boot armed-probe dials the
+/// path the daemon derived, not the one this binary would have chosen. A skew
+/// between them makes a surviving helper undialable at boot.
+pub(crate) const DEFAULT_CONTROL_SOCKET: &str = "/run/xpf/userspace-dp.sock";
+pub(crate) const DEFAULT_STATE_FILE: &str = "/run/xpf/userspace-dp.json";
+
+/// Mode for a runtime directory this helper CREATES. Only root traverses it.
+/// An existing directory keeps its own mode — the Go side judges that one
+/// (`ensureTrustedRuntimeDir`) and refuses bring-up rather than chmod'ing a
+/// directory it does not own, because a chmod an attacker can undo is not a
+/// control.
+const RUNTIME_DIR_MODE: u32 = 0o750;
+
+/// Mode for a bound helper socket. Root-only, explicitly.
+///
+/// #9003: before this the mode was `0o777 & !umask` — a value inherited from
+/// whatever the unit and the ambient environment happened to supply, asserted by
+/// no code, no unit file and no test. Under the documented `/run/xpf` config and
+/// systemd's default umask it happened to land 0755 and an unprivileged
+/// `connect()` got EACCES; a `UMask=0000` in the unit would have silently
+/// converted that to "any local user can read the WireGuard private key" with no
+/// signal anywhere. An unasserted umask is not a control.
+const SOCKET_MODE: u32 = 0o600;
+
+/// Create a runtime directory with a restrictive mode. `create_dir_all` applies
+/// the process umask to the mode, so the directory is created at
+/// `RUNTIME_DIR_MODE & !umask` — never wider.
+fn create_runtime_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(RUNTIME_DIR_MODE)
+        .create(path)
+}
+
+/// Restrict a bound Unix socket to its owner. Called AFTER `bind` — there is no
+/// atomic bind-with-mode, so the window between bind and chmod is closed by the
+/// accept-side peer check rather than by the mode.
+fn restrict_socket_mode(path: &str) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(SOCKET_MODE))
+        .map_err(|e| format!("restrict mode on {path}: {e}"))
+}
+
+/// #9003: refuse a control/session-socket peer that is neither root nor this
+/// process's own uid.
+///
+/// This is the authoritative gate, and it is the one that does not race. The
+/// socket mode above is a question about a NAME at some earlier instant;
+/// `SO_PEERCRED` is answered by the kernel for the process on the other end of
+/// THIS connection, so it holds even if the path was swapped after the bind.
+///
+/// The handler dispatch (`server/handlers/mod.rs`) serves `ping` / `status` /
+/// `apply_snapshot` / `set_forwarding_state` / `update_ha_state` with no caller
+/// check at all, so a connectable socket is dataplane TAKEOVER, not merely key
+/// readback.
+///
+/// The own-uid arm exists so a non-root test binary can drive the real accept
+/// path against a socket it bound itself. In production both ends are root and
+/// the arm never fires.
+fn reject_unprivileged_peer(
+    kind: &str,
+    stream: &std::os::unix::net::UnixStream,
+) -> Result<(), String> {
+    // `UnixStream::peer_cred` is still unstable (rust-lang#42839), so read
+    // SO_PEERCRED directly. Same kernel answer, no nightly.
+    use std::os::fd::AsRawFd;
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `stream` owns a live AF_UNIX fd for the duration of the call;
+    // `cred` and `len` are a correctly-sized, correctly-typed out-parameter
+    // pair for SO_PEERCRED.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            std::ptr::from_mut(&mut cred).cast::<libc::c_void>(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "read {kind} peer credentials: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: geteuid(2) has no failure mode and no preconditions.
+    let self_uid = unsafe { libc::geteuid() };
+    if cred.uid != 0 && cred.uid != self_uid {
+        return Err(format!(
+            "refusing {kind} connection from uid {} (gid {}, pid {}): not root and not this \
+             process (uid {self_uid}). The control protocol carries the WireGuard private key \
+             and every preshared key in cleartext, and its handlers are unauthenticated.",
+            cred.uid, cred.gid, cred.pid
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn run() -> Result<(), String> {
     // Increase socket buffer ceilings — needed for AF_XDP copy mode to avoid
     // drops when the kernel backlog is large. Raise-only: never lower a value
@@ -152,10 +261,10 @@ pub(crate) fn run() -> Result<(), String> {
         eprintln!("xpf-userspace-dp: interrupt mode — skipping busy_poll sysctls");
     }
     if let Some(parent) = Path::new(&args.control_socket).parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("create control dir: {e}"))?;
+        create_runtime_dir(parent).map_err(|e| format!("create control dir: {e}"))?;
     }
     if let Some(parent) = Path::new(&args.state_file).parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("create state dir: {e}"))?;
+        create_runtime_dir(parent).map_err(|e| format!("create state dir: {e}"))?;
     }
     // Only unlink a stale Unix socket left by a prior run — never blindly
     // delete a regular file or other object at these privileged paths (#2974).
@@ -168,12 +277,14 @@ pub(crate) fn run() -> Result<(), String> {
 
     let listener = UnixListener::bind(&args.control_socket)
         .map_err(|e| format!("listen {}: {e}", args.control_socket))?;
+    restrict_socket_mode(&args.control_socket)?;
     listener
         .set_nonblocking(true)
         .map_err(|e| format!("set nonblocking listener: {e}"))?;
 
     let session_listener = UnixListener::bind(&session_socket)
         .map_err(|e| format!("listen session {}: {e}", session_socket))?;
+    restrict_socket_mode(&session_socket)?;
     session_listener
         .set_nonblocking(true)
         .map_err(|e| format!("set nonblocking session listener: {e}"))?;
@@ -415,6 +526,15 @@ pub(crate) fn run() -> Result<(), String> {
                 while running.load(Ordering::SeqCst) {
                     match session_listener.accept() {
                         Ok((stream, _)) => {
+                            // #9003: prove the peer before dispatching. A
+                            // connectable session socket installs and reads
+                            // sessions.
+                            if let Err(err) =
+                                reject_unprivileged_peer("session socket", &stream)
+                            {
+                                eprintln!("xpf-userspace-dp: {err}");
+                                continue;
+                            }
                             // Log handle_stream failures rather than discarding
                             // them: a request that fails to decode (e.g. a
                             // wire-type mismatch) closes the socket with no
@@ -450,6 +570,13 @@ pub(crate) fn run() -> Result<(), String> {
     while running.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _)) => {
+                // #9003: prove the peer before dispatching. This socket carries
+                // apply_snapshot — the WireGuard private key and every preshared
+                // key — and its handlers run no caller check of their own.
+                if let Err(err) = reject_unprivileged_peer("control socket", &stream) {
+                    eprintln!("xpf-userspace-dp: {err}");
+                    continue;
+                }
                 // See the session-socket note above: surface decode/handler
                 // failures instead of discarding them. This is the socket that
                 // carries apply_snapshot, where a wire-type mismatch silently
@@ -542,16 +669,18 @@ fn validate_ring_entries_arg(val: &str) -> Result<usize, String> {
 }
 
 pub(crate) fn parse_args() -> Result<Args, String> {
-    let mut control_socket = env::temp_dir()
-        .join("xpf-userspace-dp")
-        .join("control.sock")
-        .to_string_lossy()
-        .to_string();
-    let mut state_file = env::temp_dir()
-        .join("xpf-userspace-dp")
-        .join("state.json")
-        .to_string_lossy()
-        .to_string();
+    // #9003: default under /run/xpf, NOT under the temp directory. The control
+    // socket carries the WireGuard local private key and every per-peer
+    // preshared key in cleartext, and a default of
+    // `${TMPDIR}/xpf-userspace-dp/control.sock` put it in a subdirectory of a
+    // world-writable directory that either side creates on first boot — a
+    // directory an unprivileged local user can create FIRST and thereby own.
+    // These spellings match the Go control plane's DefaultControlSocket /
+    // DefaultStateFile (pkg/dataplane/userspace/socket_trust_9003.go) and the
+    // shipped reference configs; the Go side always passes --control-socket
+    // explicitly, so this default only governs a hand-run helper.
+    let mut control_socket = DEFAULT_CONTROL_SOCKET.to_string();
+    let mut state_file = DEFAULT_STATE_FILE.to_string();
     let mut workers = 1usize;
     let mut ring_entries = 4096usize;
     let mut poll_mode = PollMode::BusyPoll;
@@ -808,5 +937,103 @@ mod sockbuf_raise_only_tests {
         let after: i64 = fs::read_to_string(p).unwrap().trim().parse().unwrap();
         let _ = fs::remove_file(p);
         assert_eq!(after, SOCKBUF_TARGET, "raise_sysctl must raise a low value to target");
+    }
+}
+
+/// #9003: the helper side of the control-socket trust contract.
+///
+/// The socket carries the WireGuard local private key and every per-peer
+/// preshared key in cleartext, and `server/handlers/mod.rs` dispatches `ping` /
+/// `status` / `apply_snapshot` / `set_forwarding_state` with no caller check —
+/// so a connectable socket is dataplane TAKEOVER, not merely key readback.
+#[cfg(test)]
+mod socket_trust_9003_tests {
+    use super::{
+        DEFAULT_CONTROL_SOCKET, DEFAULT_STATE_FILE, create_runtime_dir, reject_unprivileged_peer,
+        restrict_socket_mode,
+    };
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "xpf-9003-{}-{}-{:?}",
+            name,
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn a_bound_socket_is_owner_only_9003() {
+        let dir = scratch("mode");
+        create_runtime_dir(&dir).expect("create runtime dir");
+        let path = dir.join("control.sock").to_string_lossy().to_string();
+        let _listener = UnixListener::bind(&path).expect("bind");
+
+        // FAIL-ON-REVERT. Without restrict_socket_mode the socket keeps
+        // `0o777 & !umask` — 0755 under the usual 022 — and an unprivileged
+        // connect() succeeds. The pre-#9003 safety rested entirely on an
+        // inherited umask that no code, unit file or test asserted.
+        let before = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        restrict_socket_mode(&path).expect("restrict mode");
+        let after = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(
+            after, 0o600,
+            "bound control socket mode is {after:o}, want 0600 (it was {before:o} before the chmod)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_created_runtime_dir_has_no_world_bits_9003() {
+        let dir = scratch("dirmode");
+        create_runtime_dir(&dir).expect("create runtime dir");
+        let mode = std::fs::metadata(&dir).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(
+            mode & 0o007,
+            0,
+            "runtime dir mode {mode:o} carries world bits; the control socket lives here"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// POSITIVE CONTROL for the SO_PEERCRED read.
+    ///
+    /// A getsockopt whose failure was swallowed would leave a zeroed `ucred`,
+    /// whose uid is 0 — exactly the value the gate ACCEPTS. So "it returned Ok"
+    /// proves nothing on its own; this drives a real connection and asserts the
+    /// gate accepts it, which is only true if a real credential came back.
+    #[test]
+    fn a_same_uid_peer_is_accepted_9003() {
+        let dir = scratch("peer");
+        create_runtime_dir(&dir).expect("create runtime dir");
+        let path = dir.join("control.sock").to_string_lossy().to_string();
+        let listener = UnixListener::bind(&path).expect("bind");
+        let _client = UnixStream::connect(&path).expect("connect");
+        let (server_side, _) = listener.accept().expect("accept");
+        reject_unprivileged_peer("control socket", &server_side)
+            .expect("a connection from this very process must be accepted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The defaults must agree with the Go control plane, which resolves the
+    /// same paths when `system dataplane control-socket` is omitted and then
+    /// dials the path IT derived at boot (#1993 armed probe).
+    #[test]
+    fn defaults_are_not_in_a_temp_directory_9003() {
+        for p in [DEFAULT_CONTROL_SOCKET, DEFAULT_STATE_FILE] {
+            assert!(
+                p.starts_with("/run/xpf/"),
+                "default helper path {p} is not under the root-owned runtime directory"
+            );
+            assert!(
+                !p.starts_with(&std::env::temp_dir().to_string_lossy().to_string()),
+                "default helper path {p} is under the temp directory — that is the #9003 defect"
+            );
+        }
     }
 }

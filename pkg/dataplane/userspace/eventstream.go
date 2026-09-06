@@ -242,6 +242,17 @@ func (es *EventStream) Start(ctx context.Context) error {
 		slog.Error("event stream: failed to listen", "path", es.socketPath, "err", err)
 		return fmt.Errorf("event stream listen on %s: %w", es.socketPath, err)
 	}
+	// #9003: 0600 on the bound socket. Before this the mode was
+	// 0777 &^ umask — an inherited value no code, unit file or test asserted, so
+	// a `UMask=0000` in the unit (or any operator-set umask) silently made this
+	// socket connectable by every local user with no signal anywhere. The
+	// accept-side SO_PEERCRED gate below is the authoritative check; this is the
+	// cheap layer that stops an unprivileged process from reaching it at all.
+	if err := os.Chmod(es.socketPath, 0o600); err != nil {
+		_ = ln.Close()
+		slog.Error("event stream: failed to restrict socket mode", "path", es.socketPath, "err", err)
+		return fmt.Errorf("event stream chmod %s: %w", es.socketPath, err)
+	}
 	es.listener = ln
 	es.socketLock = lockFile
 	es.ownsSocket = true
@@ -427,6 +438,18 @@ func (es *EventStream) acceptLoop(ctx context.Context, listener net.Listener) {
 			}
 			slog.Debug("event stream: accept error", "err", err)
 			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		// #9003: prove the peer before letting it DISPLACE the current helper.
+		// The block below closes es.conn and installs this connection as the
+		// event source, so an unprivileged local process that connected here
+		// disconnected the real helper AND became the thing feeding session
+		// events into the control plane. Refuse and keep serving the old
+		// connection.
+		if err := verifyUnixPeerIsPrivileged("event stream socket", es.socketPath, conn); err != nil {
+			slog.Error("event stream: refusing connection from an unprivileged peer",
+				"path", es.socketPath, "err", err)
+			_ = conn.Close()
 			continue
 		}
 		slog.Info("event stream: helper connected")

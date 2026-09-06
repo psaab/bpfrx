@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -59,6 +60,21 @@ const (
 // push loop or the takeover path. The seed path runs async post-start like
 // reinitiateIPsecSAs, so a slow Kea only delays the seed, never the takeover.
 const keaControlTimeout = 5 * time.Second
+
+// maxKeaResponseBytes bounds a single Kea control-socket response (#9003).
+//
+// The exchange was DEADLINE-bounded and byte-UNBOUNDED: keaControlTimeout caps
+// how long the peer may stream, not how much, and over AF_UNIX 5 s at memory
+// bandwidth is GB-scale. The decoded value is retained (lease4-get-all /
+// lease6-get-all return every lease), so this is retention, not transient
+// buffering.
+//
+// 64 MiB is far above a real answer — a lease row is ~200 B of JSON, so this
+// admits ~300k leases, well past what Kea holds on this appliance — while
+// removing the unbounded case. The sizing rule is the same one
+// MaxControlRequestBytes follows: a cap that can reject a legitimate answer is a
+// self-inflicted outage, so bound the pathological case, not the headroom.
+const maxKeaResponseBytes = 64 << 20
 
 // SyncLease is ONE active DHCP-server lease in the cluster-portable form
 // replicated to the peer. It is deliberately a flat, family-tagged record (no
@@ -222,7 +238,7 @@ func keaControl(ctx context.Context, dial keaSocketDialer, socketPath string, cm
 	}
 	// Read the single JSON response. Kea writes one object; decode the first
 	// value from the stream so a kept-open socket does not hang us.
-	dec := json.NewDecoder(conn)
+	dec := json.NewDecoder(io.LimitReader(conn, maxKeaResponseBytes))
 	var resp keaResponse
 	if err := dec.Decode(&resp); err != nil {
 		return nil, fmt.Errorf("decode kea response for %s: %w", cmd.Command, err)

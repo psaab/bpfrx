@@ -2,7 +2,6 @@ package userspace
 
 import (
 	"net"
-	"os"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -14,11 +13,25 @@ import (
 )
 
 func deriveUserspaceConfig(cfg *config.Config) config.UserspaceConfig {
+	// #9003: the defaults live under DefaultRuntimeDir (/run/xpf), NOT under
+	// os.TempDir(). The previous defaults put the control socket — which carries
+	// the WireGuard local private key and every preshared key in cleartext — in
+	// a subdirectory of world-writable /tmp that xpfd creates with
+	// os.MkdirAll(..., 0755), an operation that silently ADOPTS a pre-existing
+	// directory of any owner. A local user who won the race to
+	// `mkdir /tmp/xpf-userspace-dp` therefore owned the directory the root
+	// helper bound inside. /run is root-owned 0755 on every systemd distro, so
+	// the same subdirectory cannot be pre-created there.
+	//
+	// These spellings match the shipped reference configs
+	// (docs/ha-cluster-userspace.conf, docs/ha-cluster-loss.conf), so a
+	// deployment that OMITS the leaves now lands where one that sets them
+	// already lands.
 	out := config.UserspaceConfig{
 		Workers:       1,
 		RingEntries:   1024,
-		ControlSocket: filepath.Join(os.TempDir(), "xpf-userspace-dp", "control.sock"),
-		StateFile:     filepath.Join(os.TempDir(), "xpf-userspace-dp", "state.json"),
+		ControlSocket: DefaultControlSocket,
+		StateFile:     DefaultStateFile,
 	}
 	if cfg != nil && cfg.System.UserspaceDataplane != nil {
 		out = *cfg.System.UserspaceDataplane
@@ -30,7 +43,7 @@ func deriveUserspaceConfig(cfg *config.Config) config.UserspaceConfig {
 		out.RingEntries = 1024
 	}
 	if out.ControlSocket == "" {
-		out.ControlSocket = filepath.Join(os.TempDir(), "xpf-userspace-dp", "control.sock")
+		out.ControlSocket = DefaultControlSocket
 	}
 	if out.StateFile == "" {
 		out.StateFile = filepath.Join(filepath.Dir(out.ControlSocket), "state.json")
