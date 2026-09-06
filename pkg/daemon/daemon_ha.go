@@ -331,6 +331,74 @@ func (d *Daemon) failFailoverActuation(rgID int, reqID uint64, b *failoverActuat
 	}
 }
 
+// #9259: the two remaining routes into #9036's collapse.
+//
+// #9036's chain was: the barrier is gone -> the wait returns nil -> nil means
+// applied. PR #9247 removed ONE way for the barrier to be gone (supersede, now
+// resolved with ErrFailoverSuperseded). The FINAL link — **absence of a barrier
+// is read as proof of fencing** — was untouched, and two more ways reach it:
+//
+//  1. NEVER ARMED: a (rgID, reqID) for which no barrier was ever registered
+//     here — a duplicate or stale failover request, or a retry across a fabric
+//     blip.
+//  2. VERDICT ALREADY CONSUMED: the first waiter deletes the entry after
+//     reading it, deliberately, so a later wait cannot re-read a stale verdict
+//     (#6177). A second wait for the same request then found an empty slot.
+//
+// Both returned nil, and sync_failover.go sends failoverAckApplied EXACTLY when
+// this returns nil. So the peer promoted on no evidence that this node fenced.
+//
+// Both are now errors, so the ack downgrades to `failed` and the peer HOLDS.
+// The trade is deliberate and asymmetric: holding costs a failover attempt,
+// while the previous default cost the one-owner-per-RG property (#5640).
+//
+// SAFE FOR THE NORMAL PATH, checked rather than assumed. handleRemoteFailover
+// calls WaitFailoverApplied only after OnRemoteFailover returned nil, and that
+// handler arms the barrier BEFORE ManualFailover and disarms it only on the
+// error path — where it returns the error and no wait ever runs. On every path
+// that reaches the wait for a live request, a barrier is armed. The supersede
+// path deliberately leaves a FAILED barrier rather than none, so it is
+// unaffected.
+var (
+	// ErrFailoverNeverArmed: no barrier was ever registered for this request.
+	ErrFailoverNeverArmed = errors.New(
+		"no fence barrier was ever armed for this failover request; nothing here " +
+			"demoted anything, so this node cannot confirm it fenced")
+	// ErrFailoverVerdictConsumed: an earlier waiter already took the verdict.
+	ErrFailoverVerdictConsumed = errors.New(
+		"the fence verdict for this failover request was already consumed by an " +
+			"earlier waiter; a second wait has no evidence of its own")
+)
+
+// failoverConsumedCap bounds the consumed-request ledger.
+//
+// The ledger exists ONLY to tell ErrFailoverVerdictConsumed from
+// ErrFailoverNeverArmed. Both are errors and both downgrade the ack
+// identically, so an eviction degrades the DIAGNOSTIC and never the safety
+// property — a key that has fallen out is reported as never-armed, which is
+// the more conservative of the two readings. Stated because a bounded ledger
+// silently changing an operator-facing reason is the kind of thing that gets
+// discovered during an outage.
+const failoverConsumedCap = 1024
+
+// noteFailoverVerdictConsumed records that this request's verdict was taken.
+// The caller holds failoverActuateMu.
+func (d *Daemon) noteFailoverVerdictConsumedLocked(key failoverActuationKey) {
+	if d.failoverActuateConsumed == nil {
+		d.failoverActuateConsumed = make(map[failoverActuationKey]struct{})
+	}
+	if _, dup := d.failoverActuateConsumed[key]; dup {
+		return
+	}
+	if len(d.failoverActuateConsumedOrder) >= failoverConsumedCap {
+		oldest := d.failoverActuateConsumedOrder[0]
+		d.failoverActuateConsumedOrder = d.failoverActuateConsumedOrder[1:]
+		delete(d.failoverActuateConsumed, oldest)
+	}
+	d.failoverActuateConsumed[key] = struct{}{}
+	d.failoverActuateConsumedOrder = append(d.failoverActuateConsumedOrder, key)
+}
+
 // waitFailoverActuated blocks until the local demotion for the (rgID, reqID)
 // transfer-out has been resolved (barrier closed by signalFailoverActuated /
 // -Failed) or the bounded timeout elapses. A nil barrier means the request was
@@ -345,7 +413,18 @@ func (d *Daemon) waitFailoverActuated(rgID int, reqID uint64) error {
 	b := d.failoverActuateWait[key]
 	d.failoverActuateMu.Unlock()
 	if b == nil {
-		return nil
+		// #9259: absence of a barrier is NOT proof of fencing. Distinguish the
+		// two ways to get here so the operator-facing reason is the true one;
+		// both downgrade the ack identically.
+		d.failoverActuateMu.Lock()
+		_, consumed := d.failoverActuateConsumed[key]
+		d.failoverActuateMu.Unlock()
+		if consumed {
+			return fmt.Errorf("redundancy group %d request %d: %w", rgID, reqID,
+				ErrFailoverVerdictConsumed)
+		}
+		return fmt.Errorf("redundancy group %d request %d: %w", rgID, reqID,
+			ErrFailoverNeverArmed)
 	}
 	timeout := d.failoverActuateTimeout
 	if timeout <= 0 {
@@ -361,6 +440,11 @@ func (d *Daemon) waitFailoverActuated(rgID int, reqID uint64) error {
 		err := b.err
 		if d.failoverActuateWait[key] == b {
 			delete(d.failoverActuateWait, key)
+			// #9259: remember that this request's verdict was taken, so a
+			// second wait reports "already consumed" rather than the
+			// indistinguishable "never armed" — and, before this change,
+			// rather than nil.
+			d.noteFailoverVerdictConsumedLocked(key)
 		}
 		d.failoverActuateMu.Unlock()
 		return err
