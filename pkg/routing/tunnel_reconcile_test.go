@@ -1823,3 +1823,71 @@ func TestWireguardVRFUnbindTransientRetried(t *testing.T) {
 		t.Fatalf("claim not cleared after successful retry: %q", got)
 	}
 }
+
+// --- #8996: what ClearTunnels does, and does NOT do, to WireGuard -----
+
+// TestClearTunnelsKeepsWireguardAddresses8996 pins the answer to a question
+// that sat deferred in clearLocked ("whether ClearTunnels should also flush WG
+// addresses") behind a CLOSED tracker.
+//
+// The answer is NO, and it is derivable from the code beside it rather than a
+// matter of taste. WG links are persistent by #1432 S2a precisely because
+// tearing one flaps the device and destroys the live peer/session and the FRR
+// routes over it. Flushing the ADDRESSES would destroy the connected route and
+// the address that live session is using — the same harm S2a exists to prevent,
+// one level down — while leaving the link up to imply it still works.
+//
+// Address hygiene on config REMOVAL is already handled, and by a mechanism that
+// can tell removal from teardown: Apply's #1919 WG-removal diff prunes the
+// addresses of a WG name that disappeared from config while keeping its link.
+// ClearTunnels is not a removal, so it must not borrow that behaviour.
+//
+// WHAT CLEARING DOES COST, stated so it is not rediscovered as a defect:
+// dropping wgConfigured means a WG tunnel removed from config ACROSS a Clear
+// boundary is not in oldWG at the next Apply, so #1919's prune cannot see it.
+// That is the SAME restart-adoption limitation clearLocked's neighbour already
+// documents ("a WG tunnel removed while the daemon was DOWN is not in
+// wgConfigured on the next start"), reached by a second route rather than a new
+// gap: the manager prunes only what it tracked applying.
+//
+// RED means someone taught ClearTunnels to flush WG addresses. Read the
+// paragraph above before changing this cell — the live session is the thing at
+// stake, and it is not visible from inside clearLocked.
+func TestClearTunnelsKeepsWireguardAddresses8996(t *testing.T) {
+	ops := newFakeLinkOps()
+	tm, _ := newReconcileManager(ops)
+	if err := tm.Apply([]*config.TunnelConfig{wgTC("172.16.0.1/30", "fe80::8/64")}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if !ops.hasAddr("wg0", "172.16.0.1/30") {
+		t.Fatal("precondition: configured address not applied")
+	}
+
+	if err := tm.Clear(); err != nil {
+		t.Fatalf("Clear: %v", err)
+	}
+
+	// The link survives — the S2a contract, and the reason the addresses must
+	// survive with it.
+	if len(ops.delNames) != 0 {
+		t.Errorf("#8996: ClearTunnels deleted a persistent WG link: %v. WG links are "+
+			"kept by #1432 S2a; tearing one flaps the device and destroys the live "+
+			"peer/session.", ops.delNames)
+	}
+	if _, err := ops.LinkByName("wg0"); err != nil {
+		t.Errorf("#8996: wg0 gone after ClearTunnels (must be kept): %v", err)
+	}
+	// The addresses survive WITH it. A link that is up but stripped of the
+	// address its live session uses is worse than either flushing both or
+	// keeping both: it looks configured and carries nothing.
+	if !ops.hasAddr("wg0", "172.16.0.1/30") {
+		t.Errorf("#8996: ClearTunnels flushed the WG address. The link is kept by S2a, " +
+			"so flushing its address destroys the connected route and the address the " +
+			"live peer/session is using while leaving the device up. Address hygiene on " +
+			"config REMOVAL is Apply's #1919 diff, which can tell removal from teardown; " +
+			"ClearTunnels cannot.")
+	}
+	if !ops.hasAddr("wg0", "fe80::8/64") {
+		t.Errorf("#8996: ClearTunnels flushed the configured link-local address")
+	}
+}
