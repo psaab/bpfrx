@@ -246,6 +246,45 @@ func longestMatchLen(re *regexp.Regexp, s string) int {
 // Changing it silently would break the deny-with-exceptions idiom this feature
 // exists to support.
 func (c CompiledLoginRegexes) Evaluate(command string) LoginRegexDecision {
+	return c.EvaluateForms(command, command)
+}
+
+// EvaluateForms decides whether a command is permitted, matching each side
+// against BOTH the full canonical string and the argument-free command prefix
+// and taking the LONGER match for that side.
+//
+// #9022: AN ANCHORED DENY WAS DEFEATED BY APPENDING ANY ARGUMENT. With
+// `deny-commands "^show log$"`, every one of these RAN:
+//
+//	show log 100          -> journalctl -u xpfd -n 100
+//	show log messages     -> tails a syslog file
+//	show log FOO extra    -> `extra` silently dropped, tails a syslog file
+//
+// while the bare `show log` was correctly denied. `Canonicalize`'s AcceptsArgs
+// arm (#8304, deliberately) passes trailing tokens through, so the string the
+// rule matched against carried them and `$` no longer matched. Any AcceptsArgs
+// node under an anchored rule was affected, including `show configuration
+// system`, which discloses the whole committed stanza.
+//
+// WHY THE MAX-PER-SIDE SHAPE RATHER THAN "DENY IF EITHER MATCHES". The obvious
+// fix — deny when either form matches a deny pattern — BREAKS the
+// deny-with-exceptions idiom this feature exists to support:
+//
+//	deny-commands  "^show log$"
+//	allow-commands "^show log 100$"
+//	operator types: show log 100
+//
+// "deny if either" denies it, because the prefix `show log` matches the deny.
+// Taking the max per side instead lets the DOCUMENTED longest-match precedence
+// decide: deny matches 8 characters (on the prefix), allow matches 12 (on the
+// full string), tier 2 gives it to allow, and the operator's explicit exception
+// survives. The tiers are unchanged; only the strings each side is measured
+// against widen.
+//
+// The direction is safe by construction: a side's match length can only grow,
+// and growth on the ALLOW side needs a pattern that matches the bare command —
+// which is an allow the operator wrote.
+func (c CompiledLoginRegexes) EvaluateForms(command, prefix string) LoginRegexDecision {
 	// No regexes configured: this class opted out of fine-grained control and
 	// the coarse permission bits are the whole story.
 	if !c.allowSet && !c.denySet {
@@ -253,12 +292,22 @@ func (c CompiledLoginRegexes) Evaluate(command string) LoginRegexDecision {
 			Reason: "no allow/deny regexes configured for this class"}
 	}
 
+	longest := func(re *regexp.Regexp) int {
+		best := longestMatchLen(re, command)
+		if prefix != command {
+			if n := longestMatchLen(re, prefix); n > best {
+				best = n
+			}
+		}
+		return best
+	}
+
 	allowLen, denyLen := -1, -1
 	if c.allowSet {
-		allowLen = longestMatchLen(c.allow, command)
+		allowLen = longest(c.allow)
 	}
 	if c.denySet {
-		denyLen = longestMatchLen(c.deny, command)
+		denyLen = longest(c.deny)
 	}
 
 	// Both matched — the precedence tiers decide.

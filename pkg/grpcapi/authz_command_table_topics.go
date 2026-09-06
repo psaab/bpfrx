@@ -76,6 +76,17 @@ import "github.com/psaab/xpf/pkg/cmdtree"
 // feature is for, and the shape Junos' own examples use — matches identically
 // on both surfaces because matching is partial rather than anchored.
 //
+// #9022 CLOSED THE ANCHORED DIRECTION, which this paragraph had correctly
+// scoped itself away from. An ANCHORED path regex used to disagree between the
+// surfaces, and in the dangerous direction: `^show log$` denied here (these
+// strings carry no arguments) and ALLOWED on the box the moment any argument
+// was appended, so an operator who verified the rule over the remote CLI got
+// the wrong answer about the console. pkg/cli now matches against the
+// argument-free command prefix as well as the full line, so both surfaces
+// agree for an anchored rule too. TestAnchoredDenyAgreesAcrossSurfaces9022
+// asserts the AGREEMENT rather than each side separately. The ARGUMENT-text
+// gap described above is unchanged and still open.
+//
 // Closing it needs a per-topic decoder turning `route-table:secret-vrf` back
 // into `show route table secret-vrf`, i.e. 129 bespoke inverse functions, each
 // one a new place the remote string can disagree with the on-box string. That
