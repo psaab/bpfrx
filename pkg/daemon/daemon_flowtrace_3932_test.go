@@ -98,6 +98,12 @@ func TestFlowTraceSingleCallbackAcrossReconciles(t *testing.T) {
 		t.Fatalf("stale writer w2 received a dispatched event (DroppedWrites %d->%d): callback leaked", before2, got)
 	}
 
+	// #9025: the trace write is now handed to a bounded queue on a dedicated
+	// goroutine, so drain it before reading the file. This does not weaken the
+	// dispatch-once assertion — it still counts LINES, and a second dispatch
+	// would still produce a second line.
+	w3.SyncForTest()
+
 	// The single live writer wrote the event exactly once (dispatch-once).
 	data, err := os.ReadFile(filepath.Join(dir, "trace3.log"))
 	if err != nil {

@@ -24,6 +24,9 @@ type LocalLogWriter struct {
 	// reopen. See locallog_reopen_9118.go.
 	wedge wedgeState9118
 
+	// #9025: bounded queue + writer goroutine for the EVENT-READER path only.
+	async *asyncAuditWriter
+
 	// Filtering (same as SyslogClient)
 	MinSeverity int
 	Categories  uint8
@@ -127,6 +130,9 @@ func NewLocalLogWriter(cfg LocalLogConfig) (*LocalLogWriter, error) {
 	if info, err := f.Stat(); err == nil {
 		lw.written = info.Size()
 	}
+	// #9025: started last, once the handle and size are set, so the writer
+	// goroutine can never observe a half-built writer.
+	lw.async = newAsyncAuditWriter(func(it auditItem) { _ = lw.Send(it.severity, it.line) })
 	return lw, nil
 }
 
@@ -227,7 +233,54 @@ func (lw *LocalLogWriter) ShouldSendEvent(severity int, categoryBit uint8) bool 
 }
 
 // Close closes the log file.
+// SendFromEventReader is the #9025 entry point for the EventStream reader
+// goroutine. It hands the formatted line to a bounded queue and returns
+// immediately; the disk write happens on a dedicated goroutine.
+//
+// WHY A SECOND ENTRY POINT rather than making Send itself async. Send's error
+// REPORTS THE WRITE RESULT, and #3478 M04 made that deliberate ("the error is
+// also returned to the caller"). That contract and "the write does not happen
+// on your goroutine" cannot both hold — an async Send would return nil for a
+// line that later fails, silently voiding a guarantee several callers and cells
+// rely on. So the synchronous contract is left exactly as it was for every
+// caller that can afford to wait, and only the one caller that CANNOT — the
+// event reader, which also carries HA session sync, the ISSU drain signal and
+// full-resync — is moved off it.
+//
+// The returned bool reports whether the line was ACCEPTED. False means it was
+// dropped (queue full or writer retired) and counted, which is the signal
+// #3478 established as the observable one.
+func (lw *LocalLogWriter) SendFromEventReader(severity int, msg string) bool {
+	if lw.async == nil {
+		return lw.Send(severity, msg) == nil
+	}
+	// The line is formatted on the WRITER goroutine (Send does it), so the
+	// reader goroutine pays only the channel send.
+	if !lw.async.enqueue(auditItem{severity: severity, line: msg}) {
+		lw.droppedWrites.Add(1)
+		lw.warnRateLimited(&lw.lastDropWarn,
+			"local security-log write dropped: writer queue full or retired", errFileUnavailable)
+		return false
+	}
+	return true
+}
+
+// SyncForTest blocks until every line queued before the call has reached the
+// file (#9025). Test-only.
+func (lw *LocalLogWriter) SyncForTest() {
+	if lw.async != nil {
+		lw.async.syncForTest()
+	}
+}
+
 func (lw *LocalLogWriter) Close() error {
+	// #9025: drain BEFORE taking mu — the writer goroutine calls Send, which
+	// takes mu, so stopping under the lock would deadlock; and dropping the
+	// queued tail would lose the audit records around whatever caused the
+	// shutdown.
+	if lw.async != nil {
+		lw.async.stop()
+	}
 	lw.mu.Lock()
 	defer lw.mu.Unlock()
 	// #9118: record that this nil handle is DELIBERATE. Send/SendBinary now

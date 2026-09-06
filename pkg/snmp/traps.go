@@ -267,6 +267,23 @@ func sendTrap(target string, pkt []byte) error {
 	}
 	defer conn.Close()
 
+	// #9025: bound the WRITE, not just the dial. A connected-UDP Write can block
+	// indefinitely on a full socket send buffer (ENOBUFS / a congested or down
+	// egress path parks the goroutine in the netpoller until the buffer drains)
+	// — the same fact pkg/flowexport/transport.go records (#4423 H07) and the
+	// same one pkg/logging/syslog.go used to deny.
+	//
+	// It matters more here than the dial timeout does, because the trap worker
+	// is SINGLE AND SERIAL: one backpressured target head-of-line-blocks traps
+	// to every HEALTHY target until the bounded queue fills, and Stop() waits on
+	// trapWG, so an uninterruptible write also delays shutdown. The queue
+	// (#2991) already stops a caller blocking; this stops one dead receiver
+	// monopolising the worker.
+	//
+	// Sized to match the dial timeout above so a single target's worst case
+	// stays symmetric and bounded at 2s per leg. Best-effort: a conn that does
+	// not support deadlines still gets its Write, just unbounded.
+	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	if _, err := conn.Write(pkt); err != nil {
 		return fmt.Errorf("write to %s: %w", addr, err)
 	}

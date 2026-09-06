@@ -16,11 +16,30 @@ import (
 	"github.com/psaab/xpf/pkg/termsafe"
 )
 
-// Resilience defaults for the stream (TCP/TLS) transports. These bound the
-// time the dataplane event hot-path can spend inside a single Send and rate-
-// limit reconnect attempts so a down server cannot drive a fresh 5s-timeout
-// dial on every event. UDP is connectionless and never blocks on Write, so
-// these do not apply to it.
+// Resilience defaults for ALL transports. These bound the time the dataplane
+// event hot-path can spend inside a single Send and rate-limit reconnect
+// attempts so a down server cannot drive a fresh 5s-timeout dial on every
+// event.
+//
+// #9025: this used to end "UDP is connectionless and never blocks on Write, so
+// these do not apply to it." THAT IS FALSE, and it was the proximate cause of
+// the omission — a false rationale re-justifies itself every time someone
+// checks it. This tree already refutes it verbatim, in
+// pkg/flowexport/transport.go (#4423 H07):
+//
+//	A connected-UDP Write is normally instantaneous, but it CAN BLOCK
+//	INDEFINITELY on a full socket send buffer (ENOBUFS / a congested or down
+//	egress path parks the goroutine in the netpoller until the buffer drains).
+//
+// Two modules in one tree held opposite beliefs about the same syscall; one
+// armed a deadline and one did not. UDP is also the DEFAULT protocol here, so
+// the unbounded path was the common one.
+//
+// What blocks is the local socket send buffer, not the network, and the
+// goroutine it parks is the EventStream reader — which also carries HA session
+// sync (EventTypeSessionOpen/Update/Close), the ISSU drain signal
+// (EventTypeDrainComplete) and EventTypeFullResync. Stalling syslog stalls
+// those.
 const (
 	// defaultWriteTimeout caps how long a single conn.Write may block before
 	// it is treated as a write failure (message dropped, reconnect armed).
@@ -638,8 +657,10 @@ func (s *SyslogClient) Send(severity int, msg string) error {
 	}
 
 	if err := s.writeMsg(line); err != nil {
-		// For stream protocols, attempt one cooldown-gated reconnect. UDP
-		// never blocks or needs reconnect, so it just returns the error.
+		// For stream protocols, attempt one cooldown-gated reconnect. UDP has
+		// no connection to re-establish, so it returns the error — but it is
+		// now a BOUNDED error: #9025 armed the same write deadline on the
+		// datagram path, so "UDP never blocks" is not asserted here either.
 		if s.protocol != "udp" {
 			// A write-deadline TIMEOUT was already bounded by the deadline;
 			// do NOT reconnect+retry (that would re-arm another writeTimeout,
@@ -674,6 +695,14 @@ func (s *SyslogClient) Send(severity int, msg string) error {
 			s.clearReconnectCooldown()
 			return nil
 		}
+		// #9025: a UDP deadline expiry is a NEW failure mode, created by arming
+		// the deadline, so counting it changes no pre-existing accounting — and
+		// not counting it would trade a silent stall for a silent drop, which is
+		// worse because it is indistinguishable from success. Other UDP write
+		// errors keep their existing behaviour.
+		if isTimeout(err) {
+			pendingWarn = s.noteDrop(dropWrite, err)
+		}
 		return err
 	}
 	return nil
@@ -688,14 +717,40 @@ func isTimeout(err error) bool {
 	return errors.As(err, &ne) && ne.Timeout()
 }
 
+// datagramWrite writes one UDP datagram under the same bounded write deadline
+// the stream path uses (#9025).
+//
+// A SEPARATE function from streamWrite, not a shared one, because the two
+// differ in exactly the way that matters: PARTIAL WRITES. A stream write can
+// return 0 < n < len(b), leaving a truncated octet-counted frame that
+// permanently desyncs the collector's length parser — hence streamWrite's conn
+// teardown (#3874). A datagram is atomic: the kernel queues all of it or none,
+// so there is no partial frame to recover from and tearing the conn down would
+// lose the socket for no benefit. Sharing one function would have carried the
+// stream's teardown into a path that cannot need it — how a correct-looking
+// generalisation acquires a wrong branch.
+//
+// A deadline expiry surfaces as os.ErrDeadlineExceeded, which satisfies
+// isTimeout, so the Send path counts it as a drop rather than letting it
+// vanish. That is the point: volume backpressure already existed (#3478);
+// LATENCY backpressure did not, and a hung write never returned to be counted.
+func (s *SyslogClient) datagramWrite(b []byte) error {
+	if s.writeTimeout > 0 {
+		// Best-effort, as in streamWrite: a conn that does not support
+		// deadlines still gets its Write, just unbounded.
+		_ = s.conn.SetWriteDeadline(s.now().Add(s.writeTimeout))
+	}
+	_, err := s.conn.Write(b)
+	return err
+}
+
 // writeMsg writes the framed message to the connection. Called with mu held.
 func (s *SyslogClient) writeMsg(line string) error {
 	if s.conn == nil {
 		return fmt.Errorf("syslog connection closed")
 	}
 	if s.protocol == "udp" {
-		_, err := s.conn.Write([]byte(line))
-		return err
+		return s.datagramWrite([]byte(line))
 	}
 	// TCP/TLS: RFC 6587 octet-counting: "<length> <message>"
 	framed := fmt.Sprintf("%d %s", len(line), line)
@@ -801,6 +856,14 @@ func (s *SyslogClient) SendBinary(data []byte) error {
 			s.clearReconnectCooldown()
 			return nil
 		}
+		// #9025: a UDP deadline expiry is a NEW failure mode, created by arming
+		// the deadline, so counting it changes no pre-existing accounting — and
+		// not counting it would trade a silent stall for a silent drop, which is
+		// worse because it is indistinguishable from success. Other UDP write
+		// errors keep their existing behaviour.
+		if isTimeout(err) {
+			pendingWarn = s.noteDrop(dropWrite, err)
+		}
 		return err
 	}
 	return nil
@@ -812,8 +875,7 @@ func (s *SyslogClient) writeBinaryMsg(data []byte) error {
 		return fmt.Errorf("syslog connection closed")
 	}
 	if s.protocol == "udp" {
-		_, err := s.conn.Write(data)
-		return err
+		return s.datagramWrite(data)
 	}
 	return s.streamWrite(data)
 }

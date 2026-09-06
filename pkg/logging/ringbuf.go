@@ -884,8 +884,14 @@ func (er *EventReader) logEvent(data []byte) {
 				}
 				msg = stdMsg
 			}
-			if err := lw.Send(severity, msg); err != nil {
-				slog.Debug("local log write failed", "err", err)
+			// #9025: this is the EVENT READER goroutine, which also carries HA
+			// session sync (EventTypeSessionOpen/Update/Close), the ISSU drain
+			// signal and full-resync. A synchronous WriteString on a raw
+			// *os.File — plus an inline rotate() when the cap trips — parks all
+			// of them under disk distress. Hand off instead; a refusal means the
+			// line was dropped and counted (#3478's observable).
+			if !lw.SendFromEventReader(severity, msg) {
+				slog.Debug("local log write dropped (queue full or writer retired)")
 			}
 		}
 	}

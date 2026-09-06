@@ -191,8 +191,15 @@ See `docs/feature-gaps.md`.
 event hot-path (EventStream reader → `EventReader.ProcessRawEvent` →
 `logEvent` → `SyslogClient.Send`). The event reader runs that path
 inline, so a syslog client must never block or thrash on a bad target.
-Two bounds enforce that for the stream transports (TCP/TLS); UDP is
-connectionless and exempt:
+Two bounds enforce that. **They now apply to UDP as well (#9025)** — this
+sentence used to read "UDP is connectionless and exempt", and that
+exemption was false. A connected-UDP `Write` can block indefinitely on a
+full socket send buffer (ENOBUFS / a congested or down egress path parks
+the goroutine in the netpoller until the buffer drains), which is what
+`pkg/flowexport/transport.go` already recorded (#4423 H07) while this
+module denied it. UDP is also the DEFAULT protocol, so the unbounded
+path was the common one, and the goroutine it parks carries HA session
+sync, the ISSU drain signal and full-resync as well as logging:
 
 - **Per-write deadline.** Every TCP/TLS `conn.Write` is preceded by
   `SetWriteDeadline(now + writeTimeout)` (default
@@ -902,3 +909,49 @@ Bounded heavy-hitter accounting (Space-Saving / Misra-Gries top-K with an
 overflow bucket) would make the top-K accurate independent of arrival
 order under adversarial cardinality. That accuracy refinement is tracked
 as a follow-up and is not required to close the DoS.
+
+
+## Audit-log disk writes are off the event reader (#9025)
+
+`TraceWriter.HandleEvent` and the local-log fan-out did a synchronous
+`WriteString` on a raw `*os.File` — no `bufio` — and called `rotate()`
+inline when the size cap tripped, all from inside ringbuf's synchronous
+callback loop. One `write(2)` per logged event on a SHARED goroutine.
+
+That goroutine is not a logging goroutine. The same EventStream switch
+loop also carries `EventTypeSessionOpen/Update/Close` (**HA session
+sync**), `EventTypeDrainComplete` (the **ISSU drain signal**) and
+`EventTypeFullResync`. Under disk distress — writeback stall,
+dirty-page throttling, a full or hung device — the reader parked and
+those parked with it. The contract was already stated in-tree and named
+this collateral: `pkg/flowexport/routemask.go` (#3743) moved FIB lookups
+off this exact path because they *"stall the event reader and every
+other callback behind it (including the trace writer)"* — and the trace
+writer it named as a victim was itself still blocking.
+
+Both writers now hand the line to a **bounded queue** (`auditQueueDepth`)
+drained by **one dedicated goroutine**, dropping and counting on
+overflow — the shape #3478 established for volume, reused rather than
+reinvented. Dropping is correct and blocking is not: a blocking send on
+a full queue reinstates the stall one buffer later.
+
+Notes that are easy to get wrong:
+
+- **`LocalLogWriter.Send` is unchanged.** Its error REPORTS THE WRITE
+  RESULT and #3478 M04 made that deliberate; that contract and "the
+  write does not happen on your goroutine" cannot both hold. So only the
+  one caller that cannot afford to wait — the event reader — was moved,
+  via `SendFromEventReader`. Every other caller keeps the synchronous
+  guarantee.
+- **A retired writer REFUSES.** After `Close`, an enqueue fails and the
+  loss is counted. Accepting into a channel with no reader would be a
+  silent loss — strictly worse than the pre-#9025 nil-file drop it
+  replaced.
+- **`Close` drains the queued tail** before closing the handle. Those are
+  exactly the audit records around whatever caused the shutdown. It
+  drains *before* taking `mu`, because the writer goroutine takes `mu`
+  itself.
+- **SNMP traps** are bounded on the write too, not just the dial (#9025).
+  The trap worker is single and serial, so one backpressured target
+  head-of-line-blocks traps to every healthy target, and `Stop()` waits
+  on `trapWG`.

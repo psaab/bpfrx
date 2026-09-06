@@ -146,6 +146,10 @@ type TraceWriter struct {
 	// failure classes get SEPARATE ≤1/s warn clocks (lastDropWarn /
 	// lastRotWarn, mu-guarded; HandleEvent/rotate run under mu) so a write-drop
 	// storm cannot suppress the rotation warning, and vice versa.
+	// #9025: the bounded queue + writer goroutine that keeps the disk write
+	// OFF the EventStream reader goroutine.
+	async *asyncAuditWriter
+
 	droppedWrites   atomic.Uint64
 	failedRotations atomic.Uint64
 	lastDropWarn    time.Time
@@ -170,6 +174,15 @@ func (tw *TraceWriter) warnRateLimited(clock *time.Time, msg string, err error) 
 // DroppedWrites reports the number of trace lines lost because the file write
 // failed (#3478). Observability accessor for status/metrics surfaces.
 func (tw *TraceWriter) DroppedWrites() uint64 { return tw.droppedWrites.Load() }
+
+// SyncForTest blocks until every trace line queued before the call has reached
+// the file (#9025). Test-only; production never needs it, because the writer
+// goroutine is always draining and Close waits for it.
+func (tw *TraceWriter) SyncForTest() {
+	if tw.async != nil {
+		tw.async.syncForTest()
+	}
+}
 
 // FailedRotations reports the number of trace-file rotations that could not
 // complete (#3478).
@@ -343,11 +356,22 @@ func NewTraceWriter(opts *config.FlowTraceoptions) (*TraceWriter, error) {
 		tw.written = info.Size()
 	}
 
+	// #9025: start the writer goroutine last, once the handle and size are set,
+	// so it can never observe a half-built writer.
+	tw.async = newAsyncAuditWriter(func(it auditItem) { tw.writeLine(it.line) })
+
 	return tw, nil
 }
 
 // Close closes the trace file.
 func (tw *TraceWriter) Close() {
+	// #9025: drain the queue BEFORE taking mu. The writer goroutine takes mu
+	// itself, so stopping under the lock would deadlock — and dropping the
+	// queued tail would lose exactly the audit records around whatever caused
+	// the shutdown.
+	if tw.async != nil {
+		tw.async.stop()
+	}
 	tw.mu.Lock()
 	defer tw.mu.Unlock()
 	// #9118: mark the nil handle DELIBERATE, so WriteRecord's reopen cannot
@@ -374,6 +398,24 @@ func (tw *TraceWriter) HandleEvent(rec EventRecord, raw []byte) {
 	// Format trace line
 	line := tw.formatTrace(rec)
 
+	// #9025: HAND OFF, do not write. This runs on the EventStream reader
+	// goroutine, which also carries HA session sync, the ISSU drain signal and
+	// full-resync — a synchronous WriteString on a raw *os.File (plus an inline
+	// rotate() when the cap trips) parks all of them under disk distress. A FULL
+	// queue drops and counts into the same DroppedWrites signal #3478
+	// established; blocking here would put the stall back one buffer later.
+	if tw.async != nil {
+		if !tw.async.enqueue(auditItem{line: line}) {
+			tw.droppedWrites.Add(1)
+		}
+		return
+	}
+	tw.writeLine(line)
+}
+
+// writeLine performs the disk write and any rotation. It runs on the async
+// writer's goroutine (#9025), never on the event reader.
+func (tw *TraceWriter) writeLine(line string) {
 	tw.mu.Lock()
 	defer tw.mu.Unlock()
 
