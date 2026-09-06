@@ -225,9 +225,32 @@ func runRollingWith(r *Runner, cl RollingCluster, rc RollingConfig) error {
 				"(force-secondary not undone, peer takeover unproven); operator attention "+
 				"needed: %w", rc.DrainDeadline, errors.Join(err, resetErr))
 		}
+		// #9038: a nil ResetFailover is an ACKNOWLEDGEMENT, not an observation.
+		// The reset clears ManualFailover and re-runs the election; whether this
+		// node reclaims the RG depends on the peer's position, so with a healthy
+		// peer legitimately holding it the reset returns nil and the node stays
+		// SECONDARY. Measured on the real cluster.Manager: peer alive, peer
+		// owning the RG at the stronger position -> ResetFailover()==nil and
+		// IsLocalPrimary()==false. Claiming "node still forwarding" there tells
+		// the operator the opposite of the truth, and RejoinAndConfirm in this
+		// same package already says a nil reset is not that proof.
+		//
+		// Read it back with the SAME predicate the rejoin path trusts, once and
+		// without polling: this is an abort, and adding a deadline here would
+		// make a failing path slower and able to hang.
+		rejoined, rerr := cl.LocalRejoinComplete()
+		if rerr != nil || !rejoined {
+			return fmt.Errorf("rolling: strong drain predicate not satisfied within %s "+
+				"(peer-primary / local-VRRP-backup / rg_active-false / sync-clean); "+
+				"failback was ACKNOWLEDGED but this node has NOT resumed ownership of "+
+				"every redundancy group (local-rejoined=%v readback-error=%v) — it is "+
+				"NOT forwarding for at least one RG and operator attention is needed: %w",
+				rc.DrainDeadline, rejoined, rerr, err)
+		}
 		return fmt.Errorf("rolling: strong drain predicate not satisfied within %s "+
 			"(peer-primary / local-VRRP-backup / rg_active-false / sync-clean); "+
-			"aborted WITHOUT cutting (node still forwarding): %w", rc.DrainDeadline, err)
+			"aborted WITHOUT cutting (node still forwarding, CONFIRMED by per-RG "+
+			"readback): %w", rc.DrainDeadline, err)
 	}
 	logf("rolling: drain complete (peer owns RGs, local backup, rg_active=false, sync clean)")
 

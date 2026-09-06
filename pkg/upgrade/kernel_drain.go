@@ -109,10 +109,22 @@ func DrainAndConfirm(cl RollingCluster, deadline time.Duration, allowMixedHA boo
 					"failed (%v) — node may be stranded demoted; operator attention needed "+
 					"(drain error: %v)", deadline, rbErr, derr)
 			}
-			if derr != nil {
-				return fmt.Errorf("drain did not complete within %s (failed back; last error: %w)", deadline, derr)
+			// #9038: "failed back" here was an acknowledgement, not an
+			// observation — same defect as the rolling abort branch, same fix.
+			// A nil ResetFailover re-runs the election; with a healthy peer
+			// holding the RG the node stays SECONDARY and the reset still
+			// returns nil.
+			rejoined, rerr := cl.LocalRejoinComplete()
+			if rerr != nil || !rejoined {
+				return fmt.Errorf("drain did not complete within %s AND the failback was "+
+					"ACKNOWLEDGED but this node has NOT resumed ownership of every "+
+					"redundancy group (local-rejoined=%v readback-error=%v) — operator "+
+					"attention needed (drain error: %v)", deadline, rejoined, rerr, derr)
 			}
-			return fmt.Errorf("drain did not complete within %s (peer did not take over / sync not clean; failed back)", deadline)
+			if derr != nil {
+				return fmt.Errorf("drain did not complete within %s (failed back, CONFIRMED; last error: %w)", deadline, derr)
+			}
+			return fmt.Errorf("drain did not complete within %s (peer did not take over / sync not clean; failed back, CONFIRMED)", deadline)
 		}
 		sleepBounded(dl, drainPollInterval)
 	}
