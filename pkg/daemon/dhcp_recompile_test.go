@@ -22,7 +22,7 @@ func TestDHCPLeaseChangeRequiresRecompile_ManagementOnlyDHCP(t *testing.T) {
 		},
 	}
 
-	if d.dhcpLeaseChangeRequiresRecompile(cfg) {
+	if d.dhcpLeaseChangeRequiresRecompile(cfg, false) {
 		t.Fatal("management-only DHCP lease refresh should not require dataplane recompile")
 	}
 }
@@ -43,7 +43,7 @@ func TestDHCPLeaseChangeRequiresRecompile_NonManagementDHCP(t *testing.T) {
 		},
 	}
 
-	if !d.dhcpLeaseChangeRequiresRecompile(cfg) {
+	if !d.dhcpLeaseChangeRequiresRecompile(cfg, false) {
 		t.Fatal("dataplane-facing DHCP lease refresh should require dataplane recompile")
 	}
 }
@@ -63,7 +63,7 @@ func TestDHCPLeaseChangeRequiresRecompile_RequiresMgmtMap(t *testing.T) {
 		},
 	}
 
-	if !d.dhcpLeaseChangeRequiresRecompile(cfg) {
+	if !d.dhcpLeaseChangeRequiresRecompile(cfg, false) {
 		t.Fatal("missing management VRF map should keep recompile path conservative")
 	}
 }
@@ -95,7 +95,7 @@ func TestDHCPLeaseChangeRequiresRecompile_ZonedNonLifelineFxp1(t *testing.T) {
 		},
 	}
 
-	if !d.dhcpLeaseChangeRequiresRecompile(cfg) {
+	if !d.dhcpLeaseChangeRequiresRecompile(cfg, false) {
 		t.Fatal("zoned non-lifeline fxp1 DHCP lease change must require the full " +
 			"recompile so its address-scoped host-inbound fence is (re)built")
 	}
@@ -124,7 +124,7 @@ func TestDHCPLeaseChangeRequiresRecompile_LifelineFastPathPreserved(t *testing.T
 				},
 			}
 
-			if d.dhcpLeaseChangeRequiresRecompile(cfg) {
+			if d.dhcpLeaseChangeRequiresRecompile(cfg, false) {
 				t.Fatalf("lifeline %s DHCP lease refresh should keep the "+
 					"management-only fast path (no recompile churn)", ifName)
 			}
@@ -159,7 +159,7 @@ func TestDHCPLeaseChangeRequiresRecompile_ClusterControlFxp1(t *testing.T) {
 		},
 	}
 
-	if d.dhcpLeaseChangeRequiresRecompile(cfg) {
+	if d.dhcpLeaseChangeRequiresRecompile(cfg, false) {
 		t.Fatal("fxp1 configured as cluster control-interface is a lifeline and " +
 			"should retain the management-only fast path")
 	}
@@ -185,7 +185,7 @@ func TestDHCPLeaseChangeRequiresRecompile_ZonedDataInterfaceUnchanged(t *testing
 		},
 	}
 
-	if !d.dhcpLeaseChangeRequiresRecompile(cfg) {
+	if !d.dhcpLeaseChangeRequiresRecompile(cfg, false) {
 		t.Fatal("zoned data-interface DHCP lease change must require the full recompile")
 	}
 }

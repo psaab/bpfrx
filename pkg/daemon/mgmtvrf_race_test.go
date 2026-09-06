@@ -31,7 +31,7 @@ func TestMgmtVRFIfaceSetPrePublish(t *testing.T) {
 			},
 		},
 	}
-	if !d.dhcpLeaseChangeRequiresRecompile(cfg) {
+	if !d.dhcpLeaseChangeRequiresRecompile(cfg, false) {
 		t.Fatal("pre-publish classification should stay conservative (recompile)")
 	}
 }
@@ -83,7 +83,7 @@ func TestMgmtVRFInterfacesConcurrentPublish(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < iters; i++ {
-				_ = d.dhcpLeaseChangeRequiresRecompile(cfg)
+				_ = d.dhcpLeaseChangeRequiresRecompile(cfg, false)
 				_ = len(d.mgmtVRFIfaceSet())
 			}
 		}()
