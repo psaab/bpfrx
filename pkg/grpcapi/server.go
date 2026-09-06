@@ -1072,6 +1072,13 @@ func (s *Server) FabricListenerHealth() map[string]bool {
 // PermissionDenied — so Commit, Delete, Rollback, and the whole config-mode
 // surface are unreachable on the network-exposed fabric IP.
 //
+// ShowText is deliberately absent for the SAME reason (#9059): it multiplexes
+// ~127 topics behind one method, so a method-name allowlist that included it
+// would admit `route-all`, `security-log`, `commit-history`, the `nat-*-detail`
+// topics and the `test-policy:` policy simulator — while the only topic either
+// peer-proxy call site ever sends is "chassis-forwarding". It is gated
+// separately, by request-topic, in isFabricSafeShowText.
+//
 // SystemAction is deliberately absent: it multiplexes fabric-safe cross-node
 // cluster-failover with destructive node actions (zeroize/reboot/halt/
 // power-off) under ONE gRPC method, so a method-name allowlist that included it
@@ -1082,7 +1089,6 @@ var fabricAllowedUnaryMethods = map[string]bool{
 	pb.BpfrxService_GetSessions_FullMethodName:        true,
 	pb.BpfrxService_GetSessionSummary_FullMethodName:  true,
 	pb.BpfrxService_GetZonePairSummary_FullMethodName: true,
-	pb.BpfrxService_ShowText_FullMethodName:           true,
 	pb.BpfrxService_ClearSessions_FullMethodName:      true,
 }
 
@@ -1170,15 +1176,21 @@ func isFabricSafeSystemAction(req interface{}) bool {
 
 // fabricAllowlistUnaryInterceptor fail-closes unary RPCs on the cluster fabric
 // listener (#4122): only the peer-proxied read/monitor RPCs
-// (fabricAllowedUnaryMethods) plus the two cross-node cluster-failover
-// SystemAction forms (isFabricSafeSystemAction) are served; every other method
-// is rejected with PermissionDenied before the handler runs. The loopback
+// (fabricAllowedUnaryMethods), the two cross-node cluster-failover SystemAction
+// forms (isFabricSafeSystemAction) and the proxied ShowText topic
+// (isFabricSafeShowText, #9059) are served; every other method is rejected with
+// PermissionDenied before the handler runs. The loopback
 // listener does NOT install this interceptor and keeps the full service.
 func (s *Server) fabricAllowlistUnaryInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 	if fabricAllowedUnaryMethods[info.FullMethod] {
 		return handler(ctx, req)
 	}
 	if info.FullMethod == pb.BpfrxService_SystemAction_FullMethodName && isFabricSafeSystemAction(req) {
+		return handler(ctx, req)
+	}
+	// #9059: same shape as the line above — a multiplexing method admitted by
+	// request content rather than by name.
+	if info.FullMethod == pb.BpfrxService_ShowText_FullMethodName && isFabricSafeShowText(req) {
 		return handler(ctx, req)
 	}
 	// #9042: network-exposed and attacker-paced. Keyed on the METHOD, which is
