@@ -523,6 +523,32 @@ func isRoutingInstanceKeyword8787(tok string) bool {
 	return false
 }
 
+// routingInstanceKeywordOwnsBody9055 reports whether a routing-instance
+// keyword is followed by a BRACED BODY rather than by a value.
+//
+// #9055: the distinction matters only for the brace-elided spelling. A
+// value-bearing keyword (`instance-type vrf`) packs its value onto the same
+// Keys run and is read by the loop above; a body-bearing one puts its body in
+// the node's Children, where the property loop mistakes it for the instance's
+// own properties.
+//
+// Derived from `isRoutingInstanceKeyword8787` rather than restated: a keyword
+// that is not admitted at all cannot reach here, and this answers only the
+// second question about the ones that are. `vrf-target`,
+// `route-distinguisher` and `vrf-table-label` are admitted, take values, and
+// currently compile to no field at all -- accepted-but-inert, with no
+// braced/elided divergence to fix and none introduced here.
+func routingInstanceKeywordOwnsBody9055(tok string) bool {
+	if !isRoutingInstanceKeyword8787(tok) {
+		return false
+	}
+	switch tok {
+	case "routing-options", "protocols":
+		return true
+	}
+	return false
+}
+
 func compileRoutingInstances(node *Node, cfg *Config) error {
 	// Assign each routing-instance a STABLE kernel routing table id derived from
 	// its NAME (#3855), never a positional counter. Positional assignment
@@ -594,7 +620,41 @@ func compileRoutingInstances(node *Node, cfg *Config) error {
 			}
 		}
 
-		for _, prop := range child.Children {
+		// #9055: an elided BODY-BEARING keyword puts its NAME on the Keys tail
+		// and its BODY in Children, so the property loop below sees the body's
+		// contents instead of the keyword.
+		//
+		//	braced   [ri1] > [routing-options] > [static] > [route ...]
+		//	elided   [ri1 routing-options] > [static] > [route ...]
+		//
+		// Measured before this fix, through configstore.CheckText -- the commit
+		// gate, not CompileConfig -- both spellings ACCEPTED with no error and
+		// no warning:
+		//
+		//	routing-options   braced static=1   elided static=0
+		//	protocols         braced ospf=true  elided ospf=false, ifs=[ge-0/0/1.0]
+		//
+		// The protocols row is NOT a plain drop, it is KEYWORD THEFT: the OSPF
+		// area's interface token fell through to the `interface` case above and
+		// was bound as a VRF member. One accepted statement produced two wrong
+		// outcomes -- OSPF vanished AND an interface silently changed routing
+		// table, which is an isolation change rather than only a routing one.
+		//
+		// Re-dispatch through the SAME readers rather than adding a second set:
+		// the keyword list drifted once already (#8787 stopped this switch at
+		// three of the eight its own admission helper names), and two
+		// implementations of one keyword is how it drifts again.
+		props := child.Children
+		if n := len(child.Keys); n >= 2 && routingInstanceKeywordOwnsBody9055(child.Keys[n-1]) {
+			props = []*Node{{
+				Keys:     []string{child.Keys[n-1]},
+				Children: child.Children,
+				Line:     child.Line,
+				Column:   child.Column,
+			}}
+		}
+
+		for _, prop := range props {
 			switch prop.Name() {
 			case "description":
 				ri.Description = nodeVal(prop)
