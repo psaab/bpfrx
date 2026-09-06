@@ -689,6 +689,31 @@ client never reconnects once the receiver returns.
   `TestLocalLogWriter_NilFileDropObservable`,
   `TestLocalLogWriter_TightensExistingMode`,
   `TestLocalLogWriter_HardenedOpen`.
+- **A wedged writer now RECOVERS, not just reports (#9118).** #3478 above made
+  the wedge observable and deliberately stopped there. The gap that left: a
+  failed reopen inside `rotate()` leaves `file == nil`, and `rotate()` is
+  reached only from `written >= maxSize` — which needs a *successful* write. So
+  once wedged, the only reopen in the file could never run again, and one
+  transient `openat` failure (EMFILE / ENFILE / ENOSPC / EROFS / EACCES) at a
+  rotation boundary silenced `security log mode event` and `traceoptions` until
+  the next config commit or a daemon restart. On an unattended appliance in
+  steady state that is unbounded, and it is the exact channel an operator uses
+  to reconstruct an incident.
+
+  Both writers now attempt a reopen on the write path itself, rate-limited to
+  one attempt per `reopenBackoff9118` (1 s) so a durable failure such as ENOSPC
+  cannot turn every dropped line into an `openat`. Recoveries are counted and
+  exported by `RecoveredWrites()`, because "never broke" and "broke and healed"
+  are indistinguishable if only the drop counter moves.
+
+  `Close()` on both writers now records that the nil handle is **deliberate**.
+  It has to: `Close()` also nils the handle, so without that flag the recovery
+  path could not tell a wedge from a retirement and would recreate an audit file
+  after shutdown — or resurrect a writer the daemon has just replaced on the
+  `ReplaceLocalWriters` path. The byte count is re-synced from `Stat()` on
+  reopen, since a wedge that began mid-rotation leaves `written` describing a
+  file that was already renamed aside.
+
 - **Flow-trace uses ONE stable EventReader callback, writer swapped in place
   (#3932).** The daemon registers a single indirection callback
   (`Daemon.flowTraceCallback`, `pkg/daemon/daemon_flow.go`) on the
