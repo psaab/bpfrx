@@ -61,6 +61,13 @@ var declaredUnsanitizedForks = []forkExemption{
 	{"../ipsec", "manager.go", "runSwanctl",
 		"generic swanctl runner; its SA-listing caller sanitizes at ingest " +
 			"(sanitizeSAStatus) and its error path escapes the captured output"},
+	{"../ipsec", "manager.go", "runSwanctlSplit",
+		"#9068 stdout-only swanctl runner for the one call whose output is " +
+			"PARSED. Same exposure as runSwanctl above and for the same reasons: " +
+			"GetSAStatus sanitizes its rows at ingest (sanitizeSAStatus), and both " +
+			"callers escape stderr into their error path " +
+			"(termsafe.SanitizeForDisplay). Splitting the streams changed WHICH " +
+			"buffer the parser reads, not whether raw output reaches a terminal"},
 
 	// ---- STREAMING sites ----
 	//
