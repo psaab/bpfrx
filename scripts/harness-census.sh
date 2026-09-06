@@ -417,15 +417,66 @@ for f in $harnesses; do
 done
 
 if [ -n "$undeclared" ]; then
-	note_fail "UNREACHED and undeclared -- invoked by no Makefile recipe, and not declared in $UNREACHED_FILE:"
-	for f in $undeclared; do echo "          $f" >&2; done
-	{
-		echo "        Remedy, pick one:"
-		echo "          - add a Makefile recipe that runs it (then it is a gate someone can run), or"
-		echo "          - add a line to $UNREACHED_FILE: '<path>  <one-line reason>'"
-		echo "        A mention in a comment, a similarly-named target, a 'bash -n' lint,"
-		echo "        or a bare relative path in a lint list does NOT count as an invocation."
-	} >&2
+	# #9006: split the UNTRACKED case out, because the two need OPPOSITE
+	# remedies and the generic text sends the untracked case to the wrong one.
+	#
+	# The census scans the FILESYSTEM, which is correct -- a harness you have
+	# added and not yet committed is exactly what it should catch. But an
+	# uncommitted scratch script in test/incus/ then fails a shared gate for
+	# your checkout only, under a message asserting "a harness was added or a
+	# recipe removed", which points at recent commits. Worse, one of the two
+	# printed remedies is actively wrong for it: adding an untracked path to
+	# $UNREACHED_FILE trips the separate check that FAILS a declaration naming
+	# a path not in the tree, so following the instructions produces a second,
+	# different failure.
+	#
+	# HERMETICITY. This file's contract is "a pure file scan ... it either
+	# scans the tree or fails to start", and that is preserved exactly: git is
+	# used ONLY to refine the remedy TEXT, never the verdict, never the exit
+	# status, and never whether the scan runs. With no git on PATH -- which is
+	# the case in the selftest's restricted-PATH leg, where PATH holds only
+	# sh grep sed cut sort awk wc -- every path falls through to the original
+	# message and the census behaves bit-identically to before this change.
+	untracked=""
+	tracked=""
+	if command -v git >/dev/null 2>&1 && git rev-parse --git-dir >/dev/null 2>&1; then
+		for f in $undeclared; do
+			if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then
+				tracked="$tracked $f"
+			else
+				untracked="$untracked $f"
+			fi
+		done
+	else
+		tracked="$undeclared"
+	fi
+
+	if [ -n "$untracked" ]; then
+		note_fail "UNTRACKED harness -- present in your working tree but NOT in git:"
+		for f in $untracked; do echo "          $f" >&2; done
+		{
+			echo "        The census scans the working tree, so an uncommitted harness fails it"
+			echo "        for your checkout only. Someone else at this same commit sees a clean"
+			echo "        census, which is why this is reported separately."
+			echo "        Remedy, pick one:"
+			echo "          - \`git add\` it and then register it (recipe or declaration), or"
+			echo "          - remove it from your working tree."
+			echo "        Do NOT add it to $UNREACHED_FILE: that list may only name COMMITTED"
+			echo "        paths, and a declaration for a path not in the tree is itself a FAIL."
+		} >&2
+	fi
+
+	if [ -n "$tracked" ]; then
+		note_fail "UNREACHED and undeclared -- invoked by no Makefile recipe, and not declared in $UNREACHED_FILE:"
+		for f in $tracked; do echo "          $f" >&2; done
+		{
+			echo "        Remedy, pick one:"
+			echo "          - add a Makefile recipe that runs it (then it is a gate someone can run), or"
+			echo "          - add a line to $UNREACHED_FILE: '<path>  <one-line reason>'"
+			echo "        A mention in a comment, a similarly-named target, a 'bash -n' lint,"
+			echo "        or a bare relative path in a lint list does NOT count as an invocation."
+		} >&2
+	fi
 fi
 
 echo ""

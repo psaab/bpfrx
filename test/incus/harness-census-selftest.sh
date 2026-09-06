@@ -477,6 +477,58 @@ else
 	printf '%s\n' "$out" | sed 's/^/         /' >&2
 fi
 
+# ── #9006: the UNTRACKED branch, asserted in BOTH directions ──────────────
+#
+# The census scans the working tree, so an uncommitted harness fails it for one
+# checkout only -- under a message asserting "a harness was added or a recipe
+# removed", which points at recent commits, and offering a remedy (declare it
+# in HARNESSES.unreached) that trips the separate stale-declaration FAIL. Two
+# cells, because one direction alone does not bound it: the untracked case must
+# produce the UNTRACKED text and NOT the generic text, and the tracked case
+# must produce the generic text and NOT the UNTRACKED text. A branch that fired
+# for both would look correct against either cell alone.
+#
+# GIT-GATED, NOT GIT-DEPENDENT. This file's contract is hermetic, and a hard
+# git dependency is exactly what broke it once before (a `mktemp` added to the
+# census died in the restricted-PATH leg). With no git these cells SKIP and the
+# suite is unchanged; the census itself already falls back to the generic text
+# in that case, which the existing cells cover.
+if command -v git >/dev/null 2>&1; then
+	FX_UT="$(new_fixture untracked-harness)"
+	printf '#!/bin/sh\necho probe\n' >"$FX_UT/test/incus/scratch-probe.sh"
+	chmod +x "$FX_UT/test/incus/scratch-probe.sh"
+	(
+		cd "$FX_UT" || exit 1
+		git init -q . >/dev/null 2>&1
+		git config user.email selftest@example.invalid
+		git config user.name selftest
+		git add -A ':!test/incus/scratch-probe.sh' >/dev/null 2>&1
+		git commit -qm fixture >/dev/null 2>&1
+	)
+
+	out="$(run_census "$FX_UT")" && rc=0 || rc=$?
+	if [[ $rc -ne 0 && "$out" == *"UNTRACKED harness"* && "$out" != *"UNREACHED and undeclared"* ]]; then
+		ok "an UNTRACKED harness reports the untracked remedy, not the commit-hunting one"
+	else
+		bad "the untracked case did not take the #9006 branch (rc=$rc)"
+		printf '%s\n' "$out" | sed 's/^/         /' >&2
+	fi
+
+	# The OTHER direction. Same file, now committed: it must fall back to the
+	# generic text. Without this the branch could fire for every undeclared
+	# harness and the cell above would still pass.
+	( cd "$FX_UT" && git add -A >/dev/null 2>&1 && git commit -qm track >/dev/null 2>&1 )
+	out="$(run_census "$FX_UT")" && rc=0 || rc=$?
+	if [[ $rc -ne 0 && "$out" == *"UNREACHED and undeclared"* && "$out" != *"UNTRACKED harness"* ]]; then
+		ok "a TRACKED undeclared harness still reports the original remedy"
+	else
+		bad "the tracked case took the wrong branch (rc=$rc)"
+		printf '%s\n' "$out" | sed 's/^/         /' >&2
+	fi
+else
+	echo "  skip — #9006 untracked-branch cells (git not on PATH; census falls back)"
+fi
+
 # ── summary ───────────────────────────────────────────────────────────────
 echo ""
 echo "harness-census-selftest: passed=$PASS failed=$FAIL"
