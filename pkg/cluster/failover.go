@@ -21,6 +21,7 @@
 package cluster
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -57,6 +58,19 @@ const (
 	// change. NOT an error — the reset is the operator's newer intent.
 	FailoverSuperseded
 )
+
+// ErrFailoverSuperseded is the verdict a superseded remote transfer-out
+// resolves its fence barrier with (#9036).
+//
+// It is a FAILURE for ack purposes even though nothing went wrong. #5640
+// requires an applied-ack to mean "this node is fenced"; a supersede means it
+// never demoted at all, which is the one condition an applied-ack must never
+// be sent for. The distinction #8000 removed from the wire — by dropping the
+// barrier, which makes the wait return nil, which is indistinguishable from a
+// real fence — is restored by resolving the barrier with THIS instead of
+// deleting it, so the operator still gets the true reason rather than #8000's
+// misleading fence timeout.
+var ErrFailoverSuperseded = errors.New("failover superseded by concurrent reset; no transfer performed")
 
 func (o FailoverOutcome) String() string {
 	if o == FailoverSuperseded {

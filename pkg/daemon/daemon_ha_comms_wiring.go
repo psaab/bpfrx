@@ -346,7 +346,12 @@ func (d *Daemon) wireSessionSyncFailoverCallbacks(ss *cluster.SessionSync) {
 		// armed), so the correct outcome stops being reported as an
 		// infrastructure fault.
 		if outcome == cluster.FailoverSuperseded {
-			d.disarmFailoverActuation(rgID, reqID, barrier)
+			// #9036: FAIL the barrier rather than disarming it. Disarming makes
+			// waitFailoverActuated return nil, which the ack path cannot tell
+			// from a real fence -- so a request that demoted NOTHING was ACKed
+			// `applied` and the peer promoted into a two-owner window, which is
+			// exactly #5640's invariant.
+			d.failFailoverActuation(rgID, reqID, barrier, cluster.ErrFailoverSuperseded)
 			slog.Info("cluster: remote failover superseded by reset; no transfer performed",
 				"rg", rgID, "req_id", reqID)
 		}
@@ -385,7 +390,9 @@ func (d *Daemon) wireSessionSyncFailoverCallbacks(ss *cluster.SessionSync) {
 		// so the operator was told the wrong thing twice, in two different
 		// directions, about the same request.
 		for _, rgID := range res.Superseded {
-			d.disarmFailoverActuation(rgID, reqID, barriers[rgID])
+			// #9036: same reasoning as the singular path. A superseded MEMBER
+			// must not contribute an applied-ack for the batch.
+			d.failFailoverActuation(rgID, reqID, barriers[rgID], cluster.ErrFailoverSuperseded)
 		}
 		if res.Partial() {
 			slog.Warn("cluster: remote batch failover partially applied; members superseded by reset",

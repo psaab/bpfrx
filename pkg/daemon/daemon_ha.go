@@ -297,6 +297,40 @@ func (d *Daemon) resolveFailoverActuation(rgID int, cause error) {
 	}
 }
 
+// failFailoverActuation resolves ONE request's barrier with a failure verdict
+// and LEAVES IT IN THE MAP for waitFailoverActuated to consume (#9036).
+//
+// It is the supersede path's replacement for disarmFailoverActuation. Both
+// stop the misleading fence timeout #8000 was fixing; only this one keeps the
+// distinction between "fenced" and "never happened" on the wire, because
+// disarming makes waitFailoverActuated take its `b == nil` arm and return nil,
+// which the ack path cannot tell from a real fence.
+//
+// Per-REQUEST, not per-RG, and that is the difference from
+// resolveFailoverActuation. A demotion EVENT answers a question every in-flight
+// request for the RG is asking, so its verdict fans out. A supersede is a fact
+// about ONE request's generation check; failing a sibling request's barrier
+// with it would discard the identity discipline #6177 exists to enforce.
+//
+// cause must be non-nil — a nil cause is indistinguishable from success, which
+// is the defect this function exists to prevent.
+func (d *Daemon) failFailoverActuation(rgID int, reqID uint64, b *failoverActuation, cause error) {
+	if b == nil || cause == nil {
+		return
+	}
+	key := failoverActuationKey{rgID: rgID, reqID: reqID}
+	d.failoverActuateMu.Lock()
+	fire := d.failoverActuateWait[key] == b && !b.resolved
+	if fire {
+		b.resolved = true
+		b.err = cause
+	}
+	d.failoverActuateMu.Unlock()
+	if fire {
+		close(b.done)
+	}
+}
+
 // waitFailoverActuated blocks until the local demotion for the (rgID, reqID)
 // transfer-out has been resolved (barrier closed by signalFailoverActuated /
 // -Failed) or the bounded timeout elapses. A nil barrier means the request was
