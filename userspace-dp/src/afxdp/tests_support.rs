@@ -331,6 +331,17 @@ pub(super) fn build_icmp_te_frame_v4(
         embedded.extend_from_slice(&snat_port.to_be_bytes());
         embedded.extend_from_slice(&server_port.to_be_bytes());
         embedded.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // seq/other
+    } else if embedded_proto == PROTO_GRE {
+        // #9031: a real quoted GRE header, so the embedded parser has a
+        // discriminator to read. `snat_port` is reused as the RFC 2890 Key —
+        // GRE has no ports, so that argument slot is free and this keeps the
+        // builder's signature unchanged for every existing caller.
+        //
+        // K bit set (0x2000), version 0, protocol type 0x0800 (IPv4 payload),
+        // then the 4-byte Key, then payload to reach the 28-byte RFC 792
+        // minimum quote the embedded parser requires.
+        embedded.extend_from_slice(&[0x20, 0x00, 0x08, 0x00]);
+        embedded.extend_from_slice(&(snat_port as u32).to_be_bytes());
     } else if embedded_proto == PROTO_ICMP {
         embedded.extend_from_slice(&[8, 0, 0x00, 0x00]); // echo request, checksum
         embedded.extend_from_slice(&snat_port.to_be_bytes()); // echo ID

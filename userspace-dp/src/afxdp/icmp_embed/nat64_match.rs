@@ -47,6 +47,7 @@
 
 use super::parse::{embedded_reply_key, parse_embedded_v4, parse_embedded_v6};
 use super::*;
+use crate::session::TunnelDiscriminator;
 
 /// Outcome of [`try_nat64_icmp_error_match`]: the matched session plus
 /// every datum the poll-side builder needs to translate and forward the
@@ -149,6 +150,12 @@ fn match_v4_error(
         IpAddr::V4(hdr.dst),
         hdr.src_port,
         hdr.dst_port,
+        // #9031: NAT64 translates the protocol across address families, so a
+        // quoted GRE header on one side does not name a tunnel identity the
+        // session on the other side carries. None is the CORRECT value here and
+        // not an omission -- the constructors #9031 names are the same-family
+        // ones. Stated so the next reader does not "fix" it into a mismatch.
+        TunnelDiscriminator::None,
     );
     let resolved = lookup_session_across_scopes(
         ctx.sessions,
@@ -213,6 +220,12 @@ fn match_v6_error(
         hdr.dst,
         hdr.src_port,
         hdr.dst_port,
+        // #9031: NAT64 translates the protocol across address families, so a
+        // quoted GRE header on one side does not name a tunnel identity the
+        // session on the other side carries. None is the CORRECT value here and
+        // not an omission -- the constructors #9031 names are the same-family
+        // ones. Stated so the next reader does not "fix" it into a mismatch.
+        TunnelDiscriminator::None,
     );
     let resolved = lookup_session_across_scopes(
         ctx.sessions,

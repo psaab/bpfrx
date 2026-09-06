@@ -40,7 +40,10 @@ pub(in crate::afxdp::icmp_embed) fn match_outer_v4(
         dst_ip: emb_dst,
         src_port: hdr.src_port,
         dst_port: hdr.dst_port,
-        discriminator: Default::default(),
+        // #9031: the QUOTED tunnel's discriminator, not None. SessionKey's
+        // Hash/Eq include it (#7188), so a hard-coded None made every
+        // exact index probe for a GRE quote MISS.
+        discriminator: hdr.discriminator,
         routing_domain: embedded_routing_domain,
     };
     let reverse_key = embedded_reply_key(
@@ -50,6 +53,7 @@ pub(in crate::afxdp::icmp_embed) fn match_outer_v4(
         emb_dst,
         hdr.src_port,
         hdr.dst_port,
+        hdr.discriminator,
     );
 
     // Forward-NAT-by-reverse path: the embedded packet matches the
