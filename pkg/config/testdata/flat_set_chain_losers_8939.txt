@@ -1,5 +1,5 @@
-# counts: losers=40 walked=64 vacuous=44 unmeasured=73
-# collector reach: 363 containers walked, 133 reached the census (134 dropped: no eligible leaf, 96 dropped: only one)
+# counts: losers=36 walked=67 vacuous=44 unmeasured=73
+# collector reach: 364 containers walked, 133 reached the census (135 dropped: no eligible leaf, 96 dropped: only one)
 class-of-service traffic-control-profiles arg1  [delay-buffer-rate | guaranteed-rate | scheduler-map]  total  OPERATOR
 class-of-service traffic-control-profiles arg1  [delay-buffer-rate | guaranteed-rate]  total  lenient-only
 firewall policer arg1 if-exceeding  [bandwidth-limit | burst-size-limit]  total  lenient-only
@@ -7,11 +7,7 @@ forwarding-options dhcp-relay group arg1 overrides  [always-broadcast | forward-
 forwarding-options dhcp-relay group arg1 overrides  [always-broadcast | forward-only]  total  OPERATOR
 forwarding-options sampling instance arg1 family inet output  [inline-jflow | source-address]  differs  OPERATOR
 forwarding-options sampling instance arg1 family inet6 output  [inline-jflow | source-address]  differs  OPERATOR
-protocols bgp  [cluster-id | graceful-restart | local-as]  total  OPERATOR
-protocols bgp  [cluster-id | graceful-restart]  total  OPERATOR
 protocols bgp multipath  [ibgp | multiple-as]  total  OPERATOR
-protocols router-advertisement interface arg1  [default-lifetime | link-mtu | managed-configuration]  total  OPERATOR
-protocols router-advertisement interface arg1  [default-lifetime | link-mtu]  total  lenient-only
 protocols router-advertisement interface arg1 prefix arg1  [autonomous | no-autonomous | no-onlink]  total  lenient-only
 protocols router-advertisement interface arg1 prefix arg1  [autonomous | no-autonomous]  total  lenient-only
 routing-options generate route arg1  [discard | policy]  total  OPERATOR

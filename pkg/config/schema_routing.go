@@ -475,7 +475,27 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 		}},
 	}},
 	"rip": {desc: "RIP configuration", children: map[string]*schemaNode{
-		"group": {desc: "Group", args: 1, placeholder: "<group-name>", children: nil},
+		// #9151: `group` is a CONTAINER to the compiler and was a LEAF here.
+		// compiler_protocols.go's `case "group"` iterates child.Children and
+		// reads `neighbor` (-> RIP.Interfaces) and `export` (-> Redistribute),
+		// but this node declared `children: nil`, so the closed-world walk had
+		// nothing to descend into and nothing to reject. The consequence was
+		// operator-reachable: `set protocols rip group g1 authentication-key
+		// secret1` committed clean and lost BOTH the group content and the
+		// sibling authentication-key -- a RIP auth key, in the subsystem where
+		// a dropped authentication-type renders `mode text` (#9105).
+		//
+		// Both children are multi-value: the compiler reads them through
+		// firewallMatchValues, which takes Keys[1:] AND child nodes, so a
+		// bracket list `export [ a b ]` is not truncated to its first entry
+		// (#3904). Declaring them `multi: true` keeps the schema's account of
+		// the leaf and the compiler's read of it in agreement.
+		"group": {desc: "Group", args: 1, placeholder: "<group-name>", children: map[string]*schemaNode{
+			"neighbor": {desc: "Neighbor interface in this group", args: 1, multi: true,
+				valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: nil},
+			"export": {desc: "Protocols redistributed into this group", args: 1, multi: true,
+				placeholder: "<protocol>", children: nil},
+		}},
 		// multi (#3904): `neighbor`/`passive-interface`/`redistribute
 		// [ a b ]` bracket lists collapse onto the leaf's Keys[1:] instead
 		// of stranding every entry past the first as a child node. The

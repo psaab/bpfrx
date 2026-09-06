@@ -265,7 +265,14 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 	if bgpNode != nil {
 		proto.BGP = &BGPConfig{}
 
-		for _, child := range bgpNode.Children {
+		// #8939, and the consequence here is not a lost setting -- it is the
+		// whole protocol. `set protocols bgp graceful-restart cluster-id
+		// 1.1.1.1 local-as 65001` nests each leaf under the previous one, so
+		// this loop saw only the flag and LocalAS stayed 0. pkg/frr gates the
+		// ENTIRE stanza on it (`if bgp != nil && bgp.LocalAS > 0`), so FRR
+		// receives NO `router bgp` block at all: no sessions, no routes, and
+		// `show configuration` renders exactly what the operator typed.
+		for _, child := range expandFlatRun(bgpNode.Children, bgpLeafSchema8939()) {
 			switch child.Name() {
 			case "local-as":
 				if len(child.Keys) >= 2 {
@@ -1021,7 +1028,17 @@ func compileRouterAdvertisement(node *Node, proto *ProtocolsConfig) error {
 			}
 		}
 
-		for _, prop := range inst.node.Children {
+		// #8939: `set … interface ge-0/0/0 managed-configuration
+		// default-lifetime 0` nests each leaf under the previous one, so this
+		// loop saw only the flag. That RE-CREATES #4119 BY A DIFFERENT ROUTE:
+		// DefaultLifetimeSet stays false, and pkg/ra/sender.go falls back to
+		// defaultRouterLifetime (1800) -- so an EXPLICIT `default-lifetime 0`,
+		// which RFC 4861 6.2.1 defines as "this router is NOT a default
+		// router", is advertised as 1800 and the router hijacks host
+		// default-route selection on a multi-router LAN. #4119 fixed the
+		// `lifetime <= 0` coercion in the sender; the flat spelling reaches the
+		// identical outcome by never setting the flag at all.
+		for _, prop := range expandFlatRun(inst.node.Children, raInterfaceSchema8939()) {
 			switch prop.Name() {
 			case "managed-configuration":
 				ra.ManagedConfig = true
