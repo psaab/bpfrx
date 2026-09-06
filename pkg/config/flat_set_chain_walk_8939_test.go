@@ -80,8 +80,21 @@ func flatSetSyntheticValue(name string) string {
 
 // flatSetChainPairs enumerates (container, leafA, leafB) triples: two leaves
 // under one container that take a value and declare no children of their own.
-func flatSetChainPairs() [][]string {
-	var out [][]string
+// flatSetChainRow is a container path plus the leaves to synthesize under it.
+// It is a STRUCT rather than a flat []string because recovering the leaf count
+// from a flat row required re-querying the schema, and that guess was wrong as
+// soon as rows could be either two or three leaves wide: it split the instance
+// placeholder `arg1` off as a leaf, producing rows like
+// `security ike gateway [arg1 | address | external-interface]` whose synthesized
+// config is nonsense. A fix to those containers then could not clear them.
+// The count is data; it should not be re-derived.
+type flatSetChainRow struct {
+	container []string
+	leaves    []string
+}
+
+func flatSetChainPairs() []flatSetChainRow {
+	var out []flatSetChainRow
 	seen := map[string]bool{}
 	var walk func(path []string, n *schemaNode, depth int)
 	walk = func(path []string, n *schemaNode, depth int) {
@@ -98,16 +111,29 @@ func flatSetChainPairs() [][]string {
 		if len(leaves) >= 2 {
 			if key := strings.Join(path, " "); !seen[key] {
 				seen[key] = true
-				// THREE leaves where the container declares three -- see the
-				// THE THIRD LEAF note in this file's header. Two is not enough
-				// to discriminate the correct fix from a recursive descent.
-				n := 3
-				if len(leaves) < 3 {
-					n = 2
+				// BOTH WIDTHS, and the reason is a measured coverage loss.
+				//
+				// Two leaves cannot discriminate the correct fix from a
+				// recursive descent (a descent passes at two and drops the
+				// third), so #9078 widened this to three. But widening MOVED
+				// containers out of the measured population: `security ike
+				// gateway` and `security ipsec gateway` were two-leaf losers,
+				// and at three leaves they fall into the unmeasured/vacuous
+				// buckets -- so a real fix to both changed the loser list by
+				// exactly nothing. Verified by taking that fix onto this
+				// ratchet: the fixture came back byte-identical, 34 before and
+				// 34 after, while `vacuous` moved 42->44.
+				//
+				// So neither width alone is the instrument. Two leaves has the
+				// coverage; three leaves has the discrimination. Emitting both
+				// keeps each container's total-loss row AND, where a third
+				// eligible leaf exists, the row that a descent-shaped fix
+				// cannot clear.
+				cp := append([]string{}, path...)
+				out = append(out, flatSetChainRow{cp, append([]string{}, leaves[:2]...)})
+				if len(leaves) >= 3 {
+					out = append(out, flatSetChainRow{cp, append([]string{}, leaves[:3]...)})
 				}
-				row := append([]string{}, path...)
-				row = append(row, leaves[:n]...)
-				out = append(out, row)
 			}
 		}
 		var keys []string
@@ -197,11 +223,7 @@ func TestFlatSetChainWalkRatchet8939(t *testing.T) {
 	var losers []string
 	var walked, vacuous, unmeasured int
 	for _, p := range flatSetChainPairs() {
-		nLeaf := 2
-		if len(p) >= 3 && flatSetLeafCount(p) == 3 {
-			nLeaf = 3
-		}
-		cont, leaves := p[:len(p)-nLeaf], p[len(p)-nLeaf:]
+		cont, leaves := p.container, p.leaves
 		base := "set " + strings.Join(cont, " ")
 
 		packedLine := base
@@ -371,54 +393,4 @@ func flatSetDiff(want, got string) string {
 		fmt.Fprintf(&b, "  - no longer losing (fixed):  %s\n", l)
 	}
 	return b.String()
-}
-
-// flatSetLeafCount reports how many trailing entries of a row are leaves. The
-// row is <container path...> <leaf>... and container segments never collide
-// with the leaf names appended after them, so counting from the end is exact:
-// the generator appends either 2 or 3.
-func flatSetLeafCount(row []string) int {
-	// The generator appends 3 when the container declared 3 eligible leaves.
-	// Recover it by asking the schema again rather than storing a parallel
-	// count that could drift from the row it describes.
-	for n := 3; n >= 2; n-- {
-		if len(row) <= n {
-			continue
-		}
-		cont := row[:len(row)-n]
-		if flatSetContainerLeafCount(cont) >= n {
-			return n
-		}
-	}
-	return 2
-}
-
-// flatSetContainerLeafCount counts eligible leaves declared by the container at
-// the given token path, walking the same way flatSetChainPairs does.
-func flatSetContainerLeafCount(path []string) int {
-	n := setSchema
-	for _, seg := range path {
-		if n == nil || n.children == nil {
-			return 0
-		}
-		c := n.children[seg]
-		if c == nil {
-			if n.wildcard != nil {
-				c = n.wildcard
-			} else {
-				return 0
-			}
-		}
-		n = c
-	}
-	if n == nil || n.children == nil {
-		return 0
-	}
-	cnt := 0
-	for _, c := range n.children {
-		if c != nil && c.children == nil && c.wildcard == nil && !c.multi {
-			cnt++
-		}
-	}
-	return cnt
 }
