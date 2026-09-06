@@ -74,9 +74,17 @@ var fabricSecretConfig = []string{
 	"set security ipsec vpn site-a pre-shared-key FAB6532-IPSEC-VPN-PSK",
 	"set protocols ospf area 0.0.0.0 interface ge-0-0-1 authentication md5 1 key FAB6532-OSPF-MD5KEY",
 	"set protocols ospf area 0.0.0.0 interface ge-0-0-9 authentication simple-password FAB6532-OSPF-SIMPLE",
+	// #9105: each key needs an explicit `authentication-type`. An absent type
+	// is now refused at commit because it is indistinguishable at the render
+	// site from a chosen PLAINTEXT one, and this fixture's whole subject is
+	// that these secrets must not be rendered — so `md5` is the spelling that
+	// matches its intent.
 	"set protocols rip authentication-key FAB6532-RIP-AUTHKEY",
+	"set protocols rip authentication-type md5",
 	"set protocols isis authentication-key FAB6532-ISIS-AREA-AUTHKEY",
+	"set protocols isis authentication-type md5",
 	"set protocols isis interface ge-0-0-2 authentication-key FAB6532-ISIS-IFACE-AUTHKEY",
+	"set protocols isis interface ge-0-0-2 authentication-type md5",
 	"set protocols bgp group external authentication-key FAB6532-BGP-AUTHPW",
 	"set system services web-management api-auth user admin password FAB6532-API-USER-PW",
 	"set system services web-management api-auth api-key FAB6532-API-KEY-TOKEN",

@@ -210,8 +210,8 @@ type Store struct {
 	// started (Codex review on PR #1817). Every arm/confirm bumps the
 	// generation; the callback carries the value at arm time and
 	// performAutoRollback rejects mismatches.
-	confirmGen      uint64
-	confirmTimer    *time.Timer
+	confirmGen   uint64
+	confirmTimer *time.Timer
 	// confirmArmDegraded records that the ARM write (confirm.json) failed, so
 	// the pending auto-rollback would not survive a crash (#9014). It was the
 	// ONE confirm-durability leg with no health state: the write logged a
@@ -229,8 +229,8 @@ type Store struct {
 	confirmArmDegraded bool
 	confirmArmRec      *confirmRecord
 	confirmArmGen      uint64
-	confirmPrevTree *config.ConfigTree // active tree before confirmed commit
-	confirmPrevCfg  *config.Config     // compiled config before confirmed commit
+	confirmPrevTree    *config.ConfigTree // active tree before confirmed commit
+	confirmPrevCfg     *config.Config     // compiled config before confirmed commit
 	// confirmPrevFirst records whether confirmPrevTree is the EMPTY BOOTSTRAP
 	// TREE — i.e. the pending commit-confirmed was the first commit on a fresh
 	// store, so its rollback must re-enter never-committed state (#1922 Item

@@ -86,8 +86,20 @@ func shapeDigest8892(t *testing.T) (string, int) {
 // defect the field was added to fix. That is the "is what it enforced before
 // acceptable?" question answering no, so the exact-equality gate must REFUSE
 // the pairing rather than let it degrade silently.
+// v10 STANDS (issue 9125): `StaticRoute.HasPreference` was added to the typed
+// config, which moved this digest because ConfigSnapshot embeds the whole
+// Config. It is tagged `json:"-"`, so it is NOT serialized and no helper --
+// old or new -- can observe it. This is the "explain why the change is
+// invisible to a helper" arm the header offers, not a version bump: bumping for
+// a field nothing transmits would spend the one signal that tells a helper the
+// wire actually changed.
+//
+// The digest still moved because this walk records the json TAG, deliberately:
+// adding `json:"-"` to an EXISTING wire field would be a silent removal, and
+// the cell has to see that. So a tag change costs a golden update and a
+// sentence, which is the intended price.
 const (
-	snapshotShapeGolden8892  = "952c3f04216e800c73f8e20468e6574104b4072e51f3c175a2de720671ab26fa"
+	snapshotShapeGolden8892  = "d1b287475df6be8b9a749b5292335d3269fe9e272f639017586908c5d1e1f752"
 	snapshotShapeVersion8892 = 10
 )
 
