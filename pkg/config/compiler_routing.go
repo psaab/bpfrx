@@ -319,6 +319,7 @@ func compileStaticRoutes(staticNode *Node, existing []*StaticRoute) []*StaticRou
 						i++
 						if n, err := strconv.Atoi(routeInst.node.Keys[i]); err == nil {
 							route.Preference = n
+							route.HasPreference = true
 						}
 					}
 				}
@@ -388,6 +389,7 @@ func compileStaticRoutes(staticNode *Node, existing []*StaticRoute) []*StaticRou
 				if v := nodeVal(prop); v != "" {
 					if n, err := strconv.Atoi(v); err == nil {
 						route.Preference = n
+						route.HasPreference = true
 					}
 				}
 			case "qualified-next-hop":
@@ -452,8 +454,14 @@ func compileStaticRoutes(staticNode *Node, existing []*StaticRoute) []*StaticRou
 			if route.Reject {
 				existingRoute.Reject = true
 			}
-			if route.Preference != 5 {
+			// #9125: HasPreference, not `!= 5`. The old test could not tell an
+			// operator who wrote `preference 5` from one who wrote nothing,
+			// because 5 is also the compiler's own default -- so an explicit 5
+			// in a later block was silently dropped while any other value
+			// applied.
+			if route.HasPreference {
 				existingRoute.Preference = route.Preference
+				existingRoute.HasPreference = true
 			}
 			if route.NextTable != "" {
 				existingRoute.NextTable = route.NextTable

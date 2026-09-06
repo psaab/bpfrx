@@ -293,8 +293,24 @@ type StaticRoute struct {
 	// Null0/blackhole, a silent drop). Both suppress a next-hop; Reject and
 	// Discard are mutually exclusive per route (Junos allows only one action).
 	Reject     bool
-	Preference int    // route preference (admin distance), default 5
-	NextTable  string // routing instance name for inter-VRF route leaking (e.g. "Comcast.inet.0" → "Comcast")
+	Preference int // route preference (admin distance), default 5
+	// HasPreference distinguishes an explicitly configured preference --
+	// INCLUDING one equal to the default 5 -- from an absent one (#9125).
+	//
+	// Without it the merge of two hierarchical `route <p> { }` blocks tested
+	// `route.Preference != 5` to decide whether the later block said anything,
+	// so an operator who wrote `preference 5` was indistinguishable from one
+	// who wrote nothing and their statement was silently dropped:
+	//
+	//	route 10.0.0.0/8 { next-hop 192.0.2.1; preference 10; }
+	//	route 10.0.0.0/8 { preference 5; }        -> compiled Preference = 10
+	//
+	// while `preference 7` in the same position compiled to 7. NextHopEntry
+	// already carries HasPreference and HasMetric for exactly this reason; this
+	// is the same bit at the route level, and the sibling's existence is why
+	// the omission was invisible -- the pattern was in the file, one type over.
+	HasPreference bool
+	NextTable     string // routing instance name for inter-VRF route leaking (e.g. "Comcast.inet.0" → "Comcast")
 	// NextTableRaw preserves the operator's original next-table token
 	// (e.g. "Comcast.inet.0") before parseNextTableInstance strips the
 	// family/index suffix. The commit-time definedness gate
