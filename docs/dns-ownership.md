@@ -15,7 +15,9 @@ startup, and on every DHCP address change it:
    - static `system name-server` (authoritative, listed first),
    - then DHCPv4-learned servers,
    - then DHCPv6-learned servers,
-   - de-duplicated, DHCP augments static (never overrides).
+   - de-duplicated, DHCP augments static (never overrides),
+   - **excluding any lease learned on an interface that belongs to a
+     routing instance** (#9138 — see "Routing-instance scoping" below).
 2. Renders `/etc/resolv.conf` (resolv.conf(5) format) with one
    `nameserver` line per server and a single `search` line combining
    `system domain-name` (first) with `system domain-search`.
@@ -36,6 +38,54 @@ startup, and on every DHCP address change it:
 
 The reconciler runs under the daemon's `applySem` (apply serialization
 lock), so it never races a concurrent commit or a DHCP-driven reconcile.
+
+### Routing-instance scoping (#9138)
+
+A DHCP lease learned on an interface that belongs to a **routing instance**
+does not contribute nameservers. Before #9138 `mergeDNSInput` walked every
+lease the manager held with no interface, zone, VRF or trust filter — and
+this section, together with the module header it documents, described the
+merge policy in detail while mentioning no scoping at all, so the dimension
+was **unconsidered, not rejected**.
+
+**Why.** `/etc/resolv.conf` is the whole resolver for this host (resolved is
+masked) and the host resolves from the **default** routing context. A
+nameserver reachable only inside a tenant VRF is therefore a **dead entry**:
+glibc consults `nameserver` lines in order, so every lookup that reaches it
+burns a full resolver timeout before falling through. That is the certain
+cost.
+
+The reason it is a filter and not a footnote is the other one. DHCP is the
+only path by which a network the firewall does not trust writes into the
+firewall's own **host** configuration, and putting an interface in a routing
+instance is the operator declaring that network separate. What the host
+resolves is bounded but not nothing: NTP peers, syslog and
+archival-transfer destinations, DDNS update servers, and the IPsec
+`dynamic-hostname` family hint.
+
+**What is NOT excluded**, and why the distinction matters:
+
+- **The default context.** A DHCP client on a WAN link in the default
+  instance still contributes. That is the supported CPE deployment and
+  matches Junos, where DHCP-learned DNS is global. The exposure on such a
+  link is inherent to running a DHCP client there; a routing instance is not
+  what creates it, and dropping this would break every standalone box.
+- **The management interfaces.** `fxp0`/`em*`/`fab*` live in the
+  **synthesized** management VRF, which is *not* a routing instance. The
+  predicate is routing-instance membership, so bootstrap DNS is untouched. A
+  naive "exclude anything in a VRF" rule would take it with them.
+- **Static `system name-server`.** Always authoritative, never filtered — and
+  it is the escape hatch. An operator who leaks an instance's routes into the
+  default table and genuinely wants that resolver names it statically.
+
+**Shared authority.** The filter reads `dhcpLeaseRoutingInstances`
+(`pkg/daemon/daemon_flow.go`), the same map `collectDHCPRoutes` uses to tag a
+DHCP-learned route with its instance. They are the same question about the
+same objects, so answering it once is what stops the two lease consumers
+drifting — and it makes this filter inherit the #9135 lease-key-shape rule
+rather than re-derive it. A filter keyed on the raw config token would be
+**inert for the canonical Junos slash spelling**, exactly as the #8963 remedy
+was.
 
 ### Input-validation render belt (#4902, #5010)
 

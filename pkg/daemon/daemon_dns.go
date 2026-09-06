@@ -72,6 +72,15 @@ type dnsReconciler struct {
 	disableMaskResolved func() error
 }
 
+// newDNSReconcilerFn is the constructor reconcileDNSLocked uses. It is a
+// package var only so a test can point that path at a tempdir and read the
+// file the reconcile ACTUALLY writes (#9138). Without it the last edge —
+// reconcileDNSLocked handing dnsInputLocked's result to the reconciler —
+// could be severed with the Go suite green: the merge policy is covered
+// against mergeDNSInput, the filesystem behaviour against a hand-built
+// dnsReconciler (#6792), and nothing joined the two.
+var newDNSReconcilerFn = newDNSReconciler
+
 func newDNSReconciler() *dnsReconciler {
 	return &dnsReconciler{
 		resolvConfPath:       resolvConfPath,
@@ -85,6 +94,42 @@ func newDNSReconciler() *dnsReconciler {
 // DHCP leases the manager currently holds. Precedence: static
 // `system name-server` first, then DHCPv4, then DHCPv6, de-duplicated
 // (static is authoritative; DHCP augments, never overrides).
+//
+// ROUTING-INSTANCE SCOPING (#9138). A lease learned on an interface that
+// belongs to a routing instance does NOT contribute. /etc/resolv.conf is the
+// whole resolver for this host (systemd-resolved is masked) and the host
+// resolves from the DEFAULT routing context, so a nameserver reachable only
+// inside a tenant VRF is a DEAD entry there: every lookup that reaches it
+// burns a full resolver timeout before falling through. That is the certain
+// cost. The reason the dimension is worth a filter rather than a note is the
+// other one: DHCP is the only path by which a network the firewall does not
+// trust writes into the firewall's own host configuration, and a routing
+// instance is the operator saying that network is separate. What the host
+// resolves is bounded but not nothing — NTP peers, syslog and
+// archival-transfer destinations, DDNS update servers, and the IPsec
+// dynamic-hostname family hint.
+//
+// The filter derives from dhcpLeaseRoutingInstances (daemon_flow.go), the
+// SAME authority collectDHCPRoutes uses to tag a route with its instance, so
+// the two lease consumers cannot answer the same question differently — and
+// so this one inherits the #9135 key-shape rule instead of re-deriving it
+// (a filter keyed on the raw config token would be inert for the canonical
+// Junos slash spelling, exactly as the #8963 remedy was).
+//
+// Two things this deliberately does NOT do:
+//
+//   - It does not exclude "anything in a VRF". fxp0 and the other management
+//     interfaces live in the synthesized mgmt VRF, which is NOT a routing
+//     instance; excluding by VRF membership would take bootstrap DNS with it.
+//     The predicate is routing-instance membership, and mgmt interfaces are
+//     absent from that map unless an operator explicitly puts them there.
+//   - It does not touch the default context. A DHCP client on a WAN link in
+//     the default instance still contributes, which is the supported CPE
+//     deployment and matches Junos, where DHCP-learned DNS is global.
+//
+// An operator who leaks the instance's routes into the default table and
+// genuinely wants that resolver names it with `system name-server`, which is
+// listed first and is already documented as authoritative.
 //
 // Lease lifecycle note: dhcp.Leases() reflects the manager's held leases.
 // A lease is dropped (and thus stops contributing DNS) when its client is
@@ -144,9 +189,19 @@ func mergeDNSInput(cfg *config.Config, leases []*dhcp.Lease) system.ResolvedDrop
 	sort.Slice(sorted, func(i, j int) bool {
 		return sorted[i].Interface < sorted[j].Interface
 	})
+	// #9138: the routing instance each lease's interface belongs to, from the
+	// shared authority (see the ROUTING-INSTANCE SCOPING note above).
+	leaseInstance := dhcpLeaseRoutingInstances(cfg)
 	for _, fam := range []dhcp.AddressFamily{dhcp.AFInet, dhcp.AFInet6} {
 		for _, l := range sorted {
 			if l.Family != fam {
+				continue
+			}
+			if ri := leaseInstance[l.Interface]; ri != "" {
+				slog.Debug("DNS: skipping DHCP-learned nameservers from a "+
+					"routing-instance interface (unreachable from the default "+
+					"resolver context)",
+					"interface", l.Interface, "instance", ri, "count", len(l.DNS))
 				continue
 			}
 			for _, ip := range l.DNS {
@@ -376,12 +431,25 @@ func (d *Daemon) reconcileDNSLocked(cfg *config.Config, bootEmptyRepairOnly bool
 	if d.reconcileDNSFn != nil {
 		return d.reconcileDNSFn(cfg, bootEmptyRepairOnly)
 	}
+	return newDNSReconcilerFn().reconcile(d.dnsInputLocked(cfg), bootEmptyRepairOnly)
+}
+
+// dnsInputLocked joins the committed config with the DHCP manager's CURRENT
+// lease set and merges them into the renderer input. Same locking contract as
+// its only caller, reconcileDNSLocked.
+//
+// Split out (#9138) because the join was unobservable: severing the
+// `d.dhcp.Leases()` read killed no test in this package, so DHCP-learned DNS
+// could stop reaching /etc/resolv.conf entirely with the Go suite green. The
+// merge policy itself is covered against mergeDNSInput, and the filesystem
+// side against a dnsReconciler with tempdir paths (#6792); this is the seam
+// between them, and it is the one that had no cell.
+func (d *Daemon) dnsInputLocked(cfg *config.Config) system.ResolvedDropinInput {
 	var leases []*dhcp.Lease
 	if d.dhcp != nil {
 		leases = d.dhcp.Leases()
 	}
-	in := mergeDNSInput(cfg, leases)
-	return newDNSReconciler().reconcile(in, bootEmptyRepairOnly)
+	return mergeDNSInput(cfg, leases)
 }
 
 // reconcileDNSFromDHCP is the DHCP-callback entry point. It acquires

@@ -130,17 +130,23 @@ func dhcpLeaseKeysForMember(cfg *config.Config, member string) []string {
 	return []string{config.DHCPLeaseIfName(base, unit)}
 }
 
-// dhcpRouteVRFMap maps a lease's interface name to the routing instance that
-// owns it, "" for the default context (#8963).
+// dhcpLeaseRoutingInstances maps a lease's interface name to the routing
+// instance that owns it, "" for the default context (#8963).
+//
+// This is the SINGLE authority for "which routing instance did this lease come
+// from", shared by every lease consumer that has to answer it — the FRR route
+// tagger (collectDHCPRoutes) and the resolver merge (mergeDNSInput, #9138).
+// They are the same question about the same objects, and answering it twice
+// invites the two to drift; a filter derived independently would also have to
+// re-learn the #9135 key-shape rule below.
 //
 // Keyed on the KERNEL/lease interface name. #9135: the instance member list is
 // stored in whatever spelling the operator authored (canonically Junos slashes),
 // while the lease is keyed in the kernel spelling, so each member is inserted
 // under every spelling a lease can actually present — see
 // dhcpLeaseKeysForMember for why that set is what it is.
-func (d *Daemon) dhcpRouteVRFMap() map[string]string {
+func dhcpLeaseRoutingInstances(cfg *config.Config) map[string]string {
 	out := map[string]string{}
-	cfg := d.store.ActiveConfig()
 	if cfg == nil {
 		return out
 	}
@@ -155,6 +161,11 @@ func (d *Daemon) dhcpRouteVRFMap() map[string]string {
 		}
 	}
 	return out
+}
+
+// dhcpRouteVRFMap is dhcpLeaseRoutingInstances over the ACTIVE config.
+func (d *Daemon) dhcpRouteVRFMap() map[string]string {
+	return dhcpLeaseRoutingInstances(d.store.ActiveConfig())
 }
 
 // collectDHCPRoutes builds FRR DHCPRoute entries from active DHCP leases.
