@@ -57,8 +57,19 @@ func compileIKE(node *Node, sec *SecurityConfig) error {
 					prop.DHGroup = n
 				}
 			case "lifetime-seconds":
-				if n, err := strconv.Atoi(v); err == nil {
+				// #9008: RECORD a value that is not a usable positive
+				// integer instead of dropping it on the floor. Atoi
+				// failure leaves the field at 0 (indistinguishable from
+				// "not configured") and a NEGATIVE parses cleanly and
+				// would otherwise be stored and rendered, so neither case
+				// is recoverable downstream from the int alone. The floor
+				// mirrors the schema's ValidateIntegerMin(1) on this leaf
+				// so the tolerant path warns exactly where the strict
+				// commit gate rejects.
+				if n, err := strconv.Atoi(v); err == nil && n >= 1 {
 					prop.LifetimeSeconds = n
+				} else if v != "" {
+					prop.LifetimeSecondsInvalidSpec = v
 				}
 			}
 		}
@@ -328,8 +339,19 @@ func compileIPsec(node *Node, sec *SecurityConfig) error {
 					prop.DHGroup = n
 				}
 			case "lifetime-seconds":
-				if n, err := strconv.Atoi(v); err == nil {
+				// #9008: RECORD a value that is not a usable positive
+				// integer instead of dropping it on the floor. Atoi
+				// failure leaves the field at 0 (indistinguishable from
+				// "not configured") and a NEGATIVE parses cleanly and
+				// would otherwise be stored and rendered, so neither case
+				// is recoverable downstream from the int alone. The floor
+				// mirrors the schema's ValidateIntegerMin(1) on this leaf
+				// so the tolerant path warns exactly where the strict
+				// commit gate rejects.
+				if n, err := strconv.Atoi(v); err == nil && n >= 1 {
 					prop.LifetimeSeconds = n
+				} else if v != "" {
+					prop.LifetimeSecondsInvalidSpec = v
 				}
 			case "lifetime-kilobytes":
 				// #4313: captured for the closed-world leaf-completeness of
