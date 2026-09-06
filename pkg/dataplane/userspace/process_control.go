@@ -189,7 +189,16 @@ func (m *Manager) requestDetailedLocked(req ControlRequest) (ControlResponse, er
 	// #9003: byte-bounded, not merely deadline-bounded. Over AF_UNIX a 3 s
 	// deadline still admits GB-scale allocation at memory bandwidth, and
 	// ControlResponse retains four unbounded slice fields.
-	if err := json.NewDecoder(bufio.NewReader(boundedResponseReader(conn))).Decode(&resp); err != nil {
+	bounded := boundedResponseReader(conn)
+	if err := json.NewDecoder(bufio.NewReader(bounded)).Decode(&resp); err != nil {
+		// #9322: the cap is checked FIRST. A truncated body reaches
+		// json.Decoder as io.ErrUnexpectedEOF, byte-identical to a helper that
+		// died mid-write, so without this the #1961 sentence below claims the
+		// helper rejected a request it actually ANSWERED — and sends the
+		// operator to a helper log with nothing in it.
+		if bounded.truncated {
+			return ControlResponse{}, responseCapError(req.Type, err)
+		}
 		// A bare EOF here means the helper closed the socket without writing a
 		// response — it rejected the request before replying (e.g. a request
 		// that failed to decode, like the #1961 wire-type mismatch). Surface an
@@ -298,7 +307,19 @@ func (m *Manager) requestSessionSyncLocked(req ControlRequest) error {
 	}
 	var resp ControlResponse
 	// #9003: byte-bounded as well as deadline-bounded — see requestDetailedLocked.
-	if err := json.NewDecoder(bufio.NewReader(boundedResponseReader(conn))).Decode(&resp); err != nil {
+	bounded := boundedResponseReader(conn)
+	if err := json.NewDecoder(bufio.NewReader(bounded)).Decode(&resp); err != nil {
+		// #9322: name the cap. The CLASSIFICATION is deliberately unchanged —
+		// this stays errSessionHelperUnreachable, which gates takeover-readiness
+		// (#5247) — because a response we could not read is a response we could
+		// not read, whatever ended it. What changes is that the operator is told
+		// WHICH of the two ended it; reclassifying a truncation as healthy would
+		// be a #6785-shaped decision with HA blast radius, and it is not this
+		// change's to make.
+		if bounded.truncated {
+			return fmt.Errorf("%w: read session response: %w",
+				errSessionHelperUnreachable, responseCapError(req.Type, err))
+		}
 		return fmt.Errorf("%w: read session response: %w", errSessionHelperUnreachable, err)
 	}
 	if !resp.OK {

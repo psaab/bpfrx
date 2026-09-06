@@ -97,7 +97,14 @@ func ProbeStatus(controlSocket string, timeout time.Duration) (*ProcessStatus, e
 	}
 	var resp ControlResponse
 	// #9003: byte-bounded as well as deadline-bounded.
-	if err := json.NewDecoder(bufio.NewReader(boundedResponseReader(conn))).Decode(&resp); err != nil {
+	bounded := boundedResponseReader(conn)
+	if err := json.NewDecoder(bufio.NewReader(bounded)).Decode(&resp); err != nil {
+		// #9322: the third boundedResponseReader call site. It returns the error
+		// bare, so without this a truncation here surfaces as an unadorned
+		// "unexpected EOF" with nothing naming the cap.
+		if bounded.truncated {
+			return nil, responseCapError("status", err)
+		}
 		return nil, err
 	}
 	if !resp.OK {
