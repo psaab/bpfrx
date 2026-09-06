@@ -131,10 +131,24 @@ type AddressBinding struct {
 
 // SecurityConfig holds all security-related configuration.
 type SecurityConfig struct {
-	Zones              map[string]*ZoneConfig // keyed by zone name
-	Policies           []*ZonePairPolicies    // ordered list of zone-pair policy sets
-	GlobalPolicies     []*Policy              // global policies (apply to all zone pairs)
-	DefaultPolicy      PolicyAction           // global fallback policy (permit-all or deny-all)
+	Zones    map[string]*ZoneConfig // keyed by zone name
+	Policies []*ZonePairPolicies    // ordered list of zone-pair policy sets
+	// MalformedZonePairs records zone-pair statements whose SHAPE shows a
+	// bracketed-list collapse (#9246), so validatePolicyZonePairShapeStrict can
+	// reject the commit and the tolerant path can warn instead (#1960). Same
+	// record-at-compile / reject-in-a-strict-gate shape as
+	// ScreenProfile.UnknownLeaves: by the time the config is compiled the
+	// residue is gone -- the pair looks like an ordinary context that happens to
+	// carry no policies -- so the defect has to be captured where the AST is
+	// still visible.
+	// json:"-" deliberately: this is a COMPILE-TIME DIAGNOSTIC, not part of the
+	// config's semantic content. Serialising it perturbs every fixture and
+	// fingerprint that compares compiled configs -- the #4406 goldens, and the
+	// ConfigFingerprint comparisons the elision censuses run -- for a field
+	// that is nil in every valid config.
+	MalformedZonePairs []string     `json:"-"`
+	GlobalPolicies     []*Policy    // global policies (apply to all zone pairs)
+	DefaultPolicy      PolicyAction // global fallback policy (permit-all or deny-all)
 	NAT                NATConfig
 	Screen             map[string]*ScreenProfile // keyed by profile name
 	AddressBook        *AddressBook
