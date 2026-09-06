@@ -311,13 +311,25 @@ var dupConservationSkipped8436 = []string{
 	// This is the site that motivated pinning the skip set.
 	"services rpm probe xpfname test",
 
-	// ---- "second leaf not observable in the typed config" (14). ----
+	// ---- "second leaf not observable in the typed config" (13). ----
 	//
 	// #8662: was 15. `system login user` left this list when the compact/block
 	// census's value synthesis learned to read the schema's valueHint — its
 	// second leaf became observable, so the skip entry was claiming a blindness
 	// the census no longer has. The two censuses share synthPair, so an
 	// improvement to the instrument moves both.
+	//
+	// #9125: was 14. `routing-options static route` left it for a different
+	// reason, and one worth distinguishing: nothing about the CENSUS changed.
+	// The compiler gained a HasPreference bit, so an explicit `preference 5`
+	// stopped compiling identically to a block that omits it — the leaf became
+	// observable because the PRODUCT learned to represent it, not because the
+	// instrument got sharper.
+	//
+	// That is #9181's mechanism running in reverse, and it is the useful half
+	// of that finding: a `vacuous` verdict is a statement about what the typed
+	// config can EXPRESS, so fixing an expressiveness gap silently un-vacuums a
+	// census row. The site is CHECKED now and conserves.
 	//
 	// The census's own VACUITY guard. The merged form compiles identically to a
 	// block carrying only the first leaf, so the census sees nothing.
@@ -384,7 +396,6 @@ var dupConservationSkipped8436 = []string{
 	"protocols rip group",
 	"routing-options rib xpfname static route",
 	"routing-options rib xpfname static route xpfname qualified-next-hop",
-	"routing-options static route",
 	"routing-options static route xpfname qualified-next-hop",
 	"security ipsec proposal",
 	"security log stream",

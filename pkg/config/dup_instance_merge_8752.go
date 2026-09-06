@@ -129,7 +129,6 @@ func mergeInstancesUnder(parent *Node, keyword string) []string {
 	return names
 }
 
-
 // mergeSiblingContainers9209 folds sibling CONTAINERS that share identical Keys
 // into the first of them, recursively.
 //
