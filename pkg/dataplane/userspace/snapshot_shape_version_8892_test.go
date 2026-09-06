@@ -98,8 +98,24 @@ func shapeDigest8892(t *testing.T) (string, int) {
 // adding `json:"-"` to an EXISTING wire field would be a silent removal, and
 // the cell has to see that. So a tag change costs a golden update and a
 // sentence, which is the intended price.
+//
+// v10 STANDS (issue 9246): `SecurityConfig.MalformedZonePairs` was added to the
+// typed config, and ConfigSnapshot embeds the whole Config, so it moved this
+// digest for the same reason HasPreference did. Same arm, same answer: it is
+// tagged `json:"-"`, it is a COMPILE-TIME DIAGNOSTIC recording zone-pair
+// statements whose shape shows a bracketed-list collapse, and it is nil in
+// every valid config. Nothing transmits it, so no helper of any vintage can
+// observe it, and bumping the protocol for it would spend the one signal that
+// says the wire really changed.
+//
+// Recorded here rather than only in a commit message because this is now the
+// THIRD field to reach this cell by embedding, and the third to need the same
+// paragraph. The general rule the three share: a field added to ANY pkg/config
+// struct lands on the helper wire via ConfigSnapshot, so it is answerable to
+// this cell whether or not the author was thinking about the helper -- and the
+// gate that catches it is `go test ./...`, not the packages the diff touched.
 const (
-	snapshotShapeGolden8892  = "d1b287475df6be8b9a749b5292335d3269fe9e272f639017586908c5d1e1f752"
+	snapshotShapeGolden8892  = "55f649e57165590eccb5ae4b07f439b4bbd3f67e1d059334d599d01e551e0ff2"
 	snapshotShapeVersion8892 = 10
 )
 
