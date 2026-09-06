@@ -246,21 +246,49 @@ func TestApplyRSSIndirectionOne_MatchingTable_SkipsWrite(t *testing.T) {
 // scan, with no ethtool invocation at all. The test now actually calls
 // applyRSSIndirection with a fake that owns both the interface list and
 // the driver map — the driver guard is exercised for real.
-func TestApplyRSSIndirection_NonMlx_Skips(t *testing.T) {
+func TestApplyRSSIndirection_NoReadableTable_NeverWritten_9040(t *testing.T) {
+	// RE-ANCHORED (#9040). This cell used to assert that a non-mlx5 interface
+	// received NO ethtool call at all — the Codex H1 driver guard. That goal
+	// (never touch a NIC xpf does not own) is carried by the ALLOWLIST, which
+	// is the userspace-dp AF_XDP binding set; the driver name was a second
+	// guard that also blocked the legitimate case, and blocking it is #9040:
+	// a NIC with more RX queues than workers silently dropped transit on the
+	// unbound queues.
+	//
+	// The contract it is re-anchored to is narrower and is the one that
+	// matters: a `ethtool -X` WRITE is never issued against an interface whose
+	// indirection table could not be read. The read probe itself is now
+	// expected, because identifying the unsupported case BEFORE the write is
+	// what stops the reshape from silently failing on some drivers.
 	f := &fakeRSSExecutor{
 		ifaces:  []string{"eth0", "eth1"},
 		drivers: map[string]string{"eth0": "virtio_net", "eth1": "iavf"},
 		queues:  map[string]int{"eth0": 4, "eth1": 4},
+		// No ethtoolX scripted: `ethtool -x` yields no parseable table, which
+		// is how a driver with no indirection support answers.
 	}
 	applyRSSIndirection(true, 4, f.ifaces, f)
-	if len(f.calls) != 0 {
-		t.Fatalf("non-mlx5 interfaces must not trigger any ethtool call, got %v", f.calls)
+
+	for _, c := range f.calls {
+		if len(c) > 0 && c[0] == "-X" {
+			t.Fatalf("an interface with no readable indirection table must never be written: %v", c)
+		}
+	}
+	// REFERENCE ARM: the probe must actually have happened. Without this the
+	// assertion above is satisfied by doing nothing at all, which is the old
+	// behaviour wearing the new contract's clothes.
+	if len(f.calls) == 0 {
+		t.Fatal("expected a capability probe on each interface; got none — " +
+			"the gate cannot be shown to be a capability test rather than a driver test")
 	}
 }
 
 // Go HIGH #1 flavour: mixed interface set. Only the mlx5 interface
 // receives ethtool writes; virtio/iavf siblings are untouched.
-func TestApplyRSSIndirection_MixedDrivers_OnlyMlxTouched(t *testing.T) {
+func TestApplyRSSIndirection_MixedDrivers_OnlyTableOwnersWritten_9040(t *testing.T) {
+	// RE-ANCHORED (#9040): "only mlx0 is TOUCHED" becomes "only an interface
+	// with a readable table is WRITTEN". Probes may target any allowlisted
+	// interface; that is the point of the change.
 	defaultTable := []byte(`RX flow hash indirection table for mlx0 with 6 RX ring(s):
     0:      0     1     2     3     4     5
     8:      0     1     2     3     4     5
@@ -277,24 +305,25 @@ func TestApplyRSSIndirection_MixedDrivers_OnlyMlxTouched(t *testing.T) {
 	}
 	applyRSSIndirection(true, 4, f.ifaces, f)
 
-	// All ethtool invocations must target mlx0 only.
+	wrote := map[string]bool{}
 	for _, c := range f.calls {
 		if len(c) < 2 {
 			t.Fatalf("malformed call: %v", c)
 		}
-		if c[1] != "mlx0" {
-			t.Fatalf("ethtool invoked on non-mlx5 iface: %v", c)
+		if c[1] == "lo" {
+			t.Fatalf("loopback must never be touched: %v", c)
 		}
-	}
-	// And the write must have happened.
-	sawWrite := false
-	for _, c := range f.calls {
 		if c[0] == "-X" {
-			sawWrite = true
+			wrote[c[1]] = true
 		}
 	}
-	if !sawWrite {
-		t.Fatalf("expected a -X write on mlx0, got %v", f.calls)
+	if !wrote["mlx0"] {
+		t.Error("the interface WITH a readable table was not written")
+	}
+	for _, iface := range []string{"virt0", "iavf0"} {
+		if wrote[iface] {
+			t.Errorf("%s has no readable table and must not be written", iface)
+		}
 	}
 }
 
@@ -396,7 +425,19 @@ func TestApplyRSSIndirection_ZeroWorkers_Skips(t *testing.T) {
 // circuits, and on mlx5 interfaces the kernel's default RSS table is
 // restored via `ethtool -X <iface> default`. Non-mlx5 interfaces are
 // untouched.
-func TestApplyRSSIndirection_DisabledRestoresDefault(t *testing.T) {
+func TestApplyRSSIndirection_DisabledRestoresEveryAllowlisted_9040(t *testing.T) {
+	// RE-ANCHORED (#9040), and the reason is a real defect the old expectation
+	// would have created: THE RESTORE SET MUST EQUAL THE POTENTIAL-APPLY SET.
+	// The apply path can now write to any allowlisted interface, so the kill
+	// switch must clear any allowlisted interface. Leaving the old driver gate
+	// here would strand a concentrated table on exactly the non-mlx5 NICs the
+	// widened apply path can now write — reachable only by an operator trying
+	// to back out, which is the worst possible time to find it.
+	//
+	// It is deliberately NOT probe-gated either: #5250 exists because an
+	// unreadable signal silently became "do nothing". On a NIC with no table
+	// the extra restore fails and is logged; that is noise. A stale table
+	// nobody clears is an outage. A restore fails open, a write fails closed.
 	f := &fakeRSSExecutor{
 		ifaces: []string{"lo", "virt0", "mlx0", "mlx1"},
 		drivers: map[string]string{
@@ -408,22 +449,24 @@ func TestApplyRSSIndirection_DisabledRestoresDefault(t *testing.T) {
 	}
 	applyRSSIndirection(false, 4, f.ifaces, f)
 
-	// Exactly one restore call per mlx5 interface; virt0/lo untouched.
-	if len(f.calls) != 2 {
-		t.Fatalf("want 2 restore calls (mlx0, mlx1), got %d: %v", len(f.calls), f.calls)
-	}
 	seen := map[string]bool{}
 	for _, c := range f.calls {
 		if len(c) != 3 || c[0] != "-X" || c[2] != "default" {
 			t.Fatalf("expected `ethtool -X <iface> default`, got %v", c)
 		}
-		if d := f.drivers[c[1]]; d != "mlx5_core" {
-			t.Fatalf("restore invoked on non-mlx5 iface %q (driver=%q)", c[1], d)
+		if c[1] == "lo" {
+			t.Fatal("loopback must never be restored")
 		}
 		seen[c[1]] = true
 	}
-	if !seen["mlx0"] || !seen["mlx1"] {
-		t.Fatalf("both mlx5 interfaces must be restored, saw %v", seen)
+	for _, iface := range []string{"virt0", "mlx0", "mlx1"} {
+		if !seen[iface] {
+			t.Errorf("kill switch did not clear %q — the restore set no longer "+
+				"covers everything the apply path can write", iface)
+		}
+	}
+	if len(f.calls) != 3 {
+		t.Fatalf("want exactly one restore per allowlisted interface, got %d: %v", len(f.calls), f.calls)
 	}
 }
 
@@ -1023,7 +1066,13 @@ func TestApplyRSSIndirectionOne_RestoreEthtoolXDefaultGenericError_LoggedAndSwal
 // #805 test 15 (Codex LOW #3): non-mlx5 driver on the new branch.
 // applyRSSIndirectionOne's first check is the driver guard; it must
 // short-circuit BEFORE the new restore-default logic.
-func TestApplyRSSIndirectionOne_NonMlxDriver_WorkersEqualsQueues_NotTouched(t *testing.T) {
+func TestApplyRSSIndirectionOne_NonMlxDriver_WorkersEqualsQueues_StaleTableRestored_9040(t *testing.T) {
+	// RE-ANCHORED (#9040). This cell scripted a STALE CONCENTRATED table on
+	// a virtio_net NIC and asserted it was left alone. That expectation WAS the
+	// defect: #805/#5124 restore a stale concentrated table whenever
+	// workers >= queues, and this interface was exempted from that repair for
+	// no reason but its driver name — so it kept RX hashed onto a subset of
+	// queues indefinitely, which is the loss #9040 is about.
 	f := &fakeRSSExecutor{
 		drivers:  map[string]string{"eth0": "virtio_net"},
 		queues:   map[string]int{"eth0": 6},
@@ -1031,15 +1080,26 @@ func TestApplyRSSIndirectionOne_NonMlxDriver_WorkersEqualsQueues_NotTouched(t *t
 	}
 	applyRSSIndirectionOne("eth0", 6, f)
 
-	if len(f.calls) != 0 {
-		t.Errorf("non-mlx5 driver on workers>=queues path → zero ethtool calls, got %v",
-			f.calls)
+	var restored bool
+	for _, c := range f.calls {
+		if len(c) == 3 && c[0] == "-X" && c[1] == "eth0" && c[2] == "default" {
+			restored = true
+		}
+	}
+	if !restored {
+		t.Errorf("a stale concentrated table on this NIC was not restored: %v", f.calls)
 	}
 }
 
 // #805 test 16 (Codex LOW #3): empty driver string (sysfs unreadable
 // for that iface). Same expectation as non-mlx5: short-circuit.
-func TestApplyRSSIndirectionOne_EmptyDriver_WorkersEqualsQueues_NotTouched(t *testing.T) {
+func TestApplyRSSIndirectionOne_EmptyDriver_WorkersEqualsQueues_StaleTableRestored_9040(t *testing.T) {
+	// RE-ANCHORED (#9040). This cell scripted a STALE CONCENTRATED table on
+	// an unknown-driver NIC and asserted it was left alone. That expectation WAS the
+	// defect: #805/#5124 restore a stale concentrated table whenever
+	// workers >= queues, and this interface was exempted from that repair for
+	// no reason but its driver name — so it kept RX hashed onto a subset of
+	// queues indefinitely, which is the loss #9040 is about.
 	f := &fakeRSSExecutor{
 		drivers:  map[string]string{}, // readDriver returns ""
 		queues:   map[string]int{"eth0": 6},
@@ -1047,9 +1107,14 @@ func TestApplyRSSIndirectionOne_EmptyDriver_WorkersEqualsQueues_NotTouched(t *te
 	}
 	applyRSSIndirectionOne("eth0", 6, f)
 
-	if len(f.calls) != 0 {
-		t.Errorf("empty driver on workers>=queues path → zero ethtool calls, got %v",
-			f.calls)
+	var restored bool
+	for _, c := range f.calls {
+		if len(c) == 3 && c[0] == "-X" && c[1] == "eth0" && c[2] == "default" {
+			restored = true
+		}
+	}
+	if !restored {
+		t.Errorf("a stale concentrated table on this NIC was not restored: %v", f.calls)
 	}
 }
 
