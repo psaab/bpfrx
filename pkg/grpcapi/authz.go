@@ -334,7 +334,9 @@ func (s *Server) principalStreamInterceptor(srv any, ss grpc.ServerStream, info 
 	if err := s.authorizeRPC(ss.Context(), info.FullMethod, nil); err != nil {
 		return err
 	}
-	return handler(srv, ss)
+	// #9051: a stream outlives its verdict. Keep re-checking while it runs, or
+	// a principal demoted mid-stream keeps its feed until it disconnects.
+	return s.authorizeStreamContinuously(srv, ss, info.FullMethod, handler)
 }
 
 // splitFullMethod splits a gRPC "/service/method" into its two halves.
