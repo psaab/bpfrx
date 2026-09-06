@@ -49,6 +49,16 @@ use super::packet::{PROTO_TCP, ScreenPacketInfo, ScreenParseError};
 /// there (the #2344/#3064 flowless handling). The continuation stays
 /// bounded by the `for _ in 0..8` extension-header cap and the
 /// top-of-loop `offset > frame.len()` fail-closed check (#2361).
+/// The protocol value the SHIM substitutes for a non-first fragment, which has
+/// no L4 header to read a real protocol from (#9114).
+///
+/// KEEP IN SYNC with `userspace-xdp/src/ipv6_ext_walk.rs`'s
+/// `PROTO_FRAGMENT_NO_L4`. The shim crate is not a dependency of this one — the
+/// only place userspace-dp reaches it is a `#[path]` include inside a parity
+/// test — so the literal is mirrored rather than shared. 255 is reserved
+/// (IANA "Reserved"), so it can never collide with a real protocol number.
+const SHIM_PROTO_FRAGMENT_NO_L4: u8 = 255;
+
 pub(crate) fn extract_screen_info(
     frame: &[u8],
     addr_family: u8,
@@ -116,6 +126,27 @@ pub(crate) fn extract_screen_info(
         info.is_fragment = (info.ip_frag_off & 0x3FFF) != 0;
         info.is_first_fragment =
             (info.ip_frag_off & 0x2000) != 0 && (info.ip_frag_off & 0x1FFF) == 0;
+        // #9114: RECOVER the real protocol when the caller handed us the shim's
+        // non-first-fragment sentinel.
+        //
+        // `userspace-xdp` substitutes `PROTO_FRAGMENT_NO_L4` for a non-first
+        // fragment's protocol BEFORE `parse_l4`, and that value rides
+        // `meta.protocol` through `stage_screen_check` into here unchanged. The
+        // screens are then keyed on a protocol that is not the packet's, so
+        // `check_icmp_fragment`, `icmp-flood` and `udp-flood` — all of which
+        // test `protocol == PROTO_ICMP/ICMPV6/UDP` — never fire on the exact
+        // packets they exist to police. It is a MISS, not an over-match: every
+        // other protocol-keyed screen tests `== PROTO_TCP` or `!= PROTO_TCP`
+        // and DECLINES on the sentinel, which is correct for a fragment with no
+        // L4 header (`check_tcp_flag_screens` carries its own explicit
+        // non-first-fragment guard immediately below its protocol test).
+        //
+        // The IPv4 protocol byte is at header offset 9 and is present: the
+        // 20-byte base header was length-validated above. Gated on the sentinel
+        // so an ordinary packet's protocol is passed through untouched.
+        if info.protocol == SHIM_PROTO_FRAGMENT_NO_L4 {
+            info.protocol = ip_hdr[9];
+        }
         // FAIL-CLOSED (#4167): the header's own IHL claims a header
         // (`ihl*4`) longer than the captured frame, so the options
         // region — and thus any LSRR/SSRR source-route option — cannot
@@ -408,6 +439,25 @@ pub(crate) fn extract_screen_info(
                     // neither loop forever nor over-read.
                     if (frag_off & 0xFFF8) != 0 {
                         // Non-first fragment: no L4 header is present here.
+                        //
+                        // #9114: recover the real upper-layer protocol before
+                        // giving up on the walk. The FRAGMENT HEADER's own
+                        // NextHdr field (its byte 0, at `offset`) names the
+                        // protocol this datagram carries, and it is present on
+                        // EVERY fragment including this one — that is the whole
+                        // point of the field. Without this the screens see the
+                        // shim's `PROTO_FRAGMENT_NO_L4` sentinel and
+                        // `check_icmp_fragment` / `icmp-flood` / `udp-flood`,
+                        // all keyed on the real protocol, never fire on the
+                        // packets they exist to police.
+                        //
+                        // `offset + 2` and `offset + 3` were just read for
+                        // `frag_off`, so `offset` is in bounds. Gated on the
+                        // sentinel so a caller that already knew the protocol
+                        // keeps it.
+                        if info.protocol == SHIM_PROTO_FRAGMENT_NO_L4 {
+                            info.protocol = frame[offset];
+                        }
                         break;
                     }
                     nexthdr = frame[offset];
