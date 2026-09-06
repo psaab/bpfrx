@@ -2,6 +2,9 @@ package grpcapi
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"regexp"
 	"testing"
 
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
@@ -35,8 +38,19 @@ func TestFabricAllowlistUnary_AllowsProxiedReadMonitorRPCs(t *testing.T) {
 		pb.BpfrxService_GetSessions_FullMethodName,
 		pb.BpfrxService_GetSessionSummary_FullMethodName,
 		pb.BpfrxService_GetZonePairSummary_FullMethodName,
-		pb.BpfrxService_ShowText_FullMethodName,
 		pb.BpfrxService_ClearSessions_FullMethodName,
+		// #9059 MOVED ShowText OUT of this list, and the move is the fix.
+		//
+		// This case passes a nil request and asserts admission BY NAME. That is
+		// the right shape for a method that does one thing, and the wrong shape
+		// for one that multiplexes ~127 topics: admitting the name admitted
+		// route-all, security-log, commit-history, the nat-*-detail topics and
+		// the test-policy: simulator, while the only topic either peer-proxy
+		// call site sends is "chassis-forwarding".
+		//
+		// It is now gated by request TOPIC, exactly as SystemAction is gated by
+		// request ACTION in TestFabricAllowlistUnary_SystemActionNestedGate
+		// below — see TestFabricAllowlistUnary_ShowTextTopicGate_9059.
 	}
 	for _, method := range allowed {
 		probe := &unaryCallProbe{}
@@ -278,5 +292,113 @@ func TestLoopbackListenerUnaffected(t *testing.T) {
 		if probe.called {
 			t.Errorf("fabric allowlist invoked the handler for denied method %s", method)
 		}
+	}
+}
+
+// TestFabricAllowlistUnary_ShowTextTopicGate_9059 is the ShowText twin of the
+// SystemAction nested gate above, and it exists for the identical reason: a
+// method that multiplexes cannot be adjudicated by its name.
+//
+// On revert (ShowText returned to the plain allowlist, or the topic gate
+// removed) the denied rows go RED, because 126 of 127 topics become reachable on
+// the fabric IP — a compartment the same interceptor already gates per-action
+// for its sibling.
+func TestFabricAllowlistUnary_ShowTextTopicGate_9059(t *testing.T) {
+	s := &Server{}
+	info := &grpc.UnaryServerInfo{FullMethod: pb.BpfrxService_ShowText_FullMethodName}
+
+	// REFERENCE ARM: the one topic the local node actually proxies must still
+	// be served, or peer-proxied `show chassis forwarding` breaks. Without this
+	// row, every denial below is satisfied by refusing ShowText outright.
+	probe := &unaryCallProbe{}
+	req := &pb.ShowTextRequest{Topic: "chassis-forwarding"}
+	if _, err := s.fabricAllowlistUnaryInterceptor(context.Background(), req, info, probe.handler); err != nil {
+		t.Fatalf("chassis-forwarding must be served on the fabric: %v", err)
+	}
+	if !probe.called {
+		t.Fatal("chassis-forwarding handler was not invoked")
+	}
+
+	// A sample across the tiers the loopback table prices differently: runtime
+	// state, an audit surface, and the policy simulator the authz table calls
+	// "policy reconnaissance ... exactly the tier confusion this file exists to
+	// prevent".
+	for _, topic := range []string{
+		"route-all",
+		"security-log",
+		"commit-history",
+		"nat-source-detail",
+		"test-policy:from-zone trust to-zone untrust",
+		"", // an empty topic must not fall through to the handler either
+	} {
+		p := &unaryCallProbe{}
+		r := &pb.ShowTextRequest{Topic: topic}
+		_, err := s.fabricAllowlistUnaryInterceptor(context.Background(), r, info, p.handler)
+		if status.Code(err) != codes.PermissionDenied {
+			t.Errorf("ShowText topic %q: expected PermissionDenied on the fabric, got %v", topic, err)
+		}
+		if p.called {
+			t.Errorf("ShowText topic %q: handler was invoked on the fabric listener", topic)
+		}
+	}
+
+	// A malformed request (wrong type for this method) must fail CLOSED, like
+	// its sibling: it cannot be type-asserted, so it cannot be shown safe.
+	p := &unaryCallProbe{}
+	if _, err := s.fabricAllowlistUnaryInterceptor(context.Background(), nil, info, p.handler); status.Code(err) != codes.PermissionDenied {
+		t.Errorf("a nil ShowText request must be denied, got %v", err)
+	}
+	if p.called {
+		t.Error("a nil ShowText request reached the handler")
+	}
+}
+
+// TestFabricShowTextAllowlistCoversEveryProxiedTopic_9059 keeps the topic
+// allowlist and the peer-proxy call sites from drifting apart.
+//
+// The failure it prevents is the OPPOSITE of #9059's and just as quiet: someone
+// adds a second peer-proxied ShowText topic, the fabric gate refuses it, and the
+// new feature silently does not work across the cluster. The allowlist's whole
+// justification is "a topic the local node actually proxies", and a claim of
+// that form needs the enumeration to be checked rather than remembered.
+//
+// It reads the call sites' SOURCE rather than a hand-kept list, so adding a
+// proxy and forgetting the allowlist cannot pass.
+func TestFabricShowTextAllowlistCoversEveryProxiedTopic_9059(t *testing.T) {
+	sources := []string{
+		"server_show_forwarding.go",
+		filepath.Join("..", "cli", "cli_show_chassis.go"),
+	}
+	re := regexp.MustCompile(`ShowTextRequest\{Topic:\s*"([^"]*)"`)
+
+	found := 0
+	for _, path := range sources {
+		src, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		for _, m := range re.FindAllStringSubmatch(string(src), -1) {
+			found++
+			if !fabricAllowedShowTextTopics[m[1]] {
+				t.Errorf("%s proxies ShowText topic %q to a peer, but the fabric "+
+					"topic allowlist does not admit it — the fabric listener will "+
+					"refuse it and the feature will silently not work across the "+
+					"cluster", path, m[1])
+			}
+		}
+	}
+	// POSITIVE CONTROL: the pattern must actually match something. A regex that
+	// found nothing would report a clean board for a check that ran over no
+	// subjects — the failure mode this repository has hit repeatedly.
+	if found == 0 {
+		t.Fatal("the proxy-call-site scan matched no ShowText request literals; " +
+			"the pattern or the paths are stale and this case is asserting nothing")
+	}
+	// And the allowlist must not have grown entries nothing proxies, or its
+	// stated justification stops being true in the other direction.
+	if len(fabricAllowedShowTextTopics) > found {
+		t.Errorf("the allowlist holds %d topics but only %d are proxied; every entry "+
+			"must be a topic the local node actually sends",
+			len(fabricAllowedShowTextTopics), found)
 	}
 }
