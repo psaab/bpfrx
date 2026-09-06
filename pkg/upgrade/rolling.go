@@ -160,6 +160,32 @@ func runRollingWith(r *Runner, cl RollingCluster, rc RollingConfig) error {
 			"image-replace (Path C) with documented connection loss")
 	}
 
+	// #9037: the session-sync half of the compatibility check. The interface
+	// has DECLARED this method since #7990 and the comment above says the
+	// session-sync half "is SessionSyncWireCompatible below" — but nothing in
+	// this function ever called it. Only the kernel-drain sibling
+	// (kernel_drain.go) gated on it, so binary rolling drained into a peer
+	// that may be unable to decode this node's session frames.
+	//
+	// A drain hands the RGs to the peer. If the peer cannot decode the
+	// sessions, that handover drops every established flow while heartbeat,
+	// election and failover all keep working — the cluster looks healthy and
+	// the loss is discovered at the failover, not here.
+	//
+	// It MUST run before ForceSecondary below: a gate that fires after the
+	// demotion has already cut the connections it exists to protect.
+	syncOK, syncWhy, err := cl.SessionSyncWireCompatible()
+	if err != nil {
+		return fmt.Errorf("rolling: check session-sync wire compatibility: %w", err)
+	}
+	if !syncOK {
+		return fmt.Errorf("rolling: session-sync WIRE version is NOT compatible with "+
+			"the peer (%s) — draining would hand the RGs to a node that cannot "+
+			"receive this node's sessions, dropping every established flow while "+
+			"the cluster still looks healthy; use image-replace (Path C) with "+
+			"documented connection loss", syncWhy)
+	}
+
 	// 2. Peer-takeover-ready precheck BEFORE demoting (else VIP stranding).
 	ready, err := cl.PeerTakeoverReady()
 	if err != nil {
