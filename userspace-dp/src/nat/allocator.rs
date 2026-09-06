@@ -3926,6 +3926,14 @@ impl PortAllocator {
     /// the lease refcount are torn down PER FLOW by the SAME teardown path
     /// (`release_flow`/`rollback_flow`) — no new delete site. Idempotent: a
     /// second packet of the same flow returns its existing translated tuple.
+    ///
+    /// #9131: on that collision a FRESH, non-sticky lease now probes the
+    /// REMAINING pool addresses before reporting exhaustion, the same `continue`
+    /// [`reserve_address_only_roundrobin`] makes. Only the retry was missing —
+    /// the refusal is correct and is kept for the two PINNED cases, an
+    /// `address-persistent` pool (the address is a pure function of the source)
+    /// and an EXISTING lease (the address is pinned by `persistent-nat` for the
+    /// permit scope's lifetime). A blanket fallback would break both.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn reserve_address_only_persistent(
         &self,
@@ -3989,32 +3997,70 @@ impl PortAllocator {
         }
 
         let reusing = reuse_addr.is_some();
-        let (translated_ip, addr_index) = match reuse_addr {
-            Some((ip, idx)) => (ip, idx),
-            None => {
-                let abs =
-                    self.address_index(flow.src_ip, family_offset, family_len, address_persistent);
-                let rel = abs.saturating_sub(family_offset) % family_len;
-                (family_addresses.ip_at(rel), family_offset + rel)
-            }
-        };
 
         // #5269 reverse-identity collision guard for THIS flow, checked BEFORE any
         // lease mutation so a denied flow leaves the lease untouched. The
         // preserved source port keys the reverse identity (0 for a port-less
         // protocol); it is never written to the wire (the caller leaves
         // `rewrite_src_port` unset).
-        let rkey = AddressOnlyReverseKey {
+        //
+        // #9131: on a collision a FRESH, non-sticky lease probes the remaining
+        // pool addresses instead of reporting exhaustion, mirroring
+        // `reserve_address_only_roundrobin`'s `continue`. For a PORT-LESS
+        // protocol (GRE/ESP/ICMP) the identity degenerates to
+        // `(proto, translated_ip, 0, dst_ip, 0)`, so two tunnels from different
+        // subscribers to the SAME popular remote — a VPN concentrator, a cloud
+        // SASE endpoint — collide the moment they land on one pool address, and
+        // the second was denied while other pool addresses sat idle.
+        //
+        // The refusal itself is correct and is KEPT for the two PINNED cases;
+        // only the missing retry was the defect:
+        //   * `address_persistent` — the address is `sticky_pool_index(src_ip)`,
+        //     a pure function of the source. Probing on would break the
+        //     `address-persistent` contract, so the sibling
+        //     `reserve_address_only_roundrobin` likewise sets
+        //     `address_attempts = 1` here.
+        //   * an EXISTING lease (`reusing`) — the address is pinned by
+        //     `persistent-nat` for the permit scope's lifetime and must not
+        //     move. Two flows sharing one public reverse identity are genuinely
+        //     ambiguous on the return path, so this stays fail-CLOSED.
+        let rkey_for = |ip: IpAddr| AddressOnlyReverseKey {
             protocol: flow.protocol,
-            translated_ip,
+            translated_ip: ip,
             translated_port: flow.src_port,
             dst_ip: flow.dst_ip,
             dst_port: flow.dst_port,
         };
-        if live.address_only_owners.contains_key(&rkey) {
+        let chosen = match reuse_addr {
+            // Pinned by an existing lease: single probe, no rotation.
+            Some((ip, idx)) => {
+                let rkey = rkey_for(ip);
+                (!live.address_only_owners.contains_key(&rkey)).then_some((ip, idx, rkey))
+            }
+            None => {
+                let abs =
+                    self.address_index(flow.src_ip, family_offset, family_len, address_persistent);
+                let start_rel = abs.saturating_sub(family_offset) % family_len;
+                // Sticky-by-source pools single-probe their chosen address;
+                // round-robin pools rotate through the whole pool.
+                let attempts = if address_persistent { 1 } else { family_len };
+                (0..attempts)
+                    .map(|offset| (start_rel + offset) % family_len)
+                    .find_map(|rel| {
+                        let ip = family_addresses.ip_at(rel);
+                        let rkey = rkey_for(ip);
+                        (!live.address_only_owners.contains_key(&rkey)).then_some((
+                            ip,
+                            family_offset + rel,
+                            rkey,
+                        ))
+                    })
+            }
+        };
+        let Some((translated_ip, addr_index, rkey)) = chosen else {
             self.shared.exhaustion_total.fetch_add(1, Ordering::Relaxed);
             return Err(super::source::SourceNatFailureReason::AllocatorExhausted);
-        }
+        };
 
         // Lease-table pressure cap for a FRESH lease, mirroring
         // `allocate_translation_locked`: one bounded GC pass, then treat a still-

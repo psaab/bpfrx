@@ -163,6 +163,11 @@ mod tests_newflow_lock;
 #[path = "tests_det_lock_scope_9130.rs"]
 mod tests_det_lock_scope_9130;
 
+// #9131: the address-only PERSISTENT allocator's sibling-address fallback.
+#[cfg(test)]
+#[path = "tests_addr_only_sibling_9131.rs"]
+mod tests_addr_only_sibling_9131;
+
 /// #3096: per-flow interface / routing-instance identity passed into the NAT
 /// match path so an interface- or routing-instance-scoped rule-set matches
 /// only its named traffic. The forwarding layer resolves each ifindex to its
