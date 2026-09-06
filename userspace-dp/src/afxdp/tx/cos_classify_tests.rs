@@ -655,6 +655,160 @@ fn demote_prepared_cos_queue_to_local_preserves_mqfq_frontier() {
 }
 
 #[test]
+fn demote_failure_preserves_mqfq_frontier_across_buckets_9066() {
+    // #9066: the FAILURE path's sibling of
+    // demote_prepared_cos_queue_to_local_preserves_mqfq_frontier above.
+    //
+    // The two early returns called cos_queue_restore_front and dropped the
+    // saved frontier, justified by a comment saying that rollback is
+    // "round-trip neutral per #913 §3.7". That is true for ONE bucket and
+    // false for several: each bucket's frontier comes back inflated by the
+    // bytes of the OTHER buckets drained ahead of its own last item
+    // (measured +4200/+2700/+3300 on three flows). vtime round-trips and
+    // relative order survives, so this is not corrupt state — it is a
+    // NEWCOMER anchoring at vtime + bytes and being served ahead of the whole
+    // restored backlog, which is #926's temporal inversion left open on the
+    // failure path.
+    //
+    // The existing single-bucket cell
+    // mqfq_push_front_is_neutral_on_drained_bucket_round_trip CANNOT see this
+    // by construction: with one bucket there are no others to drain ahead of
+    // it, so the neutrality it asserts is real and irrelevant.
+    let area = MmapArea::new(4096).expect("mmap");
+    let mut root = test_cos_runtime_with_queues(
+        10_000_000_000 / 8,
+        vec![CoSQueueConfig {
+            queue_id: 4,
+            forwarding_class: "ff".into(),
+            priority: 4,
+            transmit_rate_bytes: 10_000_000_000 / 8,
+            guarantee_enabled: true,
+            exact: true,
+            surplus_sharing: false,
+            equal_flow_enforcement: true,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
+            surplus_weight: 1,
+            buffer_bytes: 128 * 1024,
+            dscp_rewrite: None,
+            codel_target_ns: 0,
+        }],
+    );
+    let queue = &mut root.queues[0];
+    enable_test_flow_fair(queue);
+
+    let key_a = test_session_key(8001, 5201);
+    let key_b = test_session_key(8002, 5201);
+    let bucket_a = cos_flow_bucket_index(0, Some(&key_a));
+    let bucket_b = cos_flow_bucket_index(0, Some(&key_b));
+    assert_ne!(
+        bucket_a, bucket_b,
+        "test setup: ports 8001/8002 must hash to distinct buckets — with one \
+         bucket this cell degenerates into the single-bucket case it exists to \
+         distinguish itself from"
+    );
+
+    for (offset, key) in [(64u64, &key_a), (128u64, &key_b)] {
+        cos_queue_push_back(
+            queue,
+            CoSPendingTxItem::Prepared(PreparedTxRequest {
+                offset,
+                len: 1500,
+                recycle: PreparedTxRecycle::FreeTxFrame,
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: Some(key.clone()),
+                egress_ifindex: 42,
+                cos_queue_id: Some(4),
+                dscp_rewrite: None,
+                mirror_clone: false,
+                enqueue_ns: 0,
+            }),
+        );
+    }
+
+    // The COMMON trigger, not the rare one: a Local item in the queue makes
+    // drain_all yield a non-Prepared item and takes the `else` arm. The issue
+    // records that the source finding treated this as an aside and named the
+    // rarer clone failure as the trigger.
+    cos_queue_push_back(
+        queue,
+        CoSPendingTxItem::Local(TxRequest {
+            bytes: vec![0u8; 1500],
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: Some(key_a.clone()),
+            egress_ifindex: 42,
+            cos_queue_id: Some(4),
+            dscp_rewrite: None,
+            mirror_clone: false,
+            enqueue_ns: 0,
+        }),
+    );
+
+    let pre_vtime = test_flow_fair_state(queue).queue_vtime;
+    let pre_head_a = test_flow_fair_state(queue).flow_bucket_head_finish_bytes[bucket_a];
+    let pre_head_b = test_flow_fair_state(queue).flow_bucket_head_finish_bytes[bucket_b];
+    let pre_tail_a = test_flow_fair_state(queue).flow_bucket_tail_finish_bytes[bucket_a];
+    let pre_tail_b = test_flow_fair_state(queue).flow_bucket_tail_finish_bytes[bucket_b];
+    assert!(
+        pre_head_a > 0 && pre_head_b > 0,
+        "fixture: both buckets must carry a frontier, else the assertions below \
+         compare zero to zero and pass no matter what the code does"
+    );
+
+    let mut free_tx_frames = VecDeque::from([512]);
+    let mut pending_fill_frames = VecDeque::new();
+    let demoted = demote_prepared_cos_queue_to_local(
+        &area,
+        &mut free_tx_frames,
+        &mut pending_fill_frames,
+        7,
+        &mut root,
+        Some(4),
+        None,
+    );
+    assert!(
+        !demoted,
+        "fixture: the demote must FAIL for this cell to exercise the rollback \
+         path at all; a success here means the Local item did not take the \
+         `else` arm and every assertion below is measuring the success path"
+    );
+
+    let queue = &mut root.queues[0];
+    assert_eq!(
+        test_flow_fair_state(queue).queue_vtime,
+        pre_vtime,
+        "#9066: queue_vtime must round-trip across the demote FAILURE path"
+    );
+    assert_eq!(
+        test_flow_fair_state(queue).flow_bucket_head_finish_bytes[bucket_a],
+        pre_head_a,
+        "#9066: head_finish[A] inflated by the rollback. cos_queue_restore_front \
+         is round-trip neutral for ONE bucket only; across several, this bucket \
+         comes back carrying the bytes of the others drained ahead of it, and a \
+         flow arriving next anchors at vtime + bytes and jumps the whole \
+         restored backlog (#926's inversion, on the failure path)"
+    );
+    assert_eq!(
+        test_flow_fair_state(queue).flow_bucket_head_finish_bytes[bucket_b],
+        pre_head_b,
+        "#9066: head_finish[B] inflated by the rollback"
+    );
+    assert_eq!(
+        test_flow_fair_state(queue).flow_bucket_tail_finish_bytes[bucket_a],
+        pre_tail_a,
+        "#9066: tail_finish[A] inflated by the rollback"
+    );
+    assert_eq!(
+        test_flow_fair_state(queue).flow_bucket_tail_finish_bytes[bucket_b],
+        pre_tail_b,
+        "#9066: tail_finish[B] inflated by the rollback"
+    );
+}
+
+#[test]
 fn demote_prepared_cos_queue_to_local_skips_non_exact_queue() {
     let area = MmapArea::new(4096).expect("mmap");
     unsafe { area.slice_mut_unchecked(64, 4) }

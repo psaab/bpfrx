@@ -1527,6 +1527,32 @@ pub(super) fn resolve_cos_queue_idx(
     Some(default_idx())
 }
 
+/// Put back the MQFQ frontier snapshot taken before `cos_queue_drain_all`
+/// (#926, all exits since #9066).
+///
+/// Extracted so the success path and BOTH failure paths cannot drift: the
+/// failure paths used to skip it on the stated ground that
+/// `cos_queue_restore_front` is "round-trip neutral per #913 §3.7". It is —
+/// for ONE bucket. Across several, each bucket's frontier comes back inflated
+/// by the bytes of the other buckets drained ahead of its own last item, so a
+/// flow arriving right after a failed demote anchors at `vtime + bytes` and is
+/// served ahead of the whole restored backlog.
+///
+/// A no-op when nothing was saved (no flow-fair state), which is the
+/// single-bucket-configuration case and the reason this went unnoticed.
+fn restore_flow_fair_frontier(
+    queue: &mut CoSQueueRuntime,
+    saved: Option<(u64, [u64; COS_FLOW_FAIR_BUCKETS], [u64; COS_FLOW_FAIR_BUCKETS])>,
+) {
+    if let (Some(ff), Some((saved_queue_vtime, saved_head_finish, saved_tail_finish))) =
+        (queue.flow_fair_state.as_mut(), saved)
+    {
+        ff.queue_vtime = saved_queue_vtime;
+        ff.flow_bucket_head_finish_bytes = saved_head_finish;
+        ff.flow_bucket_tail_finish_bytes = saved_tail_finish;
+    }
+}
+
 pub(in crate::afxdp) fn demote_prepared_cos_queue_to_local(
     area: &MmapArea,
     free_tx_frames: &mut VecDeque<u64>,
@@ -1554,9 +1580,28 @@ pub(in crate::afxdp) fn demote_prepared_cos_queue_to_local(
     // (max(tail, queue_vtime) + bytes), letting any new flow Y
     // enqueued immediately after demotion jump ahead of the
     // demoted backlog — the temporal-inversion bug class #911 /
-    // #913 was supposed to prevent. The failure-rollback path
+    // #913 was supposed to prevent.
+    //
+    // #9066: this comment used to end "The failure-rollback path
     // (cos_queue_restore_front) is round-trip neutral per #913
-    // §3.7 and stays correct without snapshot/restore.
+    // §3.7 and stays correct without snapshot/restore." THAT IS
+    // TRUE FOR A SINGLE BUCKET AND FALSE FOR SEVERAL. Measured on
+    // three flows x two packets at vtime 5000, forced down the
+    // Local-head `else` arm: bucket head_finish moved +4200,
+    // +2700 and +3300 respectively, because each bucket's frontier
+    // is inflated by the bytes of the OTHER buckets drained ahead
+    // of its own last item. vtime round-trips exactly and the
+    // relative order among restored buckets survives, so this is
+    // not "corrupt scheduler state" — what it is, is a NEWCOMER
+    // anchoring at vtime + bytes and being served ahead of the
+    // entire restored backlog. That is #926's temporal inversion,
+    // fixed on the success path and left open on the failure one.
+    //
+    // The restore now runs on ALL THREE exits (see
+    // restore_flow_fair_frontier below). The single-bucket cell
+    // mqfq_push_front_is_neutral_on_drained_bucket_round_trip
+    // cannot see this by construction — with one bucket there are
+    // no other buckets to drain ahead of it.
     //
     // Single-worker invariant (Gemini R2): demote and pop run
     // in the same worker thread, and any in-flight pop's
@@ -1585,10 +1630,14 @@ pub(in crate::afxdp) fn demote_prepared_cos_queue_to_local(
     for item in &drained {
         let CoSPendingTxItem::Prepared(req) = item else {
             cos_queue_restore_front(queue, drained);
+            // #9066: the frontier restore runs here too. cos_queue_restore_front
+            // is NOT round-trip neutral across multiple buckets.
+            restore_flow_fair_frontier(queue, saved_flow_fair_frontier);
             return false;
         };
         let Some(local_req) = clone_prepared_request_for_cos(area, req) else {
             cos_queue_restore_front(queue, drained);
+            restore_flow_fair_frontier(queue, saved_flow_fair_frontier);
             return false;
         };
         local_items.push_back(CoSPendingTxItem::Local(local_req));
@@ -1613,13 +1662,7 @@ pub(in crate::afxdp) fn demote_prepared_cos_queue_to_local(
     // so the saved per-bucket head/tail finish-times still
     // apply. Restoring queue_vtime alongside keeps the three
     // values internally consistent.
-    if let (Some(ff), Some((saved_queue_vtime, saved_head_finish, saved_tail_finish))) =
-        (queue.flow_fair_state.as_mut(), saved_flow_fair_frontier)
-    {
-        ff.queue_vtime = saved_queue_vtime;
-        ff.flow_bucket_head_finish_bytes = saved_head_finish;
-        ff.flow_bucket_tail_finish_bytes = saved_tail_finish;
-    }
+    restore_flow_fair_frontier(queue, saved_flow_fair_frontier);
 
     // #940: explicit V_min publish after the demote restore. The
     // pop-time publish was removed in #940; without this hook,
