@@ -126,22 +126,60 @@ func zeroizeConfigDir(configDir, configBase string) error {
 		}
 	}
 
+	// #9013: paths that turned out to be SYMLINKS and were therefore NOT erased.
+	// os.Remove / os.RemoveAll act on the LINK when the final component is one:
+	// they unlink it, return nil, and the real bytes stay on the target volume
+	// while the operator is told "System zeroized. Configuration erased." The
+	// predicate is shared with configstore rather than re-spelled here — this
+	// erase logic exists TWICE (configstore.FactoryResetConfigDir is the twin,
+	// and has no non-test caller), which is exactly how a guard lands on one of
+	// a pair and silently misses the reachable one.
+	var skipped []configstore.SymlinkedTarget
+
 	dbDir := filepath.Join(configDir, ".configdb")
-	// KEY-FIRST (#4576): master.key before the encrypted DB body. Make the key
-	// unlink DURABLE before the ciphertext is removed (#5197) — fsync .configdb
-	// so the key removal is on stable storage before RemoveAll begins.
-	// Otherwise a power cut could persist the ciphertext removal while losing
-	// the key removal, defeating the key-first cryptographic-erasure guarantee.
-	keyErr := os.Remove(filepath.Join(dbDir, "master.key"))
-	fail(keyErr)
-	if keyErr == nil {
-		// The key existed and was unlinked: make that unlink durable before the
-		// ciphertext body removal. Absent .configdb → ErrNotExist, excluded by fail().
-		fail(zeroizeSyncDir(dbDir))
+	// #9013: this precedes EVERY removal in the DB block, and the ordering is the
+	// point. If .configdb is a symlink the key removal resolves THROUGH it and
+	// destroys the real master.key, while the RemoveAll that follows only unlinks
+	// the directory link — leaving active.json / candidate.json / rollback.N.json
+	// behind. On a DB with no `system master-password` (the default, so encryption
+	// is off — maybeEncryptTreeJSON returns the plaintext) that body is the full
+	// cleartext config, and the key-first cryptographic-erasure guarantee buys
+	// nothing at all.
+	if sk, isLink := configstore.SymlinkTarget(dbDir); isLink {
+		slog.Warn("zeroize: .configdb is a symlink; NOT erasing it — removing it would "+
+			"destroy master.key through the link and leave the config body",
+			"dir", sk.Path, "target", sk.Target)
+		skipped = append(skipped, sk)
+	} else if sk, isLink := configstore.SymlinkTarget(filepath.Join(dbDir, "master.key")); isLink {
+		// The INVERSE shape: a real .configdb holding a symlinked key. os.Remove
+		// unlinks the LINK, so the real key survives while the body below is
+		// erased — cryptographic erasure defeated in the other direction, since
+		// against a backup of the encrypted DB a surviving key is the whole
+		// secret. The body erase still proceeds: the key cannot be destroyed (the
+		// link may point at a volume xpf does not own), but removing the
+		// ciphertext leaves nothing on this box for it to decrypt.
+		slog.Warn("zeroize: .configdb/master.key is a symlink; NOT erasing it — removing "+
+			"it would unlink the link and leave the real key material",
+			"path", sk.Path, "target", sk.Target)
+		skipped = append(skipped, sk)
+		fail(os.RemoveAll(dbDir))
+	} else {
+		// KEY-FIRST (#4576): master.key before the encrypted DB body. Make the key
+		// unlink DURABLE before the ciphertext is removed (#5197) — fsync .configdb
+		// so the key removal is on stable storage before RemoveAll begins.
+		// Otherwise a power cut could persist the ciphertext removal while losing
+		// the key removal, defeating the key-first cryptographic-erasure guarantee.
+		keyErr := os.Remove(filepath.Join(dbDir, "master.key"))
+		fail(keyErr)
+		if keyErr == nil {
+			// The key existed and was unlinked: make that unlink durable before the
+			// ciphertext body removal. Absent .configdb → ErrNotExist, excluded by fail().
+			fail(zeroizeSyncDir(dbDir))
+		}
+		// The config SSOT (active.json, candidate.json, rollback.N.json + any
+		// residual key). RemoveAll erases the whole tree and is nil on absent.
+		fail(os.RemoveAll(dbDir))
 	}
-	// The config SSOT (active.json, candidate.json, rollback.N.json + any
-	// residual key). RemoveAll erases the whole tree and is nil on absent.
-	fail(os.RemoveAll(dbDir))
 
 	// The self-signed REST-API TLS material (#4599): tls/key.pem (the
 	// device-generated localhost HTTPS private key) + tls/cert.pem. These are
@@ -149,7 +187,17 @@ func zeroizeConfigDir(configDir, configBase string) error {
 	// regenerates a fresh pair on absence at the next boot, so removing them is
 	// safe. A subdir, so the top-level ReadDir loop's os.Remove never catches it;
 	// erase the whole tree explicitly.
-	fail(os.RemoveAll(filepath.Join(configDir, "tls")))
+	// #9013: a symlinked tls/ leaves key.pem — the device HTTPS PRIVATE KEY — on
+	// the target volume. Not a shape the issue named; found by censusing every
+	// path this function erases rather than only the two reported.
+	if sk, isLink := configstore.SymlinkTarget(filepath.Join(configDir, "tls")); isLink {
+		slog.Warn("zeroize: tls/ is a symlink; NOT erasing it — removing it would "+
+			"unlink the link and leave the REST-API private key",
+			"dir", sk.Path, "target", sk.Target)
+		skipped = append(skipped, sk)
+	} else {
+		fail(os.RemoveAll(filepath.Join(configDir, "tls")))
+	}
 
 	// Top-level artifacts in a single ReadDir pass. #5768: match ONLY names xpf
 	// itself created/tracks — the live config file, the rescue config, the audit
@@ -176,7 +224,19 @@ func zeroizeConfigDir(configDir, configBase string) error {
 			strings.HasPrefix(name, ".config.journal.") ||
 			isTextRollbackFile(name, configBase) || // <configBase>.<N> text slots
 			isFsatomicTemp(name) {
-			fail(os.Remove(filepath.Join(configDir, name)))
+			full := filepath.Join(configDir, name)
+			// #9013: the live config, the rescue config, the audit journal and the
+			// numbered rollback slots each carry the full config TEXT with
+			// cleartext secret leaves. os.Remove on a symlink unlinks the link and
+			// returns nil, so record and skip instead.
+			if sk, isLink := configstore.SymlinkTarget(full); isLink {
+				slog.Warn("zeroize: config artifact is a symlink; NOT erasing it — "+
+					"removing it would unlink the link and leave the config text",
+					"path", sk.Path, "target", sk.Target)
+				skipped = append(skipped, sk)
+				continue
+			}
+			fail(os.Remove(full))
 		}
 	}
 
@@ -187,6 +247,17 @@ func zeroizeConfigDir(configDir, configBase string) error {
 	// reported as a clean zeroize. ErrNotExist (configDir absent) is excluded
 	// by fail().
 	fail(zeroizeSyncDir(configDir))
+	// #9013: a SKIPPED erase outranks a FAILED one — an erasure that did not
+	// happen AT ALL is strictly worse than one that failed, because only the
+	// latter announces itself (the #7173 doctrine, stated for the archive).
+	// Joined so a real I/O failure is not swallowed; errors.As finds either.
+	if len(skipped) > 0 {
+		symErr := &configstore.FactoryResetSymlinkError{Skipped: skipped}
+		if firstErr != nil {
+			return errors.Join(symErr, firstErr)
+		}
+		return symErr
+	}
 	return firstErr
 }
 
