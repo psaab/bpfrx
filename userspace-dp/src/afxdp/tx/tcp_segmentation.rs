@@ -92,7 +92,11 @@ pub(super) fn segment_forwarded_tcp_frames_into_prepared(
         return None;
     }
     let tcp_flags = *payload.get(tcp_offset + 13)?;
-    if (tcp_flags & (TCP_FLAG_SYN | TCP_FLAG_FIN | TCP_FLAG_RST)) != 0 {
+    // #9116: SYN and RST decline; FIN does not. See the twin in
+    // `frame/tcp_segmentation.rs` for the full rationale — the two admission
+    // gates must agree, and both rely on `finalize_tcp_segment_headers` (shared)
+    // to carry FIN on the LAST segment only.
+    if (tcp_flags & (TCP_FLAG_SYN | TCP_FLAG_RST)) != 0 {
         return None;
     }
     let segment_payload_max = mtu.checked_sub(ip_header_len + tcp_header_len)?;
