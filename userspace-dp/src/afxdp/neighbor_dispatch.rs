@@ -731,7 +731,11 @@ pub(super) fn learn_dynamic_neighbor_from_packet(
     }
     let mut src_mac = [0u8; 6];
     src_mac.copy_from_slice(&frame[6..12]);
-    if src_mac == [0; 6] || (src_mac[0] & 1) != 0 {
+    // #9115: routed through the shared predicate rather than spelled inline.
+    // This test existed HERE and nowhere else, while the ARP-reply and NDP-NA
+    // learn arms in poll_stages.rs had none — a shared name is what keeps the
+    // three from drifting again.
+    if !crate::afxdp::frame::neighbor_mac_is_learnable(src_mac) {
         return;
     }
     let learned = LearnedNeighborKey {

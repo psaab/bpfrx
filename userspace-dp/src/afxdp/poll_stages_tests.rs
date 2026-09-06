@@ -1233,10 +1233,25 @@ fn ndp_na_frame() -> (Vec<u8>, IpAddr, [u8; 6]) {
 /// Used by the #2851 own-IP anti-poisoning tests to advertise one of
 /// the router's OWN configured IPv6 addresses.
 fn ndp_na_frame_with_target(target_bytes: [u8; 16]) -> (Vec<u8>, IpAddr, [u8; 6]) {
+    ndp_na_frame_with_target_and_mac(target_bytes, [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
+}
+
+/// #9115: as `ndp_na_frame_with_target`, with the TLLA hardware address chosen
+/// by the caller.
+///
+/// A cell CANNOT get this by rewriting the finished frame's bytes: the builder
+/// stamps the ICMPv6 checksum over the TLLA, and the NA parser is strict about
+/// it, so a post-hoc edit makes `parse_ndp_neighbor_advert` return None and the
+/// cell then passes for the wrong reason — it measures a malformed frame rather
+/// than the guard. That is exactly what a first version of the #9115 NDP cells
+/// did, and the mutation that should have killed them survived.
+fn ndp_na_frame_with_target_and_mac(
+    target_bytes: [u8; 16],
+    target_mac: [u8; 6],
+) -> (Vec<u8>, IpAddr, [u8; 6]) {
     const NEXT_HEADER_ICMPV6: u8 = 58;
     const ICMPV6_TYPE_NA: u8 = 136;
     const NDP_OPT_TARGET_LL: u8 = 2;
-    let target_mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
     let mut f = Vec::new();
     f.extend_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]); // dst
     f.extend_from_slice(&target_mac); // src
@@ -4255,3 +4270,172 @@ mod pptp_dispatch_join_tests_7699 {
         assert_eq!(inbox.dropped_count(), 1, "the drop was not counted");
     }
 }
+
+// ---------------------------------------------------------------------------
+// #9115: a neighbour entry must never be learned FOR a group or all-zero MAC.
+// ---------------------------------------------------------------------------
+
+/// #9115: the ARP-reply learn arm must REFUSE a broadcast, multicast or
+/// all-zero sender hardware address.
+///
+/// Both `poll_stages.rs` learn arms gated on the IP alone
+/// (`neighbor_ip_is_learnable` + `!owns_configured_ip`) and then inserted
+/// whatever MAC the frame carried into `dynamic_neighbors` AND programmed it
+/// into the kernel. The sibling RX-learn arm in `neighbor_dispatch.rs` has
+/// always refused exactly these; these two never did.
+///
+/// A neighbour entry programmed with a group address is a cache-poisoning
+/// primitive rather than merely a wrong entry: traffic for the victim IP is
+/// then addressed to a group and reaches every station on the segment, and the
+/// firewall's own switch port can be MAC-flapped or err-disabled.
+#[test]
+fn arp_reply_learn_refuses_group_and_zero_macs_9115() {
+    let forwarding: &'static ForwardingState = Box::leak(Box::new(build_forwarding_state(
+        &super::super::test_fixtures::nat_snapshot(),
+    )));
+    let (ctx, neighbors) = neighbor_learn_ctx(forwarding);
+
+    for (label, ip, mac) in [
+        (
+            "broadcast",
+            Ipv4Addr::new(172, 16, 80, 71),
+            [0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+        ),
+        (
+            "ipv4 multicast",
+            Ipv4Addr::new(172, 16, 80, 72),
+            [0x01, 0x00, 0x5e, 0x01, 0x02, 0x03],
+        ),
+        (
+            "all-zero",
+            Ipv4Addr::new(172, 16, 80, 73),
+            [0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+        ),
+    ] {
+        let _ = classify(&arp_reply_frame(ip, mac), link_layer_meta(11, 80), ctx);
+        assert_eq!(
+            neighbors.get(&(12, IpAddr::V4(ip))).map(|e| e.mac),
+            None,
+            "an ARP reply carrying a {label} sender MAC must NOT be learned — a \
+             neighbour entry on a group address is a cache-poisoning primitive \
+             (#9115)"
+        );
+    }
+}
+
+/// CONTROL: an ordinary UNICAST sender MAC is still learned.
+///
+/// Without this row a guard that refused every ARP reply would satisfy the
+/// assertions above while disabling neighbour learning entirely — which breaks
+/// forwarding, a strictly worse outcome than the defect.
+#[test]
+fn arp_reply_learn_still_accepts_unicast_mac_9115() {
+    let forwarding: &'static ForwardingState = Box::leak(Box::new(build_forwarding_state(
+        &super::super::test_fixtures::nat_snapshot(),
+    )));
+    let (ctx, neighbors) = neighbor_learn_ctx(forwarding);
+
+    let ip = Ipv4Addr::new(172, 16, 80, 74);
+    let mac = [0x02, 0x00, 0x00, 0x00, 0x62, 0x74];
+    assert_eq!(mac[0] & 0x01, 0, "fixture precondition: unicast MAC");
+    let _ = classify(&arp_reply_frame(ip, mac), link_layer_meta(11, 80), ctx);
+    assert_eq!(
+        neighbors.get(&(12, IpAddr::V4(ip))).map(|e| e.mac),
+        Some(mac),
+        "an ordinary unicast ARP reply must still be learned — the #9115 guard is \
+         on the MAC's group/zero shape, not on ARP replies as such"
+    );
+}
+
+/// #9115 direct predicate coverage, mirroring the #2790 cell that covers the
+/// IP-side predicate next to it.
+#[test]
+fn neighbor_mac_is_learnable_rejects_group_and_zero_9115() {
+    use crate::afxdp::frame::neighbor_mac_is_learnable;
+    assert!(!neighbor_mac_is_learnable([0, 0, 0, 0, 0, 0]), "all-zero");
+    assert!(
+        !neighbor_mac_is_learnable([0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
+        "broadcast"
+    );
+    assert!(
+        !neighbor_mac_is_learnable([0x01, 0x00, 0x5e, 0, 0, 1]),
+        "IPv4 multicast"
+    );
+    assert!(
+        !neighbor_mac_is_learnable([0x33, 0x33, 0, 0, 0, 1]),
+        "IPv6 multicast"
+    );
+    // The I/G bit is the low bit of the FIRST octet — an odd byte anywhere else
+    // must not be mistaken for it.
+    assert!(
+        neighbor_mac_is_learnable([0x02, 0x01, 0x01, 0x01, 0x01, 0x01]),
+        "unicast with odd bytes after the first octet is still unicast"
+    );
+    assert!(neighbor_mac_is_learnable([0x02, 0, 0, 0, 0, 1]), "ordinary unicast");
+}
+
+/// #9115: the NDP-NA learn arm must refuse a group / all-zero target
+/// link-layer address, exactly as the ARP arm does.
+///
+/// This cell exists because the ARP cells alone do NOT bind it: mutating the
+/// NDP arm's guard away while leaving the ARP arm's in place compiled and
+/// survived the ENTIRE suite. Two learn arms need two bindings.
+///
+/// The NA's TLLA option carries the address that gets programmed, so it is
+/// rewritten in place here rather than by a new frame builder — byte 6 of the
+/// TLLA option is where `ndp_na_frame_with_target` writes `target_mac`.
+#[test]
+fn ndp_na_learn_refuses_group_and_zero_macs_9115() {
+    let forwarding: &'static ForwardingState = Box::leak(Box::new(build_forwarding_state(
+        &super::super::test_fixtures::nat_snapshot(),
+    )));
+    let (ctx, neighbors) = neighbor_learn_ctx(forwarding);
+
+    for (label, last_octet, bad_mac) in [
+        ("broadcast", 0x91u8, [0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
+        ("ipv6 multicast", 0x92, [0x33, 0x33, 0x00, 0x00, 0x00, 0x01]),
+        ("all-zero", 0x93, [0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
+    ] {
+        let mut target = [0u8; 16];
+        target[0] = 0x20;
+        target[1] = 0x01;
+        target[15] = last_octet;
+        let (frame, ip, mac) = ndp_na_frame_with_target_and_mac(target, bad_mac);
+        assert_eq!(mac, bad_mac, "fixture builds the NA with the bad TLLA");
+        // The frame must still PARSE — otherwise this cell would pass because
+        // the NA was malformed rather than because the guard refused it.
+        assert!(
+            crate::afxdp::parser::parse_ndp_neighbor_advert(&frame).is_some(),
+            "fixture precondition: the NA must parse (a post-hoc byte edit breaks \
+             the ICMPv6 checksum and makes this cell vacuous)"
+        );
+
+        let _ = classify(&frame, link_layer_meta(11, 80), ctx);
+        assert_eq!(
+            neighbors.get(&(12, ip)).map(|e| e.mac),
+            None,
+            "an NDP NA carrying a {label} target link-layer address must NOT be \
+             learned (#9115)"
+        );
+    }
+}
+
+/// CONTROL for the NDP arm: an ordinary unicast TLLA is still learned.
+#[test]
+fn ndp_na_learn_still_accepts_unicast_mac_9115() {
+    let forwarding: &'static ForwardingState = Box::leak(Box::new(build_forwarding_state(
+        &super::super::test_fixtures::nat_snapshot(),
+    )));
+    let (ctx, neighbors) = neighbor_learn_ctx(forwarding);
+
+    let (frame, ip, mac) = ndp_na_frame();
+    assert_eq!(mac[0] & 0x01, 0, "fixture precondition: unicast TLLA");
+    let _ = classify(&frame, link_layer_meta(11, 80), ctx);
+    assert_eq!(
+        neighbors.get(&(12, ip)).map(|e| e.mac),
+        Some(mac),
+        "an ordinary unicast NA must still be learned — the #9115 guard is on the \
+         MAC's group/zero shape, not on NAs as such"
+    );
+}
+

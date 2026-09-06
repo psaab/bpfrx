@@ -195,7 +195,13 @@ fn outline_arp_reply_learn_and_program(
     neigh_limiter: &mut KernelNeighborProgramLimiter,
     worker_ctx: &WorkerContext,
 ) {
-    if neighbor_ip_is_learnable(arp.sender_ip)
+    // #9115: the sender's HARDWARE address must be learnable too. These arms
+    // gated on the IP alone, so an ARP reply carrying a multicast, broadcast or
+    // all-zero sender MAC was inserted into the neighbour cache AND programmed
+    // into the kernel. The sibling RX-learn arm (neighbor_dispatch.rs) has
+    // always enforced this; these two never did.
+    if neighbor_mac_is_learnable(arp.sender_mac)
+        && neighbor_ip_is_learnable(arp.sender_ip)
         && !worker_ctx.forwarding.owns_configured_ip(arp.sender_ip)
     {
         let ifindex = resolve_ingress_logical_ifindex(
@@ -268,7 +274,10 @@ fn outline_ndp_na_learn_and_program(
     neigh_limiter: &mut KernelNeighborProgramLimiter,
     worker_ctx: &WorkerContext,
 ) {
-    if neighbor_ip_is_learnable(na.target_ip)
+    // #9115: the NA's target link-layer address must be learnable too — see the
+    // ARP arm above and `neighbor_mac_is_learnable`.
+    if neighbor_mac_is_learnable(mac)
+        && neighbor_ip_is_learnable(na.target_ip)
         && !worker_ctx.forwarding.owns_configured_ip(na.target_ip)
     {
         let ifindex = resolve_ingress_logical_ifindex(

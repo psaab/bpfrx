@@ -100,6 +100,7 @@ pub(in crate::afxdp) use inspect::{
     L3_CTX_NONE_UNSPECIFIED_ADDR, is_non_first_fragment, l3_enforcement_flow_from_meta,
     l3_session_flow_from_meta,
     l2_dst_is_group_or_broadcast, meta_icmp_identifier_bearing, neighbor_ip_is_learnable,
+    neighbor_mac_is_learnable,
     parse_session_flow,
     source_is_invalid_for_icmp_error,
     src_is_directed_broadcast, term_match_extra_from_frame,
