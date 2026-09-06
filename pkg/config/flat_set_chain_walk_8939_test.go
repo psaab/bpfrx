@@ -326,12 +326,39 @@ func flatSetChainPairs() []flatSetChainRow {
 // flatSetAdmittedAnyOrder reports whether ANY leaf order is admitted.
 //
 // #9100: the channel column tested the ALPHABETICAL order only, which is not
-// what an operator is constrained to. lane-8388 established that a flat run is
-// rejected iff the leaf it STARTS at declares a type/validator -- a validated
-// leaf routes to the typed-leaf branch, whose modifier-child check refuses the
-// trailing tokens, while an untyped `args:1` leaf falls through to the
-// container branch that by #3332's compiler-faithful contract deliberately
-// ignores leftover Keys. So REACHABILITY IS ORDER-DEPENDENT WITHIN ONE
+// what an operator is constrained to.
+//
+// #9113 CORRECTS THE RULE THIS COMMENT USED TO STATE. It said a flat run is
+// rejected iff the leaf it STARTS at declares a type/validator. That is HALF.
+// Measured through compileTreeStrict across four containers:
+//
+//	container                    unknown-kw   run@untyped   run@typed
+//	system login class           ACCEPT       ACCEPT        REJECT
+//	security ike gateway         ACCEPT       ACCEPT        REJECT
+//	security ipsec proposal      REJECT       REJECT        REJECT
+//	security flow tcp-session    REJECT       --            REJECT
+//
+//	A flat run is ACCEPTED iff the container is OPEN-WORLD *and* the leaf it
+//	starts at is UNTYPED. Either condition alone rejects it.
+//
+// `security ipsec proposal` is the counter-example that falsifies the
+// leaf-only form: its starting leaf is untyped (`validator=false valueType=0`)
+// and the run is rejected anyway, because #4313 made that container
+// closed-world. The container half is lane-8526's (their #9091 measures it
+// directly at 102 containers); the leaf half is lane-8388's; NEITHER IS THE
+// DISCRIMINATOR ALONE.
+//
+// THE COLUMN ITSELF WAS NEVER WRONG, and the distinction matters for how much
+// to trust it: it calls SchemaValidateWithDefinitions, which is the real gate,
+// so every row's verdict is measured rather than derived from this rule. What
+// was wrong is the EXPLANATION -- the third time this file has carried a
+// correct measurement under a wrong account of why.
+//
+// The mechanism, now stated for the leaf half only: a validated leaf routes to
+// the typed-leaf branch, whose modifier-child check refuses the trailing
+// tokens, while an untyped `args:1` leaf falls through to the container branch
+// that by #3332's compiler-faithful contract deliberately ignores leftover
+// Keys. That is why REACHABILITY IS ORDER-DEPENDENT WITHIN AN OPEN-WORLD
 // CONTAINER:
 //
 //	ike gateway   address A external-interface E   ACCEPTED
