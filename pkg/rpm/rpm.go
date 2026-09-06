@@ -755,7 +755,27 @@ func (m *Manager) executeProbe(ctx context.Context, test *config.RPMTest, key st
 
 func (m *Manager) probeTCP(ctx context.Context, test *config.RPMTest, opts probeSockOpts) (time.Duration, error) {
 	port := test.EffectiveDestinationPort()
-	addr := net.JoinHostPort(test.Target, fmt.Sprintf("%d", port))
+
+	// #9026: an IPv6 link-local target must carry a scope, exactly as
+	// probeICMP requires. Without this, an unscopeable fe80:: target dialed,
+	// failed, and was wrapped as a generic error — which pkg/rpm counts as PATH
+	// LOSS, and `services ip-monitoring` drives preferred-route injection off
+	// that. A probe that never left the box could fail over a WAN.
+	//
+	// Resolved BEFORE the dial so the address carries its zone; a bare fe80::
+	// with no zone returns ErrProbeSetup and the test HOLDS.
+	target := test.Target
+	if ip, zone := splitTargetZone9026(target); ip != nil {
+		resolved, zerr := m.resolveLinkLocalZone9026("tcp", ip, zone, test.DestinationInterface)
+		if zerr != nil {
+			return 0, zerr
+		}
+		if resolved != "" {
+			target = ip.String() + "%" + resolved
+		}
+	}
+
+	addr := net.JoinHostPort(target, fmt.Sprintf("%d", port))
 	dialer, sink, err := probeDialer(5*time.Second, test.SourceAddress, opts)
 	if err != nil {
 		return 0, err
@@ -948,4 +968,16 @@ func carryProbeVerdict(res, prev *ProbeResult) {
 	res.TotalSent = prev.TotalSent
 	res.TotalRecv = prev.TotalRecv
 	res.LastProbeAt = prev.LastProbeAt
+}
+
+// splitTargetZone9026 parses a probe target literal into its IP and %zone.
+// Returns a nil IP when the target is a hostname rather than a literal — a
+// hostname cannot be a link-local scope question, and resolving it here would
+// duplicate the resolver the ICMP path uses.
+func splitTargetZone9026(target string) (net.IP, string) {
+	host, zone := target, ""
+	if i := strings.IndexByte(target, '%'); i >= 0 {
+		host, zone = target[:i], target[i+1:]
+	}
+	return net.ParseIP(host), zone
 }
