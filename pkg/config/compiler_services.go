@@ -1207,7 +1207,12 @@ func compileRPM(node *Node, svc *ServicesConfig) error {
 				test = &RPMTest{Name: testInst.name}
 			}
 
-			for _, prop := range testInst.node.Children {
+			// #8939: split a packed run. `test T target address 10.0.0.1 …`
+			// packs onto one node's Keys, so this switch read the first
+			// property and dropped the rest — including the probe TARGET, and
+			// a probe with no target is a probe that cannot detect the outage
+			// it was configured for.
+			for _, prop := range hoistAndSplitRun8939(testInst.node.Children, rpmProbeTestSchema8939()) {
 				switch prop.Name() {
 				case "probe-type":
 					test.ProbeType = nodeVal(prop)
