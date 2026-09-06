@@ -27,6 +27,7 @@ import (
 	"github.com/psaab/xpf/pkg/conntrack"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	ddnspkg "github.com/psaab/xpf/pkg/ddns"
+	"github.com/psaab/xpf/pkg/denyaudit"
 	"github.com/psaab/xpf/pkg/dhcp"
 	"github.com/psaab/xpf/pkg/dhcpserver"
 	"github.com/psaab/xpf/pkg/feeds"
@@ -1180,7 +1181,16 @@ func (s *Server) fabricAllowlistUnaryInterceptor(ctx context.Context, req interf
 	if info.FullMethod == pb.BpfrxService_SystemAction_FullMethodName && isFabricSafeSystemAction(req) {
 		return handler(ctx, req)
 	}
-	slog.Warn("fabric gRPC listener denied non-allowlisted method", "method", info.FullMethod)
+	// #9042: network-exposed and attacker-paced. Keyed on the METHOD, which is
+	// a bounded set (the allowlist's complement over the service's own method
+	// names), so the key space cannot be grown by a caller.
+	if emit, suppressed := denyaudit.Note(denyaudit.SurfaceFabricMethod, info.FullMethod); emit {
+		slog.Warn("fabric gRPC listener denied non-allowlisted method",
+			"method", info.FullMethod, "suppressed_since_last", suppressed,
+			"denials_total", denyaudit.Total(denyaudit.SurfaceFabricMethod))
+	} else {
+		slog.Debug("fabric gRPC listener denied non-allowlisted method", "method", info.FullMethod)
+	}
 	return nil, status.Errorf(codes.PermissionDenied, "method %s is not permitted on the cluster fabric listener", info.FullMethod)
 }
 
@@ -1191,7 +1201,14 @@ func (s *Server) fabricAllowlistStreamInterceptor(srv interface{}, ss grpc.Serve
 	if fabricAllowedStreamMethods[info.FullMethod] {
 		return handler(srv, ss)
 	}
-	slog.Warn("fabric gRPC listener denied non-allowlisted stream method", "method", info.FullMethod)
+	// #9042: as above, on the streaming interceptor.
+	if emit, suppressed := denyaudit.Note(denyaudit.SurfaceFabricStream, info.FullMethod); emit {
+		slog.Warn("fabric gRPC listener denied non-allowlisted stream method",
+			"method", info.FullMethod, "suppressed_since_last", suppressed,
+			"denials_total", denyaudit.Total(denyaudit.SurfaceFabricStream))
+	} else {
+		slog.Debug("fabric gRPC listener denied non-allowlisted stream method", "method", info.FullMethod)
+	}
 	return status.Errorf(codes.PermissionDenied, "stream method %s is not permitted on the cluster fabric listener", info.FullMethod)
 }
 

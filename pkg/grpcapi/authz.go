@@ -13,6 +13,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/authz"
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/denyaudit"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 )
 
@@ -290,11 +291,24 @@ func principalFromContext(ctx context.Context, cfg *config.Config) authz.Princip
 // The message reports only identity the caller already knows about ITSELF
 // (authz.Principal.String()), never another principal's and never a secret.
 func denyRPC(fullMethod string, required config.LoginClassPermission, p authz.Principal, reason error) error {
-	slog.Warn("gRPC call denied by login-class authorization (#5278)",
-		"method", fullMethod,
-		"required", authz.PermissionName(required),
-		"principal", p.String(),
-		"reason", reason.Error())
+	// #9042: bounded, and COUNTED whether or not it is logged. The denial
+	// path's rate is attacker-controlled -- every local non-root UID resolves
+	// to an empty-Class principal and is denied -- so an unconditional
+	// per-RPC Warn shipped to remote syslog at request rate and pushed xpfd's
+	// other lines past journald's cap. Keyed on the principal so one noisy
+	// caller cannot hide a first denial from a different one.
+	if emit, suppressed := denyaudit.Note(denyaudit.SurfaceGRPCLoginClass, p.String()); emit {
+		slog.Warn("gRPC call denied by login-class authorization (#5278)",
+			"method", fullMethod,
+			"required", authz.PermissionName(required),
+			"principal", p.String(),
+			"reason", reason.Error(),
+			"suppressed_since_last", suppressed,
+			"denials_total", denyaudit.Total(denyaudit.SurfaceGRPCLoginClass))
+	} else {
+		slog.Debug("gRPC call denied by login-class authorization (#5278)",
+			"method", fullMethod, "principal", p.String(), "reason", reason.Error())
+	}
 	return status.Error(codes.PermissionDenied, reason.Error()+grpcDenialRemedy)
 }
 
