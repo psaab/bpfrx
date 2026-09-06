@@ -255,6 +255,29 @@ set system services dhcp-local-server expired-leases-processing unwarned-cycles 
 (The `dhcpv6-local-server` hierarchy takes the same subtree; v4 and v6 are
 tuned independently because Kea renders the block once per family.)
 
+- **The per-subnet `interface` selector is handled OPPOSITELY in v4 and v6,
+  and that asymmetry is deliberate (#6520 / #1835 / #9122).** A group whose
+  member list was narrowed at runtime by the chassis-cluster master-RG filter
+  (`MembersFiltered`) has no pool→member edge, so the surviving interface
+  cannot be attributed to any particular pool.
+  - **v4 SUPPRESSES the selector** and lets Kea fall back to address-based
+    subnet selection. Emitting it would cross-bind a removed member's network
+    to the survivor's interface (#6520).
+  - **v6 REFUSES the group.** Kea v6 cannot fall back to address matching —
+    clients talk from link-local source addresses — so a `subnet6` with no
+    `interface` key is *unselectable*, and Kea silently answers no SOLICIT for
+    it. Before #9122 the narrowed group rendered exactly that: the
+    `len(Interfaces) > 1` guard sees the FILTERED list, which is a singleton,
+    so the loud path was bypassed and the outage was total and silent. It is
+    the STEADY state on an active/active pair, not a failover transient —
+    `filterDHCPConfigForMasterRGs` runs on the 2 s converger as well as on RG
+    edges.
+  - The v6 refusal carries its **own** message, distinct from the
+    authored-multi-interface one, because the remedies differ: "author one
+    DHCPv6 group per redundancy group" versus "split this over-broad group".
+  - **Never bind a narrowed v6 group to `Interfaces[0]`.** That is the #6520
+    cross-bind re-opened for v6: Kea would lease a foreign prefix on the
+    survivor's link.
 - **Reclamation is GLOBAL per family, NOT per pool.** Kea's
   `expired-leases-processing` is a top-level `Dhcp4`/`Dhcp6` block — there
   is no per-subnet reclamation. The config model therefore attaches to the
