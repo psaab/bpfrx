@@ -31,10 +31,24 @@ package config
 var dupConservationInventory8436 = []string{
 	// ---- SILENT: no commit gate at all. ----
 	//
-	// EMPTY, as of #8436's last batch. Every container the census could reach
-	// that lost configuration silently has been fixed; what remains below is
-	// conservation achieved by REFUSAL, where an operator is told rather than
-	// quietly given a different config.
+	// EMPTY, as of #8436's last batch — and read the qualifier, because it
+	// carries almost everything: every container the census COULD REACH that
+	// lost configuration silently has been fixed.
+	//
+	// Issue 9024 measured the reach. The census CHECKS 9 containers and lists
+	// 104 more as UNPROBED by name in dupConservationSkipped8436 (139 are
+	// eligible; the remainder are the `groups` re-host bucket, counted
+	// separately). So "SILENT: 0" is a statement about 9 containers, and two
+	// CONFIRMED silent drops sit in the unprobed set today
+	// (`forwarding-options sampling instance` and `snmp trap-group`, proven
+	// end-to-end in #9023).
+	//
+	// The hedge was true when written and did all the work of the sentence,
+	// which is how a reader arrives at "this class is handled". An empty
+	// section plus an unmeasured majority is not evidence of absence; it is
+	// evidence of reach. What remains below is conservation achieved by
+	// REFUSAL, where an operator is told rather than quietly given a different
+	// config.
 	//
 	// An empty section is not the end of the census's job — it is the state in
 	// which the census earns its keep, because the next NEW non-conserving
@@ -70,6 +84,108 @@ var dupConservationInventory8436 = []string{
 // one, so a container the census cannot probe is a recorded decision rather
 // than the one place a defect can hide from the guard #8436 asked for.
 var dupConservationSkipped8436 = []string{
+	// Issue 9024: the 85 containers below were INVISIBLE to this census until
+	// the collector stopped dropping them. They are ELIGIBLE -- named
+	// containers with children -- but no two-block fixture could be built, so
+	// the collector discarded them BEFORE the census ran. They reached neither
+	// the population nor this list, and the skip ratchet could not guard them
+	// because the ratchet guards the population and the population was
+	// filtered first.
+	//
+	// Measured: 139 eligible containers, 85 dropped (61%). The census was
+	// examining 9 of them and reporting "SILENT: 0".
+	//
+	// Two of these are CONFIRMED silent drops proven end-to-end elsewhere
+	// (#9023): `forwarding-options sampling instance` and `snmp trap-group`.
+	// They are listed here as UNPROBED, which is the honest state -- this
+	// census still cannot check them, and now says so by name instead of by
+	// omission. Fixing the fixture so they become CHECKED is the follow-on.
+	"applications application-set",
+	"chassis cluster control-ports fpc",
+	"chassis cluster redundancy-group",
+	"chassis cluster redundancy-group xpfname node",
+	"class-of-service classifiers dscp",
+	"class-of-service classifiers dscp xpfname forwarding-class",
+	"class-of-service classifiers dscp xpfname forwarding-class xpfname loss-priority",
+	"class-of-service classifiers ieee-802.1",
+	"class-of-service classifiers ieee-802.1 xpfname forwarding-class",
+	"class-of-service classifiers ieee-802.1 xpfname forwarding-class xpfname loss-priority",
+	"class-of-service classifiers inet-precedence",
+	"class-of-service classifiers inet-precedence xpfname forwarding-class",
+	"class-of-service classifiers inet-precedence xpfname forwarding-class xpfname loss-priority",
+	"class-of-service fairness rss-expectation interface",
+	"class-of-service interfaces xpfname shaping-rate",
+	"class-of-service interfaces xpfname unit xpfname shaping-rate",
+	"class-of-service rewrite-rules dscp",
+	"class-of-service rewrite-rules dscp xpfname forwarding-class",
+	"class-of-service rewrite-rules dscp xpfname forwarding-class xpfname loss-priority",
+	"class-of-service rewrite-rules exp",
+	"class-of-service rewrite-rules exp xpfname forwarding-class",
+	"class-of-service rewrite-rules exp xpfname forwarding-class xpfname loss-priority",
+	"class-of-service rewrite-rules ieee-802.1",
+	"class-of-service rewrite-rules ieee-802.1 xpfname forwarding-class",
+	"class-of-service rewrite-rules ieee-802.1 xpfname forwarding-class xpfname loss-priority",
+	"class-of-service rewrite-rules inet-precedence",
+	"class-of-service rewrite-rules inet-precedence xpfname forwarding-class",
+	"class-of-service rewrite-rules inet-precedence xpfname forwarding-class xpfname loss-priority",
+	"class-of-service scheduler-maps",
+	"class-of-service scheduler-maps xpfname forwarding-class",
+	"class-of-service schedulers xpfname buffer-size",
+	"class-of-service schedulers xpfname transmit-rate",
+	"event-options policy",
+	"event-options policy xpfname within",
+	"firewall family inet6 filter",
+	"firewall family inet6 filter xpfname term",
+	"firewall family inet filter",
+	"firewall family inet filter xpfname term",
+	"firewall policer",
+	"firewall three-color-policer",
+	"forwarding-options dhcp-relay group",
+	"forwarding-options port-mirroring instance",
+	"forwarding-options sampling instance",
+	"policy-options community",
+	"policy-options policy-statement",
+	"policy-options policy-statement xpfname term",
+	"protocols lldp interface",
+	"protocols ospf3 area",
+	"protocols ospf area",
+	"protocols ospf area xpfname interface xpfname authentication md5",
+	"protocols ospf area xpfname virtual-link",
+	"protocols router-advertisement interface xpfname nat64prefix",
+	"protocols router-advertisement interface xpfname nat-prefix",
+	"routing-options generate route",
+	"routing-options rib",
+	"routing-options rib xpfname static route xpfname next-hop",
+	"routing-options static route xpfname next-hop",
+	"security address-book global address-set",
+	"security dynamic-address address-name",
+	"security dynamic-address feed-server xpfname feed-name",
+	"security ipsec policy",
+	"security log profile",
+	"security nat destination pool",
+	"security nat destination rule-set",
+	"security nat destination rule-set xpfname rule",
+	"security nat proxy-arp interface",
+	"security nat source rule-set",
+	"security nat source rule-set xpfname rule",
+	"security nat static rule-set",
+	"security nat static rule-set xpfname rule",
+	"security policies from-zone",
+	"security screen ids-option",
+	"security zones security-zone xpfname address-book address-set",
+	"services ip-monitoring policy",
+	"services ip-monitoring policy xpfname then preferred-route routing-instance",
+	"services rpm probe",
+	"snmp community",
+	"snmp trap-group",
+	"snmp v3 usm local-engine user",
+	"system backup-router",
+	"system ntp threshold",
+	"system services dhcp-local-server group",
+	"system services dhcp-local-server group xpfname pool",
+	"system services dhcpv6-local-server group",
+	"system services dhcpv6-local-server group xpfname pool",
+
 	// ---- "a spelling did not parse or compile" (5). ----
 	//
 	// The synthesized duplicate did not survive commit, which is EITHER
