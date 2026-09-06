@@ -349,8 +349,8 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 					"simple-password": {desc: "Simple password", args: 1, placeholder: "<password>", children: nil},
 				}},
 				"bfd-liveness-detection": {desc: "BFD liveness detection", children: map[string]*schemaNode{
-					"minimum-interval": {desc: "Minimum interval", args: 1, placeholder: "<milliseconds>", children: nil},
-					"multiplier":       {desc: "Multiplier", args: 1, placeholder: "<multiplier>", children: nil},
+					"minimum-interval": {desc: "Minimum interval (milliseconds)", args: 1, valueType: ValueInteger, placeholder: "<milliseconds>", validator: ValidateInteger(10, 60000), children: nil},
+					"multiplier":       {desc: "Multiplier", args: 1, valueType: ValueInteger, placeholder: "<multiplier>", validator: ValidateInteger(2, 255), children: nil},
 				}},
 			}},
 			"area-type": {desc: "Area type", children: map[string]*schemaNode{
@@ -378,8 +378,8 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 				"retransmit-interval": {desc: "Retransmit interval (seconds)", args: 1, valueType: ValueInteger, placeholder: "<seconds>", validator: ValidateInteger(1, 65535), children: nil},
 				"priority":            {desc: "Router priority for DR election", args: 1, valueType: ValueInteger, placeholder: "<priority>", validator: ValidateInteger(0, 255), children: nil},
 				"bfd-liveness-detection": {desc: "BFD liveness detection", children: map[string]*schemaNode{
-					"minimum-interval": {desc: "Minimum interval", args: 1, placeholder: "<milliseconds>", children: nil},
-					"multiplier":       {desc: "Multiplier", args: 1, placeholder: "<multiplier>", children: nil},
+					"minimum-interval": {desc: "Minimum interval (milliseconds)", args: 1, valueType: ValueInteger, placeholder: "<milliseconds>", validator: ValidateInteger(10, 60000), children: nil},
+					"multiplier":       {desc: "Multiplier", args: 1, valueType: ValueInteger, placeholder: "<multiplier>", validator: ValidateInteger(2, 255), children: nil},
 				}},
 			}},
 		}},
@@ -395,10 +395,10 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 			"ibgp":        {desc: "Enable iBGP multipath", children: nil},
 		}},
 		"damping": {desc: "Route damping", children: map[string]*schemaNode{
-			"half-life":    {desc: "Half life", args: 1, placeholder: "<minutes>", children: nil},
-			"reuse":        {desc: "Reuse threshold", args: 1, placeholder: "<value>", children: nil},
-			"suppress":     {desc: "Suppress threshold", args: 1, placeholder: "<value>", children: nil},
-			"max-suppress": {desc: "Max suppress time", args: 1, placeholder: "<minutes>", children: nil},
+			"half-life":    {desc: "Half life (minutes)", args: 1, valueType: ValueInteger, placeholder: "<minutes>", validator: ValidateInteger(1, 45), children: nil},
+			"reuse":        {desc: "Reuse threshold", args: 1, valueType: ValueInteger, placeholder: "<value>", validator: ValidateInteger(1, 20000), children: nil},
+			"suppress":     {desc: "Suppress threshold", args: 1, valueType: ValueInteger, placeholder: "<value>", validator: ValidateInteger(1, 20000), children: nil},
+			"max-suppress": {desc: "Max suppress time (minutes)", args: 1, valueType: ValueInteger, placeholder: "<minutes>", validator: ValidateInteger(1, 255), children: nil},
 		}},
 		"export": {desc: "Export policy", args: 1, multi: true, placeholder: "<policy-name>", children: nil},
 		"import": {desc: "Import policy", args: 1, multi: true, placeholder: "<policy-name>", children: nil},
@@ -433,8 +433,8 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 				}},
 			}},
 			"bfd-liveness-detection": {desc: "BFD liveness detection", children: map[string]*schemaNode{
-				"minimum-interval": {desc: "Minimum interval", args: 1, placeholder: "<milliseconds>", children: nil},
-				"multiplier":       {desc: "Multiplier", args: 1, placeholder: "<multiplier>", children: nil},
+				"minimum-interval": {desc: "Minimum interval (milliseconds)", args: 1, valueType: ValueInteger, placeholder: "<milliseconds>", validator: ValidateInteger(10, 60000), children: nil},
+				"multiplier":       {desc: "Multiplier", args: 1, valueType: ValueInteger, placeholder: "<multiplier>", validator: ValidateInteger(2, 255), children: nil},
 			}},
 			"neighbor": {desc: "BGP neighbor", args: 1, placeholder: "<address>", children: map[string]*schemaNode{
 				"description":            {desc: "Description", args: 1, scalar: true, placeholder: "<text>", children: nil},
@@ -468,14 +468,34 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 					}},
 				}},
 				"bfd-liveness-detection": {desc: "BFD liveness detection", children: map[string]*schemaNode{
-					"minimum-interval": {desc: "Minimum interval", args: 1, placeholder: "<milliseconds>", children: nil},
-					"multiplier":       {desc: "Multiplier", args: 1, placeholder: "<multiplier>", children: nil},
+					"minimum-interval": {desc: "Minimum interval (milliseconds)", args: 1, valueType: ValueInteger, placeholder: "<milliseconds>", validator: ValidateInteger(10, 60000), children: nil},
+					"multiplier":       {desc: "Multiplier", args: 1, valueType: ValueInteger, placeholder: "<multiplier>", validator: ValidateInteger(2, 255), children: nil},
 				}},
 			}},
 		}},
 	}},
 	"rip": {desc: "RIP configuration", children: map[string]*schemaNode{
-		"group": {desc: "Group", args: 1, placeholder: "<group-name>", children: nil},
+		// #9151: `group` is a CONTAINER to the compiler and was a LEAF here.
+		// compiler_protocols.go's `case "group"` iterates child.Children and
+		// reads `neighbor` (-> RIP.Interfaces) and `export` (-> Redistribute),
+		// but this node declared `children: nil`, so the closed-world walk had
+		// nothing to descend into and nothing to reject. The consequence was
+		// operator-reachable: `set protocols rip group g1 authentication-key
+		// secret1` committed clean and lost BOTH the group content and the
+		// sibling authentication-key -- a RIP auth key, in the subsystem where
+		// a dropped authentication-type renders `mode text` (#9105).
+		//
+		// Both children are multi-value: the compiler reads them through
+		// firewallMatchValues, which takes Keys[1:] AND child nodes, so a
+		// bracket list `export [ a b ]` is not truncated to its first entry
+		// (#3904). Declaring them `multi: true` keeps the schema's account of
+		// the leaf and the compiler's read of it in agreement.
+		"group": {desc: "Group", args: 1, placeholder: "<group-name>", children: map[string]*schemaNode{
+			"neighbor": {desc: "Neighbor interface in this group", args: 1, multi: true,
+				valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: nil},
+			"export": {desc: "Protocols redistributed into this group", args: 1, multi: true,
+				placeholder: "<protocol>", children: nil},
+		}},
 		// multi (#3904): `neighbor`/`passive-interface`/`redistribute
 		// [ a b ]` bracket lists collapse onto the leaf's Keys[1:] instead
 		// of stranding every entry past the first as a child node. The
@@ -519,8 +539,8 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 				valueType: ValueEnumOf, valueDesc: "authentication type",
 				valueExamples: AuthTypeSpellings(), validator: ValidateAuthType, children: nil},
 			"bfd-liveness-detection": {desc: "BFD liveness detection", children: map[string]*schemaNode{
-				"minimum-interval": {desc: "Minimum interval", args: 1, placeholder: "<milliseconds>", children: nil},
-				"multiplier":       {desc: "Multiplier", args: 1, placeholder: "<multiplier>", children: nil},
+				"minimum-interval": {desc: "Minimum interval (milliseconds)", args: 1, valueType: ValueInteger, placeholder: "<milliseconds>", validator: ValidateInteger(10, 60000), children: nil},
+				"multiplier":       {desc: "Multiplier", args: 1, valueType: ValueInteger, placeholder: "<multiplier>", validator: ValidateInteger(2, 255), children: nil},
 			}},
 		}},
 		"authentication-key": {desc: "Authentication key", args: 1, placeholder: "<key>", children: nil},
@@ -876,8 +896,8 @@ var schemaRoutingInstances = &schemaNode{desc: "Routing instance configuration",
 						"simple-password": {desc: "Simple password", args: 1, placeholder: "<password>", children: nil},
 					}},
 					"bfd-liveness-detection": {desc: "BFD liveness detection", children: map[string]*schemaNode{
-						"minimum-interval": {desc: "Minimum interval", args: 1, placeholder: "<milliseconds>", children: nil},
-						"multiplier":       {desc: "Multiplier", args: 1, placeholder: "<multiplier>", children: nil},
+						"minimum-interval": {desc: "Minimum interval (milliseconds)", args: 1, valueType: ValueInteger, placeholder: "<milliseconds>", validator: ValidateInteger(10, 60000), children: nil},
+						"multiplier":       {desc: "Multiplier", args: 1, valueType: ValueInteger, placeholder: "<multiplier>", validator: ValidateInteger(2, 255), children: nil},
 					}},
 				}},
 				"area-type": {desc: "Area type", children: map[string]*schemaNode{
@@ -905,8 +925,8 @@ var schemaRoutingInstances = &schemaNode{desc: "Routing instance configuration",
 					"retransmit-interval": {desc: "Retransmit interval (seconds)", args: 1, valueType: ValueInteger, placeholder: "<seconds>", validator: ValidateInteger(1, 65535), children: nil},
 					"priority":            {desc: "Router priority for DR election", args: 1, valueType: ValueInteger, placeholder: "<priority>", validator: ValidateInteger(0, 255), children: nil},
 					"bfd-liveness-detection": {desc: "BFD liveness detection", children: map[string]*schemaNode{
-						"minimum-interval": {desc: "Minimum interval", args: 1, placeholder: "<milliseconds>", children: nil},
-						"multiplier":       {desc: "Multiplier", args: 1, placeholder: "<multiplier>", children: nil},
+						"minimum-interval": {desc: "Minimum interval (milliseconds)", args: 1, valueType: ValueInteger, placeholder: "<milliseconds>", validator: ValidateInteger(10, 60000), children: nil},
+						"multiplier":       {desc: "Multiplier", args: 1, valueType: ValueInteger, placeholder: "<multiplier>", validator: ValidateInteger(2, 255), children: nil},
 					}},
 				}},
 			}},
@@ -914,10 +934,10 @@ var schemaRoutingInstances = &schemaNode{desc: "Routing instance configuration",
 		"bgp": {desc: "BGP configuration", children: map[string]*schemaNode{
 			"graceful-restart": {desc: "Graceful restart", children: nil},
 			"damping": {desc: "Route damping", children: map[string]*schemaNode{
-				"half-life":    {desc: "Half life", args: 1, placeholder: "<minutes>", children: nil},
-				"reuse":        {desc: "Reuse threshold", args: 1, placeholder: "<value>", children: nil},
-				"suppress":     {desc: "Suppress threshold", args: 1, placeholder: "<value>", children: nil},
-				"max-suppress": {desc: "Max suppress time", args: 1, placeholder: "<minutes>", children: nil},
+				"half-life":    {desc: "Half life (minutes)", args: 1, valueType: ValueInteger, placeholder: "<minutes>", validator: ValidateInteger(1, 45), children: nil},
+				"reuse":        {desc: "Reuse threshold", args: 1, valueType: ValueInteger, placeholder: "<value>", validator: ValidateInteger(1, 20000), children: nil},
+				"suppress":     {desc: "Suppress threshold", args: 1, valueType: ValueInteger, placeholder: "<value>", validator: ValidateInteger(1, 20000), children: nil},
+				"max-suppress": {desc: "Max suppress time (minutes)", args: 1, valueType: ValueInteger, placeholder: "<minutes>", validator: ValidateInteger(1, 255), children: nil},
 			}},
 			"group": {desc: "BGP group", args: 1, placeholder: "<group-name>", children: nil},
 		}},
@@ -943,8 +963,8 @@ var schemaRoutingInstances = &schemaNode{desc: "Routing instance configuration",
 					valueType: ValueEnumOf, valueDesc: "authentication type",
 					valueExamples: AuthTypeSpellings(), validator: ValidateAuthType, children: nil},
 				"bfd-liveness-detection": {desc: "BFD liveness detection", children: map[string]*schemaNode{
-					"minimum-interval": {desc: "Minimum interval", args: 1, placeholder: "<milliseconds>", children: nil},
-					"multiplier":       {desc: "Multiplier", args: 1, placeholder: "<multiplier>", children: nil},
+					"minimum-interval": {desc: "Minimum interval (milliseconds)", args: 1, valueType: ValueInteger, placeholder: "<milliseconds>", validator: ValidateInteger(10, 60000), children: nil},
+					"multiplier":       {desc: "Multiplier", args: 1, valueType: ValueInteger, placeholder: "<multiplier>", validator: ValidateInteger(2, 255), children: nil},
 				}},
 			}},
 			"authentication-key": {desc: "Authentication key", args: 1, placeholder: "<key>", children: nil},

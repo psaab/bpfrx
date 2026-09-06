@@ -1,5 +1,5 @@
-# counts: losers=36 walked=67 vacuous=45 unmeasured=73
-# collector reach: 363 containers walked, 133 reached the census (134 dropped: no eligible leaf, 96 dropped: only one)
+# counts: losers=36 walked=67 vacuous=44 unmeasured=73
+# collector reach: 364 containers walked, 133 reached the census (135 dropped: no eligible leaf, 96 dropped: only one)
 class-of-service traffic-control-profiles arg1  [delay-buffer-rate | guaranteed-rate | scheduler-map]  total  OPERATOR
 class-of-service traffic-control-profiles arg1  [delay-buffer-rate | guaranteed-rate]  total  lenient-only
 firewall policer arg1 if-exceeding  [bandwidth-limit | burst-size-limit]  total  lenient-only

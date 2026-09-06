@@ -363,6 +363,19 @@ type compileOpts struct {
 	// fail-closed-on-load doctrine. Same doctrine as lenientIPsecGatewayRefs.
 	lenientIPsecEndpoints bool
 
+	// lenientIPsecProposalLifetime (#9008) downgrades the IKE/IPsec proposal
+	// `lifetime-seconds` value gate (validateIPsecProposalLifetimesStrict)
+	// from a hard compile error to a cfg.Warnings entry on the tolerant load
+	// / peer-sync paths. The schema already carries ValidateIntegerMin(1) on
+	// both leaves, but SchemaValidate runs only from compileTreeStrict, so a
+	// negative or non-numeric lifetime was rejected at commit and accepted in
+	// SILENCE by Store.Load and HA SyncApply. Commit hard-rejects (unchanged
+	// — that path already did, via the schema); an already-persisted or
+	// peer-synced config an older binary accepted must still BOOT, so the
+	// tolerant path warns rather than gaining a new rejection. Same #1960
+	// fail-closed-on-load doctrine as lenientIPsecEndpoints.
+	lenientIPsecProposalLifetime bool
+
 	// lenientIPsecTrafficSelectors (#4098) downgrades the IPsec
 	// `traffic-selector local-ip / remote-ip` value gate
 	// (validateIPsecTrafficSelectorsStrict) from a hard compile error to a
@@ -2595,6 +2608,7 @@ func lenientCompileOpts() compileOpts {
 		lenientIPsecGatewayRefs:                true,
 		lenientIKEPolicyChainRef:               true,
 		lenientIPsecEndpoints:                  true,
+		lenientIPsecProposalLifetime:           true,
 		lenientIPsecTrafficSelectors:           true,
 		lenientReservedProposalSetNames:        true,
 		lenientChassisClusterIdentities:        true,

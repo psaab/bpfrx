@@ -1621,6 +1621,19 @@ type IKEProposal struct {
 	AuthAlg         string // "sha-256"
 	DHGroup         int    // DH group number
 	LifetimeSeconds int
+	// LifetimeSecondsInvalidSpec (#9008) records the RAW `lifetime-seconds`
+	// token when it was present but not a usable positive integer. The
+	// parse above drops such a value on the floor: a non-integer leaves
+	// LifetimeSeconds at 0 (indistinguishable from "not configured") and a
+	// negative parses cleanly and is STORED, so neither case is recoverable
+	// from the compiled int alone. The strict commit gate rejects these in
+	// SchemaValidate before the compiler runs; the tolerant path
+	// (compileTreeLenient, used by Store.Load and HA SyncApply) does not,
+	// which is the #9008 defect. This field is the compile-time artifact
+	// validateIPsecProposalLifetimesStrict reads so the tolerant path can
+	// WARN instead of accepting in silence. Not serialised: it is a
+	// diagnostic about the input text, not configuration state.
+	LifetimeSecondsInvalidSpec string `json:"-"`
 }
 
 // IKEPolicy defines Phase 1 policy (mode, proposal reference, PSK).
@@ -1651,6 +1664,19 @@ type IPsecProposal struct {
 	AuthAlg         string // "hmac-sha-256" (ignored for GCM)
 	DHGroup         int    // DH group number
 	LifetimeSeconds int
+	// LifetimeSecondsInvalidSpec (#9008) records the RAW `lifetime-seconds`
+	// token when it was present but not a usable positive integer. The
+	// parse above drops such a value on the floor: a non-integer leaves
+	// LifetimeSeconds at 0 (indistinguishable from "not configured") and a
+	// negative parses cleanly and is STORED, so neither case is recoverable
+	// from the compiled int alone. The strict commit gate rejects these in
+	// SchemaValidate before the compiler runs; the tolerant path
+	// (compileTreeLenient, used by Store.Load and HA SyncApply) does not,
+	// which is the #9008 defect. This field is the compile-time artifact
+	// validateIPsecProposalLifetimesStrict reads so the tolerant path can
+	// WARN instead of accepting in silence. Not serialised: it is a
+	// diagnostic about the input text, not configuration state.
+	LifetimeSecondsInvalidSpec string `json:"-"`
 	// LifetimeKilobytes is the Junos ESP volume-based rekey threshold
 	// (`lifetime-kilobytes`). It is CAPTURED so the #4313 closed-world flip
 	// on `security ipsec proposal` is leaf-complete (a valid proposal

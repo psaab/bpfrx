@@ -111,6 +111,22 @@ func runUniformGatesIPsecEvent(tree *ConfigTree, cfg *Config, opts compileOpts) 
 		}
 	}
 
+	// #9008 IKE/IPsec proposal `lifetime-seconds` value gate. The schema's
+	// ValidateIntegerMin(1) on both leaves is enforced only by SchemaValidate,
+	// which compileTreeStrict runs and compileTreeLenient downgrades — so a
+	// negative or non-numeric lifetime committed clean at Store.Commit but was
+	// accepted with NO diagnostic at all by Store.Load and HA SyncApply, and a
+	// negative was carried into the swanctl renderer as a stored value. Strict
+	// on commit, warn on the tolerant path (#1960 fail-closed-on-load class).
+	if err := validateIPsecProposalLifetimesStrict(cfg); err != nil {
+		if opts.lenientIPsecProposalLifetime {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("ipsec proposal lifetime (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #2270 IKE (Phase 1) gateway -> ike-policy -> ike-proposal cross-
 	// reference. A gateway that names an ike-policy whose chain does not
 	// resolve (the policy is undefined, or its `proposals` reference

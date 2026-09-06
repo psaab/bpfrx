@@ -782,8 +782,15 @@ func deletePath(current *[]*Node, path []string, grouped []bool, schema *schemaN
 	// succeeds, fails deeper, and reports "no node matching <leaf>" while the
 	// elided node is never examined at all. See elided_delete_8992.go for the
 	// bound: only a node encoding exactly ONE statement is removed.
-	if i == 0 && schema != nil {
-		if idx := findElidedNodeForPath(*current, path, schema); idx >= 0 {
+	// #8997: at EVERY level, not just the top. An elided node can sit at any
+	// depth -- `chassis { cluster strict-session-auth; }` puts it one level
+	// down -- and restricting this to i == 0 meant a partially elided stanza
+	// was never examined. `schema` is the schema node for the CURRENT
+	// container, so the bound below is evaluated in the right scope; where the
+	// descent has dropped the schema (nil) the check is skipped, which is the
+	// conservative direction for a delete.
+	if schema != nil {
+		if idx := findElidedNodeForPath(*current, path[i:], schema); idx >= 0 {
 			*current = append((*current)[:idx], (*current)[idx+1:]...)
 			return nil
 		}
@@ -792,7 +799,7 @@ func deletePath(current *[]*Node, path []string, grouped []bool, schema *schemaN
 		// others with it (#3846's fail-wide), and splitting it is
 		// consumeNodeKeys work #8932 records as unfinished -- so refuse, and
 		// say which.
-		if keys := elidedPackedRunCarrying(*current, path, schema); keys != nil {
+		if keys := elidedPackedRunCarrying(*current, path[i:], schema); keys != nil {
 			return fmt.Errorf("%w: %q is present in an ELIDED spelling packed together "+
 				"with other statements on one line (%q), and deleting it would remove "+
 				"them too. Re-author that line with braces around %q, then delete it "+

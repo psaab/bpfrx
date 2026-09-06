@@ -97,17 +97,11 @@ var nodeLocalChassisLeaves = []string{"strict-session-auth"}
 // chassisClusterFlagSet reports whether a bare flag leaf is present under
 // `chassis cluster` in tree. A nil tree reports false, which is what makes a
 // not-yet-committed node preserve nothing.
+// #8997: this delegates to config.FlagSetAtPath rather than walking with
+// FindChild. FindChild matches only a node whose Keys are exactly one segment,
+// so it saw the fully-braced spelling and MISSED both elided ones — and a miss
+// here reads as AGREEMENT with the peer, not as a failure, so the fail-closed
+// branch below was unreachable in precisely the case it guards.
 func chassisClusterFlagSet(tree *config.ConfigTree, leaf string) bool {
-	if tree == nil {
-		return false
-	}
-	chassis := tree.FindChild("chassis")
-	if chassis == nil {
-		return false
-	}
-	cluster := chassis.FindChild("cluster")
-	if cluster == nil {
-		return false
-	}
-	return cluster.FindChild(leaf) != nil
+	return tree.FlagSetAtPath(append(append([]string(nil), chassisClusterPath...), leaf))
 }
