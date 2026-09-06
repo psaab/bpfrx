@@ -161,11 +161,23 @@ func compileRoutingOptions(node *Node, ro *RoutingOptionsConfig) error {
 				continue
 			}
 			gr := &GenerateRoute{Prefix: prefix}
-			if policyNode := routeNode.FindChild("policy"); policyNode != nil {
-				gr.Policy = nodeVal(policyNode)
-			}
-			if routeNode.FindChild("discard") != nil {
-				gr.Discard = true
+			// #8939: split a packed run before reading. `generate route <p>
+			// discard policy P` nests as `[route <p>] > [discard policy P]`, so
+			// FindChild("discard") matched and `policy P` -- sitting on that
+			// same node's Keys -- was never read. The generated route was
+			// installed with no policy, which is the opposite of what the
+			// operator wrote: a policy is what SELECTS the contributing routes,
+			// so without it the aggregate's contributor set is unconstrained.
+			routeChildren := expandFlatRun(routeNode.Children, generateRouteSchema8939())
+			for _, rc := range routeChildren {
+				switch rc.Name() {
+				case "policy":
+					if v := nodeVal(rc); v != "" {
+						gr.Policy = v
+					}
+				case "discard":
+					gr.Discard = true
+				}
 			}
 			// Also handle inline keys: "route X/Y discard" or "route X/Y policy Z"
 			for i := 2; i < len(routeNode.Keys); i++ {
@@ -186,7 +198,12 @@ func compileRoutingOptions(node *Node, ro *RoutingOptionsConfig) error {
 	// Parse global interface-routes { rib-group { inet X; inet6 Y; } }
 	if irNode := node.FindChild("interface-routes"); irNode != nil {
 		if rgNode := irNode.FindChild("rib-group"); rgNode != nil {
-			for _, rgChild := range rgNode.Children {
+			// #8939: split a packed run. `rib-group inet RG inet6 RG` is ONE
+			// command and SetPath nests the second family onto the first
+			// rather than making them siblings, so this loop saw `inet` and
+			// dropped the v6 rib-group with it — a leak the operator asked
+			// for that silently does not happen for one family.
+			for _, rgChild := range expandFlatRun(rgNode.Children, interfaceRoutesRibGroupSchema8939()) {
 				switch rgChild.Name() {
 				case "inet":
 					ro.InterfaceRoutesRibGroup = nodeVal(rgChild)
@@ -609,7 +626,10 @@ func compileRoutingInstances(node *Node, cfg *Config) error {
 				// Parse interface-routes rib-group
 				if irNode := prop.FindChild("interface-routes"); irNode != nil {
 					if rgNode := irNode.FindChild("rib-group"); rgNode != nil {
-						for _, rgChild := range rgNode.Children {
+						// #8939: the routing-instance TWIN of the global site
+						// above. Fixing one and not the other is how this class
+						// keeps coming back.
+						for _, rgChild := range expandFlatRun(rgNode.Children, interfaceRoutesRibGroupSchema8939()) {
 							switch rgChild.Name() {
 							case "inet":
 								ri.InterfaceRoutesRibGroup = nodeVal(rgChild)
