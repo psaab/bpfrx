@@ -774,6 +774,33 @@ func deletePath(current *[]*Node, path []string, grouped []bool, schema *schemaN
 		return ErrPathNotFound
 	}
 
+	// #8992: before anything else at the TOP level, a fully elided stanza --
+	// `system master-password ascii-text "x";` -- is ONE node whose Keys carry
+	// the whole path, so no descent by container name can find it. Handled
+	// here rather than in the not-found branch because the elided node may sit
+	// beside a BRACED container of the same name, in which case the descent
+	// succeeds, fails deeper, and reports "no node matching <leaf>" while the
+	// elided node is never examined at all. See elided_delete_8992.go for the
+	// bound: only a node encoding exactly ONE statement is removed.
+	if i == 0 && schema != nil {
+		if idx := findElidedNodeForPath(*current, path, schema); idx >= 0 {
+			*current = append((*current)[:idx], (*current)[idx+1:]...)
+			return nil
+		}
+		// The stanza IS present, elided, but packed together with at least one
+		// other statement on the same node. Removing the node would take the
+		// others with it (#3846's fail-wide), and splitting it is
+		// consumeNodeKeys work #8932 records as unfinished -- so refuse, and
+		// say which.
+		if keys := elidedPackedRunCarrying(*current, path, schema); keys != nil {
+			return fmt.Errorf("%w: %q is present in an ELIDED spelling packed together "+
+				"with other statements on one line (%q), and deleting it would remove "+
+				"them too. Re-author that line with braces around %q, then delete it "+
+				"(#8992, #8932)",
+				ErrPathNotFound, strings.Join(path, " "), strings.Join(keys, " "), path[len(path)-1])
+		}
+	}
+
 	keyword := path[i]
 
 	// Look up keyword in current schema level.
