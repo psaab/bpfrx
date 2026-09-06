@@ -531,6 +531,28 @@ func checkTCPMSSKind(node *Node, nodePath string, lenient bool) ([]string, error
 }
 
 func compileFlow(node *Node, sec *SecurityConfig) error {
+	// #8939: SPLIT A PACKED RUN BEFORE ANY LOOKUP. This function asks
+	// node.FindChild(...) once per flag, and `set security flow
+	// allow-dns-reply allow-embedded-icmp force-ip-reassembly` is ONE child
+	// node carrying all three on its Keys — so the FIRST flag matched and every
+	// other lookup missed:
+	//
+	//	packed  AllowDNSReply=true  AllowEmbeddedICMP=false  ForceIPReassembly=false
+	//	split   AllowDNSReply=true  AllowEmbeddedICMP=true   ForceIPReassembly=true
+	//
+	// `force-ip-reassembly` is the one that matters most: without it fragments
+	// are not reassembled before inspection, which is a classic evasion path —
+	// so the packed spelling silently removed a control the operator enabled.
+	//
+	// Expanded ONCE here rather than at each of ~20 lookups: a per-lookup fix
+	// would be twenty chances to miss one, and the next flag added would be the
+	// twenty-first.
+	if expanded := expandFlatRun(node.Children, securityFlowSchema8939()); len(expanded) != len(node.Children) {
+		clone := *node
+		clone.Children = expanded
+		node = &clone
+	}
+
 	// Aggressive session aging
 	if agingNode := node.FindChild("aging"); agingNode != nil {
 		for _, opt := range agingNode.Children {
