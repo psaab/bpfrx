@@ -124,8 +124,11 @@ func openTraceFile(name string) (*os.File, error) {
 
 // TraceWriter writes matching flow events to a trace file with rotation.
 type TraceWriter struct {
-	mu       sync.Mutex
-	file     *os.File
+	mu   sync.Mutex
+	file *os.File
+	// #9118 recovery bookkeeping for a writer wedged by a failed rotation
+	// reopen. See locallog_reopen_9118.go.
+	wedge    wedgeState9118
 	name     string // sanitized basename, written under traceLogDir
 	path     string // traceLogDir/name (rotation suffixes append to this)
 	maxSize  int64  // bytes
@@ -347,6 +350,9 @@ func NewTraceWriter(opts *config.FlowTraceoptions) (*TraceWriter, error) {
 func (tw *TraceWriter) Close() {
 	tw.mu.Lock()
 	defer tw.mu.Unlock()
+	// #9118: mark the nil handle DELIBERATE, so WriteRecord's reopen cannot
+	// resurrect a trace file after the writer was retired.
+	tw.wedge.closed = true
 	if tw.file != nil {
 		tw.file.Close()
 		tw.file = nil
@@ -371,11 +377,15 @@ func (tw *TraceWriter) HandleEvent(rec EventRecord, raw []byte) {
 	tw.mu.Lock()
 	defer tw.mu.Unlock()
 
-	if tw.file == nil {
+	// #9118: try to recover a wedge first. rotate() is reached only from a
+	// successful write, so once the handle is nil nothing else can ever reopen
+	// it and every later event is lost.
+	if !tw.ensureOpenLocked() {
 		// #3478 item 1: a nil file means a prior rotation reopen failed and the
-		// writer is wedged. Every subsequent event is lost — count and warn
-		// (rate-limited) instead of returning silently, otherwise the operator
-		// sees a single FailedRotations bump and no further signal.
+		// writer is wedged (or the retry is still backing off). Every such event
+		// is lost — count and warn (rate-limited) instead of returning silently,
+		// otherwise the operator sees a single FailedRotations bump and no
+		// further signal.
 		tw.droppedWrites.Add(1)
 		tw.warnRateLimited(&tw.lastDropWarn, "flow-trace write dropped: file unavailable after failed rotation", errFileUnavailable)
 		return
