@@ -2552,8 +2552,13 @@ pub(super) fn poll_binding_process_descriptor(
                                     // Check NPTv6 outbound, then static NAT SNAT, then interface SNAT.
                                     // Use merge() to combine with any pre-routing DNAT
                                     // decision rather than overwriting it.
-                                    let nat_match_flow =
-                                        flow.with_destination(effective_resolution_target);
+                                    // #9034: the post-DNAT PORT as well as the
+                                    // address. `policy_dst_port` is the same
+                                    // derivation policy matching already uses,
+                                    // reused rather than re-spelled so the two
+                                    // cannot drift apart.
+                                    let nat_match_flow = flow
+                                        .with_destination(effective_resolution_target, policy_dst_port);
                                     // #3121: NPTv6 outbound source-prefix translation is
                                     // orthogonal to a pre-routing destination rewrite
                                     // (DNAT / static DNAT). The two NAT stages COMPOSE --
@@ -5732,8 +5737,13 @@ pub(super) fn poll_binding_process_descriptor(
                                     // cold-path histogram sample is taken at the
                                     // early eval site above.
                                     {
+                                        // #9034: carry the translated PORT too.
                                         let nat_match_flow = flow.with_destination(
                                             pending_decision.nat.rewrite_dst.unwrap_or(flow.dst_ip),
+                                            pending_decision
+                                                .nat
+                                                .rewrite_dst_port
+                                                .unwrap_or(flow.forward_key.dst_port),
                                         );
                                         // #1852: gate pool-mode SNAT allocation
                                         // for a non-first fragment (no L4 ports).

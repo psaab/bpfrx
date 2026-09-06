@@ -362,9 +362,27 @@ pub(super) struct SessionFlow {
 }
 
 impl SessionFlow {
-    pub(super) fn with_destination(&self, dst_ip: IpAddr) -> Self {
+    /// Rebuild the flow against a POST-translation destination.
+    ///
+    /// #9034: this used to take the address alone and carry
+    /// `forward_key.dst_port` over unchanged, so a composed DNAT -> source-NAT
+    /// matched the source-NAT rule against a HALF-TRANSLATED destination — the
+    /// post-DNAT address with the PRE-DNAT port. A `destination-nat` that moved
+    /// the port (443 -> 8443, the ordinary VIP shape) therefore matched a
+    /// source-NAT rule written against the real service port, or missed one
+    /// written against the translated port.
+    ///
+    /// The port is a REQUIRED parameter rather than an `Option` or a second
+    /// method: the whole defect was that a caller could forget it and still
+    /// compile. `poll_descriptor` already derives exactly this value for POLICY
+    /// matching (`policy_dst_port`), whose comment records that it "carries the
+    /// correct post-translation tuple for all inbound destination translations
+    /// (DNAT/static-DNAT/NPTv6/NAT64)". Source-NAT matching was the one consumer
+    /// left on the pre-translation port.
+    pub(super) fn with_destination(&self, dst_ip: IpAddr, dst_port: u16) -> Self {
         let mut forward_key = self.forward_key.clone();
         forward_key.dst_ip = dst_ip;
+        forward_key.dst_port = dst_port;
         Self {
             src_ip: self.src_ip,
             dst_ip,
@@ -578,6 +596,97 @@ mod l3_addrs_tests_7890 {
         assert!(
             bad.l3_addrs().is_none(),
             "#7890 widens the UNSPECIFIED leg only"
+        );
+    }
+}
+
+#[cfg(test)]
+mod with_destination_port_tests_9034 {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn flow_9034() -> SessionFlow {
+        let client = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
+        let vip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10));
+        SessionFlow {
+            src_ip: client,
+            dst_ip: vip,
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: crate::afxdp::PROTO_TCP,
+                src_ip: client,
+                dst_ip: vip,
+                src_port: 51000,
+                dst_port: 443,
+                discriminator: Default::default(),
+                routing_domain: 0,
+            },
+        }
+    }
+
+    /// #9034: `with_destination` must carry the POST-translation port, not just
+    /// the address.
+    ///
+    /// The composed shape is DNAT (443 -> 8443 on an internal server) followed
+    /// by source-NAT. Before this, the source-NAT rule was matched against the
+    /// post-DNAT ADDRESS and the PRE-DNAT PORT — a tuple that existed on no
+    /// wire — so a rule written against the real service port 8443 did not
+    /// match, and one written against 443 matched when it should not have.
+    #[test]
+    fn with_destination_carries_the_translated_port_9034() {
+        let server = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
+        let out = flow_9034().with_destination(server, 8443);
+
+        assert_eq!(out.dst_ip, server, "address is translated");
+        assert_eq!(
+            out.forward_key.dst_ip, server,
+            "the key the source-NAT matcher reads must carry the translated address"
+        );
+        assert_eq!(
+            out.forward_key.dst_port, 8443,
+            "the key the source-NAT matcher reads must carry the translated PORT — \
+             carrying the pre-DNAT port matches the rule against a half-translated \
+             destination that existed on no wire (#9034)"
+        );
+    }
+
+    /// The fields that are NOT the destination must survive untouched. A
+    /// `with_destination` that rebuilt the whole key would silently drop the
+    /// source identity, which no assertion above would catch.
+    #[test]
+    fn with_destination_preserves_the_rest_of_the_key_9034() {
+        let before = flow_9034();
+        let after = before.with_destination(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), 8443);
+
+        assert_eq!(after.src_ip, before.src_ip, "source address preserved");
+        assert_eq!(
+            after.forward_key.src_ip, before.forward_key.src_ip,
+            "key source address preserved"
+        );
+        assert_eq!(
+            after.forward_key.src_port, before.forward_key.src_port,
+            "key source PORT preserved — the destination rewrite must not disturb it"
+        );
+        assert_eq!(
+            after.forward_key.protocol, before.forward_key.protocol,
+            "protocol preserved"
+        );
+        assert_eq!(
+            after.forward_key.routing_domain, before.forward_key.routing_domain,
+            "routing_domain preserved (#7160 identity field)"
+        );
+    }
+
+    /// CONTROL: an UNCHANGED port must round-trip. Passing the flow's own port
+    /// has to leave the key identical, or every caller with no port translation
+    /// would silently acquire a wrong one.
+    #[test]
+    fn with_destination_unchanged_port_is_identity_9034() {
+        let before = flow_9034();
+        let after = before.with_destination(before.dst_ip, before.forward_key.dst_port);
+        assert_eq!(
+            after.forward_key, before.forward_key,
+            "no translation must leave the key untouched"
         );
     }
 }
