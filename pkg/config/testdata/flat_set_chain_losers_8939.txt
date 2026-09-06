@@ -1,4 +1,4 @@
-# counts: losers=48 walked=47 vacuous=51 unmeasured=75
+# counts: losers=47 walked=48 vacuous=51 unmeasured=75
 # collector reach: 363 containers walked, 133 reached the census (134 dropped: no eligible leaf, 96 dropped: only one)
 class-of-service traffic-control-profiles arg1  [delay-buffer-rate | guaranteed-rate | scheduler-map]  total  OPERATOR
 firewall policer arg1 if-exceeding  [bandwidth-limit | burst-size-limit]  total  lenient-only
@@ -45,6 +45,5 @@ system dataplane coalescence  [adaptive | rx-usecs | tx-usecs]  total  lenient-o
 system dataplane coalescence  [adaptive | rx-usecs]  total  lenient-only
 system dataplane shared-umem  [artifact-file | mode | phase0-artifact-file]  total  OPERATOR
 system dataplane shared-umem  [artifact-file | mode]  total  OPERATOR
-system login class arg1  [allow-commands | allow-commands-regexps | allow-configuration]  total  OPERATOR
 system services dhcp-local-server group arg1 pool arg1 static-binding arg1  [fixed-address | host-name]  total  lenient-only
 system services ssh  [client-alive-count-max | client-alive-interval | connection-limit]  total  lenient-only
