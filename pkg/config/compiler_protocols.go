@@ -265,7 +265,14 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 	if bgpNode != nil {
 		proto.BGP = &BGPConfig{}
 
-		for _, child := range bgpNode.Children {
+		// #8939, and the consequence here is not a lost setting -- it is the
+		// whole protocol. `set protocols bgp graceful-restart cluster-id
+		// 1.1.1.1 local-as 65001` nests each leaf under the previous one, so
+		// this loop saw only the flag and LocalAS stayed 0. pkg/frr gates the
+		// ENTIRE stanza on it (`if bgp != nil && bgp.LocalAS > 0`), so FRR
+		// receives NO `router bgp` block at all: no sessions, no routes, and
+		// `show configuration` renders exactly what the operator typed.
+		for _, child := range expandFlatRun(bgpNode.Children, bgpLeafSchema8939()) {
 			switch child.Name() {
 			case "local-as":
 				if len(child.Keys) >= 2 {
