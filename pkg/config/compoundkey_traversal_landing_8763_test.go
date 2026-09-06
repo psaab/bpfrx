@@ -284,6 +284,20 @@ func famOnlyCases8763() []famOnlyCase8763 {
 		// a link was removed from the chain and the interface is silently
 		// running with no filter again.
 		{"inet filter", "", ifUnit("   family inet {\n    filter { input f4probe; }\n   }"), ifUnit("   family inet filter input f4probe;"), ifUnit("   family inet {\n   }"), recover8763},
+
+		// #9017: `family any` is a THIRD firewall filter family, declared so
+		// that `set firewall family any filter ... then discard` stops
+		// committing clean and minting zero filters. Its `filter` head has to
+		// be measured here for the same reason its siblings are: the packed
+		// spelling `family any filter F { … }` dropped the whole filter until
+		// `any filter` joined the compact-normalize scope, so this pair is a
+		// RECOVERY, not an inert read. Measured braced=1+1 filters,
+		// packed=1+1, baseline=0+0.
+		{"any filter", "",
+			"firewall {\n family any {\n  filter fanyprobe {\n   term t1 { from { protocol tcp; } then { accept; } }\n  }\n }\n}\n",
+			"firewall {\n family any filter fanyprobe {\n  term t1 { from { protocol tcp; } then { accept; } }\n }\n}\n",
+			"firewall {\n family any {\n }\n}\n",
+			recover8763},
 		{"inet6 filter", "", ifUnit("   family inet6 {\n    filter { input f6probe; }\n   }"), ifUnit("   family inet6 filter input f6probe;"), ifUnit("   family inet6 {\n   }"), recover8763},
 		// #8755: the four links that complete the interface-unit chains. Each is
 		// measured HERE at the compoundKey shape as well as in

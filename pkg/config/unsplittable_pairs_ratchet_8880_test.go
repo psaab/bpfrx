@@ -333,7 +333,7 @@ func TestUnsplittablePairRatchet8880(t *testing.T) {
 	// Re-derived at this base, twice, not computed as 460 - 8.
 	const (
 		wantArgs2 = 101
-		wantArgs1 = 452
+		wantArgs1 = 453
 	)
 	pairs2, _ := unsplittablePairs8880(2)
 	pairs1, conflict1 := unsplittablePairs8880(1)

@@ -134,6 +134,14 @@ var dupConservationSkipped8436 = []string{
 	"class-of-service schedulers xpfname transmit-rate",
 	"event-options policy",
 	"event-options policy xpfname within",
+	// #9017: `family any` joins its two siblings, for the same structural
+	// reason they are here -- the census cannot synthesize a two-block
+	// duplicate fixture for a filter container. Nothing about `any` is
+	// different; it is a third family declared so that
+	// `set firewall family any filter ... then discard` stops committing
+	// clean and minting zero filters.
+	"firewall family any filter",
+	"firewall family any filter xpfname term",
 	"firewall family inet6 filter",
 	"firewall family inet6 filter xpfname term",
 	"firewall family inet filter",

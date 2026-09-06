@@ -937,8 +937,29 @@ Design of record: `docs/research/1434-multi-tunnel-wireguard/plan.md`.
 
 **The limitation is now SURFACED AT COMMIT.** It used to be silent: a
 config declaring two WireGuard tunnels on distinct listen ports committed
-clean and the second tunnel was simply, permanently dead with no operator
-signal at all. `validateWireguardSingleSteeredPort`
+clean with no operator signal at all.
+
+> **#9016 correction.** Both this section and the warning itself used to say
+> the unsteered tunnel was *dead* — that no inbound transport reaches it and
+> no handshake ever completes. **That is false.** The host-inbound filter
+> admits EVERY configured listen-port (`config.WireGuardListenPorts` feeds
+> `emitHostInboundWireGuardAcceptNetlink`, the production netlink installer,
+> not merely the nft text renderer), and the helper spawns a control thread
+> with its own bound socket for every wireguard endpoint. The unsteered port
+> therefore still receives transport and still decapsulates — it is served by
+> the KERNEL path instead of the AF_XDP one. "Unsteered" means *not on the
+> fast path*, not *inert*, and the same misreading appeared as a
+> "currently a no-op at the kernel" comment on
+> `emitHostInboundWireGuardAccept`. An operator told a live tunnel is dead
+> leaves it in place, so the wording below has been replaced.
+>
+> Note also what is NOT special about the unsteered tunnel: **no** WireGuard
+> tunnel's decapsulated plaintext is zone-adjudicated today, steered or not.
+> That is the separate #5618 advisory, which fires for every tunnel in the
+> config (with an acute variant for one that has been assigned a zone, since
+> that reads as protected and is not). Steering is not adjudication, and
+> reading the multi-port warning as if it were implies the steered tunnel is
+> policed. `validateWireguardSingleSteeredPort`
 (`pkg/config/compiler_validate_wireguard_multiport.go`, run from
 `runTailGates`) now emits a commit **warning** whenever the configuration
 resolves to more than one distinct WireGuard listen port. The warning names
@@ -948,16 +969,20 @@ will NOT be, e.g.:
 ```
 wireguard: 2 distinct listen-ports are configured, but the dataplane steers
 inbound WireGuard transport for only ONE of them. listen-port 51820 (wg0) IS
-steered and works. listen-port 51900 (wg1) is NOT steered - no inbound
-WireGuard transport reaches that tunnel, so no handshake ever completes and
-no return traffic arrives: dead while appearing configured. Only one
-WireGuard listen-port can receive inbound transport until multi-port steering
-lands (#1434 Increment 2, deferred); remove or re-point the unsteered
-tunnel(s) rather than leaving them silently down.
+steered onto the AF_XDP WireGuard path. listen-port 51900 (wg1) is NOT
+steered: that tunnel still receives inbound transport (the host-inbound
+filter admits every configured listen-port and each tunnel binds its own
+socket), but it is served by the KERNEL path rather than the dataplane's, so
+it is not counted or handled there. Only one WireGuard listen-port can be
+steered until multi-port steering lands (#1434 Increment 2, deferred). Note
+this is about STEERING only: no WireGuard tunnel's decapsulated plaintext is
+zone-adjudicated today, steered or not - see the separate tunnel plaintext
+advisory, which covers every tunnel in this config.
 ```
 
 It is a WARNING, never a reject — the config is legal, its first tunnel
-works exactly as authored, and rejecting would change commit acceptance for
+works exactly as authored (and the second is unsteered, not down), and
+rejecting would change commit acceptance for
 configs that commit clean at every released version. The steered port is
 derived from `config.EmitTunnelEndpointNames`, the same SSOT emitter
 `buildTunnelEndpointSnapshots` drives, so the port the warning names is the

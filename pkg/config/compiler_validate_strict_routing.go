@@ -1524,3 +1524,99 @@ func validatePolicyASPathRegexStrict(cfg *Config) error {
 	}
 	return nil
 }
+
+// validateBGPDuplicateNeighborStrict hard-rejects one BGP neighbor address
+// appearing in TWO DIFFERENT `protocols bgp group` blocks within a single BGP
+// instance (#9007).
+//
+// Junos rejects this at commit; xpf accepted it with zero warnings. The typed
+// config keeps a *BGPNeighbor per authored (group, neighbor) pair, and
+// pkg/frr/protocols_render.go builds its `validNeighbors` set by filtering
+// only on PeerAS and address shape -- there is no dedup on Address. Every
+// downstream loop (the neighbor declaration, the address-family activation,
+// and the BFD peer accumulator) then iterates that slice PER ENTRY, so the
+// address renders once per group: two `remote-as`, two `timers`, two
+// `password` lines and two `bfd` peer blocks for one peer.
+//
+// The password line is the sharp edge. The other divergences are
+// misconfigurations an operator can eventually observe; the authentication
+// key is not. One of two secrets is selected by render order, silently, while
+// `show` keeps reporting both groups exactly as authored -- so the operator's
+// view and FRR's behaviour disagree with nothing in the product signalling
+// that they do.
+//
+// DIFFERENT groups is the whole condition, and the narrowness is load-bearing.
+// The compiler emits one *BGPNeighbor PER AST NODE, and a single authored
+// neighbor can occupy several nodes: `set protocols bgp group G neighbor X`
+// followed by `set protocols bgp group G neighbor X import PS` -- ordinary
+// flat-set authoring, and the shape the slot-escape fixtures use -- yields TWO
+// entries for one peer, both in group G, one carrying the import policy. Those
+// are not an operator error and must not be rejected: they render redundantly
+// (a repeated `remote-as` line, which FRR accepts) but CORRECTLY, because the
+// second entry is what carries `activate` and the route-map. A gate keyed on
+// the address alone would blame the operator for a compiler artifact, and a
+// render-side first-wins dedup would silently DROP the policy-bearing entry.
+// Tracked separately; this gate deliberately says nothing about it.
+//
+// Scope: the check partitions by BGP INSTANCE. The same neighbor address in
+// two different routing instances is legitimate (separate VRFs peering with
+// one address is ordinary), so duplicates are sought only WITHIN one
+// BGPConfig, never across them.
+//
+// On the tolerant load / peer-sync paths the call site downgrades this to a
+// warning (opts.lenientBGPDuplicateNeighbor) so an already-persisted or
+// peer-synced config still BOOTS (#1960 fail-closed-on-load class). Commit /
+// commit-check stay strict. Mirrors validateBGPNeighborPeerASStrict.
+func validateBGPDuplicateNeighborStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+
+	checkBGP := func(scope string, bgp *BGPConfig) error {
+		if bgp == nil {
+			return nil
+		}
+		// first[addr] is the group that claimed the address earliest in
+		// authoring order. A later entry for that address matters only when
+		// it names a DIFFERENT group; repeats within one group are the
+		// per-AST-node artifact described above.
+		first := make(map[string]string, len(bgp.Neighbors))
+		var dups []string
+		for _, n := range bgp.Neighbors {
+			if n == nil {
+				continue
+			}
+			prev, seen := first[n.Address]
+			if !seen {
+				first[n.Address] = n.GroupName
+				continue
+			}
+			if prev == n.GroupName {
+				continue
+			}
+			dups = append(dups, fmt.Sprintf("%sprotocols bgp neighbor %q is configured in "+
+				"more than one group (%s and %s)", scope, n.Address, prev, n.GroupName))
+		}
+		if len(dups) == 0 {
+			return nil
+		}
+		sort.Strings(dups)
+		return fmt.Errorf("%s: one neighbor address renders once per group that "+
+			"names it, so FRR receives two divergent definitions (including two "+
+			"`password` lines) for one peer and resolves them by render order; "+
+			"give the peer a single group", dups[0])
+	}
+
+	if err := checkBGP("", cfg.Protocols.BGP); err != nil {
+		return err
+	}
+	for _, ri := range cfg.RoutingInstances {
+		if ri == nil {
+			continue
+		}
+		if err := checkBGP(fmt.Sprintf("routing-instance %s ", ri.Name), ri.BGP); err != nil {
+			return err
+		}
+	}
+	return nil
+}
