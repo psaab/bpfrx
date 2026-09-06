@@ -765,6 +765,67 @@ all three remain open. The rule is documented here rather than left in the
 tracker because a policy that lives only in an issue is not read before the
 next test is written, which is how this reached four packages.
 
+**4. SLEEP-THEN-ASSERT is clause 1 wearing clause 3's clothes, and it is the
+one that keeps getting written (#9110).** The shape is
+
+```go
+time.Sleep(2 * SomeInterval)   // "let the goroutine get going"
+if counter.Load() == 0 { t.Error("it never ran") }
+```
+
+There is no deadline here and nothing is being waited FOR. The sleep is a
+*guess* at how long the scheduler will take, and the assertion silently becomes
+"the goroutine was scheduled AND made progress inside my guess" — a claim about
+the machine, wearing the words of a claim about the code. Under `go test ./...`
+on an oversubscribed box it reds a test whose subject is perfectly healthy.
+
+Convert it to clause 3: **wait for the condition, with a budget sized for the
+LOADED case, and dump the goroutines when the budget expires.**
+`waitForTeardownProgress` (#7970, `pkg/cluster`) is the reference implementation
+and its comment carries the reason the dump is not optional — this wait cannot
+tell a STARVED goroutine from a BLOCKED one, and those have completely
+different fixes, but the stack can tell them apart immediately.
+
+**A flaky red is worse than no test.** At the moment you must decide whether to
+merge, a flaky red and a real red are the same output, and the correct response
+to each is the opposite of the other. That is what trains people to explain reds
+away — and then a real red gets explained away too.
+
+### Before you call a red a flake, DIFF — do not re-run (#9110)
+
+A cell that passes alone and fails in the suite differs by something specific,
+and it is almost never luck. Look for these first, in this order:
+
+1. **The rest of its package ran first.** This is the difference "run it alone"
+   deletes, so an isolation re-run cannot see it. Reproduce with the whole
+   package binary, in its normal order — and run it from the package directory,
+   because a prebuilt test binary invoked from elsewhere fails every
+   source-scanning cell for a reason that has nothing to do with the defect.
+2. **A shared resource.** A package-level `var` a test mutates and restores,
+   `/tmp`, `/dev/shm`, the cluster lock, the stash.
+3. **An unsound match.** A cell scanning for a byte value or a substring that
+   randomised data can legitimately contain reds at a rate nobody can explain
+   and everybody calls flake.
+4. **The tree changed under the gate.** A background `go test ./...` plus a
+   `git checkout` in the SAME worktree measures a tree that no longer exists.
+   Gate in a dedicated worktree with nothing else running; this turned two
+   unexplainable reds into clean passes in one session.
+
+And the failure this rule exists to prevent, which is not flakiness at all:
+**a red in a package your diff never touched can simply be REAL.** The #9110
+investigation found `TestTreeIsGofmtClean` redding on `origin/master` for every
+lane, from an un-gofmt'd file in an unrelated package — the most flake-shaped
+red imaginable, and entirely genuine. Confirm the tree, not the vibe:
+`git show origin/master:<path> | gofmt -l` answers it in one command.
+
+**What a non-reproduction is worth.** The two #9110 tests were run ~100 times
+each across three load shapes — 3x CPU oversubscription; concurrent with a full
+repo-wide `go test ./...`; and the whole package in order under load — with
+zero failures. That does not clear them, and it is not a licence to close the
+issue: the rate may simply be below 1-in-100. It does mean "timing-sensitive"
+stays an unconfirmed hypothesis rather than becoming an inherited fact, and
+that a fix must be justified by reading the test, not by the premise.
+
 ## Verification discipline (#8348)
 
 Two rules earned by a defect that stayed invisible for four months while every
