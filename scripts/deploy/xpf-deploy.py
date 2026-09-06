@@ -953,6 +953,56 @@ def _golden_lock(golden):
                 os.close(fd)
 
 
+@contextlib.contextmanager
+def _watermark_lock(wm_path):
+    """Serialize the anti-rollback watermark read/compare/publish (#9238).
+
+    The watermark is checked twice per fetch — once before the download and
+    once after verification — and the publish (incus alias import, or the
+    libvirt golden replacement) happens after the second check. Between the
+    second read and the publish, a concurrent fetch of a NEWER version can
+    advance the watermark and publish, after which this process overwrites the
+    alias with the older image. The watermark then names v2 and the thing that
+    boots is v1.
+
+    Aborting on the inversion (the `die` at the late check) narrows that window
+    but does not close it: the check and the publish are still two steps. This
+    lock makes them one, so the losing fetch always observes the winner's
+    advance and refuses, rather than observing a stale `prev` and proceeding.
+
+    An exclusive flock beside the watermark file. The watermark is per-user
+    state under XDG_STATE_HOME, so per-user is the correct scope — the racing
+    parties are two `fetch` runs sharing one watermark, and they necessarily
+    share its directory.
+
+    Best-effort in the same sense as `_golden_lock`: if the lock cannot be
+    taken the fetch proceeds unserialized and says so, because a state dir that
+    is not writable must not turn a first fetch on a fresh workstation into a
+    hard failure. The late comparison still runs in that case and still aborts
+    on an inversion it can see — a narrower guarantee, reported rather than
+    silently assumed."""
+    lockpath = os.path.join(os.path.dirname(wm_path), ".image-watermark.lock")
+    fd = None
+    try:
+        try:
+            os.makedirs(os.path.dirname(lockpath), exist_ok=True)
+            fd = os.open(lockpath, os.O_CREAT | os.O_RDWR, 0o644)
+        except OSError as exc:
+            print(f"==> note: watermark lock {lockpath} unavailable ({exc}); "
+                  f"proceeding WITHOUT serialization against a concurrent "
+                  f"fetch (#9238)")
+            yield False
+            return
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield True
+    finally:
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
 def _install_libvirt_golden(srcq, image):
     """Install a verified qcow2 to the libvirt golden path deploy reads
     (fable-165 H-30). Returns the destination path.
@@ -1690,95 +1740,136 @@ def cmd_fetch(args):
         except sign.SignError as e:
             die(f"VERIFICATION FAILED for {names[w]}: {e}")
 
-    # Advance the monotonic watermark only AFTER a successful verify (so a
-    # failed/tampered fetch never moves it). Best-effort: a write failure is
-    # non-fatal (the signature is the real gate).
-    if not args.allow_rollback:
-        try:
+    # #9238 — the late watermark check is a DECISION, and the whole
+    # read-compare-publish is ONE transaction.
+    #
+    # This block used to re-read `prev`, and when the comparison failed simply
+    # not take the branch: no die, no warning, execution falling through to the
+    # alias import / golden replacement below. That is the one place in the
+    # process holding correct information about the inversion, and it threw it
+    # away. Two overlapping fetches could therefore end with the watermark at
+    # v2 and the thing that actually boots at v1:
+    #
+    #   A verifies v1, passes the early check, stalls
+    #   B verifies v2, advances the watermark, publishes      wm=v2 alias=v2
+    #   A resumes, re-reads prev=v2, skips the write, PUBLISHES     alias=v1
+    #
+    # Deploy only checks alias/golden existence, so v1 is then consumed as the
+    # stable identity with nothing dissenting. No forged signature and no
+    # --allow-rollback is involved; both images are legitimately signed and the
+    # ordering does all the work.
+    #
+    # The original comment reasoned only about NOT advancing on a bad fetch
+    # ("so a failed/tampered fetch never moves it"), which is correct and is
+    # retained below. It never considered the watermark moving underneath a
+    # GOOD fetch, which is this case.
+    #
+    # Half 1: an inversion aborts BEFORE anything is published.
+    # Half 2: the lock spans the read, the compare AND the publish, so a second
+    # fetch cannot slip between the check and the alias import. Without it half
+    # 1 is only a narrower race. Lock ORDER is watermark-then-golden
+    # (_install_libvirt_golden takes _golden_lock inside this block); nothing
+    # takes them the other way round.
+    with _watermark_lock(wm_path):
+        # Advance the monotonic watermark only AFTER a successful verify (so a
+        # failed/tampered fetch never moves it). Best-effort: a write failure is
+        # non-fatal (the signature is the real gate).
+        if not args.allow_rollback:
             wm = read_watermark()
             prev = wm.get(args.channel)
-            if not prev or _ver_key(ver) >= _ver_key(prev):
-                wm[args.channel] = ver
-                os.makedirs(os.path.dirname(wm_path), exist_ok=True)
-                tmpw = wm_path + ".tmp"
-                with open(tmpw, "w") as f:
-                    json.dump(wm, f, indent=2, sort_keys=True)
-                os.replace(tmpw, wm_path)
-        except OSError:
-            pass  # best-effort; never block a verified fetch on watermark I/O
+            if prev and _ver_key(ver) < _ver_key(prev):
+                die(f"channel '{args.channel}' advanced to {prev} while this "
+                    f"fetch of {ver} was verifying — refusing to publish {ver} "
+                    f"over it. The artifact is validly signed but is no longer "
+                    f"the newest version installed on this channel; publishing "
+                    f"it would leave the anti-rollback watermark at {prev} and "
+                    f"the image that actually boots at {ver}. This is a "
+                    f"concurrent-fetch collision: re-run the fetch (it will "
+                    f"pick up {prev}), or pass --allow-rollback for a "
+                    f"deliberate downgrade.")
+            try:
+                if not prev or _ver_key(ver) >= _ver_key(prev):
+                    wm[args.channel] = ver
+                    os.makedirs(os.path.dirname(wm_path), exist_ok=True)
+                    tmpw = wm_path + ".tmp"
+                    with open(tmpw, "w") as f:
+                        json.dump(wm, f, indent=2, sort_keys=True)
+                    os.replace(tmpw, wm_path)
+            except OSError:
+                pass  # best-effort; never block a verified fetch on watermark I/O
 
-    # libvirt golden basename = deploy's `image:` default, so the incus alias
-    # and the libvirt golden name AGREE (fable-165 H-30).
-    img_name = args.alias or "xpf-appliance"
-    # Public path for the non-consuming (--no-import) message only. The two
-    # in-process consumers below read from a private staging dir, NOT this
-    # re-openable public path (#5817).
-    qcow2_pub = os.path.join(out, names["qcow2"])
+        # libvirt golden basename = deploy's `image:` default, so the incus alias
+        # and the libvirt golden name AGREE (fable-165 H-30).
+        img_name = args.alias or "xpf-appliance"
+        # Public path for the non-consuming (--no-import) message only. The two
+        # in-process consumers below read from a private staging dir, NOT this
+        # re-openable public path (#5817).
+        qcow2_pub = os.path.join(out, names["qcow2"])
 
-    # H-30: bridge the fetch -> libvirt gap. `deploy --hypervisor libvirt`
-    # reads the golden at libvirt_golden_path(image); --install-libvirt puts
-    # the verified qcow2 there (shared path helper — the two can't drift).
-    if args.install_libvirt:
-        # #5817: install the qcow2 to the golden from the private staging copy,
-        # so a post-verify swap in --out cannot poison the golden.
+        # H-30: bridge the fetch -> libvirt gap. `deploy --hypervisor libvirt`
+        # reads the golden at libvirt_golden_path(image); --install-libvirt puts
+        # the verified qcow2 there (shared path helper — the two can't drift).
+        if args.install_libvirt:
+            # #5817: install the qcow2 to the golden from the private staging copy,
+            # so a post-verify swap in --out cannot poison the golden.
+            with _verified_private_artifacts(
+                    sign, out, names, ["qcow2"], manifest, sig) as staged:
+                _install_libvirt_golden(staged["qcow2"], img_name)
+            print(f"==> done. Deploy with: xpf-deploy.py --hypervisor libvirt "
+                  f"deploy <appliance.yaml>  (image: {img_name})")
+            return 0
+
+        if args.no_import or args.qcow2_only:
+            golden = libvirt_golden_path(img_name)
+            # #8597 (muse-004 K08): the printed install must be GATED on the digest,
+            # not merely preceded by a verification that already happened.
+            #
+            # The two importing paths above stage into a private directory
+            # (_verified_private_artifacts, #5817) and re-verify the staged copy, so
+            # "a post-verify swap in --out cannot poison the golden". This path
+            # cannot do that — it hands the operator a command to run LATER, so the
+            # gap between the verify and the install is unbounded and is exactly the
+            # window _verified_private_artifacts' own docstring names: "The public
+            # --out dir may be writable by another local process."
+            #
+            # Printing the expected digest and a verify-then-install one-liner moves
+            # the check to the moment of the write. `sha256sum -c` here is bound to
+            # THIS path and THIS digest on one line, so it is not the cwd-relative
+            # `sha256sum -c` sign.py warns about — the file being hashed is the file
+            # being installed.
+            try:
+                expected_sha = sign.sha256_file(qcow2_pub)
+            except OSError as exc:
+                die(f"cannot hash the verified qcow2 {qcow2_pub} to print its digest: {exc}")
+            print(f"==> verified into {out} (not imported). For libvirt/KVM, install "
+                  f"it to the golden path deploy reads — RE-VERIFY at install time, "
+                  f"because {out} stays writable by any local process after this "
+                  f"command exits and the golden is not re-checked downstream:\n"
+                  f"      echo '{expected_sha}  {qcow2_pub}' | sha256sum -c - && \\\n"
+                  f"        sudo install -m 0644 -D {qcow2_pub} {golden}\n"
+                  f"   (or re-run fetch with --install-libvirt, which stages the "
+                  f"bytes privately and re-verifies them, #5817), then: "
+                  f"xpf-deploy.py --hypervisor libvirt deploy <appliance.yaml> "
+                  f"(image: {img_name}). For incus, re-run without "
+                  f"--qcow2-only/--no-import.")
+            return 0
+
+        alias = img_name
+        subprocess.run(["incus", "image", "delete", alias],
+                       capture_output=True, text=True)
+        print(f"==> importing verified image as incus alias '{alias}'")
+        # #5817: import from the private staging dir so a post-verify swap of the
+        # public metadata/qcow2 in --out cannot feed unauthenticated bytes to
+        # `incus image import`. The dir is rmtree'd once the import returns.
         with _verified_private_artifacts(
-                sign, out, names, ["qcow2"], manifest, sig) as staged:
-            _install_libvirt_golden(staged["qcow2"], img_name)
-        print(f"==> done. Deploy with: xpf-deploy.py --hypervisor libvirt "
-              f"deploy <appliance.yaml>  (image: {img_name})")
+                sign, out, names, ["metadata", "qcow2"], manifest, sig) as staged:
+            r = subprocess.run(["incus", "image", "import",
+                                staged["metadata"], staged["qcow2"], "--alias", alias])
+        if r.returncode != 0:
+            die("incus image import failed")
+        print(f"==> done. Deploy with: xpf-deploy.py deploy <appliance.yaml> "
+              f"(image: {alias})")
         return 0
-
-    if args.no_import or args.qcow2_only:
-        golden = libvirt_golden_path(img_name)
-        # #8597 (muse-004 K08): the printed install must be GATED on the digest,
-        # not merely preceded by a verification that already happened.
-        #
-        # The two importing paths above stage into a private directory
-        # (_verified_private_artifacts, #5817) and re-verify the staged copy, so
-        # "a post-verify swap in --out cannot poison the golden". This path
-        # cannot do that — it hands the operator a command to run LATER, so the
-        # gap between the verify and the install is unbounded and is exactly the
-        # window _verified_private_artifacts' own docstring names: "The public
-        # --out dir may be writable by another local process."
-        #
-        # Printing the expected digest and a verify-then-install one-liner moves
-        # the check to the moment of the write. `sha256sum -c` here is bound to
-        # THIS path and THIS digest on one line, so it is not the cwd-relative
-        # `sha256sum -c` sign.py warns about — the file being hashed is the file
-        # being installed.
-        try:
-            expected_sha = sign.sha256_file(qcow2_pub)
-        except OSError as exc:
-            die(f"cannot hash the verified qcow2 {qcow2_pub} to print its digest: {exc}")
-        print(f"==> verified into {out} (not imported). For libvirt/KVM, install "
-              f"it to the golden path deploy reads — RE-VERIFY at install time, "
-              f"because {out} stays writable by any local process after this "
-              f"command exits and the golden is not re-checked downstream:\n"
-              f"      echo '{expected_sha}  {qcow2_pub}' | sha256sum -c - && \\\n"
-              f"        sudo install -m 0644 -D {qcow2_pub} {golden}\n"
-              f"   (or re-run fetch with --install-libvirt, which stages the "
-              f"bytes privately and re-verifies them, #5817), then: "
-              f"xpf-deploy.py --hypervisor libvirt deploy <appliance.yaml> "
-              f"(image: {img_name}). For incus, re-run without "
-              f"--qcow2-only/--no-import.")
-        return 0
-
-    alias = img_name
-    subprocess.run(["incus", "image", "delete", alias],
-                   capture_output=True, text=True)
-    print(f"==> importing verified image as incus alias '{alias}'")
-    # #5817: import from the private staging dir so a post-verify swap of the
-    # public metadata/qcow2 in --out cannot feed unauthenticated bytes to
-    # `incus image import`. The dir is rmtree'd once the import returns.
-    with _verified_private_artifacts(
-            sign, out, names, ["metadata", "qcow2"], manifest, sig) as staged:
-        r = subprocess.run(["incus", "image", "import",
-                            staged["metadata"], staged["qcow2"], "--alias", alias])
-    if r.returncode != 0:
-        die("incus image import failed")
-    print(f"==> done. Deploy with: xpf-deploy.py deploy <appliance.yaml> "
-          f"(image: {alias})")
-    return 0
 
 
 # ── LANE-1 HA kernel-rolling orchestration (#1930 INC-2) ──────────────────

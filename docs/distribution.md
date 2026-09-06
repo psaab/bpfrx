@@ -157,6 +157,18 @@ publisher isolates suites in its own database and is unaffected. `selftest.sh`
   semver build metadata is ignored for precedence (`1.0.0+build.7` ranks equal
   to `1.0.0`, per semver 11.4) — all three spellings are advertised as
   accepted by `validate_version`.
+  The watermark check runs TWICE — once before the download and once after
+  verification — and BOTH are refusals (#9238). The late one used to be only
+  the condition for *writing* the watermark, so when it failed the fetch fell
+  through and published anyway: two overlapping fetches could end with the
+  watermark naming v2 and the image the alias actually resolves to being v1,
+  with no forged signature and no `--allow-rollback` involved. It now aborts
+  before the alias import / golden replacement, naming both versions. The late
+  read, the comparison and the publish are also serialized by an exclusive
+  flock on `<state>/xpf/.image-watermark.lock`, so a concurrent fetch cannot
+  advance the watermark between the check and the publish; the lock is
+  best-effort in the same sense as the golden lock, and its absence is
+  reported rather than assumed.
 
 ### Key rotation
 
