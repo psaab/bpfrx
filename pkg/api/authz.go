@@ -880,6 +880,13 @@ func (s *Server) readAuthz(w http.ResponseWriter, r *http.Request, next http.Han
 		writeError(w, http.StatusForbidden, err.Error())
 		return
 	}
+	// #9051: the verdict above is a point-in-time answer, and an SSE handler
+	// runs indefinitely. Keep checking for as long as the handler runs, so a
+	// revoked principal loses the feed rather than keeping it until it
+	// disconnects. Cheap and inert for an ordinary GET, which returns long
+	// before the first tick.
+	r, stop := s.watchReadAuthorization(r, required)
+	defer stop()
 	next.ServeHTTP(w, r)
 }
 
