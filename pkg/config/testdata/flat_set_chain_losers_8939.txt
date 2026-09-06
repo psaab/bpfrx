@@ -1,35 +1,75 @@
-# counts: losers=34 walked=5 vacuous=42 unmeasured=52
+# counts: losers=74 walked=19 vacuous=51 unmeasured=77
+class-of-service traffic-control-profiles arg1  [delay-buffer-rate | guaranteed-rate | scheduler-map]  total
 firewall policer arg1 if-exceeding  [bandwidth-limit | burst-size-limit]  total
+forwarding-options dhcp-relay group arg1 overrides  [always-broadcast | forward-only | maximum-hop-count]  total
+forwarding-options dhcp-relay group arg1 overrides  [always-broadcast | forward-only]  total
 forwarding-options sampling instance arg1 family inet output  [inline-jflow | source-address]  total
 forwarding-options sampling instance arg1 family inet6 output  [inline-jflow | source-address]  total
+policy-options policy-statement arg1 term arg1 then  [accept | load-balance | local-preference]  total
+policy-options policy-statement arg1 term arg1 then  [accept | load-balance]  total
 policy-options policy-statement arg1 then  [accept | reject]  total
 protocols bgp  [cluster-id | graceful-restart | local-as]  total
+protocols bgp  [cluster-id | graceful-restart]  total
+protocols bgp multipath  [ibgp | multiple-as]  total
 protocols isis  [authentication-key | authentication-type | is-type]  total
-protocols isis interface arg1 authentication-key  [authentication-type | level]  total
+protocols isis  [authentication-key | authentication-type]  total
+protocols isis interface arg1  [authentication-key | authentication-type | level]  total
+protocols isis interface arg1  [authentication-key | authentication-type]  total
 protocols rip  [authentication-key | authentication-type | group]  total
+protocols rip  [authentication-key | authentication-type]  total
+protocols router-advertisement interface arg1  [default-lifetime | link-mtu | managed-configuration]  total
+protocols router-advertisement interface arg1  [default-lifetime | link-mtu]  total
+protocols router-advertisement interface arg1 prefix arg1  [autonomous | no-autonomous | no-onlink]  total
+protocols router-advertisement interface arg1 prefix arg1  [autonomous | no-autonomous]  total
 routing-options generate route arg1  [discard | policy]  total
 routing-options interface-routes rib-group  [inet | inet6]  total
-schedulers scheduler arg1 start-date  [start-time | stop-date]  total
+routing-options static route arg1 qualified-next-hop arg1  [interface | metric | preference]  total
+routing-options static route arg1 qualified-next-hop arg1  [interface | metric]  total
+schedulers scheduler arg1  [start-date | start-time | stop-date]  total
+schedulers scheduler arg1  [start-date | start-time]  total
+schedulers scheduler arg1 daily  [all-day | exclude | start-time]  total
+schedulers scheduler arg1 friday  [all-day | exclude | start-time]  total
+schedulers scheduler arg1 friday  [all-day | exclude]  total
+schedulers scheduler arg1 monday  [all-day | exclude | start-time]  total
+schedulers scheduler arg1 monday  [all-day | exclude]  total
+schedulers scheduler arg1 saturday  [all-day | exclude | start-time]  total
+schedulers scheduler arg1 saturday  [all-day | exclude]  total
+schedulers scheduler arg1 sunday  [all-day | exclude | start-time]  total
+schedulers scheduler arg1 sunday  [all-day | exclude]  total
+schedulers scheduler arg1 thursday  [all-day | exclude | start-time]  total
+schedulers scheduler arg1 thursday  [all-day | exclude]  total
+schedulers scheduler arg1 tuesday  [all-day | exclude | start-time]  total
+schedulers scheduler arg1 tuesday  [all-day | exclude]  total
+schedulers scheduler arg1 wednesday  [all-day | exclude | start-time]  total
+schedulers scheduler arg1 wednesday  [all-day | exclude]  total
 security flow  [allow-dns-reply | allow-embedded-icmp | force-ip-reassembly]  total
+security flow  [allow-dns-reply | allow-embedded-icmp]  total
 security flow tcp-session  [closing-timeout | established-timeout | initial-timeout]  total
-security ike policy arg1 mode  [pre-shared-key | proposal-set]  total
-security ike proposal arg1 authentication-algorithm  [authentication-method | description]  total
-security ipsec proposal arg1 authentication-algorithm  [description | dh-group]  total
+security flow tcp-session  [closing-timeout | established-timeout]  total
+security ike gateway arg1  [address | external-interface | ike-policy]  total
+security ike gateway arg1  [address | external-interface]  total
+security ike gateway arg1 dead-peer-detection  [always-send | interval | optimized]  total
+security ike policy arg1  [mode | pre-shared-key | proposal-set]  total
+security ike proposal arg1  [authentication-algorithm | authentication-method | description]  total
+security ike proposal arg1  [authentication-algorithm | authentication-method]  total
+security ipsec gateway arg1  [address | external-interface | ike-policy]  total
+security ipsec gateway arg1  [address | external-interface]  total
+security ipsec gateway arg1 dead-peer-detection  [always-send | interval | optimized]  total
 security ipsec vpn arg1 ike  [gateway | ipsec-policy]  total
-security ipsec vpn arg1 vpn-monitor destination-ip  [optimized | source-interface]  total
+security ipsec vpn arg1 vpn-monitor  [destination-ip | optimized | source-interface]  total
+security ipsec vpn arg1 vpn-monitor  [destination-ip | optimized]  total
 security log  [format | mode | source-interface]  total
+security log  [format | mode]  total
 security nat source pool arg1  [port-overloading-factor | routing-instance]  total
-security zones security-zone arg1 description  [screen | tcp-rst]  total
 services flow-monitoring version-ipfix template arg1  [flow-active-timeout | flow-inactive-timeout]  total
 services flow-monitoring version9 template arg1  [flow-active-timeout | flow-inactive-timeout]  total
 services rpm probe arg1 test arg1 target  [address | url]  total
 system archival configuration  [transfer-interval | transfer-on-commit]  total
 system dataplane  [binary | claim-host-tunables | control-socket]  total
 system dataplane coalescence  [adaptive | rx-usecs | tx-usecs]  total
+system dataplane coalescence  [adaptive | rx-usecs]  total
 system dataplane shared-umem  [artifact-file | mode | phase0-artifact-file]  total
-system login class arg1 allow-commands  [allow-commands-regexps | allow-configuration]  total
-system ntp server arg1 key  [prefer | routing-instance]  differs
+system dataplane shared-umem  [artifact-file | mode]  total
+system login class arg1  [allow-commands | allow-commands-regexps | allow-configuration]  total
 system services dhcp-local-server group arg1 pool arg1 static-binding arg1  [fixed-address | host-name]  total
-system services dynamic-dns provider arg1 api-token  [aws-access-key | aws-region]  differs
 system services ssh  [client-alive-count-max | client-alive-interval | connection-limit]  total
-system syslog file arg1 archive files  [no-world-readable | size]  differs
