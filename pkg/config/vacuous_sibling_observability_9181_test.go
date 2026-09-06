@@ -145,7 +145,7 @@ func TestVacuousRowsObservableOnlyViaSibling9181(t *testing.T) {
 	}
 
 	var c2, haveChild, shape int
-	var rows, unmeasurable []string
+	var rows, unmeasurable, evaluated []string
 	for _, p := range flatSetChainPairs() {
 		cont, leaves := p.container, p.leaves
 		base := "set " + strings.Join(cont, " ")
@@ -184,6 +184,7 @@ func TestVacuousRowsObservableOnlyViaSibling9181(t *testing.T) {
 		}
 		sort.Strings(names)
 		haveChild++
+		evaluated = append(evaluated, strings.Join(cont, " "))
 
 		found, anyCompiled := false, false
 		for _, cn := range names {
@@ -212,22 +213,38 @@ func TestVacuousRowsObservableOnlyViaSibling9181(t *testing.T) {
 		}
 	}
 
+	// POSITIVE CONTROL, RE-ANCHORED (#9199).
+	//
+	// It used to require `protocols bgp group` to APPEAR IN rows — i.e. to
+	// still exhibit the defect. A control of that shape cannot distinguish
+	// "fixed" from "the instrument broke": it passes only while the bug is
+	// live, and goes red the moment someone repairs the thing it guards. That
+	// is exactly what happened when the `bgp group` compiler fix landed, and
+	// both the control and the count failed together, which is the least
+	// informative possible pairing.
+	//
+	// It now asserts the ENUMERATION REACHED the container and evaluated it.
+	// That is the property a `0` below depends on, and it stays true after a
+	// fix.
 	ctl := false
-	for _, r := range rows {
-		if strings.HasPrefix(r, "protocols bgp group") {
+	for _, e := range evaluated {
+		if strings.HasPrefix(e, "protocols bgp group") {
 			ctl = true
 		}
 	}
 	if !ctl {
-		t.Errorf("POSITIVE CONTROL FAILED: `protocols bgp group` is a MEASURED instance "+
-			"(lane-8388 fixed the compiler and the census moved ZERO rows). If this "+
-			"enumeration cannot find it, the %d below is a property of the instrument.", shape)
+		t.Errorf("POSITIVE CONTROL FAILED: the enumeration never EVALUATED "+
+			"`protocols bgp group` — it did not reach the sibling-fixture stage for a "+
+			"container known to be reachable. The %d below is therefore a property of "+
+			"the instrument, not of the schema. (Evaluated %d containers.)",
+			shape, len(evaluated))
 	}
 	sort.Strings(rows)
 	sort.Strings(unmeasurable)
-	if shape != 2 {
-		t.Errorf("#9181: %d vacuous rows are observable-only-via-a-sibling, want 2 "+
-			"(both `protocols bgp group`).\n  %s\n\n"+
+	if shape != 0 {
+		t.Errorf("#9181: %d vacuous rows are observable-only-via-a-sibling, want 0 "+
+			"(the two `protocols bgp group` rows were the only known instances and the "+
+			"compiler fix in #9199 made them observable).\n  %s\n\n"+
 			"GREW: another container now hides a real loss behind a vacuous label — "+
 			"adjudicate it, it is a defect the census cannot see. SHRANK: a compiler "+
 			"fix made one observable, which is good news; re-derive and lower this.",
