@@ -71,7 +71,7 @@ func TestShowZonesDetailTextWarnsOnReadError(t *testing.T) {
 		},
 	}
 	var buf strings.Builder
-	s.showZonesDetail(store.ActiveConfig(), &buf)
+	s.showZonesDetail(store.ActiveConfig(), "", &buf)
 	if !strings.Contains(buf.String(), "warning") {
 		t.Fatalf("showZonesDetail text lacks a counter-read warning; got:\n%s", buf.String())
 	}

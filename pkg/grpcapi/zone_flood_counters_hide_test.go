@@ -42,7 +42,7 @@ func TestShowZonesDetailTextZoneCountersNotAvailable(t *testing.T) {
 		},
 	}
 	var buf strings.Builder
-	s.showZonesDetail(store.ActiveConfig(), &buf)
+	s.showZonesDetail(store.ActiveConfig(), "", &buf)
 	out := buf.String()
 	if !strings.Contains(out, "Traffic statistics: not available") {
 		t.Fatalf("zone text lacks the per-zone 'not available' marker; got:\n%s", out)

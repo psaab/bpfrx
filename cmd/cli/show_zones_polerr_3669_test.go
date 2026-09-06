@@ -33,7 +33,7 @@ func TestShowZonesSurfacesGetPoliciesError(t *testing.T) {
 	var out string
 	var err error
 	out = captureStdout(t, func() {
-		err = c.showZones()
+		err = c.showZones("")
 	})
 
 	if err == nil {
@@ -79,7 +79,7 @@ func TestShowZonesSucceedsWhenPolicyInventoryOK(t *testing.T) {
 	c := &ctl{client: fake}
 
 	out := captureStdout(t, func() {
-		if err := c.showZones(); err != nil {
+		if err := c.showZones(""); err != nil {
 			t.Fatalf("showZones returned error on the happy path: %v", err)
 		}
 	})

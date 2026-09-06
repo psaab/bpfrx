@@ -8,6 +8,27 @@
 //
 // FAIL-ON-REVERT: restoring the silent-drop loop makes the want-error
 // cases below return nil and the assertions go RED.
+//
+// #9065 SPLIT THE `zone` ROW OUT, and the distinction matters. This table's
+// claim — "a malformed value or an unknown token must not be silently dropped,
+// because a dropped value leaves the field zero, which is the WILDCARD, and
+// silently WIDENS the inspected set" — is unchanged and still true of every
+// row that remains. What was folded into it was a second, separate claim
+// carried only by `{"zone", "notanumber"}`: its inline reason read *"remote
+// Zone is a numeric id"*, and that premise is wrong. pkg/cmdtree offers zone
+// NAMES as the completion set for this exact path, the local console resolves
+// the name, and the SAME binary's `clear security flow session zone` takes a
+// string — so `zone trust` was rejected as malformed and the tree offered a
+// completion this binary refused.
+//
+// The protected BEHAVIOUR did not move: a zone that cannot be resolved still
+// refuses, and still issues no request, so it still cannot widen to the
+// wildcard. Only the LAYER moved, from parse time to resolve time, because
+// resolution needs a GetZones round trip a pure parser must not make. That
+// half is asserted in TestFlowSessionUnknownZoneDoesNotWiden9065 and
+// TestFlowSessionZoneWithNoRuntimeIDRefused9065 — three states (valid name,
+// unknown name, name with no runtime id) needing three signals, which a single
+// parse-time row could not carry.
 package main
 
 import "testing"
@@ -18,7 +39,6 @@ func TestParseFlowSessionArgsRejectsMalformed(t *testing.T) {
 		{"source-port", "abc"},
 		{"source-port", "0"}, // out of 1-65535
 		{"destination-port", "70000"},
-		{"zone", "notanumber"},                 // remote Zone is a numeric id
 		{"protocol", "tcpip"},                  // unknown protocol token
 		{"limit", "0"},                         // non-positive limit
 		{"bogus-token"},                        // unknown filter keyword

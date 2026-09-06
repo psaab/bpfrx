@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/psaab/xpf/pkg/cmdtree"
 	"github.com/psaab/xpf/pkg/config"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"github.com/psaab/xpf/pkg/policymatch"
@@ -62,10 +63,30 @@ func (c *ctl) handleShowSecurity(args []string) error {
 
 	switch args[0] {
 	case "zones":
-		if len(args) >= 2 && args[1] == "detail" {
-			return c.showCommand("show security zones detail")
+		// #9065: this was `args[1] == "detail"`, so `show security zones trust
+		// detail` matched neither arm and fell through to the unfiltered,
+		// non-detail inventory — BOTH the zone name and the modifier silently
+		// discarded. The local console has bound a zone selector here since it
+		// was written (cli_show_security_dispatch.go `filterZone = args[1]`)
+		// and pkg/cmdtree offers zone NAMES as the completion set at this node
+		// (tree.go:407), so the tree offered a selector two of its three
+		// consumers honoured. Position-independent split, from the tree.
+		zsplit := cmdtree.SplitModifiers(
+			cmdtree.OperationalTree["show"].Children["security"].Children["zones"].Children,
+			args[1:])
+		if len(zsplit.Ambiguous) > 0 {
+			return fmt.Errorf("ambiguous keyword %q after `show security zones`",
+				zsplit.Ambiguous[0])
 		}
-		return c.showZones()
+		if len(zsplit.Extra) > 0 {
+			return fmt.Errorf("unexpected argument %q: `show security zones` takes at "+
+				"most one zone name", zsplit.Extra[0])
+		}
+		switch {
+		case zsplit.Has("detail"):
+			return c.showTextFiltered("zones-detail", zsplit.Selector)
+		}
+		return c.showZones(zsplit.Selector)
 	case "policies":
 		// #4908 (C175-HC-126): reject a from-zone/to-zone selector missing its
 		// zone value (e.g. "... from-zone trust to-zone"). The loose parse below
@@ -212,7 +233,14 @@ func zoneHostInboundView(z *pb.ZoneInfo) config.HostInboundView {
 	return v
 }
 
-func (c *ctl) showZones() error {
+// showZones renders the zone inventory, optionally narrowed to one zone.
+//
+// #9065: the filter is applied CLIENT-SIDE because this view is assembled
+// client-side from GetZones + GetPolicies — there is no selector to send. What
+// matters is that a zone name the operator typed reaches SOMETHING; before
+// this it reached nothing at all and the operator was shown every zone with no
+// indication their selector had been dropped.
+func (c *ctl) showZones(filter string) error {
 	resp, err := c.client.GetZones(c.ctx(), &pb.GetZonesRequest{})
 	if err != nil {
 		return fmt.Errorf("%v", err)
@@ -229,7 +257,12 @@ func (c *ctl) showZones() error {
 	// is visible rather than reported as success.
 	polResp, polErr := c.client.GetPolicies(c.ctx(), &pb.GetPoliciesRequest{})
 
+	matched := false
 	for _, z := range resp.Zones {
+		if filter != "" && z.Name != filter {
+			continue
+		}
+		matched = true
 		if z.Id > 0 {
 			fmt.Printf("Zone: %s (id: %d)\n", z.Name, z.Id)
 		} else {
@@ -329,6 +362,13 @@ func (c *ctl) showZones() error {
 		}
 
 		fmt.Println()
+	}
+	// A selector that matched nothing must FAIL, not print an empty inventory.
+	// Silence is what the pre-#9065 dropped selector already looked like, and
+	// an operator cannot tell "no such zone" from "this zone is empty" — the
+	// same reasoning as the #3669 policy-error branch below.
+	if filter != "" && !matched {
+		return fmt.Errorf("zone %q not found", filter)
 	}
 	if polErr != nil {
 		return fmt.Errorf("policy inventory unavailable (zone policy references omitted): %w", polErr)

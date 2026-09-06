@@ -448,33 +448,61 @@ func (c *ctl) handlePing(args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: ping <host> [count N] [source IP] [size N] [routing-instance NAME]")
 	}
+	// #9065: every option here was parsed with its error DISCARDED — a bare
+	// `if v, err := strconv.Atoi(...); err == nil` with no else, and an
+	// `if i+1 < len(args)` with no else. So `ping host count abc` and
+	// `ping host count` both ran a 5-packet ping and said nothing, and the
+	// operator got a different ping from the one they typed. Same family as the
+	// dropped selectors above: the command succeeds while answering a different
+	// question.
+	//
+	// SCOPED to the four declared options. An UNKNOWN trailing token is still
+	// ignored rather than refused — that is a second claim about this loop which
+	// this change does not measure, and turning it into an error could refuse a
+	// form some script relies on. The silent handling of a KNOWN option's own
+	// value is what is fixed.
 	req := &pb.PingRequest{Target: args[0], Count: 5}
+	takePingValue := func(i *int, kw string) (string, error) {
+		if *i+1 >= len(args) {
+			return "", fmt.Errorf("missing value for %q", kw)
+		}
+		*i++
+		return args[*i], nil
+	}
 	for i := 1; i < len(args); i++ {
 		switch args[i] {
 		case "count":
-			if i+1 < len(args) {
-				i++
-				if v, err := strconv.Atoi(args[i]); err == nil {
-					req.Count = int32(v)
-				}
+			v, err := takePingValue(&i, "count")
+			if err != nil {
+				return err
 			}
+			n, cerr := strconv.Atoi(v)
+			if cerr != nil {
+				return fmt.Errorf("invalid count %q: must be a number", v)
+			}
+			req.Count = int32(n)
 		case "source":
-			if i+1 < len(args) {
-				i++
-				req.Source = args[i]
+			v, err := takePingValue(&i, "source")
+			if err != nil {
+				return err
 			}
+			req.Source = v
 		case "size":
-			if i+1 < len(args) {
-				i++
-				if v, err := strconv.Atoi(args[i]); err == nil {
-					req.Size = int32(v)
-				}
+			v, err := takePingValue(&i, "size")
+			if err != nil {
+				return err
 			}
+			n, cerr := strconv.Atoi(v)
+			if cerr != nil {
+				return fmt.Errorf("invalid size %q: must be a number", v)
+			}
+			req.Size = int32(n)
 		case "routing-instance":
-			if i+1 < len(args) {
-				i++
-				req.RoutingInstance = args[i]
+			v, err := takePingValue(&i, "routing-instance")
+			if err != nil {
+				return err
 			}
+			req.RoutingInstance = v
 		}
 	}
 	ctx, cancel := context.WithTimeout(c.ctx(), 60*time.Second)

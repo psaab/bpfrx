@@ -25,14 +25,31 @@ import (
 // showZonesDetail renders per-zone configuration plus dataplane traffic
 // counters, policy references, interface details, screen profile
 // breakdown, and policy-rule summaries.
-func (s *Server) showZonesDetail(cfg *config.Config, buf *strings.Builder) {
+// #9065: filter narrows the render to one zone. The remote CLI can now bind a
+// zone name to this topic (`show security zones <name> detail`, which the local
+// console has always honoured and pkg/cmdtree has always offered), so the
+// server must honour it — a client that sends a selector the server ignores
+// shows the operator every zone with nothing saying their selector was
+// discarded, which is the same silence the dropped selector produced.
+//
+// An unmatched selector writes a NOT-FOUND line rather than an empty body, for
+// the reason the caller's own zone filter errors: "no such zone" and "this zone
+// is empty" must not read identically.
+func (s *Server) showZonesDetail(cfg *config.Config, filter string, buf *strings.Builder) {
 	if cfg == nil || len(cfg.Security.Zones) == 0 {
 		buf.WriteString("No security zones configured\n")
 		return
 	}
 	zoneNames := make([]string, 0, len(cfg.Security.Zones))
 	for name := range cfg.Security.Zones {
+		if filter != "" && name != filter {
+			continue
+		}
 		zoneNames = append(zoneNames, name)
+	}
+	if len(zoneNames) == 0 {
+		fmt.Fprintf(buf, "security zone %q not found\n", filter)
+		return
 	}
 	sort.Strings(zoneNames)
 	cr := s.applyResult()
