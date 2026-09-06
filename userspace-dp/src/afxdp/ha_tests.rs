@@ -3001,6 +3001,7 @@ fn a_pass1_refused_import_is_counted_and_not_published_6979_f1() {
                     dst_ip: local_flow.dst_ip,
                     src_port: local_flow.src_port,
                     dst_port: local_flow.dst_port,
+                    routing_scope: 0,
                 },
                 crate::nat::TranslatedTuple {
                     ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),

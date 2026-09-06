@@ -231,6 +231,9 @@ fn reserve_synced_source_nat_allocation_with_holder(
         dst_ip: nat.rewrite_dst.unwrap_or(key.dst_ip),
         src_port: key.src_port,
         dst_port: key.dst_port,
+        // #9062: the same domain the session layer stamped, so this key matches
+        // the one the match path built.
+        routing_scope: key.routing_domain,
     };
     // #6211 PASS 1 — reserve on a rule the ACTIVE node could actually have
     // matched. `flow` is byte-identical to the active's SNAT-match tuple

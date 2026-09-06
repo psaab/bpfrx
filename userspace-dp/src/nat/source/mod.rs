@@ -1,3 +1,5 @@
+mod keys;
+pub(crate) use keys::*;
 mod lease_note_7560;
 pub(crate) use lease_note_7560::{dropped_persistent_lease_note, report_dropped_leases};
 // Source NAT (SNAT) rules + matching + lookup.
@@ -103,14 +105,7 @@ pub(crate) use overlap::*;
 const DEFAULT_PERSISTENT_NAT_TIMEOUT_SECS: i64 = 300;
 
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub(crate) struct SourceNatFlowKey {
-    pub(crate) protocol: u8,
-    pub(crate) src_ip: IpAddr,
-    pub(crate) dst_ip: IpAddr,
-    pub(crate) src_port: u16,
-    pub(crate) dst_port: u16,
-}
+
 
 /// #2823: remote-endpoint scope of a persistent NAT lease, the full
 /// three-way Junos `persistent-nat permit` enum. Replaces the pre-#2823
@@ -160,32 +155,6 @@ impl PersistentNatPermit {
     }
 }
 
-impl SourceNatFlowKey {
-    /// #2397: build the persistent-NAT lease key for this flow.
-    ///
-    /// #2823: the scope is selected by the three-way `permit` enum:
-    ///   - `AnyRemoteHost`   -> `remote = None`: source-tuple-only key, any
-    ///     remote host reuses the mapping.
-    ///   - `TargetHost`      -> `remote = Some((dst_ip, 0))`: the destination
-    ///     IP is folded in but the port is dropped, so a second flow from the
-    ///     same source to a NEW port on the SAME remote host keys to the same
-    ///     lease and reuses the mapping.
-    ///   - `TargetHostPort`  -> `remote = Some((dst_ip, dst_port))`: the full
-    ///     remote endpoint is folded in, so a different remote port keys to a
-    ///     distinct lease and gets a fresh mapping (the pre-#2823 behavior).
-    pub(super) fn persistent_source_key(self, permit: PersistentNatPermit) -> PersistentSourceKey {
-        PersistentSourceKey {
-            protocol: self.protocol,
-            src_ip: self.src_ip,
-            src_port: self.src_port,
-            remote: match permit {
-                PersistentNatPermit::AnyRemoteHost => None,
-                PersistentNatPermit::TargetHost => Some((self.dst_ip, 0)),
-                PersistentNatPermit::TargetHostPort => Some((self.dst_ip, self.dst_port)),
-            },
-        }
-    }
-}
 
 /// #3429: source-NAT `match application` protocol wildcard. 256 is outside the
 /// 0-255 protocol range so it never aliases protocol 0 (HOPOPT); a term carrying
@@ -310,16 +279,26 @@ pub(crate) struct SourceNatRule {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
-struct SourceNatPoolAllocatorKey {
+pub(crate) struct SourceNatPoolAllocatorKey {
     pool_name: String,
     pool_addresses_v4: Vec<Ipv4Addr>,
     pool_addresses_v6: Vec<Ipv6Addr>,
     port_low: u16,
     port_high: u16,
+    /// #9062: the rule-set's `from` routing instance. Two rule-sets scoped to
+    /// different instances that name the same pool used to share ONE
+    /// PortAllocator, so a port handed to one tenant was unavailable to the
+    /// other and -- with the flow key also domain-blind -- the second tenant's
+    /// identical 5-tuple was answered with the first's translation.
+    ///
+    /// Taken from the rule rather than from the packet: the allocator is
+    /// selected per RULE, and the rule's own scope is what the operator wrote.
+    from_routing_instance: String,
 }
 
 impl SourceNatRule {
-    fn allocator_key(&self) -> Option<SourceNatPoolAllocatorKey> {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn allocator_key(&self) -> Option<SourceNatPoolAllocatorKey> {
         let total_pool = self.pool_addresses_v4.len() + self.pool_addresses_v6.len();
         (self.pool_mode && total_pool > 0 && self.pool_failure.is_none()).then(|| {
             self.allocator_key_for(self.pool_port_low, self.pool_port_high)
@@ -374,6 +353,7 @@ impl SourceNatRule {
             pool_addresses_v6: self.pool_addresses_v6.clone(),
             port_low,
             port_high,
+            from_routing_instance: self.from_routing_instance.clone(),
         }
     }
 }

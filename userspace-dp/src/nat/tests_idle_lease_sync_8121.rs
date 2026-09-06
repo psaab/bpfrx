@@ -26,6 +26,7 @@ fn flow(src: &str, sport: u16) -> SourceNatFlowKey {
         dst_ip: "8.8.8.8".parse().unwrap(),
         src_port: sport,
         dst_port: 443,
+        routing_scope: 0,
     }
 }
 

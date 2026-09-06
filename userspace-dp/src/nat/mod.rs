@@ -171,6 +171,14 @@ pub(crate) struct NatScopeCtx<'a> {
     pub(crate) egress_ifname: &'a str,
     pub(crate) ingress_routing_instance: &'a str,
     pub(crate) egress_routing_instance: &'a str,
+    /// #9062: the flow's routing domain -- `SessionKey.routing_domain`, passed
+    /// through rather than re-derived, so the flow key this scope builds is the
+    /// same one the release and HA-sync paths compute from the SessionKey.
+    ///
+    /// The instance NAMES above scope which RULE matches; this scopes the
+    /// flow's IDENTITY under that rule. They are different questions and the
+    /// second one has to agree with the session layer.
+    pub(crate) routing_domain: u32,
 }
 
 pub(crate) use allocator::{

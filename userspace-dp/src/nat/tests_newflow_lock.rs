@@ -27,6 +27,7 @@ fn pool_flow(src_port: u16) -> SourceNatFlowKey {
         dst_ip: "8.8.8.8".parse().unwrap(),
         src_port,
         dst_port: 443,
+        routing_scope: 0,
     }
 }
 
