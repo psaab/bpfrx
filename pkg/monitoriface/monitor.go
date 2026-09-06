@@ -171,9 +171,38 @@ func displayTrafficCounters(snap *Snapshot) trafficCounters {
 	return counters
 }
 
-func snapshotTrafficDeltas(curr, prev *Snapshot) (rxPktsDelta, txPktsDelta, rxBytesDelta, txBytesDelta uint64) {
+// snapshotTrafficDeltas returns the per-window deltas and reports whether the
+// USERSPACE component had to be left out of them.
+//
+// #9047: the both-samples gate below is correct and must stay -- these are
+// CUMULATIVE counters, so treating a missing side as zero would attribute the
+// entire cumulative total to one window and render a spike that never
+// happened. What was wrong is that declining was SILENT.
+//
+// The window that drops it is not rare: hasUserspaceTrafficSource is false at
+// the first sample after helper start, after a helper restart, and whenever the
+// status read failed -- that path sets Userspace to a struct carrying only a
+// StatusNote, with no bindings and no counters, so the gate declines.
+//
+// AND THE SAME RENDER DISAGREES WITH ITSELF. displayTrafficCounters gates on
+// `curr` ALONE, so in any window where prev lacks a source and curr has one,
+// the displayed TOTAL includes userspace bytes while the displayed RATE does
+// not. The two gates are NOT reconciled to match, deliberately: they answer
+// different questions. A total is a single-sample fact and is right to include
+// userspace as soon as curr has it; a rate needs two samples and cannot be
+// computed without both. Forcing the total to drop userspace whenever prev
+// lacked a source would make the TOTAL wrong to fix a cosmetic disagreement.
+// The honest reconciliation is to say so, which is what the flag is for.
+//
+// That is #7422 row 10's doctrine applied to the path that reintroduced the
+// shape it fixed: a counter group that could not be contributed must carry a
+// NOTE rather than silently render 0, because 0 is indistinguishable from a
+// genuinely idle interface. #7422 fixed the two sibling groups on the strength
+// of the userspace group already having a note -- and then the RATE path went
+// on dropping that same group silently.
+func snapshotTrafficDeltas(curr, prev *Snapshot) (rxPktsDelta, txPktsDelta, rxBytesDelta, txBytesDelta uint64, userspaceDropped bool) {
 	if curr == nil || prev == nil {
-		return 0, 0, 0, 0
+		return 0, 0, 0, 0, false
 	}
 
 	rxPktsDelta = deltaU64(curr.RxPkts, prev.RxPkts)
@@ -186,9 +215,16 @@ func snapshotTrafficDeltas(curr, prev *Snapshot) (rxPktsDelta, txPktsDelta, rxBy
 		txPktsDelta += deltaU64(curr.Userspace.TxPackets, prev.Userspace.TxPackets)
 		rxBytesDelta += deltaU64(curr.Userspace.RxBytes, prev.Userspace.RxBytes)
 		txBytesDelta += deltaU64(curr.Userspace.TxBytes, prev.Userspace.TxBytes)
+		return rxPktsDelta, txPktsDelta, rxBytesDelta, txBytesDelta, false
 	}
 
-	return rxPktsDelta, txPktsDelta, rxBytesDelta, txBytesDelta
+	// Dropped. Report it ONLY when the interface actually has a userspace
+	// source to contribute in the current sample -- otherwise every
+	// kernel-only interface would carry a permanent note about a component it
+	// never has, which is the false-positive that makes operators stop reading
+	// notes.
+	return rxPktsDelta, txPktsDelta, rxBytesDelta, txBytesDelta,
+		hasUserspaceTrafficSource(curr.Userspace)
 }
 
 func ResolvePhysicalParent(name string) string {
@@ -599,10 +635,12 @@ func RenderSingleInterface(w io.Writer, hostname, displayName, kernelName string
 	fmt.Fprintf(w, "Encapsulation: Ethernet, Speed: %s\n", speed)
 
 	var rxBps, txBps, rxPps, txPps uint64
+	var userspaceRateDropped bool
 	if prev != nil {
 		dt := snap.Timestamp.Sub(prev.Timestamp).Seconds()
 		if dt > 0 {
-			rxPktsDelta, txPktsDelta, rxBytesDeltaStep, txBytesDeltaStep := snapshotTrafficDeltas(snap, prev)
+			rxPktsDelta, txPktsDelta, rxBytesDeltaStep, txBytesDeltaStep, dropped := snapshotTrafficDeltas(snap, prev)
+			userspaceRateDropped = dropped
 			rxBps = uint64(float64(rxBytesDeltaStep) * 8 / dt)
 			txBps = uint64(float64(txBytesDeltaStep) * 8 / dt)
 			rxPps = uint64(float64(rxPktsDelta) / dt)
@@ -612,7 +650,7 @@ func RenderSingleInterface(w io.Writer, hostname, displayName, kernelName string
 
 	var rxBytesDelta, txBytesDelta, rxPktsDelta, txPktsDelta uint64
 	if baseline != nil {
-		rxPktsDelta, txPktsDelta, rxBytesDelta, txBytesDelta = snapshotTrafficDeltas(snap, baseline)
+		rxPktsDelta, txPktsDelta, rxBytesDelta, txBytesDelta, _ = snapshotTrafficDeltas(snap, baseline)
 	}
 	currCounters := displayTrafficCounters(snap)
 
@@ -624,6 +662,15 @@ func RenderSingleInterface(w io.Writer, hostname, displayName, kernelName string
 	if snap.DataplaneCountersNote != "" {
 		fmt.Fprintf(w, "  Note: dataplane counters unavailable (%s) — byte/packet values below are NOT a measurement\n",
 			snap.DataplaneCountersNote)
+	}
+	// #9047: the rate below excludes userspace forwarding for this window while
+	// the TOTAL beside it includes it. Say so rather than render a rate that
+	// under-reports with no indication -- `monitor` is a live-diagnosis
+	// surface, and a silently-wrong rate on it is worse than no rate.
+	if userspaceRateDropped {
+		fmt.Fprintf(w, "  Note: rate EXCLUDES userspace/XSK forwarding this window "+
+			"(no userspace counters in the previous sample — helper start, restart, or a "+
+			"failed status read); the totals below DO include it, so bps/pps under-reports\n")
 	}
 	fmt.Fprintf(w, "  Input  bytes:         %20d (%d bps)    [%d]\n", currCounters.rxBytes, rxBps, rxBytesDelta)
 	fmt.Fprintf(w, "  Output bytes:         %20d (%d bps)    [%d]\n", currCounters.txBytes, txBps, txBytesDelta)
@@ -836,7 +883,7 @@ func RenderTrafficSummary(w io.Writer, hostname string, names []string, kernelNa
 			}
 			var rxDelta, txDelta uint64
 			if prev := prevSnaps[name]; prev != nil {
-				rxDelta, txDelta, _, _ = snapshotTrafficDeltas(snap, prev)
+				rxDelta, txDelta, _, _, _ = snapshotTrafficDeltas(snap, prev)
 			}
 			totalRxDelta += rxDelta
 			totalTxDelta += txDelta
@@ -925,7 +972,7 @@ func snapshotRates(curr, prev *Snapshot) (rxPps, txPps, rxBytesPerSec, txBytesPe
 	if dt <= 0 {
 		return 0, 0, 0, 0
 	}
-	rxPktsDelta, txPktsDelta, rxBytesDelta, txBytesDelta := snapshotTrafficDeltas(curr, prev)
+	rxPktsDelta, txPktsDelta, rxBytesDelta, txBytesDelta, _ := snapshotTrafficDeltas(curr, prev)
 	return uint64(float64(rxPktsDelta) / dt),
 		uint64(float64(txPktsDelta) / dt),
 		uint64(float64(rxBytesDelta) / dt),
