@@ -906,8 +906,14 @@ func compilePolicyOptions(node *Node, po *PolicyOptionsConfig) error {
 					parsePolicyTermInlineKeys(term, prop.Keys[2:])
 				}
 			case "then":
-				// Default action at the policy level
-				for _, ac := range prop.Children {
+				// Default action at the policy level. #8939: the only two
+				// leaves here are `accept` and `reject`, which are mutually
+				// exclusive, so a flat run of both is not a command an
+				// operator writes -- but the two spellings disagreed about
+				// which one won (split last-wins `reject`, packed `accept`),
+				// and a spelling difference on a contradictory input is still
+				// a spelling difference.
+				for _, ac := range expandFlatRun(prop.Children, policyStatementThenSchema8939()) {
 					switch ac.Name() {
 					case "accept":
 						ps.DefaultAction = "accept"
@@ -1136,7 +1142,13 @@ func parsePolicyTermChildren(term *PolicyTerm, children []*Node) {
 				}
 			}
 		case "then":
-			for _, ac := range tc.Children {
+			// #8939: `set … term t1 then accept load-balance per-packet
+			// local-preference 200` nests each action under the previous one,
+			// so this loop saw only `accept`. The route is still ACCEPTED --
+			// `accept` is alphabetically first, so it is the one token that
+			// survives -- and installed WITHOUT the attributes the operator
+			// attached to it: default local-preference, no ECMP.
+			for _, ac := range expandFlatRun(tc.Children, policyTermThenSchema8939()) {
 				switch ac.Name() {
 				case "accept":
 					term.Action = "accept"
@@ -1544,4 +1556,37 @@ func RibGroupConnectedPrefixes(cfg *Config) map[string][]string {
 		}
 	}
 	return out
+}
+
+// policyStatementThenSchema8939 / policyTermThenSchema8939 resolve the two
+// `then` containers under `policy-options policy-statement`.
+//
+// THEY ARE NOT EQUALLY INTERESTING AND THE CENSUS CANNOT SAY SO. The
+// policy-level `then` declares exactly `accept` and `reject`, which are
+// mutually exclusive, so its census row is the only pair that exists and is
+// not a command anyone writes. The TERM-level `then` declares ten children --
+// `load-balance`, `local-preference`, `metric`, `next-hop`, `origin`,
+// `as-path-prepend`, `community` among them -- and `then { local-preference
+// 200; load-balance per-packet; accept; }` is ordinary Junos. That is the row
+// with the operator behind it.
+func policyStatementThenSchema8939() *schemaNode {
+	po := resolveSchemaChild(setSchema, "policy-options")
+	ps := resolveSchemaChild(po, "policy-statement")
+	if ps != nil && ps.wildcard != nil {
+		ps = ps.wildcard
+	}
+	return resolveSchemaChild(ps, "then")
+}
+
+func policyTermThenSchema8939() *schemaNode {
+	po := resolveSchemaChild(setSchema, "policy-options")
+	ps := resolveSchemaChild(po, "policy-statement")
+	if ps != nil && ps.wildcard != nil {
+		ps = ps.wildcard
+	}
+	term := resolveSchemaChild(ps, "term")
+	if term != nil && term.wildcard != nil {
+		term = term.wildcard
+	}
+	return resolveSchemaChild(term, "then")
 }
