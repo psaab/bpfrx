@@ -820,9 +820,50 @@ func credentialPrincipalUser(cfg AuthConfig, r *http.Request) (string, bool) {
 // which is why TestEveryReadRouteHasAPermission_6660 enumerates the mux and
 // fails on any /api/v1 GET the table does not cover, moving that risk from
 // runtime to the test suite.
+// readPermissionFor resolves the permission guarding a SAFE request, keyed on
+// (method, path), and adjudicates a non-GET safe method against the GET entry.
+//
+// #9134: HEAD WAS A COMPLETE AUTHORIZATION BYPASS ON ALL 40 GUARDED READ ROUTES.
+// isSafeHTTPMethod admits HEAD, the lookup was keyed on `r.Method + " " + path`,
+// and restReadPermissions holds 40 `"GET "` keys and ZERO `"HEAD "` keys. An
+// unknown key is the deliberate fail-OPEN arm (so /health and /metrics keep
+// serving), so every HEAD landed there and was handed straight to the mux --
+// which routes HEAD to the GET pattern DIRECTLY, no redirect. The handler ran
+// with no authorization decision at all:
+//
+//	GET  /api/v1/config         403  permission denied ... class ""
+//	HEAD /api/v1/config         200  handler executed
+//	HEAD /api/v1/config/export  200  clen=168   exact body SIZE disclosed
+//	HEAD /api/v1/routing/ospf   200  clen=55    the FRR handler ran
+//
+// A response to HEAD carries no body, but Content-Length is the body's exact
+// size and the status code separates "exists and you may not see it" from
+// "exists"; both are read access to information the GET was refused.
+//
+// FIXING IT BY ADDING 40 "HEAD " KEYS WOULD BE THE WRONG SHAPE. The table would
+// then have to be edited twice per route forever, and the next safe method Go's
+// mux learns to alias reopens the hole. Resolving the alias HERE means the table
+// stays keyed on the route as it is served, and a route added with only a GET
+// entry is guarded under every safe method that can reach its handler.
+//
+// The fall-through for a genuinely unknown path is unchanged: /health and
+// /metrics have no entry and must keep serving.
+func readPermissionFor(method, path string) (config.LoginClassPermission, bool) {
+	if required, known := restReadPermissions[method+" "+path]; known {
+		return required, true
+	}
+	// A safe method other than GET reaches the GET handler through the mux, so
+	// it is the GET entry that governs it.
+	if method != http.MethodGet && isSafeHTTPMethod(method) {
+		if required, known := restReadPermissions[http.MethodGet+" "+path]; known {
+			return required, true
+		}
+	}
+	return 0, false
+}
+
 func (s *Server) readAuthz(w http.ResponseWriter, r *http.Request, next http.Handler) {
-	route := r.Method + " " + r.URL.Path
-	required, known := restReadPermissions[route]
+	required, known := readPermissionFor(r.Method, r.URL.Path)
 	if !known {
 		next.ServeHTTP(w, r)
 		return
