@@ -55,6 +55,14 @@ func (c *xpfCollector) initGlobalDescriptors() {
 			"cap, by limiter (session_walk, remote_walk, diagnostic).",
 		[]string{"limiter"}, nil,
 	)
+	c.authzDenialsTotal = prometheus.NewDesc(
+		"xpf_authz_denials_total",
+		"Total authorization/authentication denials, by surface "+
+			"(grpc_login_class, fabric_auth, fabric_method_allowlist, "+
+			"fabric_stream_allowlist, rest_cross_site). Always emitted, "+
+			"including at zero (#9042).",
+		[]string{"surface"}, nil,
+	)
 	c.sessionsCreatedTotal = prometheus.NewDesc(
 		"xpf_sessions_created_total",
 		"Total sessions created.",

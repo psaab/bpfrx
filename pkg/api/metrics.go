@@ -99,6 +99,7 @@ type xpfCollector struct {
 	// from the diagcmd limiters themselves, so there is no counter state on the
 	// collector to keep in step.
 	admissionRefusalsTotal *prometheus.Desc
+	authzDenialsTotal      *prometheus.Desc
 
 	// Interface counters
 	ifacePacketsTotal *prometheus.Desc
@@ -802,6 +803,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.flowCacheTotal
 	ch <- c.counterReadErrorsTotal
 	c.describeAdmissionRefusals(ch)
+	c.describeAuthzDenials(ch)
 	ch <- c.ifacePacketsTotal
 	ch <- c.ifaceBytesTotal
 	ch <- c.interfaceCounterReadErrorsTotal
@@ -1172,6 +1174,7 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	// exactly when a scrape is most likely to be refused, so emitting these
 	// after the dataplane gate would hide them in the case they matter most.
 	defer c.emitAdmissionRefusals(ch)
+	defer c.emitAuthzDenials(ch)
 
 	// #1799: config-persist health is a control-plane signal — emit it
 	// BEFORE the dataplane gate below so the degraded state stays

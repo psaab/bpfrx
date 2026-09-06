@@ -1,6 +1,8 @@
 package api
 
 import (
+	"github.com/psaab/xpf/pkg/denyaudit"
+
 	"log/slog"
 	"mime"
 	"net/http"
@@ -69,9 +71,24 @@ func mutationCrossSiteGuard(next http.Handler) http.Handler {
 			return
 		}
 		if reason, reject := crossSiteRejectReason(r); reject {
-			slog.Warn("api: rejected cross-site mutation request",
-				"method", r.Method, "path", r.URL.Path,
-				"reason", reason, "remote", r.RemoteAddr)
+			// #9042: unbounded per-request on the REST surface, and the
+			// remote address was in the record -- so an attacker both paced
+			// the line and chose part of its content. Keyed on the REASON,
+			// which is a bounded set: keying on the remote address would let
+			// one source spread a flood across every bucket and defeat the
+			// limiter, which is the failure mode a per-key limiter invites
+			// when the key is attacker-supplied.
+			if emit, suppressed := denyaudit.Note(denyaudit.SurfaceRESTCrossSite, reason); emit {
+				slog.Warn("api: rejected cross-site mutation request",
+					"method", r.Method, "path", r.URL.Path,
+					"reason", reason, "remote", r.RemoteAddr,
+					"suppressed_since_last", suppressed,
+					"denials_total", denyaudit.Total(denyaudit.SurfaceRESTCrossSite))
+			} else {
+				slog.Debug("api: rejected cross-site mutation request",
+					"method", r.Method, "path", r.URL.Path,
+					"reason", reason, "remote", r.RemoteAddr)
+			}
 			writeError(w, http.StatusForbidden, "cross-site request forbidden")
 			return
 		}

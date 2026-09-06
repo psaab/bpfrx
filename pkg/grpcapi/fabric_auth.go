@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/psaab/xpf/pkg/denyaudit"
+
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -309,7 +311,19 @@ func (s *Server) checkFabricAuth(ctx context.Context, method string) error {
 		if present && !tokenOK {
 			reason += s.noteFabricAuthSkew(keys, token, time.Now())
 		}
-		slog.Warn("fabric gRPC listener rejected call: authentication failed", "method", method, "reason", reason)
+		// #9042: the fabric listener is NETWORK-EXPOSED, so this is the
+		// worst-positioned of the five sites -- an off-box peer controls the
+		// rate. Keyed on the reason rather than a remote address: the address
+		// is attacker-supplied and would spread one flood across every bucket.
+		if emit, suppressed := denyaudit.Note(denyaudit.SurfaceFabricAuth, reason); emit {
+			slog.Warn("fabric gRPC listener rejected call: authentication failed",
+				"method", method, "reason", reason,
+				"suppressed_since_last", suppressed,
+				"denials_total", denyaudit.Total(denyaudit.SurfaceFabricAuth))
+		} else {
+			slog.Debug("fabric gRPC listener rejected call: authentication failed",
+				"method", method, "reason", reason)
+		}
 		return status.Errorf(codes.Unauthenticated, "fabric RPC authentication failed: %s", reason)
 	}
 	return nil
