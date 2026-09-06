@@ -42,7 +42,12 @@ func compileIKE(node *Node, sec *SecurityConfig) error {
 	// IKE proposals (Phase 1 crypto)
 	for _, inst := range namedInstances(node.FindChildren("proposal")) {
 		prop := &IKEProposal{Name: inst.name}
-		for _, p := range inst.node.Children {
+		// #8939: a flat run drops every leaf after the first, so
+		// `authentication-algorithm sha1 authentication-method pre-shared-keys
+		// dh-group group14` compiles to the algorithm alone -- no DH group and
+		// no authentication method, i.e. phase-1 crypto selected by default
+		// rather than by the operator.
+		for _, p := range expandFlatRun(inst.node.Children, securityNamedLeafSchema8939(node, "proposal")) {
 			v := nodeVal(p)
 			switch p.Name() {
 			case "authentication-method":
@@ -88,7 +93,7 @@ func compileIKE(node *Node, sec *SecurityConfig) error {
 		if pol == nil {
 			pol = &IKEPolicy{Name: inst.name}
 		}
-		for _, p := range inst.node.Children {
+		for _, p := range expandFlatRun(inst.node.Children, securityNamedLeafSchema8939(node, "policy")) {
 			v := nodeVal(p)
 			switch p.Name() {
 			case "mode":
@@ -311,7 +316,9 @@ func compileIPsec(node *Node, sec *SecurityConfig) error {
 	// IPsec proposals (Phase 2 crypto)
 	for _, inst := range namedInstances(node.FindChildren("proposal")) {
 		prop := &IPsecProposal{Name: inst.name}
-		for _, p := range inst.node.Children {
+		// #8939, phase 2: the same drop leaves a proposal with no
+		// `encryption-algorithm` -- an ESP proposal that names no cipher.
+		for _, p := range expandFlatRun(inst.node.Children, securityNamedLeafSchema8939(node, "proposal")) {
 			v := nodeVal(p)
 			switch p.Name() {
 			case "protocol":
@@ -348,6 +355,22 @@ func compileIPsec(node *Node, sec *SecurityConfig) error {
 	// IPsec policies (PFS + proposal reference)
 	for _, inst := range namedInstances(node.FindChildren("policy")) {
 		pol := &IPsecPolicyDef{Name: inst.name}
+		// NOT expandFlatRun'd, deliberately. `security ipsec policy` declares
+		// three children -- `perfect-forward-secrecy` (a CONTAINER),
+		// `proposals` (MULTI) and `proposal-set` -- so exactly ONE is an
+		// eligible flat-run leaf and the #8939 collector drops the container
+		// as "only one eligible leaf". It has no census row and cannot have
+		// one. Its packed spelling DOES lose a value in both orderings:
+		//
+		//   proposal-set S perfect-forward-secrecy keys G  -> PFS group lost
+		//   perfect-forward-secrecy keys G proposal-set S  -> proposal-set lost
+		//
+		// but neither is the flat-run chain: the first needs the
+		// perfect-forward-secrecy reader to accept its arg packed onto Keys
+		// (the #2419/#6690 dual-shape class), and the second needs a hoist out
+		// of a container leaf's body, which expandFlatRun refuses BY DESIGN.
+		// Filed separately rather than smuggled in here; a call added here
+		// would be inert and would read as coverage.
 		for _, p := range inst.node.Children {
 			switch p.Name() {
 			case "proposal-set":
@@ -795,4 +818,34 @@ func ipsecTrafficSelectorSchema8939() *schemaNode {
 		return ts.wildcard
 	}
 	return ts
+}
+
+// securityNamedLeafSchema8939 resolves `security <branch> <kind> <name>` for
+// expandFlatRun, where branch is whichever of `ike` / `ipsec` is being
+// compiled and kind is `proposal` or `policy`. The four containers are
+// DISTINCT schema nodes with distinct leaf sets and four duplicated readers,
+// so one helper parameterised by both is the only shape that does not invite
+// a copy per site.
+//
+// CHANNEL, measured rather than assumed: all four are CLOSED-WORLD subtrees
+// (#4313 flipped `security ipsec proposal`), so the packed spelling is
+// REJECTED on the operator commit path and reaches this code only via
+// Store.Load and Store.SyncApply. These are lenient-only rows; the fix is
+// still worth making because a persisted or peer-synced config carries the
+// truncation with nothing watching, but the operator-typed story does not
+// apply and is deliberately not told here.
+func securityNamedLeafSchema8939(parent *Node, kind string) *schemaNode {
+	if parent == nil || len(parent.Keys) == 0 {
+		return nil
+	}
+	sec := resolveSchemaChild(setSchema, "security")
+	branch := resolveSchemaChild(sec, parent.Keys[0])
+	n := resolveSchemaChild(branch, kind)
+	if n == nil {
+		return nil
+	}
+	if n.wildcard != nil {
+		return n.wildcard
+	}
+	return n
 }
