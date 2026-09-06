@@ -1266,7 +1266,7 @@ func (s *Server) ClearSessions(ctx context.Context, req *pb.ClearSessionsRequest
 		// (Failures==0, accurate counts).
 		agg.add("clear-all", err)
 		if !forwarded {
-			agg.add("peer clear", s.clearPeerSessions(req))
+			agg.add("peer clear", s.clearPeerSessions(ctx, req))
 		}
 		resp := &pb.ClearSessionsResponse{
 			Ipv4Cleared: int32(v4),
@@ -1329,7 +1329,7 @@ func (s *Server) ClearSessions(ctx context.Context, req *pb.ClearSessionsRequest
 	v6Deleted := s.clearFilteredSessionsV6(ctx, filter, &agg)
 
 	if !forwarded {
-		agg.add("peer clear", s.clearPeerSessions(req))
+		agg.add("peer clear", s.clearPeerSessions(ctx, req))
 	}
 	resp := &pb.ClearSessionsResponse{
 		Ipv4Cleared: int32(v4Deleted),
@@ -1678,7 +1678,7 @@ func (s *Server) clearFilteredSessionsV6Rescan(ctx context.Context, filter *sess
 //
 // A standalone node (no cluster manager) has no peer to clear and
 // returns nil — not a failure.
-func (s *Server) clearPeerSessions(req *pb.ClearSessionsRequest) error {
+func (s *Server) clearPeerSessions(ctx context.Context, req *pb.ClearSessionsRequest) error {
 	if s.cluster == nil {
 		return nil
 	}
@@ -1688,7 +1688,21 @@ func (s *Server) clearPeerSessions(req *pb.ClearSessionsRequest) error {
 		return fmt.Errorf("dial peer node %d: %w", peerID, err)
 	}
 	defer conn.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// #9041: derive from the CALLER's context, not context.Background().
+	//
+	// Every sibling in this fan-out already does (fetchPeerSessions,
+	// proxyPeerSessionSummary, proxyPeerZonePairSummary, proxyMonitorInterface,
+	// proxyPeerSystemAction); this one could not, because it did not take a ctx
+	// at all. The cancel is REACHABLE by two independent routes: the REST
+	// handler passes `r.Context()`, which net/http cancels when the client
+	// disconnects, and the CLI passes `cmdCtx`, whose own field comment reads
+	// "per-command context, cancelled by Ctrl-C".
+	//
+	// Without this the operator's cancel returned immediately while the PEER
+	// clear ran to completion -- a ghost clear, the one outcome the #5882/#2468
+	// partial-success apparatus cannot represent, since it reports what was
+	// attempted and this was neither reported nor stopped.
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	ctx = metadata.AppendToOutgoingContext(ctx, "x-peer-forwarded", "1")
 	if _, err := pb.NewBpfrxServiceClient(conn).ClearSessions(ctx, req); err != nil {
