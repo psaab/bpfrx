@@ -402,6 +402,36 @@ and a flow re-allocates its own tuple on retransmit. The subscriber→block→IP
 assignment (the part that must be deterministic and reversible for compliance
 logging) is identical for both modes.
 
+**Allocator lock discipline (#9130).** The block probe runs BEFORE the
+allocator's `live` map mutex is taken, and every critical section around it is
+O(1). Until #9130 both `allocate_deterministic_v4` and `allocate_deterministic_v6`
+took `lock_live()` first and held it across the whole linear CAS scan of the
+subscriber's block, so the hold time was O(occupied prefix of the block) — up to
+a few thousand CAS attempts for a subscriber near its own block budget, with
+every other flow through that pool serialized behind it. That is the shape #4676
+had already removed from the sibling round-robin PAT path
+(`allocate_translation_inner`: claim the port lock-free on the CAS occupancy
+bitmap, take the mutex only for the reuse/cap/insert critical section); the
+deterministic arms never received it. The order is now:
+
+1. scan the subscriber's block on the lock-free occupancy bitmap;
+2. **no free port** — take the mutex once, O(1), and check idempotent re-entry
+   BEFORE reporting the block full. A live flow's own port is one of the
+   occupied ones, so a full block is the normal state for a re-entering flow;
+   reporting exhaustion here would turn a working flow's second packet into a
+   drop;
+3. **port claimed** — take the mutex once, O(1), for the re-entry check, the
+   flow-table cap check, and the insert. Both refusals give the claimed port
+   back with `free_no_recycle` (never `free_recycle`): a deterministic port is
+   reusable via its occupancy bit alone, and the deterministic allocation path
+   never drains the per-address recycle queue, so a recycled token would leak
+   (the #4559/#5178 no-recycle contract).
+
+The scope is bound by `userspace-dp/src/nat/tests_det_lock_scope_9130.rs`, which
+holds `debug_live()` on one thread and asserts an allocating worker still claims
+its port on the (lock-free) bitmap — a structural discriminator rather than a
+timing assertion.
+
 **Deferred (still tracked in #4559):**
 - RUNTIME block-occupancy alarm for deterministic pools (the #2079 alarm still
   skips them — `UsedPorts` is not the right numerator for block allocation; see

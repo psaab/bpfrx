@@ -1412,6 +1412,38 @@ impl PortAllocator {
         }
     }
 
+    /// Test-only: insert a live allocation directly, into a guard the caller
+    /// already holds.
+    ///
+    /// This exists to make the #9130 insert-critical-section idempotency race
+    /// DETERMINISTIC. That arm fires only when another worker installs the flow
+    /// between this one's lock-free port claim and its insert — a window no
+    /// single-threaded test can enter, and a stress test would hit it once in
+    /// many runs, which scores a mutation as "survived" most of the time. With
+    /// this the test parks on `debug_live()`, waits for the worker to claim its
+    /// port (observable lock-free on the occupancy bitmap), injects the winning
+    /// record, and releases: the worker takes the race arm on EVERY run.
+    #[cfg(test)]
+    pub(super) fn debug_insert_live_locked(
+        live: &mut PortAllocatorLiveState,
+        flow: SourceNatFlowKey,
+        translated: TranslatedTuple,
+        addr_index: usize,
+        deterministic: bool,
+    ) {
+        live.live_by_flow.insert(
+            flow,
+            LiveAllocation {
+                translated,
+                persistent_key: None,
+                addr_index,
+                deterministic,
+                address_only: false,
+                holders: NatHolder::Untracked.bit(),
+            },
+        );
+    }
+
     /// Test-only: clear a synthetic owner seeded via `debug_seed_owner`
     /// (clear its occupancy bit) without pushing the port onto the recycle
     /// queue.
@@ -2519,53 +2551,92 @@ impl PortAllocator {
         }
         let port_end = (port_start + params.block_size as u32 - 1).min(self.port_high as u32);
 
-        let mut live = self.lock_live();
-        if let Some(existing) = live.live_by_flow.get(&flow) {
-            self.shared.reuses_total.fetch_add(1, Ordering::Relaxed);
-            return Ok(existing.translated);
-        }
-        if live.live_by_flow.len() >= self.shared.max_tracked_flows {
-            self.shared.exhaustion_total.fetch_add(1, Ordering::Relaxed);
-            return Err(SourceNatFailureReason::AllocatorExhausted);
-        }
-        // Claim the first free port in the subscriber's block. The block is small
-        // (typically a few thousand ports) and this is the cold path (first
-        // packet of a flow), so a linear CAS probe is fine.
+        // #9130: the block probe runs BEFORE the mutex is taken, and every
+        // critical section below it is O(1) — the shape #4676 gave the sibling
+        // PAT path (`allocate_translation_inner`), which the deterministic arms
+        // never received. Holding the map mutex across the linear scan made the
+        // hold time O(occupied prefix of the block), so one subscriber near its
+        // own block budget serialized every other flow through this pool.
+        //
+        // Claim the first free port in the subscriber's block, LOCK-FREE: the
+        // occupancy bitmap is CAS-based and lives outside the map mutex, and
+        // nothing above this point takes the mutex, so no thread ever holds it
+        // across the scan.
+        let mut claimed = None;
         for p in port_start..=port_end {
             let port = p as u16;
             if self.shared.occupancy[ip_idx].reserve(port) {
-                let translated = TranslatedTuple {
-                    ip: translated_ip,
-                    port,
-                };
-                live.live_by_flow.insert(
-                    flow,
-                    LiveAllocation {
-                        translated,
-                        persistent_key: None,
-                        addr_index: ip_idx,
-                        deterministic: true,
-                        address_only: false,
-                        // #6522: the ALLOCATING worker's holder bit. A locally-born session is
-                        // replicated to every SIBLING worker (`replicate_session_upsert` fans a
-                        // `WorkerLocalImport` entry to `peer_worker_commands`, which EXCLUDES
-                        // this worker) and each sibling reserves against this same record, so
-                        // without this bit the mask holds every worker EXCEPT the one actually
-                        // forwarding — and the last sibling replica to age-reap frees a
-                        // `(pool_addr, port)` still in use. Recording the owner here makes the
-                        // mask complete, so the port survives until the owner itself releases.
-                        holders: holder.bit(),
-                    },
-                );
-                self.shared
-                    .allocations_total
-                    .fetch_add(1, Ordering::Relaxed);
-                return Ok(translated);
+                claimed = Some(port);
+                break;
             }
         }
-        // Every port in the subscriber's block is live — the block is full.
-        self.shared.exhaustion_total.fetch_add(1, Ordering::Relaxed);
-        Err(SourceNatFailureReason::AllocatorExhausted)
+        let Some(port) = claimed else {
+            // No free port in the subscriber's block. Take the mutex ONCE, for
+            // O(1), before reporting the block full: a LIVE flow's own port is
+            // one of the occupied ones, so a full block is the NORMAL state for
+            // a re-entering flow. Reporting exhaustion here would turn the
+            // second packet of a working flow into a drop.
+            let live = self.lock_live();
+            if let Some(existing) = live.live_by_flow.get(&flow) {
+                self.shared.reuses_total.fetch_add(1, Ordering::Relaxed);
+                return Ok(existing.translated);
+            }
+            // Every port in the subscriber's block is live — the block is full.
+            self.shared.exhaustion_total.fetch_add(1, Ordering::Relaxed);
+            return Err(SourceNatFailureReason::AllocatorExhausted);
+        };
+        let translated = TranslatedTuple {
+            ip: translated_ip,
+            port,
+        };
+
+        // Insert critical section: O(1). The idempotency check lives here (and,
+        // for a full block, on the arm above) rather than before the probe,
+        // because the probe must not be gated on the mutex.
+        let mut live = self.lock_live();
+        if let Some(existing) = live.live_by_flow.get(&flow) {
+            // This flow already has a translation — a second packet racing the
+            // session install, or a sibling worker that inserted it while the
+            // probe ran. Give the port back WITHOUT recycling: a deterministic
+            // port is reusable via the occupancy bit alone and must never reach
+            // the per-address recycle queue, which the deterministic allocation
+            // path never drains (#4559 / #5178 — a recycled deterministic port
+            // is a leak).
+            let existing = existing.translated;
+            self.shared.reuses_total.fetch_add(1, Ordering::Relaxed);
+            drop(live);
+            self.free_translated_port(ip_idx, port, false);
+            return Ok(existing);
+        }
+        if live.live_by_flow.len() >= self.shared.max_tracked_flows {
+            self.shared.exhaustion_total.fetch_add(1, Ordering::Relaxed);
+            drop(live);
+            self.free_translated_port(ip_idx, port, false);
+            return Err(SourceNatFailureReason::AllocatorExhausted);
+        }
+        live.live_by_flow.insert(
+            flow,
+            LiveAllocation {
+                translated,
+                persistent_key: None,
+                addr_index: ip_idx,
+                deterministic: true,
+                address_only: false,
+                // #6522: the ALLOCATING worker's holder bit. A locally-born session is
+                // replicated to every SIBLING worker (`replicate_session_upsert` fans a
+                // `WorkerLocalImport` entry to `peer_worker_commands`, which EXCLUDES
+                // this worker) and each sibling reserves against this same record, so
+                // without this bit the mask holds every worker EXCEPT the one actually
+                // forwarding — and the last sibling replica to age-reap frees a
+                // `(pool_addr, port)` still in use. Recording the owner here makes the
+                // mask complete, so the port survives until the owner itself releases.
+                holders: holder.bit(),
+            },
+        );
+        self.shared
+            .allocations_total
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(translated)
     }
 
     /// #4559: allocate a deterministic CGNAT port for a NAPT64 (mode 2) flow
@@ -2615,50 +2686,90 @@ impl PortAllocator {
         }
         let port_end = (port_start + params.block_size as u32 - 1).min(self.port_high as u32);
 
-        let mut live = self.lock_live();
-        if let Some(existing) = live.live_by_flow.get(&flow) {
-            self.shared.reuses_total.fetch_add(1, Ordering::Relaxed);
-            return Ok(existing.translated);
-        }
-        if live.live_by_flow.len() >= self.shared.max_tracked_flows {
-            self.shared.exhaustion_total.fetch_add(1, Ordering::Relaxed);
-            return Err(SourceNatFailureReason::AllocatorExhausted);
-        }
+        // #9130: the block probe runs BEFORE the mutex is taken, and every
+        // critical section below it is O(1) — the shape #4676 gave the sibling
+        // PAT path (`allocate_translation_inner`), which the deterministic arms
+        // never received. Holding the map mutex across the linear scan made the
+        // hold time O(occupied prefix of the block), so one subscriber near its
+        // own block budget serialized every other flow through this pool.
+        //
+        // Claim the first free port in the subscriber's block, LOCK-FREE (the
+        // v4 arm's comment applies verbatim).
+        let mut claimed = None;
         for p in port_start..=port_end {
             let port = p as u16;
             if self.shared.occupancy[ip_idx].reserve(port) {
-                let translated = TranslatedTuple {
-                    ip: translated_ip,
-                    port,
-                };
-                live.live_by_flow.insert(
-                    flow,
-                    LiveAllocation {
-                        translated,
-                        persistent_key: None,
-                        addr_index: ip_idx,
-                        deterministic: true,
-                        address_only: false,
-                        // #6522: the ALLOCATING worker's holder bit. A locally-born session is
-                        // replicated to every SIBLING worker (`replicate_session_upsert` fans a
-                        // `WorkerLocalImport` entry to `peer_worker_commands`, which EXCLUDES
-                        // this worker) and each sibling reserves against this same record, so
-                        // without this bit the mask holds every worker EXCEPT the one actually
-                        // forwarding — and the last sibling replica to age-reap frees a
-                        // `(pool_addr, port)` still in use. Recording the owner here makes the
-                        // mask complete, so the port survives until the owner itself releases.
-                        holders: holder.bit(),
-                    },
-                );
-                self.shared
-                    .allocations_total
-                    .fetch_add(1, Ordering::Relaxed);
-                return Ok(translated);
+                claimed = Some(port);
+                break;
             }
         }
-        // Every port in the subscriber's block is live — the block is full.
-        self.shared.exhaustion_total.fetch_add(1, Ordering::Relaxed);
-        Err(SourceNatFailureReason::AllocatorExhausted)
+        let Some(port) = claimed else {
+            // No free port in the subscriber's block. Take the mutex ONCE, for
+            // O(1), before reporting the block full: a LIVE flow's own port is
+            // one of the occupied ones, so a full block is the NORMAL state for
+            // a re-entering flow. Reporting exhaustion here would turn the
+            // second packet of a working flow into a drop.
+            let live = self.lock_live();
+            if let Some(existing) = live.live_by_flow.get(&flow) {
+                self.shared.reuses_total.fetch_add(1, Ordering::Relaxed);
+                return Ok(existing.translated);
+            }
+            // Every port in the subscriber's block is live — the block is full.
+            self.shared.exhaustion_total.fetch_add(1, Ordering::Relaxed);
+            return Err(SourceNatFailureReason::AllocatorExhausted);
+        };
+        let translated = TranslatedTuple {
+            ip: translated_ip,
+            port,
+        };
+
+        // Insert critical section: O(1). The idempotency check lives here (and,
+        // for a full block, on the arm above) rather than before the probe,
+        // because the probe must not be gated on the mutex.
+        let mut live = self.lock_live();
+        if let Some(existing) = live.live_by_flow.get(&flow) {
+            // This flow already has a translation — a second packet racing the
+            // session install, or a sibling worker that inserted it while the
+            // probe ran. Give the port back WITHOUT recycling: a deterministic
+            // port is reusable via the occupancy bit alone and must never reach
+            // the per-address recycle queue, which the deterministic allocation
+            // path never drains (#4559 / #5178 — a recycled deterministic port
+            // is a leak).
+            let existing = existing.translated;
+            self.shared.reuses_total.fetch_add(1, Ordering::Relaxed);
+            drop(live);
+            self.free_translated_port(ip_idx, port, false);
+            return Ok(existing);
+        }
+        if live.live_by_flow.len() >= self.shared.max_tracked_flows {
+            self.shared.exhaustion_total.fetch_add(1, Ordering::Relaxed);
+            drop(live);
+            self.free_translated_port(ip_idx, port, false);
+            return Err(SourceNatFailureReason::AllocatorExhausted);
+        }
+        live.live_by_flow.insert(
+            flow,
+            LiveAllocation {
+                translated,
+                persistent_key: None,
+                addr_index: ip_idx,
+                deterministic: true,
+                address_only: false,
+                // #6522: the ALLOCATING worker's holder bit. A locally-born session is
+                // replicated to every SIBLING worker (`replicate_session_upsert` fans a
+                // `WorkerLocalImport` entry to `peer_worker_commands`, which EXCLUDES
+                // this worker) and each sibling reserves against this same record, so
+                // without this bit the mask holds every worker EXCEPT the one actually
+                // forwarding — and the last sibling replica to age-reap frees a
+                // `(pool_addr, port)` still in use. Recording the owner here makes the
+                // mask complete, so the port survives until the owner itself releases.
+                holders: holder.bit(),
+            },
+        );
+        self.shared
+            .allocations_total
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(translated)
     }
 
     /// #4388: reserve a SPECIFIC translated `(ip, port)` for `flow` WITHOUT
