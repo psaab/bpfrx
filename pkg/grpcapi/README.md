@@ -539,6 +539,33 @@ contract.
   `zeroizeFn==nil` fallback. The rendered/BPF/networkd leg targets in
   `performZeroizeWipe` are package vars so the full primitive is hermetically
   testable end-to-end (no real `/etc`) — production paths unchanged.
+- **Zeroize erases the upgrade config-DB SNAPSHOTS, not just the live DB
+  (#9236).** `/var/lib/xpf/versions/.<ver>.dbsnap` is an unfiltered `copyTree`
+  of `ConfigDBDir`, and `master.key` lives INSIDE that directory — so each
+  snapshot is the AES-GCM body **and the key that opens it**, in one place.
+  That is the README's own threat model (`pkg/configstore/README.md`: "copy
+  `master.key` one directory over and decrypt"). It is not an in-flight
+  window: `pkg/upgrade/flip.go`'s GC keeps a snapshot for as long as its
+  version dir survives and `protected[]` covers current/target/previous, so
+  after one successful upgrade it is the steady state of the box.
+  `performZeroizeWipe` had zero occurrences of "versions" while knowing about
+  `/var/lib/xpf/archive` and `/var/lib/xpf/provisioned-users`, and returned
+  `Configuration erased` regardless — an affirmative receipt, at the RMA /
+  resale / re-tenanting boundary the control exists for.
+  `zeroizeUpgradeDBSnapshots` erases every `.<ver>.dbsnap` and
+  `.<ver>.dbsnap.partial` with the SAME key-first discipline as the live DB
+  (unlink `master.key`, fsync, then the body — #4576/#5197) and the same
+  #9013 symlink refusal. It takes the host-wide upgrade lock FIRST and **fails
+  busy rather than racing a cut**: a concurrent upgrade writes a fresh
+  snapshot after the sweep passes it, so a half-erase would report success.
+  Version directories, `.<ver>.partial` (staged BINARIES) and the `current`
+  symlink are deliberately preserved — the target is the DB snapshots, not the
+  running system. Every failure is folded into the surfaced result, so a busy
+  lock or a failed unlink is an INCOMPLETE zeroize, never a clean one.
+  Censused alongside it: `.configdb.restore.partial` and `.configdb.old`, the
+  rollback path's sibling copies, are full DB copies inside the directory the
+  reset already walks and matched none of the #5768 owned-name rules; they are
+  now erased by the same helper.
 - **Zeroize erases the CONFIGURED config root, not a hardcoded `/etc/xpf`
   (#5280).** `runZeroize` resolves the config root from
   `configstore.Store.ConfigPath()` — the daemon's `-config` path, the SAME

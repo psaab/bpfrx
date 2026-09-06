@@ -181,6 +181,29 @@ func zeroizeConfigDir(configDir, configBase string) error {
 		fail(os.RemoveAll(dbDir))
 	}
 
+	// #9236 (censused, not reported): the rollback path stages a full DB copy
+	// as a SIBLING of .configdb — `.configdb.restore.partial` (the snapshot
+	// being installed) and `.configdb.old` (the live DB moved aside). Both are
+	// complete copies including master.key. The success path removes .old, but
+	// a crash between the two renames is exactly the state the recovery branch
+	// is designed to find, so both can be on disk indefinitely.
+	//
+	// These sit INSIDE the directory this function already enumerates, and the
+	// #5768 owned-name loop below matches neither: not the live config, not the
+	// rescue config, not a journal, not a numbered rollback slot, and
+	// isFsatomicTemp requires ".tmp-". So they survived a reset that reported
+	// success. Named exactly, never a `.configdb*` prefix match — that would
+	// re-include .configdb itself and widen a RemoveAll over the symlink
+	// handling above.
+	for _, suffix := range []string{".restore.partial", ".old"} {
+		copyDir := dbDir + suffix
+		if _, statErr := os.Lstat(copyDir); statErr != nil {
+			continue
+		}
+		skipped = append(skipped,
+			zeroizeDBCopyDir(copyDir, ".configdb"+suffix, fail)...)
+	}
+
 	// The self-signed REST-API TLS material (#4599): tls/key.pem (the
 	// device-generated localhost HTTPS private key) + tls/cert.pem. These are
 	// xpf-generated, not tenant config — generateSelfSignedCertAt (pkg/api)
@@ -1189,6 +1212,21 @@ var performZeroizeWipe = func(configDir, configBase, archiveDir string) error {
 		if e := configstore.FactoryResetArchiveDir(archiveDir); e != nil && err == nil {
 			err = e
 		}
+	}
+
+	// Upgrade config-DB snapshots (#9236): /var/lib/xpf/versions/.<ver>.dbsnap
+	// is an unfiltered copy of the config DB — the AES-GCM body AND master.key
+	// in one directory, which the project's own threat model calls "copy
+	// master.key one directory over and decrypt". The GC retains it for as long
+	// as its version dir survives, so it is the steady state of any upgraded
+	// box, not an in-flight window. This primitive knew /var/lib/xpf/archive and
+	// /var/lib/xpf/provisioned-users and had zero occurrences of "versions",
+	// which is what made the omission an oversight rather than a decision.
+	// Security-critical, so its first error is folded into the surfaced result:
+	// a busy upgrade lock or a failed unlink means the reset is INCOMPLETE and
+	// must not be reported as a clean factory reset.
+	if e := zeroizeUpgradeDBSnapshots(zeroizeVersionsDir); e != nil && err == nil {
+		err = e
 	}
 
 	// BPF pins + managed networkd files carry no secret material, so their
