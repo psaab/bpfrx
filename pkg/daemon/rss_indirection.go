@@ -24,7 +24,7 @@
 // commit, so changes to `system dataplane workers` or the
 // `rss-indirection enable|disable` knob take effect without a restart.
 // Re-application is idempotent (matching tables skip the write) and
-// strictly per-mlx5 (driver-guarded at both the top-level scan and the
+// strictly per-interface (capability-probed at both the top-level scan and the
 // per-interface call site).
 package daemon
 
@@ -43,8 +43,14 @@ import (
 )
 
 const (
-	// mlx5Driver is the sysfs driver name we detect D3-eligible NICs by.
-	// Non-mlx5 drivers are skipped silently — xpf must still bring up
+	// mlx5Driver is retained for DIAGNOSTIC logging only (#9040): it names
+	// the driver this path was originally written for and validated on, so a
+	// log line can say which NIC family an observation came from. It is NO
+	// LONGER an eligibility gate — see rssIndirectionSupported. Do not
+	// reintroduce a `driver == mlx5Driver` branch; the question that gate was
+	// standing in for is "does this netdev expose a readable indirection
+	// table", and that is now asked directly.
+	// Historical note: non-mlx5 drivers used to be skipped silently — xpf must still bring up
 	// virtio, i40e, etc. unchanged. D3 is an optimization, not a
 	// correctness requirement.
 	mlx5Driver = "mlx5_core"
@@ -116,9 +122,14 @@ func (realRSSExecutor) listInterfaces() []string {
 	return out
 }
 
-// applyRSSIndirection reshapes the RSS indirection table on mlx5_core
-// interfaces that are actually bound to the userspace dataplane so that
-// only queues 0..workers-1 receive traffic.
+// applyRSSIndirection reshapes the RSS indirection table on interfaces that
+// are actually bound to the userspace dataplane so that only queues
+// 0..workers-1 receive traffic.
+//
+// #9040: eligibility is a CAPABILITY, not a driver name. Every allowlisted
+// netdev is probed with `ethtool -x`; one that exposes a readable indirection
+// table is reshaped, and one that does not is left alone with the queue cap
+// (reported at bring-up, #9262) as its whole remedy.
 //
 // Invariants:
 //   - Runs at daemon startup (and on reconcile for worker-count changes),
@@ -126,14 +137,18 @@ func (realRSSExecutor) listInterfaces() []string {
 //   - `allowed` is the userspace-dp binding allowlist — the authoritative
 //     set of Linux interface names that AF_XDP will bind. Only members
 //     of that set are ever considered, and every member is still passed
-//     through the mlx5 driver guard. An empty allowlist is treated as
+//     probed for indirection support. An empty allowlist is treated as
 //     "no interfaces to touch" (no-op) — never a fall-back to scanning
 //     every netdev. Review finding Codex H1.
-//   - Non-mlx5 interfaces in the allowlist are skipped — `ethtool` is
-//     never invoked on virtio, iavf, i40e, etc. The driver-guard is
-//     also repeated inside applyRSSIndirectionOne as defense in depth.
+//   - Interfaces with no readable indirection table are skipped after the
+//     `ethtool -x` probe. NOTE (#9040): `ethtool -x` IS now invoked on
+//     non-mlx5 netdevs — that is the probe. What is never invoked on them
+//     is the `ethtool -X` WRITE, which is gated on the read having
+//     succeeded and parsed. The previous contract ("ethtool is never
+//     invoked on virtio, iavf, i40e") no longer holds and was the reason
+//     those NICs silently dropped transit on unbound queues.
 //   - enabled == false is a hard kill switch: restore the default
-//     indirection table on every allowlisted mlx5 interface.
+//     indirection table on every allowlisted interface that supports one.
 //   - workers == 1: no weight vector is applied (single worker benefits
 //     from default RSS spreading across all HW queues / IRQ lines;
 //     weight-pinning to a single queue would serialize the worker on one
@@ -153,12 +168,13 @@ func (realRSSExecutor) listInterfaces() []string {
 func applyRSSIndirection(enabled bool, workers int, allowed []string, execer rssExecutor) {
 	if !enabled {
 		// Kill switch. Actively restore default (equal-weight) RSS on
-		// every allowlisted mlx5 interface so toggling disable at
+		// every allowlisted supported interface so toggling disable at
 		// runtime reverts the table without a daemon restart.
 		// Idempotent: restoring an already-default table is a no-op
 		// ethtool call. The restore is scoped per-interface with the
-		// same driver filter as the apply path, so non-mlx5 netdevs
-		// and non-userspace-dp interfaces are never touched.
+		// same CAPABILITY PROBE as the apply path (#9040) — the two must
+		// agree, or disabling would fail to clear a table enabling wrote.
+		// Non-userspace-dp interfaces are never touched.
 		restoreDefaultRSSIndirection(allowed, execer)
 		slog.Info("linksetup: rss indirection disabled by config",
 			"allowed_count", len(allowed))
@@ -186,7 +202,7 @@ func applyRSSIndirection(enabled bool, workers int, allowed []string, execer rss
 		// No userspace-dp bindings derived from config — nothing to
 		// reshape. This is distinct from "listInterfaces returned
 		// nothing": an empty allowlist means the compiled config has
-		// no userspace-dp-bound mlx5 interfaces (e.g. management-only
+		// no userspace-dp-bound interfaces (e.g. management-only
 		// deploy), not a sysfs error.
 		slog.Debug("linksetup: rss indirection skipped (no userspace-dp bound interfaces)",
 			"workers", workers)
@@ -197,24 +213,17 @@ func applyRSSIndirection(enabled bool, workers int, allowed []string, execer rss
 		if iface == "lo" {
 			continue
 		}
-		drv := execer.readDriver(iface)
-		if drv != mlx5Driver {
-			// Allowlist can legitimately include non-mlx5 interfaces
-			// (virtio/iavf/i40e that userspace-dp binds on); skip
-			// silently at the driver guard. Codex H1: never invoke
-			// ethtool on a non-mlx5 netdev.
-			slog.Debug("linksetup: rss indirection skipped (non-mlx5 driver)",
-				"iface", iface, "driver", drv)
-			continue
-		}
+		// #9040: eligibility is a CAPABILITY question, not a driver name.
+		// applyRSSIndirectionOne probes the live table and skips any netdev
+		// that cannot expose one.
 		applyRSSIndirectionOne(iface, workers, execer)
 	}
 }
 
 // restoreDefaultRSSIndirection is called when the kill switch is engaged.
-// Runs `ethtool -X <iface> default` on every allowlisted mlx5 interface so
+// Runs `ethtool -X <iface> default` on every allowlisted supported interface so
 // the kernel reverts to equal-weight RSS across all HW queues. Idempotent
-// (already-default is a no-op). Non-mlx5 interfaces are filtered out at
+// (already-default is a no-op). Unsupported interfaces are filtered out at
 // the call site, mirroring applyRSSIndirection's guard. An empty allowlist
 // is a no-op: the restore path must not escape the userspace-dp binding
 // scope (Codex H1).
@@ -226,9 +235,21 @@ func restoreDefaultRSSIndirection(allowed []string, execer rssExecutor) {
 		if iface == "lo" {
 			continue
 		}
-		if execer.readDriver(iface) != mlx5Driver {
-			continue
-		}
+		// #9040: the RESTORE SET must equal the POTENTIAL-APPLY SET, and the
+		// apply set is now "every allowlisted interface", not "every mlx5
+		// one". So the kill switch sweeps them all. Two consequences, both
+		// intended:
+		//
+		//   - Leaving the old driver-name gate here would strand a
+		//     concentrated table on exactly the non-mlx5 NICs the widened
+		//     apply path can now write to — a defect reachable only by an
+		//     operator trying to back out, which is the worst time to find one.
+		//   - It is NOT probe-gated either, for #5250's reason: a restore
+		//     gated on a read that can fail turns an unreadable signal into
+		//     "do nothing". On a NIC with no indirection table the extra
+		//     `ethtool -X default` fails and is logged; that is noise. The
+		//     alternative is a stale table nobody clears, which is an outage.
+		//     A restore fails open; only a write fails closed.
 		err := restoreDefaultRSSIndirectionOne(iface, execer)
 		if err != nil && isExecNotFound(err) {
 			// ethtool is missing for the whole process, not just this
@@ -267,18 +288,40 @@ func restoreDefaultRSSIndirectionOne(iface string, execer rssExecutor) error {
 	return nil
 }
 
-// applyRSSIndirectionOne applies the weight-vector to a single mlx5 iface.
+// applyRSSIndirectionOne applies the weight-vector to a single iface.
 // Errors are logged and swallowed: D3 is best-effort.
 //
 // The caller (applyRSSIndirection) is responsible for driver filtering;
 // this function additionally re-checks the driver as defense in depth so a
-// future caller cannot accidentally invoke ethtool on a non-mlx5 netdev.
+// future caller cannot accidentally issue an `ethtool -X` write against a
+// netdev whose indirection table could not be read (#9040).
 func applyRSSIndirectionOne(iface string, workers int, execer rssExecutor) {
-	if drv := execer.readDriver(iface); drv != mlx5Driver {
-		slog.Debug("linksetup: rss indirection skipped (non-mlx5 driver at per-iface check)",
-			"iface", iface, "driver", drv)
-		return
+	// #9040: eligibility is a readable indirection table, not a driver name.
+	//
+	// The probe is LAZY and runs AT MOST ONCE. Ordering matters twice over:
+	//
+	//   - It must come AFTER the free checks (sysfs queue count, weight
+	//     computation), so a NIC that needs no work — one queue, workers==0,
+	//     an already-correct table — still issues ZERO ethtool calls. Several
+	//     cells assert exactly that, and they are right to: this path runs on
+	//     every daemon start and every reconcile.
+	//   - It must come BEFORE every `ethtool -X` WRITE, including the
+	//     unknown-queue-count restore below. That is the whole point: identify
+	//     the unsupported case before the write rather than after it, where
+	//     the error is deliberately swallowed.
+	//
+	// Memoized because two of the three write sites need the table bytes and
+	// re-reading them would issue a second ioctl for one question.
+	var probeOut []byte
+	var probeDone, probeOK bool
+	probe := func() ([]byte, bool) {
+		if !probeDone {
+			probeDone = true
+			probeOut, probeOK = rssIndirectionSupported(iface, execer)
+		}
+		return probeOut, probeOK
 	}
+
 	queues, err := execer.readQueueCount(iface)
 	if err != nil {
 		// #5250 (A7-b2 F2): a sysfs enumeration failure used to be laundered
@@ -294,6 +337,11 @@ func applyRSSIndirectionOne(iface string, workers int, execer rssExecutor) {
 		// leave the NIC in a worse state than the stale table it replaces.
 		slog.Warn("linksetup: rx queue count unreadable, restoring default rss indirection",
 			"iface", iface, "workers", workers, "err", err)
+		// #9040: deliberately NOT probe-gated, and the asymmetry is the point.
+		// #5250 exists because an unreadable signal silently became "do
+		// nothing" and left a concentrated table live. Gating this restore on
+		// a second read that can also fail would re-create that defect one
+		// level up. A RESTORE fails open; only a WRITE fails closed.
 		if workers >= 1 {
 			if out, rerr := execer.runEthtool("-X", iface, "default"); rerr != nil {
 				if isExecNotFound(rerr) {
@@ -332,25 +380,26 @@ func applyRSSIndirectionOne(iface string, workers int, execer rssExecutor) {
 		// workers <= 0 is a non-userspace deploy filtered by the caller,
 		// and restoring its table would be out of scope).
 		if workers >= 1 && queues > 1 {
-			maybeRestoreDefault(iface, queues, execer)
+			// Probe-gated, unlike the two unconditional restores: this one
+			// COMPARES against the live table to decide whether a restore is
+			// needed at all, so it cannot run without having read it. An
+			// unreadable table here means "cannot tell", and the honest
+			// answer is to leave it alone rather than guess in either
+			// direction — the write below is what would need justifying.
+			if out, ok := probe(); ok {
+				maybeRestoreDefault(iface, queues, out, execer)
+			}
 		}
 		return
 	}
 
-	// Idempotency: read the live table; skip the write if it already
-	// matches the target layout. Avoids kernel log noise on repeated
-	// daemon restarts and avoids spurious NIC churn during reconcile.
-	out, err := execer.runEthtool("-x", iface)
-	if err != nil {
-		// ethtool missing / unsupported → best-effort skip.
-		if isExecNotFound(err) {
-			slog.Warn("linksetup: ethtool binary not found, skipping rss indirection",
-				"iface", iface)
-			return
-		}
-		slog.Warn("linksetup: ethtool -x failed, skipping rss indirection",
-			"iface", iface, "err", err,
-			"output", strings.TrimSpace(string(out)))
+	// Idempotency: skip the write if the live table already matches the
+	// target layout. Avoids kernel log noise on repeated daemon restarts and
+	// avoids spurious NIC churn during reconcile. The table was already read
+	// by the capability probe above (#9040) — re-reading it here would be a
+	// second ethtool call answering a question we have the answer to.
+	out, ok := probe()
+	if !ok {
 		return
 	}
 	if indirectionTableMatches(out, weights) {
@@ -387,19 +436,12 @@ func applyRSSIndirectionOne(iface string, workers int, execer rssExecutor) {
 //
 // Best-effort: ethtool probe failures are logged and skipped without
 // attempting a write, mirroring the apply path's error handling.
-func maybeRestoreDefault(iface string, queues int, execer rssExecutor) {
-	out, err := execer.runEthtool("-x", iface)
-	if err != nil {
-		if isExecNotFound(err) {
-			slog.Warn("linksetup: ethtool binary not found, cannot probe for default rss indirection",
-				"iface", iface)
-			return
-		}
-		slog.Warn("linksetup: ethtool -x failed, cannot probe for default rss indirection",
-			"iface", iface, "err", err,
-			"output", strings.TrimSpace(string(out)))
-		return
-	}
+// #9040: `out` is the table already read by the caller's capability probe.
+// It used to re-read it here, which after the probe was introduced made every
+// restore-check path issue TWO `ethtool -x` calls for one question — an extra
+// ioctl on a path whose whole purpose is to avoid unnecessary NIC churn. The
+// existing call-count cell caught it; passing the bytes in is the fix.
+func maybeRestoreDefault(iface string, queues int, out []byte, execer rssExecutor) {
 	if indirectionTableIsDefault(out, queues) {
 		slog.Debug("linksetup: rss indirection already default, no restore needed",
 			"iface", iface)
@@ -677,4 +719,62 @@ func indirectionTableMatches(output []byte, weights []int) bool {
 // correct mechanism — no substring matching required.
 func isExecNotFound(err error) bool {
 	return errors.Is(err, exec.ErrNotFound)
+}
+
+// rssIndirectionSupported probes whether this netdev exposes a READABLE RSS
+// indirection table, and returns the probe output so the caller can reuse it
+// for the idempotency comparison rather than issuing a second `ethtool -x`.
+//
+// #9040: this replaces a hard `driver == mlx5_core` gate. The gate was not
+// wrong about mlx5 — it was answering the wrong question. `computeWeightVector`
+// has always been driver-generic (it clamps `active` to
+// min(queues, BindingQueuesPerIface) for anything it is called on), so the
+// clamp was never the gap; the gap was one level up, where a non-mlx5 NIC with
+// more RX queues than workers never reached the generic clamp at all and
+// transit on the unbound queues was dropped.
+//
+// WHY A PROBE RATHER THAN DROPPING THE GATE. `ethtool -X` indirection support
+// varies by driver: i40e/ice/bnxt accept the table write, virtio-net may not,
+// and this whole path deliberately swallows its errors because a D3 regression
+// must never break interface bring-up. Simply widening the gate would have
+// produced a reshape that silently succeeds on some drivers and silently fails
+// on others — **the same class of defect this issue is about, re-created one
+// layer up**: a mitigation indistinguishable from healthy when it does not work.
+//
+// Reading the table first turns "which global policy" into a per-interface
+// answer, and it identifies the unsupported case BEFORE the write instead of
+// after it, which is what makes the swallowed-error path stop mattering. A NIC
+// whose table cannot be read is in the refuse-or-tolerate bucket, where the
+// #9262 bring-up warning plus the degraded-path counter are the whole remedy.
+//
+// The probe costs nothing on the path it replaces: applyRSSIndirectionOne
+// already read this table for its idempotency check, so an mlx5 interface
+// issues exactly the same ethtool invocations as before.
+func rssIndirectionSupported(iface string, execer rssExecutor) (out []byte, ok bool) {
+	out, err := execer.runEthtool("-x", iface)
+	if err != nil {
+		if isExecNotFound(err) {
+			slog.Warn("linksetup: ethtool binary not found, skipping rss indirection",
+				"iface", iface)
+			return nil, false
+		}
+		// Not an error condition: a driver with no indirection table
+		// answers this way, and that is a supported deployment. The
+		// queue cap is reported at bring-up either way (#9262).
+		slog.Info("linksetup: rss indirection not supported on this interface, queue cap is the remedy",
+			"iface", iface, "driver", execer.readDriver(iface),
+			"err", err, "output", strings.TrimSpace(string(out)))
+		return nil, false
+	}
+	rows, parsed := parseIndirectionTable(out)
+	if !parsed || len(rows) == 0 {
+		// `ethtool -x` succeeded but printed no table rows. Treat an
+		// UNPARSEABLE answer as unsupported rather than guessing: writing a
+		// weight vector against a table we could not read is precisely the
+		// silent-failure shape the probe exists to prevent.
+		slog.Info("linksetup: rss indirection table unreadable, queue cap is the remedy",
+			"iface", iface, "driver", execer.readDriver(iface), "rows", len(rows))
+		return nil, false
+	}
+	return out, true
 }

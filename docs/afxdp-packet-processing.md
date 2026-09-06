@@ -134,12 +134,36 @@ The shim checks several conditions before redirecting a packet to userspace:
    `(Q-16)/Q` on that interface while it reads up.
 
    RSS is reshaped to fit the bound set (`computeWeightVector`, which clamps
-   `active` to `min(queues, BindingQueuesPerIface)`) **only on `mlx5_core`** —
-   `pkg/daemon/rss_indirection.go` guards on the driver and skips everything
-   else. So an mlx5 NIC is protected by that clamp and a virtio-net / i40e /
-   ice / bnxt NIC with more than 16 queues is not. There is no `ethtool -L`
-   anywhere in this tree, so nothing reduces the channel count on the box's
-   behalf.
+   `active` to `min(queues, BindingQueuesPerIface)`) on **every interface that
+   exposes a readable RSS indirection table**, not only `mlx5_core` (#9040).
+   `pkg/daemon/rss_indirection.go` probes each allowlisted netdev with
+   `ethtool -x` and reshapes the ones that answer.
+
+   The clamp was never the gap — `computeWeightVector` has always been
+   driver-generic. The gap was one level up: `applyRSSIndirection` matched on
+   the driver NAME and skipped everything else, so a virtio-net / i40e / ice /
+   bnxt NIC never reached the generic clamp at all.
+
+   It is a probe rather than simply a widened gate because `ethtool -X` support
+   varies by driver and this path deliberately swallows its errors (a D3
+   regression must not break interface bring-up). A reshape that silently
+   succeeds on some drivers and silently fails on others would be the same
+   class of defect as the one it fixes, one layer up. The probe identifies the
+   unsupported case **before** the write, which is what stops the swallowed
+   error from mattering; a NIC with no readable table keeps the queue cap
+   warning as its whole remedy.
+
+   Restores are deliberately **not** probe-gated, and the asymmetry is
+   intentional: #5250 exists because an unreadable signal silently became "do
+   nothing" and left a concentrated table live. A wrongly attempted restore is
+   a logged no-op; a wrongly attempted reshape is a silent misconfiguration.
+   **A restore fails open, a write fails closed.** For the same reason the kill
+   switch now sweeps every allowlisted interface rather than only the mlx5
+   ones — the restore set must equal the potential-apply set, or backing out
+   would strand a table on exactly the NICs the widened apply path can write.
+
+   There is still no `ethtool -L` anywhere in this tree, so nothing reduces the
+   channel count on the box's behalf.
 
    Since #9040 the cap logs a named warning at bring-up, and the resulting
    drops are exported as
