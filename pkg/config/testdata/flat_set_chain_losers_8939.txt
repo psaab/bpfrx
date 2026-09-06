@@ -1,10 +1,10 @@
-# counts: losers=70 walked=23 vacuous=51 unmeasured=77
+# counts: losers=55 walked=40 vacuous=51 unmeasured=75
 class-of-service traffic-control-profiles arg1  [delay-buffer-rate | guaranteed-rate | scheduler-map]  total
 firewall policer arg1 if-exceeding  [bandwidth-limit | burst-size-limit]  total
 forwarding-options dhcp-relay group arg1 overrides  [always-broadcast | forward-only | maximum-hop-count]  total
 forwarding-options dhcp-relay group arg1 overrides  [always-broadcast | forward-only]  total
-forwarding-options sampling instance arg1 family inet output  [inline-jflow | source-address]  total
-forwarding-options sampling instance arg1 family inet6 output  [inline-jflow | source-address]  total
+forwarding-options sampling instance arg1 family inet output  [inline-jflow | source-address]  differs
+forwarding-options sampling instance arg1 family inet6 output  [inline-jflow | source-address]  differs
 policy-options policy-statement arg1 term arg1 then  [accept | load-balance | local-preference]  total
 policy-options policy-statement arg1 term arg1 then  [accept | load-balance]  total
 policy-options policy-statement arg1 then  [accept | reject]  total
@@ -27,21 +27,6 @@ routing-options static route arg1 qualified-next-hop arg1  [interface | metric |
 routing-options static route arg1 qualified-next-hop arg1  [interface | metric]  total
 schedulers scheduler arg1  [start-date | start-time | stop-date]  total
 schedulers scheduler arg1  [start-date | start-time]  total
-schedulers scheduler arg1 daily  [all-day | exclude | start-time]  total
-schedulers scheduler arg1 friday  [all-day | exclude | start-time]  total
-schedulers scheduler arg1 friday  [all-day | exclude]  total
-schedulers scheduler arg1 monday  [all-day | exclude | start-time]  total
-schedulers scheduler arg1 monday  [all-day | exclude]  total
-schedulers scheduler arg1 saturday  [all-day | exclude | start-time]  total
-schedulers scheduler arg1 saturday  [all-day | exclude]  total
-schedulers scheduler arg1 sunday  [all-day | exclude | start-time]  total
-schedulers scheduler arg1 sunday  [all-day | exclude]  total
-schedulers scheduler arg1 thursday  [all-day | exclude | start-time]  total
-schedulers scheduler arg1 thursday  [all-day | exclude]  total
-schedulers scheduler arg1 tuesday  [all-day | exclude | start-time]  total
-schedulers scheduler arg1 tuesday  [all-day | exclude]  total
-schedulers scheduler arg1 wednesday  [all-day | exclude | start-time]  total
-schedulers scheduler arg1 wednesday  [all-day | exclude]  total
 security flow  [allow-dns-reply | allow-embedded-icmp | force-ip-reassembly]  total
 security flow  [allow-dns-reply | allow-embedded-icmp]  total
 security flow tcp-session  [closing-timeout | established-timeout | initial-timeout]  total
