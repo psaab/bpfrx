@@ -1907,9 +1907,15 @@ func (d *Daemon) desiredClusterDHCPConfig(cfg *config.Config) *config.DHCPServer
 	if cfg.System.DHCPServer.DHCPLocalServer == nil && cfg.System.DHCPServer.DHCPv6LocalServer == nil {
 		return nil
 	}
-	// filterDHCPConfigForMasterRGs copies the config and resolves RETH
-	// interface names internally. It returns nil when no group's interfaces
-	// belong to a currently-MASTER RG.
+	// filterDHCPConfigForMasterRGs resolves RETH interface names into a COPY
+	// (resolveDHCPRethInterfaces returns one; the shared active config is never
+	// written) and filters the groups into freshly-allocated ones. It returns
+	// nil when no group's interfaces belong to a currently-MASTER RG.
+	//
+	// #9141: this comment previously claimed the function "copies the config",
+	// which is what made the in-place rewrite invisible — the copy was a shallow
+	// struct copy over pointer/map/slice fields, so the resolve wrote straight
+	// through to cfg. The claim is now true.
 	return d.filterDHCPConfigForMasterRGs(cfg)
 }
 
@@ -1987,8 +1993,7 @@ func (d *Daemon) filterDHCPConfigForMasterRGs(cfg *config.Config) *config.DHCPSe
 		rgScoped[stripUntaggedUnitSuffix(n)] = true
 	}
 
-	dhcpCfg := cfg.System.DHCPServer
-	resolveDHCPRethInterfaces(&dhcpCfg, cfg)
+	dhcpCfg := resolveDHCPRethInterfaces(cfg.System.DHCPServer, cfg)
 
 	filterGroups := func(groups map[string]*config.DHCPServerGroup) map[string]*config.DHCPServerGroup {
 		if groups == nil {
@@ -2067,8 +2072,7 @@ func (d *Daemon) applyRethServices() {
 		}
 	}
 	if d.dhcpServer != nil && (cfg.System.DHCPServer.DHCPLocalServer != nil || cfg.System.DHCPServer.DHCPv6LocalServer != nil) {
-		dhcpCfg := cfg.System.DHCPServer
-		resolveDHCPRethInterfaces(&dhcpCfg, cfg)
+		dhcpCfg := resolveDHCPRethInterfaces(cfg.System.DHCPServer, cfg)
 		// ApplyAsync (#1835 F2): see applyRethServicesForRG.
 		d.dhcpServer.ApplyAsync(&dhcpCfg, "vrrp MASTER (legacy all-RG)")
 		slog.Info("vrrp: DHCP server apply enqueued (MASTER)")
@@ -2432,20 +2436,91 @@ func (d *Daemon) reinitiateIPsecSAs() {
 	}
 }
 
-// resolveDHCPRethInterfaces translates RETH interface names in DHCP server
-// groups to their physical member Linux names (Kea needs real device names).
-func resolveDHCPRethInterfaces(dhcpCfg *config.DHCPServerConfig, cfg *config.Config) {
-	resolve := func(groups map[string]*config.DHCPServerGroup) {
-		for _, group := range groups {
-			for i, iface := range group.Interfaces {
-				group.Interfaces[i] = config.LinuxIfName(cfg.ResolveReth(iface))
-			}
+// desiredStandaloneDHCPConfig returns the DHCP server config the STANDALONE
+// (non-cluster) Kea applier should install: the committed stanza with RETH
+// logical interface names resolved to their physical member Linux names, in a
+// COPY. It is the sibling of desiredClusterDHCPConfig, which does the same for
+// the clustered path and additionally filters the groups to the RGs this node
+// masters.
+//
+// It exists as a named function for the reason #9141 exists: the standalone
+// site used to inline `resolveDHCPRethInterfaces(&cfg.System.DHCPServer, cfg)`,
+// which handed the resolver the shared active config by pointer. Naming the
+// derivation gives it a seam a cell can drive, and makes the standalone and
+// cluster paths symmetric — both now RETURN a desired config rather than
+// editing one in place.
+func desiredStandaloneDHCPConfig(cfg *config.Config) config.DHCPServerConfig {
+	if cfg == nil {
+		return config.DHCPServerConfig{}
+	}
+	return resolveDHCPRethInterfaces(cfg.System.DHCPServer, cfg)
+}
+
+// resolveDHCPRethInterfaces RETURNS a copy of dhcpCfg whose DHCP server group
+// interfaces are translated from RETH logical names to their physical member
+// Linux names (Kea needs real device names). It never writes through cfg.
+//
+// #9141: it used to take a *config.DHCPServerConfig and rewrite
+// `group.Interfaces[i]` IN PLACE. Every caller looked safe — two of them did
+// `dhcpCfg := cfg.System.DHCPServer` first — but that is a SHALLOW struct copy:
+// DHCPLocalServer is a pointer, Groups is a map of pointers, and Interfaces is a
+// slice, so all three are shared with the daemon's live active config and the
+// rewrite landed on it. (The third caller, applyRoutingAndServices in
+// daemon_apply_routing.go, passed &cfg.System.DHCPServer with no copy at all.)
+//
+// Measured harm — the shared config is mutated and an ATTRIBUTION one subsystem
+// over flips:
+//
+//	BEFORE: Groups[g1].Interfaces = [reth1.0]   rgForInterfaces = 1
+//	AFTER : Groups[g1].Interfaces = [ge-0-0-1.0] rgForInterfaces = 0
+//
+// rgForInterfaces (daemon_ddns.go) looks the group's member up in
+// cfg.Interfaces.Interfaces, which is keyed by JUNOS names (`reth1`). After the
+// rewrite the base name is `ge-0-0-1`, which misses, so the pool is scored RG 0
+// = "not HA-owned". buildLeaseSubnetRGMap then reports no RG-owned pool at all,
+// ddnsReconcileOptions sees anyRGOwnedPool false, and the unattributable-lease
+// branch flips from FAIL-CLOSED to admit — the #2664 per-lease double-write /
+// stale-memfile guard is disarmed. It is ORDER-DEPENDENT: the guard behaves
+// differently before and after the first apply in a process lifetime, and is
+// repaired only by a daemon restart (which recompiles the config from text).
+//
+// The peer is NOT affected: config sync ships TEXT (ShowActive -> the ConfigTree
+// AST), not the compiled struct, so each node recompiles from its own copy.
+//
+// The copy is deliberately SHALLOW past the fields that are written: the
+// family-level scalars ride along on the struct copy, the group's Pools slice is
+// shared because nothing here writes it, and only the Interfaces slices — the
+// only thing this function rewrites — are freshly allocated.
+func resolveDHCPRethInterfaces(dhcpCfg config.DHCPServerConfig, cfg *config.Config) config.DHCPServerConfig {
+	resolve := func(src *config.DHCPLocalServerConfig) *config.DHCPLocalServerConfig {
+		if src == nil {
+			return nil
 		}
+		out := *src
+		if src.Groups == nil {
+			return &out
+		}
+		groups := make(map[string]*config.DHCPServerGroup, len(src.Groups))
+		for name, group := range src.Groups {
+			if group == nil {
+				groups[name] = nil
+				continue
+			}
+			cp := *group
+			if group.Interfaces != nil {
+				ifaces := make([]string, len(group.Interfaces))
+				for i, iface := range group.Interfaces {
+					ifaces[i] = config.LinuxIfName(cfg.ResolveReth(iface))
+				}
+				cp.Interfaces = ifaces
+			}
+			groups[name] = &cp
+		}
+		out.Groups = groups
+		return &out
 	}
-	if dhcpCfg.DHCPLocalServer != nil {
-		resolve(dhcpCfg.DHCPLocalServer.Groups)
-	}
-	if dhcpCfg.DHCPv6LocalServer != nil {
-		resolve(dhcpCfg.DHCPv6LocalServer.Groups)
-	}
+	out := dhcpCfg
+	out.DHCPLocalServer = resolve(dhcpCfg.DHCPLocalServer)
+	out.DHCPv6LocalServer = resolve(dhcpCfg.DHCPv6LocalServer)
+	return out
 }

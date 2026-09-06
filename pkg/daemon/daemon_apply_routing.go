@@ -128,9 +128,12 @@ func (d *Daemon) applyServicesReconcile(cfg *config.Config) (error, error) {
 		// the regenerated config reflects the current knob.
 		d.dhcpServer.SetLeaseSyncEnabled(d.dhcpLeaseSyncEnabled(cfg))
 		if !isCluster {
-			// Resolve RETH interface names for Kea (needs real Linux names)
-			resolveDHCPRethInterfaces(&cfg.System.DHCPServer, cfg)
-			if err := d.dhcpServer.Apply(&cfg.System.DHCPServer); err != nil {
+			// #9141: the STANDALONE sibling of desiredClusterDHCPConfig. This
+			// site used to call resolveDHCPRethInterfaces(&cfg.System.DHCPServer,
+			// cfg) — passing the shared active config by pointer and letting the
+			// resolver rewrite its group interface lists in place.
+			desired := desiredStandaloneDHCPConfig(cfg)
+			if err := d.dhcpServer.Apply(&desired); err != nil {
 				slog.Warn("failed to apply DHCP server config", "err", err)
 				dhcpServerErr = fmt.Errorf("apply DHCP server config: %w", err)
 			}
