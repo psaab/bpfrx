@@ -1,4 +1,4 @@
-# counts: losers=45 walked=60 vacuous=43 unmeasured=73
+# counts: losers=38 walked=66 vacuous=44 unmeasured=73
 # collector reach: 363 containers walked, 133 reached the census (134 dropped: no eligible leaf, 96 dropped: only one)
 class-of-service traffic-control-profiles arg1  [delay-buffer-rate | guaranteed-rate | scheduler-map]  total  OPERATOR
 class-of-service traffic-control-profiles arg1  [delay-buffer-rate | guaranteed-rate]  total  lenient-only
@@ -10,8 +10,6 @@ forwarding-options sampling instance arg1 family inet6 output  [inline-jflow | s
 protocols bgp  [cluster-id | graceful-restart | local-as]  total  OPERATOR
 protocols bgp  [cluster-id | graceful-restart]  total  OPERATOR
 protocols bgp multipath  [ibgp | multiple-as]  total  OPERATOR
-protocols router-advertisement interface arg1  [default-lifetime | link-mtu | managed-configuration]  total  OPERATOR
-protocols router-advertisement interface arg1  [default-lifetime | link-mtu]  total  lenient-only
 protocols router-advertisement interface arg1 prefix arg1  [autonomous | no-autonomous | no-onlink]  total  lenient-only
 protocols router-advertisement interface arg1 prefix arg1  [autonomous | no-autonomous]  total  lenient-only
 routing-options generate route arg1  [discard | policy]  total  OPERATOR
@@ -24,11 +22,6 @@ security flow  [allow-dns-reply | allow-embedded-icmp | force-ip-reassembly]  to
 security flow  [allow-dns-reply | allow-embedded-icmp]  total  OPERATOR
 security flow aging  [early-ageout | high-watermark | low-watermark]  total  lenient-only
 security flow aging  [early-ageout | high-watermark]  total  lenient-only
-security ike policy arg1  [mode | pre-shared-key | proposal-set]  total  OPERATOR
-security ike policy arg1  [mode | pre-shared-key]  total  OPERATOR
-security ike proposal arg1  [authentication-algorithm | authentication-method | description]  total  lenient-only
-security ike proposal arg1  [authentication-algorithm | authentication-method]  total  lenient-only
-security ipsec proposal arg1  [authentication-algorithm | description | dh-group]  total  lenient-only
 security log  [format | mode | source-interface]  total  lenient-only
 security log  [format | mode]  total  lenient-only
 security nat source pool arg1  [port-overloading-factor | routing-instance]  total  OPERATOR

@@ -36,15 +36,21 @@ import (
 //
 // The config COMPILES, so an operator can author it.
 //
-// THIS CELL IS A KNOWN-BAD RATCHET, NOT A PASS. It pins the divergence set to
-// exactly the collision case. It reds if the set GROWS (the drift the NOTE
-// asks about, now detectable) and equally if it SHRINKS -- which would mean
-// someone fixed it, and this cell plus #8994 should then be updated rather
-// than the expectation loosened.
+// THE DIVERGENCE IS NOW FIXED and this cell asserts the set is EMPTY.
 //
-// The fix is NOT attempted here: ResolveKernelIfName has 15 non-test callers
-// including daemon_ha_vip.go and daemon_cluster_bind.go, so changing its
-// precedence is a staged change owing the cluster gate, not a drive-by.
+// It landed first as a known-bad ratchet pinning that one row, deliberately
+// mutation-tested in BOTH directions -- and the mutant that APPLIED the fix
+// was what proved the fix worked before it was written for real. The fix
+// (resolveKernelIfNameWith: a ref naming a DECLARED interface takes the bare
+// arm) then shrank the set to empty, which reddened the ratchet exactly as it
+// was designed to, and the expectation moved rather than being loosened.
+//
+// A red here now means the two derivations have separated again: a tunnel's
+// kernel device named one thing by routing and another by the dataplane, which
+// is the orphan-device shape. The corpus KEEPS the collision case (a declared
+// `gr-0/0/0.0` alongside a tunnel unit publishing that same TunnelNameMap key)
+// because that is the row the fix exists for -- removing it would leave a
+// green cell measuring nothing.
 func TestResolverAgreement8994(t *testing.T) {
 	tree := &config.ConfigTree{}
 	for _, l := range []string{
@@ -93,13 +99,15 @@ func TestResolverAgreement8994(t *testing.T) {
 		t.Fatalf("#8994: compared only %d declared interfaces, want >= 4 — the corpus "+
 			"stopped compiling and this cell is measuring less than it claims", compared)
 	}
-	want := []string{"gr-0/0/0.0: config=gr-0-0-0 dataplane=gr-0-0-0.0"}
-	if strings.Join(diverged, "\n") != strings.Join(want, "\n") {
-		t.Errorf("#8994: the resolver divergence set CHANGED.\n got:\n  %s\nwant:\n  %s\n\n"+
-			"GREW: ResolveKernelIfName and snapshotLinuxName have drifted further apart — "+
-			"the NOTE in pkg/config/types.go asks for them to be kept in step and cannot "+
-			"detect this. SHRANK: the dotted-ref precedence was fixed; update this cell "+
-			"and #8994 rather than loosening the expectation.",
-			strings.Join(diverged, "\n  "), strings.Join(want, "\n  "))
+	if len(diverged) != 0 {
+		t.Errorf("#8994: ResolveKernelIfName and snapshotLinuxName disagree on %d "+
+			"declared interface(s):\n  %s\n\n"+
+			"They must name the same kernel device for the same configured interface. "+
+			"A ref that NAMES a declared interface takes the bare arm in "+
+			"resolveKernelIfNameWith precisely so a dotted authored name is not re-read "+
+			"as a unit ref and resolved onto some other device — reverting that arm "+
+			"reproduces exactly this. The NOTE in pkg/config/types.go asks for these to "+
+			"be kept in step and cannot detect it; this cell can.",
+			len(diverged), strings.Join(diverged, "\n  "))
 	}
 }
