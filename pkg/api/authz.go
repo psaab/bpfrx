@@ -1019,6 +1019,12 @@ func (s *Server) mutationAuthzGuard(next http.Handler) http.Handler {
 			deny(p, err)
 			return
 		}
+		// #9154: the class's `*-configuration` regexes — see
+		// authz_config_regex_9154.go for why this surface consulted none.
+		if err := s.authorizeRESTConfigMutation(r, cfg, p); err != nil {
+			deny(p, err)
+			return
+		}
 		slog.Debug("api: authorized mutating request",
 			"method", r.Method, "path", r.URL.Path,
 			"principal", p.String(), "required", authz.PermissionName(required))

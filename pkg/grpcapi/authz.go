@@ -262,6 +262,12 @@ func (s *Server) authorizeRPC(ctx context.Context, fullMethod string, req any) e
 		if err := s.authorizeRPCCommand(cfg, p.Class, fullMethod, req); err != nil {
 			return denyRPC(fullMethod, required, p, err)
 		}
+		// #9154: the class's `*-configuration` regexes, which this surface did
+		// not consult at all. #7172's acceptance says both dispatch surfaces
+		// must use them and "neither may be gated alone"; only pkg/cli did.
+		if err := s.authorizeRPCConfigMutation(cfg, p.Class, fullMethod, req); err != nil {
+			return denyRPC(fullMethod, required, p, err)
+		}
 	}
 	return nil
 }
