@@ -733,7 +733,7 @@ is the ONLY one:
 
 | Attempt line | What actually happened |
 |---|---|
-| `Fence confirmed by peer (peer disabled N/N redundancy groups)` | The guarantee held. The peer acknowledged relinquishing every RG before this node claimed them. |
+| `Fence confirmed by peer (peer disabled N/N redundancy groups)` | The peer reported that, at the instant it replied, it had driven `rg_active=false` for every RG in its live config. That is a DATAPLANE SUPPRESSION receipt — read the next subsection before reading it as a relinquishment. |
 | `Fence unconfirmed, took over anyway: <reason>` | **No confirmation.** Takeover proceeded regardless. The reason names which path — not connected, peer predates #7147, disconnected mid-wait, or timed out. |
 | `Fence NOT confirmed (<detail>), took over anyway` | The peer ANSWERED but reported it had not fully complied (partial, or no dataplane). |
 
@@ -741,6 +741,40 @@ The `Confirmations: received N, timed out N, sent to peer N` line summarises the
 same thing in aggregate; `timed out` is the count of takeovers that proceeded
 without the guarantee. Neither `Fences sent` nor the configured action
 distinguishes them, which is why both surfaces exist.
+
+### What a CONFIRMED fence does and does not give you (#9120)
+
+A confirmed fence is narrower than the word suggests, and the gap is the part an
+operator would misjudge, so it is stated here rather than left to be inferred
+from the code. `fenceAllRedundancyGroups` drives `rg_active=false` on the
+dataplane and re-arms the RG state machine. It does NOT:
+
+- **release the VRRP virtual addresses.** The fenced node keeps every VIP, keeps
+  answering ARP/ND for them, and keeps winning the VRRP election on the RETH
+  members. Upstream L2 still steers that traffic at it and the dataplane drops
+  it. A confirmed fence turns the peer into a BLACKHOLE, not into a node that
+  has handed the addresses over. Traffic converges when the surviving node's own
+  takeover moves the VIPs, not when the ack arrives.
+- **demote the peer.** `clusterPri` is untouched: the fenced node still reports
+  itself primary for those groups in `show chassis cluster status`, and an
+  operator comparing the two nodes during a partition will see two primaries.
+  That is expected and is not the sign of a failed fence.
+- **hold.** `desired = clusterPri || allVrrpMaster`, and the fence changes
+  neither input, so the next `reconcileRGState` pass on the fenced node
+  re-drives `rg_active=true` (that re-arm is #6530's required behaviour — a
+  fenced-then-recovered primary must not stay dark forever). **The suppression
+  therefore lasts at most one reconcile interval** unless something else
+  changes one of those inputs first: the peer observing the takeover over the
+  sync channel, an operator, or a real crash.
+
+What the gate genuinely buys is ORDERING — in the reachable-peer case it puts
+the local takeover strictly after the peer's suppression, which closes the
+window where both nodes forward the same flows. That is what
+`disable-rg-confirmed` should be selected for. It is not a lease, and a longer
+guarantee cannot be had without a fence that clears `clusterPri`, which needs a
+bounded self-clearing timer of its own — an unbounded one converts a lost sync
+channel into a no-primary outage. Pinned by
+`TestFenceAckProvesDataplaneSuppressionOnly9120`.
 
 **Mixed-version clusters are safe and need no coordinated upgrade.** Both wire
 changes are additive: `syncMsgFenceAck` is a new type that an old peer skips

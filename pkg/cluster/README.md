@@ -2884,6 +2884,18 @@ operator-facing table.
   or a negative ack all proceed with the takeover, each recorded to
   `EventFence` with its reason. `SendFenceAwait` returns immediately when there
   is no active connection, so the ordinary dead-peer takeover pays nothing.
+- **A CONFIRMED ack proves dataplane suppression, not relinquishment (#9120).**
+  `fenceAllRedundancyGroups` drives `rg_active=false` and re-arms the RG state
+  machine. It does not release VIPs (the peer keeps answering ARP/ND and keeps
+  winning the VRRP election — a confirmed fence makes it a BLACKHOLE, not a
+  node that handed the addresses over), does not clear `clusterPri`, and does
+  not hold: `desired = clusterPri || allVrrpMaster` is computed from two
+  untouched inputs, so the next `reconcileRGState` pass re-drives
+  `rg_active=true`. The suppression is bounded by ONE RECONCILE INTERVAL. The
+  gate's real product is ORDERING the local takeover behind that suppression.
+  `sync_fence_ack_7147.go` carries the long form; the pinning cell is
+  `TestFenceAckProvesDataplaneSuppressionOnly9120`, which is the counterpart of
+  #6530's `TestFenceRearmsReconcileRetry`, not its inversion.
 - **It REDUCES the split-brain window; it does not eliminate it.** The residual
   is a partition where the sync socket is live but blackholed — TCP has not
   timed out, so the fence is written and no ack returns, and after the bound
