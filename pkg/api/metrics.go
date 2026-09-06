@@ -106,6 +106,10 @@ type xpfCollector struct {
 	napiProbeTargetSkipsTotal *prometheus.Desc
 	learnedRouteCapHitsTotal  *prometheus.Desc
 
+	// #9040: dataplane drops taken on a degraded path, by reason. Sparse and
+	// status-dependent; see metrics_degraded_path_9040.go.
+	degradedPathTotal *prometheus.Desc
+
 	// Interface counters
 	ifacePacketsTotal *prometheus.Desc
 	ifaceBytesTotal   *prometheus.Desc
@@ -810,6 +814,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	c.describeAdmissionRefusals(ch)
 	c.describeAuthzDenials(ch)
 	c.describeDataplaneSilentSkips(ch)
+	ch <- c.degradedPathTotal
 	ch <- c.ifacePacketsTotal
 	ch <- c.ifaceBytesTotal
 	ch <- c.interfaceCounterReadErrorsTotal
@@ -1601,6 +1606,9 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	// actually read — see emitZoneCounterOverflow for why its absence and its 0
 	// mean different things.
 	c.emitZoneCounterOverflow(ch, userspaceStatus)
+	// #9040: the degraded-path drop reasons, same status pointer and the same
+	// emitted-only-if-read contract.
+	c.emitDegradedPathCounters(ch, userspaceStatus)
 }
 
 // #709: emit per-bucket counter samples. Bucket index maps to a

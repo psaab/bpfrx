@@ -860,9 +860,42 @@ pub(crate) fn replan_bindings_from_candidates(
     // adjacent ifindex's queue-0 row, which the Go publisher already refuses
     // (#4894). Capping here rather than refusing keeps a NIC with more than 16
     // combined channels usable on its first 16.
+    //
+    // #9040: the cap is not silent any more. It was a bare `.min()` with no
+    // eprintln, no status field and no counter, which made "this NIC is
+    // dropping (Q-16)/Q of its transit" indistinguishable from a healthy plan
+    // -- the exact property the SLOT-cap arm one function below refuses a plan
+    // over, in its own words "a partial plan is an availability failure
+    // indistinguishable from healthy".
+    //
+    // This still caps rather than refusing, because refusing would take a
+    // working box offline on a change that is meant to make a silent loss
+    // audible; which of the two is right is a product decision recorded on the
+    // issue. What is NOT a product decision is whether the operator gets to
+    // know, and the honest floor is that they do. The drop itself already
+    // increments the `binding_missing` degraded-path reason, which #9040 also
+    // exports as `xpf_dataplane_degraded_path_total{reason="binding_missing"}`
+    // -- so this line names the cause at bring-up and the counter shows the
+    // ongoing cost.
     let per_interface: Vec<(String, usize)> = candidates
         .iter()
-        .map(|(name, rx)| (name.clone(), (*rx).min(BINDING_QUEUES_PER_IFACE)))
+        .map(|(name, rx)| {
+            let bound = (*rx).min(BINDING_QUEUES_PER_IFACE);
+            if *rx > BINDING_QUEUES_PER_IFACE {
+                eprintln!(
+                    "xpf-userspace-dp: WARNING {name}: {rx} RX queues exceeds the \
+                     per-interface binding stride of {BINDING_QUEUES_PER_IFACE}; \
+                     binding the first {bound}. RSS is only reshaped to fit the \
+                     bound set on mlx5_core, so on any other driver the NIC keeps \
+                     hashing across all {rx} queues and transit landing on queues \
+                     {bound}..{rx} is DROPPED (degraded-path reason \
+                     binding_missing, exported as \
+                     xpf_dataplane_degraded_path_total). Reduce the channel count \
+                     with `ethtool -L {name} combined {bound}` to recover it."
+                );
+            }
+            (name.clone(), bound)
+        })
         .collect();
     // The widest interface. This is what bounds the minted queue-id range, and
     // therefore the worker-id range, so it replaces the global minimum in the
