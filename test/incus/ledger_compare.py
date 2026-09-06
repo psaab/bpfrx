@@ -829,8 +829,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--lint-merge",
         action="store_true",
         help=(
-            "if HEAD is a merge commit, verify the ledger retained every run_id "
-            "from both parents (#8346); a no-op on a non-merge HEAD"
+            "verify the ledger retained every run_id from both parents across "
+            "the last --lint-merge-count merges (#8346, window widened #9046); "
+            "exit 3 when there is no merge to check"
+        ),
+    )
+    p.add_argument(
+        "--lint-merge-count",
+        type=int,
+        default=25,
+        help=(
+            "how many recent merges --lint-merge inspects (default 25). #9046: "
+            "this was effectively 1 (HEAD only), so a shard-dropping merge was "
+            "invisible one commit later."
         ),
     )
     args = p.parse_args(argv)
@@ -842,26 +853,66 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.lint_merge:
         import subprocess
 
-        parents = subprocess.run(
-            ["git", "rev-parse", "HEAD^@"], capture_output=True, text=True
+        # #9046: this was HEAD-only. A merge that drops a shard was catchable
+        # ONLY by running the gate while HEAD was exactly that merge; one
+        # commit later it is permanently invisible, because plain lint_ledger
+        # cannot see a missing row -- a deleted shard leaves a lint-clean
+        # directory (see lint_merge_completeness's docstring).
+        #
+        # So the window is the defect, and widening it is the fix: check the
+        # last N merges rather than only the tip.
+        revs = subprocess.run(
+            ["git", "rev-list", "--merges", "-n", str(args.lint_merge_count), "HEAD"],
+            capture_output=True,
+            text=True,
         ).stdout.split()
-        if len(parents) < 2:
-            # Not a merge. Reporting "clean" here would be the empty-set pass
-            # this file guards against elsewhere, so say what was checked.
-            print("lint-merge: HEAD is not a merge commit — nothing to check")
-            return 0
-        # run_ids_at_rev, not a read of one path: it unions the legacy file and
-        # the shard directory at every rev, so a parent from before #8346 is
-        # not silently the empty set. See its docstring.
-        merged = run_ids_at_rev("HEAD")
-        probs = lint_merge_completeness_ids(merged, [run_ids_at_rev(p_) for p_ in parents])
-        if probs:
-            for pr in probs:
-                print(pr)
-            return 1
+        if not revs:
+            # #9046: this used to `return 0`, and the caller mapped rc 0 to a
+            # PASS line. The label said "nothing to check", which the author
+            # intended as the disclosure -- but a PASS line still increments
+            # the suite's `passed=` total, and the total is what anyone
+            # actually reads. A disclosure that does not survive aggregation
+            # is not a disclosure.
+            #
+            # Exit 3 is "we could not look", distinct from 0 "we looked and it
+            # is clean" and 1 "we looked and it is not". The caller maps it to
+            # SKIP, so the count stops claiming a check that did not happen.
+            print(
+                f"lint-merge: no merge commits in the last "
+                f"{args.lint_merge_count} — nothing to check"
+            )
+            return 3
+        checked = 0
+        total_ids = 0
+        for rev in revs:
+            parents = subprocess.run(
+                ["git", "rev-parse", f"{rev}^@"], capture_output=True, text=True
+            ).stdout.split()
+            if len(parents) < 2:
+                continue
+            # run_ids_at_rev, not a read of one path: it unions the legacy file
+            # and the shard directory at every rev, so a parent from before
+            # #8346 is not silently the empty set. See its docstring.
+            merged = run_ids_at_rev(rev)
+            probs = lint_merge_completeness_ids(
+                merged, [run_ids_at_rev(p_) for p_ in parents]
+            )
+            if probs:
+                print(f"lint-merge: at merge {rev[:12]}:")
+                for pr in probs:
+                    print(f"  {pr}")
+                return 1
+            checked += 1
+            total_ids = max(total_ids, len(merged))
+        if checked == 0:
+            print(
+                f"lint-merge: no merge commits in the last "
+                f"{args.lint_merge_count} — nothing to check"
+            )
+            return 3
         print(
-            f"lint-merge: OK — {len(merged)} run_id(s), none dropped "
-            f"across {len(parents)} parents"
+            f"lint-merge: OK — {checked} merge(s) checked, "
+            f"{total_ids} run_id(s), none dropped"
         )
         return 0
 

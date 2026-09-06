@@ -502,13 +502,23 @@ if command -v python3 >/dev/null 2>&1; then
 	# PARENTS instead of against the file alone, and is a run_id SET check --
 	# a count would pass a merge that dropped one row and added another.
 	#
-	# A no-op on a non-merge HEAD, and it SAYS so rather than printing a bare
-	# pass, because "checked nothing" and "checked and clean" must not look the
-	# same here.
+	# #9046 widened this twice over. It used to inspect HEAD ONLY, so a merge
+	# that dropped a shard was catchable only while HEAD was exactly that
+	# merge -- one commit later it was permanently invisible, because plain
+	# ledger-lint cannot see a missing row. It now walks the last N merges.
+	#
+	# And "nothing to check" is no longer a PASS. The previous code returned 0
+	# on a non-merge HEAD and put the words "nothing to check" in the PASS
+	# label, which was the intended disclosure -- but a PASS line still
+	# increments the suite's `passed=` total, and the total is what gets read.
+	# rc 3 is "we could not look" and maps to SKIP, so the count never claims
+	# a check that did not happen.
 	out=$(python3 test/incus/ledger_compare.py --lint-merge 2>&1)
 	rc=$?
 	if [ "$rc" -eq 0 ]; then
 		passl "ledger-merge-completeness ($out)"
+	elif [ "$rc" -eq 3 ]; then
+		skipl "ledger-merge-completeness ($out)"
 	else
 		faill "ledger-merge-completeness"
 		echo "$out" | sed 's/^/      /'
