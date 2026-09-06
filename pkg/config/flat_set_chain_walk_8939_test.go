@@ -98,7 +98,16 @@ func flatSetChainPairs() [][]string {
 		if len(leaves) >= 2 {
 			if key := strings.Join(path, " "); !seen[key] {
 				seen[key] = true
-				out = append(out, append(append([]string{}, path...), leaves[0], leaves[1]))
+				// THREE leaves where the container declares three -- see the
+				// THE THIRD LEAF note in this file's header. Two is not enough
+				// to discriminate the correct fix from a recursive descent.
+				n := 3
+				if len(leaves) < 3 {
+					n = 2
+				}
+				row := append([]string{}, path...)
+				row = append(row, leaves[:n]...)
+				out = append(out, row)
 			}
 		}
 		var keys []string
@@ -188,32 +197,84 @@ func TestFlatSetChainWalkRatchet8939(t *testing.T) {
 	var losers []string
 	var walked, vacuous, unmeasured int
 	for _, p := range flatSetChainPairs() {
-		cont, a, b := p[:len(p)-2], p[len(p)-2], p[len(p)-1]
+		nLeaf := 2
+		if len(p) >= 3 && flatSetLeafCount(p) == 3 {
+			nLeaf = 3
+		}
+		cont, leaves := p[:len(p)-nLeaf], p[len(p)-nLeaf:]
 		base := "set " + strings.Join(cont, " ")
-		av, bv := flatSetSyntheticValue(a), flatSetSyntheticValue(b)
-		packed, ep := flatSetCompile([]string{
-			fmt.Sprintf("%s %s %s %s %s", base, a, av, b, bv)})
-		split, es := flatSetCompile([]string{
-			fmt.Sprintf("%s %s %s", base, a, av),
-			fmt.Sprintf("%s %s %s", base, b, bv)})
+
+		packedLine := base
+		var splitLines []string
+		for _, lf := range leaves {
+			v := flatSetSyntheticValue(lf)
+			packedLine += " " + lf + " " + v
+			splitLines = append(splitLines, fmt.Sprintf("%s %s %s", base, lf, v))
+		}
+		packed, ep := flatSetCompile([]string{packedLine})
+		split, es := flatSetCompile(splitLines)
 		if ep != nil || es != nil || packed == nil || split == nil {
 			unmeasured++
 			continue
 		}
 		if reflect.DeepEqual(packed, split) {
-			// vacuity control: both empty proves nothing about walking.
+			// VACUITY CONTROL 1: both empty proves nothing about walking.
 			if empty != nil && reflect.DeepEqual(packed, empty) {
 				vacuous++
 				continue
 			}
+			// VACUITY CONTROL 2, and it is the one that matters at three
+			// leaves. An equal comparison means nothing if the LAST leaf is
+			// not observable in the typed config at all: both spellings then
+			// compile to the same thing for a reason that has nothing to do
+			// with walking the chain, and the row reports WALKED having
+			// measured nothing.
+			//
+			// Found by the count moving the WRONG WAY. Going from two leaves
+			// to three moved containers from LOSE to WALK -- `schedulers
+			// scheduler <s> friday` among them -- which cannot happen if the
+			// measurement is sound, because a third leaf can only expose more
+			// loss. Without this control the three-leaf ratchet reported 34
+			// losers and 45 walked, and four of those "fixes" were leaves the
+			// compiler never reads.
+			if prev, e := flatSetCompile(splitLines[:len(splitLines)-1]); e == nil &&
+				prev != nil && reflect.DeepEqual(split, prev) {
+				vacuous++
+				continue
+			}
 			walked++
+			if os.Getenv("SHOW_WALKED_8939") != "" {
+				fmt.Printf("WALKED %s [%s]\n", strings.Join(cont, " "), strings.Join(leaves, " | "))
+			}
 			continue
 		}
-		losers = append(losers, strings.Join(cont, " ")+"  ["+a+" | "+b+"]")
+		// HOW MUCH is lost, not merely that something is. With three leaves
+		// this separates the two fix shapes: a recursive descent recovers leaf
+		// B and still drops C, which is `partial`; total loss is `total`.
+		kind := "differs"
+		if prefix, e := flatSetCompile(splitLines[:1]); e == nil && prefix != nil &&
+			reflect.DeepEqual(packed, prefix) {
+			kind = "total"
+		} else if len(splitLines) > 2 {
+			if prefix, e := flatSetCompile(splitLines[:2]); e == nil && prefix != nil &&
+				reflect.DeepEqual(packed, prefix) {
+				kind = "partial(descent-shaped)"
+			}
+		}
+		losers = append(losers, strings.Join(cont, " ")+"  ["+
+			strings.Join(leaves, " | ")+"]  "+kind)
 	}
 	sort.Strings(losers)
 
-	got := strings.Join(losers, "\n") + "\n"
+	// THE COUNTS ARE PART OF THE FIXTURE, and that is a mutation result, not a
+	// flourish. With only the loser set recorded, deleting the observability
+	// vacuity control above passes: removing it moves rows between `vacuous`
+	// and `walked` and never touches the loser list, so the control could be
+	// dropped in silence. Recording all four counts is what makes it a
+	// control rather than a comment.
+	got := fmt.Sprintf("# counts: losers=%d walked=%d vacuous=%d unmeasured=%d\n",
+		len(losers), walked, vacuous, unmeasured) +
+		strings.Join(losers, "\n") + "\n"
 	if os.Getenv("UPDATE_8939") != "" {
 		if err := os.WriteFile(flatSetChainFixture, []byte(got), 0o644); err != nil {
 			t.Fatal(err)
@@ -236,10 +297,29 @@ func TestFlatSetChainWalkRatchet8939(t *testing.T) {
 			"the operator typed.\n\ndiff:\n%s",
 			len(losers), walked, vacuous, unmeasured, flatSetDiff(string(wantB), got))
 	}
-	if walked < 20 {
-		t.Errorf("only %d containers WALK the chain. This file's argument against "+
-			"#8939's parse-time rejection rests on that population being large; at "+
-			"this size the argument needs re-deriving.", walked)
+	// THIS FLOOR WAS WRONG AND FIRING IT IS HOW I FOUND OUT. It read
+	// `walked < 20`, on the belief -- published in PR #8999 and on #8939 --
+	// that ~41 containers demonstrably walk the chain. Two corrections:
+	//
+	//  1. Most of that 41 was VACUOUS. Those rows compared equal because the
+	//     last leaf is not observable in the typed config at all, not because
+	//     any compiler walked anything. With the observability control the
+	//     honest number is 5.
+	//  2. `applications` -- the witness the whole argument rests on -- is NOT
+	//     IN THIS POPULATION. Its match leaves are `multi` or carry children,
+	//     so the eligibility predicate excludes them. The count never had
+	//     anything to say about it.
+	//
+	// So the argument against a parse-time rejection does not rest on the
+	// census count and never did. It rests on the `applications` control at
+	// the top of this test, which drives a real value through a real compile
+	// and asserts it (`dport == "8080"`). That control is the floor.
+	if walked < 1 {
+		t.Errorf("zero containers in the census population walk the chain. That is "+
+			"not fatal to this file's argument -- the `applications` control above "+
+			"carries it -- but it means the census can no longer corroborate it, "+
+			"and the issue comment quoting these numbers should say so. (walked=%d, "+
+			"vacuous=%d, losers=%d)", walked, vacuous, len(losers))
 	}
 }
 
@@ -271,14 +351,74 @@ func flatSetDiff(want, got string) string {
 	}
 	var b strings.Builder
 	for l := range g {
-		if !w[l] {
-			fmt.Fprintf(&b, "  + NEWLY LOSING (regression): %s\n", l)
+		if w[l] {
+			continue
 		}
+		if strings.HasPrefix(l, "# counts:") {
+			fmt.Fprintf(&b, "  ! counts moved, now: %s\n", strings.TrimPrefix(l, "# counts: "))
+			continue
+		}
+		fmt.Fprintf(&b, "  + NEWLY LOSING (regression): %s\n", l)
 	}
 	for l := range w {
-		if !g[l] {
-			fmt.Fprintf(&b, "  - no longer losing (fixed):  %s\n", l)
+		if g[l] {
+			continue
 		}
+		if strings.HasPrefix(l, "# counts:") {
+			fmt.Fprintf(&b, "  ! counts were:       %s\n", strings.TrimPrefix(l, "# counts: "))
+			continue
+		}
+		fmt.Fprintf(&b, "  - no longer losing (fixed):  %s\n", l)
 	}
 	return b.String()
+}
+
+// flatSetLeafCount reports how many trailing entries of a row are leaves. The
+// row is <container path...> <leaf>... and container segments never collide
+// with the leaf names appended after them, so counting from the end is exact:
+// the generator appends either 2 or 3.
+func flatSetLeafCount(row []string) int {
+	// The generator appends 3 when the container declared 3 eligible leaves.
+	// Recover it by asking the schema again rather than storing a parallel
+	// count that could drift from the row it describes.
+	for n := 3; n >= 2; n-- {
+		if len(row) <= n {
+			continue
+		}
+		cont := row[:len(row)-n]
+		if flatSetContainerLeafCount(cont) >= n {
+			return n
+		}
+	}
+	return 2
+}
+
+// flatSetContainerLeafCount counts eligible leaves declared by the container at
+// the given token path, walking the same way flatSetChainPairs does.
+func flatSetContainerLeafCount(path []string) int {
+	n := setSchema
+	for _, seg := range path {
+		if n == nil || n.children == nil {
+			return 0
+		}
+		c := n.children[seg]
+		if c == nil {
+			if n.wildcard != nil {
+				c = n.wildcard
+			} else {
+				return 0
+			}
+		}
+		n = c
+	}
+	if n == nil || n.children == nil {
+		return 0
+	}
+	cnt := 0
+	for _, c := range n.children {
+		if c != nil && c.children == nil && c.wildcard == nil && !c.multi {
+			cnt++
+		}
+	}
+	return cnt
 }
