@@ -937,6 +937,44 @@ per-path:
   `zeroizeConfigDir` mirror apply the identical scoped match; the dedicated
   `<root>/.configdb` and (gRPC-only) `<root>/tls` subdir `RemoveAll`s stay —
   those are exclusively xpf-owned subdirectories.
+- **Symlinked erase targets are REFUSED, not unlinked (#9013).** `os.Remove`
+  and `os.RemoveAll` act on the **link** when a path's FINAL component is a
+  symlink: they unlink it, return `nil`, and the real bytes stay on the target
+  volume — so the operator saw "System zeroized. Configuration erased." while
+  the archived config text, `active.json`, the live config, the rescue config,
+  the audit journal, the numbered rollback slots, `master.key` or `tls/key.pem`
+  survived. (Only the final component matters; when an INTERMEDIATE component
+  is a link, `RemoveAll` resolves through it and does erase the real directory —
+  measured, not assumed.) Every such path is now `Lstat`ed via the shared
+  `configstore.SymlinkTarget` predicate before removal; a link is recorded and
+  SKIPPED, and the wipe returns a `*FactoryResetSymlinkError` naming each path
+  **and its target** so the operator knows where the secrets actually are.
+  Refusing rather than resolving-and-erasing matches `ValidateFactoryResetRoot`'s
+  doctrine: a link may point at a shared, remote or compliance volume that is
+  not xpf's to destroy, so the reset fails CLOSED instead of guessing. A skipped
+  erase OUTRANKS a failed one when both happen (an erasure that did not happen
+  at all is strictly worse, because only a failure announces itself), and the
+  two are `errors.Join`ed so neither is swallowed.
+  - The `.configdb` ordering is why that check runs BEFORE any removal: the key
+    deletion resolves THROUGH a symlinked directory and destroys the real
+    `master.key`, and only then does `RemoveAll` unlink the link — destroying
+    the key while leaving the config body. With no `system master-password`
+    configured (the default, so `maybeEncryptTreeJSON` returns plaintext) that
+    body is the full cleartext config, and the key-first cryptographic-erasure
+    guarantee buys nothing.
+  - The INVERSE shape — a real `.configdb` holding a symlinked `master.key` —
+    leaves the real key while the body is erased, defeating cryptographic
+    erasure in the other direction against a backup of the DB. There the body
+    erase still proceeds: the key cannot be destroyed, but removing the
+    ciphertext leaves nothing on this box for it to decrypt.
+  - **The guard is applied to BOTH twins.** This erase logic exists twice, and
+    `FactoryResetConfigDir` in this package has **no non-test caller** —
+    `pkg/grpcapi`'s `zeroizeConfigDir` is the one production runs, via
+    `PerformZeroizeWipe` (the gRPC path and, through the `zeroizeFullWipe` seam,
+    the console). A guard written only against this package's copy would have
+    been inert in production, which is why the predicate is shared rather than
+    re-spelled. `tls/` is gRPC-only and is covered there.
+
 - **`FactoryResetArchiveDir` — local config-archive erasure (#5186).**
   `zeroize` must remove EVERY on-box generation of config secrets. The
   config archive (`<archive-dir>/config-*.conf`, 0600 full-config-text
