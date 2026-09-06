@@ -3226,8 +3226,37 @@ pub(super) fn poll_binding_process_descriptor(
                                                 dst_ip: IpAddr::V4(snat_v4),
                                                 src_port,
                                                 dst_port,
-                                                                                            discriminator: Default::default(),
-                                                                                            routing_domain: 0,
+                                                discriminator: Default::default(),
+                                                // #9033: carry the forward flow's
+                                                // routing domain. The sibling arm below
+                                                // builds its reverse companion through
+                                                // `reverse_session_key`, which preserves
+                                                // it verbatim, so hardcoding 0 here gave
+                                                // the same flow a different identity
+                                                // purely because it took the NAT64
+                                                // branch -- and the reply, whose key IS
+                                                // domain-stamped on ingress, then missed
+                                                // this installed companion.
+                                                //
+                                                // This is an INSTALLED companion, not a
+                                                // reverse-MATCH index key. The
+                                                // deliberate domain-agnostic convention
+                                                // in session/key.rs belongs to
+                                                // `reverse_wire_key` /
+                                                // `reverse_canonical_key`, whose probes
+                                                // are zeroed to match by
+                                                // `reverse_match_key`; that pairing is
+                                                // self-consistent and independent of
+                                                // what an installed session carries.
+                                                //
+                                                // The `discriminator` above is left as
+                                                // it is on purpose: NAT64 is v6<->v4
+                                                // translation, not tunnelling, and the
+                                                // embedded-ICMP discriminator erasure is
+                                                // #9031's subject, which needs the
+                                                // quoted GRE header parsed rather than a
+                                                // field copied.
+                                                routing_domain: flow.forward_key.routing_domain,
                                             },
                                             rev_proto,
                                         )

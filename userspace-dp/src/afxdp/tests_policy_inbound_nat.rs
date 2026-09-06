@@ -862,3 +862,81 @@ fn source_nat_does_not_match_pre_dnat_destination_port_9034() {
          port scoping is being ignored rather than translated (#9034)"
     );
 }
+
+/// #9033: the NAT64 arm's reverse companion must carry the forward flow's
+/// routing domain, like its sibling arm does.
+///
+/// `poll_descriptor` builds the reverse companion two ways. The non-NAT64 arm
+/// calls `flow.reverse_key_with_nat(...)` -> `reverse_session_key`, which
+/// preserves `routing_domain` verbatim. The NAT64 arm hand-built a `SessionKey`
+/// and hardcoded `routing_domain: 0`, so the same flow got a different identity
+/// purely by taking that branch — and the reply, whose key IS domain-stamped on
+/// ingress, missed the installed companion.
+///
+/// THIS CELL EXISTS BECAUSE THE OBVIOUS CONTROLS ARE VACUOUS. Every NAT64 cell
+/// in the tree runs on a snapshot with no routing-instance membership, where
+/// `routing_domain` is 0 on both sides and the defect is invisible. A green
+/// suite therefore said nothing about this fix; only a domain-BEARING NAT64
+/// flow can tell the two branches apart.
+///
+/// Fail-on-revert: restore `routing_domain: 0` in the NAT64 arm and the
+/// installed reverse companion reads 0 while the forward reads 7.
+#[test]
+fn nat64_reverse_companion_carries_the_routing_domain_9033() {
+    let mut snapshot = nat64_snapshot(lan_to_wan_permit("64:ff9b::/96", "permit-synthetic-v6"));
+    // Put every interface in routing instance 7. Without this the cell is
+    // vacuous — which is exactly why the existing NAT64 cells could not catch
+    // the defect.
+    for iface in snapshot.interfaces.iter_mut() {
+        iface.routing_domain = 7;
+    }
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+
+    let src: Ipv6Addr = "2001:559:8585:ef00::102".parse().expect("v6 client");
+    let dst: Ipv6Addr = "64:ff9b::808:808".parse().expect("nat64 dst");
+    let frame = build_txn_tcp_syn_frame_v6(src, dst, 12345, 443);
+    let meta = txn_meta_v6(24, frame.len());
+    let (_batch, _dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+
+    // Collect every installed key's domain. The forward (v6) session and its
+    // v4 reverse companion must agree.
+    let mut domains: Vec<(u8, u32)> = Vec::new();
+    sessions.iter_with_origin(|key, _d, _m, _o| {
+        domains.push((key.addr_family as u8, key.routing_domain));
+    });
+    assert!(
+        !domains.is_empty(),
+        "fixture precondition: the NAT64 flow must install at least one session, \
+         or this cell asserts over an empty table"
+    );
+    let v4_entries: Vec<u32> = domains
+        .iter()
+        .filter(|(af, _)| *af == libc::AF_INET as u8)
+        .map(|(_, d)| *d)
+        .collect();
+    assert!(
+        !v4_entries.is_empty(),
+        "fixture precondition: the NAT64 flow must install a v4 REVERSE companion \
+         — that companion is the subject of #9033"
+    );
+    for d in &v4_entries {
+        assert_eq!(
+            *d, 7,
+            "the NAT64 v4 reverse companion must carry the forward flow's routing \
+             domain (7). Hardcoding 0 gives it a different identity from the \
+             sibling arm's companion, and the domain-stamped reply then misses it \
+             (#9033)"
+        );
+    }
+}
