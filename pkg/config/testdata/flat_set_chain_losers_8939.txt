@@ -1,6 +1,6 @@
 # counts: losers=48 walked=47 vacuous=51 unmeasured=75
 # collector reach: 363 containers walked, 133 reached the census (134 dropped: no eligible leaf, 96 dropped: only one)
-class-of-service traffic-control-profiles arg1  [delay-buffer-rate | guaranteed-rate | scheduler-map]  total  lenient-only
+class-of-service traffic-control-profiles arg1  [delay-buffer-rate | guaranteed-rate | scheduler-map]  total  OPERATOR
 firewall policer arg1 if-exceeding  [bandwidth-limit | burst-size-limit]  total  lenient-only
 forwarding-options dhcp-relay group arg1 overrides  [always-broadcast | forward-only | maximum-hop-count]  total  OPERATOR
 forwarding-options dhcp-relay group arg1 overrides  [always-broadcast | forward-only]  total  OPERATOR
@@ -9,8 +9,8 @@ forwarding-options sampling instance arg1 family inet6 output  [inline-jflow | s
 policy-options policy-statement arg1 term arg1 then  [accept | load-balance | local-preference]  total  OPERATOR
 policy-options policy-statement arg1 term arg1 then  [accept | load-balance]  total  OPERATOR
 policy-options policy-statement arg1 then  [accept | reject]  total  OPERATOR
-protocols bgp  [cluster-id | graceful-restart | local-as]  total  lenient-only
-protocols bgp  [cluster-id | graceful-restart]  total  lenient-only
+protocols bgp  [cluster-id | graceful-restart | local-as]  total  OPERATOR
+protocols bgp  [cluster-id | graceful-restart]  total  OPERATOR
 protocols bgp multipath  [ibgp | multiple-as]  total  OPERATOR
 protocols isis  [authentication-key | authentication-type | is-type]  total  OPERATOR
 protocols isis  [authentication-key | authentication-type]  total  OPERATOR
@@ -18,7 +18,7 @@ protocols isis interface arg1  [authentication-key | authentication-type | level
 protocols isis interface arg1  [authentication-key | authentication-type]  total  OPERATOR
 protocols rip  [authentication-key | authentication-type | group]  total  OPERATOR
 protocols rip  [authentication-key | authentication-type]  total  OPERATOR
-protocols router-advertisement interface arg1  [default-lifetime | link-mtu | managed-configuration]  total  lenient-only
+protocols router-advertisement interface arg1  [default-lifetime | link-mtu | managed-configuration]  total  OPERATOR
 protocols router-advertisement interface arg1  [default-lifetime | link-mtu]  total  lenient-only
 protocols router-advertisement interface arg1 prefix arg1  [autonomous | no-autonomous | no-onlink]  total  lenient-only
 protocols router-advertisement interface arg1 prefix arg1  [autonomous | no-autonomous]  total  lenient-only
@@ -30,16 +30,16 @@ schedulers scheduler arg1  [start-date | start-time | stop-date]  total  lenient
 schedulers scheduler arg1  [start-date | start-time]  total  lenient-only
 security flow  [allow-dns-reply | allow-embedded-icmp | force-ip-reassembly]  total  OPERATOR
 security flow  [allow-dns-reply | allow-embedded-icmp]  total  OPERATOR
-security ike policy arg1  [mode | pre-shared-key | proposal-set]  total  lenient-only
+security ike policy arg1  [mode | pre-shared-key | proposal-set]  total  OPERATOR
 security ike proposal arg1  [authentication-algorithm | authentication-method | description]  total  lenient-only
 security ike proposal arg1  [authentication-algorithm | authentication-method]  total  lenient-only
 security log  [format | mode | source-interface]  total  lenient-only
 security log  [format | mode]  total  lenient-only
-security nat source pool arg1  [port-overloading-factor | routing-instance]  total  lenient-only
+security nat source pool arg1  [port-overloading-factor | routing-instance]  total  OPERATOR
 services flow-monitoring version-ipfix template arg1  [flow-active-timeout | flow-inactive-timeout]  total  lenient-only
 services flow-monitoring version9 template arg1  [flow-active-timeout | flow-inactive-timeout]  total  lenient-only
 services rpm probe arg1 test arg1 target  [address | url]  total  OPERATOR
-system archival configuration  [transfer-interval | transfer-on-commit]  total  lenient-only
+system archival configuration  [transfer-interval | transfer-on-commit]  total  OPERATOR
 system dataplane  [binary | claim-host-tunables | control-socket]  total  OPERATOR
 system dataplane coalescence  [adaptive | rx-usecs | tx-usecs]  total  lenient-only
 system dataplane coalescence  [adaptive | rx-usecs]  total  lenient-only
