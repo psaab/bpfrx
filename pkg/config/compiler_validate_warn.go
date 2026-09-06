@@ -672,7 +672,8 @@ func ValidateConfig(cfg *Config) []string {
 	// address-book / application object changes; xpf clears only the policies
 	// whose own match/action text changed. Warn on `extensive` so an operator is
 	// not misled; a plain `policy-rematch` needs no advisory now that its core is
-	// enforced. The `extensive` gap stays tracked in #4234.
+	// enforced. The `extensive` gap outlived #4234, which is CLOSED; it is
+	// tracked on #8993.
 	if cfg.Security.PolicyRematchExtensive {
 		warnings = append(warnings,
 			"security policies policy-rematch extensive configured but only "+
@@ -680,7 +681,7 @@ func ValidateConfig(cfg *Config) []string {
 				"whose own match/action changed, but does NOT re-evaluate sessions "+
 				"of an UNCHANGED policy when a referenced address-book / application "+
 				"object changes (the `extensive` case); those sessions keep "+
-				"forwarding until idle timeout (#4234)")
+				"forwarding until idle timeout (#4234; tracked on #8993)")
 	}
 
 	// #4231 (fable-167 P-3): five `security flow` knobs are now typed +

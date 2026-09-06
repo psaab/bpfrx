@@ -213,7 +213,7 @@ func (c *Config) ResolveFab(ref string) string {
 // pkg/daemon/daemon_dhcp.go. Migration to centralize all callers was
 // tracked as a follow-up to #1565, which is CLOSED while the three
 // resolvers are still kept in step by this note rather than by
-// construction — #8942 tracks the residual. Keeping them in sync is
+// construction — #8994 tracks the residual. Keeping them in sync is
 // therefore a live obligation on anyone editing any of the three, not
 // something a pending migration is about to remove.
 // resolveBareKernelIfName is the BARE-ref arm of ResolveKernelIfName, split out

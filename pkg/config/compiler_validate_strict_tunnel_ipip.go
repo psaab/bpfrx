@@ -351,7 +351,8 @@ func validateIpipTunnelDeadWarning(cfg *Config) []string {
 // name divergence tracked in #6941 (routing keys its desired set by
 // TunnelConfig.Name -- pkg/routing/tunnel.go `desired[tc.Name]`; the dataplane
 // binds via snapshotLinuxName, pkg/dataplane/userspace/interfaces.go). #6941 is
-// CLOSED and both halves still key differently, so #8942 tracks the residual.
+// CLOSED and both halves still key differently, so #8995 tracks the residual
+// (and #8994 the general case: three resolvers kept in step by a NOTE).
 //
 // Why the DEVICE clause has to exist at all: the advisory's claim is about a
 // Linux device — "an interface an operator can see that carries no traffic" —

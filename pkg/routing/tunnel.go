@@ -1282,7 +1282,7 @@ func (t *tunnelManager) clearLocked() error {
 	// re-adopts cleanly. Whether ClearTunnels should also flush WG
 	// addresses is deferred to #1434 (full teardown grammar). #1434 is
 	// CLOSED and ClearTunnels still does not flush them, so the open
-	// question is tracked on #8942.
+	// question is tracked on #8996.
 	t.wgConfigured = nil
 	// clearLocked drains every keepalive runner first
 	// (stopAllKeepalivesLocked above), so no live runner holds a stale
