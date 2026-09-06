@@ -1446,11 +1446,24 @@ func validateFilterRoutingInstanceConflictStrict(cfg *Config) error {
 // conflict when the term carries more than one DISTINCT terminal. Repeating the
 // SAME terminal (e.g. two `then discard` blocks) is a redundancy, not a
 // conflict, and is allowed. The non-terminating modifiers (count/log/
-// forwarding-class/loss-priority/dscp/traffic-class/policer/routing-instance)
-// are not terminals and coexist with a terminal — a term with `then count X
-// accept` is valid. (`then routing-instance` co-located with a terminating
-// discard/reject is a separate contradiction handled by
-// validateFilterRoutingInstanceConflictStrict, #3308.)
+// forwarding-class/loss-priority/dscp/traffic-class/policer) are not terminals
+// and coexist with a terminal — a term with `then count X accept` is valid.
+//
+// `then routing-instance <x>` is NOT one of them. It is a TERMINATING
+// (filter-based-forwarding) action: the term takes its own forwarding decision
+// and both runtimes terminate on it — the Rust evaluator sets
+// `continue_term: snap.action.is_empty() && snap.routing_instance.is_empty()`
+// (userspace-dp/src/filter/compiler.rs) and resolves the empty action to
+// Accept, and the kernel lo0 nft mirror emits a terminating `accept`
+// (nftRulesFromTerm, pkg/daemon/daemon_nft_term_lower.go;
+// nftLo0RulesFromTerm, pkg/nftables/netlink_lo0.go). It is simply not recorded
+// on term.TerminalActions, because that slice carries only the accept/reject/
+// discard KEYWORDS. #9140 corrects this comment, which previously listed
+// routing-instance among the non-terminating modifiers — the misreading that
+// let the next-term contradiction below through. (`then routing-instance`
+// co-located with an explicit terminating discard/reject is a separate
+// contradiction handled by validateFilterRoutingInstanceConflictStrict, #3308;
+// co-located with `then accept` it is the legitimate FBF case and stays legal.)
 //
 // The walk is deterministic (filters sorted by name, terms in config order) so
 // the first-reported error is stable across runs. On the tolerant load /
@@ -1512,14 +1525,39 @@ func validateFilterTerminalConflictStrict(cfg *Config) error {
 				// contradiction here, naming the filter+term. A modifier-only
 				// next-term term (no terminating action) is a VALID fall-through
 				// (#2544/#3427) and is left untouched.
-				if term.NextTerm && len(term.TerminalActions) > 0 {
+				//
+				// #9140 extends the same invariant to `then routing-instance
+				// <x>`, which is a TERMINATING filter-based-forwarding action
+				// that compileFilterThen records on term.RoutingInstance rather
+				// than on term.TerminalActions. Because the gate read only
+				// TerminalActions, `then { routing-instance mgmt-vrf; next
+				// term; }` committed cleanly and then rendered a TERMINATING
+				// accept in BOTH runtimes (continue_term is false when the
+				// routing-instance is set, and the empty action resolves to
+				// Accept), so every later term — including an SSH deny — went
+				// dead for the term's whole match set. That is the #5142
+				// fail-open shape reached through a different field. The
+				// runtimes are NOT the bug here and must not be changed: they
+				// agree with each other, and diverging the nft mirror from the
+				// Rust evaluator would break the mirror contract stated at
+				// daemon_nft_term_lower.go. The bug is that the operator was
+				// allowed to author the contradiction at all.
+				terminal := ""
+				switch {
+				case len(term.TerminalActions) > 0:
+					terminal = term.TerminalActions[0]
+				case term.RoutingInstance != "":
+					terminal = "routing-instance " + term.RoutingInstance
+				}
+				if term.NextTerm && terminal != "" {
 					return fmt.Errorf(
 						"firewall family %s filter %q term %q: terminating "+
 							"action %q cannot be combined with `then next term` — "+
-							"a terminating action (accept/reject/discard) always "+
-							"terminates and must not fall through to the next term "+
-							"(remove one)",
-						family, name, term.Name, term.TerminalActions[0])
+							"a terminating action (accept/reject/discard, and "+
+							"`routing-instance`, which takes its own forwarding "+
+							"decision) always terminates and must not fall through "+
+							"to the next term (remove one)",
+						family, name, term.Name, terminal)
 				}
 			}
 		}

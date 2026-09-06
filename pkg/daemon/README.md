@@ -2793,6 +2793,20 @@ never lock an operator out of a remote box it manages.
   `TestLo0PayloadFallThroughDoesNotShadowDiscard`, and
   `TestLo0PayloadRoutingInstanceTerminatesAcceptNoOverDrop` (the over-drop
   counterexample).
+  **`routing-instance` + `next term` is rejected at COMMIT, not un-terminated
+  here (#9140):** because a routing-instance term terminates, co-locating it
+  with `then next term` is the #5142 contradiction reached through
+  `term.RoutingInstance` instead of `term.TerminalActions` — the operator wrote
+  a fall-through and got a terminating accept that killed every later term.
+  `validateFilterTerminalConflictStrict` (`pkg/config`) now hard-rejects that
+  combination at commit. This renderer is UNCHANGED: the tolerant load /
+  peer-sync path downgrades the gate to a warning (#1960), so the shape can
+  still arrive, and it must keep mirroring the Rust evaluator, which terminates
+  it. Making the nft side fall through alone would be a kernel-vs-userspace
+  divergence — pinned by
+  `TestNftRoutingInstanceWithNextTermStillTerminatesMirroringRust9140` and
+  `TestLo0PayloadRoutingInstanceNextTermShadowsLaterDeny9140`
+  (`lo0_ri_nextterm_mirror_9140_test.go`).
   **Unknown terminating action fails CLOSED (#3724 M08):** the terminating
   verdict switch mirrors the Rust filter compiler
   (`userspace-dp/src/filter/compiler.rs`) EXACTLY — `discard` → `drop`,
