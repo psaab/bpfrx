@@ -659,9 +659,28 @@ var filedStillOpen = map[string]string{
 	// normalizer's predicate is keyed on a (container keyword, head) pair, and
 	// production calls it with `node.Keys[0]` -- which for these sites is an
 	// arbitrary INSTANCE NAME (`ge-0/0/0`, `bd1`), not a keyword. No static
-	// pair can name it, so no widening can admit it. That is a permanent bound
-	// of the predicate (#8921), not a contingent classification, and it is the
-	// only durability argument on offer that a later fix cannot dissolve.
+	// pair can name it, so no ADMISSION can reach it. That is a permanent bound
+	// of the predicate (#8921), not a contingent classification.
+	//
+	// #8932 NARROWED WHAT THAT BUYS, and the correction is mine. I wrote that
+	// this was "the only durability argument on offer that a later fix cannot
+	// dissolve". The bound is real and the inference was one step too wide: it
+	// says no PAIR-KEYED admission can reach the site, and says nothing about
+	// the other two remedies.
+	//
+	//	packedStatements     declared on a NODE, not keyed on a pair -- not
+	//	                     subject to this bound at all. Measured on
+	//	                     bridge-domains: it does NOT fix that site, but for
+	//	                     an unrelated reason (the compiler skips the leaf
+	//	                     before any run-splitting happens), not because the
+	//	                     bound stopped it.
+	//	a compiler change    reaches anything.
+	//
+	// So an instance-name slot makes an anchor durable against the sweep that
+	// consumed the previous three, and NOT against a fix aimed at the site. If
+	// #8932's bridge-domains row is ever fixed, this anchor goes with it and
+	// becomes the fourth. The honest statement is that this is the most durable
+	// argument available, not an argument that cannot be dissolved.
 	//
 	// Verified by reading the compiler, which is what membership here requires:
 	// compiler_services.go:2404 reaches the value with
