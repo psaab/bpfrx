@@ -1,8 +1,6 @@
-# counts: losers=29 walked=75 vacuous=44 unmeasured=76
+# counts: losers=27 walked=77 vacuous=44 unmeasured=76
 # collector reach: 369 containers walked, 135 reached the census (137 dropped: no eligible leaf, 97 dropped: only one)
 firewall policer arg1 if-exceeding  [bandwidth-limit | burst-size-limit]  total  lenient-only
-forwarding-options dhcp-relay group arg1 overrides  [always-broadcast | forward-only | maximum-hop-count]  total  OPERATOR
-forwarding-options dhcp-relay group arg1 overrides  [always-broadcast | forward-only]  total  OPERATOR
 forwarding-options sampling instance arg1 family inet output  [inline-jflow | source-address]  differs  OPERATOR
 forwarding-options sampling instance arg1 family inet6 output  [inline-jflow | source-address]  differs  OPERATOR
 protocols router-advertisement interface arg1 prefix arg1  [autonomous | no-autonomous | no-onlink]  total  lenient-only
