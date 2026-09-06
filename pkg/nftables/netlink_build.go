@@ -457,10 +457,16 @@ func (p *nlPlan) portMatch(off uint32, ports []nlPort, except bool) []expr.Any {
 	var els []nftables.SetElement
 	if interval {
 		for _, pt := range ports {
-			els = append(els,
-				nftables.SetElement{Key: binaryutil.BigEndian.PutUint16(pt.lo)},
-				nftables.SetElement{Key: portEnd(pt.hi), IntervalEnd: true},
-			)
+			els = append(els, nftables.SetElement{Key: binaryutil.BigEndian.PutUint16(pt.lo)})
+			// #9005, the port twin of #8597: a range reaching the top of the
+			// key space has no "first port not covered", so it gets NO end
+			// element and the interval runs open to the end of the range.
+			// Emitting the wrapped end put the marker at the BOTTOM of the key
+			// space (`0000!end`) instead — the same encoding #8597 measured and
+			// rejected for addresses, on the same kernel representation.
+			if end, ok := portNext(pt.hi); ok {
+				els = append(els, nftables.SetElement{Key: end, IntervalEnd: true})
+			}
 		}
 	} else {
 		for _, pt := range ports {
@@ -797,10 +803,19 @@ func orLastBits(b []byte, hostBits int) {
 	}
 }
 
-// portEnd returns the big-endian interval end for a port range upper bound.
-func portEnd(hi uint16) []byte {
+// portNext returns the big-endian interval end for a port range upper bound —
+// the first port NOT covered — and false when there is none because the range
+// reaches the top of the key space (#9005).
+//
+// It replaces portEnd, which returned a WRAPPED 0x0000 for hi == 0xffff. That
+// is not an end marker at the top; it is an end marker at the BOTTOM, and the
+// kernel stores it as such. The address side reached the same conclusion in
+// #8597 and its `prefixNext` has the identical shape and contract, which is why
+// this returns (value, ok) rather than a sentinel: a caller cannot forget to
+// check, and the two key types now answer the question the same way.
+func portNext(hi uint16) ([]byte, bool) {
 	if hi == 0xffff {
-		return binaryutil.BigEndian.PutUint16(0)
+		return nil, false
 	}
-	return binaryutil.BigEndian.PutUint16(hi + 1)
+	return binaryutil.BigEndian.PutUint16(hi + 1), true
 }
