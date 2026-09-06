@@ -237,6 +237,59 @@ mechanism — `SetPath` nests the tokens into a chain before any pass runs, so
 there is no packed tail to split and `normalizeCompactStanzas` correctly folds
 nothing. That is a grammar-side question, tracked separately as issue 8939.
 
+### Which flat runs an operator can actually COMMIT (8939)
+
+A compiler that drops the tail of a flat run is a defect at every container, but
+the CHANNEL it arrives by is not uniform, and severity does not survive assuming
+it is. The typed-leaf schema walk runs **hard** on the operator commit path
+(`Store.Commit` → `compileTree` → `compileTreeStrict` →
+`schemaValidateExpandedTreeForNode`) and is downgraded to a `slog.Warn` on
+`Store.Load` and `Store.SyncApply` by `compileTreeLenient`, which says so in its
+own comment. So a flat run rejected by the walk is unreachable from the keyboard
+and still perfectly reachable on **boot from the persisted DB and on HA config
+sync from the peer** — where no operator is watching the warning.
+
+Measured through `configstore.CheckText`:
+
+```
+security flow tcp-session { closing-timeout 10 established-timeout 20 ... }
+  -> commit check failed: unknown modifier "established-timeout"
+security flow tcp-session { bogus-token 5; }
+  -> commit check failed: unknown configuration keyword under closed-world subtree
+
+security ike gateway g1  { bogus-token 5; }   -> ACCEPTED
+security ipsec vpn v1    { bogus-token 5; }   -> ACCEPTED
+```
+
+**The discriminator is not the container. It is whether the walk REACHES the
+trailing tokens**, and there are two ways it does not:
+
+1. **An arg-modelled instance container.** `gateway` is `args=1` with 12
+   children and NO wildcard, so the walk consumes the instance name as a value
+   and stops. **Nothing under a named gateway is validated** — a typo commits
+   clean. Compare `vpn`, modelled with a wildcard child: the walk descends, and
+   `bind-interface st0.1 df-bit clear` is rejected as `unknown modifier`.
+2. **An UNDECLARED first keyword.** `security ipsec vpn <name> gateway` and
+   `ipsec-policy` are read by `compiler_ipsec.go` and absent from `setSchema`.
+   The walk skips the unknown keyword open-world and the whole trailing run
+   rides along with it, so the packed spelling commits and the compiler then
+   drops everything after the first token. This is the schema-behind-compiler
+   direction of the skew, and it is what makes a site operator-reachable.
+
+So: **an 8939 defect is reachable from an operator's keyboard exactly where the
+schema validates nothing.** Reachability and schema blindness are the same
+measurement, which also means the loser list and the schema-coverage gate are
+two faces of one hole. State which channel a fix addresses; do not write the
+operator-typed story for a container whose subtree is closed-world.
+
+A corollary for the census that drives this work: it calls `CompileConfig`, not
+the admission path, so its population is the compiler's, not the operator's. A
+row also leaves that population as `unmeasured` whenever a STRICT VALIDATOR
+rejects the synthesized placeholder — `bind-interface ge-0/0/0` fails the 5297
+secure-tunnel gate, `local-ip xpfval` fails the 4098 selector gate — so
+`unmeasured` is **not neutral**: it is enriched for exactly the containers
+someone cared enough about to gate.
+
 The IKE gateway had all three wrong at once, which is why the symptom moved
 depending on statement ORDER: `gateway gw1 external-interface ge-0/0/0
 local-identity hostname foo;` compiled the external-interface and silently
