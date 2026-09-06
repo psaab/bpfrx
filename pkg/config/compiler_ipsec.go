@@ -171,7 +171,7 @@ func compileIKE(node *Node, sec *SecurityConfig) error {
 					gw.NoNATTraversal = true
 				}
 			case "dead-peer-detection":
-				parseDeadPeerDetectionNode(p, gw)
+				parseDeadPeerDetectionNode(p, gw, resolveSchemaChild(gatewayLeafSchema8939(node), "dead-peer-detection"))
 			case "local-identity":
 				if len(p.Keys) >= 3 {
 					gw.LocalIDType = p.Keys[1]
@@ -246,7 +246,7 @@ func compileIKE(node *Node, sec *SecurityConfig) error {
 // Tokens may ride on the node's own Keys (compact-hierarchical
 // `dead-peer-detection always-send` / `dead-peer-detection interval 10`) or on
 // child nodes (flat-set and block forms), so both are scanned.
-func parseDeadPeerDetectionNode(node *Node, gw *IPsecGateway) {
+func parseDeadPeerDetectionNode(node *Node, gw *IPsecGateway, container *schemaNode) {
 	if gw == nil || node == nil {
 		return
 	}
@@ -275,7 +275,13 @@ func parseDeadPeerDetectionNode(node *Node, gw *IPsecGateway) {
 		}
 	}
 
-	for _, c := range node.Children {
+	// #8939: `set … dead-peer-detection always-send interval 10 threshold 4`
+	// nests ONE node under `always-send` carrying ["interval","10","threshold",
+	// "4"], so the switch below saw a single child named `interval` and never
+	// reached `threshold`. The keys loop above reads the HIERARCHICAL spelling
+	// (`dead-peer-detection interval 10;` on one line) -- a different shape, and
+	// its presence is why this site read as already-walking.
+	for _, c := range expandFlatRun(node.Children, container) {
 		switch c.Name() {
 		case "always-send", "optimized", "probe-idle-tunnel":
 			gw.DeadPeerDetect = c.Name()
@@ -416,7 +422,7 @@ func compileIPsec(node *Node, sec *SecurityConfig) error {
 					gw.NoNATTraversal = true
 				}
 			case "dead-peer-detection":
-				parseDeadPeerDetectionNode(p, gw)
+				parseDeadPeerDetectionNode(p, gw, resolveSchemaChild(gatewayLeafSchema8939(node), "dead-peer-detection"))
 			case "local-identity":
 				if len(p.Keys) >= 3 {
 					gw.LocalIDType = p.Keys[1]
@@ -473,7 +479,8 @@ func compileIPsec(node *Node, sec *SecurityConfig) error {
 		if vpn == nil {
 			vpn = &IPsecVPN{Name: inst.name}
 		}
-		for _, p := range inst.node.Children {
+		vpnSchema := ipsecVPNLeafSchema8939()
+		for _, p := range expandFlatRun(inst.node.Children, vpnSchema) {
 			v := nodeVal(p)
 			switch p.Name() {
 			case "bind-interface":
@@ -484,7 +491,7 @@ func compileIPsec(node *Node, sec *SecurityConfig) error {
 				vpn.EstablishTunnels = v
 			case "ike":
 				// Nested ike { gateway X; ipsec-policy Y; }
-				for _, c := range p.Children {
+				for _, c := range expandFlatRun(p.Children, resolveSchemaChild(vpnSchema, "ike")) {
 					cv := nodeVal(c)
 					switch c.Name() {
 					case "gateway":
@@ -516,7 +523,7 @@ func compileIPsec(node *Node, sec *SecurityConfig) error {
 				// so ValidateConfig emits an advisory; xpf has no ICMP-probe
 				// liveness / st0 interface-state coupling yet.
 				vpn.VPNMonitor = true
-				for _, c := range p.Children {
+				for _, c := range expandFlatRun(p.Children, resolveSchemaChild(vpnSchema, "vpn-monitor")) {
 					switch c.Name() {
 					case "source-interface":
 						vpn.VPNMonitorSourceInterface = nodeVal(c)
@@ -533,7 +540,7 @@ func compileIPsec(node *Node, sec *SecurityConfig) error {
 				vpn.TrafficSelectors = make(map[string]*IPsecTrafficSelector)
 			}
 			ts := &IPsecTrafficSelector{Name: tsInst.name}
-			for _, p := range tsInst.node.Children {
+			for _, p := range expandFlatRun(tsInst.node.Children, ipsecTrafficSelectorSchema8939()) {
 				switch p.Name() {
 				case "local-ip":
 					ts.LocalIP = nodeVal(p)
@@ -750,4 +757,42 @@ func gatewayLeafSchema8939(parent *Node) *schemaNode {
 		return gw.wildcard
 	}
 	return gw
+}
+
+// ipsecVPNLeafSchema8939 resolves `security ipsec vpn <name>` so expandFlatRun
+// can tell one of the VPN's own leaves from a value token.
+//
+// This container is NOT in the #8939 ratchet fixture and never was. The
+// generator synthesizes `bind-interface ge-0/0/0` -- the alphabetically first
+// eligible leaf, handed a placeholder that the #5297 secure-tunnel gate
+// rejects -- so BOTH arms fail to compile and the row leaves the population as
+// `unmeasured` rather than as a loser. It was found by compiling the container
+// by hand.
+func ipsecVPNLeafSchema8939() *schemaNode {
+	sec := resolveSchemaChild(setSchema, "security")
+	ipsec := resolveSchemaChild(sec, "ipsec")
+	vpn := resolveSchemaChild(ipsec, "vpn")
+	if vpn == nil {
+		return nil
+	}
+	if vpn.wildcard != nil {
+		return vpn.wildcard
+	}
+	return vpn
+}
+
+// ipsecTrafficSelectorSchema8939 resolves `security ipsec vpn <name>
+// traffic-selector <name>`. Shared with the #4098/#5692 admission gate in
+// compiler_ipsec_trafficselector.go, which walks the same children and needs
+// the same segmentation -- fixing only the compiler would leave the packed
+// spelling rejected at commit, so the fix would never be reachable.
+func ipsecTrafficSelectorSchema8939() *schemaNode {
+	ts := resolveSchemaChild(ipsecVPNLeafSchema8939(), "traffic-selector")
+	if ts == nil {
+		return nil
+	}
+	if ts.wildcard != nil {
+		return ts.wildcard
+	}
+	return ts
 }

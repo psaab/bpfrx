@@ -98,7 +98,17 @@ func validateIPsecTrafficSelectorsStrict(nodes []*Node, lenient bool) ([]string,
 					// swanctl child — effectiveTrafficSelectors), which are already
 					// accumulated correctly.
 					valueCounts := map[string]int{}
-					for _, leaf := range tsInst.node.Children {
+					// #8939: the flat spelling
+					//   set … traffic-selector ts1 local-ip 10.0.0.0/8 remote-ip 172.16.0.0/12
+					// nests the remote-ip node UNDER local-ip, so
+					// trafficSelectorValues read `remote-ip` as a SECOND local-ip
+					// VALUE and this gate rejected the command with a message
+					// naming the wrong problem. Segmenting first makes the gate
+					// see the two leaves the operator typed. Repeated sibling
+					// leaves -- the #5692 case this gate exists for -- are
+					// untouched: expandFlatRun only splits a node whose Keys
+					// carry a further schema sibling.
+					for _, leaf := range expandFlatRun(tsInst.node.Children, ipsecTrafficSelectorSchema8939()) {
 						leafName := leaf.Name()
 						if leafName != "local-ip" && leafName != "remote-ip" {
 							continue

@@ -1,4 +1,4 @@
-# counts: losers=53 walked=42 vacuous=51 unmeasured=75
+# counts: losers=48 walked=47 vacuous=51 unmeasured=75
 class-of-service traffic-control-profiles arg1  [delay-buffer-rate | guaranteed-rate | scheduler-map]  total  lenient-only
 firewall policer arg1 if-exceeding  [bandwidth-limit | burst-size-limit]  total  lenient-only
 forwarding-options dhcp-relay group arg1 overrides  [always-broadcast | forward-only | maximum-hop-count]  total  OPERATOR
@@ -29,14 +29,9 @@ schedulers scheduler arg1  [start-date | start-time | stop-date]  total  lenient
 schedulers scheduler arg1  [start-date | start-time]  total  lenient-only
 security flow  [allow-dns-reply | allow-embedded-icmp | force-ip-reassembly]  total  OPERATOR
 security flow  [allow-dns-reply | allow-embedded-icmp]  total  OPERATOR
-security ike gateway arg1 dead-peer-detection  [always-send | interval | optimized]  total  lenient-only
 security ike policy arg1  [mode | pre-shared-key | proposal-set]  total  lenient-only
 security ike proposal arg1  [authentication-algorithm | authentication-method | description]  total  lenient-only
 security ike proposal arg1  [authentication-algorithm | authentication-method]  total  lenient-only
-security ipsec gateway arg1 dead-peer-detection  [always-send | interval | optimized]  total  lenient-only
-security ipsec vpn arg1 ike  [gateway | ipsec-policy]  total  OPERATOR
-security ipsec vpn arg1 vpn-monitor  [destination-ip | optimized | source-interface]  total  lenient-only
-security ipsec vpn arg1 vpn-monitor  [destination-ip | optimized]  total  lenient-only
 security log  [format | mode | source-interface]  total  lenient-only
 security log  [format | mode]  total  lenient-only
 security nat source pool arg1  [port-overloading-factor | routing-instance]  total  lenient-only

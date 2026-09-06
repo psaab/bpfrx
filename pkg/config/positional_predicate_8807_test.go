@@ -178,18 +178,20 @@ func containerForSwitch8807(ranges []rangeInfo8807, sw *ast.SwitchStmt) string {
 	if imm == nil {
 		return ""
 	}
-	// `range <v>.Children` or `range <v>.node.Children`
-	base := ""
-	if sel, ok := imm.node.X.(*ast.SelectorExpr); ok && sel.Sel.Name == "Children" {
-		switch b := sel.X.(type) {
-		case *ast.Ident:
-			base = b.Name
-		case *ast.SelectorExpr:
-			if id, ok := b.X.(*ast.Ident); ok {
-				base = id.Name
-			}
-		}
-	}
+	// `range <v>.Children` or `range <v>.node.Children`, AND through a
+	// wrapping call: `range expandFlatRun(<v>.Children, schema)`.
+	//
+	// #8939 THREADS EVERY CHILDREN LOOP IT FIXES THROUGH expandFlatRun, and
+	// without the call case that rewrite silently DELETES this predicate's
+	// coverage of the container -- the range expression stops being a
+	// SelectorExpr, container recovery returns "", and every site in the
+	// switch drops out. It is not hypothetical: it took `vpn`'s recovered
+	// read set to empty, which pushed the container under
+	// converseCoverage8807 and removed the pinned `vpn / traffic-selector`
+	// row. The ratchet reported that as unmeasured rows FALLING -- a good
+	// failure that reads exactly like progress. Tightening the constant would
+	// have BANKED the loss.
+	base := baseChildrenIdent8807(imm.node.X)
 	if base == "" {
 		return imm.fc // the range itself is the FindChildren loop
 	}
@@ -200,6 +202,35 @@ func containerForSwitch8807(ranges []rangeInfo8807, sw *ast.SwitchStmt) string {
 		}
 		if r.node.Body != nil && r.node.Body.Pos() <= sw.Pos() && r.node.Body.End() >= sw.End() {
 			return r.fc
+		}
+	}
+	return ""
+}
+
+// baseChildrenIdent8807 recovers the loop variable of a `<v>.Children` /
+// `<v>.node.Children` range expression, looking THROUGH any wrapping call so a
+// helper interposed between the loop and the node list does not blind the
+// predicate. Returns "" when the range is not over some node's children.
+func baseChildrenIdent8807(x ast.Expr) string {
+	switch e := x.(type) {
+	case *ast.SelectorExpr:
+		if e.Sel.Name != "Children" {
+			return ""
+		}
+		switch b := e.X.(type) {
+		case *ast.Ident:
+			return b.Name
+		case *ast.SelectorExpr:
+			if id, ok := b.X.(*ast.Ident); ok {
+				return id.Name
+			}
+		}
+	case *ast.CallExpr:
+		// The node list is an ARGUMENT of the wrapper, not its result.
+		for _, a := range e.Args {
+			if v := baseChildrenIdent8807(a); v != "" {
+				return v
+			}
 		}
 	}
 	return ""
