@@ -76,8 +76,12 @@ func TestBerEncodeOID_Short(t *testing.T) {
 }
 
 func TestBerEncodeSubID(t *testing.T) {
+	// #9133: the parameter is uint32 (RFC 2578 §7.1.3's sub-identifier type), so
+	// the out-of-range case is unrepresentable at the call rather than checked
+	// inside. The negative case that used to reach here is now bound by
+	// TestEncoderRefusesAnOutOfRangeComponent9133 at berEncodeOID.
 	tests := []struct {
-		val  int
+		val  uint32
 		want []byte
 	}{
 		{0, []byte{0}},
