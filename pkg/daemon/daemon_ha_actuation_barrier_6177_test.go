@@ -199,17 +199,24 @@ func TestFailoverActuationBarrier_VerdictFansOutAcrossRequests(t *testing.T) {
 
 // TestFailoverActuationBarrier_DisarmedRequestReportsNoFence pins the
 // ManualFailover-error contract: the demotion was never enqueued, so no event
-// will ever fire. The disarm must leave the wait free to return immediately
+// will ever fire. The disarm must leave the wait free to return IMMEDIATELY
 // rather than burning the full timeout — the handler is not on the ack path
 // here, but a leaked barrier would be closed later by an unrelated event.
+//
+// #9259 changed the VALUE and deliberately kept the TIMING assertion verbatim.
+// This cell's subject is immediacy — its own comment says the handler is not on
+// the ack path here — so `want nil` was incidental to what it pins, while
+// returning nil on the ack path is #9036's final link. The wait now reports
+// ErrFailoverNeverArmed, still immediately.
 func TestFailoverActuationBarrier_DisarmedRequestReportsNoFence(t *testing.T) {
 	d := newBarrierDaemon(2 * time.Second)
 	b := d.armFailoverActuation(3, 11)
 	d.disarmFailoverActuation(3, 11, b)
 
 	start := time.Now()
-	if err := d.waitFailoverActuated(3, 11); err != nil {
-		t.Fatalf("wait on a disarmed request = %v, want nil", err)
+	err := d.waitFailoverActuated(3, 11)
+	if !errors.Is(err, ErrFailoverNeverArmed) {
+		t.Fatalf("wait on a disarmed request = %v, want ErrFailoverNeverArmed (#9259)", err)
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("wait on a disarmed request took %v, want an immediate return", elapsed)
@@ -276,5 +283,84 @@ func TestFailoverActuationBarrier_ResolveIsIdempotentUnderConcurrency(t *testing
 	}
 	if n := armedBarriers(d); n != 0 {
 		t.Fatalf("armed barriers after the wait consumed the verdict = %d, want 0", n)
+	}
+}
+
+// #9259 route 2: the verdict was already CONSUMED by an earlier waiter.
+//
+// The first waiter deletes the entry after reading it, deliberately, so a later
+// wait cannot re-read a stale verdict (#6177). Before #9259 a second wait then
+// found an empty slot and returned nil — and nil is what sync_failover.go turns
+// into failoverAckApplied. So a duplicate or retried ack promoted the peer off
+// a barrier that had already been spent.
+//
+// The two routes are distinguished on purpose: "never armed" and "already
+// consumed" send an operator to different places — a stale/duplicate request
+// versus a retry racing its own first attempt.
+func TestFailoverActuationBarrier_ConsumedVerdictIsNotReusable9259(t *testing.T) {
+	d := newBarrierDaemon(2 * time.Second)
+	d.armFailoverActuation(4, 21)
+	d.resolveFailoverActuation(4, nil)
+
+	// First waiter: takes the real verdict. This is the control — if it did
+	// not succeed, the second wait below would prove nothing about consumption.
+	if err := d.waitFailoverActuated(4, 21); err != nil {
+		t.Fatalf("first wait = %v, want the actuated verdict (nil); without a "+
+			"successful first wait this cell measures nothing", err)
+	}
+
+	// Second waiter for the SAME request.
+	err := d.waitFailoverActuated(4, 21)
+	if err == nil {
+		t.Fatal("#9259: a second wait for an already-consumed verdict returned nil. " +
+			"sync_failover.go sends failoverAckApplied exactly when this returns nil, " +
+			"so a duplicate or retried failover ack promotes the peer off a barrier " +
+			"that was already spent — #5640's invariant again.")
+	}
+	if !errors.Is(err, ErrFailoverVerdictConsumed) {
+		t.Errorf("#9259: verdict = %v, want ErrFailoverVerdictConsumed. Reporting it "+
+			"as never-armed would be safe but wrong: it sends the operator looking "+
+			"for a stale request id when the real event is a retry.", err)
+	}
+}
+
+// The consumed ledger is BOUNDED, and an eviction must degrade the DIAGNOSTIC
+// rather than the safety property: an evicted key reports as never-armed, which
+// is still an error and still downgrades the ack. Pinned because a bounded
+// structure silently changing an operator-facing reason is exactly what gets
+// discovered during an outage.
+func TestFailoverConsumedLedgerIsBoundedAndFailsSafe9259(t *testing.T) {
+	d := newBarrierDaemon(2 * time.Second)
+	// Consume one verdict, then push it out of the ledger.
+	first := failoverActuationKey{rgID: 9, reqID: 1}
+	d.armFailoverActuation(first.rgID, first.reqID)
+	d.resolveFailoverActuation(first.rgID, nil)
+	if err := d.waitFailoverActuated(first.rgID, first.reqID); err != nil {
+		t.Fatalf("fixture: first wait = %v, want nil", err)
+	}
+	if !errors.Is(d.waitFailoverActuated(first.rgID, first.reqID), ErrFailoverVerdictConsumed) {
+		t.Fatal("fixture: the key was not recorded as consumed, so the eviction " +
+			"below would prove nothing")
+	}
+
+	d.failoverActuateMu.Lock()
+	for i := 0; i < failoverConsumedCap+1; i++ {
+		d.noteFailoverVerdictConsumedLocked(failoverActuationKey{rgID: 99, reqID: uint64(i + 1000)})
+	}
+	d.failoverActuateMu.Unlock()
+
+	if n := len(d.failoverActuateConsumed); n > failoverConsumedCap {
+		t.Errorf("#9259: the consumed ledger holds %d entries, cap is %d — it is "+
+			"unbounded and grows with every failover for the life of the process",
+			n, failoverConsumedCap)
+	}
+	// The evicted key must still FAIL, just with the other reason.
+	err := d.waitFailoverActuated(first.rgID, first.reqID)
+	if err == nil {
+		t.Fatal("#9259: an evicted consumed key returned nil. Eviction must cost " +
+			"the diagnostic, never the safety property.")
+	}
+	if !errors.Is(err, ErrFailoverNeverArmed) {
+		t.Errorf("#9259: evicted key = %v, want the conservative ErrFailoverNeverArmed", err)
 	}
 }

@@ -1277,6 +1277,14 @@ type Daemon struct {
 	// The map is keyed by (RG, peer request id) so a stale request's disarm
 	// or expired wait can never evict a newer request's barrier (#6177).
 	failoverActuateWait map[failoverActuationKey]*failoverActuation
+	// #9259: requests whose verdict a waiter already consumed. Consulted only
+	// to tell ErrFailoverVerdictConsumed from ErrFailoverNeverArmed — both are
+	// errors and downgrade the ack identically, so this ledger affects the
+	// operator-facing REASON and never the safety property. Bounded by
+	// failoverConsumedCap with oldest-out eviction; an evicted key reports as
+	// never-armed, the more conservative reading.
+	failoverActuateConsumed      map[failoverActuationKey]struct{}
+	failoverActuateConsumedOrder []failoverActuationKey
 	// failoverActuateTimeout bounds waitFailoverActuated so a demotion event
 	// that is never actuated (superseded reset, event-channel drop) downgrades
 	// the ack to failed instead of hanging the peer's failover request.
