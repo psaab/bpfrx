@@ -564,8 +564,33 @@ pub(super) fn build_local_origin_tunnel_tx_request(
         resolution,
         nat: NatDecision::default(),
     };
-    let flow = parse_session_flow_from_bytes(&inner_frame, meta)
+    let mut flow = parse_session_flow_from_bytes(&inner_frame, meta)
         .ok_or_else(|| "parse_local_origin_session_flow_failed".to_string())?;
+    // #9032: STAMP THE ROUTING DOMAIN. #7160 made `routing_domain` part of
+    // session identity and stamped it at what its own comment calls "THE single
+    // site that populates `SessionKey.routing_domain` for a received frame"
+    // (`poll_descriptor/mod.rs`). This producer never reaches that site: it
+    // reads packets off the TUN, outside the AF_XDP descriptor loop, so
+    // `parse_session_flow_from_bytes` left the domain at 0 and the session was
+    // PUBLISHED under domain 0 — a different identity from the one the same
+    // flow gets when it arrives on a wire, on a box with routing instances.
+    //
+    // The domain is available here and was already being used one line below
+    // for `egress_zone_id`: the tunnel's own logical ifindex, resolved into
+    // `decision.resolution.egress_ifindex`. There is no ingress interface for a
+    // locally-originated packet, so the tunnel's egress interface IS the
+    // interface whose routing instance this flow belongs to.
+    //
+    // `ingress_routing_domain` is the shared lookup rather than a second
+    // spelling of the same map probe, so this cannot drift from the wire path;
+    // it short-circuits to 0 on `!has_routing_domains`, keeping a deployment
+    // with no routing instances bit-identical to pre-#7160.
+    flow.forward_key.routing_domain = crate::afxdp::forwarding::ingress_routing_domain(
+        forwarding,
+        decision.resolution.egress_ifindex,
+        0,
+        None,
+    );
     // #6471: a firewall-INITIATED IKE exchange routed via this tunnel sees
     // its replies arrive on the Stage-11 secondary path (GRE-inner local
     // destination) with the Responder SPI set and NO inbound seed — without
