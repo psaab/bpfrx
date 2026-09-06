@@ -97,7 +97,24 @@ func validateSecureTunnelBindInterfaceAST(nodes []*Node, lenient bool) ([]string
 	collect := forEachChild(nodes, "security", func(security *Node) error {
 		return forEachChild(security.Children, "ipsec", func(ipsec *Node) error {
 			for _, inst := range namedInstances(ipsec.FindChildren("vpn")) {
-				biNode := inst.node.FindChild("bind-interface")
+				// #9088: expand a packed flat run before looking for the leaf.
+				// This gate walks the AST, and a one-liner such as
+				//
+				//	set security ipsec vpn v1 gateway G ipsec-policy P \
+				//	    bind-interface ge-0/0/0
+				//
+				// buries `bind-interface` inside a SIBLING node's Keys, so a
+				// bare FindChild returns nil and this VPN is skipped entirely.
+				// The gate then never sees a value to reject and the config
+				// commits -- with no XFRM device at all, which is the exact
+				// condition this gate exists to prevent.
+				//
+				// So the packed spelling did not merely lose a value; it
+				// removed this gate's SUBJECT. Fixing the compiler alone is not
+				// enough for the same reason ipsecTrafficSelectorSchema8939
+				// gives one file over, pointed the other way: the admission
+				// gate walks the same children and needs the same segmentation.
+				biNode := findChildInRun9088(inst.node, "bind-interface")
 				if biNode == nil {
 					continue
 				}
@@ -206,4 +223,23 @@ func validateSecureTunnelBindInterfaceAST(nodes []*Node, lenient bool) ([]string
 		}
 	}
 	return warnings, nil
+}
+
+// findChildInRun9088 finds a named leaf among a vpn node's children, expanding
+// any packed flat run first.
+//
+// Split out rather than inlined so the two readers of this container -- this
+// admission gate and the compiler -- segment identically by construction. A
+// gate and a compiler that disagree about where a run ends is how a value
+// reaches one and not the other, which is #9088.
+func findChildInRun9088(vpn *Node, name string) *Node {
+	if vpn == nil {
+		return nil
+	}
+	for _, c := range expandFlatRun(vpn.Children, ipsecVPNRunSchema9088()) {
+		if c != nil && c.Name() == name {
+			return c
+		}
+	}
+	return nil
 }
