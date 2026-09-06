@@ -259,6 +259,28 @@ pub(in crate::afxdp) fn l2_dst_is_group_or_broadcast(eth_dst: &[u8; 6]) -> bool 
 /// is already scoped to the ingress logical ifindex, and a directed
 /// broadcast is a normal unicast address to this test — matching the
 /// warmer's posture, which also only tests the limited broadcast.
+/// Is this HARDWARE address one a neighbour entry may be learned FOR? (#9115)
+///
+/// Rejects the all-zero MAC and any address with the I/G group bit set — which
+/// covers every multicast MAC and the broadcast address.
+///
+/// A neighbour entry programmed with a group address is a cache-poisoning
+/// primitive, not merely a wrong entry: traffic for the victim IP is then
+/// addressed to a group, so every station on the segment receives it, and the
+/// firewall's own switch port can be MAC-flapped or err-disabled. The IP-side
+/// predicate `neighbor_ip_is_learnable` below has always existed; this is its
+/// missing L2 counterpart.
+///
+/// ONE predicate, called from every learn arm, deliberately: the RX-learn arm
+/// in `neighbor_dispatch.rs` carried this exact test INLINE while the ARP-reply
+/// and NDP-NA arms in `poll_stages.rs` had nothing, which is precisely the
+/// drift a shared, named predicate prevents. A fourth learn arm inherits it
+/// instead of having to remember it.
+#[inline]
+pub(in crate::afxdp) fn neighbor_mac_is_learnable(mac: [u8; 6]) -> bool {
+    mac != [0u8; 6] && (mac[0] & 0x01) == 0
+}
+
 #[inline]
 pub(in crate::afxdp) fn neighbor_ip_is_learnable(ip: IpAddr) -> bool {
     match ip {
