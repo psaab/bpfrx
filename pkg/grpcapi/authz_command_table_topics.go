@@ -41,13 +41,20 @@ import "github.com/psaab/xpf/pkg/cmdtree"
 //     with it BY CONSTRUCTION.
 //
 // The only sound attribution source is cmd/cli, which is where the topic is
-// chosen — and it is not mechanically walkable (computed topic strings, nested
-// switches). Making the client mapping declarative is tracked in #8058; a
-// cross-check becomes a table comparison rather than an AST walk once it is.
-// Until then these entries were transcribed by READING cmd/cli's dispatch
-// (show.go, show_security.go, show_system.go, show_nat.go, show_services.go,
-// show_interfaces.go, show_protocols.go, show_flow.go, main.go, clear.go,
-// request.go) and are re-checkable only the same way.
+// chosen. These entries were originally transcribed by READING cmd/cli's
+// dispatch, because that dispatch computed topic strings in nested switches
+// and could not be walked mechanically.
+//
+// #8942: that is no longer the shape of the client, and this paragraph
+// outlived it. #8058 MADE THE CLIENT MAPPING DECLARATIVE: cmd/cli's
+// showCommand resolves through cmdtree.ShowTextTopicForCommand (a lookup in
+// the showTextTopicCommand map, ~130 entries, pkg/cmdtree/showtext_topic.go),
+// call sites name the COMMAND rather than a topic literal, and an
+// unresolvable command fails loudly instead of guessing. So the cross-check
+// this paragraph said would "become a table comparison rather than an AST
+// walk once it is" IS a table comparison now, and a reader who trusted the
+// deferral would go build an AST walk for a correspondence that is already
+// one table both binaries read.
 //
 // ── ARGUMENT-FREE ENTRIES, AND THE GAP THAT CREATES ──────────────────────
 //
