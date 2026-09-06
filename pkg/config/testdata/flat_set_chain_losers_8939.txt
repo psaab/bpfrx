@@ -1,7 +1,5 @@
-# counts: losers=31 walked=73 vacuous=44 unmeasured=76
+# counts: losers=29 walked=75 vacuous=44 unmeasured=76
 # collector reach: 369 containers walked, 135 reached the census (137 dropped: no eligible leaf, 97 dropped: only one)
-class-of-service traffic-control-profiles arg1  [delay-buffer-rate | guaranteed-rate | scheduler-map]  total  OPERATOR
-class-of-service traffic-control-profiles arg1  [delay-buffer-rate | guaranteed-rate]  total  lenient-only
 firewall policer arg1 if-exceeding  [bandwidth-limit | burst-size-limit]  total  lenient-only
 forwarding-options dhcp-relay group arg1 overrides  [always-broadcast | forward-only | maximum-hop-count]  total  OPERATOR
 forwarding-options dhcp-relay group arg1 overrides  [always-broadcast | forward-only]  total  OPERATOR
