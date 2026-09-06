@@ -146,6 +146,7 @@ func natReverseInfo(r *nat.ReverseResult) NATDeterministicInfo {
 		Pool:              r.Pool,
 		Mode:              uint8(r.Mode),
 		InternalHost:      r.InternalHost,
+		InternalPrefixLen: r.InternalPrefixLen,
 		ExternalIP:        r.ExternalIP,
 		NATPort:           r.NATPort,
 		PortLow:           r.PortLow,

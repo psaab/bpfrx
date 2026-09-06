@@ -80,6 +80,8 @@ func (s *Server) GetNATDeterministic(_ context.Context, req *pb.GetNATDeterminis
 			Pool:              res.Pool,
 			Mode:              uint32(res.Mode),
 			InternalHost:      res.InternalHost,
+			// #9070: the deterministic UNIT length for the recovered base.
+			InternalPrefixLen: uint32(res.InternalPrefixLen),
 			ExternalIp:        res.ExternalIP,
 			NatPort:           uint32(res.NATPort),
 			PortLow:           uint32(res.PortLow),

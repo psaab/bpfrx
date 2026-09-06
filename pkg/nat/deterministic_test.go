@@ -570,3 +570,115 @@ func TestRenderContainsKeyFields(t *testing.T) {
 		}
 	}
 }
+
+// v6View64 is v6View with a /64-configured subscriber prefix (#9070).
+//
+// The distinction is the whole point of the cells below: a /32-configured pool
+// has wordOffset 4 and a /64 deterministic unit, a /64-configured pool has
+// wordOffset 8 and a /96 unit. The two are never equal, so a fix that echoed
+// the configured prefix would look right on one fixture and be wrong on this
+// one.
+func v6View64(gen uint64) AppliedView {
+	pool := &config.NATPool{
+		Name:      "napt64-pool64",
+		Addresses: []string{"198.51.100.1", "198.51.100.2", "198.51.100.3", "198.51.100.4"},
+		Deterministic: &config.DeterministicNATConfig{
+			BlockSize:   512,
+			HostAddress: "2001:db8::/64",
+		},
+	}
+	cfg := &config.Config{}
+	cfg.Security.NAT.SourcePools = map[string]*config.NATPool{"napt64-pool64": pool}
+	cfg.Security.NAT.NAT64 = []*config.NAT64RuleSet{{
+		Name:       "v6-to-v4-64",
+		Prefix:     "64:ff9b::/96",
+		SourcePool: "napt64-pool64",
+	}}
+	return AppliedView{Config: cfg, Generation: gen, Available: true}
+}
+
+// #9070: the reverse lookup returns the deterministic UNIT's network BASE, and
+// must report that unit's prefix length so a bare address is not read as an
+// exact /128.
+//
+// THE /64 ROW IS THE LOAD-BEARING ONE. The obvious annotation — echo the
+// configured pool prefix — yields /64 there, and the true unit is a /96,
+// because the unit is the configured prefix PLUS the reconstructed 32-bit
+// subscriber word. An assertion that merely checked "a prefix length is
+// present" would pass that confidently-wrong value.
+func TestReverseReportsDeterministicUnitPrefixLen9070(t *testing.T) {
+	// /32-configured pool -> wordOffset 4 -> /64 unit.
+	rev, err := LookupReverse(v6View(1), "napt64-pool", "198.51.100.1", 3584)
+	if err != nil {
+		t.Fatalf("reverse (/32 pool): %v", err)
+	}
+	if rev.InternalPrefixLen != 64 {
+		t.Fatalf("/32-configured pool: InternalPrefixLen = %d, want 64 (the unit, "+
+			"= configured 32 + the 32-bit subscriber word)", rev.InternalPrefixLen)
+	}
+
+	// /64-configured pool -> wordOffset 8 -> /96 unit. NOT 64.
+	rev64, err := LookupReverse(v6View64(1), "napt64-pool64", "198.51.100.1", 3584)
+	if err != nil {
+		t.Fatalf("reverse (/64 pool): %v", err)
+	}
+	if rev64.InternalPrefixLen == 64 {
+		t.Fatalf("/64-configured pool reported /64 — that is the CONFIGURED pool " +
+			"prefix echoed back, not the deterministic unit. The unit is a /96 " +
+			"(configured 64 + the 32-bit subscriber word), and echoing the pool " +
+			"prefix replaces an ambiguous answer with a confidently wrong one (#9070)")
+	}
+	if rev64.InternalPrefixLen != 96 {
+		t.Fatalf("/64-configured pool: InternalPrefixLen = %d, want 96",
+			rev64.InternalPrefixLen)
+	}
+
+	// IPv4 mode: an exact host, so no prefix at all.
+	rev4, err := LookupReverse(v4View(1), "cgn-pool", "203.0.113.1", 3584)
+	if err != nil {
+		t.Fatalf("reverse (v4): %v", err)
+	}
+	if rev4.InternalPrefixLen != 0 {
+		t.Fatalf("IPv4 mode: InternalPrefixLen = %d, want 0 — the value is an exact "+
+			"host and must not acquire a prefix", rev4.InternalPrefixLen)
+	}
+}
+
+// #9070: the rendered reverse output must carry the unit length, and must not
+// present a network base under a label that reads as an exact host.
+func TestReverseRenderShowsUnitPrefix9070(t *testing.T) {
+	rev64, err := LookupReverse(v6View64(1), "napt64-pool64", "198.51.100.1", 3584)
+	if err != nil {
+		t.Fatalf("reverse: %v", err)
+	}
+	var b strings.Builder
+	rev64.Render(&b)
+	out := b.String()
+	if !strings.Contains(out, "/96") {
+		t.Fatalf("rendered reverse result must carry the /96 unit length:\n%s", out)
+	}
+	if strings.Contains(out, "Internal host:") {
+		t.Fatalf("a reconstructed network BASE must not be rendered under \"Internal "+
+			"host\", which reads as an exact /128:\n%s", out)
+	}
+	if !strings.Contains(out, "Internal prefix:") {
+		t.Fatalf("expected the base to be labelled as a prefix:\n%s", out)
+	}
+
+	// CONTROL: the IPv4 reverse result is an exact host and keeps that label
+	// with no prefix — a change that relabelled everything would pass the
+	// assertions above while mislabelling real hosts.
+	rev4, err := LookupReverse(v4View(1), "cgn-pool", "203.0.113.1", 3584)
+	if err != nil {
+		t.Fatalf("reverse v4: %v", err)
+	}
+	var b4 strings.Builder
+	rev4.Render(&b4)
+	out4 := b4.String()
+	if !strings.Contains(out4, "Internal host:") {
+		t.Fatalf("an IPv4 exact host must keep the host label:\n%s", out4)
+	}
+	if strings.Contains(out4, "/") && strings.Contains(out4, "Internal prefix:") {
+		t.Fatalf("an IPv4 exact host must not acquire a prefix:\n%s", out4)
+	}
+}

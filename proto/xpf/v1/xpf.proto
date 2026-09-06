@@ -1202,6 +1202,13 @@ message GetNATDeterministicResponse {
   uint32 port_high = 11;      // inclusive port-block high
   uint32 block_size = 12;
   uint32 block_index = 13;
+  // #9070: on a REVERSE lookup in IPv6 mode, `internal_host` is the
+  // deterministic UNIT's network BASE, not an exact host, and a bare address
+  // reads as an exact /128. This is that unit's prefix length (64 or 96); 0 for
+  // a forward lookup or IPv4 mode. It is NOT the configured pool prefix -- the
+  // unit is the configured prefix PLUS the reconstructed 32-bit subscriber
+  // word, so the two are never equal.
+  uint32 internal_prefix_len = 14;
 }
 
 // --- Completion messages ---

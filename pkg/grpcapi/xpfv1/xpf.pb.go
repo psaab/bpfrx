@@ -7822,6 +7822,13 @@ type GetNATDeterministicResponse struct {
 	PortHigh          uint32 `protobuf:"varint,11,opt,name=port_high,json=portHigh,proto3" json:"port_high,omitempty"`           // inclusive port-block high
 	BlockSize         uint32 `protobuf:"varint,12,opt,name=block_size,json=blockSize,proto3" json:"block_size,omitempty"`
 	BlockIndex        uint32 `protobuf:"varint,13,opt,name=block_index,json=blockIndex,proto3" json:"block_index,omitempty"`
+	// #9070: on a REVERSE lookup in IPv6 mode, `internal_host` is the
+	// deterministic UNIT's network BASE, not an exact host, and a bare address
+	// reads as an exact /128. This is that unit's prefix length (64 or 96); 0 for
+	// a forward lookup or IPv4 mode. It is NOT the configured pool prefix -- the
+	// unit is the configured prefix PLUS the reconstructed 32-bit subscriber
+	// word, so the two are never equal.
+	InternalPrefixLen uint32 `protobuf:"varint,14,opt,name=internal_prefix_len,json=internalPrefixLen,proto3" json:"internal_prefix_len,omitempty"`
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -7943,6 +7950,13 @@ func (x *GetNATDeterministicResponse) GetBlockSize() uint32 {
 func (x *GetNATDeterministicResponse) GetBlockIndex() uint32 {
 	if x != nil {
 		return x.BlockIndex
+	}
+	return 0
+}
+
+func (x *GetNATDeterministicResponse) GetInternalPrefixLen() uint32 {
+	if x != nil {
+		return x.InternalPrefixLen
 	}
 	return 0
 }
@@ -9382,7 +9396,7 @@ const file_xpf_proto_rawDesc = "" +
 	"\x04pool\x18\x02 \x01(\tR\x04pool\x12#\n" +
 	"\rinternal_host\x18\x03 \x01(\tR\finternalHost\x12\x15\n" +
 	"\x06nat_ip\x18\x04 \x01(\tR\x05natIp\x12\x19\n" +
-	"\bnat_port\x18\x05 \x01(\rR\anatPort\"\xa5\x03\n" +
+	"\bnat_port\x18\x05 \x01(\rR\anatPort\"\xd5\x03\n" +
 	"\x1bGetNATDeterministicResponse\x12\x14\n" +
 	"\x05found\x18\x01 \x01(\bR\x05found\x12\x1d\n" +
 	"\n" +
@@ -9401,7 +9415,8 @@ const file_xpf_proto_rawDesc = "" +
 	"\n" +
 	"block_size\x18\f \x01(\rR\tblockSize\x12\x1f\n" +
 	"\vblock_index\x18\r \x01(\rR\n" +
-	"blockIndex\"X\n" +
+	"blockIndex\x12.\n" +
+	"\x13internal_prefix_len\x18\x0e \x01(\rR\x11internalPrefixLen\"X\n" +
 	"\x0fCompleteRequest\x12\x12\n" +
 	"\x04line\x18\x01 \x01(\tR\x04line\x12\x10\n" +
 	"\x03pos\x18\x02 \x01(\x05R\x03pos\x12\x1f\n" +
