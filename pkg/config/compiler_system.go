@@ -1078,7 +1078,11 @@ func hasDNSProxyChild(node *Node) bool {
 }
 
 func compileUserspaceDataplane(node *Node, cfg *UserspaceConfig, warnings *[]string) error {
-	for _, child := range node.Children {
+	// #8939: split a packed run. `set system dataplane binary /x claim-host-tunables true`
+	// is ONE child node carrying both on its Keys, so this switch read `binary`
+	// and dropped the rest — including `control-socket`, whose loss #9003 shows
+	// falls back to a path in /tmp.
+	for _, child := range expandFlatRun(node.Children, systemDataplaneSchema8939()) {
 		switch child.Name() {
 		case "userspace":
 			// #903: `set system dataplane userspace ...` is a redundant
@@ -1502,7 +1506,8 @@ func userspaceRetiredKnobWarnings(cfg *Config) []string {
 // config on any node (#5300 determinism).
 func compileSharedUMEMConfig(node *Node) *SharedUMEMConfig {
 	cfg := &SharedUMEMConfig{}
-	for _, child := range node.Children {
+	// #8939: same packed-run split, one level down.
+	for _, child := range expandFlatRun(node.Children, systemDataplaneSharedUMEMSchema8939()) {
 		switch child.Name() {
 		case "mode":
 			cfg.Mode = nodeVal(child)
