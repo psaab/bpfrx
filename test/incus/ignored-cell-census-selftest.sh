@@ -220,6 +220,55 @@ else
 	bad "MUTATION ESCAPED: a broken classifier did not trip the control (rc=$rc): $out"
 fi
 
+# -- 7. MUTATION: widen/over-narrow the scan pattern; the control must trip --
+#
+# #8980: the scan matched `#[ignore` anywhere, so PROSE mentioning the
+# attribute inside a doc comment counted as a cell. The census already had a
+# control for the scan -- the ZERO-hits check in cell 5 -- and it could not
+# see this: a non-zero-hits check bounds a pattern that is too TIGHT and is
+# blind BY CONSTRUCTION to one that is too LOOSE. These mutants cover the
+# other half of that space, one in each direction.
+scan_mutant="$WORK/scan-mutant-census.sh"
+
+# 7a. LOOSE: remove the comment filter from the composition entirely.
+python3 - "$CENSUS" "$scan_mutant" <<'PYMUT'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+s = open(src, encoding="utf-8").read()
+old = "\tfi | drop_comment_lines\n"
+assert s.count(old) == 1, f"loose-mutation anchor not found ({s.count(old)})"
+open(dst, "w", encoding="utf-8").write(s.replace(old, "\tfi\n"))
+PYMUT
+out=$(IGN_CENSUS_SCRIPT="$scan_mutant" IGN_CENSUS_ROOT="$linked" IGN_CENSUS_DIRS="crate" \
+	sh "$scan_mutant" 2>&1)
+rc=$?
+if [[ $rc -ne 0 && "$out" == *"scan-pattern control"* && "$out" == *"too-loose"* ]]; then
+	ok "MUTATION: a scan that counts doc-comment prose trips the scan control"
+else
+	bad "MUTATION ESCAPED: a too-loose scan was not caught (rc=$rc): $out"
+fi
+
+# 7b. TIGHT: a filter that drops any line CONTAINING "//" instead of one in
+# comment POSITION. It looks equivalent and silently discards every cell whose
+# reason cites a URL -- also invisible to a zero-hits control, since plenty of
+# cells would remain.
+python3 - "$CENSUS" "$scan_mutant" <<'PYMUT'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+s = open(src, encoding="utf-8").read()
+old = "grep -vE '^[^:]*:[0-9]+:[[:space:]]*//'"
+assert s.count(old) == 1, f"tight-mutation anchor not found ({s.count(old)})"
+open(dst, "w", encoding="utf-8").write(s.replace(old, "grep -vE '//'"))
+PYMUT
+out=$(IGN_CENSUS_SCRIPT="$scan_mutant" IGN_CENSUS_ROOT="$linked" IGN_CENSUS_DIRS="crate" \
+	sh "$scan_mutant" 2>&1)
+rc=$?
+if [[ $rc -ne 0 && "$out" == *"scan-pattern control"* && "$out" == *"too-tight"* ]]; then
+	ok "MUTATION: a comment filter keyed on // anywhere trips the scan control"
+else
+	bad "MUTATION ESCAPED: an over-aggressive comment filter was not caught (rc=$rc): $out"
+fi
+
 echo
 echo "  ignored-cell census selftest: $PASS passed, $FAIL failed"
 [[ "$FAIL" -eq 0 ]] || exit 1
