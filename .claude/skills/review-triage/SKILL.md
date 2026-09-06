@@ -26,8 +26,15 @@ questions. Otherwise produce reviewable issue drafts and the result report.
 Implementation follows the requested engineering workflow; it is not an
 automatic side effect of classifying a finding.
 
-The established watcher compatibility paths are `/tmp/*-review*.md`,
-`/tmp/result-<basename>.md`, and `/tmp/.researched-<basename>`. Exclude result/
+Watch `/var/tmp/deep-review-reports/*-review*.md` for new reports and continue
+reading legacy `/tmp/*-review*.md` inputs. All new triage result reports live at
+`/var/tmp/deep-review-reports/result-<basename>.md` and new processed markers at
+`/var/tmp/deep-review-work/state/.researched-<basename>.md`, where `<basename>`
+is the source report stem without its final `.md`. Continue reading established
+legacy `/tmp/result-<basename>.md` and `/tmp/.researched-<source-filename>` paths.
+Reconcile source identity and prior results/markers across both layouts; a
+copied report must not become new work merely because its directory changed.
+Exclude result/
 report derivatives and intermediate files from new input selection. In particular,
 exclude every `result-` basename and `Artifact kind: research-result`, even when
 the model or research slug contains `-review` and matches the broad glob. Prefer the
@@ -125,7 +132,10 @@ occurred. Report pending tag actions separately from creation.
 
 ## 3. Write the reasoned result
 
-Use a unique owned scratch directory. Produce a complete draft result before
+For every new triage run, allocate a unique owned scratch directory with
+`mktemp -d /var/tmp/deep-review-work/triage-work.XXXXXXXXXX`, after ensuring the parent
+is a real directory. Keep drafts, evidence, logs and task-local temporary/build
+outputs there. Produce a complete draft result before
 publication. The result includes:
 
 - Source report/run ID, repository identity, review base, comparison ref/SHA/
@@ -154,9 +164,10 @@ targets; do not infer that every historical tag is supported.
 Return both the source report path and this updated result path, clearly naming
 which snapshot records the later issue-filing status.
 
-Publish `/tmp/result-<basename>.md` atomically with create-if-absent semantics
-after the draft is complete, using a same-filesystem hard link where available
-(`ln -T -- <draft> <result>` on this Linux host). An existing directory is a
+Publish the result at the new path defined above, atomically with
+create-if-absent semantics after the draft is complete. Read
+[report storage and publication](../deep-review/references/report-storage.md)
+and use its same-filesystem create-if-absent procedure. An existing directory is a
 collision, not a destination to follow into.
 For result naming, `<basename>` is the source report stem without the final
 `.md`, as illustrated in the shared contract; do not append the extension twice.

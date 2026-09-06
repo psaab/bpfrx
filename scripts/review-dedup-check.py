@@ -25,31 +25,36 @@ def normalize_whoami(raw):
 
 def load_review_titles():
     titles = []
-    # From review-index.json if exists (faster)
-    try:
-        data = json.loads(open('/tmp/review-index.json').read())
-        for entry in data:
-            for t in entry.get('titles', []):
-                titles.append((entry['filename'], t))
-        return titles
-    except:
-        pass
-    # Fallback: glob
-    for path in glob.glob('/tmp/*-review*.md'):
+    # Current and legacy indexes are leads, not an exhaustive report inventory.
+    for index in ('/var/tmp/deep-review-work/review-index.json', '/tmp/review-index.json'):
+        try:
+            data = json.loads(open(index).read())
+            for entry in data:
+                for t in entry.get('titles', []):
+                    titles.append((entry['filename'], t))
+        except:
+            pass
+    # Always scan both report roots: an older cached index may not include a
+    # newly published report. Retain legacy inputs without creating aliases.
+    paths = glob.glob('/var/tmp/deep-review-reports/*-review*.md') + glob.glob('/tmp/*-review*.md')
+    for path in paths:
         try:
             content = open(path, 'r', errors='ignore').read()
             for m in re.finditer(r'^Title\s*[:\-]\s*([^\n]+)', content, re.MULTILINE | re.IGNORECASE):
                 titles.append((os.path.basename(path), m.group(1).strip()))
         except:
             pass
-    return titles
+    return list(dict.fromkeys(titles))
 
 def load_issue_titles():
-    try:
-        data = json.loads(open('/tmp/issue-pr-index.json').read())
-        return [(f"ISSUE #{i['number']}", i['title']) for i in data.get('issues',[])]
-    except:
-        return []
+    titles = []
+    for index in ('/var/tmp/deep-review-work/issue-pr-index.json', '/tmp/issue-pr-index.json'):
+        try:
+            data = json.loads(open(index).read())
+            titles.extend((f"ISSUE #{i['number']}", i['title']) for i in data.get('issues', []))
+        except:
+            pass
+    return list(dict.fromkeys(titles))
 
 def check_finding(new_title, threshold=0.5):
     """Check if new_title is similar to prior review or issue"""
@@ -89,4 +94,3 @@ if __name__ == "__main__":
         print(f"Found {len(matches)} potential duplicates:")
         for fname, title, jaccard, overlap in matches:
             print(f"  - {fname}: {title[:80]} (jaccard={jaccard:.2f}, overlap={overlap})")
-

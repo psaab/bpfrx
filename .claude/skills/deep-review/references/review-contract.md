@@ -293,10 +293,16 @@ component. Lowercase the name, replace runs outside ASCII `a-z` and `0-9` with
 record that fallback. Choose a short descriptive name at setup; no shell
 evaluation of review names or issue titles is permitted.
 
-New reports use `/tmp/<WHOAMI>-review-<REVIEW_SLUG>-NNN.md`. The immutable run ID,
+New deep-review reports use
+`/var/tmp/deep-review-reports/<WHOAMI>-review-<REVIEW_SLUG>-NNN.md`; working files
+and worktrees use unique run subdirectories of `/var/tmp/deep-review-work/`. Read
+[report storage and publication](report-storage.md) for same-filesystem atomic
+publication and corresponding triage paths. The immutable run ID,
 repository and finding IDs establish provenance; the filename alone does not.
-Legacy `/tmp/<WHOAMI>-review-NNN.md` reports remain readable and participate in
-deduplication. Never publish a second compatibility alias of the same report:
+Legacy named `/tmp/<WHOAMI>-review-<REVIEW_SLUG>-NNN.md` and unnamed
+`/tmp/<WHOAMI>-review-NNN.md` reports remain readable and participate in
+deduplication and applicable sequence selection across both roots. Do not move
+old reports or publish a second compatibility alias of the same report:
 watchers could treat it as new work and file twice.
 
 Every report includes a filing ledger, even in report-only mode:
@@ -330,8 +336,14 @@ renamed reports, multi-report research and new discoveries. Resolve the intended
 GitHub target, then record a `Filing repository key`: lowercase
 `<github-host>/<owner>/<repository>`, without scheme, credentials or trailing
 `.git`. Hash its exact UTF-8 bytes, without a newline, using SHA-256. The mutex is
-`/tmp/xpf-review-filing-<hex-digest>.lock` on the shared filing host/filesystem.
+`/var/tmp/deep-review-work/locks/xpf-review-filing-<hex-digest>.lock` on the
+shared filing host/filesystem. Ensure the parent is a real directory before use.
 A local-only or unresolved target remains report-only until this is resolved.
+
+Coordinate the transition from legacy `/tmp/xpf-review-filing-<hex-digest>.lock`
+writers before filing: all active writers must use the same new mutex. If that
+cannot be established, stay report-only and report the coordination prerequisite.
+Never move/delete a live old lock or infer that a new path synchronizes with it.
 
 Draft evidence before acquiring the mutex. Before final preflight, a live owner
 must acquire and hold the OS lock through issue-state readback, mutations,
@@ -339,7 +351,7 @@ uncertain-response reconciliation and result publication. File existence or a
 standalone `flock` that has already exited does not hold a mutex. If ownership
 cannot be acquired or retained, do not file. Acquire this repository mutex
 before existing per-report locks; acquire multiple report locks in sorted key
-order. Never delete shared lock files. `/tmp` protects only cooperating writers
+order. Never delete shared lock files. A local filesystem mutex protects only cooperating writers
 in that filesystem namespace; coordinate other hosts or incompatible legacy
 writers before filing, rather than assuming they are serialized.
 
@@ -379,7 +391,7 @@ In an authorized issue-filing run:
   and coordinator model/source separately. Research also records its own run ID,
   model/source, verification revision and disposition, without replacing the
   original discovery identity. Include the published report basename
-  and durable report URL if available; a local `/tmp` path is a locator, not a
+  and durable report URL if available; a local temporary path is a locator, not a
   GitHub-accessible evidence link. Include decisive evidence and fix acceptance
   criteria in the issue itself rather than relying on a temporary report.
 - Persist the create result in the run ledger immediately, then read back the
@@ -398,11 +410,15 @@ In an authorized issue-filing run:
   original provenance and clearly distinguish rediscovery from initial discovery.
 
 If triage files issues after the original report was published, leave that
-report immutable. `/tmp/result-<report-stem>.md` contains the findings,
+report immutable. New triage results, including for legacy inputs, use
+`/var/tmp/deep-review-reports/result-<report-stem>.md` and contain the findings,
 reasoned dispositions and updated filing ledger as a self-contained filing-status
 report, where `report-stem` is the original filename without its final `.md`.
 For example, `gpt-5.6-sol-review-ha-failover-001.md` produces
-`/tmp/result-gpt-5.6-sol-review-ha-failover-001.md`, not a `.md.md` suffix.
+`/var/tmp/deep-review-reports/result-gpt-5.6-sol-review-ha-failover-001.md`, not
+a `.md.md` suffix. Existing legacy `/tmp/result-<report-stem>.md` results remain
+readable; consult the storage reference for scratch and processed-marker paths.
+Match source identity before reusing a result or marker from either layout.
 Return both paths and identify the result as the later status snapshot.
 Pending filing/tagging actions remain explicit; neither an issue-creation count
 nor the triaged marker means provenance tagging or remediation is complete.
@@ -538,6 +554,11 @@ For filing changes, check a report-only run, a new issue, a linked duplicate,
 multi-model findings grouped into one issue, a lost create response, missing
 label permissions, and triage after immutable report publication. Named and
 legacy filenames must both be consumed exactly once without inventing origin.
+For storage changes, test both report roots, legacy results/markers, unchanged
+basename/model attribution, and deduplication even with an existing cached index.
+Exercise publication between the two `/var/tmp` roots, exact
+target file/directory/symlink collisions, complete content visibility and retained
+drafts on failure. Named scratch must never become watcher input.
 For research integration, include general questions with no issue or defect table,
 mixed/partial review claims, a valid defect with a rejected fix, unknown and human
 authors, and stale source evidence with changed guards. Check model/name strings

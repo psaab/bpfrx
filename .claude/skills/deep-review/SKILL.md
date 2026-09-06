@@ -40,7 +40,8 @@ criteria shared by this skill, `review-triage`, and code-finding research.
 Parse arguments as data; never interpolate free-form context into shell code.
 Record the effective mode, scope, focus, exclusions, and any user time/effort
 limit in the report. Delta and area modes override full-tree instructions.
-Every run writes a findings report under `/tmp`, including runs with no confirmed
+Every run writes a findings report under `/var/tmp/deep-review-reports/`,
+including runs with no confirmed
 findings or no issues filed. The report records coverage and unresolved work;
 an empty findings list is not a reason to skip it.
 
@@ -66,10 +67,17 @@ or prerequisites becomes a named validation task, not an improvised probe.
    record its repository, ref, SHA, and fetch time. Refresh remote refs when
    available without moving the base. If comparison is unavailable, record that
    limitation; never claim current-tip verification.
-4. Allocate a unique scratch directory with
-   `mktemp -d /tmp/review-work.XXXXXXXXXX`. Its unique basename is the run ID.
-   Record owned paths in its run manifest. Do not use the future report sequence
-   number to allocate shared scratch resources.
+4. Ensure `/var/tmp/deep-review-reports/` (final reports) and
+   `/var/tmp/deep-review-work/`
+   (working storage) are real directories, creating them if absent; do not
+   follow a substituted symlink or overwrite an occupied path. Allocate the run
+   with `mktemp -d /var/tmp/deep-review-work/review-work.XXXXXXXXXX`. Its unique
+   basename is the run ID. Keep worktrees, drafts, logs, manifests, test fixtures,
+   build/temp directories and retained evidence inside this owned run directory.
+   Give workers these paths explicitly; set task-local `TMPDIR` and relevant
+   build/cache output paths there so tool defaults do not scatter scratch in
+   `/tmp` or the control checkout. Record owned paths in the manifest; the
+   future report sequence number must not allocate shared scratch resources.
 5. Establish the coordinator's identity using the shared contract's model
    identity and naming rules. Record `MODEL_RAW`, `MODEL_SOURCE`, `MODEL_HOST`
    and `WHOAMI` in the manifest and report header before assigning work.
@@ -331,8 +339,9 @@ work.
 A review report is not an issue filing: say "recommended for filing" unless
 actual issue IDs exist.
 
-Write `/tmp/<WHOAMI>-review-<REVIEW_SLUG>-NNN.md`, for example
-`/tmp/gpt-5.6-sol-review-ha-failover-001.md` only when that model is evidenced.
+Write `/var/tmp/deep-review-reports/<WHOAMI>-review-<REVIEW_SLUG>-NNN.md`, for example
+`/var/tmp/deep-review-reports/gpt-5.6-sol-review-ha-failover-001.md` only when
+that model is evidenced.
 Use the shared filing/provenance contract to mark each finding's actual issue
 status, originating model, issue URL and verified origin tags. When filing is
 authorized during the run, reconcile that ledger before freezing the report;
@@ -350,16 +359,20 @@ Before publication, independently re-derive `WHOAMI` from the recorded identity
 and `REVIEW_SLUG` from the review name. Check that the manifest, report header
 and final basename agree. A mismatch blocks publication until reconciled;
 no "compatibility family" override exists.
-Determine the next number from exact final basenames for that `WHOAMI` and
-`REVIEW_SLUG` at publication time. A new model/review pair can begin at 001;
+Determine the next number from exact final basenames in
+`/var/tmp/deep-review-reports/` and the legacy `/tmp/` location for that
+`WHOAMI` and `REVIEW_SLUG` at
+publication time. A new model/review pair can begin at 001;
 deduplication still reads named and legacy reports across all model prefixes.
-Publish the complete draft with an atomic create-if-absent operation, such as a hard link
-on the same filesystem (`ln -T -- <draft> <final>`), never a replacing copy. On
-collision, update the draft's output-path header and retry the next number.
-Freeze the draft after linking: a hard link shares its contents with the final.
-The target must be the exact final file, never a directory to follow into.
-Only complete, immutable finals belong directly under `/tmp/`; scratch and
-evidence stay under the unique run directory.
+Read [report storage and publication](references/report-storage.md) before
+publishing. Both roots are under `/var/tmp`; verify filesystem identity before
+using a hard link. Publish atomically create-if-absent, never
+copy into a visible final pathname or overwrite a collision. Update the draft's
+output-path header before retrying another number. Keep published reports and
+their source drafts immutable. Only complete finals belong in
+`/var/tmp/deep-review-reports/`; all named working files remain under the owned
+`/var/tmp/deep-review-work/` run.
+Do not move old reports or create compatibility aliases in the legacy location.
 
 Verify the published report is complete and the artifact references resolve.
 Preserve test-only diffs, outputs, manifest, and supporting evidence until
