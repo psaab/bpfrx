@@ -577,7 +577,13 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 			pool = &NATPool{Name: inst.name}
 		}
 
-		for _, prop := range inst.node.Children {
+		// #8939: split a packed run. `pool PL port-overloading-factor 4
+		// routing-instance RI` is ONE child node carrying both on its Keys, so
+		// this switch read the first and dropped the rest — including the
+		// pool's routing-instance, which is what binds the translated address
+		// to a VRF. A pool bound to the wrong table translates into the wrong
+		// tenant's routing domain.
+		for _, prop := range hoistAndSplitRun8939(inst.node.Children, natSourcePoolSchema8939()) {
 			switch prop.Name() {
 			case "address":
 				// A source pool `address` value carries EVERY IP the

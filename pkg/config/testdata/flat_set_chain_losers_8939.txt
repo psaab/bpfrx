@@ -1,8 +1,6 @@
-# counts: losers=22 walked=81 vacuous=45 unmeasured=76
+# counts: losers=19 walked=84 vacuous=45 unmeasured=76
 # collector reach: 369 containers walked, 135 reached the census (137 dropped: no eligible leaf, 97 dropped: only one)
 firewall policer arg1 if-exceeding  [bandwidth-limit | burst-size-limit]  total  lenient-only
-forwarding-options sampling instance arg1 family inet output  [inline-jflow | source-address]  differs  OPERATOR
-forwarding-options sampling instance arg1 family inet6 output  [inline-jflow | source-address]  differs  OPERATOR
 protocols router-advertisement interface arg1 prefix arg1  [autonomous | no-autonomous | no-onlink]  total  lenient-only
 protocols router-advertisement interface arg1 prefix arg1  [autonomous | no-autonomous]  total  lenient-only
 routing-options static route arg1 qualified-next-hop arg1  [interface | metric | preference]  total  lenient-only
@@ -13,7 +11,6 @@ security flow aging  [early-ageout | high-watermark | low-watermark]  total  len
 security flow aging  [early-ageout | high-watermark]  total  lenient-only
 security log  [format | mode | source-interface]  total  lenient-only
 security log  [format | mode]  total  lenient-only
-security nat source pool arg1  [port-overloading-factor | routing-instance]  total  OPERATOR
 security nat source pool arg1 persistent-nat  [inactivity-timeout | permit]  total  lenient-only
 services flow-monitoring version-ipfix template arg1  [flow-active-timeout | flow-inactive-timeout]  total  lenient-only
 services flow-monitoring version9 template arg1  [flow-active-timeout | flow-inactive-timeout]  total  lenient-only
