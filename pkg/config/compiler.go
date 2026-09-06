@@ -225,6 +225,15 @@ func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) 
 	// removes the duplicate and would therefore remove the diagnostic with it,
 	// swallowing exactly the information the gate was added to surface.
 	var dupMergeWarnings []string
+	// Issue 9023: repeated named BLOCKS, merged on BOTH paths. Unlike the
+	// policy fold below there is no duplicate-name gate here to preserve, so
+	// tolerant-only scoping would leave the operator-typed case losing data.
+	for _, what := range mergeDuplicateBlocks9023(tree) {
+		dupMergeWarnings = append(dupMergeWarnings,
+			"duplicate block `"+what+"` — the repeated statements were merged into the "+
+				"first occurrence (#9023); previously the later block replaced the earlier "+
+				"one and its configuration was discarded")
+	}
 	if opts.lenientDuplicatePolicyNames {
 		for _, what := range mergeDuplicateNamedInstances(tree) {
 			// The wording deliberately carries "duplicate policy name" and
@@ -503,6 +512,15 @@ func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts
 	// removes the duplicate and would therefore remove the diagnostic with it,
 	// swallowing exactly the information the gate was added to surface.
 	var dupMergeWarnings []string
+	// Issue 9023: repeated named BLOCKS, merged on BOTH paths. Unlike the
+	// policy fold below there is no duplicate-name gate here to preserve, so
+	// tolerant-only scoping would leave the operator-typed case losing data.
+	for _, what := range mergeDuplicateBlocks9023(tree) {
+		dupMergeWarnings = append(dupMergeWarnings,
+			"duplicate block `"+what+"` — the repeated statements were merged into the "+
+				"first occurrence (#9023); previously the later block replaced the earlier "+
+				"one and its configuration was discarded")
+	}
 	if opts.lenientDuplicatePolicyNames {
 		for _, what := range mergeDuplicateNamedInstances(tree) {
 			// The wording deliberately carries "duplicate policy name" and
