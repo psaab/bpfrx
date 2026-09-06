@@ -19,7 +19,31 @@ func applyTailMentions8967(t *testing.T, starter string) bool {
 	if err != nil {
 		t.Fatalf("cannot read daemon_apply_tail.go: %v -- this cell is blind without it", err)
 	}
-	return strings.Contains(string(src), "d."+starter+"(")
+	// ANCHOR, because reading a source file BY NAME survives the change that
+	// breaks it. If the apply tail is split into another file the read still
+	// SUCCEEDS, `Contains` returns false for every starter, and this cell
+	// reports "the starter is not called from the apply tail" -- which is
+	// false, and points whoever reads it at the knob rather than at the move.
+	//
+	// A sibling lane lost a whole census to the silent form of this: its
+	// scraper read a predicate's file by name, the predicate was split into a
+	// new file, the old file still existed, and the census reported a stable,
+	// confident ZERO for every population. Re-running never catches it. The
+	// only thing that does is a second source for the same fact.
+	//
+	// Here the failure is LOUD rather than silent -- the caller asserts
+	// `!applyTailMentions8967(...)` -- so the anchor buys a correct DIAGNOSIS
+	// rather than a caught defect. That is still worth having: a wrong
+	// diagnostic sends the next reader to the wrong place, which is the #9006
+	// and #8992 shape.
+	body := string(src)
+	if !strings.Contains(body, "func (d *Daemon)") {
+		t.Fatalf("daemon_apply_tail.go no longer contains any Daemon method, so it is " +
+			"not the apply tail any more. This cell scrapes it BY NAME; the file was " +
+			"renamed, split, or emptied. Repoint the scrape -- do NOT read the result " +
+			"below as a finding about any knob.")
+	}
+	return strings.Contains(body, "d."+starter+"(")
 }
 
 // #8967: the IPsec SA sync publisher was the one comms-scoped loop that did
