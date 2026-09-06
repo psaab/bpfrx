@@ -518,33 +518,74 @@ func canonicalRoutePrefix(s string) string {
 	return n.String()
 }
 
+// #9132: walk every routing-instance interface reference twice — pass 0 binds
+// the reference AS WRITTEN, pass 1 adds the units a BARE reference fans down
+// onto, never overwriting a key pass 0 already holds.
+//
+// Two properties come out of that shape, and both are worth stating because
+// they are what make the change reviewable:
+//
+//   - pass 0 is byte-for-byte the pre-#9132 loop, so the fix is PURELY
+//     ADDITIVE on these maps: every key master produced still carries master's
+//     value, and the only new keys are unit keys of bare references.
+//   - an EXPLICIT unit reference always beats a unit key reached by fanning a
+//     bare reference down. A single pass with plain assignment would resolve
+//     `ge-0/0/0` in tenant-a against `ge-0/0/0.1` in tenant-b by CONFIG ORDER,
+//     which is a silent order-dependent VRF binding for a contradictory config.
+//     `cfg.RoutingInstances` is a slice, so that order is at least
+//     deterministic — it is still not a rule anyone chose.
+func forEachRoutingInstanceInterfaceKey(cfg *config.Config, bind func(riName, key string)) {
+	if cfg == nil {
+		return
+	}
+	seen := make(map[string]struct{})
+	for pass := 0; pass < 2; pass++ {
+		for _, ri := range cfg.RoutingInstances {
+			if ri == nil || ri.Name == "" {
+				continue
+			}
+			for _, ifname := range ri.Interfaces {
+				if ifname == "" {
+					continue
+				}
+				// #5878 phase 2: canonicalize the .<unit> suffix so ge-0/0/0.01
+				// binds the same table as ge-0/0/0.1 (the per-unit snapshot
+				// consumer keys these maps by the canonical "%s.%d" unit name).
+				keys := config.InterfaceUnitRefKeys(cfg, ifname)
+				if len(keys) == 0 {
+					continue
+				}
+				if pass == 0 {
+					seen[keys[0]] = struct{}{}
+					bind(ri.Name, keys[0])
+					continue
+				}
+				for _, key := range keys[1:] {
+					if _, exists := seen[key]; exists {
+						continue
+					}
+					seen[key] = struct{}{}
+					bind(ri.Name, key)
+				}
+			}
+		}
+	}
+}
+
 func buildInterfaceRouteTables(cfg *config.Config) (map[string]string, map[string]string) {
 	v4 := make(map[string]string)
 	v6 := make(map[string]string)
-	if cfg == nil {
-		return v4, v6
-	}
-	for _, ri := range cfg.RoutingInstances {
-		if ri == nil || ri.Name == "" {
-			continue
-		}
-		for _, ifname := range ri.Interfaces {
-			if ifname == "" {
-				continue
-			}
-			// #5878 phase 2: canonicalize the .<unit> suffix so ge-0/0/0.01 binds
-			// the same route table as ge-0/0/0.1 (the per-unit snapshot consumer
-			// keys these maps by the canonical "%s.%d" unit name).
-			key := config.CanonicalInterfaceUnitRef(ifname)
-			v4[key] = ri.Name + ".inet.0"
-			v6[key] = ri.Name + ".inet6.0"
-		}
-	}
+	forEachRoutingInstanceInterfaceKey(cfg, func(riName, key string) {
+		v4[key] = riName + ".inet.0"
+		v6[key] = riName + ".inet6.0"
+	})
 	return v4, v6
 }
 
 // buildInterfaceRoutingInstances maps each interface (config name, e.g.
-// "ge-0-0-1.80") to the routing-instance it belongs to. The default
+// "ge-0-0-1.80") to the routing-instance it belongs to. A BARE reference is
+// fanned down onto every configured unit (#9132) — see
+// forEachRoutingInstanceInterfaceKey and config.InterfaceUnitRefKeys. The default
 // instance is the empty string. This mirrors buildInterfaceRouteTables'
 // membership lookup, but carries the bare instance NAME so the Rust
 // dataplane can scope its rebuilt-from-interface connected routes to the
@@ -553,23 +594,9 @@ func buildInterfaceRouteTables(cfg *config.Config) (map[string]string, map[strin
 // connected prefix owned by a different routing-instance.
 func buildInterfaceRoutingInstances(cfg *config.Config) map[string]string {
 	out := make(map[string]string)
-	if cfg == nil {
-		return out
-	}
-	for _, ri := range cfg.RoutingInstances {
-		if ri == nil || ri.Name == "" {
-			continue
-		}
-		for _, ifname := range ri.Interfaces {
-			if ifname == "" {
-				continue
-			}
-			// #5878 phase 2: canonicalize the .<unit> suffix so ge-0/0/0.01 binds
-			// the same routing-instance as ge-0/0/0.1 (the per-unit snapshot
-			// consumer keys this map by the canonical "%s.%d" unit name).
-			out[config.CanonicalInterfaceUnitRef(ifname)] = ri.Name
-		}
-	}
+	forEachRoutingInstanceInterfaceKey(cfg, func(riName, key string) {
+		out[key] = riName
+	})
 	return out
 }
 

@@ -25,6 +25,75 @@ import (
 // remain as one-line delegations so their call sites and the doc trail are
 // unchanged.
 
+// InterfaceUnitRefKeys returns the runtime map keys a cross-subsystem interface
+// reference binds, in a stable order: the reference AS WRITTEN first, then the
+// units a BARE reference fans down onto, in ascending unit order.
+//
+// This is the ONE fan-down rule for the reference family
+// CanonicalInterfaceUnitRef names in its own doc comment — buildInterfaceZoneMap,
+// buildInterfaceRoutingInstances, buildInterfaceRouteTables. Before #9132 only
+// the zone binder implemented it; the two routing binders keyed a BARE reference
+// on the bare name alone. The per-unit snapshot rows that carry the ADDRESSES
+// are named "<base>.<unit>", so a routine, accepted, strict-commit-clean
+// `set routing-instances <ri> interface ge-0/0/0` bound no addressed unit at
+// all: the box reported the interface as a VRF member on every show surface
+// while the dataplane installed its connected prefix into inet.0 with a working
+// egress ifindex.
+//
+// The rules, each load-bearing:
+//
+//   - a UNIT reference ("ge-0/0/0.1") binds EXACTLY that unit. It must NOT fan
+//     UP to the base: the base snapshot row inherits the kernel netdev's
+//     addresses, which belong to unit 0, so binding the base from a unit-1
+//     reference would move unit 0's prefix into unit 1's routing instance —
+//     the #9063 hazard pointed the other way.
+//   - a BARE reference ("ge-0/0/0") binds the base key AND every configured
+//     unit, because in xpf a bare reference MEANS "every unit of this
+//     interface" (the #6722 cells say so for zones). The base key is kept so a
+//     consumer looking up the physical row still resolves.
+//   - a trailing-dot form ("ge-0/0/0.") binds the literal only. The #5933
+//     strict gate skips it as bare and no subsystem's runtime has ever fanned
+//     it down; changing that here would be an unreviewed behaviour change on a
+//     spelling nothing in the tree produces.
+//   - a malformed suffix is returned unchanged, exactly as
+//     CanonicalInterfaceUnitRef leaves it: the strict gate rejects it at commit
+//     and it stays inert on the tolerant-load path.
+//
+// The zone binder's EXTRA "a unit reference also binds the base key" write is
+// deliberately NOT here. It is right for zones — host-inbound on the physical
+// interface must resolve — and wrong for routing, for the reason in the first
+// rule. Each consumer states that policy at its own call site so the difference
+// stays visible instead of being buried in a shared helper (levelling the three
+// to one behaviour would be consistency achieved in the wrong direction).
+func InterfaceUnitRefKeys(cfg *Config, rawRef string) []string {
+	if rawRef == "" {
+		return nil
+	}
+	ref := CanonicalInterfaceUnitRef(rawRef)
+	if _, _, hasUnit := strings.Cut(ref, "."); hasUnit {
+		// A unit reference, a degenerate ".<unit>", or the trailing-dot form:
+		// all bind the literal key only.
+		return []string{ref}
+	}
+	keys := []string{ref}
+	if cfg == nil {
+		return keys
+	}
+	ifCfg := cfg.Interfaces.Interfaces[ref]
+	if ifCfg == nil {
+		return keys
+	}
+	units := make([]int, 0, len(ifCfg.Units))
+	for unitNum := range ifCfg.Units {
+		units = append(units, unitNum)
+	}
+	sort.Ints(units)
+	for _, unitNum := range units {
+		keys = append(keys, fmt.Sprintf("%s.%d", ref, unitNum))
+	}
+	return keys
+}
+
 func InterfaceZoneMap(cfg *Config) map[string]string {
 	if cfg == nil || len(cfg.Security.Zones) == 0 {
 		return nil
@@ -50,24 +119,26 @@ func InterfaceZoneMap(cfg *Config) map[string]string {
 			// consumer (buildInterfaceSnapshots) keys this map by the canonical
 			// "%s.%d" unit name, so a raw ".01" key would miss and the unit would
 			// bind to NO zone. A bare ref or a malformed suffix is unchanged.
-			iface := CanonicalInterfaceUnitRef(rawIface)
-			if _, exists := out[iface]; !exists {
-				out[iface] = zoneName
+			//
+			// #9132: the bare-ref fan-down moved into InterfaceUnitRefKeys, the
+			// shared rule the two routing binders now use too. Byte-for-byte the
+			// same keys in the same order as the loop it replaced — the ordering
+			// matters because this map is FIRST-writer-wins over sorted zone
+			// names.
+			for _, key := range InterfaceUnitRefKeys(cfg, rawIface) {
+				if _, exists := out[key]; !exists {
+					out[key] = zoneName
+				}
 			}
-			if base, unit, ok := strings.Cut(iface, "."); ok && base != "" {
+			// ZONE-SPECIFIC, and deliberately outside the shared helper: a UNIT
+			// reference ALSO binds the PHYSICAL interface key, so host-inbound
+			// on the port resolves (#6722 case A: zoning st0.1 zones st0). The
+			// routing binders must NOT do this — the base row inherits unit 0's
+			// kernel addresses, so a unit-1 reference would drag unit 0's prefix
+			// into unit 1's routing instance. See InterfaceUnitRefKeys.
+			if base, _, ok := strings.Cut(CanonicalInterfaceUnitRef(rawIface), "."); ok && base != "" {
 				if _, exists := out[base]; !exists {
 					out[base] = zoneName
-				}
-				if unit != "" {
-					continue
-				}
-			}
-			if ifCfg := cfg.Interfaces.Interfaces[iface]; ifCfg != nil {
-				for unitNum := range ifCfg.Units {
-					unitName := fmt.Sprintf("%s.%d", iface, unitNum)
-					if _, exists := out[unitName]; !exists {
-						out[unitName] = zoneName
-					}
 				}
 			}
 		}
