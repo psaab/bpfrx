@@ -212,6 +212,11 @@ func (d *Daemon) commitAndApply(ctx context.Context, authority configstore.Commi
 			if ierr := clusterIdentityCommitPreflight(d.cluster, cand); ierr != nil {
 				return ierr
 			}
+			// #8965: and refuse a LIVE control-endpoint move, which would restart
+			// comms on the new address before the peer can be told about it.
+			if eerr := clusterControlEndpointCommitPreflight(d.cluster, cand); eerr != nil {
+				return eerr
+			}
 			// #6650: refuse a config the cluster PEER cannot represent, before
 			// the store promotes anything. Ordered last among the cluster
 			// preflights: the topology/identity gates above decide whether this
@@ -483,6 +488,18 @@ func (d *Daemon) syncAndApply(ctx context.Context, configText string, chassisPre
 		d.reconcileManagementAfterPromotion(compiled, "peer-synced identity change refused")
 		return nil, ierr
 	}
+	// #8965: and refuse a LIVE control-endpoint move, which would restart
+	// comms on the new address before the peer can be told about it.
+	if eerr := clusterControlEndpointCommitPreflight(d.cluster, compiled); eerr != nil {
+		slog.Error("cluster: refusing to apply a peer-synced node-id/cluster-id "+
+			"identity change live; a restart is required to re-key the HA manager",
+			"err", eerr)
+		// #6720: same reasoning as the topology backstop above — the promoted
+		// config's authorization is live policy regardless of the HA re-key
+		// constraint that stops the apply.
+		d.reconcileManagementAfterPromotion(compiled, "peer-synced identity change refused")
+		return nil, eerr
+	}
 
 	// #5564: SyncApply (above) has ALREADY promoted the peer config to active,
 	// and once applyConfigLocked arms the dataplane snapshot this node is
@@ -657,6 +674,11 @@ func (d *Daemon) commitConfirmedAndApply(ctx context.Context, authority configst
 			// reject it up front while the operator is still connected.
 			if ierr := clusterIdentityCommitPreflight(d.cluster, cand); ierr != nil {
 				return ierr
+			}
+			// #8965: and refuse a LIVE control-endpoint move, which would restart
+			// comms on the new address before the peer can be told about it.
+			if eerr := clusterControlEndpointCommitPreflight(d.cluster, cand); eerr != nil {
+				return eerr
 			}
 			// #6707: the rollback target must be APPLIABLE, not merely
 			// device-map safe. The timeout path applies it unconditionally

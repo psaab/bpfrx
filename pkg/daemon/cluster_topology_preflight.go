@@ -176,3 +176,90 @@ func clusterIdentityCommitPreflight(running *cluster.Manager, newCfg *config.Con
 		"system offline: %w",
 		runNode, runCluster, cc.NodeID, cc.ClusterID, errClusterIdentityRequiresRestart)
 }
+
+// clusterControlEndpointCommitPreflight refuses a LIVE move of the cluster
+// control-link peer address (#8965).
+//
+// THE DEFECT IT PREVENTS. applyAndSyncCommitted applies before it pushes:
+// applyConfigLocked's step 20 stops cluster comms and restarts them on the NEW
+// endpoint, and only then does pushCommittedConfigToPeer run -- over a
+// transport that was just torn down and rebuilt on a different address. The
+// peer is still on the OLD endpoint, so it never receives the candidate.
+//
+// AND NOTHING HEALS IT. QueueConfig no-ops on a nil connection, so the push
+// fails SILENTLY rather than erroring the commit. The #5863 reconciler returns
+// early on !syncPeerConnected, and that flag is set in exactly one place -- the
+// session-sync connect callback -- so it cannot bootstrap a mismatch in which
+// nothing is connected. Heartbeats carry no config. Both nodes are durably
+// configured, so retry and reboot REPRODUCE the split rather than repair it:
+// the standby eventually promotes on the stale tuple while this node stays
+// primary on the new one, and fencing cannot traverse the severed channel
+// either. A commit whose purpose was to preserve HA is what removes it.
+//
+// WHY REFUSE RATHER THAN MAKE-BEFORE-BREAK. A stage-and-ACK would have to be
+// implemented at EVERY apply path -- commitAndApply, syncAndApply and
+// commitConfirmedAndApply all reach applyConfigLocked -- and a version landed
+// at one of them would leave the others silently broken. A preflight runs
+// BEFORE any of them and covers all three by construction. It is also the
+// answer this file already gives twice, for mode changes and for identity
+// changes, to exactly this class: a change that cannot be re-keyed live from
+// one side. You cannot move both ends of a point-to-point control link
+// atomically from one end of it.
+//
+// SCOPE, and it is narrower than "the control tuple". This gates the peer
+// ADDRESS, which is what the node dials and therefore what determines whether
+// the push can land. `control-interface` is NOT gated: the manager keeps no
+// running value to compare a candidate against without further plumbing, so a
+// gate on it would have to compare config-to-config and would fire on a
+// peer-synced text that merely renders the interface differently. That bound
+// is recorded rather than papered over -- an interface-only move has the same
+// shape and is not covered here.
+//
+// PEER-SYNC IS SAFE. `PeerAddress` is per-node (each node's config names the
+// OTHER node's address), and a synced text compiles for the LOCAL node, so in
+// steady state the candidate's value equals the running one and this gate is a
+// no-op -- the same reasoning the identity gate documents for itself.
+func clusterControlEndpointCommitPreflight(running *cluster.Manager, newCfg *config.Config) error {
+	if running == nil || !clusterTopologyConfigured(newCfg) {
+		// No running HA manager, or the candidate is not clustered: the
+		// topology gate owns those cases.
+		return nil
+	}
+	return controlEndpointDecision8965(running.HeartbeatPeerAddr(),
+		newCfg.Chassis.Cluster.PeerAddress)
+}
+
+// controlEndpointDecision8965 is the DECISION, split from the accessor plumbing
+// above so a cell can exercise it without constructing a running
+// cluster.Manager -- which would need interfaces and sockets a unit test has no
+// business creating.
+//
+// THE SPLIT IS DELIBERATE AND THE FIRST VERSION OF IT WAS WRONG. That version
+// exposed only the message builder for testing, so the cell asserted the
+// operator-facing TEXT while the decision -- when to refuse at all -- went
+// unexercised: neutering the gate to `return nil` left the cell GREEN. A seam
+// that bypasses the thing under test is worse than no seam, because it reads as
+// coverage. This one is the decision itself, so the same mutation reds.
+func controlEndpointDecision8965(have, want string) error {
+	if want == "" || have == "" || want == have {
+		// Unset on either side means there is no live endpoint to strand --
+		// the heartbeat has not started, or the candidate leaves it to the
+		// runtime default. Equal means this is not a move.
+		return nil
+	}
+	return controlEndpointMoveRefusal8965(have, want)
+}
+
+// controlEndpointMoveRefusal8965 is the operator-facing text, factored so the
+// cell asserting it and the gate producing it cannot drift apart.
+func controlEndpointMoveRefusal8965(have, want string) error {
+	return fmt.Errorf("commit rejected: changing the chassis cluster control-link "+
+		"peer address from %s to %s cannot be done on a running cluster — applying "+
+		"it restarts this node's cluster comms on the NEW address before the config "+
+		"can be pushed to the peer, which is still on the OLD one, so the peer never "+
+		"receives the change and the two nodes are durably partitioned.\n"+
+		"To move the control link: set the new address on BOTH nodes and restart "+
+		"xpfd on both, or take the cluster down before the move. Do NOT commit the "+
+		"change on each node separately while both are running — that produces the "+
+		"same partition by hand", have, want)
+}
