@@ -33,6 +33,42 @@ genuinely the branch's.
 A test suite tells you what your change does to the code that is present. It
 cannot tell you what your change removes.
 
+`git diff --stat` alone also **understates** a change: a new file that is not
+yet `git add`ed is invisible to it. A lane landing #8993 had two new files and
+a diffstat that did not mention either.
+
+### `git stash` is REPO-GLOBAL. In a multi-worktree repo it is a shared stack.
+
+Every worktree of one repository shares **one** stash stack. `git stash pop`
+with no argument takes whatever is on TOP, which in a campaign is very likely
+another lane's work.
+
+This is not hypothetical, and the evidence is on the stack itself. Measured
+2026-09-05: **32 entries, oldest from 2026-05-28**, two of which exist *because
+it already went wrong* —
+
+```
+RESCUE-2026-08-21-foreign-stash-accidentally-popped-into-wt-close-cohorts
+                                    (icmp_embed/nat64/wg WIP, NOT mine)
+RESCUE-2026-06-17-displaced-1635wip-from-errant-pop
+```
+
+Somebody popped someone else's work into their worktree, twice, and had to
+stash the displacement to get it back. The recovery is itself on the shared
+stack, where the next bare `pop` can take it.
+
+- **Prefer not to stash at all.** `git worktree` gives you a second tree;
+  `git merge origin/master` updates a stale base in place. Both avoid the
+  stack entirely, and the stale-base problem that usually prompts a stash is
+  better solved by the merge anyway.
+- If you must stash: **push and pop immediately**, and **verify the restored
+  files are yours** before doing anything else. The whole exposure is the gap
+  between the two, so make it as close to zero as you can.
+- **Never `git stash drop` or `git stash clear`.** Entries that look like
+  abandoned debris are how stranded work looks from outside; several of those
+  32 are plausibly real. Tidying the stack is the destructive move it already
+  documents.
+
 
 ## First principles
 
