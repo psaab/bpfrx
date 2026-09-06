@@ -31,11 +31,45 @@ import (
 // observables and it is not the one an operator would assume. This
 // implementation sends the ack only AFTER the local fence has run, and reports
 // how many redundancy groups were actually driven to rg_active=false out of how
-// many the receiver's LIVE config contains. fenceAckOK therefore means "the
-// peer confirms it relinquished every RG it knows about", which is the property
-// a takeover gate should be built on. A peer in config-only mode (no published
-// dataplane) cannot relinquish anything and says so with fenceAckUnavailable
+// many the receiver's LIVE config contains. A peer in config-only mode (no
+// published dataplane) cannot act at all and says so with fenceAckUnavailable
 // rather than reporting a vacuous success over an empty RG set.
+//
+// AND EXACTLY WHAT IT DOES NOT MEAN (#9120). An earlier version of this comment
+// read "the peer confirms it relinquished every RG it knows about, which is the
+// property a takeover gate should be built on". That is STRICTLY STRONGER than
+// what the receiver does, and the difference is the whole span an operator
+// would misjudge. fenceAllRedundancyGroups does two things per RG —
+// SetRGActive(false) on the dataplane, and InvalidateApplied() on the RG state
+// machine — and it does NOT:
+//
+//   - release the VRRP virtual addresses. The peer keeps every VIP, keeps
+//     answering ARP/ND for them, and keeps winning the VRRP election. The
+//     upstream L2 domain still points that traffic at the fenced node; the
+//     dataplane drops it rather than forwarding it. That is a BLACKHOLE, not a
+//     relinquishment, and it is what "relinquished" would have promised.
+//   - change cluster state. clusterPri is untouched, so the peer still reports
+//     itself primary for those groups in `show chassis cluster status`.
+//   - hold. `desired = clusterPri || allVrrpMaster` in pkg/daemon/rg_state.go
+//     is computed from those two untouched inputs, so the very next
+//     reconcileRGState pass sees desired=true, applied=false (that is what the
+//     InvalidateApplied above arranges) and re-drives rg_active=TRUE. The
+//     suppression therefore lasts AT MOST ONE RECONCILE INTERVAL unless
+//     something else — the peer observing the takeover over the sync channel,
+//     an operator, a real crash — changes one of the two inputs first.
+//
+// So the honest reading of a fenceAckOK is: "at the instant it replied, the
+// peer had driven rg_active=false for every RG in its live config." It is a
+// point-in-time DATAPLANE SUPPRESSION receipt. It is sound for what the gate
+// actually uses it for — ORDERING the local takeover behind the peer's
+// suppression, closing the window where both nodes forward — and it is NOT a
+// lease, a VIP transfer, or a demotion. Do not build a gate on the stronger
+// reading; if a future gate needs one, it needs a fence that changes an input
+// to `desired` (and then a bounded self-clearing timer, because a fence that
+// clears clusterPri and never expires converts a lost sync channel into a
+// no-primary outage). Pinned by TestFenceAckProvesDataplaneSuppressionOnly9120
+// in pkg/daemon, which is the counterpart of #6530's
+// TestFenceRearmsReconcileRetry, not its inversion.
 //
 // FAIL-OPEN IS A REQUIREMENT, NOT A COMPROMISE. Every negative path — no
 // connection, peer not capable, send error, timeout, partial or unavailable ack
@@ -91,7 +125,10 @@ const (
 // two are distinct because they need distinct operator remediation, not because
 // the takeover behaviour differs — every one of them fails open.
 const (
-	// FenceAckOK: the peer disabled every redundancy group in its live config.
+	// FenceAckOK: at the instant it replied, the peer had driven
+	// rg_active=false for every redundancy group in its live config. NOT a
+	// VIP release and NOT a demotion — see "AND EXACTLY WHAT IT DOES NOT
+	// MEAN" above (#9120).
 	FenceAckOK uint8 = 0
 	// FenceAckPartial: at least one SetRGActive(false) failed. The peer may
 	// still be forwarding for that group.
@@ -120,8 +157,10 @@ const (
 const localCapabilityFlags = capFlagFenceAck
 
 // FenceResult is what the local fence handler reports about what it achieved.
-// It is the daemon's answer to "did you actually relinquish everything", and
-// it is what gets encoded into the ack.
+// It is the daemon's answer to "how many RGs did you just drive to
+// rg_active=false, out of how many you have", and it is what gets encoded into
+// the ack. It is deliberately NOT an answer to "did you relinquish everything"
+// — no VIP moves and no cluster-state change is implied (#9120).
 type FenceResult struct {
 	// RGsFenced is the number of redundancy groups successfully driven to
 	// rg_active=false.
@@ -159,8 +198,10 @@ type FenceAck struct {
 	RGsTotal  int
 }
 
-// Confirmed reports whether this ack authorises the sender to treat the peer as
-// fenced.
+// Confirmed reports whether this ack authorises the sender to treat the peer's
+// DATAPLANE as suppressed, which is what it may order its own takeover behind.
+// It does not authorise treating the peer as demoted or as having released its
+// VIPs — neither is implied and neither is checked (#9120).
 func (a FenceAck) Confirmed() bool { return a.Status == FenceAckOK }
 
 // Reason renders the ack for the operator-facing EventFence history.
