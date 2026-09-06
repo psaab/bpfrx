@@ -75,12 +75,44 @@ func TestMultiportAdvisoryDoesNotClaimTheTunnelIsDead9016(t *testing.T) {
 		}
 	}
 
-	// It must NOT imply the steered tunnel is adjudicated. No WireGuard
-	// tunnel's plaintext is, steered or not; claiming otherwise here is the
-	// same false reassurance in the other direction.
-	if !strings.Contains(text, "zone-adjudicated") {
-		t.Fatalf("advisory must state that steering is not adjudication, or a reader "+
-			"infers the steered tunnel is policed:\n\n%s", text)
+	// THE ASYMMETRY. This assertion is INVERTED from what it originally
+	// required, and the inversion is the point of the change that brought it.
+	//
+	// It used to demand that the advisory deny any difference — "no WireGuard
+	// tunnel's plaintext is zone-adjudicated, steered or not". That was written
+	// from the #5618 advisory, which describes the PRE-#8274 world. Three
+	// independent statements in this tree say it is false at HEAD:
+	//
+	//  1. userspace-xdp/src/lib.rs, the #8274 step 3 arm: "a WireGuard
+	//     TRANSPORT-DATA record for a configured local listener is NOT local
+	//     delivery any more — the worker decaps it and adjudicates the inner
+	//     packet under the tunnel's logical ingress zone."
+	//  2. userspace-dp poll_descriptor/mod.rs at the stage_wg_decap call:
+	//     "Everything downstream then sees the INNER packet — flow parse,
+	//     screen, session, policy, NAT, forward build ... instead of being
+	//     written to the wgN TUN for the kernel to forward with no zone policy
+	//     at all."
+	//  3. maps_sync.go: userspaceCtrlFlagWgRx is set iff at least one WireGuard
+	//     tunnel is configured, so the gate those two describe is armed exactly
+	//     when this advisory can fire.
+	//
+	// The steered port IS adjudicated and an unsteered port is NOT. Requiring
+	// the advisory to deny that erased the only difference an operator needs to
+	// see, in the one message that reads as authoritative on the subject — and
+	// a cell demanding the denial is what would have kept it there.
+	for _, required := range []string{
+		"NOT THE SAME",
+		"adjudicated under the tunnel's ingress zone",
+		"forwarded by the KERNEL with no zone policy",
+	} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("advisory must state the steered/unsteered SECURITY asymmetry "+
+				"(missing %q). Denying it tells an operator the bypass is not a "+
+				"bypass:\n\n%s", required, text)
+		}
+	}
+	if strings.Contains(text, "steered or not") {
+		t.Fatalf("advisory still denies the asymmetry:\n\n%s", text)
 	}
 
 	// CONTROL: one tunnel, no advisory. A check that fired always would satisfy

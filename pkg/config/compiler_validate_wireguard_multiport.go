@@ -117,13 +117,39 @@ func validateWireguardSingleSteeredPort(cfg *Config) []string {
 	// An operator told a live tunnel is dead will leave it in place. The honest
 	// statement is that it is unsteered, not that it is down.
 	//
-	// Deliberately NOT claimed here: that the unsteered tunnel's plaintext is
-	// uniquely unadjudicated. It is not — NO WireGuard tunnel's decapsulated
-	// plaintext is zone-adjudicated, steered or not, and the separate #5618
-	// advisory says so for every tunnel in the config (with an acute variant for
-	// one assigned a zone). Repeating it here would imply the steered tunnel is
-	// adjudicated, which is the same class of false reassurance in the other
-	// direction.
+	// THE ASYMMETRY IS THE POINT, and a previous edit of this file denied it.
+	//
+	// This comment used to say that the unsteered tunnel is "not uniquely
+	// unadjudicated" because "NO WireGuard tunnel's decapsulated plaintext is
+	// zone-adjudicated, steered or not", citing the #5618 advisory as authority.
+	// That is false at HEAD, and the sentence built on it went out to operators.
+	//
+	// #8274 step 3 changed exactly this. The shim no longer treats a WireGuard
+	// TRANSPORT-DATA record for the steered listener as local delivery; the
+	// worker claims it and decaps it INSIDE the pipeline. Its own call site
+	// (poll_descriptor/mod.rs) states the result: "Everything downstream then
+	// sees the INNER packet — flow parse, screen, session, policy, NAT, forward
+	// build ... adjudicated under the tunnel's logical ingress zone instead of
+	// being written to the wgN TUN for the kernel to forward with no zone policy
+	// at all."
+	//
+	// So the two ports differ in the security property, not merely in which code
+	// path serves them:
+	//
+	//	steered port    transport data -> worker decap -> zone/session/policy
+	//	unsteered port  transport data -> kernel -> control thread -> wgN TUN
+	//	                                -> kernel forwards, no zone policy
+	//
+	// `wg_worker_claim` requires `parsed.flow_dst_port == ctrl.wg_listen_port`,
+	// a single scalar, so a second port never matches and falls to the generic
+	// local-destination arm.
+	//
+	// The #5618 advisory this used to defer to describes the PRE-#8274 world
+	// ("the XDP shim deliberately steers inbound UDP on the configured
+	// WireGuard listen port to the KERNEL"), and it fires for every WireGuard
+	// tunnel including a single steered one. That is tracked separately; this
+	// file must not repeat its claim, because here the claim erases the one
+	// difference an operator needs to see.
 	return []string{fmt.Sprintf(
 		"wireguard: %d distinct listen-ports are configured, but the dataplane "+
 			"steers inbound WireGuard transport for only ONE of them. "+
@@ -131,12 +157,17 @@ func validateWireguardSingleSteeredPort(cfg *Config) []string {
 			"%s %s %s NOT steered: %s still receives inbound transport (the "+
 			"host-inbound filter admits every configured listen-port and each "+
 			"tunnel binds its own socket), but it is served by the KERNEL path "+
-			"rather than the dataplane's, so it is not counted or handled there. "+
+			"rather than the dataplane's. THE SECURITY POSTURE OF THE TWO IS "+
+			"NOT THE SAME: the steered port's decapsulated plaintext is "+
+			"adjudicated under the tunnel's ingress zone (screen, session, "+
+			"policy, NAT), while an unsteered port's plaintext is written to "+
+			"its wgN TUN and forwarded by the KERNEL with no zone policy, no "+
+			"session and no counters — an authenticated peer on %s reaches "+
+			"whatever the kernel routes to, subject only to that peer's "+
+			"allowed-ips (a source-ownership check, not a destination policy). "+
 			"Only one WireGuard listen-port can be steered until multi-port "+
-			"steering lands (#1434 Increment 2, deferred). Note this is about "+
-			"STEERING only: no WireGuard tunnel's decapsulated plaintext is "+
-			"zone-adjudicated today, steered or not — see the separate tunnel "+
-			"plaintext advisory, which covers every tunnel in this config.",
+			"steering lands (#1434 Increment 2, deferred).",
 		len(strandedPorts)+1, steered.port, steered.name,
-		strandedNoun, strings.Join(stranded, ", "), strandedVerb, strandedSubject)}
+		strandedNoun, strings.Join(stranded, ", "), strandedVerb, strandedSubject,
+		strandedSubject)}
 }
