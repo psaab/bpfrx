@@ -1,7 +1,9 @@
 package snmp
 
 import (
+	"fmt"
 	"net"
+	"strings"
 	"testing"
 )
 
@@ -168,7 +170,7 @@ func TestV1TrapFallsBackToZeroWhenNoSourceExists9123(t *testing.T) {
 // the change.
 func TestV2cTrapIsUnaffectedByTheTargetMove9123(t *testing.T) {
 	a := &Agent{}
-	var lens []int
+	var lens []string
 	for _, target := range []string{"", "127.0.0.1:162", "10.9.9.9:162"} {
 		pkts := a.buildLinkTrapsForVersion("public", "v2", target, true, 5, "ge-0-0-0")
 		if len(pkts) != 1 {
@@ -184,12 +186,13 @@ func TestV2cTrapIsUnaffectedByTheTargetMove9123(t *testing.T) {
 					"has no agent-addr field and must not have grown one", target)
 			}
 		}
-		lens = append(lens, len(pkts[0]))
+		lens = append(lens, berShape9335(t, msg))
 	}
 	for i := 1; i < len(lens); i++ {
 		if lens[i] != lens[0] {
-			t.Errorf("the v2c packet length varies with the target (%v); it does not "+
-				"depend on the target and must not start to", lens)
+			t.Errorf("the v2c packet SHAPE varies with the target:\n  %s\n  %s\n"+
+				"it does not depend on the target and must not start to",
+				lens[0], lens[i])
 			break
 		}
 	}
@@ -242,5 +245,101 @@ func TestIPv4NarrowingHandlesBothForms9123(t *testing.T) {
 	}
 	if got, ok := ipv4Bytes9123(nil); ok {
 		t.Errorf("nil narrowed to %v", got)
+	}
+}
+
+// berShape9335 renders a BER value as a canonical structural signature:
+// the tag tree, with every leaf's bytes included EXCEPT for INTEGERs, whose
+// VALUE is deliberately discarded.
+//
+// #9335: the assertion this replaces compared packet LENGTHS across three
+// builds, and that is unsound for the same reason the byte-identity check
+// documented above it was unsound — one level down and with a much lower hit
+// rate, which is why it survived review and then reddened `go test ./...` for
+// every lane at a measured 1.08% over 20,000 iterations.
+//
+// The v2c PDU carries a RANDOMIZED request-id, and a BER INTEGER is
+// minimal-width: a request-id that fits in one byte encodes shorter than one
+// needing three. So the packet length varies by chance, with nothing about the
+// target having changed. I wrote a comment saying byte-identity "was measuring
+// the randomness rather than the change", and then asserted a length identity
+// that measures exactly that same randomness.
+//
+// A LOW-RATE FLAKE IS WORSE THAN A LOUD ONE. At 1.08% it passes every time the
+// author runs it and fails for someone else weeks later in an unrelated
+// package, where the honest reading — "my change did this" — is wrong, and the
+// cheap reading — "re-run it" — is how a suite stops being believed.
+//
+// Discarding INTEGER values is a real loss of strength, which is why
+// TestTheShapeSignatureDiscriminates9335 exists: a signature that discards too
+// much passes trivially, so the discarding has to be shown to still
+// discriminate.
+func berShape9335(t *testing.T, v []byte) string {
+	t.Helper()
+	var b strings.Builder
+	var walk func(v []byte, depth int)
+	walk = func(v []byte, depth int) {
+		for _, kv := range berChildren9123(t, v) {
+			tag := kv[0].(byte)
+			body := kv[1].([]byte)
+			fmt.Fprintf(&b, "%*s%#x", depth*2, "", tag)
+			switch {
+			case tag == tagInteger:
+				// Value discarded: the request-id is random and
+				// minimal-width, so its bytes AND its length are noise here.
+				b.WriteString("(int)\n")
+			case tag&0x20 != 0 || tag == tagSequence || tag >= 0xa0:
+				// Constructed: recurse rather than compare opaque bytes, so a
+				// structural change inside is visible.
+				b.WriteString("{\n")
+				walk(body, depth+1)
+				fmt.Fprintf(&b, "%*s}\n", depth*2, "")
+			default:
+				fmt.Fprintf(&b, "=%x\n", body)
+			}
+		}
+	}
+	walk(v, 0)
+	return b.String()
+}
+
+// The signature must still SEE a real difference. Without this, berShape9335
+// could return a constant and every assertion built on it would pass — the
+// failure mode of every summarising comparison.
+func TestTheShapeSignatureDiscriminates9335(t *testing.T) {
+	a := &Agent{}
+	up := a.buildLinkTrapsForVersion("public", "v2", "", true, 5, "ge-0-0-0")
+	down := a.buildLinkTrapsForVersion("public", "v2", "", false, 5, "ge-0-0-0")
+	if len(up) != 1 || len(down) != 1 {
+		t.Fatalf("want one packet each, got %d and %d", len(up), len(down))
+	}
+	upMsg, ok := berFind9123(t, up[0], tagSequence)
+	if !ok {
+		t.Fatal("no outer SEQUENCE in the link-up packet")
+	}
+	downMsg, ok := berFind9123(t, down[0], tagSequence)
+	if !ok {
+		t.Fatal("no outer SEQUENCE in the link-down packet")
+	}
+	if berShape9335(t, upMsg) == berShape9335(t, downMsg) {
+		t.Error("linkUp and linkDown produce the SAME shape signature, so the " +
+			"signature discards the very differences it is used to detect")
+	}
+
+	// And it must be STABLE across repeated builds of the same trap — the
+	// property the old length check failed to have. Twenty iterations is not a
+	// proof at a 1.08% rate, but a signature that varies at all here fails
+	// immediately rather than in someone else's package.
+	base := berShape9335(t, upMsg)
+	for i := 0; i < 20; i++ {
+		pkts := a.buildLinkTrapsForVersion("public", "v2", "", true, 5, "ge-0-0-0")
+		msg, ok := berFind9123(t, pkts[0], tagSequence)
+		if !ok {
+			t.Fatal("no outer SEQUENCE")
+		}
+		if got := berShape9335(t, msg); got != base {
+			t.Fatalf("shape varied across two builds of the SAME trap on iteration "+
+				"%d; the signature is not invariant to the randomized request-id", i)
+		}
 	}
 }
