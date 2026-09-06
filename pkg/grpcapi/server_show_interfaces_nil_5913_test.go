@@ -92,7 +92,7 @@ func TestShowInterfacesExtensiveNilSlots5913(t *testing.T) {
 
 	var buf strings.Builder
 	require5913NoPanic(t, "showInterfacesExtensive", func() {
-		if err := (&Server{}).showInterfacesExtensive(cfg, &buf); err != nil {
+		if err := (&Server{}).showInterfacesExtensive(cfg, "", &buf); err != nil {
 			t.Fatalf("showInterfacesExtensive error = %v", err)
 		}
 	})

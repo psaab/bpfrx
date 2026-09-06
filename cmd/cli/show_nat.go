@@ -24,7 +24,12 @@ func (c *ctl) handleShowNAT(args []string) error {
 			return c.showNATSourceSummary()
 		}
 		if len(args) >= 2 && args[1] == "pool" {
-			return c.showNATPoolStats()
+			// #9065: args[2], the pool name, used to be discarded here.
+			poolName := ""
+			if len(args) >= 3 {
+				poolName = args[2]
+			}
+			return c.showNATPoolStats(poolName)
 		}
 		if len(args) >= 3 && args[1] == "persistent-nat-table" && args[2] == "detail" {
 			return c.showCommand("show security nat source persistent-nat-table detail")
@@ -225,12 +230,29 @@ func (c *ctl) showNATSourceSummary() error {
 	return nil
 }
 
-func (c *ctl) showNATPoolStats() error {
+// showNATPoolStats renders `show security nat source pool [<name>]`.
+//
+// #9065: the pool name was read off args[2] and DISCARDED — the operator asked
+// about one pool and was shown every pool, with nothing saying the selector had
+// been dropped. Scoped CLIENT-SIDE deliberately: GetNATPoolStatsRequest carries
+// no selector (`{}` in xpf.proto), so the daemon does identical work either way
+// and only the printing differs. Adding a proto field to narrow it would be a
+// wire change for no server-side saving.
+//
+// An unmatched name FAILS rather than printing nothing: "no such pool" and
+// "this pool has no sessions" must not read identically, which is the same
+// silence the dropped selector produced.
+func (c *ctl) showNATPoolStats(name string) error {
 	resp, err := c.client.GetNATPoolStats(c.ctx(), &pb.GetNATPoolStatsRequest{})
 	if err != nil {
 		return fmt.Errorf("%v", err)
 	}
+	matched := false
 	for _, p := range resp.Pools {
+		if name != "" && p.Name != name {
+			continue
+		}
+		matched = true
 		fmt.Printf("Pool name: %s\n", p.Name)
 		fmt.Printf("  Address: %s\n", p.Address)
 		if !p.IsInterface {
@@ -241,6 +263,9 @@ func (c *ctl) showNATPoolStats() error {
 			fmt.Printf("  Active sessions: %d\n", p.UsedPorts)
 		}
 		fmt.Println()
+	}
+	if name != "" && !matched {
+		return fmt.Errorf("source NAT pool %q not found", name)
 	}
 	return nil
 }

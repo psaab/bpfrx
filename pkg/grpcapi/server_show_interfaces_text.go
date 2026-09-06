@@ -34,7 +34,16 @@ import (
 // showInterfacesExtensive renders the Junos-style extensive interface
 // listing — admin/oper state, description, speed/duplex from sysfs,
 // MTU, MAC, kernel and BPF traffic counters, and address list.
-func (s *Server) showInterfacesExtensive(cfg *config.Config, buf *strings.Builder) error {
+// showInterfacesExtensive renders `show interfaces [<name>] extensive`.
+//
+// #9065: filter is honoured here for the same reason the detail twin honours
+// its own — the remote CLI can now bind an interface name to this topic, and a
+// client that sends a selector the server ignores is worse than one that never
+// sent it: the operator asked about one interface, gets every interface, and
+// nothing says the selector was discarded. Exact-match on the kernel name,
+// matching showInterfacesDetail's rule so the two topics cannot disagree about
+// what a selector means.
+func (s *Server) showInterfacesExtensive(cfg *config.Config, filter string, buf *strings.Builder) error {
 	linksList, err := netlink.LinkList()
 	if err != nil {
 		return status.Errorf(codes.Internal, "listing interfaces: %v", err)
@@ -69,6 +78,9 @@ func (s *Server) showInterfacesExtensive(cfg *config.Config, buf *strings.Builde
 	for _, link := range linksList {
 		attrs := link.Attrs()
 		if attrs.Name == "lo" {
+			continue
+		}
+		if filter != "" && attrs.Name != filter {
 			continue
 		}
 		adminUp := attrs.Flags&net.FlagUp != 0
@@ -293,7 +305,9 @@ func (s *Server) showInterfacesDetail(cfg *config.Config, filter string, buf *st
 // showInterfacesStatistics renders the per-interface kernel
 // counter table (input/output packets/bytes/errors), excluding lo,
 // VRFs, XFRM, and GRE devices.
-func (s *Server) showInterfacesStatistics(buf *strings.Builder) error {
+// showInterfacesStatistics renders `show interfaces [<name>] statistics`.
+// filter is honoured for the #9065 reason recorded on showInterfacesExtensive.
+func (s *Server) showInterfacesStatistics(filter string, buf *strings.Builder) error {
 	linksList, err := netlink.LinkList()
 	if err != nil {
 		return status.Errorf(codes.Internal, "listing interfaces: %v", err)
@@ -307,6 +321,9 @@ func (s *Server) showInterfacesStatistics(buf *strings.Builder) error {
 		name := link.Attrs().Name
 		if name == "lo" || strings.HasPrefix(name, "vrf-") ||
 			strings.HasPrefix(name, "xfrm") || strings.HasPrefix(name, "gre-") {
+			continue
+		}
+		if filter != "" && name != filter {
 			continue
 		}
 		st := link.Attrs().Statistics

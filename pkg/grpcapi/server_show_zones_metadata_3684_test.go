@@ -95,7 +95,7 @@ func TestGRPCZoneDetailPolicyMetadata(t *testing.T) {
 	s := metadataZoneGRPCServer(t, map[string]bool{"workhours": false})
 
 	var buf strings.Builder
-	s.showZonesDetail(s.store.ActiveConfig(), &buf)
+	s.showZonesDetail(s.store.ActiveConfig(), "", &buf)
 	out := buf.String()
 
 	for _, want := range []string{
@@ -120,7 +120,7 @@ func TestGRPCZoneDetailPolicyMetadataActiveScheduler(t *testing.T) {
 	s := metadataZoneGRPCServer(t, map[string]bool{"workhours": true})
 
 	var buf strings.Builder
-	s.showZonesDetail(s.store.ActiveConfig(), &buf)
+	s.showZonesDetail(s.store.ActiveConfig(), "", &buf)
 	out := buf.String()
 
 	if strings.Contains(out, "(inactive)") {

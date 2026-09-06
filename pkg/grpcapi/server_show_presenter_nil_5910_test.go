@@ -134,7 +134,7 @@ func TestShowZonesDetailNilIfaceSlots5910(t *testing.T) {
 			s := &Server{store: store} // dp nil: skip counters, run interface detail
 			var buf strings.Builder
 			require5910NoPanic(t, "showZonesDetail "+tc.name, func() {
-				s.showZonesDetail(cfg, &buf)
+				s.showZonesDetail(cfg, "", &buf)
 			})
 			if tc.wantAddress && !strings.Contains(buf.String(), "127.0.0.1/8") {
 				t.Fatalf("valid unit address dropped by nil-unit skip:\n%s", buf.String())

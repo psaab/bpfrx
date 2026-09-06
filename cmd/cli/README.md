@@ -64,6 +64,46 @@ The split is pure code motion. All handlers moved verbatim; the gRPC
 call sequences and the text-proxy fallthrough are preserved so the
 remote CLI output stays bit-identical to before.
 
+## Selectors are not positional (#9065)
+
+An operational command may carry both a **selector** (an operator-supplied
+value — an interface name, a zone, a pool) and one or more **modifiers**
+(declared keywords such as `detail`, `terse`, `extensive`). This package used
+to decide which was which by POSITION: `if args[1] == "detail"`. That is wrong
+by construction, because `show interfaces ge-0/0/1 extensive` and
+`show interfaces extensive` differ by which words are keywords, not by index —
+so at whichever token a ladder failed to enumerate, the modifier overwrote the
+selector or both were dropped. `show interfaces ge-0/0/1 extensive` sent
+`Filter="extensive"`, matched nothing, and printed EMPTY output for an
+interface that exists.
+
+Fixing that per command re-opens the class at the next word — which is
+empirically what happened when `global` was fixed on the filtered policy path
+and `brief` was left broken one line above it. So:
+
+**Use `cmdtree.SplitModifiersAt` / `cmdtree.SplitModifiers`.** The command
+tree is the authority on which words are keywords at a node, so a modifier
+child added to the tree later is handled here for free instead of becoming the
+next member. The split is position-independent, resolves abbreviations by the
+same prefix rule as the rest of the tree, and reports a second value (`Extra`)
+and an ambiguous keyword (`Ambiguous`) rather than silently binding either.
+
+**Never silently discard a selector.** Either bind it into the request, scope
+the response client-side, or REFUSE the command with an error naming it. The
+third outcome — issuing a request for a different question and printing the
+answer — is the defect: the operator is shown output that looks valid and is
+told nothing. Where the selector is scoped client-side (`show security zones`,
+`show security nat source pool`, `show security policies from-zone/to-zone`),
+an unmatched value must FAIL rather than print an empty body, because "no such
+zone" and "this zone is empty" otherwise read identically.
+
+`selector_survives_modifier_9065_test.go` is the completeness gate: it walks
+every operational-tree node declaring a value slot beside keyword children and
+drives each (selector, modifier) pair through `handleShow`. Its header records
+what it can and cannot see — notably that a selector honoured client-side is
+indistinguishable from one dropped, which is why the obvious per-node
+strengthening was written, measured, and withdrawn.
+
 ## Interactive loop & signals
 
 The interactive session runs two goroutines against one `ctl`:

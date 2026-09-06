@@ -62,7 +62,7 @@ func TestShowSecurityZonesTextSurfacesOmittedScreenChecks(t *testing.T) {
 	cfg := maximalScreenTextStore(t)
 	s := &Server{}
 	var buf strings.Builder
-	s.showZonesDetail(cfg, &buf)
+	s.showZonesDetail(cfg, "", &buf)
 	out := buf.String()
 	if !strings.Contains(out, "Enabled checks:") {
 		t.Fatalf("zones detail missing Enabled checks line; got:\n%s", out)

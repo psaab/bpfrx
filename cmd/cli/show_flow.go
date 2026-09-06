@@ -39,6 +39,10 @@ type flowSessionParse struct {
 	action    flowSessionAction
 	sortKey   string
 	hasFilter bool // a traffic-filter predicate token was supplied
+	// zoneName is the `zone <v>` token EXACTLY as typed, unresolved.
+	// Resolution needs a GetZones round trip, which a pure parse must not
+	// make, so the caller resolves it — see resolveSessionZone (#9065).
+	zoneName string
 }
 
 // parseFlowSessionArgs strictly parses the remote-CLI session filter
@@ -62,15 +66,20 @@ func parseFlowSessionArgs(args []string) (*flowSessionParse, error) {
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "zone":
+			// #9065: this ran strconv.ParseUint on the value and answered
+			// `invalid zone "trust"` for every real zone name. Three
+			// independent contrasts said it was wrong: the local console
+			// resolves the name through cr.ZoneIDs (pkg/cli/session_filter.go),
+			// pkg/cmdtree offers zone NAMES as the completion set for this exact
+			// path (tree.go:527) so the tree offered a completion this binary
+			// then rejected, and the SAME binary's `clear security flow session
+			// zone` takes a string (clear.go). The token is kept as typed and
+			// resolved by the caller.
 			v, err := takeValue(&i, "zone")
 			if err != nil {
 				return nil, err
 			}
-			n, err := strconv.ParseUint(v, 10, 32)
-			if err != nil {
-				return nil, fmt.Errorf("invalid zone %q", v)
-			}
-			p.req.Zone = uint32(n)
+			p.zoneName = v
 			p.hasFilter = true
 		case "protocol":
 			v, err := takeValue(&i, "protocol")
@@ -202,6 +211,9 @@ func (c *ctl) showFlowSession(args []string) error {
 	}
 	req := p.req
 	brief := p.brief
+	if err := c.resolveSessionZone(p); err != nil {
+		return err
+	}
 
 	resp, err := c.client.GetSessions(c.ctx(), req)
 	if err != nil {
@@ -417,4 +429,50 @@ func (c *ctl) showFlowStatistics() error {
 	}
 
 	return nil
+}
+
+// resolveSessionZone binds `show security flow session zone <name>` to the zone
+// id GetSessions filters on (#9065).
+//
+// THE WILDCARD IS THE TRAP. GetSessionsRequest.Zone == 0 means "every zone", so
+// a resolve that failed soft would silently WIDEN the inspected set — the exact
+// class of defect being fixed, and worse than the loud `invalid zone "trust"`
+// it replaces. An unresolvable name is therefore an ERROR, mirroring the
+// server's own `zone %q not found` (server_sessions.go).
+//
+// ZoneInfo.Id is populated from the same cr.ZoneIDs space GetSessions filters
+// on, and config.StableZoneID is uint16-bounded to [1, 65533], so the
+// server's `req.Zone > 65535` reject can never trip on a real zone id. An id of
+// 0 in the response means the daemon has no apply result yet — indistinguishable
+// on the wire from the wildcard, so it is refused rather than sent.
+//
+// A NUMERIC token is accepted only when no zone bears that NAME, so a zone
+// literally named "5" keeps precedence over id 5 and existing numeric scripts
+// still work.
+func (c *ctl) resolveSessionZone(p *flowSessionParse) error {
+	if p.zoneName == "" {
+		return nil
+	}
+	resp, err := c.client.GetZones(c.ctx(), &pb.GetZonesRequest{})
+	if err != nil {
+		return fmt.Errorf("resolving zone %q: %v", p.zoneName, err)
+	}
+	for _, z := range resp.GetZones() {
+		if z.GetName() != p.zoneName {
+			continue
+		}
+		if z.GetId() == 0 {
+			return fmt.Errorf("zone %q has no runtime id yet (no configuration has "+
+				"been applied), so it cannot be used as a session filter; zone id 0 is "+
+				"the request's WILDCARD and would silently match every zone",
+				p.zoneName)
+		}
+		p.req.Zone = z.GetId()
+		return nil
+	}
+	if n, cerr := strconv.ParseUint(p.zoneName, 10, 32); cerr == nil && n > 0 {
+		p.req.Zone = uint32(n)
+		return nil
+	}
+	return fmt.Errorf("zone %q not found", p.zoneName)
 }

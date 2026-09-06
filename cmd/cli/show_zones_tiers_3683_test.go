@@ -80,7 +80,7 @@ func TestShowZonesRendersGlobalAndDefaultTiers(t *testing.T) {
 	c := &ctl{client: fake}
 
 	out := captureStdout(t, func() {
-		if err := c.showZones(); err != nil {
+		if err := c.showZones(""); err != nil {
 			t.Fatalf("showZones: %v", err)
 		}
 	})
@@ -142,7 +142,7 @@ func TestShowZonesNoTransitPoliciesShowsDefaultOnly(t *testing.T) {
 	c := &ctl{client: fake}
 
 	out := captureStdout(t, func() {
-		if err := c.showZones(); err != nil {
+		if err := c.showZones(""); err != nil {
 			t.Fatalf("showZones: %v", err)
 		}
 	})

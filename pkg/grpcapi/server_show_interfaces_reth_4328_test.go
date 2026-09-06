@@ -185,7 +185,7 @@ func TestShowInterfacesTextExtensiveReth4328(t *testing.T) {
 	s := rethShowGRPCStore(t)
 	cfg := s.store.ActiveConfig()
 	var buf strings.Builder
-	if err := s.showInterfacesExtensive(cfg, &buf); err != nil {
+	if err := s.showInterfacesExtensive(cfg, "", &buf); err != nil {
 		t.Fatalf("showInterfacesExtensive: %v", err)
 	}
 	out := buf.String()

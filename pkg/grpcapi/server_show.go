@@ -162,7 +162,7 @@ func (s *Server) showText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 	switch req.Topic {
 	case "zones-detail":
 		// #1043 Phase 8: case body extracted to server_show_zones_text.go
-		s.showZonesDetail(cfg, &buf)
+		s.showZonesDetail(cfg, req.Filter, &buf)
 
 	case "ipsec-statistics":
 		// #1043 Phase 12: case body extracted to server_show_security_text.go
@@ -385,7 +385,7 @@ func (s *Server) showText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 
 	case "interfaces-extensive":
 		// #1043 Phase 6: case body extracted to server_show_interfaces_text.go
-		if err := s.showInterfacesExtensive(cfg, &buf); err != nil {
+		if err := s.showInterfacesExtensive(cfg, req.Filter, &buf); err != nil {
 			return nil, err
 		}
 
@@ -397,7 +397,7 @@ func (s *Server) showText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 
 	case "interfaces-statistics":
 		// #1043 Phase 6: case body extracted to server_show_interfaces_text.go
-		if err := s.showInterfacesStatistics(&buf); err != nil {
+		if err := s.showInterfacesStatistics(req.Filter, &buf); err != nil {
 			return nil, err
 		}
 
