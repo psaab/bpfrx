@@ -251,9 +251,27 @@ func (t *ConfigTree) FormatPathSet(path []string) string {
 func formatSetNodes(b *strings.Builder, nodes []*Node, prefix []string, prefixQuote, prefixGroup []bool) {
 	for _, n := range canonicalOrder(nodes) {
 		path, pathQuote, pathGroup := appendNodeKeysGrouped(prefix, prefixQuote, prefixGroup, n)
-		if n.IsLeaf {
+		switch {
+		case n.IsLeaf:
 			fmt.Fprintf(b, "set %s\n", joinKeysProvGrouped(path, pathQuote, pathGroup))
-		} else {
+		case len(n.Children) == 0:
+			// #9126: AN EMPTY CONTAINER MUST STILL EMIT ITS OWN `set` LINE.
+			//
+			// Recursing into no children emits nothing, so the container
+			// vanished from `show | display set` and the round trip lost it.
+			// When it was ALSO deactivated the output was actively broken: a
+			// bare `deactivate <path>` with no preceding `set`, which
+			// setInactiveAtPath rejects with `container %q does not exist`.
+			// LoadSet and LoadMerge are atomic, so that one line aborts the
+			// WHOLE restore -- it fails loudly and closed, but it costs the
+			// transaction.
+			//
+			// Emitting the container is what Junos does and what makes the
+			// deactivate replayable; there is no other line that could carry
+			// it, because a container with no children has no leaf to hang it
+			// off.
+			fmt.Fprintf(b, "set %s\n", joinKeysProvGrouped(path, pathQuote, pathGroup))
+		default:
 			formatSetNodes(b, n.Children, path, pathQuote, pathGroup)
 		}
 		if n.Inactive {

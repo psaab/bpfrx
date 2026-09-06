@@ -23,9 +23,28 @@ func TestElidedBareFlagDelete8997(t *testing.T) {
 		wantErr  bool
 		wantLeft string // FormatSet of the tree afterwards, when the delete succeeds
 	}{
+		// #9126 CORRECTED THESE EXPECTATIONS, and the correction is the
+		// interesting part. `want ""` was asserting a property of the SET VIEW,
+		// not of the tree: deleting the leaf leaves its now-empty ancestor
+		// containers behind, and FormatSet used to render an empty container as
+		// NOTHING, so they were invisible here.
+		//
+		// `show configuration` always showed them -- measured, before this test
+		// was ever written:
+		//
+		//	before  chassis { cluster { strict-session-auth; } }
+		//	delete  err=<nil>
+		//	after   chassis { cluster { } }          <- the braced view
+		//	after   ""                               <- the set view, pre-#9126
+		//
+		// So the two views DISAGREED and this cell recorded the one that was
+		// hiding something. The leftover empty containers are a real,
+		// pre-existing question -- deletePath does not prune an ancestor it
+		// emptied -- and are filed separately; they are not this fix's doing
+		// and not this cell's subject.
 		{"fully packed", `chassis cluster strict-session-auth;`, false, ""},
-		{"cluster brace elided", `chassis { cluster strict-session-auth; }`, false, ""},
-		{"fully braced (control — worked before)", `chassis { cluster { strict-session-auth; } }`, false, ""},
+		{"cluster brace elided", `chassis { cluster strict-session-auth; }`, false, "set chassis"},
+		{"fully braced (control — worked before)", `chassis { cluster { strict-session-auth; } }`, false, "set chassis cluster"},
 
 		// The flag elided BESIDE a sibling that must survive.
 		{
