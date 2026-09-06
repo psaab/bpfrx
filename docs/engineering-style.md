@@ -93,6 +93,45 @@ So:
   the population it measures cannot detect a coverage loss, because the
   population is what moved.
 
+### Hand over a MECHANISM, not a count — and gate a shared helper with a DIFFERENTLY-FILTERED instrument
+
+Two rules that came out of the same afternoon, both about what a finding does to
+the person who receives it.
+
+**A COUNT INVITES A FIX SCOPED TO THE COUNTED ROWS.** A lane found that three
+census rows were mislabelled `vacuous` and, rather than filing "3 rows are
+wrong", handed over the mechanism plus an explicit lower bound because their
+schema walk was crude. The real cause sat one level above: the generator derived
+every value from the leaf's NAME when the schema already carried an example --
+`530 leaves, 57 typed, 42 handed a placeholder their validator rejects`. Filing
+the count would have made three special cases the plausible remedy and left 39
+typed leaves still guessed. The mechanism invited a fix where the mechanism
+lived: one lookup.
+
+This does NOT contradict "publish the denominator" or "an aggregate count is not
+reviewable". Those are rules for a CLAIM. This is a rule for a HANDOFF: a number
+tells the recipient how big the problem is and simultaneously tells them where to
+stop looking. State the count for scale, hand over the mechanism for repair, and
+say which of the two you are confident in.
+
+**A CHANGE TO A SHARED TRAVERSAL HELPER MUST BE GATED BY AN INSTRUMENT WHOSE
+POPULATION FILTER DIFFERS FROM THE ONE THAT MOTIVATED THE CHANGE.**
+
+The concrete instance: an edit to `expandFlatRun` broke three leaves at three
+unrelated containers, every one of them `multi` -- and `!multi` is the #8939
+collector's own eligibility filter, so its fixture reported nothing at any of
+them. `TestSchemaSpellingDifferentialGate` caught all three because it sweeps a
+differently-filtered population and reports per-spelling verdicts.
+
+Today the full-package gate enforces this by accident. **The reason it works is
+not that it is bigger, it is that it is differently filtered** -- so a future
+scoped gate would look like a reasonable optimisation and would silently remove
+the only instrument that can see this class. That is why the rule is written
+here rather than left to package scope.
+
+Corollary, from the same instance: a wrong-population blind spot does not fail
+once. It fails silently every time the same helper meets the same excluded class.
+
 ### `git stash` is REPO-GLOBAL. In a multi-worktree repo it is a shared stack.
 
 Every worktree of one repository shares **one** stash stack. `git stash pop`
