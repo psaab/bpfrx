@@ -101,11 +101,34 @@ func expandFlatRun(children []*Node, container *schemaNode) []*Node {
 		// Split this node's Keys at every token the container declares as
 		// another leaf. The first keyword keeps the node; each later one
 		// becomes a synthesized sibling.
+		// #9124: A LEAF'S DECLARED VALUE SLOTS ARE NOT CUT CANDIDATES.
+		//
+		// The scan used to test every index from 1, so index 1 of an `args: 1`
+		// leaf -- its VALUE -- was a cut point whenever the value happened to
+		// spell another leaf of the same container:
+		//
+		//	security ike gateway gw1 { ike-policy address; address 198.51.100.1; }
+		//
+		// with a policy legitimately NAMED `address` cut `ike-policy address`
+		// into `ike-policy` + `address`, so the gateway compiled with
+		// IKEPolicy="" and committed CLEAN at CheckText with zero warnings.
+		// The trigger is a naming coincidence rather than an ordinary spelling,
+		// which is why it survived: the operator's own object name has to equal
+		// a sibling keyword.
+		//
+		// Skipping `args` tokens after each cut point is the whole fix, and it
+		// is the same information the schema already carries for the SetPath
+		// walk -- the scan simply never asked for it.
 		cut := []int{0}
-		for i := 1; i < len(n.Keys); i++ {
-			if sib := resolveSchemaChild(container, n.Keys[i]); sib != nil {
-				cut = append(cut, i)
+		i := 1 + leaf.args
+		for ; i < len(n.Keys); i++ {
+			sib := resolveSchemaChild(container, n.Keys[i])
+			if sib == nil {
+				continue
 			}
+			cut = append(cut, i)
+			// The sibling's own value slots belong to it, not to the next cut.
+			i += sib.args
 		}
 		if len(cut) > 1 {
 			changed = true
