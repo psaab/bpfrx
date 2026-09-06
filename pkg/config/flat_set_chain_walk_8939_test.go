@@ -126,7 +126,32 @@ func (l flatSetLeaf) spell() string {
 	return l.name + " " + flatSetSyntheticValue(l.name)
 }
 
+// flatSetCollectorReach records what the COLLECTOR discarded before the census
+// ran. THE RATCHET GUARDS THE POPULATION; THE POPULATION IS FILTERED FIRST.
+//
+// A guard, however correct, only ever sees what survived the filter above it --
+// so a pre-filter blind spot is a different failure from a missing guard and
+// cannot be caught by tightening one. lane-8015 found exactly this in the
+// #8436 duplicate-block census: 139 eligible containers, 85 discarded by the
+// collector, 9 examined, and the headline read `SILENT: 0`.
+//
+// This collector discards a container that declares fewer than two ELIGIBLE
+// leaves, where eligible means `children == nil && wildcard == nil && !multi`.
+// Both exclusions are defensible -- a leaf with children is a container, and a
+// `multi` leaf absorbs a trailing run BY DESIGN (#2419 bracketed lists) -- but
+// defensible is not the same as visible, and `losers=48` over 140 containers
+// and over 376 are the same string.
+type flatSetCollectorReach struct {
+	visited  int // containers walked (depth<=6, groups excluded)
+	zeroLeaf int // dropped: no eligible leaf
+	oneLeaf  int // dropped: exactly one, so no two-leaf run is possible
+	reached  int // 2+ eligible leaves -- these are what the census measures
+}
+
+var flatSetReach flatSetCollectorReach
+
 func flatSetChainPairs() []flatSetChainRow {
+	flatSetReach = flatSetCollectorReach{}
 	var out []flatSetChainRow
 	seen := map[string]bool{}
 	var walk func(path []string, n *schemaNode, depth int)
@@ -141,6 +166,18 @@ func flatSetChainPairs() []flatSetChainRow {
 			}
 		}
 		sort.Slice(leaves, func(i, j int) bool { return leaves[i].name < leaves[j].name })
+		if key := strings.Join(path, " "); !seen["reach:"+key] {
+			seen["reach:"+key] = true
+			flatSetReach.visited++
+			switch len(leaves) {
+			case 0:
+				flatSetReach.zeroLeaf++
+			case 1:
+				flatSetReach.oneLeaf++
+			default:
+				flatSetReach.reached++
+			}
+		}
 		if len(leaves) >= 2 {
 			if key := strings.Join(path, " "); !seen[key] {
 				seen[key] = true
@@ -387,8 +424,12 @@ func TestFlatSetChainWalkRatchet8939(t *testing.T) {
 	// and `walked` and never touches the loser list, so the control could be
 	// dropped in silence. Recording all four counts is what makes it a
 	// control rather than a comment.
-	got := fmt.Sprintf("# counts: losers=%d walked=%d vacuous=%d unmeasured=%d\n",
-		len(losers), walked, vacuous, unmeasured) +
+	got := fmt.Sprintf("# counts: losers=%d walked=%d vacuous=%d unmeasured=%d\n"+
+		"# collector reach: %d containers walked, %d reached the census "+
+		"(%d dropped: no eligible leaf, %d dropped: only one)\n",
+		len(losers), walked, vacuous, unmeasured,
+		flatSetReach.visited, flatSetReach.reached,
+		flatSetReach.zeroLeaf, flatSetReach.oneLeaf) +
 		strings.Join(losers, "\n") + "\n"
 	if os.Getenv("UPDATE_8939") != "" {
 		if err := os.WriteFile(flatSetChainFixture, []byte(got), 0o644); err != nil {
@@ -473,6 +514,11 @@ func flatSetDiff(want, got string) string {
 			fmt.Fprintf(&b, "  ! counts moved, now: %s\n", strings.TrimPrefix(l, "# counts: "))
 			continue
 		}
+		if strings.HasPrefix(l, "# collector reach:") {
+			fmt.Fprintf(&b, "  ! COLLECTOR REACH moved, now: %s\n",
+				strings.TrimPrefix(l, "# collector reach: "))
+			continue
+		}
 		fmt.Fprintf(&b, "  + NEWLY LOSING (regression): %s\n", l)
 	}
 	for l := range w {
@@ -481,6 +527,11 @@ func flatSetDiff(want, got string) string {
 		}
 		if strings.HasPrefix(l, "# counts:") {
 			fmt.Fprintf(&b, "  ! counts were:       %s\n", strings.TrimPrefix(l, "# counts: "))
+			continue
+		}
+		if strings.HasPrefix(l, "# collector reach:") {
+			fmt.Fprintf(&b, "  ! COLLECTOR REACH was:        %s\n",
+				strings.TrimPrefix(l, "# collector reach: "))
 			continue
 		}
 		fmt.Fprintf(&b, "  - no longer losing (fixed):  %s\n", l)
