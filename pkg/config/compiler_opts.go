@@ -1666,6 +1666,22 @@ type compileOpts struct {
 	// and a leniently-loaded bad neighbor is inert. Same doctrine as
 	// lenientRoutingExportRef.
 	lenientBGPNeighborPeerAS bool
+
+	// lenientBGPDuplicateNeighbor (#9007) downgrades the duplicate BGP
+	// neighbor gate (validateBGPDuplicateNeighborStrict) from a hard compile
+	// error to a cfg.Warnings entry on the tolerant load / peer-sync paths.
+	// The same neighbor address in two `protocols bgp group` blocks renders
+	// once per group -- two remote-as, two timers, two divergent `password`
+	// lines and two bfd peer blocks for one peer, resolved by render order
+	// with no signal to the operator, whose `show` still reports both groups
+	// as authored. Commit / commit-check hard-reject so a new operator edit
+	// fails loudly (as it does on Junos); an already-persisted or peer-synced
+	// config an older binary accepted must still BOOT, so it warns. The
+	// renderer is deliberately NOT deduped: the compiler emits one neighbor
+	// per AST node, so a first-wins dedup would drop the policy-bearing half
+	// of a single authored neighbor. Same #1960 fail-closed-on-load doctrine
+	// as lenientBGPNeighborPeerAS.
+	lenientBGPDuplicateNeighbor bool
 	// lenientBGPNeighborAddress (#6796) downgrades the BGP neighbor-address
 	// gate (validateBGPNeighborAddressStrict) from a hard compile error to a
 	// cfg.Warnings entry. The address is rendered RAW into frr.conf at 24
@@ -2665,6 +2681,7 @@ func lenientCompileOpts() compileOpts {
 		lenientRPMHTTPGetScheme:                true,
 		lenientRPMRoutingInstance:              true,
 		lenientBGPNeighborPeerAS:               true,
+		lenientBGPDuplicateNeighbor:            true,
 		lenientBGPNeighborAddress:              true,
 		lenientRouterID:                        true,
 		lenientSNMPTrapGroup:                   true,
