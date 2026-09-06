@@ -1276,13 +1276,33 @@ func (t *tunnelManager) clearLocked() error {
 	}
 	t.appliedAddrs = nil
 	t.appliedRI = nil
-	// Reset the WG-removal-prune tracking too (#1919). ClearTunnels does
-	// NOT delete WG links (they are persistent and not in tunnels/
-	// ownedNames) — only the tracking map is dropped so a post-Clear Apply
-	// re-adopts cleanly. Whether ClearTunnels should also flush WG
-	// addresses is deferred to #1434 (full teardown grammar). #1434 is
-	// CLOSED and ClearTunnels still does not flush them, so the open
-	// question is tracked on #8996.
+	// Reset the WG-removal-prune tracking too (#1919). Clear does NOT delete
+	// WG links (they are persistent and not in tunnels/ownedNames) — only the
+	// tracking map is dropped so a post-Clear Apply re-adopts cleanly.
+	//
+	// #8996: whether Clear should ALSO flush WG addresses was deferred here to
+	// #1434 for a long time and is now DECIDED: it must not, and the reason is
+	// in the code beside this rather than a matter of taste. The link is kept
+	// by #1432 S2a precisely because tearing one flaps the device and destroys
+	// the live peer/session and the FRR routes over it. Flushing the ADDRESSES
+	// destroys the connected route and the address that live session is using —
+	// the same harm S2a exists to prevent, one level down — while leaving the
+	// device up to imply it still works.
+	//
+	// Address hygiene on config REMOVAL is already handled, by a mechanism that
+	// can tell removal from teardown: Apply's #1919 WG-removal diff prunes a WG
+	// name that DISAPPEARED from config while keeping its link. Clear is not a
+	// removal and must not borrow that behaviour.
+	//
+	// WHAT DROPPING THE MAP COSTS, so it is not rediscovered as a defect: a WG
+	// tunnel removed from config ACROSS a Clear boundary is not in oldWG at the
+	// next Apply, so the #1919 prune cannot see it. That is the SAME
+	// restart-adoption limitation this manager already documents (a WG tunnel
+	// removed while the daemon was DOWN is not in wgConfigured on the next
+	// start) reached by a second route — the manager prunes only what it
+	// tracked applying — rather than a new gap.
+	//
+	// Pinned by TestClearTunnelsKeepsWireguardAddresses8996.
 	t.wgConfigured = nil
 	// clearLocked drains every keepalive runner first
 	// (stopAllKeepalivesLocked above), so no live runner holds a stale
