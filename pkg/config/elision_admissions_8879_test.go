@@ -1456,7 +1456,9 @@ func TestDepth2UnadmittedPopulation8929(t *testing.T) {
 		if got < wantPopulation {
 			verb = "SHRANK"
 		}
-		t.Errorf("depth-2 un-admitted population %s: got %d, want %d.\n"+
+		t.Errorf("depth-2 un-admitted population %s: got %d PAIRS, want %d PAIRS "+
+			"(unit: distinct (mid, head) pairs — NOT sites; one pair reached "+
+			"under two stanzas is ONE).\n"+
 			"GREW means a new depth-2 pair declares a body and is not admitted, "+
 			"so a spelling eliding its brace can drop it — measure it (braced "+
 			"vs the spelling that elides HEAD's brace under MID, not the "+
