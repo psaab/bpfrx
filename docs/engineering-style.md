@@ -436,10 +436,36 @@ the mechanics, so this section is sequencing only.
      can disagree productively.
 
    Iterate until BOTH reviewers are clean (or have explicit-with-
-   reason dispositions). Squash merge once CI is green and findings
-   are resolved. If the diff grows in response to review, push and
-   request a re-review — both Copilot and Codex re-fire on the new
-   HEAD.
+   reason dispositions), then merge once the findings are resolved AND
+   the gates below are green. If the diff grows in response to review,
+   push and request a re-review — both Copilot and Codex re-fire on the
+   new HEAD.
+
+   **"Once CI is green" used to stand here, and there is no CI (#9052
+   item 3).** `.github/` contains only `instructions/`; the Makefile says
+   so twice in as many words — *"There is no CI in this repo, so this is a
+   developer convenience, not an automated gate: nothing runs it unless
+   invoked"*. So the written merge criterion was **vacuously satisfiable**:
+   a PR could satisfy the procedure with `make test` alone, and every gate
+   below is developer-invoked and chained from no default target. Naming
+   the gates is the fix; a criterion that cannot be unsatisfied is not a
+   criterion.
+
+   Run what your diff touches, not all of them every time:
+
+   | Gate | Run it when |
+   |---|---|
+   | `make test` | always — Go **and** Rust; a Rust regression fails it |
+   | `go test ./...` | a `pkg/config` type change, or a NEW commit-time rejection: both have repo-wide blast radius, and a package list cannot see it |
+   | `make selftest` | image / day-0 / dist / deploy tooling |
+   | `make harness-census` | adding or moving anything under `test/incus/` or `scripts/userspace-*.sh` |
+   | `make ignored-cell-census` | adding or changing a Rust `#[ignore]` |
+   | `make go-skip-census` | adding or changing a Go `t.Skip` |
+   | `sudo make test-root` | touching the XDP shim — its behavioural cells SKIP unprivileged, and the #1864 verifier gate does not substitute (two distinct WRONG fixes pass it) |
+   | `make test-failover` | cluster, VRRP, session-sync or failover code — **mandatory**, self-locked, shared cluster |
+
+   The last two are the ones that get skipped, and they are the two whose
+   subjects nothing else examines.
 
 ## Hot-path coding discipline
 

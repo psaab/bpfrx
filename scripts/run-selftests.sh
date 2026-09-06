@@ -147,6 +147,8 @@ test/incus/harness-result-selftest.sh
 test/incus/harness-ledger-mutation-selftest.sh
 scripts/ignored-cell-census.sh
 test/incus/ignored-cell-census-selftest.sh
+scripts/go-skip-census.sh
+test/incus/go-skip-census-selftest.sh
 "
 for s in $SH_SCRIPTS; do
 	[ -f "$s" ] || continue
@@ -362,6 +364,16 @@ run_bash test/incus/harness-ledger-mutation-selftest.sh
 # must pass, because a census that reddened on everything would satisfy every
 # failure cell while being useless.
 run_bash test/incus/ignored-cell-census-selftest.sh
+
+# -- go-skip census (#9052 item 4) --
+#
+# The missing sibling of the three censuses above: `go test ./...` prints `ok`
+# for a package whose cells all skipped, so 318 skip call sites were invisible
+# to every gate in the repo. Its self-test is positive-control shaped — every
+# claim is paired with a fixture the census MUST reject — because a census that
+# cannot be made to fail is indistinguishable from one that examines nothing,
+# which is the defect the whole of #9052 is about.
+run_bash test/incus/go-skip-census-selftest.sh
 
 # -- harness reachability census (#8302) --
 #

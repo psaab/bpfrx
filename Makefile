@@ -77,6 +77,30 @@ install: build build-ctl
 # so a non-zero exit from either leg aborts the target (Make stops at the
 # first failing prerequisite) — a Rust test failure now fails `make test`.
 test: test-go test-rust
+	@echo ""
+	@echo "make test: NOT EXAMINED by this run — the XDP shim's behavioural"
+	@echo "  coverage (pkg/dataplane/userspace/fragment_disposition_7494_test.go)"
+	@echo "  SKIPS unprivileged. It is the ONLY behavioural coverage of the shim's"
+	@echo "  control flow, and the #1864 verifier gate does not substitute: two"
+	@echo "  distinct WRONG fixes both pass it. Run 'sudo make test-root' (#9052)."
+
+# #9052 item 1: the root-capable aggregate. `test-shim-run` was a prerequisite
+# of NOTHING — not of `test`, not of `selftest`, not of any ledger row — so the
+# only behavioural coverage of the shim was reachable solely by someone
+# remembering its name. That is the #7766 shape (a harness wired into no gate),
+# and silence was the worst available option: a green `make test` looked
+# identical whether the shim was covered or not.
+#
+# It is NOT a prerequisite of `test`, deliberately: `make test` must stay
+# runnable unprivileged, and a target that fails without root would make the
+# ordinary gate unusable. The remedy is the ANNOUNCEMENT above plus this named
+# aggregate — the gate now says what it did not examine instead of implying it
+# examined everything.
+.PHONY: test-root
+test-root: test-shim-run
+	@echo "make test-root: the privilege-gated legs ran."
+	@echo "  NOTE: some cells skip BECAUSE you are root (10 at last census)."
+	@echo "  No single run examines every cell; see 'make go-skip-census'."
 
 # Go suite. Invocation preserved exactly from the pre-#4006 `test` target.
 # #7494: behavioural coverage for the shim's own control flow, via
@@ -719,9 +743,20 @@ test-cluster-env-lib:
 # `#<issue>: ...` (comes back when that issue closes). With `gh` available it
 # also asserts every named issue is still OPEN, so closing the issue reds this
 # and whoever closed it must un-ignore the cell.
-.PHONY: ignored-cell-census test-ignored-cell-census-lib
+.PHONY: ignored-cell-census test-ignored-cell-census-lib go-skip-census test-go-skip-census-lib
 ignored-cell-census:
 	sh scripts/ignored-cell-census.sh --check-issues
+
+# #9052 item 4: the census over Go test SKIPS — the missing sibling of the
+# three that already exist (Rust `#[ignore]` above, shell harnesses in
+# harness-census, python in run-selftests). `go test ./...` prints `ok` for a
+# package whose cells all skipped: the summary line for "everything passed" and
+# "nothing ran" is byte-identical, and no leg passes -v.
+go-skip-census:
+	sh scripts/go-skip-census.sh
+
+test-go-skip-census-lib:
+	bash ./test/incus/go-skip-census-selftest.sh
 
 test-ignored-cell-census-lib:
 	bash ./test/incus/ignored-cell-census-selftest.sh
@@ -797,6 +832,20 @@ mouse-target-destroy:
 # workspaces so `cargo test` at the root does not reach it.
 # Run this after touching newflow_ceiling_analyze.py, newflow-gen, or the
 # harness's node selection (#6962 — newflow-ceiling-lib.sh + its selftest).
+# #9052 item 2: the cold-path-flooder crate was reached by NOTHING — no
+# Makefile recipe, no run-selftests.sh line, and not declared in
+# test/incus/HARNESSES.unreached either. It sits outside both cargo workspaces
+# by design, there is no root Cargo.toml, and `make test-rust` pins
+# --manifest-path userspace-dp/Cargo.toml, so 44 #[test] functions were
+# unreachable by construction.
+#
+# The wiring pattern already existed one target below, for the sibling
+# out-of-workspace crate newflow-gen, with the same "lives outside the
+# workspaces" reasoning. It was simply never applied here.
+.PHONY: test-cold-path-flooder
+test-cold-path-flooder:
+	cargo test --manifest-path test/incus/cold-path-flooder/Cargo.toml
+
 test-newflow-ceiling-lib:
 	cd test/incus && python3 -m unittest newflow_ceiling_analyze_test
 	cargo test --release --manifest-path test/incus/newflow-gen/Cargo.toml
