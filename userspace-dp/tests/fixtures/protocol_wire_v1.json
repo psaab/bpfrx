@@ -968,6 +968,7 @@
     "neighbor_warm_drops_total": 0,
     "owner_rg_filings_declined_total": 0,
     "packet_too_big_rate_limited_total": 0,
+    "peer_delete_refused_local_owned": 0,
     "pending_neigh_capacity_drops_total": 0,
     "pending_neigh_decap_drops_total": 0,
     "pending_neigh_duplicate_drops_total": 0,

@@ -236,6 +236,41 @@ func (s *SessionSync) takeDeleteGenV6(key dataplane.SessionKeyV6) uint64 {
 // generation to record on a successful apply (the incoming generation, or the
 // preserved stored generation when the incoming one is 0). The bool reports
 // whether the install should proceed.
+// WHAT THESE GUARDS ARE, AND THE ONE THING THEY ARE REPEATEDLY READ AS (#9048).
+//
+// installGenGuardV4/V6 and deleteGenGuardV4/V6 are per-key REORDERING guards
+// for ONE sender's stream (#2170). They answer "is this delta older than the
+// last one I applied for this key?" and nothing else.
+//
+// `stored == 0` therefore means "I HAVE NO ORDERING INFORMATION FOR THIS KEY",
+// not "this delta is safe". recvGenV4 is populated solely by
+// recordInstalledGenV4 — prior PEER installs — so a session THIS node created
+// itself has no stored generation and both guards admit anything for it. That
+// reads like a fall-through defect and it is not one: with no prior peer
+// install there is no ordering to violate, and refusing on gen-0 would break
+// every legitimate first install and every legacy (pre-#2170) sender, which is
+// exactly what the `incoming == 0` / `deleteGen == 0` arms are for.
+//
+// THEY ARE NOT OWNERSHIP GUARDS, and nothing here should become one. "May this
+// peer touch a session this node owns and is forwarding for?" is a different
+// question with different inputs (local origin + local HA state), and it is
+// answered one layer down in the dataplane helper, where both facts actually
+// live:
+//
+//   - INSTALL: SessionTable::upsert_synced_with_origin refuses to clobber a
+//     local-origin entry unless synced_entry_allows_local_replace says the
+//     incoming entry's owner RG is not locally forwarding-active.
+//   - DELETE: handle_delete_synced refuses to tear down a local-origin entry
+//     whose owner RG IS locally forwarding-active, counting
+//     PEER_DELETE_REFUSED_LOCAL_OWNED (#9048). Until then only the install
+//     verb had a guard, and the asymmetry was invisible because the two verbs
+//     are guarded in different files at different layers.
+//
+// Both are inert in normal operation: the delta EMITTER is gated on
+// IsPrimaryForRGFn, so exactly one node emits and the receiver's entries at
+// those keys carry a peer-synced origin. They fire only when both nodes are
+// primary for the same RG, which is what makes that helper counter a
+// split-brain indicator rather than a tuning knob.
 func (s *SessionSync) installGenGuardV4(key dataplane.SessionKey, incoming uint64) (record uint64, apply bool) {
 	s.recvGenMu.Lock()
 	defer s.recvGenMu.Unlock()

@@ -372,6 +372,7 @@ pub(crate) fn run() -> Result<(), String> {
             worker_command_queue_drops: 0,
             session_delete_replica_dropped: 0,
             session_delete_replica_drop_repaired: 0,
+            peer_delete_refused_local_owned: 0,
             shared_session_poison_recoveries: 0,
             session_install_stale_ignored: 0,
             session_delete_stale_ignored: 0,

@@ -21,15 +21,67 @@ pub(in crate::afxdp::session_glue) fn handle_delete_synced(
     sessions: &mut SessionTable,
     session_map_fd: c_int,
     forwarding: &ForwardingState,
+    // #9048: the local HA view, so a peer delete cannot tear down a session
+    // this node is actively forwarding for. Same two inputs the sibling
+    // `handle_upsert_synced` arm already takes.
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
     key: SessionKey,
     now_ns: u64,
+    now_secs: u64,
     deleted_keys: &mut Vec<SessionKey>,
     // #6211 F2: THIS worker's id. `DeleteSynced` is replicated to EVERY worker
     // queue (`replicate_session_delete`), so each worker drops its own holder
     // bit and the port is freed by whichever worker happens to be last.
     worker_id: u32,
 ) {
-    let delete_alias = sessions.lookup(&key, now_ns, 0);
+    let (delete_alias, existing_origin) = match sessions.lookup_with_origin(&key, now_ns, 0) {
+        Some((lookup, origin)) => (Some(lookup), Some(origin)),
+        None => (None, None),
+    };
+    // #9048: REFUSE a peer delete that would tear down a LIVE LOCAL session.
+    //
+    // This is the delete-side mirror of the install-side clobber guard in
+    // `SessionTable::upsert_synced_with_origin` ("Reject peer data that would
+    // clobber a locally-owned session"). Until now only the INSTALL verb had
+    // one, and the asymmetry was invisible because the two verbs are guarded
+    // in different files at different layers.
+    //
+    // WHY THE GENERATION GUARD DOES NOT COVER THIS, and why looking there is
+    // the natural mistake. `deleteGenGuardV4` (Go, pkg/cluster) refuses only
+    // when the STORED generation is non-zero, and `recvGenV4` is populated
+    // solely by `recordInstalledGenV4` — prior PEER installs. A session this
+    // node created itself has no stored generation, so the guard has no
+    // ordering information and admits the delete. That is CORRECT for the
+    // question it asks: it is a per-key reordering guard for one sender's
+    // stream (#2170), not an ownership guard, and gen-0 means "I cannot order
+    // this", not "this is safe". The ownership question is a different guard,
+    // and on this verb it did not exist.
+    //
+    // WHEN IT FIRES. Only when both nodes are primary for the same RG — the
+    // delta EMITTER is already gated on `IsPrimaryForRGFn`, so in normal
+    // operation exactly one node emits and the receiver's entries at those
+    // keys are peer-synced origin, leaving this guard inert. In a
+    // dual-primary split both nodes forward the same flows, both create
+    // LOCAL sessions under the same 5-tuples, and either node closing its
+    // copy syncs a delete that tears down the other's LIVE session
+    // mid-flight. Refusing is the conservative side: the worst case is a
+    // session that lingers until it ages out, against a live flow killed
+    // outright.
+    //
+    // Nothing else below runs either — not the NAT pool release, not the
+    // session-map delete, and NOT the `deleted_keys` record. #6457 records
+    // that key unconditionally so a stale flow-cache permit cannot outlive
+    // the table entry it was seeded from; here the table entry SURVIVES, so
+    // the permit is still backed and invalidating it would be wrong in the
+    // one direction #6457 does not consider.
+    let refuse = matches!(existing_origin, Some(origin) if !origin.is_peer_synced())
+        && delete_alias.as_ref().is_some_and(|lookup| {
+            owner_rg_is_locally_active(ha_state, lookup.metadata.owner_rg_id, now_secs)
+        });
+    if refuse {
+        PEER_DELETE_REFUSED_LOCAL_OWNED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     sessions.delete(&key);
     deleted_keys.push(key.clone());
     if let Some(lookup) = delete_alias {

@@ -452,6 +452,21 @@ type ProcessStatus struct {
 	// nothing ran #8576's NAT teardown on its behalf.
 	SessionDeleteReplicaDropped      uint64 `json:"session_delete_replica_dropped,omitempty"`
 	SessionDeleteReplicaDropRepaired uint64 `json:"session_delete_replica_drop_repaired,omitempty"`
+	// PeerDeleteRefusedLocalOwned is #9048: peer DeleteSynced commands the
+	// helper REFUSED because the key named a LIVE LOCAL session this node is
+	// actively forwarding for — the delete-side mirror of the install-side
+	// clobber guard in upsert_synced_with_origin.
+	//
+	// Nonzero means the cluster is, or recently was, DUAL-PRIMARY for some
+	// redundancy group. The delta emitter is gated on IsPrimaryForRGFn, so in
+	// normal operation exactly one node emits deletes and the receiver's
+	// entries at those keys carry a peer-synced origin — the guard is inert
+	// and this stays flat at 0. It is the ONLY surface that reports the
+	// refusal: the refusal itself is silent by design, because the condition
+	// that produces it produces one per closing flow, so a log line would be
+	// a storm exactly when the cluster is already in trouble. Decodes to 0
+	// for an older helper that does not send the key.
+	PeerDeleteRefusedLocalOwned uint64 `json:"peer_delete_refused_local_owned,omitempty"`
 	// #2402/#6641: shared-session mutex poison recoveries (a worker
 	// thread panicked while holding a shared-session or owner-RG-index
 	// mutex; the committed map was recovered and the poison cleared --
