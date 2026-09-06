@@ -139,6 +139,29 @@ type flatSetChainRow struct {
 type flatSetLeaf struct {
 	name string
 	args int
+	// placeholder is the schema's OWN token shape for this slot, e.g.
+	// "ascii-text <key>" for a 2-arg leaf. Used when args >= 2, where a single
+	// value cannot fill the slot.
+	//
+	// #9149, the THIRD sub-cause of one class. A leaf with `args: 2` --
+	// `security ike policy <p> pre-shared-key`, which Junos writes as
+	// `pre-shared-key ascii-text <secret>` -- was handed ONE token. The
+	// statement lands nowhere, split(2) equals split(1), vacuity control 2
+	// fires, and the row is filed as "the last leaf is not observable at all":
+	// a confident claim about the compiler produced by a command with the
+	// wrong NUMBER OF ARGUMENTS.
+	//
+	// Three sub-causes now, one class, all of them the harness GUESSING WHERE
+	// IT COULD HAVE ASKED:
+	//
+	//	the value derived from the leaf's NAME       -> #9108 (valueExamples)
+	//	the value that fails a TYPE validator        -> #9108 (valueExamples)
+	//	the value with the wrong ARITY               -> here (placeholder)
+	//
+	// Every one synthesizes a config the schema itself would reject, and in
+	// every one the schema carried the answer on the node the whole time --
+	// `valueExamples`, then `args`, then `placeholder`.
+	placeholder string
 	// example is the schema's OWN illustrative value for this slot
 	// (`valueExamples[0]`), empty when the schema declares none.
 	//
@@ -176,10 +199,43 @@ func (l flatSetLeaf) spell() string {
 	if l.args == 0 {
 		return l.name
 	}
+	if l.args >= 2 {
+		if toks := flatSetPlaceholderTokens(l.placeholder, l.args, l.name); toks != "" {
+			return l.name + " " + toks
+		}
+	}
 	if l.example != "" {
 		return l.name + " " + l.example
 	}
 	return l.name + " " + flatSetSyntheticValue(l.name)
+}
+
+// flatSetPlaceholderTokens renders a multi-arg slot from the schema's own
+// placeholder: a bare word is a LITERAL keyword and is kept verbatim, an
+// <angled> segment is a value and gets a synthetic one. "ascii-text <key>"
+// therefore yields "ascii-text xpfval".
+//
+// Returns "" when the placeholder does not account for exactly `args` tokens,
+// rather than padding or truncating -- a slot this function cannot fill
+// honestly should fall through to the existing path and be visible as such,
+// not be filled with a guess wearing the schema's authority.
+func flatSetPlaceholderTokens(placeholder string, args int, leafName string) string {
+	if placeholder == "" {
+		return ""
+	}
+	fields := strings.Fields(placeholder)
+	if len(fields) != args {
+		return ""
+	}
+	out := make([]string, 0, len(fields))
+	for _, f := range fields {
+		if strings.HasPrefix(f, "<") && strings.HasSuffix(f, ">") {
+			out = append(out, flatSetSyntheticValue(strings.Trim(f, "<>")))
+			continue
+		}
+		out = append(out, f)
+	}
+	return strings.Join(out, " ")
 }
 
 // flatSetCollectorReach records what the COLLECTOR discarded before the census
@@ -218,7 +274,7 @@ func flatSetChainPairs() []flatSetChainRow {
 		var leaves []flatSetLeaf
 		for k, c := range n.children {
 			if c != nil && c.children == nil && c.wildcard == nil && !c.multi {
-				lf := flatSetLeaf{name: k, args: c.args}
+				lf := flatSetLeaf{name: k, args: c.args, placeholder: c.placeholder}
 				if len(c.valueExamples) > 0 {
 					lf.example = c.valueExamples[0]
 				}
