@@ -576,6 +576,23 @@ step. Both are required — neither sees the other's case:
 - In cluster mode the package emits a blackhole default at admin distance
   250 so traffic to the active fabric peer survives a brief
   active/active overlap.
+- **A DHCP route's `vrf` clause names the KERNEL namespace, not the Junos
+  one (#9136).** `DHCPRoute.VRF` carries the BARE routing-instance name —
+  the suppression maps in `renderDHCPDefaults` key on it and are internally
+  consistent that way — but FRR knows `vrf-<name>`, the device
+  `pkg/routing/vrf.go` creates, and an `instance-type forwarding` instance
+  has no VRF device at all. `renderDHCPDefaults` previously interpolated the
+  bare name, so a tenant's DHCP-learned default named a VRF that does not
+  exist and a forwarding instance was given a `vrf` clause it can never
+  have. Both are now resolved through **`instanceRouteTarget`**, extracted
+  from `renderPreferredRoutes` so the two renderers cannot disagree:
+  `vrf <InstanceConfig.VRFName>` for a virtual-router, `table <TableID>` for
+  a forwarding instance, no clause when the instance carries neither (the
+  master table), and the historical `vrf-<name>` on a lookup miss. The
+  #5557/#8963 control-character belt still applies, now to the resolver's
+  output; the `table` arm needs none, `TableID` being an int.
+  Coupled to #9135: before that fix `DHCPRoute.VRF` was non-empty only for
+  a dash-authored config, so this clause was rarely exercised.
 - **DHCP default routes bind the originating interface for BOTH families
   (#2547).** `renderDHCPDefaults` (admin distance 200) emits `ip route
   0.0.0.0/0 <gw> <iface> 200` / `ipv6 route ::/0 <gw> <iface> 200` whenever

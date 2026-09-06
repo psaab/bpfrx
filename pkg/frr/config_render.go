@@ -292,6 +292,42 @@ func renderGenerateRoutes(b *strings.Builder, fc *FullConfig) {
 	b.WriteString("!\n")
 }
 
+// instanceRouteTarget resolves a BARE routing-instance name (as carried by
+// DHCPRoute.VRF and RouteOverlayEntry.RoutingInstance) to the FRR rendering
+// target for a route that belongs to it.
+//
+// The bare name is NOT a namespace FRR knows. A `virtual-router` instance is
+// backed by the kernel device `vrf-<name>` (pkg/routing/vrf.go), which is what
+// InstanceConfig.VRFName carries; an `instance-type forwarding` instance has no
+// VRF device at all, so daemon_ipmon.go sets VRFName="" and its routes belong in
+// the instance's dedicated kernel table (#1827 PR-2 — the same table the FBF
+// `ip rule`s and the dataplane's `<ri>.inet.0` snapshot target).
+//
+// A lookup MISS falls back to the historical "vrf-<name>" rendering, per the
+// InstanceConfig.Name doc, rather than to the bare name or to nothing.
+//
+// #9136 extracted this from renderPreferredRoutes so renderDHCPDefaults cannot
+// disagree with it. It had: renderDHCPDefaults interpolated the bare name, so a
+// DHCP-learned tenant default named a VRF that does not exist, and a forwarding
+// instance was given a `vrf` clause it can never have.
+func instanceRouteTarget(instances []InstanceConfig, name string) (vrfName string, tableID int) {
+	if name == "" {
+		return "", 0
+	}
+	vrfName = "vrf-" + name
+	for i := range instances {
+		if instances[i].Name != name {
+			continue
+		}
+		vrfName = instances[i].VRFName
+		if vrfName == "" {
+			tableID = instances[i].TableID
+		}
+		break
+	}
+	return vrfName, tableID
+}
+
 // renderDHCPDefaults emits DHCP-learned routes at admin distance 200: the
 // default route (option-3 gateway or the option-121 0.0.0.0/0 entry) plus
 // any RFC 3442 classless static routes (option 121 / legacy 249), each
@@ -383,15 +419,26 @@ func renderDHCPDefaults(b *strings.Builder, fc *FullConfig) {
 				}
 			}
 		}
-		// #8963: the `vrf <name>` clause, through sanitizeFRRValue for the same
-		// #5557 reason the static-route clause is sanitized -- the tolerant
-		// load / HA config-sync paths only warn, so a control character
-		// reaching here could inject a second vtysh line into the managed
-		// frr.conf. This is the single interpolation point for the DHCP route's
-		// vrf clause, matching how the static renderer keeps that property.
+		// #9136: dr.VRF is the BARE instance name (the suppression maps above
+		// key on it, and are internally consistent that way). FRR knows the
+		// kernel namespace, not the Junos one, so resolve through the shared
+		// instanceRouteTarget — `vrf vrf-<name>` for a virtual-router,
+		// `table <id>` for a forwarding instance, which has no VRF device.
+		// This previously emitted `vrf <bare>`, naming a VRF that does not
+		// exist, so the tenant's DHCP-learned default never reached its table.
+		//
+		// #8963: the clause goes through sanitizeFRRValue for the same #5557
+		// reason the static-route clause is sanitized -- the tolerant load / HA
+		// config-sync paths only warn, so a control character reaching here
+		// could inject a second vtysh line into the managed frr.conf. This is
+		// the single interpolation point for the DHCP route's vrf clause,
+		// matching how the static renderer keeps that property. The `table`
+		// arm needs no belt: TableID is an int.
 		vrfPart := ""
-		if dr.VRF != "" {
-			vrfPart = " vrf " + sanitizeFRRValue(dr.VRF)
+		if vrfName, tableID := instanceRouteTarget(fc.Instances, dr.VRF); vrfName != "" {
+			vrfPart = " vrf " + sanitizeFRRValue(vrfName)
+		} else if tableID > 0 {
+			vrfPart = fmt.Sprintf(" table %d", tableID)
 		}
 		if dr.IsIPv6 {
 			if dr.Interface != "" {
@@ -503,23 +550,7 @@ func (m *Manager) renderPreferredRoutes(b *strings.Builder, fc *FullConfig) {
 		return
 	}
 	for _, entry := range fc.PreferredRoutes {
-		vrfName := ""
-		tableID := 0
-		if entry.RoutingInstance != "" {
-			vrfName = "vrf-" + entry.RoutingInstance
-			for i := range fc.Instances {
-				if fc.Instances[i].Name != entry.RoutingInstance {
-					continue
-				}
-				// Forwarding instances carry no VRF device: render
-				// into their kernel table in the default VRF instead.
-				vrfName = fc.Instances[i].VRFName
-				if vrfName == "" {
-					tableID = fc.Instances[i].TableID
-				}
-				break
-			}
-		}
+		vrfName, tableID := instanceRouteTarget(fc.Instances, entry.RoutingInstance)
 		sr := &config.StaticRoute{
 			Destination: entry.Destination,
 			Preference:  1,
