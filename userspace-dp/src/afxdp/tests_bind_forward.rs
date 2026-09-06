@@ -2231,7 +2231,18 @@ fn post_dnat_source_nat_matches_translated_destination() {
     );
     assert_eq!(dnat.rewrite_dst_port, Some(8443));
 
-    let translated_flow = flow.with_destination(dnat.rewrite_dst.unwrap());
+    // #9034: the source-NAT rule must be matched against the FULL post-DNAT
+    // destination. This cell already asserts `rewrite_dst_port == Some(8443)`
+    // two lines up and then dropped it, matching SNAT against the post-DNAT
+    // address with the PRE-DNAT port 443 — a tuple that exists on no wire.
+    let translated_flow = flow.with_destination(
+        dnat.rewrite_dst.unwrap(),
+        dnat.rewrite_dst_port.unwrap_or(flow.forward_key.dst_port),
+    );
+    assert_eq!(
+        translated_flow.forward_key.dst_port, 8443,
+        "the flow handed to the source-NAT matcher must carry the translated port"
+    );
     let snat = match_source_nat_for_flow(&state, 0, "wan", "lan", 24, &translated_flow)
         .expect("snat after dnat");
     assert_eq!(

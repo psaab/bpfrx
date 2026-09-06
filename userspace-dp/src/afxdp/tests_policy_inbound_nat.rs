@@ -737,3 +737,128 @@ fn policy_inbound_nat64_missing_neighbor_permits_on_synthetic_v6_not_default_den
 // while a legitimate flowless TCP packet (real L4 header) keeps its ports.
 // ---------------------------------------------------------------------------
 
+
+/// #9034: composed DNAT -> source-NAT must match the source-NAT rule against
+/// the POST-DNAT destination PORT, not the pre-DNAT one.
+///
+/// `SessionFlow::with_destination` carried the address across and left
+/// `forward_key.dst_port` at its pre-DNAT value, so the source-NAT rule was
+/// evaluated against the post-DNAT ADDRESS with the PRE-DNAT PORT — a tuple
+/// that existed on no wire. `SourceNatRule::l4_matches` tests `dst_port`
+/// against `match_dst_ports`, so a rule scoped to the real service port did
+/// not match, and one scoped to the external port matched when it should not.
+///
+/// This drives the REAL poll path (`txn_run_descriptor` ->
+/// `poll_binding_process_descriptor`), which is the point: the unit cells on
+/// `with_destination` bind the function, and only this one binds the CALL SITE
+/// that chooses which port to hand it. Mutating
+/// `poll_descriptor/mod.rs` to pass `flow.forward_key.dst_port` instead of
+/// `policy_dst_port` survived the entire suite before this cell existed.
+///
+/// The DNAT is 172.16.80.8:443 -> 10.0.61.102:8443 (from `inbound_dnat_snapshot`),
+/// and the source-NAT rule is scoped to destination port 8443 ONLY. A packet
+/// arrives addressed to :443. If the matcher sees 443 the rule cannot match and
+/// no SNAT is applied.
+#[test]
+fn source_nat_matches_post_dnat_destination_port_9034() {
+    let permit = wan_to_lan_permit("10.0.61.102/32", "permit-internal");
+    let mut snapshot = inbound_dnat_snapshot(permit);
+    snapshot.source_nat_rules = vec![crate::protocol::SourceNATRuleSnapshot {
+        name: "snat-only-on-translated-port".to_string(),
+        from_zone: "wan".to_string(),
+        to_zone: "lan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        interface_mode: true,
+        // The discriminator: this rule applies ONLY to the POST-DNAT port.
+        match_destination_ports: vec![crate::protocol::NatPortRangeWire {
+            low: 8443,
+            high: 8443,
+        }],
+        ..Default::default()
+    }];
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 12, 0);
+    binding.interface = Arc::<str>::from("reth0.80");
+    let mut sessions = SessionTable::new();
+
+    // Addressed to the VIP on the EXTERNAL port 443.
+    let frame = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(198, 51, 100, 10),
+        Ipv4Addr::new(172, 16, 80, 8),
+        54323,
+        443,
+        TCP_FLAG_SYN,
+    );
+    let meta = txn_meta_v4(12, TCP_FLAG_SYN, frame.len() as u16);
+    let (_batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+
+    assert_eq!(
+        dbg.nat_applied_snat, 1,
+        "a source-NAT rule scoped to the POST-DNAT port (8443) must match the \
+         composed DNAT -> source-NAT flow. Matching on the pre-DNAT port (443) \
+         leaves the rule unmatched and the flow un-SNAT'd (#9034)"
+    );
+}
+
+/// CONTROL for the cell above: a rule scoped to the PRE-DNAT port must NOT
+/// match once the port is translated.
+///
+/// Without this, a fix that simply matched "any port" would satisfy the
+/// assertion above while destroying the port scoping entirely. This is the row
+/// that makes the pair a discriminator rather than a smoke test.
+#[test]
+fn source_nat_does_not_match_pre_dnat_destination_port_9034() {
+    let permit = wan_to_lan_permit("10.0.61.102/32", "permit-internal");
+    let mut snapshot = inbound_dnat_snapshot(permit);
+    snapshot.source_nat_rules = vec![crate::protocol::SourceNATRuleSnapshot {
+        name: "snat-only-on-external-port".to_string(),
+        from_zone: "wan".to_string(),
+        to_zone: "lan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        interface_mode: true,
+        // The PRE-DNAT port. The flow's destination is 8443 by the time
+        // source-NAT is evaluated, so this rule must NOT match.
+        match_destination_ports: vec![crate::protocol::NatPortRangeWire {
+            low: 443,
+            high: 443,
+        }],
+        ..Default::default()
+    }];
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 12, 0);
+    binding.interface = Arc::<str>::from("reth0.80");
+    let mut sessions = SessionTable::new();
+
+    let frame = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(198, 51, 100, 10),
+        Ipv4Addr::new(172, 16, 80, 8),
+        54323,
+        443,
+        TCP_FLAG_SYN,
+    );
+    let meta = txn_meta_v4(12, TCP_FLAG_SYN, frame.len() as u16);
+    let (_batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+
+    assert_eq!(
+        dbg.nat_applied_snat, 0,
+        "a source-NAT rule scoped to the PRE-DNAT port (443) must NOT match once \
+         the destination has been translated to 8443 — matching it would mean the \
+         port scoping is being ignored rather than translated (#9034)"
+    );
+}
