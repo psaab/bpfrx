@@ -1,0 +1,150 @@
+package config
+
+import (
+	"sort"
+	"strings"
+	"testing"
+)
+
+// #9206: a `multi` leaf defeats its container's closed world. Absorption
+// (#2419) turns trailing tokens into VALUES before any keyword check runs, so
+// an undeclared statement standing behind a multi leaf is INJECTED rather than
+// refused:
+//
+//	set protocols rip group g1 authentication-key secret1                    REJECT
+//	set protocols rip group g1 neighbor ge-0/0/0 authentication-key secret1  ACCEPT
+//	  -> ifaces = [ge-0/0/0 authentication-key secret1]
+//
+// THE POPULATION, not the instance. Every `multi: true` leaf under a
+// `closedWorld: true` container has the shape; this measures how many actually
+// reach the compiled config, because that is what decides the remedy.
+//
+//	19  structural sites (multi leaf, closed-world ancestor)
+//	 2  of those are `groups`-rehosted duplicates of the RIP pair -- the SAME
+//	    schema nodes reached by a second route (#8921), so 17 are distinct
+//	19  absorb at the SCHEMA WALK (all 19 controls reject without the multi leaf)
+//	 1  survives the COMPILER and reaches the config
+//
+// So the mechanism is general and the exposure is singular, which is the same
+// shape #9181 turned out to have. The discriminator is not the container: it is
+// whether the absorbing leaf's VALUE TYPE has a downstream validator.
+// `neighbor` takes free-form interface names and nothing checks that an
+// interface exists, so the garbage becomes two non-existent interfaces named to
+// FRR. Every other multi leaf in the set validates its values -- `export`
+// requires a known policy, the NAT match leaves require parseable addresses --
+// and each rejects the absorbed token by name.
+//
+// THE `multi` PREDICATE IS CORROBORATED, NOT ASSUMED. Mutating the filter away
+// -- counting EVERY leaf under a closed-world container, not just multi ones --
+// leaves the count unchanged at 19. So no non-multi leaf absorbs, which is the
+// mechanism's own prediction measured rather than restated. That mutant
+// SURVIVING is the evidence; had the filter been doing the work, widening it
+// would have added sites.
+//
+// A SCHEMA-WALK RESULT IS AN UPPER BOUND on what commits, which is why the
+// walk's 19 and the compiler's 1 are both reported. Each compiler row is paired
+// with a BASELINE that omits the absorbed token: without it, a rejection for a
+// missing `then` or an undefined pool is indistinguishable from the absorption
+// being caught, and three of these rows initially rejected for exactly those
+// unrelated reasons.
+func TestMultiLeafAbsorptionPopulation9206(t *testing.T) {
+	type site struct {
+		path []string
+		leaf string
+		node *schemaNode
+	}
+	var sites []site
+	seen := map[string]bool{}
+	var walk func(path []string, n *schemaNode, closed bool)
+	walk = func(path []string, n *schemaNode, closed bool) {
+		if n == nil || len(path) > 9 {
+			return
+		}
+		closed = closed || n.closedWorld
+		for k, c := range n.children {
+			if c == nil {
+				continue
+			}
+			// The fixture path must carry an INSTANCE NAME for every node that
+			// takes one. `protocols rip group` is args:1 with no wildcard, so a
+			// path without one makes the undeclared keyword the GROUP NAME --
+			// the control then wrongly ACCEPTS and the row is discarded. That
+			// silently removed 15 of 19 sites, the RIP instance among them.
+			childPath := append(append([]string{}, path...), k)
+			if c.args >= 1 || c.wildcard != nil {
+				childPath = append(childPath, "xpfinst")
+			}
+			key := strings.Join(childPath, " ")
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			if closed && c.multi && c.children == nil && c.wildcard == nil {
+				sites = append(sites, site{append([]string{}, path...), k, c})
+			}
+			next := c
+			if c.wildcard != nil {
+				next = c.wildcard
+			}
+			walk(childPath, next, closed || c.closedWorld)
+		}
+	}
+	for k, c := range setSchema.children {
+		p0 := []string{k}
+		if c.args >= 1 || c.wildcard != nil {
+			p0 = append(p0, "xpfinst")
+		}
+		next := c
+		if c.wildcard != nil {
+			next = c.wildcard
+		}
+		walk(p0, next, c.closedWorld)
+	}
+
+	validate := func(lines []string) error {
+		tree := &ConfigTree{}
+		for _, l := range lines {
+			p, err := ParseSetCommand(l)
+			if err != nil {
+				return err
+			}
+			tree.SetPath(p)
+		}
+		return SchemaValidateWithDefinitions(tree, tree, nil)
+	}
+	synth := func(n *schemaNode) string {
+		if v, _, ok := synthPair(n); ok && v != "" {
+			return v
+		}
+		return "xpfv"
+	}
+
+	var absorbing, distinct int
+	var rows []string
+	for _, s := range sites {
+		base := "set " + strings.Join(s.path, " ")
+		if validate([]string{base + " xpfbogus9206 v1"}) == nil {
+			t.Errorf("#9206: control ACCEPTED at %q — the container is not closed "+
+				"there, so an ACCEPT below would prove nothing", base)
+			continue
+		}
+		if validate([]string{base + " " + s.leaf + " " + synth(s.node) + " xpfbogus9206 v1"}) == nil {
+			absorbing++
+			if !strings.HasPrefix(strings.Join(s.path, " "), "groups") {
+				distinct++
+			}
+			rows = append(rows, strings.Join(s.path, " ")+" multi="+s.leaf)
+		}
+	}
+	sort.Strings(rows)
+
+	const wantAbsorbing, wantDistinct = 19, 17
+	if absorbing != wantAbsorbing || distinct != wantDistinct {
+		t.Errorf("#9206: %d sites absorb at the schema walk (%d excluding `groups` "+
+			"rehosts), want %d (%d).\n  %s\n\n"+
+			"GREW: a new multi leaf under a closed-world container, or a new "+
+			"closedWorld flip over an existing one — check whether it reaches the "+
+			"compiler too. SHRANK: absorption is being refused somewhere; re-derive.",
+			absorbing, distinct, wantAbsorbing, wantDistinct, strings.Join(rows, "\n  "))
+	}
+}
