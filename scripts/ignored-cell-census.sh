@@ -106,6 +106,38 @@ classify() {
 	echo "UNDECLARED"
 }
 
+# THE scan expression, in three named pieces so the control below exercises the
+# SAME regex and the SAME filter the real sweep uses rather than copies of them.
+#
+#   IGNORE_ATTR_RE  matches the attribute in either spelling (`#[ignore]`,
+#                   `#[ignore = "..."]`) while \b keeps `#[ignored_x]` out.
+#   drop_comment_lines  reads `file:line:content` and drops lines whose CONTENT
+#                   starts with `//` -- so `//`, `///` and `//!` prose that
+#                   merely MENTIONS the attribute is not counted as a cell
+#                   (#8980). An attribute in code position survives.
+IGNORE_ATTR_RE='#\[ignore\b'
+
+drop_comment_lines() {
+	grep -vE '^[^:]*:[0-9]+:[[:space:]]*//'
+}
+
+# scan_ignores [paths...]
+#   with paths: walk them. with NO args: filter stdin, which is how the control
+#   below drives it. Both arms feed ONE `| drop_comment_lines`, so the control
+#   exercises the real composition -- dropping the filter cannot be a mutation
+#   the control survives, which it would be if the control called the pieces.
+scan_ignores() {
+	if [ "$#" -eq 0 ]; then
+		grep -E "$IGNORE_ATTR_RE"
+	else
+		# -H is load-bearing: with a SINGLE file argument grep omits the
+		# filename and emits `line:content`, so a filter (or the
+		# `cut -d: -f1,2` below) written for `file:line:content` silently
+		# reads the wrong fields.
+		grep -rHnE --include='*.rs' "$IGNORE_ATTR_RE" "$@" 2>/dev/null
+	fi | drop_comment_lines
+}
+
 # ── positive control: the classifier itself ──────────────────────────
 control_fail=""
 [ "$(classify 'MEASUREMENT: not an assertion')" = "MEASUREMENT" ] ||
@@ -127,6 +159,57 @@ if [ -n "$control_fail" ]; then
 fi
 echo "  PASS: positive control — the classifier scores all five probes correctly"
 
+# ── control: the SCAN PATTERN, in both directions (#8980) ────────────
+#
+# The classifier control above bounds `classify`. Nothing bounded the scan
+# expression, and the census already had one control for it -- the ZERO-hits
+# check further down. That control is real, but it is blind BY CONSTRUCTION to
+# half the failure space: a non-zero-hits check detects a pattern that is too
+# TIGHT and can never detect one that is too LOOSE. #8980 was the loose kind.
+# The pattern matched `#[ignore` anywhere, including inside a doc comment, so
+# prose reading "UN-`#[ignore]`d by the change that satisfies it" -- written by
+# a change that REMOVED two ignores and documented doing so -- counted as two
+# undeclared cells. The guard fired on the CORRECT behaviour, and the cheapest
+# way to green was to delete the explanation.
+#
+# The probes are fed as text through the same regex and the same filter, so
+# this needs no temp files and no tools beyond grep: checks (1) and (2) are
+# documented as hermetic and must keep running wherever a plain `sh` does.
+scan_probe() {
+	printf '%s\n' "$@" | scan_ignores | grep -c . || true
+}
+# LOOSE bound: every one of these is PROSE or a different attribute, so a
+# correct pattern scores ZERO.
+ctl_loose=$(scan_probe \
+	'src/a.rs:1:/// UN-`#[ignore]`d by the change that satisfies it.' \
+	'src/a.rs:2:// #[ignore] commented out while debugging.' \
+	'src/a.rs:3://! module doc mentioning #[ignore = "MEASUREMENT: x"].' \
+	'src/a.rs:4:	/// indented doc comment mentioning #[ignore].' \
+	'src/a.rs:5:#[ignored_by_some_other_tool]')
+# TIGHT bound: real attributes, bare and with a reason, at column zero, tab-
+# indented and space-indented. Ranking prose out must not rank these out too --
+# a pattern that scores 0 here would make the census silently measure nothing.
+# The last probe carries a URL on purpose: the comment filter must key on
+# comment POSITION, not on the presence of "//" anywhere in the line. Without
+# it, a filter of `grep -v '//'` passes this control while silently dropping
+# every cell whose reason cites a link.
+ctl_tight=$(scan_probe \
+	'src/b.rs:1:#[ignore]' \
+	'src/b.rs:2:	#[ignore = "MEASUREMENT: indented, carries a reason"]' \
+	'src/b.rs:3:    #[ignore = "#7209: reds until the mutex is split"]' \
+	'src/b.rs:4:#[ignore = "MEASUREMENT: baseline at https://ci/run/7, not an assertion"]')
+scan_ctl_fail=""
+[ "$ctl_loose" -eq 0 ] ||
+	scan_ctl_fail="$scan_ctl_fail too-loose(counted $ctl_loose of 5 non-cells)"
+[ "$ctl_tight" -eq 4 ] ||
+	scan_ctl_fail="$scan_ctl_fail too-tight(found $ctl_tight of 4 real cells)"
+if [ -n "$scan_ctl_fail" ]; then
+	echo "FAIL: scan-pattern control —$scan_ctl_fail" >&2
+	echo "  The sweep below would be measuring the wrong lines, so it was not run." >&2
+	exit 1
+fi
+echo "  PASS: scan-pattern control — 0 of 5 non-cells, 4 of 4 real cells"
+
 # ── scan ─────────────────────────────────────────────────────────────
 SCAN_LIST=""
 for d in $SCAN_DIRS; do
@@ -138,7 +221,7 @@ if [ -z "$SCAN_LIST" ]; then
 fi
 
 # shellcheck disable=SC2086
-HITS=$(grep -rn --include='*.rs' '#\[ignore' $SCAN_LIST 2>/dev/null)
+HITS=$(scan_ignores $SCAN_LIST)
 
 TOTAL=0
 UNDECLARED=""
