@@ -443,6 +443,34 @@ harness_exe_check() {
 	fi
 }
 
+# harness_exe_scope <mode> <peer_node> <peer_running_sha>
+#
+# #9044: how much of the cluster this row's executable attestation actually
+# covers. The row could not previously express "I attested ONE of the two nodes
+# this gate used", so a single-node attestation read as a whole-cluster MATCH —
+# and on an HA gate, which fails over by definition, the unattested node is the
+# one the result depends on.
+#
+#   n/a         hermetic run: there is no deployed binary to attest.
+#   both        this node AND the peer were read back.
+#   local-only  the peer could not be read. NOT a void: the crash gates
+#               force-stop a node and may leave it down, so voiding here would
+#               red exactly the gates whose job is to kill a node. It is a
+#               SCOPE statement, and its whole purpose is that a reader can
+#               tell it apart from `both` instead of both spelling MATCH.
+harness_exe_scope() {
+	local mode="${1:-cluster}" peer_node="${2:-}" peer_sha="${3:-}"
+	if [[ "$mode" == "hermetic" ]]; then
+		printf 'n/a\n'
+		return 0
+	fi
+	if [[ -n "$peer_node" && -n "$peer_sha" ]]; then
+		printf 'both\n'
+	else
+		printf 'local-only\n'
+	fi
+}
+
 # ─────────────────────────────────────────────────────────────────────
 # The emitter
 # ─────────────────────────────────────────────────────────────────────
@@ -464,6 +492,7 @@ harness_result_emit() {
 	local gate="" env="" verdict="" void_reason="" headline="" direction=""
 	local metrics="" build_git_sha="" build_exe="" running_exe="" exe_check=""
 	local duration_s="" artifacts="" adapter="" ledger="" node="" ts=""
+	local node_peer="" running_exe_peer="" exe_scope=""
 	while (($#)); do
 		case "$1" in
 		--gate) gate="$2"; shift 2 ;;
@@ -481,6 +510,9 @@ harness_result_emit() {
 		--artifacts) artifacts="$2"; shift 2 ;;
 		--adapter) adapter="$2"; shift 2 ;;
 		--node) node="$2"; shift 2 ;;
+		--node-peer) node_peer="$2"; shift 2 ;;
+		--running-exe-sha256-peer) running_exe_peer="$2"; shift 2 ;;
+		--exe-scope) exe_scope="$2"; shift 2 ;;
 		--ledger) ledger="$2"; shift 2 ;;
 		--ts) ts="$2"; shift 2 ;;
 		*) _hr_warn "emit: unknown argument '$1'"; return 2 ;;
@@ -553,7 +585,9 @@ harness_result_emit() {
 			HR_DIRECTION="$direction" HR_METRICS="$metrics" HR_GITSHA="$build_git_sha" \
 			HR_BUILD_EXE="$build_exe" HR_RUN_EXE="$running_exe" HR_EXE_CHECK="$exe_check" \
 			HR_DURATION="$duration_s" HR_ARTIFACTS="$artifacts" HR_ADAPTER="$adapter" \
-			HR_NODE="$node" HR_LEDGER="$ledger" \
+			HR_NODE="$node" HR_NODE_PEER="$node_peer" \
+			HR_RUN_EXE_PEER="$running_exe_peer" HR_EXE_SCOPE="$exe_scope" \
+			HR_LEDGER="$ledger" \
 			python3 - <<'PY'
 import json, os, pathlib, sys
 
@@ -624,6 +658,13 @@ row = {
     "artifacts": opt("HR_ARTIFACTS"),
     "adapter": opt("HR_ADAPTER"),
     "node": opt("HR_NODE"),
+    # #9044: the PEER half of the executable attestation, and how much of the
+    # cluster it covers. Additive: a reader of an older row sees neither key,
+    # which is exactly the state those rows were emitted in — a single-node
+    # attestation that could not say so.
+    "node_peer": opt("HR_NODE_PEER"),
+    "running_exe_sha256_peer": opt("HR_RUN_EXE_PEER"),
+    "exe_scope": opt("HR_EXE_SCOPE"),
 }
 # separators without spaces and ensure_ascii=False keep the row compact; json
 # escapes every newline, so a row is always exactly one physical line even when
@@ -678,6 +719,7 @@ PY
 # is what the ledger-coverage census reads.
 harness_result_run() {
 	local gate="" adapter="" env="" mode="cluster" node="" build_exe="" artifacts="" ledger=""
+	local peer_node_arg=""
 	while (($#)); do
 		case "$1" in
 		--gate) gate="$2"; shift 2 ;;
@@ -686,6 +728,10 @@ harness_result_run() {
 		--cluster) mode="cluster"; shift ;;
 		--hermetic) mode="hermetic"; shift ;;
 		--node) node="$2"; shift 2 ;;
+		# #9044: the peer is normally resolved from cluster-env.sh like --node
+		# is; the flag exists so a caller (and the self-test) can name it
+		# explicitly, the same reason --node exists.
+		--node-peer) peer_node_arg="$2"; shift 2 ;;
 		--build-exe) build_exe="$2"; shift 2 ;;
 		--artifacts) artifacts="$2"; shift 2 ;;
 		--ledger) ledger="$2"; shift 2 ;;
@@ -735,10 +781,24 @@ harness_result_run() {
 	metrics=$(cut -f5 <<<"$adapted")
 
 	local build_git_sha build_exe_sha running_exe_sha exe_check
+	# Initialised explicitly: the run wrapper executes under `set -u`, and a
+	# value-less `local` makes the first `[[ -z "$peer_node" ]]` an unbound-
+	# variable error rather than a false test (#9044).
+	local peer_node="$peer_node_arg" peer_running_exe_sha="" exe_scope=""
 	build_git_sha=$(harness_build_git_sha "$root" || echo "unknown")
 	if [[ "$mode" == "cluster" ]]; then
 		[[ -z "$build_exe" ]] && build_exe="$root/xpfd"
 		[[ -f "$build_exe" ]] && build_exe_sha=$(sha256sum "$build_exe" | awk '{print $1}')
+		# #9044: the PEER, resolved the same way. An HA gate fails over BY
+		# DEFINITION, so the node a single-node attestation does not cover is
+		# the node the test's outcome depends on.
+		if [[ -z "$peer_node" ]]; then
+			peer_node=$(
+				# shellcheck disable=SC1091
+				source "$HARNESS_RESULT_DIR/cluster-env.sh" >/dev/null 2>&1 &&
+					printf '%s' "${FW1:-}"
+			) || peer_node=""
+		fi
 		if [[ -z "$node" ]]; then
 			# Resolve the node the same way every HA smoke does, rather than
 			# re-deriving it in each Makefile recipe. cluster-env.sh is a
@@ -755,13 +815,26 @@ harness_result_run() {
 			# The single readback in the tree, extracted from
 			# deploy_verify_running_xpfd so there is not a second one.
 			#
-			# Two things this deliberately does NOT do. It does not take the
-			# shared cluster lock: the gate has already finished and released
-			# it, and `systemctl show` + `sha256sum /proc/PID/exe` are
-			# read-only. And it reads NODE 0 only -- both nodes carry the same
-			# build after a `cluster-deploy`, so one readback is the
-			# attribution point for the run; reading both would double the
-			# post-gate incus traffic to answer the same question.
+			# It deliberately does NOT take the shared cluster lock: the gate
+			# has already finished and released it, and `systemctl show` +
+			# `sha256sum /proc/PID/exe` are read-only.
+			#
+			# It USED to read node 0 only, on the stated ground that "both
+			# nodes carry the same build after a `cluster-deploy`, so one
+			# readback is the attribution point for the run". That premise is
+			# not a property of the system -- it is a property of ONE way of
+			# invoking it. `Makefile:NODE ?= all` is a plain override and
+			# `cluster-setup.sh deploy [0|1|all]` accepts the scope, so
+			#
+			#     make cluster-deploy NODE=0 && make test-failover
+			#
+			# is two ordinary lines. And the failure is ASYMMETRIC: `NODE=1`
+			# fails safe (fw0 holds the old build, MISMATCH, the row is VOID),
+			# while `NODE=0` is the dangerous direction -- fw0 matches, fw1
+			# silently runs a different build, and the row records a clean
+			# MATCH for a gate that failed over onto the unattested node. An
+			# HA smoke fails over by definition, so that is the node the
+			# result depends on (#9044).
 			# shellcheck source=deploy-lib.sh
 			[[ -n "${_XPF_DEPLOY_LIB_LOADED:-}" ]] || {
 				# deploy-lib.sh documents that it depends on the SOURCING
@@ -777,6 +850,9 @@ harness_result_run() {
 			}
 			if declare -F deploy_running_xpfd_sha256 >/dev/null; then
 				running_exe_sha=$(deploy_running_xpfd_sha256 "$node" "${XPF_EXE_READBACK_TRIES:-3}" || true)
+				# #9044: and the peer, when there is one to read.
+				[[ -n "$peer_node" && "$peer_node" != "$node" ]] &&
+					peer_running_exe_sha=$(deploy_running_xpfd_sha256 "$peer_node" "${XPF_EXE_READBACK_TRIES:-3}" || true)
 			else
 				# Fails SAFE (exe_check becomes UNAVAILABLE -> the row is a
 				# VOID), but say so out loud: a silent degradation here would
@@ -786,6 +862,28 @@ harness_result_run() {
 		fi
 	fi
 	exe_check=$(harness_exe_check "${build_exe_sha:-}" "${running_exe_sha:-}" "$mode")
+	exe_scope=$(harness_exe_scope "$mode" "${peer_node:-}" "${peer_running_exe_sha:-}")
+
+	# #9044: fold the PEER into the verdict, and do it ASYMMETRICALLY on
+	# purpose.
+	#
+	# A peer that READ BACK a DIFFERENT binary is the whole finding: the gate
+	# failed over onto a node running something other than the build under
+	# test, so the row is no more attributable than a local mismatch and
+	# becomes a VOID by the same #2176 rule.
+	#
+	# A peer that could not be read is NOT a void. `test-ha-crash`,
+	# `test-chained-crash` and `test-double-failover` force-stop a node and may
+	# legitimately leave it down when the gate ends, so treating an unreadable
+	# peer as UNAVAILABLE would VOID exactly the gates whose job is to kill a
+	# node -- a loop layer breaking the gates it measures, which is the same
+	# mistake the exit-status note above refuses to make. That case is recorded
+	# as a PARTIAL scope instead, which is the fact ("I attested one of the two
+	# nodes this gate used") the row previously could not express at all.
+	if [[ "$exe_check" == "MATCH" && -n "${peer_running_exe_sha:-}" &&
+		"${peer_running_exe_sha}" != "${build_exe_sha:-}" ]]; then
+		exe_check="MISMATCH"
+	fi
 
 	# A measurement of a binary we cannot name is a VOID *IN THE LEDGER*, not a
 	# result. The emitter refuses the other spelling, so this downgrade is not
@@ -800,7 +898,7 @@ harness_result_run() {
 	# is worse than no loop layer.
 	local gate_verdict="$verdict"
 	if [[ "$verdict" != "VOID" && ( "$exe_check" == "MISMATCH" || "$exe_check" == "UNAVAILABLE" ) ]]; then
-		void_reason="exe_check=$exe_check: the running binary could not be confirmed to be the build under test (build_exe_sha256=${build_exe_sha:-<none>} running_exe_sha256=${running_exe_sha:-<none>}) — the gate reported $verdict but of an unknown build (#2176)"
+		void_reason="exe_check=$exe_check: the running binary could not be confirmed to be the build under test (build_exe_sha256=${build_exe_sha:-<none>} running_exe_sha256=${running_exe_sha:-<none>} peer=${peer_node:-<none>} peer_running_exe_sha256=${peer_running_exe_sha:-<none>} exe_scope=${exe_scope:-<none>}) — the gate reported $verdict but of an unknown build (#2176/#9044)"
 		verdict="VOID"
 		headline=""
 		direction=""
@@ -817,7 +915,9 @@ harness_result_run() {
 		--build-git-sha "$build_git_sha" --build-exe-sha256 "${build_exe_sha:-}" \
 		--running-exe-sha256 "${running_exe_sha:-}" --exe-check "$exe_check" \
 		--duration-s "$((t1 - t0))" --artifacts "$artifacts" --adapter "$adapter" \
-		--node "$node" "${ledger_arg[@]}"; then
+		--node "$node" --node-peer "${peer_node:-}" \
+		--running-exe-sha256-peer "${peer_running_exe_sha:-}" \
+		--exe-scope "$exe_scope" "${ledger_arg[@]}"; then
 		_hr_warn "NO ROW WRITTEN for gate '$gate' (verdict was $verdict)"
 	else
 		printf 'harness-result: recorded %s %s verdict=%s\n' "$gate" "$env" "$verdict" >&2

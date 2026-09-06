@@ -90,7 +90,8 @@ accumulate uncovered.
  "metrics":{"cells_passed":21,"cells_failed":0,"throughput_gbps":23.1},
  "build_git_sha":"1a56c19dc…","build_exe_sha256":"…","running_exe_sha256":"…",
  "exe_check":"MATCH","duration_s":412,"artifacts":null,"adapter":"ha-smoke",
- "node":"loss:xpf-userspace-fw0"}
+ "node":"loss:xpf-userspace-fw0","node_peer":"loss:xpf-userspace-fw1",
+ "running_exe_sha256_peer":"…","exe_scope":"both"}
 ```
 
 ### Provenance: which build actually produced the measurement
@@ -129,6 +130,48 @@ check" is not spelled the same as "checked and fine":
 **The emitter refuses a non-VOID verdict carrying `MISMATCH` or `UNAVAILABLE`.**
 A measurement of a binary nobody can name is not a result. The rule lives in
 the emitter rather than in each caller so a future caller cannot forget it.
+
+### The attestation covers BOTH nodes, and says so when it cannot (#9044)
+
+The readback used to read **node 0 only**, on the stated ground that "both
+nodes carry the same build after a `cluster-deploy`, so one readback is the
+attribution point for the run". That is a property of one way of *invoking*
+the deploy, not of the system. `Makefile`'s `NODE ?= all` is a plain override
+and `cluster-setup.sh deploy [0|1|all]` accepts the scope, so
+
+```
+make cluster-deploy NODE=0
+make test-failover
+```
+
+is two ordinary lines. The failure is **asymmetric**, and only one direction is
+dangerous:
+
+| Deploy scope | fw0 | fw1 | Old row |
+|---|---|---|---|
+| `NODE=1` | old build | new build | `MISMATCH` → **VOID**. Fails safe. |
+| `NODE=0` | new build | old build | **clean `MATCH`** — for a gate that failed over onto the unattested node. |
+
+An HA smoke **fails over by definition**, so the node a single-node attestation
+skips is the node the result depends on. Both nodes are now read back:
+
+* `node_peer` / `running_exe_sha256_peer` — the peer half, so what fw1 was
+  running at the time of the run is recoverable rather than lost;
+* `exe_scope` — `both`, `local-only`, or `n/a` (hermetic). This is the fact the
+  row previously **could not express at all**: "I attested one of the two nodes
+  this gate used".
+
+A peer running a **different** build makes the row `MISMATCH` → VOID, by the
+same #2176 rule as a local mismatch. A peer that is **unreadable** does *not*:
+`test-ha-crash`, `test-chained-crash` and `test-double-failover` force-stop a
+node and may legitimately leave it down when the gate ends, so voiding there
+would red exactly the gates whose job is to kill a node — the same mistake the
+exit-status rule below refuses to make. That case records `exe_scope=local-only`
+instead, which a reader can tell apart from a whole-cluster `MATCH`.
+
+Both new fields are **additive**: `REQUIRED_KEYS` is unchanged, so every row
+already emitted still lints. An old row carries neither key, which is exactly
+the state it was emitted in — a single-node attestation with no way to say so.
 
 ### The row's verdict and the gate's exit status are separate
 
