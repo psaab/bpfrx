@@ -7814,6 +7814,7 @@ fn retire_dead_worker_holders_reclaims_only_dead_workers_6979() {
         dst_ip: "198.51.100.9".parse().unwrap(),
         src_port: 4000,
         dst_port: 80,
+        routing_scope: 0,
     };
     let translated = crate::nat::TranslatedTuple {
         ip: egress,
@@ -7885,6 +7886,7 @@ fn retire_dead_worker_holders_reclaims_only_dead_workers_6979() {
         dst_ip: "198.51.100.9".parse().unwrap(),
         src_port: 4001,
         dst_port: 80,
+        routing_scope: 0,
     };
     assert!(
         alloc.reserve_flow(flow2, translated, 0, false, 3_000, NatHolder::Worker(3)),
@@ -7935,6 +7937,7 @@ fn refresh_status_reclaims_dead_worker_holders_6979() {
         dst_ip: "198.51.100.4".parse().unwrap(),
         src_port: 5000,
         dst_port: 443,
+        routing_scope: 0,
     };
     let translated = crate::nat::TranslatedTuple {
         ip: egress,
@@ -8002,6 +8005,7 @@ fn stop_inner_retires_holders_for_all_allocator_families_7092() {
         dst_ip: "198.51.100.11".parse().unwrap(),
         src_port,
         dst_port: 443,
+        routing_scope: 0,
     };
 
     // (1) interface-mode
@@ -8280,6 +8284,7 @@ fn f4_seed(coordinator: &mut Coordinator, worker_id: u32) -> crate::nat::Transla
         dst_ip: key.dst_ip,
         src_port: key.src_port,
         dst_port: key.dst_port,
+        routing_scope: 0,
     };
     let alloc = &coordinator.forwarding.source_nat_rules[0].pool_allocator;
     assert!(

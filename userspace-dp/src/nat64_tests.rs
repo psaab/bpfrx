@@ -4151,6 +4151,7 @@ fn nat64_4512_reserve_release_wrapper_symmetry() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
         src_port: 5000,
         dst_port: 443,
+        routing_scope: 0,
     };
     let flow2 = SourceNatFlowKey {
         src_ip: "2001:db8::2".parse().unwrap(),
@@ -5810,6 +5811,7 @@ fn nat64_6876_release_frees_every_prefix_holding_the_flow() {
         dst_ip: IpAddr::V4(dst_v4),
         src_port: 6000,
         dst_port: 443,
+        routing_scope: 0,
     };
     assert!(
         crate::nat::reserve_nat64_pool_port(
@@ -6297,6 +6299,7 @@ fn nat64_6892_synced_reserve_picks_the_prefix_the_active_used() {
         dst_ip: IpAddr::V4(dst_v4),
         src_port: 6000,
         dst_port: 443,
+        routing_scope: 0,
     };
     assert!(
         !reserve_nat64_pool_port(
@@ -6351,6 +6354,7 @@ fn nat64_6892_synced_reserve_follows_the_destination_prefix_both_ways() {
         dst_ip: IpAddr::V4(dst_v4),
         src_port: 6000,
         dst_port: 443,
+        routing_scope: 0,
     };
     assert!(
         !reserve_nat64_pool_port(
@@ -6414,6 +6418,7 @@ fn nat64_6892_unmatched_destination_still_falls_back_to_the_pool_scan() {
         dst_ip: IpAddr::V4(dst_v4),
         src_port: 6000,
         dst_port: 443,
+        routing_scope: 0,
     };
     assert!(
         !reserve_nat64_pool_port(

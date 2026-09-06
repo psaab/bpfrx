@@ -98,6 +98,8 @@ fn source_nat_decision_with_holder(
         forwarding,
         ingress_ifindex,
         egress_ifindex,
+        // #9062: the session layer's own domain, not a value re-derived here.
+        flow.forward_key.routing_domain,
     );
     // #2871: static-NAT reverse (source) translation is gated on the EGRESS
     // (destination) zone matching the rule's external `from zone`, mirroring

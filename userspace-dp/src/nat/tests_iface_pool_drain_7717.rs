@@ -210,6 +210,7 @@ fn interface_mint_fails_closed_while_draining_then_recovers_7717() {
         dst_ip: SRV.parse().expect("dst"),
         src_port: 5555,
         dst_port: 80,
+        routing_scope: 0,
     };
     let translated = TranslatedTuple {
         ip: E.parse::<IpAddr>().expect("egress"),

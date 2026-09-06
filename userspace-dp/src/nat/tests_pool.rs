@@ -626,6 +626,7 @@ fn pool_snat_no_translation_collision_denies_second_flow_5269() {
         dst_ip: "8.8.8.8".parse().unwrap(),
         src_port: 12345,
         dst_port: 443,
+        routing_scope: 0,
     };
     let owners = rules[0].pool_allocator.debug_address_only_owners();
     assert_eq!(owners.len(), 1, "flow A must mint exactly one occupancy token");
@@ -4026,6 +4027,7 @@ fn pool_snat_sequential_collision_probes_next_free_port() {
         dst_ip: "8.8.8.8".parse().unwrap(),
         src_port: 40000,
         dst_port: 443,
+        routing_scope: 0,
     };
     let result = alloc.allocate_translation(
         flow,
@@ -4074,6 +4076,7 @@ fn pool_snat_recycled_collision_retains_port() {
         dst_ip: "8.8.8.8".parse().unwrap(),
         src_port: 40001,
         dst_port: 443,
+        routing_scope: 0,
     };
     let result = alloc.allocate_translation(
         flow,
@@ -4105,6 +4108,7 @@ fn pool_snat_recycled_collision_retains_port() {
         dst_ip: "8.8.8.8".parse().unwrap(),
         src_port: 40002,
         dst_port: 443,
+        routing_scope: 0,
     };
     let result2 = alloc.allocate_translation(
         flow2,
@@ -4146,6 +4150,7 @@ fn pool_snat_recycle_order_is_fifo_not_lifo() {
         dst_ip: "8.8.8.8".parse().unwrap(),
         src_port,
         dst_port: 443,
+        routing_scope: 0,
     };
     let allocate = |flow: SourceNatFlowKey| {
         alloc
@@ -4349,6 +4354,7 @@ fn synced_session_reserves_nat_pool_port_4388() {
         dst_ip: "8.8.8.8".parse().unwrap(),
         src_port: 40001,
         dst_port: 443,
+        routing_scope: 0,
     };
     let translated = rules[0]
         .pool_allocator
@@ -4394,6 +4400,7 @@ fn synced_session_reserves_nat_pool_port_4388() {
         dst_ip: "8.8.8.8".parse().unwrap(),
         src_port: 40002,
         dst_port: 443,
+        routing_scope: 0,
     };
     let reused = rules[0]
         .pool_allocator
@@ -4722,6 +4729,7 @@ fn synced_address_only_session_reserves_reverse_identity_token_5338() {
         dst_ip: "8.8.8.8".parse().unwrap(),
         src_port: 12345,
         dst_port: 443,
+        routing_scope: 0,
     };
     let owners = rules[0].pool_allocator.debug_address_only_owners();
     assert_eq!(
@@ -4892,6 +4900,7 @@ fn synced_reservation_follows_active_zone_match_6211() {
         dst_ip: "8.8.8.8".parse().unwrap(),
         src_port: 40001,
         dst_port: 443,
+        routing_scope: 0,
     };
     let translated = rules[1]
         .pool_allocator
@@ -5754,6 +5763,7 @@ fn deterministic_cgnat_no_translation_collision_denies_second_flow_5341() {
         dst_ip: "8.8.8.8".parse().unwrap(),
         src_port: 12345,
         dst_port: 443,
+        routing_scope: 0,
     };
     let owners = rules[0].pool_allocator.debug_address_only_owners();
     assert_eq!(
@@ -5978,6 +5988,7 @@ fn deterministic_napt64_v6_fixed_block_per_subscriber_reversible() {
             dst_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             src_port: sport,
             dst_port: 443,
+            routing_scope: 0,
         };
         let t = alloc
             .allocate_deterministic_v6(
@@ -6046,6 +6057,7 @@ fn deterministic_napt64_v6_fixed_block_per_subscriber_reversible() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
         src_port: 30001,
         dst_port: 443,
+        routing_scope: 0,
     };
     assert!(
         alloc
@@ -6144,6 +6156,7 @@ fn deterministic_napt64_v6_rejects_out_of_prefix_shared_word() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
         src_port: 40001,
         dst_port: 443,
+        routing_scope: 0,
     };
     assert!(
         alloc
@@ -6341,6 +6354,7 @@ fn pool_snat_lockfree_concurrent_fill_is_exact_and_collision_free() {
                     dst_ip: "8.8.8.8".parse().unwrap(),
                     src_port: 1024 + n as u16,
                     dst_port: 443,
+                    routing_scope: 0,
                 };
                 if let Ok(t) = alloc.allocate_translation(
                     flow,
@@ -6428,6 +6442,7 @@ fn pool_snat_lockfree_concurrent_churn_no_double_alloc_no_leak() {
                     dst_ip: "8.8.8.8".parse().unwrap(),
                     src_port: 1024,
                     dst_port: 443,
+                    routing_scope: 0,
                 };
                 match alloc.allocate_translation(
                     flow,
@@ -6492,6 +6507,7 @@ fn pool_snat_release_frees_bit_and_port_is_reusable() {
         dst_ip: "8.8.8.8".parse().unwrap(),
         src_port,
         dst_port: 443,
+        routing_scope: 0,
     };
     let alloc_one = |flow: SourceNatFlowKey| {
         alloc.allocate_translation(
@@ -6551,6 +6567,7 @@ fn pool_snat_fills_to_exact_capacity_then_exhausts() {
             dst_ip: "8.8.8.8".parse().unwrap(),
             src_port: 1024 + i,
             dst_port: 443,
+            routing_scope: 0,
         };
         let t = alloc
             .allocate_translation(
@@ -6579,6 +6596,7 @@ fn pool_snat_fills_to_exact_capacity_then_exhausts() {
         dst_ip: "8.8.8.8".parse().unwrap(),
         src_port: 2048,
         dst_port: 443,
+        routing_scope: 0,
     };
     assert!(
         alloc
@@ -6846,6 +6864,7 @@ fn pool_snat_gc_chunked_concurrent_alloc_release_stays_consistent() {
                         dst_ip: "8.8.8.8".parse().unwrap(),
                         src_port: 1024 + (i % 60000) as u16,
                         dst_port: 443,
+                        routing_scope: 0,
                     };
                     if let Ok(translated) = alloc.allocate_translation(
                         flow,
@@ -7362,6 +7381,7 @@ fn untracked_allocation_still_frees_on_first_release_6211_f2() {
         dst_ip: "8.8.8.8".parse().unwrap(),
         src_port: 40001,
         dst_port: 443,
+        routing_scope: 0,
     };
     let translated = rules[0]
         .pool_allocator
@@ -8298,6 +8318,7 @@ fn synced_reserve_distinguishes_no_pool_from_a_refusal_7581() {
         dst_ip: "8.8.8.8".parse().unwrap(),
         src_port: 40099,
         dst_port: 443,
+        routing_scope: 0,
     };
     assert!(
         pool_rules[0].pool_allocator.reserve_flow(
@@ -8532,6 +8553,7 @@ fn f6_flow() -> SourceNatFlowKey {
         dst_ip: "8.8.8.8".parse().unwrap(),
         src_port: 1111,
         dst_port: 443,
+        routing_scope: 0,
     }
 }
 
@@ -8750,6 +8772,7 @@ fn a_pass1_refusal_does_not_fall_through_to_a_sibling_allocator_6979_f1() {
         dst_ip: "8.8.8.8".parse().unwrap(),
         src_port: 40099,
         dst_port: 443,
+        routing_scope: 0,
     };
     assert!(
         rules[0].pool_allocator.reserve_flow(
@@ -8846,6 +8869,7 @@ fn a_refused_pass1_import_reports_do_not_publish_6979_f1() {
         dst_ip: "8.8.8.8".parse().unwrap(),
         src_port: 40099,
         dst_port: 443,
+        routing_scope: 0,
     };
     assert!(rules[0].pool_allocator.reserve_flow(
         squatter,
@@ -8889,6 +8913,7 @@ fn pass2_still_falls_through_a_refusing_owner_6979_f1() {
         dst_ip: "8.8.8.8".parse().unwrap(),
         src_port: 40099,
         dst_port: 443,
+        routing_scope: 0,
     };
     assert!(rules[0].pool_allocator.reserve_flow(
         squatter,
@@ -9881,6 +9906,7 @@ fn flow_key_8132(dst_ip: &str, dst_port: u16) -> SourceNatFlowKey {
         dst_ip: dst_ip.parse().expect("dst"),
         src_port: 12345,
         dst_port,
+        routing_scope: 0,
     }
 }
 
@@ -10179,6 +10205,7 @@ fn m13_allocate(
         dst_ip: "8.8.8.8".parse().unwrap(),
         src_port: 40_000 + nth,
         dst_port: 443,
+        routing_scope: 0,
     };
     alloc.allocate_translation(
         flow,
@@ -10960,5 +10987,82 @@ fn a_carried_address_only_token_is_not_a_collision_with_its_own_flow_8597_k11() 
         outcome.refused, 0,
         "nor as a port-bearing refusal — the two outcomes are different \
          populations and must not be conflated"
+    );
+}
+
+// #9062 THE WIRING. The identity cells in tests_scope.rs build SourceNatFlowKey
+// directly and are blind to whether the MATCH PATH populates the scope — a
+// mutation pinning `routing_scope: 0` at the match site killed none of them,
+// which is the defect restated one layer up.
+//
+// This is the issue's own acceptance criterion: two flows with an IDENTICAL
+// 5-tuple in different routing domains, against ONE pool, must receive DISTINCT
+// translations. Sharing a translation is the cross-tenant reply misdelivery —
+// the reply arrives in the pool's WAN domain, which matches neither tenant.
+#[test]
+fn pool_snat_separates_identical_tuples_across_routing_domains_9062() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "shared-pool-snat".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "shared".to_string(),
+        pool_addresses: vec!["203.0.113.1/32".to_string()],
+        port_low: 1024,
+        port_high: 65535,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+
+    let translate = |domain: u32| {
+        let mut counter = None;
+        expect_snat_decision(match_source_nat_result_for_tuple(
+            &InterfaceNatAllocators::default(),
+            &rules,
+            &NatScopeCtx {
+                routing_domain: domain,
+                ..NatScopeCtx::default()
+            },
+            "lan",
+            "wan",
+            // The SAME 5-tuple in both domains: overlapping tenant address
+            // space is the whole premise.
+            "10.0.1.100".parse().expect("src"),
+            "8.8.8.8".parse().expect("dst"),
+            Some(PROTO_TCP),
+            12345,
+            443,
+            None,
+            None,
+            0,
+            false,
+            false,
+            NatHolder::Untracked,
+            &mut counter,
+        ))
+    };
+
+    let a = translate(1);
+    let b = translate(2);
+    assert!(
+        a.rewrite_src_port.is_some() && b.rewrite_src_port.is_some(),
+        "both tenants must get a port; without that this compares two Nones"
+    );
+    assert_ne!(
+        (a.rewrite_src, a.rewrite_src_port),
+        (b.rewrite_src, b.rewrite_src_port),
+        "two tenants' identical 5-tuples in DIFFERENT routing domains received \
+         the SAME translation from one pool. The reply then arrives in the \
+         pool's WAN domain matching neither tenant, and reverse NAT delivers it \
+         to whichever flow was reserved first"
+    );
+
+    // REFERENCE ARM: the SAME domain must still be one flow. Without it, "give
+    // them different translations" is satisfied by minting a fresh translation
+    // per packet, which drains the pool and breaks every long-lived flow.
+    let a2 = translate(1);
+    assert_eq!(
+        (a.rewrite_src, a.rewrite_src_port),
+        (a2.rewrite_src, a2.rewrite_src_port),
+        "the same 5-tuple in the SAME domain must reuse its translation"
     );
 }

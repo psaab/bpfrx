@@ -8518,6 +8518,7 @@ fn drop8114_reserve(forwarding: &ForwardingState, worker_id: u32) -> crate::nat:
         dst_ip: key.dst_ip,
         src_port: key.src_port,
         dst_port: key.dst_port,
+        routing_scope: 0,
     };
     let alloc = &forwarding.source_nat_rules[0].pool_allocator;
     assert!(

@@ -27,7 +27,9 @@
 //! Interface mode has NO pool: `rewrite_src` is the egress interface's own
 //! address, and the reverse-lookup namespace it lands in is global BY ADDRESS
 //! (`session/key.rs` keys on the wire tuple; nothing carries ingress interface,
-//! zone or VRF onto the reverse path — that is open #2387). Two different
+//! zone or VRF onto the reverse path — #2387, since CLOSED; #9062 added the
+//! routing domain to the FORWARD flow and allocator keys, and the reverse path
+//! is still address-keyed). Two different
 //! interface-mode rules that egress the same interface therefore share one
 //! identity space, and a per-rule allocator would let each mint the same
 //! identity. The registry keys ONE `PortAllocator` per egress ADDRESS, which is

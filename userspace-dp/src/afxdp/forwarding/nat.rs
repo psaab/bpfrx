@@ -12,6 +12,12 @@ pub(in crate::afxdp) fn nat_scope_ctx_for_flow(
     forwarding: &ForwardingState,
     ingress_ifindex: i32,
     egress_ifindex: i32,
+    // #9062: SessionKey.routing_domain, passed through rather than re-derived.
+    // Re-deriving it here would need the ingress VLAN id and the fabric-encoded
+    // zone, neither of which this function has -- and a value that disagreed
+    // with the session layer's would make the HA-synced reserve fail to match
+    // the flow the active reserved.
+    routing_domain: u32,
 ) -> crate::nat::NatScopeCtx<'_> {
     let name = |ifindex: i32| -> &str {
         forwarding
@@ -32,6 +38,7 @@ pub(in crate::afxdp) fn nat_scope_ctx_for_flow(
         egress_ifname: name(egress_ifindex),
         ingress_routing_instance: ri(ingress_ifindex),
         egress_routing_instance: ri(egress_ifindex),
+        routing_domain,
     }
 }
 
@@ -45,7 +52,8 @@ pub(in crate::afxdp) fn match_source_nat_for_flow(
     flow: &SessionFlow,
 ) -> Option<NatDecision> {
     let egress = forwarding.egress.get(&egress_ifindex)?;
-    let scope = nat_scope_ctx_for_flow(forwarding, ingress_ifindex, egress_ifindex);
+    let scope = nat_scope_ctx_for_flow(forwarding, ingress_ifindex, egress_ifindex,
+        flow.forward_key.routing_domain);
     match_source_nat(
         &forwarding.iface_nat_allocators,
         &forwarding.source_nat_rules,
@@ -109,7 +117,8 @@ pub(in crate::afxdp) fn match_source_nat_for_flow_result_at(
         return SourceNatLookup::NoMatch;
     };
     // #3096: resolve the interface / routing-instance scope for this flow.
-    let scope = nat_scope_ctx_for_flow(forwarding, ingress_ifindex, egress_ifindex);
+    let scope = nat_scope_ctx_for_flow(forwarding, ingress_ifindex, egress_ifindex,
+        flow.forward_key.routing_domain);
     crate::nat::match_source_nat_result_for_tuple(
         // #6751: interface-mode SNAT mints its translated identity here.
         &forwarding.iface_nat_allocators,

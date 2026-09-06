@@ -212,6 +212,7 @@ fn source_nat_zone_scope_unaffected_by_interface_plumbing() {
         egress_ifname: "ge-0/0/8.0",
         ingress_routing_instance: "whatever",
         egress_routing_instance: "whatever",
+        routing_domain: 0,
     };
     assert!(
         match_source_nat(
@@ -682,3 +683,81 @@ fn destination_nat_from_routing_instance_scope_matches_only_named_vrf() {
 // port/protocol. Reverting the l4_matches gate makes the wrong-port / wrong-app
 // lookups translate, turning the NoMatch assertions RED. ===
 
+
+// #9062: two rule-sets scoped to DIFFERENT routing instances that reference the
+// SAME pool shared one flow-identity space and one PortAllocator, so an
+// identical 5-tuple in two VRFs collided.
+//
+// `live_by_flow.get(&flow)` then handed the second tenant's flow the FIRST's
+// translated tuple. #7160 cannot recover it: the reverse index is inserted and
+// probed with routing_domain 0, and the two-pass domain PREFERENCE it uses has
+// nothing to prefer once both forward sessions carry the same reverse identity.
+#[test]
+fn source_nat_flow_key_separates_routing_domains_9062() {
+    let a = SourceNatFlowKey {
+        protocol: 6,
+        src_ip: "10.0.0.1".parse().unwrap(),
+        dst_ip: "8.8.8.8".parse().unwrap(),
+        src_port: 1234,
+        dst_port: 443,
+        routing_scope: 1,
+    };
+    let b = SourceNatFlowKey {
+        routing_scope: 2,
+        ..a
+    };
+    assert_ne!(
+        a, b,
+        "an identical 5-tuple in two routing domains must be two flow \
+         identities; sharing one is the cross-tenant reply misdelivery"
+    );
+
+    // REFERENCE ARM: the SAME domain must still be the same flow, or every
+    // repeat packet of one flow mints a new translation and the pool drains.
+    let a2 = SourceNatFlowKey { ..a };
+    assert_eq!(a, a2, "the same flow in the same domain must be one identity");
+
+    // The unscoped default is 0, so a deployment with no routing instances
+    // keys exactly as it did before this change.
+    let unscoped = SourceNatFlowKey {
+        routing_scope: 0,
+        ..a
+    };
+    assert_ne!(unscoped, a, "domain 0 and domain 1 are different scopes");
+}
+
+// The ALLOCATOR key must separate them too. Keying only the flow would still
+// leave both tenants drawing ports from ONE PortAllocator, so a port handed to
+// one is unavailable to the other -- a quieter defect than the collision, and
+// one the flow-key fix alone does not close.
+#[test]
+fn source_nat_allocator_key_separates_routing_instances_9062() {
+    let mk = |ri: &str| SourceNATRuleSnapshot {
+        name: format!("snat-{ri}"),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        from_routing_instance: ri.to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "shared-pool".to_string(),
+        pool_addresses: vec!["203.0.113.10".to_string()],
+        ..SourceNATRuleSnapshot::default()
+    };
+    let vrf_a = parse_source_nat_rules(&[mk("tenant-a")]);
+    let vrf_b = parse_source_nat_rules(&[mk("tenant-b")]);
+    let same = parse_source_nat_rules(&[mk("tenant-a")]);
+
+    let key = |rs: &[crate::nat::SourceNatRule]| rs[0].allocator_key();
+    assert_ne!(
+        key(&vrf_a),
+        key(&vrf_b),
+        "two rule-sets in DIFFERENT routing instances naming the same pool must \
+         not share one PortAllocator"
+    );
+    // REFERENCE ARM: the same instance must still share, or every apply mints a
+    // fresh allocator and every in-flight translation is forgotten.
+    assert_eq!(
+        key(&vrf_a),
+        key(&same),
+        "the same rule in the same instance must select the same allocator"
+    );
+}

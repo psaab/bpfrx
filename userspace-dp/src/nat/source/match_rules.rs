@@ -330,6 +330,11 @@ fn match_source_nat_result_for_tuple_inner(
         dst_ip,
         src_port,
         dst_port,
+        // #9062: separate two tenants' identical 5-tuples. This is
+        // SessionKey.routing_domain, passed through the scope rather than
+        // re-derived, so this key matches the one the release and HA-sync paths
+        // build from the SessionKey.
+        routing_scope: scope.routing_domain,
     };
     // #4161: this is first-match on slice order, and that is INTENTIONALLY
     // most-specific-scope-wins. The Go snapshot builder

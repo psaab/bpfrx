@@ -141,6 +141,7 @@ fn flow(src: &str, src_port: u16) -> SourceNatFlowKey {
         dst_ip: REMOTE.parse().expect("dst"),
         src_port,
         dst_port: 443,
+        routing_scope: 0,
     }
 }
 
