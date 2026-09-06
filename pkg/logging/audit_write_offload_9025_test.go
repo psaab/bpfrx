@@ -37,11 +37,11 @@ func (c *deadlineRecordingConn9025) Write(b []byte) (int, error) {
 	c.armedBeforeWrite.Store(c.armed.Load())
 	return len(b), nil
 }
-func (c *deadlineRecordingConn9025) Read(_ []byte) (int, error)    { return 0, nil }
-func (c *deadlineRecordingConn9025) Close() error                  { return nil }
-func (c *deadlineRecordingConn9025) LocalAddr() net.Addr           { return dummyAddr{} }
-func (c *deadlineRecordingConn9025) RemoteAddr() net.Addr          { return dummyAddr{} }
-func (c *deadlineRecordingConn9025) SetDeadline(time.Time) error   { return nil }
+func (c *deadlineRecordingConn9025) Read(_ []byte) (int, error)  { return 0, nil }
+func (c *deadlineRecordingConn9025) Close() error                { return nil }
+func (c *deadlineRecordingConn9025) LocalAddr() net.Addr         { return dummyAddr{} }
+func (c *deadlineRecordingConn9025) RemoteAddr() net.Addr        { return dummyAddr{} }
+func (c *deadlineRecordingConn9025) SetDeadline(time.Time) error { return nil }
 func (c *deadlineRecordingConn9025) SetReadDeadline(time.Time) error {
 	return nil
 }
