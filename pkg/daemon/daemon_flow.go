@@ -44,13 +44,100 @@ func (d *Daemon) publishMgmtVRFIfaces(m map[string]bool) {
 	d.mgmtVRFInterfaces.Store(&m)
 }
 
+// dhcpLeaseKeysForMember enumerates every interface-name spelling under which
+// a DHCP lease learned on routing-instance member `member` can be keyed, so
+// dhcpRouteVRFMap's PRODUCER side is reachable by the CONSUMER's key.
+//
+// The two sides genuinely disagree on spelling and neither is free to change:
+//
+//   - the producer is `RoutingInstance.Interfaces`, which the compiler appends
+//     VERBATIM from the config token (compiler_routing.go), so the canonical
+//     Junos form carries SLASHES — `ge-0/0/1.0`;
+//   - the consumer is `lease.Interface` = `config.DHCPLeaseIfName`, i.e.
+//     `LinuxIfName` (slashes -> dashes) unconditionally, plus a `.<vlan-id>`
+//     suffix for a TAGGED unit — so `ge-0-0-1`, or `ge-0-0-3.50`.
+//
+// #9135: keying on the raw member made the #8963 remedy INERT for the canonical
+// slash spelling — every VRF-attached DHCP route fell back to `vrf == ""` and
+// was emitted in the DEFAULT context, which is the behaviour #8963 was filed
+// against. Only a dash-authored config ever resolved.
+//
+// Three things follow from `DHCPLeaseIfName` being the consumer's rule, and
+// they are why this builds the keys it does and no others:
+//
+//  1. A lease key can NEVER contain a slash, so the raw config token is not a
+//     candidate key at all. It is not inserted (pre-#9135 it was, uselessly);
+//     a dash-authored member reaches the same key through LinuxIfName.
+//  2. A lease key NEVER carries a unit NUMBER — DHCPLeaseIfName has no
+//     unit-number fallback, and its own doc calls unit number and VLAN ID
+//     "distinct concepts". So `logicalUnitDeviceKey`'s `base.<unit>` arm, which
+//     is right for the netdev-name family (#8321/#8597), is wrong here.
+//  3. A member naming the WHOLE DEVICE (`ge-0/0/3`, the #9063 reading) claims
+//     every unit on it, and a tagged unit's lease is keyed `base.<vlan-id>` —
+//     a key the base alone cannot produce. Those are enumerated.
+//
+// reth is deliberately NOT resolved. `buildDHCPClientSpecs` keys the lease on
+// the CONFIG interface name with no `ResolveReth` (daemon_dhcp.go), so a reth
+// DHCP client's lease is keyed `reth0` — which `base` already covers. Inserting
+// the physical member's name would add a key no lease presents and could
+// mis-attribute a lease genuinely learned on that member.
+func dhcpLeaseKeysForMember(cfg *config.Config, member string) []string {
+	if member == "" {
+		return nil
+	}
+	baseRef, unitTok, hasUnit := strings.Cut(config.CanonicalInterfaceUnitRef(member), ".")
+	base := config.LinuxIfName(baseRef)
+
+	// The member may be authored in either spelling while cfg.Interfaces is
+	// keyed by the spelling the `interfaces` stanza used, and the two need not
+	// agree (#8829). Match on the kernel name, which both reduce to.
+	var ifc *config.InterfaceConfig
+	if cfg != nil {
+		for name, candidate := range cfg.Interfaces.Interfaces {
+			if candidate != nil && config.LinuxIfName(name) == base {
+				ifc = candidate
+				break
+			}
+		}
+	}
+
+	if !hasUnit {
+		// Whole-device member: it claims every unit on the device (#9063's
+		// reading of the same list), and each unit's lease is keyed
+		// independently — a tagged one by its VLAN ID, which the device name
+		// on its own cannot produce.
+		if ifc == nil {
+			// The instance names an interface with no `interfaces` stanza.
+			// That is legal (bindRoutingInstanceMembers tolerates a member
+			// absent on this chassis) and it also happens transiently, between
+			// deleting the stanza and the DHCP client reconcile retiring the
+			// lease. No unit is knowable, so the device name is the only key.
+			return []string{base}
+		}
+		keys := make([]string, 0, len(ifc.Units))
+		for _, u := range ifc.Units {
+			keys = append(keys, config.DHCPLeaseIfName(base, u))
+		}
+		return keys
+	}
+	var unit *config.InterfaceUnit
+	if unitNum, _, err := config.CanonicalLogicalUnit(unitTok); err == nil && ifc != nil {
+		unit = ifc.Units[unitNum]
+	}
+	// A nil unit (stanza absent, or an unparseable unit token) yields the bare
+	// base — which is what an untagged lease is keyed by, so this degrades to
+	// the pre-#9135 dash-spelling behaviour rather than to an empty key.
+	return []string{config.DHCPLeaseIfName(base, unit)}
+}
+
 // dhcpRouteVRFMap maps a lease's interface name to the routing instance that
 // owns it, "" for the default context (#8963).
 //
-// Keyed on the KERNEL/lease interface name, and matched against the instance's
-// configured member names with the unit suffix tolerated in both directions,
-// because a lease reports the interface it was learned on while the config
-// names the logical unit.
+// Keyed on the KERNEL/lease interface name. #9135: the instance member list is
+// stored in whatever spelling the operator authored (canonically Junos slashes),
+// while the lease is keyed in the kernel spelling, so each member is inserted
+// under every spelling a lease can actually present — see
+// dhcpLeaseKeysForMember for why that set is what it is.
 func (d *Daemon) dhcpRouteVRFMap() map[string]string {
 	out := map[string]string{}
 	cfg := d.store.ActiveConfig()
@@ -62,13 +149,8 @@ func (d *Daemon) dhcpRouteVRFMap() map[string]string {
 			continue
 		}
 		for _, member := range ri.Interfaces {
-			if member == "" {
-				continue
-			}
-			out[member] = ri.Name
-			// `ge-0/0/1.0` in the config, `ge-0/0/1` on the lease.
-			if i := strings.LastIndex(member, "."); i > 0 {
-				out[member[:i]] = ri.Name
+			for _, k := range dhcpLeaseKeysForMember(cfg, member) {
+				out[k] = ri.Name
 			}
 		}
 	}

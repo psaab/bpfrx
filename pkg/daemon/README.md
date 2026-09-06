@@ -1132,6 +1132,47 @@ per-subnet selector for a narrowed group, and still emits one for an authored
 singleton). The two files name their own side of the agreement so a failure says
 which half broke.
 
+### DHCP-learned routes and their routing instance: the key shape (#9135)
+
+`collectDHCPRoutes` (`daemon_flow.go`) tags each DHCP-learned route with the
+routing instance that owns the learning interface, so `renderDHCPDefaults`
+can emit it in the instance's table instead of the default one (#8963). The
+lookup crosses a spelling boundary, and the two sides are owned by different
+subsystems:
+
+- the **producer** is `RoutingInstance.Interfaces`, which the compiler appends
+  VERBATIM from the config token, so the canonical Junos form carries slashes
+  (`ge-0/0/1.0`);
+- the **consumer** is `lease.Interface`, which is `config.DHCPLeaseIfName` —
+  `LinuxIfName` unconditionally (slashes become dashes) plus a `.<vlan-id>`
+  suffix for a tagged unit, so `ge-0-0-1` or `ge-0-0-3.50`.
+
+Keying the map on the raw member made the #8963 remedy **inert for the
+canonical spelling**: only a dash-authored config ever resolved, and every
+other VRF-attached DHCP route fell back to the default context — the exact
+behaviour #8963 was filed against. `dhcpLeaseKeysForMember` now inserts each
+member under every spelling a lease can present. Three consequences of
+`DHCPLeaseIfName` being the consumer's rule shape that set:
+
+1. a lease key can never contain a slash, so the raw config token is not a
+   candidate key at all and is no longer inserted;
+2. a lease key never carries a unit NUMBER (`DHCPLeaseIfName` has no
+   unit-number fallback), so `logicalUnitDeviceKey`'s `base.<unit>` arm —
+   correct for the netdev-name family (#8321/#8597) — is wrong here;
+3. a member naming the WHOLE DEVICE claims every unit on it (#9063's reading),
+   and a tagged unit's lease key is `base.<vlan-id>`, which the device name
+   alone cannot produce — so those units are enumerated.
+
+reth is deliberately not resolved: `buildDHCPClientSpecs` keys the lease on the
+config interface name with no `ResolveReth`, so a reth client's lease is keyed
+`reth0`, which the base spelling already covers.
+
+The renderer-side #8963 tests live in `pkg/frr` and hand-build `DHCPRoute`
+literals, so they are upstream-blind by construction — the fixture's shape is
+why the defect survived the fix. `dhcp_route_vrf_key_shape_9135_test.go` drives
+`collectDHCPRoutes` and, separately, `assembleFRRConfig`: severing
+`DHCPRoutes: d.collectDHCPRoutes()` there previously killed zero tests.
+
 ### Out-of-band `rg_active` writers must re-arm the reconcile retry (#6530)
 
 `rgStateMachine` (`rg_state.go`) tracks a desired `active` value and an
