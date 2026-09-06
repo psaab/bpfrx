@@ -133,3 +133,74 @@ func TestApiKeyLiteralIsNotMintedAsACredential9027(t *testing.T) {
 		"stops a NEW instance, and the warning is what tells the operator about an "+
 		"existing one", got)
 }
+
+// #9029: THE GATE MUST NOT REFUSE A LEGITIMATELY-NAMED OBJECT.
+//
+// #8883's `k == self` skip in firewallMatchValues was the same over-reach in
+// the other direction — it DROPPED such an object, silently. Both mistakes come
+// from treating the spelling question as unanswerable when the AST already
+// answers it two different ways:
+//
+//   - ARITY. Keys[1..args] are the leaf's first value, or its NAME. `address
+//     address 10.0.0.0/8` DEFINES an address called "address"; flagging Keys[1]
+//     there refuses a definition rather than a repeat.
+//   - QUOTING. `address "address"` says in the grammar itself that the token is
+//     a name. KeysQuoted is exactly that bit (#6673: "the one bit about a key
+//     that its TEXT cannot carry").
+func TestLegitimatelyNamedObjectIsAccepted9029(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		text       string
+		wantRefuse bool
+	}{
+		// The definition of an object NAMED after its own keyword. Refusing
+		// this was the first version of the gate over-reaching.
+		{"an address DEFINED as `address`",
+			`security { address-book { global { address address 10.0.0.0/8; } } }`, false},
+
+		// Referencing it, said unambiguously by QUOTING.
+		{"a member quoted as \"address\"",
+			`security { address-book { global { address address 10.0.0.0/8;
+				address-set AS1 { address "address"; } } } }`, false},
+
+		// The api-key site: a key legitimately named `api-key`, quoted.
+		{"a quoted api-key name",
+			`system { services { web-management { api-auth {
+				api-key AAA; api-key "api-key"; } } } }`, false},
+
+		// THE ROW THAT BINDS THE QUOTING BRANCH, and it is the only one that
+		// does. The two spellings below produce the IDENTICAL Keys
+		// (`[address ADDR-A address]`) and differ only in KeysQuoted, so the
+		// verdict comes from that bit and nothing else.
+		//
+		// Without this pair the quoting branch is INERT: arity scoping already
+		// covers every other case in this file, and a mutation disabling
+		// KeyQuoted killed zero cells until this row existed. A branch nothing
+		// can fail is a claim, not a guard.
+		{"a member run whose second member is QUOTED as the keyword",
+			`security { address-book { global { address ADDR-A 10.0.0.0/8; address address 10.1.0.0/16;
+				address-set AS1 { address ADDR-A "address"; } } } }`, false},
+		{"the same run UNQUOTED is refused",
+			`security { address-book { global { address ADDR-A 10.0.0.0/8; address address 10.1.0.0/16;
+				address-set AS1 { address ADDR-A address; } } } }`, true},
+
+		// STILL REFUSED. The bare repeat is the missing-semicolon shape and the
+		// security case; the quoting escape must not open it.
+		{"bare api-key run is still refused",
+			`system { services { web-management { api-auth { api-key AAA api-key BBB; } } } }`, true},
+		{"bare address member run is still refused",
+			`security { address-book { global { address ADDR-A 10.0.0.0/8; address ADDR-B 10.1.0.0/16;
+				address-set AS1 { address ADDR-A address ADDR-B; } } } }`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := selfRepeatTree9027(t, tc.text)
+			_, err := CompileConfig(tr)
+			if (err != nil) != tc.wantRefuse {
+				t.Fatalf("refused=%v, want %v (err=%v)", err != nil, tc.wantRefuse, err)
+			}
+			if tc.wantRefuse && !strings.Contains(err.Error(), "QUOTE it") {
+				t.Errorf("the refusal does not offer quoting as the remedy: %v", err)
+			}
+		})
+	}
+}

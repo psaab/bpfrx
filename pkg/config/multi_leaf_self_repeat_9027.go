@@ -66,20 +66,52 @@ func validateMultiLeafSelfRepeat9027(tree *ConfigTree, lenient bool) ([]string, 
 			}
 			here := append(append([]string{}, path...), n.Keys[0])
 			if child.multi && child.children == nil {
-				// The leaf's OWN keyword appearing among its values is the
-				// ambiguous shape. Its own Keys[0] is the keyword itself, so
-				// only Keys[1:] are candidates.
-				for _, v := range n.Keys[1:] {
+				// THE SCAN STARTS PAST THE LEAF'S DECLARED ARITY, and getting
+				// this wrong over-reaches in a way that looks like the defect.
+				//
+				// Keys[1..args] are the leaf's FIRST value — or, for a leaf
+				// that names an object, its NAME. `address address 10.0.0.0/8`
+				// defines an address legitimately CALLED "address", and
+				// flagging Keys[1] there refused a definition rather than a
+				// repeat. Only a keyword appearing AFTER the first value can be
+				// a second statement's head. Same arity discipline as #9124.
+				start := 1 + child.args
+				if start < 1 {
+					start = 1
+				}
+				if start > len(n.Keys) {
+					continue
+				}
+				for i, v := range n.Keys[start:] {
 					if v != n.Keys[0] {
+						continue
+					}
+					// #9029: A QUOTED REPEAT IS NOT AMBIGUOUS. The operator
+					// wrote `address "address"`, which says in the grammar
+					// itself that this token is a NAME and not a keyword — and
+					// KeysQuoted is exactly that bit, recorded by #6673 as "the
+					// one bit about a key that its TEXT cannot carry".
+					//
+					// Without this the gate refuses a legitimately-named
+					// object, which is the same over-reach #8883's `k == self`
+					// skip made in the other direction: it DROPPED the name
+					// silently. Both mistakes come from treating a spelling
+					// question as unanswerable when the AST already answers it.
+					//
+					// So the refusal is now scoped to the BARE repeat, which is
+					// the missing-semicolon shape and nothing else, and the
+					// message can offer quoting as the remedy rather than only
+					// describing the ambiguity.
+					if n.KeyQuoted(i + start) {
 						continue
 					}
 					msg := fmt.Sprintf(
 						"`%s` repeats its own keyword %q among its values. That is ambiguous "+
 							"and this build refuses to guess: it is either TWO statements "+
 							"missing a semicolon (`%s <a>; %s <b>;`), or ONE statement listing "+
-							"a value that happens to be named %q. Write the braced or "+
-							"semicolon-separated form to say which (#9027)",
-						strings.Join(here, " "), v, n.Keys[0], n.Keys[0], v)
+							"a value that happens to be named %q — in which case QUOTE it "+
+							"(`%s %q`), which says so in the grammar itself (#9027, #9029)",
+						strings.Join(here, " "), v, n.Keys[0], n.Keys[0], v, n.Keys[0], v)
 					if lenient {
 						slog.Warn("config: a multi-value leaf repeats its own keyword among its values",
 							"path", strings.Join(here, " "), "issue", "#9027")
