@@ -207,7 +207,18 @@ var showGoldenConfigCommands = []string{
 	"routing-options autonomous-system 65000",
 	"routing-instances vr1 instance-type virtual-router",
 	"routing-instances vr1 interface ge-0-0-0.0",
-	"vlans v100 vlan-id 100",
+	// #8990: `vlans v100 vlan-id 100` stood here and was NEVER modelled --
+	// there is no top-level `vlans` keyword in pkg/config, so the line was
+	// silently discarded and the golden recorded "No VLANs configured" for a
+	// topic the product supports. The #8965 unmodeled-stanza gate turned that
+	// silent discard into a commit rejection, which is how it surfaced.
+	// Replaced with the grammar `show vlans` actually reads (unit.VlanID and
+	// ifc.VlanTagging), so this topic now exercises the renderer instead of
+	// its empty branch -- including the trunk mode, which derives from
+	// vlan-tagging.
+	"interfaces ge-0-0-1 vlan-tagging",
+	"interfaces ge-0-0-1 unit 100 vlan-id 100",
+	"interfaces ge-0-0-1 unit 100 family inet address 10.0.100.1/24",
 	"policy-options policy-statement export-statics term t1 then accept",
 	"event-options policy ep1 events SNMP_TRAP_LINK_DOWN",
 	"event-options policy ep1 then execute-commands commands \"show interfaces\"",
