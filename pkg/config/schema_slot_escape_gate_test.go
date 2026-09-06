@@ -464,10 +464,28 @@ func TestSlotEscapeCoverage(t *testing.T) {
 	}
 
 	sort.Strings(needFixture)
+	var refusedByDesign []string
 	for _, s := range needFixture {
+		// #9017: a site under `family any` may have NO value it accepts, so no
+		// row can express it. `family any` compiles into BOTH pools (#4287),
+		// and #4296 REFUSES every family-specific match there -- a v4/v6
+		// address literal, a per-family icmp type/code -- because such a match
+		// can never match the other family and would silently under-block it.
+		//
+		// The exclusion is MEASURED, not declared: the site is only excused if
+		// a representative commit is actually refused, and refused by #4296
+		// rather than by anything else. A register that could be satisfied by
+		// writing a line here would be worth less than the hole it covers.
+		if why := familyAnyRefusal9017(s); why != "" {
+			refusedByDesign = append(refusedByDesign, s+"  ("+why+")")
+			continue
+		}
 		t.Errorf("multi leaf %q carries NO slot-escape verdict: it does not commit clean under a "+
 			"synthetic parent path, and it has no row in slotEscapeRows. Add one — a prerequisite "+
 			"base config that commits clean, a value the leaf accepts, and one it must reject.", s)
+	}
+	for _, s := range refusedByDesign {
+		t.Logf("refused by design, no value to probe: %s", s)
 	}
 
 	// A row whose site is no longer a leaf in setSchema silently stops covering
@@ -490,4 +508,47 @@ func TestSlotEscapeCoverage(t *testing.T) {
 			t.Errorf("slotEscapeUngated records %q, which is no longer a leaf in setSchema", site)
 		}
 	}
+}
+
+// familyAnyRefusal9017 reports why a `firewall family any` match leaf has no
+// probeable value, or "" if it actually has one.
+//
+// It COMMITS a representative value and requires the refusal to name #4296. A
+// site that starts accepting a value -- because the gate was relaxed, or
+// because the leaf stopped being family-specific -- stops being excused here
+// and goes back to demanding a real row, which is the direction we want.
+func familyAnyRefusal9017(site string) string {
+	const prefix = "firewall family any filter <*> term <*> from "
+	if !strings.HasPrefix(site, prefix) {
+		return ""
+	}
+	leaf := strings.TrimPrefix(site, prefix)
+	val, ok := map[string]string{
+		"source-address":      "10.0.0.0/8",
+		"destination-address": "10.0.0.0/8",
+		"icmp-type":           "3",
+		"icmp-code":           "1",
+	}[leaf]
+	if !ok {
+		return ""
+	}
+	tr := &ConfigTree{}
+	for _, l := range []string{
+		"set firewall family any filter F term t1 then accept",
+		"set firewall family any filter F term t1 from " + leaf + " " + val,
+	} {
+		pth, err := ParseSetCommand(l)
+		if err != nil {
+			return ""
+		}
+		tr.SetPath(pth)
+	}
+	_, err := CompileConfig(tr)
+	if err == nil {
+		return "" // it DOES accept a value — demand a real row
+	}
+	if !strings.Contains(err.Error(), "#4296") {
+		return ""
+	}
+	return "#4296 refuses family-specific matches under family any"
 }

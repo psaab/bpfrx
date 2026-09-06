@@ -300,6 +300,25 @@ var notAValueList = map[string]string{
 	// registration classifies leaves that were always non-lists; it does not
 	// hide something the fix broke. That distinction is the whole reason the
 	// tracker exists rather than a paragraph.
+	// #9017: `family any` is a third firewall filter family, a deep copy of
+	// inet's subtree. These eleven `then` leaves are the same leaves with the
+	// same arities and the same discard-the-extras behaviour, so they carry
+	// the same reasons. Listed explicitly rather than derived from inet: this
+	// map is read by siteKey, and a family that silently inherited entries
+	// would be a family nobody could see had been checked. Only the ELEVEN the
+	// gate actually flagged are here — mirroring the twelfth would register a
+	// site the gate never asked about.
+	"firewall family any filter <*> term <*> then accept":             "args:0 terminal action; extra tokens are DISCARDED, verified below",
+	"firewall family any filter <*> term <*> then count":              "args:1 — one counter name; extra tokens are DISCARDED, verified below",
+	"firewall family any filter <*> term <*> then discard":            "args:0 terminal action; extra tokens are DISCARDED, verified below",
+	"firewall family any filter <*> term <*> then dscp":               "args:1 — one code point; extra tokens are DISCARDED, verified below",
+	"firewall family any filter <*> term <*> then forwarding-class":   "args:1 — one class name; extra tokens are DISCARDED, verified below",
+	"firewall family any filter <*> term <*> then log":                "args:0 flag; extra tokens are DISCARDED, verified below",
+	"firewall family any filter <*> term <*> then loss-priority":      "args:1 — one priority; extra tokens are DISCARDED, verified below",
+	"firewall family any filter <*> term <*> then policer":            "args:1 — one policer name; extra tokens are DISCARDED, verified below",
+	"firewall family any filter <*> term <*> then routing-instance":   "args:1 — one instance name; extra tokens are DISCARDED, verified below",
+	"firewall family any filter <*> term <*> then syslog":             "args:0 flag; extra tokens are DISCARDED, verified below",
+	"firewall family any filter <*> term <*> then traffic-class":      "args:1 — one code point; extra tokens are DISCARDED, verified below",
 	"firewall family inet filter <*> term <*> then accept":            "args:0 terminal action; extra tokens are DISCARDED, verified below",
 	"firewall family inet filter <*> term <*> then discard":           "args:0 terminal action; extra tokens are DISCARDED, verified below",
 	"firewall family inet filter <*> term <*> then log":               "args:0 flag; extra tokens are DISCARDED, verified below",

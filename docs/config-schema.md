@@ -809,6 +809,69 @@ conflict diagnostic. Making it an error needs a `compileOpts` lenient flag, sinc
 The per-interface `isis interface <if> level` leaf is a different concept and a
 different defect — accepted, stored, and never rendered at all (#8450).
 
+### `firewall family` — `any` is declared, and unknown families are gated (#9017)
+
+`set firewall family any filter BLOCK term T1 then discard` **committed clean and
+minted ZERO filters**. A Junos-valid deny-everything-not-matched filter, authored
+on the primary configuration surface, displayed in `show` and enforced nothing —
+no counter, no warning, and no difference in output between "installed" and "does
+not exist". The hierarchical spelling of the same configuration worked, which is
+what kept it invisible.
+
+Two defects shared the symptom, and fixing only the first leaves the worse one:
+
+1. **`any` was not declared** as a `family` child, so the flat-set path could not
+   nest it and never delivered the token to `compiler_firewall.go` — which has
+   handled `case "any": dests = {Inet, Inet6}` all along. The support existed; the
+   spelling could not reach it.
+2. **Any undeclared address-family token collapsed identically.** `family inett`
+   also committed clean and minted zero filters. A fix aimed only at `any` leaves
+   every typo silently voiding a filter.
+
+Both are closed. Measured on the flat-set path:
+
+| spelling | commit gate | FiltersInet | FiltersInet6 |
+|---|---|---|---|
+| `family inet` | ACCEPT | 1 | 0 |
+| `family inet6` | ACCEPT | 0 | 1 |
+| `family any` | ACCEPT | 1 | 1 |
+| `family inett` | **REJECT** at strict compile, naming the token; WARN on the tolerant path | 0 | 0 |
+
+**Two designs were tried and backed out; both are worth knowing about.**
+
+`closedWorld: true` on the `family` compound key looks like the obvious gate and
+is wrong: **the flag INHERITS**, so arming it there closes the entire filter
+grammar beneath `family` and starts rejecting `from source-prefix-list trusted` —
+valid configuration that ships in the CLI tests. The scoped gate is
+`validateFirewallFilterFamilyTokensAST`, a compiler prewalk check beside the
+#3884 family-collision gate, with the same strict-rejects / lenient-warns split
+(#1960). Its permitted set is read from the schema, so declaring a fourth family
+permits it automatically. `TestFirewallFamiliesAcceptTheSameGrammar9017` asserts
+`closedWorld` stays OFF, so the backed-out fix is not re-applied.
+
+`any` **sharing** `inet`'s children map was also tried. It is wrong for a reason
+specific to this tree: a dozen schema **censuses** walk it and several dedup by
+NODE IDENTITY, so one node reachable at two paths is attributed to whichever path
+is reached first and the other silently stops being covered — observed directly,
+as #8768 reporting that `firewall/family/inet/filter/term/then` "no longer opts
+in" while nothing about inet had changed. `any` now gets a DEEP COPY. That trades
+invisibility for drift, and drift is the failure a test can see:
+`TestFirewallFamiliesAcceptTheSameGrammar9017` compares all three families' `from`
+grammars.
+
+Declaring `any` was also **necessary and not sufficient**: the compact spelling
+`family any filter F { … }` stayed packed until `any filter` joined the
+compact-normalize scope table. Note that the scope pair after a compound-key
+descent is the SUB-KEY (`inet`), not the compound keyword — looking for a
+`family filter` entry finds nothing and reads as "not scoped at all", which is
+the wrong conclusion.
+
+The assertion that would have caught the original defect is
+`TestFlatSetAndHierarchicalFamilyAnyAgree9017`: the two spellings of the same
+configuration must compile to the same typed filter set. It asserts the
+hierarchical arm is non-empty FIRST, because "both spellings mint zero" would
+satisfy a count-based check.
+
 ## Strict commit-time validators → `pkg/config/compiler_validate_strict_*.go`
 
 The typed per-leaf `SchemaValidate` walk (4) cannot express cross-field or

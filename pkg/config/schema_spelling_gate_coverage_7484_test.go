@@ -297,7 +297,7 @@ func gateLeafChangesWarnings(g gateLeaf, pre string, epath []string) bool {
 // and read as value-less flags -- are now compared. `enumerated` is unchanged
 // at 1098, which is what says the movement is spelling coverage rather than a
 // change in the population.
-const gateCoverageFloor = 694
+const gateCoverageFloor = 715
 
 var gateBlindCeiling = map[gateBlindClass]int{
 	// #7492 moved leaves out of `unreachable` in two rounds. The parent
@@ -512,7 +512,7 @@ var gateBlindCeiling = map[gateBlindClass]int{
 	// completion still offers only <[Enter]>, so it does not fix the defect. The
 	// children form was chosen on that measurement rather than on which number
 	// it moves.
-	gateBlindFlag: 201, // 209 -> 201, issue 8939; coverage cost tracked at issue 8971
+	gateBlindFlag: 217, // 209 -> 201, issue 8939; coverage cost tracked at issue 8971
 	gateBlindErr:  43,
 	// TIGHTENED 1 -> 0. The single member of this class was
 	// `policy-options policy-statement <*> then`, and it is gone because the

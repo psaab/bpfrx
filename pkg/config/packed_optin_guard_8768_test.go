@@ -395,6 +395,36 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 			},
 			read: firewallThenRead8939(false),
 		},
+		// #9017: `family any` is a third firewall filter family. It gets its own
+		// fixture rather than sharing inet's because the schema subtree is a
+		// DEEP COPY -- sharing a node made one of the two paths invisible to
+		// this very census (it reported inet as "no longer opting in" while
+		// nothing about inet had changed).
+		"firewall/family/any/filter/term/then": {
+			prefix: "firewall { family any { filter f1 { term t1 { ",
+			open:   "then",
+			closer: " } } } }",
+			stmts: map[string]string{
+				"count":            "count c1",
+				"dscp":             "dscp af11",
+				"forwarding-class": "forwarding-class ef",
+				"log":              "log",
+				"loss-priority":    "loss-priority low",
+				"policer":          "policer pol1",
+				"routing-instance": "routing-instance ri1",
+				"traffic-class":    "traffic-class af12",
+			},
+			second: map[string]string{
+				"count":            "count c2",
+				"dscp":             "dscp af21",
+				"forwarding-class": "forwarding-class af1",
+				"loss-priority":    "loss-priority high",
+				"policer":          "policer pol2",
+				"routing-instance": "routing-instance ri2",
+				"traffic-class":    "traffic-class af22",
+			},
+			read: firewallThenRead8939(false),
+		},
 		"firewall/family/inet6/filter/term/then": {
 			prefix: "firewall { family inet6 { filter f1 { term t1 { ",
 			open:   "then",

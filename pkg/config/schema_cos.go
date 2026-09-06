@@ -503,6 +503,14 @@ var schemaFirewall = &schemaNode{desc: "Firewall filters and policers", children
 			"loss-priority": {desc: "Set loss priority for out-of-profile traffic", args: 1, placeholder: "<priority>", children: nil},
 		}},
 	}},
+	// #9017: an undeclared address-family token here used to collapse the
+	// flat-set nesting and mint ZERO filters, so `family inett` -- a typo --
+	// committed clean and voided the filter with no diagnostic. That is gated
+	// by validateFirewallFilterFamilyTokensAST (compiler_firewall_family_9017.go)
+	// rather than by `closedWorld: true`, because closedWorld INHERITS: arming
+	// it here closed the ENTIRE filter grammar beneath it and started rejecting
+	// `from source-prefix-list trusted`, which is valid and shipped. The gate
+	// below is scoped to the family token itself.
 	"family": {desc: "Protocol family for firewall filters", compoundKey: true, children: map[string]*schemaNode{
 		"inet": {desc: "IPv4 firewall filters", children: map[string]*schemaNode{
 			"filter": {desc: "Firewall filter", args: 1, placeholder: "<filter-name>", children: map[string]*schemaNode{
