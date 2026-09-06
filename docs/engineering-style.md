@@ -37,6 +37,62 @@ cannot tell you what your change removes.
 yet `git add`ed is invisible to it. A lane landing #8993 had two new files and
 a diffstat that did not mention either.
 
+### A WRONG INSTRUMENT and a WRONG POPULATION need different remedies
+
+An instrument can be wrong in two ways that look identical in its output and
+are not fixable by the same move.
+
+**WRONG INSTRUMENT** — it measured the right subject at the wrong layer. Four
+of these cost real numbers on one class in one day:
+
+| # | error | cost |
+|---|---|---|
+| 1 | `CompileConfig` where the commit gate is `CheckText` | a whole census reported the tolerant channel as the operator one |
+| 2 | a schema walk where a later compiler gate also runs | 246 blind, 205 actually accepted |
+| 3 | counting `groups`-rehosted paths as distinct | 205 collapsed to 102 |
+| 4 | hierarchical text where the subject is a flat run | would have measured #8437's guard and reported it as the walk |
+
+Every one is found by **a control at that layer**. Add the good-value probe,
+the end-to-end spot-check, the per-prefix histogram, the flat-vs-hierarchical
+pair — and the number moves.
+
+**WRONG POPULATION** — the subject was never admitted, so no control at any
+layer can reach it. A control interrogates what the filter passed; it cannot
+interrogate what the filter removed.
+
+The instance, measured: the #8939 collector admits a leaf only when
+`children == nil && wildcard == nil && !multi`, discarding 63% of containers
+before the census runs. A fix to `system login class` turned `permissions` from
+read to inert — and `permissions` is `multi`, so **the census could not have
+measured that leaf under any outcome.** The row left the loser list, which
+reads as the fix working.
+
+> **An aggregate ratchet cannot see a fix that breaks a neighbour inside the
+> same row. A ratchet cannot see anything its filter removed at all. The first
+> needs the dimensions kept separate; the second needs a SECOND INSTRUMENT.**
+
+`TestSchemaSpellingDifferentialGate` caught it, because it reports per-spelling
+verdicts rather than one number per subject, and because its population is
+filtered differently.
+
+So:
+
+- **Publish the denominator.** `SILENT: 0` over 9 containers and over 139 are
+  the same string; `losers=48` over 133 reached and over 363 walked are the
+  same string. A census that does not state its reach is asserting the world.
+- **Print a per-prefix breakdown.** Nearly free, and it catches unit errors
+  without anyone remembering the rule — a `groups` double-count was found this
+  way by someone who had personally written the note warning about it.
+- **A hedge that is accurate and load-bearing is worse than a wrong claim**,
+  because it survives review: the reviewer checks it and it holds. "EMPTY,
+  every container the census could reach" was true, and the qualifier carried
+  130 containers. Repair it by stating the reach in numbers, not by softening
+  it further.
+- **Before landing a fix, point the instrument at a known-good one and check
+  the delta is the one you predicted.** An instrument validated only against
+  the population it measures cannot detect a coverage loss, because the
+  population is what moved.
+
 ### `git stash` is REPO-GLOBAL. In a multi-worktree repo it is a shared stack.
 
 Every worktree of one repository shares **one** stash stack. `git stash pop`
