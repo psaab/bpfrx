@@ -158,9 +158,16 @@ func (a *Agent) buildLinkTrap(community string, linkUp bool, ifindex int, ifname
 // distinct v1 PDU shape: the trap type is carried in the generic-trap /
 // specific-trap / time-stamp fields (not as sysUpTime.0 + snmpTrapOID.0
 // varbinds), and the message version field is 0. The enterprise is the
-// snmpTraps node and agent-addr is 0.0.0.0, per the RFC 2576 §3.1
-// SNMPv2->SNMPv1 mapping for a standard generic trap.
-func (a *Agent) buildLinkTrapV1(community string, linkUp bool, ifindex int, ifname string) []byte {
+// snmpTraps node.
+//
+// #9123: agent-addr is derived from the source address this trap will actually
+// leave from (agentAddrForTarget), NOT hardcoded to 0.0.0.0. The comment that
+// used to justify the hardcode cited "RFC 2576 §3.1", which is the wrong
+// direction of the mapping, and RFC 3584 §3.2's normative text requires the
+// opposite: a notification originator sending over IP SHALL set agent-addr to
+// its own IP address, and 0.0.0.0 is the fallback for a non-IP transport. See
+// agent_addr_9123.go.
+func (a *Agent) buildLinkTrapV1(community, target string, linkUp bool, ifindex int, ifname string) []byte {
 	// sysUpTime in hundredths of a second.
 	uptime := int(time.Since(a.startTime).Milliseconds() / 10)
 
@@ -199,7 +206,8 @@ func (a *Agent) buildLinkTrapV1(community string, linkUp bool, ifindex int, ifna
 	// time-stamp, variable-bindings.
 	var pduBody []byte
 	pduBody = append(pduBody, berEncodeTLV(tagObjectIdentifier, berEncodeOID(oidSnmpTraps))...)
-	pduBody = append(pduBody, berEncodeTLV(tagIPAddress, []byte{0, 0, 0, 0})...)
+	agentAddr := agentAddrForTarget(target)
+	pduBody = append(pduBody, berEncodeTLV(tagIPAddress, agentAddr[:])...)
 	pduBody = append(pduBody, berEncodeIntegerTLV(genericTrap)...)
 	pduBody = append(pduBody, berEncodeIntegerTLV(0)...) // specific-trap
 	pduBody = append(pduBody, berEncodeTLV(tagTimeTicks, berEncodeTimeTicks(uptime))...)
@@ -221,13 +229,18 @@ func (a *Agent) buildLinkTrapV1(community string, linkUp bool, ifindex int, ifna
 // empty/unspecified value — the default) emits an SNMPv2c trap, and "all"
 // emits BOTH. Any unrecognized value defaults to v2c (the pre-#3948 behavior)
 // rather than dropping the notification.
-func (a *Agent) buildLinkTrapsForVersion(community, version string, linkUp bool, ifindex int, ifname string) [][]byte {
+//
+// #9123: it now takes the target, because the v1 PDU carries an agent-addr that
+// must agree with the source address the trap will leave from. On a multi-homed
+// box that differs per target, so the packet is built per target rather than
+// once per group.
+func (a *Agent) buildLinkTrapsForVersion(community, version, target string, linkUp bool, ifindex int, ifname string) [][]byte {
 	switch version {
 	case "v1":
-		return [][]byte{a.buildLinkTrapV1(community, linkUp, ifindex, ifname)}
+		return [][]byte{a.buildLinkTrapV1(community, target, linkUp, ifindex, ifname)}
 	case "all":
 		return [][]byte{
-			a.buildLinkTrapV1(community, linkUp, ifindex, ifname),
+			a.buildLinkTrapV1(community, target, linkUp, ifindex, ifname),
 			a.buildLinkTrap(community, linkUp, ifindex, ifname),
 		}
 	default: // "v2", "" (unspecified), or anything else -> v2c
@@ -304,8 +317,11 @@ func (a *Agent) sendLinkTraps(linkUp bool, ifindex int, ifname string) {
 		if !groupWantsCategory(tg, snmpCategoryLink) {
 			continue
 		}
-		pkts := a.buildLinkTrapsForVersion(community, tg.Version, linkUp, ifindex, ifname)
 		for _, target := range tg.Targets {
+			// #9123: built inside the target loop, because the v1 agent-addr is
+			// derived from the source address toward THIS target. The v2c packet
+			// carries no agent-addr and is unaffected by the move.
+			pkts := a.buildLinkTrapsForVersion(community, tg.Version, target, linkUp, ifindex, ifname)
 			for _, pkt := range pkts {
 				a.enqueueTrap(trapJob{
 					target:  target,

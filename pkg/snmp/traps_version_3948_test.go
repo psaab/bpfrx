@@ -47,7 +47,7 @@ func TestBuildLinkTrapV1_Structure(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a := &Agent{startTime: time.Now().Add(-30 * time.Second)}
-			pkt := a.buildLinkTrapV1("public", tc.linkUp, 5, "ge-0-0-0")
+			pkt := a.buildLinkTrapV1("public", "", tc.linkUp, 5, "ge-0-0-0")
 
 			version, pduTag := decodeTrapVersionAndPDU(t, pkt)
 			if version != snmpVersion1 {
