@@ -566,6 +566,30 @@ impl ShardedNeighborMap {
                 }
             }
         });
+        // #9071: bump the INSERT GENERATION too. The three per-key insert paths
+        // do; the two bulk paths did not, so #7156's poll-loop gate --
+        // `neigh_generation != binding.last_neigh_generation` -- never fired for
+        // a neighbour learned through here, and the buffered packet for that hop
+        // waited for the RESOLUTION_RECHECK_INTERVAL_NS backstop instead.
+        //
+        // The shard epoch and the insert generation answer DIFFERENT questions
+        // and neither substitutes for the other: the epoch invalidates cached
+        // flows resolved to one shard, and the generation tells the poll loop a
+        // resolution pass is worth running at all.
+        //
+        // ONLY WHEN SOMETHING WAS INSTALLED. Bumping unconditionally makes the
+        // gate fire on every netlink sync, empty or not -- the #7156
+        // optimisation removed while looking like a fix, since a counter that
+        // advances on every call carries the same information as one that never
+        // advances.
+        //
+        // The condition is "did we install anything", NOT the `changed_shards`
+        // set the epoch uses. Those answer different questions and reusing the
+        // epoch's set was my first attempt and wrong: changed_shards marks a key
+        // whose MAC CHANGED, and a brand-new key has no prior MAC to differ
+        // from -- so a freshly resolved neighbour, the exact case the poll loop
+        // is waiting for, would not have bumped.
+        self.bump_insert_generation_9071(!insert_entries.is_empty());
     }
 
     /// #3169: bump-aware atomic multi-key insert for the #1787 RX
@@ -595,7 +619,7 @@ impl ShardedNeighborMap {
         keys: &[(i32, IpAddr)],
         val: NeighborEntry,
     ) {
-        self.with_all_shards(|bulk| {
+        let installed = self.with_all_shards(|bulk| {
             // #5673: refuse the WHOLE pair-write if ANY new key's shard is at
             // the per-shard cap. This is the transit-source RX learn arm
             // (`learn_dynamic_neighbor`), the primary M02/#5673 vector: an
@@ -613,7 +637,8 @@ impl ShardedNeighborMap {
             });
             if blocked {
                 self.learn_cap_drops.fetch_add(1, Ordering::Relaxed);
-                return;
+                // #9071: a refused pair-write changed nothing.
+                return false;
             }
             // #5147: mark the SHARD of each key that genuinely changed MAC.
             // The pair-write can straddle two shards (the physical and the
@@ -637,7 +662,31 @@ impl ShardedNeighborMap {
                     self.bump_shard_epoch(shard);
                 }
             }
+            // #9071: reaching here means the pair-write was NOT refused, so
+            // entries were installed. Reported separately from changed_shards,
+            // which marks only a key whose MAC changed -- a brand-new key has
+            // no prior MAC to differ from, and a freshly learned neighbour is
+            // exactly what the poll loop is waiting for.
+            !keys.is_empty()
         });
+        // #9071: see bulk_replace_neighbors. Same omission, same consequence,
+        // and the same "only when something changed" condition.
+        self.bump_insert_generation_9071(installed);
+    }
+
+    /// #9071: advance the insert generation.
+    ///
+    /// Named rather than inlined so the two bulk paths and the three per-key
+    /// paths are greppable as one set -- the defect was that two members of a
+    /// five-member set did not do this, and a bare `fetch_add` at five sites is
+    /// how a sixth gets added without it.
+    /// `installed` gates the bump: the two bulk callers pass whether the call
+    /// actually installed any entry. A no-op sync must not advance it, or the
+    /// poll-loop gate fires every sweep and #7156's optimisation is gone.
+    fn bump_insert_generation_9071(&self, installed: bool) {
+        if installed {
+            self.insert_generation.fetch_add(1, Ordering::Release);
+        }
     }
 
     /// Total entry count summed across shards. Locks all shards in

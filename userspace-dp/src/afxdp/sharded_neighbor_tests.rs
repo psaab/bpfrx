@@ -872,3 +872,75 @@ fn the_process_seed_is_wired_and_stable_7752() {
     );
     assert!(first < NUM_SHARDS, "shard index {first} out of range");
 }
+
+// #9071: the two BULK insert paths bumped only the shard epoch, never the
+// insert generation, while the three per-key paths bumped both.
+//
+// The consumer is #7156's poll-loop gate: a full resolution pass runs only when
+// `neigh_generation != binding.last_neigh_generation`. So a neighbour learned
+// through the netlink bulk sync or the #1787 RX source-MAC transit learn never
+// woke that pass, and the buffered packet for that hop waited for the
+// RESOLUTION_RECHECK_INTERVAL_NS backstop instead.
+//
+// The epoch and the generation answer DIFFERENT questions and neither
+// substitutes for the other: the epoch invalidates cached flows resolved to one
+// shard, the generation tells the poll loop a resolution pass is worth running
+// at all. This case asserts BOTH move, so a later "the epoch already covers it"
+// simplification reds.
+#[test]
+fn bulk_paths_bump_the_insert_generation_9071() {
+    let m = ShardedNeighborMap::new();
+
+    // POSITIVE CONTROL first: a per-key path bumps. If it does not, the
+    // assertions below are measuring a counter nothing moves.
+    let before = m.insert_generation();
+    m.insert_if_changed(key_v4(3, 1), entry(0x11));
+    assert!(
+        m.insert_generation() > before,
+        "the per-key path must bump the insert generation; without that control \
+         every assertion below is about a dead counter"
+    );
+
+    // bulk_replace_neighbors — the netlink sync path.
+    let before = m.insert_generation();
+    m.bulk_replace_neighbors(&[], &[(3, key_v4(3, 2).1, entry(0x22))]);
+    assert!(
+        m.insert_generation() > before,
+        "bulk_replace_neighbors did not bump the insert generation, so #7156's \
+         poll-loop gate never fires for a neighbour learned by the netlink sync \
+         and its buffered packet waits for the recheck backstop"
+    );
+
+    // learn_pair_if_changed — the #1787 RX source-MAC transit learn.
+    let before = m.insert_generation();
+    m.learn_pair_if_changed(&[key_v4(3, 3)], entry(0x33));
+    assert!(
+        m.insert_generation() > before,
+        "learn_pair_if_changed did not bump the insert generation"
+    );
+}
+
+// NARROWNESS: a bulk call that installs NOTHING must not bump either. A
+// generation that advances on every call is the same as one that never
+// advances — the gate fires every sweep and #7156's optimisation is gone.
+#[test]
+fn empty_bulk_calls_do_not_bump_the_generation_9071() {
+    let m = ShardedNeighborMap::new();
+
+    // Establish the counter moves at all, so a flat reading below is a
+    // property of the empty call rather than of the fixture.
+    let start = m.insert_generation();
+    m.bulk_replace_neighbors(&[], &[(3, key_v4(3, 9).1, entry(0x99))]);
+    assert!(m.insert_generation() > start, "fixture: a real bulk insert must bump");
+
+    let before = m.insert_generation();
+    m.bulk_replace_neighbors(&[], &[]);
+    m.learn_pair_if_changed(&[], entry(0x44));
+    assert_eq!(
+        m.insert_generation(),
+        before,
+        "an empty bulk call bumped the generation; a counter that advances on \
+         every call makes the poll-loop gate fire every sweep, which is the \
+         optimisation #7156 added removed"
+    );
+}

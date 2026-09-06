@@ -94,9 +94,22 @@ pub(super) const PENDING_NEIGH_SWEEP_BUDGET: usize = 64;
 /// This is NOT what keeps resolution prompt — the generation gate in
 /// `retry_pending_neigh` does that, walking every key on the sweep after any
 /// neighbour insert, so a dynamically-resolved hop dispatches with exactly the
-/// pre-#7156 latency. This covers the one case that gate cannot see: the STATIC
+/// pre-#7156 latency. This covers the case that gate cannot see: the STATIC
 /// `forwarding.neighbors` map, which changes on config apply rather than
 /// through `ShardedNeighborMap`, and so bumps no insert generation.
+///
+/// #9071: this used to say "the ONE case", and that was false. Two DYNAMIC
+/// paths were also invisible to the gate -- `bulk_replace_neighbors` and
+/// `learn_pair_if_changed` bumped only the shard epoch, never the insert
+/// generation -- so the netlink bulk sync and the #1787 RX source-MAC transit
+/// learn both relied on this backstop without saying so. Both now bump, and the
+/// static map is genuinely the remaining case.
+///
+/// The correction matters more than the latency it fixed: a reader tuning
+/// RESOLUTION_RECHECK_INTERVAL_NS upward on the strength of "the one case is the
+/// static map" would have converted a bounded 50 ms delay on two live paths into
+/// a real drop. A rationale that has silently stopped being true is the kind
+/// that gets acted on later.
 ///
 /// Sized against that: a config apply is a human-scale event, and 50 ms is far
 /// inside the 800 ms–2 s pending timeout, so a statically-configured neighbour
