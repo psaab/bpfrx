@@ -1,6 +1,20 @@
 // #8000, daemon half: a superseded member must not leave its fence barrier
 // armed.
 //
+// #9036 CHANGED THE MECHANISM AND KEPT THE GOAL. #8000 achieved "no misleading
+// fence timeout" by DISARMING the barrier, which makes waitFailoverActuated
+// take its `b == nil` arm and return nil — indistinguishable from a real
+// fence, so a request that demoted NOTHING was ACKed `applied` and the peer
+// promoted into the two-owner window #5640 exists to prevent. The barrier is
+// now RESOLVED with cluster.ErrFailoverSuperseded instead: it still returns
+// immediately (the assertion #8000 actually bought), and it now carries the
+// reason, so the ack downgrades to failed and the operator is told the truth
+// rather than a fence timeout.
+//
+// The cells below therefore assert PROMPT + SUPERSEDED, not PROMPT + nil. The
+// timing assertion is #8000's and is kept verbatim; dropping it would hand back
+// what #8000 bought while claiming to fix something else.
+//
 // The two halves of #8000 are one fix. Reporting the partial outcome (the
 // pkg/cluster half) still leaves the applied-ack burning the full fence timeout
 // on whichever member a concurrent reset claimed, and then reporting
@@ -16,6 +30,7 @@
 package daemon
 
 import (
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -95,9 +110,13 @@ func resetDuringFailoverHook(t *testing.T, cm *cluster.Manager, rgID int, fn fun
 	}
 }
 
-// FAIL-ON-REVERT: delete the `for _, rgID := range res.Superseded` disarm loop in
-// wireSessionSyncFailoverCallbacks and RG0's wait below burns barrier8000Timeout
-// and returns the fence-timeout error — the misdiagnosis #8000 names.
+// FAIL-ON-REVERT, two directions:
+//   - delete the `for _, rgID := range res.Superseded` loop in
+//     wireSessionSyncFailoverCallbacks and RG0's wait burns barrier8000Timeout
+//     and returns the fence-timeout error — the misdiagnosis #8000 names.
+//   - swap failFailoverActuation back to disarmFailoverActuation and RG0's wait
+//     returns nil promptly, which is #9036: a member that demoted nothing
+//     reports the same verdict as one that fenced.
 func TestRemoteBatchFailoverDisarmsSupersededBarrier8000(t *testing.T) {
 	d := newBarrier8000Daemon(t, 0, 1)
 	ss := cluster.NewSessionSync("127.0.0.1:4785", "127.0.0.1:4785", nil)
@@ -116,10 +135,12 @@ func TestRemoteBatchFailoverDisarmsSupersededBarrier8000(t *testing.T) {
 	// The superseded member: no demotion event was ever enqueued for RG0, so a
 	// barrier left armed here can only expire. It must already be gone.
 	start := time.Now()
-	if err := d.waitFailoverActuated(0, reqID); err != nil {
-		t.Errorf("waitFailoverActuated(RG0) = %v, want nil. RG0 was superseded by a "+
-			"concurrent reset, so no fence actuation is owed — reporting a fence "+
-			"timeout tells the operator the fencing path broke when it did not (#8000)", err)
+	if err := d.waitFailoverActuated(0, reqID); !errors.Is(err, cluster.ErrFailoverSuperseded) {
+		t.Errorf("waitFailoverActuated(RG0) = %v, want ErrFailoverSuperseded. RG0 was "+
+			"superseded by a concurrent reset, so no fence actuation is owed — but nil "+
+			"would ACK the member `applied` when it never demoted, which is #5640's "+
+			"two-owner window (#9036). A fence TIMEOUT is equally wrong: it tells the "+
+			"operator the fencing path broke when it did not (#8000)", err)
 	}
 	if elapsed := time.Since(start); elapsed > barrier8000Timeout/2 {
 		t.Errorf("waitFailoverActuated(RG0) took %v (fence timeout is %v): the barrier was "+
@@ -147,8 +168,10 @@ func TestRemoteBatchFailoverDisarmsSupersededBarrier8000(t *testing.T) {
 // closure with its own arm/disarm, so deleting its disarm arm leaves the batch
 // cell above green.
 //
-// FAIL-ON-REVERT: delete the `if outcome == cluster.FailoverSuperseded` disarm in
-// ss.OnRemoteFailover and this cell burns the timeout and reds.
+// FAIL-ON-REVERT, two directions: delete the
+// `if outcome == cluster.FailoverSuperseded` arm in ss.OnRemoteFailover and this
+// cell burns the timeout and reds; swap failFailoverActuation back to
+// disarmFailoverActuation and it reds on the verdict instead (#9036).
 func TestRemoteFailoverDisarmsSupersededBarrier8000(t *testing.T) {
 	d := newBarrier8000Daemon(t, 0)
 	ss := cluster.NewSessionSync("127.0.0.1:4785", "127.0.0.1:4785", nil)
@@ -164,8 +187,10 @@ func TestRemoteFailoverDisarmsSupersededBarrier8000(t *testing.T) {
 	}
 
 	start := time.Now()
-	if err := d.waitFailoverActuated(0, reqID); err != nil {
-		t.Errorf("waitFailoverActuated(RG0) = %v, want nil after a supersede", err)
+	if err := d.waitFailoverActuated(0, reqID); !errors.Is(err, cluster.ErrFailoverSuperseded) {
+		t.Errorf("waitFailoverActuated(RG0) = %v, want ErrFailoverSuperseded after a "+
+			"supersede: nil would ACK `applied` for a request that demoted nothing "+
+			"(#9036)", err)
 	}
 	if elapsed := time.Since(start); elapsed > barrier8000Timeout/2 {
 		t.Errorf("waitFailoverActuated(RG0) took %v: the singular path left the barrier "+
