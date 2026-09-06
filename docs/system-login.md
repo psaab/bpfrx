@@ -474,35 +474,71 @@ Matching is **partial**, not anchored: `allow-commands "show interfaces"` admits
 is only coherent if the default is partial, and the anchored spelling works
 too.
 
-> **An anchor cuts in OPPOSITE directions for allow and for deny, and only the
-> allow direction is illustrated above (#9022).**
+> **An anchor cuts in OPPOSITE directions for allow and for deny (#9022).**
 >
 > Partial matching makes an **allow** wider than its text — `allow-commands
 > "show interfaces"` admits `show interfaces terse`, which is the permissive
 > direction and is the one operators notice.
 >
-> It makes an **anchored deny narrower** than operators generally intend, and
-> that is the direction nobody notices, because the command still runs:
+> It used to make an **anchored deny narrower** than operators intend, and that
+> is the direction nobody notices, because the command still runs. With
+> `deny-commands "^show log$"`, every argument form ESCAPED:
 >
 > ```
-> deny-commands "^show log$"
->
->   show log        canonical "show log"       DENIED
->   show log 100    canonical "show log 100"   ALLOWED   <- same journalctl command
->   show log messages                          ALLOWED
+>   show log            canonical "show log"           DENIED
+>   show log 100        canonical "show log 100"       ALLOWED  <- same journalctl command
+>   show log messages   canonical "show log messages"  ALLOWED
 > ```
 >
 > `show log` accepts arguments (`AcceptsArgs` in the operational tree), so the
-> canonical string carries them and the `$` no longer matches. `show log 100`
-> runs the very command the rule denies. **Write the deny unanchored** —
-> `deny-commands "show log"` — unless you specifically mean to deny only the
-> bare form and permit every argument form of the same command.
+> canonical string carried them and the `$` no longer matched. **This is fixed.**
+> Each side of the rule is now matched against BOTH the full canonical string
+> and the argument-free command prefix, and the longer match for that side is
+> what the precedence tiers see. All three rows above now deny.
 >
-> This is distinct from the #8289 case, which is covered: appending a *sibling
-> keyword* rather than an argument (`show version configuration` under
+> **The widening is per-side, not "deny if either matches".** That distinction
+> is what preserves deny-with-exceptions:
+>
+> ```
+> deny-commands  "^show log$"
+> allow-commands "^show log 100$"
+>
+>   show log        DENIED   (deny matches; no allow does)
+>   show log 100    ALLOWED  (deny matches 8 chars on the prefix, allow matches
+>                             12 on the full string — tier 2 gives it to allow)
+>   show log 200    DENIED   (not the allowed exception)
+> ```
+>
+> A blunt "deny when either form matches a deny pattern" closes the hole and
+> breaks that idiom, denying the form the operator explicitly allowed.
+>
+> **An anchored deny still binds to ITS OWN command, not to a subtree.**
+> `deny-commands "^show configuration$"` does not deny `show configuration
+> system`, because that is a DISTINCT command node with its own handler (`show
+> configuration` is not `AcceptsArgs`; it has 16 declared children). That is the
+> same property as `^show version$` not denying `show route`, and widening it
+> would mean an anchored rule silently covered a whole subtree. To deny a
+> subtree, write the deny unanchored: `deny-commands "show configuration"`.
+>
+> The line the fix draws is *the same command with arguments* versus *a
+> different command*: `show log 100` runs the very handler `show log` runs
+> (`journalctl -u xpfd -n 100`), while `show configuration system` runs another
+> one. That is why the widening uses the resolved KEYWORD RUN and not "the first
+> two words".
+>
+> Distinct again from the #8289 case, which was already covered: appending a
+> *sibling keyword* rather than an argument (`show version configuration` under
 > `deny-commands "^show version$"`) yields an unresolvable canonical command and
-> **fails closed**. The hole is confined to nodes that legitimately accept
-> arguments.
+> **fails closed**.
+>
+> **Both control surfaces now agree for an anchored rule.** The remote ShowText
+> path prices commands by topic through argument-free canonical strings, so it
+> always denied correctly; the console did not. An operator who verified a deny
+> rule over the remote CLI therefore got the wrong answer about the console.
+> `TestAnchoredDenyAgreesAcrossSurfaces9022` asserts the agreement rather than
+> each side separately. The separate ARGUMENT-TEXT gap recorded in
+> `pkg/grpcapi/authz_command_table_topics.go` (a regex written against argument
+> text matches on the box and not remotely) is unchanged and still open.
 
 #### An EMPTY pattern is not an absent one
 

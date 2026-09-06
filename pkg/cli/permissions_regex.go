@@ -145,7 +145,13 @@ func evaluateCommandRegex(
 			class, firstWord(words))
 	}
 
-	decision := rules.Evaluate(strings.Join(canon, " "))
+	// #9022: match against the full canonical string AND the argument-free
+	// command prefix. `Canonicalize` passes an AcceptsArgs node's trailing
+	// tokens through (#8304, deliberately), so an ANCHORED deny such as
+	// `^show log$` stopped matching the moment any argument was appended and
+	// the denied command ran. See EvaluateForms for why this is a max-per-side
+	// widening rather than "deny if either matches".
+	decision := rules.EvaluateForms(strings.Join(canon, " "), canonicalPrefix(canon))
 	if decision.Allowed {
 		return nil
 	}
