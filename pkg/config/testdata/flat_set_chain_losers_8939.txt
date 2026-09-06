@@ -1,4 +1,4 @@
-# counts: losers=45 walked=60 vacuous=43 unmeasured=73
+# counts: losers=43 walked=62 vacuous=43 unmeasured=73
 # collector reach: 363 containers walked, 133 reached the census (134 dropped: no eligible leaf, 96 dropped: only one)
 class-of-service traffic-control-profiles arg1  [delay-buffer-rate | guaranteed-rate | scheduler-map]  total  OPERATOR
 class-of-service traffic-control-profiles arg1  [delay-buffer-rate | guaranteed-rate]  total  lenient-only
@@ -10,8 +10,6 @@ forwarding-options sampling instance arg1 family inet6 output  [inline-jflow | s
 protocols bgp  [cluster-id | graceful-restart | local-as]  total  OPERATOR
 protocols bgp  [cluster-id | graceful-restart]  total  OPERATOR
 protocols bgp multipath  [ibgp | multiple-as]  total  OPERATOR
-protocols router-advertisement interface arg1  [default-lifetime | link-mtu | managed-configuration]  total  OPERATOR
-protocols router-advertisement interface arg1  [default-lifetime | link-mtu]  total  lenient-only
 protocols router-advertisement interface arg1 prefix arg1  [autonomous | no-autonomous | no-onlink]  total  lenient-only
 protocols router-advertisement interface arg1 prefix arg1  [autonomous | no-autonomous]  total  lenient-only
 routing-options generate route arg1  [discard | policy]  total  OPERATOR
