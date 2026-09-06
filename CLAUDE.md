@@ -375,8 +375,21 @@ in git history; `git log -- bpf/xdp/ bpf/tc/` walks the deleted source.
 
 ### Parser Dual AST Shape & Set Syntax Testing
 - Hierarchical `family inet { dhcp; }` → `Node{Keys:["family","inet"]}` with children
-- Flat `set interfaces eth0 unit 0 family inet dhcp` → `Node{Keys:["family"]}` with child `Node{Keys:["inet"]}`
+- Flat `set protocols bgp group g1 neighbor 10.0.0.1 peer-as 65001` → a CHAIN,
+  one node per leaf, each nested under the previous leaf's node:
+  `[protocols] > [bgp] > [group g1] > [neighbor 10.0.0.1] > [peer-as 65001]`
 - Compiler must handle **both** shapes
+- **`family inet` is NOT an example of the difference** — do not use it as one.
+  `family` is declared `compoundKey: true`, so `SetPath` consumes the sub-key
+  into the same node exactly as the hierarchical parser does, and the two trees
+  come out **structurally identical** (`Keys=["family","inet"]` either way; they
+  differ only in the `Line`/`Column` source positions the hierarchical parser
+  records and `SetPath` leaves zero, which nothing reads for shape). This bullet
+  previously used `family inet` to illustrate a divergence that does not exist
+  there (#8808), which is wrong in the direction that makes people skip a
+  measurement: a compiler tested only against `family inet` looks shape-agnostic
+  while being blind to every non-compound container. `pkg/config/ast_shape_doc_8808_test.go`
+  pins both claims so this cannot rot again.
 - **Bracketed lists (`[ a b c ]`) collapse onto ONE leaf's Keys in BOTH shapes (#2419).** The lexer strips `[`/`]`, so `from protocol [ tcp udp icmp ]` becomes a single leaf `Keys=["protocol","tcp","udp","icmp"]` whether parsed hierarchically or via flat-set `SetPath`. A `multi: true` leaf in `setSchema` absorbs every trailing non-sibling token onto its node key. A compiler reading a multi-value leaf MUST read `child.Keys[1:]` AND `child.Children` and accumulate (use `firewallMatchValues`); reading only `Keys[1]` drops all but the first list value (the #2419 bug). See `docs/config-schema.md` "Multi-value leaves and bracketed lists".
 - **Testing flat set syntax:** ALWAYS use `ParseSetCommand()` + `tree.SetPath()` loop, NEVER `NewParser()` — the parser treats newlines as whitespace and will merge all set lines into one giant node
 
