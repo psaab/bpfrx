@@ -7106,3 +7106,192 @@ fn a_generation_fenced_miss_is_not_reported_as_an_alias_7056() {
          change (#7056)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #9128 / #9129: an ICMP error's QUOTED packet must keep its fragmentation
+// fields across the embedded translation.
+//
+// Both directions had the same defect from opposite ends. v6->v4 wrote
+// `ID=0, DF=1` over whatever the quote said; v4->v6 never emitted an IPv6
+// Fragment Header at all, so the translated quote described an unfragmented
+// datagram that was never sent.
+//
+// Scope, stated because it is what makes these Low rather than High: a
+// non-first fragment is refused upstream in BOTH directions -- by
+// `ipv6_is_non_first_fragment` (#2290) going v6->v4, and by `parse_embedded_v4`
+// (#1852) going v4->v6. Those guards filter on OFFSET, so an `MF=1, offset=0`
+// FIRST fragment passes and is the reachable case. The fix copies the offset
+// anyway so neither arm is correct only by virtue of a guard somewhere else.
+// ---------------------------------------------------------------------------
+
+/// A quoted IPv6 packet with an optional Fragment Header, carrying a UDP header.
+fn quoted_v6_9128(frag: Option<(u32, u16, bool)>) -> Vec<u8> {
+    let mut q = vec![0u8; 40];
+    q[0] = 0x60;
+    q[7] = 64; // hop limit
+    q[8..24].copy_from_slice(&Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).octets());
+    q[24..40].copy_from_slice(&Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0x0a00, 0x0001).octets());
+    let udp = [0x30u8, 0x39, 0x00, 0x50, 0x00, 0x08, 0x00, 0x00];
+    match frag {
+        Some((ident, offset_units, more)) => {
+            q[6] = 44; // next header = Fragment
+            let mut fh = vec![0u8; 8];
+            fh[0] = PROTO_UDP;
+            let w = (offset_units << 3) | u16::from(more);
+            fh[2..4].copy_from_slice(&w.to_be_bytes());
+            fh[4..8].copy_from_slice(&ident.to_be_bytes());
+            q.extend_from_slice(&fh);
+            q.extend_from_slice(&udp);
+            let plen = (8 + udp.len()) as u16;
+            q[4..6].copy_from_slice(&plen.to_be_bytes());
+        }
+        None => {
+            q[6] = PROTO_UDP;
+            q.extend_from_slice(&udp);
+            q[4..6].copy_from_slice(&(udp.len() as u16).to_be_bytes());
+        }
+    }
+    q
+}
+
+fn embed_map_v6_to_v4_9128() -> EmbeddedV6ToV4 {
+    EmbeddedV6ToV4 {
+        mapped_embedded_src: Ipv4Addr::new(192, 0, 2, 1),
+        mapped_embedded_dst: Ipv4Addr::new(10, 0, 0, 1),
+        mapped_embedded_dst_port: None,
+    }
+}
+
+#[test]
+fn embedded_v6_to_v4_carries_the_quoted_fragmentation_9128() {
+    let mut out = [0u8; MAX_EMBEDDED_LEN];
+
+    // REFERENCE ARM. An UNFRAGMENTED quote must stay byte-identical to the
+    // pre-fix behaviour: ID 0, DF set. Without this the fragmented assertion
+    // below could pass against a translator that simply copies garbage.
+    let plain = quoted_v6_9128(None);
+    let n = translate_embedded_v6_to_v4(&mut out, &plain, &embed_map_v6_to_v4_9128())
+        .expect("unfragmented quote must translate");
+    assert_eq!(&out[4..6], &[0, 0], "unfragmented quote must keep ID 0");
+    assert_eq!(
+        u16::from_be_bytes([out[6], out[7]]),
+        0x4000,
+        "unfragmented quote must keep DF=1, MF=0, offset=0"
+    );
+    assert!(n >= 20);
+
+    // THE DEFECT: a FIRST fragment (offset 0, M=1). ID and MF were discarded.
+    let frag = quoted_v6_9128(Some((0xDEAD_BEEF, 0, true)));
+    translate_embedded_v6_to_v4(&mut out, &frag, &embed_map_v6_to_v4_9128())
+        .expect("first-fragment quote must translate");
+    assert_eq!(
+        u16::from_be_bytes([out[4], out[5]]),
+        0xBEEF,
+        "RFC 7915 5.1: Identification comes from the low 16 bits of the Fragment Header"
+    );
+    let w = u16::from_be_bytes([out[6], out[7]]);
+    assert_eq!(w & 0x4000, 0, "DF must be CLEARED for a fragmented quote");
+    assert_eq!(w & 0x2000, 0x2000, "M flag must be copied to MF");
+    assert_eq!(w & 0x1FFF, 0, "a first fragment's offset is 0");
+
+    // NARROWNESS: the offset is copied, not synthesized. A guard upstream keeps
+    // offset != 0 from reaching here; this arm must not DEPEND on that.
+    let deep = quoted_v6_9128(Some((1, 5, false)));
+    if translate_embedded_v6_to_v4(&mut out, &deep, &embed_map_v6_to_v4_9128()).is_some() {
+        assert_eq!(
+            u16::from_be_bytes([out[6], out[7]]) & 0x1FFF,
+            5,
+            "if a non-first quote ever reaches this arm its offset must be copied"
+        );
+    }
+}
+
+/// A quoted IPv4 packet with the given fragmentation word, carrying a UDP header.
+fn quoted_v4_9129(ident: u16, offset_units: u16, more: bool) -> Vec<u8> {
+    let udp = [0x30u8, 0x39, 0x00, 0x50, 0x00, 0x08, 0x00, 0x00];
+    let mut q = vec![0u8; 20];
+    q[0] = 0x45;
+    q[2..4].copy_from_slice(&((20 + udp.len()) as u16).to_be_bytes());
+    q[4..6].copy_from_slice(&ident.to_be_bytes());
+    let w = (offset_units & 0x1FFF) | if more { 0x2000 } else { 0 };
+    q[6..8].copy_from_slice(&w.to_be_bytes());
+    q[8] = 64;
+    q[9] = PROTO_UDP;
+    q[12..16].copy_from_slice(&Ipv4Addr::new(192, 0, 2, 1).octets());
+    q[16..20].copy_from_slice(&Ipv4Addr::new(10, 0, 0, 1).octets());
+    q.extend_from_slice(&udp);
+    q
+}
+
+fn embed_map_v4_to_v6_9129() -> EmbeddedV4ToV6 {
+    let mut prefix_bytes = [0u8; 12];
+    prefix_bytes[..4].copy_from_slice(&[0x00, 0x64, 0xff, 0x9b]);
+    EmbeddedV4ToV6 {
+        mapped_embedded_src: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+        prefix_bytes,
+        mapped_embedded_src_port: None,
+    }
+}
+
+#[test]
+fn embedded_v4_to_v6_emits_a_fragment_header_9129() {
+    let mut out = [0u8; MAX_EMBEDDED_LEN];
+
+    // REFERENCE ARM. An UNFRAGMENTED quote must be byte-identical to before:
+    // no Fragment Header, next-header is the real protocol, L4 at offset 40.
+    let plain = quoted_v4_9129(0x1234, 0, false);
+    let n = translate_embedded_v4_to_v6(&mut out, &plain, &embed_map_v4_to_v6_9129())
+        .expect("unfragmented quote must translate");
+    assert_eq!(out[6], PROTO_UDP, "no Fragment Header for an unfragmented quote");
+    assert_eq!(n, 48, "40-byte IPv6 header + 8-byte UDP header");
+    assert_eq!(&out[40..42], &[0x30, 0x39], "L4 must still start at offset 40");
+
+    // THE DEFECT: a FIRST fragment (MF=1, offset=0) passed the upstream offset
+    // filter and lost its ID and M flag entirely, because no Fragment Header
+    // was emitted.
+    let frag = quoted_v4_9129(0x1234, 0, true);
+    let n = translate_embedded_v4_to_v6(&mut out, &frag, &embed_map_v4_to_v6_9129())
+        .expect("first-fragment quote must translate");
+    assert_eq!(out[6], 44, "base next-header must chain the Fragment Header");
+    assert_eq!(out[40], PROTO_UDP, "Fragment Header carries the real protocol");
+    let w = u16::from_be_bytes([out[42], out[43]]);
+    assert_eq!(w & 0x0001, 1, "M flag must mirror IPv4 MF");
+    assert_eq!(w >> 3, 0, "a first fragment's offset is 0");
+    assert_eq!(
+        u32::from_be_bytes([out[44], out[45], out[46], out[47]]),
+        0x1234,
+        "RFC 7915 4: the IPv4 16-bit ID is zero-extended to 32 bits"
+    );
+    assert_eq!(n, 56, "the Fragment Header adds 8 bytes");
+    assert_eq!(
+        u16::from_be_bytes([out[4], out[5]]) as usize,
+        8 + 8,
+        "payload length must count the Fragment Header"
+    );
+    assert_eq!(&out[48..50], &[0x30, 0x39], "L4 must shift past the Fragment Header");
+}
+
+#[test]
+fn embedded_v4_to_v6_fragment_header_shortens_rather_than_drops_9129() {
+    // The Fragment Header costs 8 bytes the scratch was not sized for: a
+    // maximal quote already lands exactly on MAX_EMBEDDED_LEN. Growing past it
+    // would make the bounds check fail and DROP the ICMP error, turning an
+    // unfaithful translation into a missing one -- a worse outcome than the
+    // defect being fixed. The quote must be shortened instead.
+    let mut q = quoted_v4_9129(0x4321, 0, true);
+    let pad = MAX_EMBEDDED_LEN; // far past any budget
+    q.extend(std::iter::repeat(0xAA).take(pad));
+    let total = q.len() as u16;
+    q[2..4].copy_from_slice(&total.to_be_bytes());
+
+    let mut out = [0u8; MAX_EMBEDDED_LEN];
+    let n = translate_embedded_v4_to_v6(&mut out, &q, &embed_map_v4_to_v6_9129())
+        .expect("an oversized fragmented quote must still translate, shortened");
+    assert!(n <= MAX_EMBEDDED_LEN, "must fit the scratch, got {n}");
+    assert_eq!(out[6], 44, "and must still carry the Fragment Header");
+    assert_eq!(
+        u32::from_be_bytes([out[44], out[45], out[46], out[47]]),
+        0x4321,
+        "the identification survives the shortening"
+    );
+}
