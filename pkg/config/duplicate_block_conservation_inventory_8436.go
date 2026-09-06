@@ -291,12 +291,38 @@ var dupConservationSkipped8436 = []string{
 	// the census no longer has. The two censuses share synthPair, so an
 	// improvement to the instrument moves both.
 	//
-	// The census's own VACUITY guard, and structurally uninteresting for this
-	// property rather than unverified: the merged form compiles identically to a
-	// block carrying only the first leaf, so the second leaf is invisible to the
-	// typed config and the site cannot show a loss either way. Listed so the set
-	// is BOUNDED — a container that newly becomes unobservable is a change worth
-	// noticing, not a silent drop in coverage.
+	// The census's own VACUITY guard. The merged form compiles identically to a
+	// block carrying only the first leaf, so the census sees nothing.
+	//
+	// #9181: THE REASON THIS SET USED TO GIVE WAS FALSE, and it is corrected
+	// here rather than deleted. It said the second leaf "is invisible to the
+	// typed config and the site cannot show a loss either way". The first
+	// clause is a true observation about THE FIXTURE; the second is a claim
+	// about the SITE, and it is wrong for all three entries below. Each shows
+	// a real loss once the fixture can express what the site needs, and each
+	// needs a DIFFERENT thing — which is why one shared sentence covered them
+	// and was wrong about every one:
+	//
+	//	protocols bgp group      needs a SIBLING (`neighbor`) plus that
+	//	                         sibling's own prerequisite (`peer-as`, required
+	//	                         by the compiler and not declared in the schema).
+	//	                         Group settings fold into BGPNeighbor, so with no
+	//	                         neighbor there is nothing for them to land in.
+	//	cos interfaces .. unit   needs the referenced object DEFINED: a
+	//	                         `scheduler-map` reference to an undefined map is
+	//	                         rejected outright, so the fixture never compiles.
+	//	RA .. prefix             needs a THIRD leaf: its first two are booleans
+	//	                         that collapse identically, so two leaves cannot
+	//	                         separate the spellings at all.
+	//
+	// So these stay skipped because THE FIXTURE CANNOT EXPRESS THE
+	// PREREQUISITE, not because the site is unobservable. That distinction is
+	// the whole of #9181: "not measured" and "nothing to measure" had the same
+	// spelling here, and the second reading hardened into a justification a
+	// reader would not re-check.
+	//
+	// Listed so the set is BOUNDED — a container that newly becomes
+	// unobservable is a change worth noticing, not a silent drop in coverage.
 	"class-of-service interfaces xpfname unit",
 	"protocols bgp group",
 	"protocols router-advertisement interface xpfname prefix",
