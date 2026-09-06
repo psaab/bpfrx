@@ -2325,6 +2325,20 @@ func schedulerWindowFromNode(n *Node) (SchedulerDayWindow, bool) {
 	var win SchedulerDayWindow
 	found := false
 
+	// #8939: a flat `set` command naming several window leaves is ONE command,
+	// and SetPath nests them instead of making them siblings:
+	//
+	//	set schedulers scheduler s1 monday all-day exclude start-time 08:00:00
+	//	  [monday]
+	//	    [all-day]
+	//	      [exclude start-time 08:00:00]     <- ONE node, a FLAT RUN
+	//
+	// The Children loop below sees `all-day` and nothing else, so `exclude` and
+	// the window were silently dropped. Flattening here rather than at the two
+	// call sites covers `daily` AND all seven weekdays in one place, because
+	// this is the single extractor they share -- measured before relying on it.
+	children := expandFlatRun(n.Children, schedulerDayLeafSchema8939())
+
 	// Flat leaf shape where the keyword rides on the node's own Keys, e.g.
 	// hierarchical `daily all-day;` parses to Keys=["daily","all-day"].
 	if len(n.Keys) >= 2 {
@@ -2338,7 +2352,7 @@ func schedulerWindowFromNode(n *Node) (SchedulerDayWindow, bool) {
 		}
 	}
 
-	for _, c := range n.Children {
+	for _, c := range children {
 		switch c.Name() {
 		case "start-time":
 			win.StartTime = nodeVal(c)
@@ -2355,6 +2369,21 @@ func schedulerWindowFromNode(n *Node) (SchedulerDayWindow, bool) {
 		}
 	}
 	return win, found
+}
+
+// schedulerDayLeafSchema8939 resolves the leaf set a scheduler day window
+// declares. `daily` and every weekday share it, which is why one lookup serves
+// both call sites of schedulerWindowFromNode.
+func schedulerDayLeafSchema8939() *schemaNode {
+	sch := resolveSchemaChild(setSchema, "schedulers")
+	inst := resolveSchemaChild(sch, "scheduler")
+	if inst == nil {
+		return nil
+	}
+	if inst.wildcard != nil {
+		inst = inst.wildcard
+	}
+	return resolveSchemaChild(inst, "daily")
 }
 
 func compileChassis(node *Node, ch *ChassisConfig) error {
