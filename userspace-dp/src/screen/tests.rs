@@ -6321,3 +6321,145 @@ fn has_screen_state_sees_an_inert_only_config_7888() {
          same all-or-nothing hole #6860 closed for undefined references"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #9114: the shim's non-first-fragment protocol sentinel must be recovered, or
+// every protocol-keyed screen is evaluated against a protocol that is not the
+// packet's.
+// ---------------------------------------------------------------------------
+
+/// #9114 (IPv4): a NON-FIRST fragment arrives with `protocol` = the shim's
+/// `PROTO_FRAGMENT_NO_L4` sentinel (255), and `extract_screen_info` must
+/// recover the datagram's real protocol from the IP header.
+///
+/// `userspace-xdp` substitutes the sentinel before `parse_l4`, and it rides
+/// `meta.protocol` into the screens unchanged. `check_icmp_fragment`,
+/// `icmp-flood` and `udp-flood` are all keyed on `protocol == PROTO_ICMP /
+/// PROTO_ICMPV6 / PROTO_UDP`, so they never fired on the exact packets they
+/// exist to police.
+///
+/// THE EXISTING FRAGMENT FIXTURES CANNOT CATCH THIS: they pass the REAL
+/// protocol as the caller argument, which is a packet shape the shim never
+/// emits for a non-first fragment. This cell passes the sentinel, as the shim
+/// does.
+#[test]
+fn extract_recovers_real_protocol_for_v4_non_first_fragment_9114() {
+    let mut frame = vec![0u8; 14 + 40];
+    let ip = 14;
+    frame[ip] = 0x45;
+    frame[ip + 2..ip + 4].copy_from_slice(&40u16.to_be_bytes());
+    // NON-first fragment: offset != 0 (185 * 8 bytes in), MF clear.
+    frame[ip + 6..ip + 8].copy_from_slice(&185u16.to_be_bytes());
+    frame[ip + 9] = 1; // real protocol = ICMP
+    frame[ip + 12..ip + 16].copy_from_slice(&[1, 2, 3, 4]);
+    frame[ip + 16..ip + 20].copy_from_slice(&[5, 6, 7, 8]);
+
+    let info = extract_screen_info(
+        &frame,
+        libc::AF_INET as u8,
+        255, // the shim's PROTO_FRAGMENT_NO_L4 sentinel
+        0,
+        40,
+        IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+        IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)),
+        0,
+        0,
+        14,
+    )
+    .expect("a non-first IPv4 fragment must still parse");
+
+    assert!(info.is_fragment, "fixture precondition: offset != 0 is a fragment");
+    assert!(
+        !info.is_first_fragment,
+        "fixture precondition: this must be a NON-first fragment, or the sentinel \
+         would never have been substituted"
+    );
+    assert_eq!(
+        info.protocol, 1,
+        "the screens must see the datagram's REAL protocol (ICMP), not the shim's \
+         255 sentinel — icmp-fragment and icmp-flood are keyed on it (#9114)"
+    );
+}
+
+/// #9114 (IPv6): same recovery, from the FRAGMENT HEADER's own NextHdr field.
+///
+/// The v6 walk `break`s out on a non-first fragment before it would read
+/// `nexthdr`, so the real protocol has to be taken from the fragment header
+/// itself — a field present on every fragment, which is its purpose.
+#[test]
+fn extract_recovers_real_protocol_for_v6_non_first_fragment_9114() {
+    // eth(14) + IPv6 base(40) + fragment header(8)
+    let mut frame = vec![0u8; 14 + 40 + 8];
+    let ip = 14;
+    frame[ip] = 0x60; // version 6
+    frame[ip + 4..ip + 6].copy_from_slice(&8u16.to_be_bytes()); // payload len
+    frame[ip + 6] = 44; // next header = Fragment
+    frame[ip + 7] = 64; // hop limit
+    let fh = ip + 40;
+    frame[fh] = 17; // fragment header NextHdr = UDP (the real protocol)
+    // frag offset field: non-first (offset != 0), M bit clear.
+    frame[fh + 2..fh + 4].copy_from_slice(&(185u16 << 3).to_be_bytes());
+
+    let info = extract_screen_info(
+        &frame,
+        libc::AF_INET6 as u8,
+        255, // the shim's sentinel
+        0,
+        48,
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2)),
+        0,
+        0,
+        14,
+    )
+    .expect("a non-first IPv6 fragment must still parse");
+
+    assert!(info.is_fragment, "fixture precondition: a fragment");
+    assert!(
+        !info.is_first_fragment,
+        "fixture precondition: NON-first fragment"
+    );
+    assert_eq!(
+        info.protocol, 17,
+        "the screens must see the datagram's REAL protocol (UDP) recovered from the \
+         fragment header's NextHdr, not the shim's 255 sentinel — udp-flood is keyed \
+         on it (#9114)"
+    );
+}
+
+/// CONTROL: an ordinary packet's protocol is passed through UNTOUCHED.
+///
+/// The recovery is gated on the sentinel. Without this row a change that always
+/// re-derived the protocol from the frame would satisfy both cells above while
+/// overriding a caller that legitimately knew better (a decapsulated inner
+/// packet, for one).
+#[test]
+fn extract_leaves_a_real_caller_protocol_untouched_9114() {
+    let mut frame = vec![0u8; 14 + 40];
+    let ip = 14;
+    frame[ip] = 0x45;
+    frame[ip + 2..ip + 4].copy_from_slice(&40u16.to_be_bytes());
+    frame[ip + 6..ip + 8].copy_from_slice(&0u16.to_be_bytes()); // not a fragment
+    frame[ip + 9] = 1; // header says ICMP
+    frame[ip + 12..ip + 16].copy_from_slice(&[1, 2, 3, 4]);
+    frame[ip + 16..ip + 20].copy_from_slice(&[5, 6, 7, 8]);
+
+    let info = extract_screen_info(
+        &frame,
+        libc::AF_INET as u8,
+        6, // caller says TCP, and the caller wins
+        0x02,
+        40,
+        IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+        IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)),
+        12345,
+        80,
+        14,
+    )
+    .expect("ordinary packet parses");
+    assert_eq!(
+        info.protocol, 6,
+        "a non-sentinel caller protocol must be passed through unchanged — the \
+         #9114 recovery is gated on the sentinel, not unconditional"
+    );
+}
