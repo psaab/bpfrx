@@ -808,6 +808,17 @@ func TestElidedSSHRootLoginReachesTheDaemon8690(t *testing.T) {
 // and re-opening the instance does not merge, so these are unmeasurable by this
 // method until #8436 lands, not merely unfixtured.
 var knownUnexaminable8690 = []string{
+	// #8928: `services ip-monitoring policy` is unexaminable for the exact
+	// reason the note above carves out — the leaf under test IS the stanza's
+	// validity condition. An ip-monitoring policy requires at least one
+	// `then preferred-route route`, so a fixture carrying only the leaf under
+	// test is rejected on that ground and the control cannot be built at all.
+	// Measured: the braced GOOD-reference arm fails with "at least one then
+	// preferred-route route is required", not with anything about the leaf.
+	//
+	// This is NOT the alternative-leaf case the note excludes: no other leaf
+	// satisfies the stanza in place of the required `then`.
+	"services ip-monitoring policy",
 	// #8690: this one is the INVERSE of every other entry, and the difference
 	// is worth stating because the failure message tells the next person to
 	// supply a missing sibling — which cannot work here.

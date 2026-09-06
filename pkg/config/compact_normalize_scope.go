@@ -1388,6 +1388,7 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		"security ssh-known-hosts",
 		"services flow-monitoring",
 		"services ip-monitoring",
+		"ip-monitoring policy",
 		// #8879 batch 8. `forwarding-options family` uses mode `packet-based`
 		// deliberately: `flow-based` is the compiled DEFAULT, and a fixture
 		// carrying the default reads CLEAN WHILE BROKEN.

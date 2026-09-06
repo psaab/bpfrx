@@ -1398,7 +1398,11 @@ func TestDepth2UnadmittedPopulation8929(t *testing.T) {
 	//
 	// It reads SAME, exactly like both siblings, so it does not drop and does
 	// not belong in knownDropping.
-	wantPopulation = 25
+	// #8928 admitted `ip-monitoring policy`, which leaves the depth-2
+	// UN-admitted population: 25 -> 24. A shrink here is the intended
+	// direction — the ratchet reds on it precisely so an admission cannot
+	// pass unremarked. Re-derived at this base.
+	wantPopulation = 24
 
 	parentAdmitted := func(mid string) bool {
 		for stanza := range setSchema.children {
