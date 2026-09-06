@@ -90,7 +90,40 @@ func flatSetSyntheticValue(name string) string {
 // The count is data; it should not be re-derived.
 type flatSetChainRow struct {
 	container []string
-	leaves    []string
+	leaves    []flatSetLeaf
+}
+
+// flatSetLeaf is a leaf NAME together with its arity, because the two are
+// needed together and re-deriving either has already gone wrong once here
+// (flatSetLeafCount, #9078). ARITY IS THE POINT: a leaf declaring `args: 0` is
+// a FLAG, and handing it a synthesized value produces a command no operator can
+// write --
+//
+//	generator  monday all-day xpfval exclude xpfval   ->  exclude=false
+//	operator   monday all-day exclude                 ->  exclude=true
+//
+// -- so all fifteen `schedulers scheduler <s> <weekday>` rows were UNCLEARABLE
+// BY CONSTRUCTION. A correct fix to that family (#9081) cleared none of them,
+// because the row asked a question about a malformed input. Making them clear
+// would have required teaching the compiler to swallow a stray token after an
+// args:0 flag, which is shaping production to satisfy an instrument.
+//
+// Third defect of this shape in this generator, after `arg1`-as-leaf and
+// flatSetLeafCount: a SYNTHETIC CONFIG THAT IS NOT A CONFIG, producing a row no
+// correct fix can clear. Found by lane-8388 reporting what actually cleared
+// instead of what was predicted to clear.
+type flatSetLeaf struct {
+	name string
+	args int
+}
+
+// spell renders the leaf as an operator would write it: a flag alone, a
+// value-taking leaf with its synthesized value.
+func (l flatSetLeaf) spell() string {
+	if l.args == 0 {
+		return l.name
+	}
+	return l.name + " " + flatSetSyntheticValue(l.name)
 }
 
 func flatSetChainPairs() []flatSetChainRow {
@@ -101,13 +134,13 @@ func flatSetChainPairs() []flatSetChainRow {
 		if depth > 6 || n == nil || n.children == nil {
 			return
 		}
-		var leaves []string
+		var leaves []flatSetLeaf
 		for k, c := range n.children {
 			if c != nil && c.children == nil && c.wildcard == nil && !c.multi {
-				leaves = append(leaves, k)
+				leaves = append(leaves, flatSetLeaf{name: k, args: c.args})
 			}
 		}
-		sort.Strings(leaves)
+		sort.Slice(leaves, func(i, j int) bool { return leaves[i].name < leaves[j].name })
 		if len(leaves) >= 2 {
 			if key := strings.Join(path, " "); !seen[key] {
 				seen[key] = true
@@ -130,9 +163,9 @@ func flatSetChainPairs() []flatSetChainRow {
 				// eligible leaf exists, the row that a descent-shaped fix
 				// cannot clear.
 				cp := append([]string{}, path...)
-				out = append(out, flatSetChainRow{cp, append([]string{}, leaves[:2]...)})
+				out = append(out, flatSetChainRow{cp, append([]flatSetLeaf{}, leaves[:2]...)})
 				if len(leaves) >= 3 {
-					out = append(out, flatSetChainRow{cp, append([]string{}, leaves[:3]...)})
+					out = append(out, flatSetChainRow{cp, append([]flatSetLeaf{}, leaves[:3]...)})
 				}
 			}
 		}
@@ -229,9 +262,8 @@ func TestFlatSetChainWalkRatchet8939(t *testing.T) {
 		packedLine := base
 		var splitLines []string
 		for _, lf := range leaves {
-			v := flatSetSyntheticValue(lf)
-			packedLine += " " + lf + " " + v
-			splitLines = append(splitLines, fmt.Sprintf("%s %s %s", base, lf, v))
+			packedLine += " " + lf.spell()
+			splitLines = append(splitLines, base+" "+lf.spell())
 		}
 		packed, ep := flatSetCompile([]string{packedLine})
 		split, es := flatSetCompile(splitLines)
@@ -266,7 +298,11 @@ func TestFlatSetChainWalkRatchet8939(t *testing.T) {
 			}
 			walked++
 			if os.Getenv("SHOW_WALKED_8939") != "" {
-				fmt.Printf("WALKED %s [%s]\n", strings.Join(cont, " "), strings.Join(leaves, " | "))
+				wn := make([]string, 0, len(leaves))
+				for _, lf := range leaves {
+					wn = append(wn, lf.name)
+				}
+				fmt.Printf("WALKED %s [%s]\n", strings.Join(cont, " "), strings.Join(wn, " | "))
 			}
 			continue
 		}
@@ -283,8 +319,12 @@ func TestFlatSetChainWalkRatchet8939(t *testing.T) {
 				kind = "partial(descent-shaped)"
 			}
 		}
+		names := make([]string, 0, len(leaves))
+		for _, lf := range leaves {
+			names = append(names, lf.name)
+		}
 		losers = append(losers, strings.Join(cont, " ")+"  ["+
-			strings.Join(leaves, " | ")+"]  "+kind)
+			strings.Join(names, " | ")+"]  "+kind)
 	}
 	sort.Strings(losers)
 
