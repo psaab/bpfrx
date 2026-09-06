@@ -92,6 +92,22 @@ after the configured prefix:
 Only `/32` and `/64` prefix lengths are supported for IPv6 host addresses (any
 other length is hard-rejected at commit: `IPv6 host prefix must be /32 or /64`).
 
+**What a reverse lookup can actually resolve to (#9070).** The reverse direction
+reconstructs the subscriber WORD, not the host, so its answer is the network
+base of a *deterministic unit* — the configured prefix plus that 32-bit word:
+
+| configured prefix | subscriber word | deterministic unit |
+|---|---|---|
+| `/32` | word[1] (bytes 4-7)  | **`/64`** |
+| `/64` | word[2] (bytes 8-11) | **`/96`** |
+
+The unit is therefore NEVER the configured prefix, and reporting the configured
+value would be confidently wrong rather than merely ambiguous. `show` renders
+this as `Internal prefix: <base>/<unit>` (not `Internal host:`, which reads as an
+exact `/128`), and both APIs carry it: REST `internal_prefix_len`, gRPC
+`internal_prefix_len`. It is 0 in IPv4 mode, where the recovered value IS an
+exact host.
+
 The source must lie **inside the configured subscriber prefix**: the subscriber
 index is derived from the 32-bit word alone, so a source in a DIFFERENT prefix
 that happens to share that word would otherwise be mapped into the in-prefix

@@ -136,11 +136,23 @@ type ForwardResult struct {
 
 // ReverseResult is a translated -> subscriber deterministic mapping.
 type ReverseResult struct {
-	Pool              string
-	Mode              Mode
-	ExternalIP        string // translated external IPv4 (echoed)
-	NATPort           uint16 // translated port (echoed)
-	InternalHost      string // recovered subscriber (IPv4, or IPv6 prefix)
+	Pool         string
+	Mode         Mode
+	ExternalIP   string // translated external IPv4 (echoed)
+	NATPort      uint16 // translated port (echoed)
+	InternalHost string // recovered subscriber (IPv4, or IPv6 prefix BASE)
+	// InternalPrefixLen is the prefix length of the DETERMINISTIC UNIT that
+	// InternalHost names, or 0 in IPv4 mode where the value is an exact host
+	// (#9070).
+	//
+	// It is NOT the configured pool prefix. `detParamsForPool` reports that
+	// separately as 32 or 64; this is the unit the reverse lookup can actually
+	// resolve to, which is the configured prefix PLUS the 32-bit subscriber
+	// word the lookup reconstructs: wordOffset 4 -> /64, wordOffset 8 -> /96.
+	// The two answer similar-sounding questions and are never equal, so a
+	// consumer that reused the pool prefix here would render a /64 for a value
+	// that is really a /96 -- confidently wrong rather than merely ambiguous.
+	InternalPrefixLen int
 	PortLow           uint16 // inclusive low of the block containing NATPort
 	PortHigh          uint16 // inclusive high of that block
 	BlockSize         uint16
@@ -727,6 +739,8 @@ func lookupReverseInPool(p detParams, poolName string, natIP net.IP, natPort uin
 	low, high := blockPorts(p, blockIdx)
 
 	var subscriber string
+	// #9070: 0 in IPv4 mode -- an exact host has no prefix to render.
+	internalPrefixLen := 0
 	switch p.mode {
 	case ModeV4:
 		if subIdx > math.MaxUint32-p.hostBaseV4 {
@@ -742,6 +756,10 @@ func lookupReverseInPool(p detParams, poolName string, natIP net.IP, natPort uin
 		octets := p.hostBaseV6
 		binary.BigEndian.PutUint32(octets[off:off+4], baseWord+subIdx)
 		subscriber = formatV6(octets[:])
+		// #9070: the unit is the configured prefix PLUS the reconstructed
+		// 32-bit subscriber word -- derived from `off`, never from the pool's
+		// configured prefix length.
+		internalPrefixLen = (off + 4) * 8
 	}
 
 	return &ReverseResult{
@@ -750,6 +768,7 @@ func lookupReverseInPool(p detParams, poolName string, natIP net.IP, natPort uin
 		ExternalIP:        ip4.String(),
 		NATPort:           natPort,
 		InternalHost:      subscriber,
+		InternalPrefixLen: internalPrefixLen,
 		PortLow:           low,
 		PortHigh:          high,
 		BlockSize:         p.blockSize,
@@ -825,7 +844,16 @@ func (r *ReverseResult) Render(w io.Writer) {
 	fmt.Fprintf(w, "  Mode:              %d (%s)\n", r.Mode, r.Mode)
 	fmt.Fprintf(w, "  Translated IP:     %s\n", r.ExternalIP)
 	fmt.Fprintf(w, "  Translated port:   %d\n", r.NATPort)
-	fmt.Fprintf(w, "  Internal host:     %s\n", r.InternalHost)
+	// #9070: a bare address under "Internal host" reads as an exact /128. On
+	// the REVERSE lookup the value is the deterministic UNIT's network base, so
+	// it is rendered with that unit's length and under a label that says so.
+	// ForwardResult.Render is deliberately NOT changed: there InternalHost is
+	// the exact host the operator supplied, not a reconstructed base.
+	if r.InternalPrefixLen > 0 {
+		fmt.Fprintf(w, "  Internal prefix:   %s/%d\n", r.InternalHost, r.InternalPrefixLen)
+	} else {
+		fmt.Fprintf(w, "  Internal host:     %s\n", r.InternalHost)
+	}
 	fmt.Fprintf(w, "  Port block:        %d-%d\n", r.PortLow, r.PortHigh)
 	fmt.Fprintf(w, "  Block size:        %d\n", r.BlockSize)
 	fmt.Fprintf(w, "  Block index:       %d\n", r.BlockIndex)

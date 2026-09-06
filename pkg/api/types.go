@@ -536,13 +536,17 @@ type NATDestInfo struct {
 // ErrorCode carries a stable machine-readable token identical to the gRPC
 // and CLI surfaces.
 type NATDeterministicInfo struct {
-	Found             bool   `json:"found"`
-	ErrorCode         string `json:"error_code,omitempty"`
-	ErrorDetail       string `json:"error_detail,omitempty"`
-	Direction         string `json:"direction"`
-	Pool              string `json:"pool,omitempty"`
-	Mode              uint8  `json:"mode,omitempty"`
+	Found       bool   `json:"found"`
+	ErrorCode   string `json:"error_code,omitempty"`
+	ErrorDetail string `json:"error_detail,omitempty"`
+	Direction   string `json:"direction"`
+	Pool        string `json:"pool,omitempty"`
+	Mode        uint8  `json:"mode,omitempty"`
+	// InternalPrefixLen is the DETERMINISTIC UNIT prefix length for an IPv6
+	// reverse lookup, 0 otherwise (#9070). `internal_host` is that unit's
+	// network BASE there, not an exact host. NOT the configured pool prefix.
 	InternalHost      string `json:"internal_host,omitempty"`
+	InternalPrefixLen int    `json:"internal_prefix_len,omitempty"`
 	ExternalIP        string `json:"external_ip,omitempty"`
 	NATPort           uint16 `json:"nat_port,omitempty"`
 	PortLow           uint16 `json:"port_low,omitempty"`
