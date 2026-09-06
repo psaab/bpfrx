@@ -1505,10 +1505,36 @@ func snapshotBindingPlanKey(snapshot *ConfigSnapshot) string {
 	// so it needs no process restart. This is whether the two PLAN hashes
 	// agree about what constitutes a plan change.
 	if su := snapshot.Userspace.SharedUMEM; su != nil {
-		fmt.Fprintf(&b, "shared_umem=%s/%s/%s;", su.Mode, strings.Join(su.Interfaces, ","), su.Phase0ArtifactFile)
+		// #9009 D4: SORTED. Rust hashes shared_umem through
+		// `update_canonical_json_hash`, which sorts array items, while this side
+		// joined `su.Interfaces` in AUTHORED order — and compileSharedUMEMConfig
+		// appends in authored order with no sort, so REORDERING A BRACKETED LIST
+		// is a supported operator edit that moved only this key.
+		//
+		// Over-detection is not wasted CPU: `!samePlan` reaches
+		// stopForNewGenerationLocked -> stopLocked + ensureProcessLocked, a full
+		// AF_XDP teardown and rebind, and inside the XSK-startup window the
+		// snapshot is not published at all. A forwarding interruption.
+		//
+		// Sorting a COPY — the snapshot is shared and the authored order is
+		// meaningful to everything downstream of this hash.
+		ifaces := append([]string(nil), su.Interfaces...)
+		sort.Strings(ifaces)
+		fmt.Fprintf(&b, "shared_umem=%s/%s/%s;", su.Mode, strings.Join(ifaces, ","), su.Phase0ArtifactFile)
 	}
+	// #9009 D3: the refusal tally, built ONCE and used by both loops. Rust
+	// filters rows whose BIND TARGET the snapshot refuses — `replan_queues`
+	// produces no candidate for them — while this side had the predicate
+	// (buildUserspaceRefusedNetdevs, already used by the alias builder below)
+	// and never applied it here. Rust's row set was a strict subset, so its key
+	// moved where this one did not.
+	refused := buildUserspaceRefusedNetdevs(snapshot)
 	for _, iface := range snapshot.Interfaces {
-		if iface.Zone == "" || userspaceSkipsIngressInterface(iface) {
+		if !planKeyIncludesInterface(iface) {
+			continue
+		}
+		resolvedLinux := planKeyResolvedLinuxName(iface)
+		if planKeyBindingTargetRefused(refused, iface, resolvedLinux) {
 			continue
 		}
 		// #8901: `vlan_id` and `parent_linux_name` were hashed by Rust and not
@@ -1524,7 +1550,27 @@ func snapshotBindingPlanKey(snapshot *ConfigSnapshot) string {
 			iface.LinuxName,
 			iface.Ifindex,
 			iface.ParentIfindex,
-			iface.RXQueues,
+			// #9009 D1/D6: the EFFECTIVE count the planner will use, including
+			// the orphan-VLAN-child re-key onto the PARENT's hardware queues.
+			// The raw field is, for that shape, a different number tracking a
+			// different device — so the two sides were not sampling one value
+			// twice, they were following two values.
+			planKeyRXQueues(snapshot, iface, resolvedLinux),
+			// #9009 D5: Rust has no `logical_only` field at all, and the #8901
+			// adjudication justified keeping it here as "Rust excludes the row
+			// upstream via include_userspace_binding_interface". THAT IS FALSE:
+			// that function tests zone-empty, local_fabric_member,
+			// userspace_unbindable_netdev and mgmt/control; `logical_only`
+			// appears nowhere in userspace-dp, and the wire value is silently
+			// discarded by a serde struct that has no such field.
+			//
+			// The CONCLUSION survives, which is why the field stays: a
+			// LogicalOnly flip also swaps the row between a real and a synthetic
+			// ifindex (shouldUseLogicalOnlyParentBoundRethVLAN), and BOTH sides
+			// hash the ifindex — so it cannot move this key alone. The reason on
+			// record is now the true one. A false rationale that licenses a real
+			// difference is worse than none: the next reader inherits it as
+			// established fact and reasons from it.
 			iface.LogicalOnly,
 			iface.Tunnel,
 			iface.VLANID,
@@ -1532,13 +1578,37 @@ func snapshotBindingPlanKey(snapshot *ConfigSnapshot) string {
 		)
 	}
 	for _, fab := range snapshot.Fabrics {
+		// #9009 D2 — the cleanest under-detect, and the loop that had NO filter
+		// at all. Rust drops a fabric whose parent netdev the snapshot refuses
+		// (`snapshot_refuses_parent_netdev`), so its key moves; this loop
+		// carried none of the signals, so this key did not.
+		//
+		// The isolating case needs nothing exotic: give fab0 a member whose
+		// netdev is in NO security zone — so its row is absent from the
+		// interface loop above — then add a tunnel stanza to that member. On the
+		// Rust side the owner row flips userspace_unbindable_netdev, the refusal
+		// is unanimous and the key moves. Here ParentLinuxName comes from
+		// config.LinuxIfName rather than snapshotLinuxName, so the tunnel stanza
+		// does not rename it; ifindex and RXQueues are unchanged; and the member
+		// row is unzoned so it is not in the loop above either. Nothing moved.
+		// The same flip is reachable with NO config change at all, through
+		// snapshotSecureTunnel's liveXfrmNetdevs oracle.
+		if refused.refusesNetdev(fab.ParentLinuxName, fab.ParentIfindex) {
+			continue
+		}
+		// #9009 D6: the same resolution Rust's fabric candidate loop uses —
+		// effective count, then at least 1 because a fabric needs a TX queue.
+		fabRX := planKeyEffectiveRXQueues(fab.RXQueues, fab.ParentLinuxName)
+		if fabRX < 1 {
+			fabRX = 1
+		}
 		fmt.Fprintf(
 			&b,
 			"fabric=%s/%s/%d/%d;",
 			fab.Name,
 			fab.ParentLinuxName,
 			fab.ParentIfindex,
-			fab.RXQueues,
+			fabRX,
 		)
 	}
 	return b.String()

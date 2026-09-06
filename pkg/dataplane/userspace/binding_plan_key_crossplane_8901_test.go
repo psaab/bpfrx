@@ -1,6 +1,9 @@
 package userspace
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -82,36 +85,80 @@ func rustPlanKeyIfaceFields8901(t *testing.T) []string {
 // `snapshotBindingPlanKey`'s own Fprintf rather than by listing it here.
 func goPlanKeyIfaceFields8901(t *testing.T) []string {
 	t.Helper()
-	src, err := os.ReadFile("maps_sync.go")
+	// #9009: parsed with go/ast, not a regex over a text window.
+	//
+	// The previous extractor took the segment from `"iface=` to the FIRST `)`
+	// and matched `iface\.([A-Za-z]+)` in it. That worked only while every
+	// argument was a bare field selector: the moment one became a CALL —
+	// `planKeyRXQueues(snapshot, iface, resolvedLinux)`, which is how #9009
+	// aligns the effective rx_queues — its inner `)` truncated the window and
+	// SILENTLY dropped every field after it. The failure reported four fields
+	// as "hashed by Rust and not by Go" that Go still hashes, i.e. it
+	// misattributed an instrument break to the code under test, in the
+	// direction that reads as a real defect.
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "maps_sync.go", nil, 0)
 	if err != nil {
-		t.Fatalf("cannot read maps_sync.go: %v", err)
+		t.Fatalf("parse maps_sync.go: %v", err)
 	}
-	body := string(src)
-	start := strings.Index(body, "func snapshotBindingPlanKey(")
-	if start < 0 {
+	var fn *ast.FuncDecl
+	for _, d := range f.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Name.Name == "snapshotBindingPlanKey" {
+			fn = fd
+			break
+		}
+	}
+	if fn == nil {
 		t.Fatal("LIVENESS: snapshotBindingPlanKey no longer exists under that name")
 	}
-	seg := body[start:]
-	if e := strings.Index(seg, "\nfunc "); e > 0 {
-		seg = seg[:e]
-	}
-	ifStart := strings.Index(seg, `"iface=`)
-	if ifStart < 0 {
+
+	// The Fprintf whose format literal starts the `iface=` tuple.
+	var tuple *ast.CallExpr
+	ast.Inspect(fn, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok || tuple != nil {
+			return true
+		}
+		for _, a := range call.Args {
+			lit, ok := a.(*ast.BasicLit)
+			if ok && lit.Kind == token.STRING && strings.HasPrefix(lit.Value, `"iface=`) {
+				tuple = call
+				return false
+			}
+		}
+		return true
+	})
+	if tuple == nil {
 		t.Fatal("LIVENESS: snapshotBindingPlanKey no longer emits an `iface=` tuple")
 	}
-	ifSeg := seg[ifStart:]
-	if e := strings.Index(ifSeg, ")"); e > 0 {
-		ifSeg = ifSeg[:e]
-	}
-	re := regexp.MustCompile(`iface\.([A-Za-z]+)`)
-	var out []string
+
 	seen := map[string]bool{}
-	for _, m := range re.FindAllStringSubmatch(ifSeg, -1) {
-		f := goFieldToWireName8901(m[1])
-		if !seen[f] {
-			seen[f] = true
-			out = append(out, f)
+	var out []string
+	add := func(wire string) {
+		if !seen[wire] {
+			seen[wire] = true
+			out = append(out, wire)
 		}
+	}
+	for _, arg := range tuple.Args {
+		ast.Inspect(arg, func(n ast.Node) bool {
+			switch e := n.(type) {
+			case *ast.SelectorExpr:
+				// A field read off the row itself.
+				if id, ok := e.X.(*ast.Ident); ok && id.Name == "iface" {
+					add(goFieldToWireName8901(e.Sel.Name))
+				}
+			case *ast.CallExpr:
+				// A field supplied by a RESOLVER rather than read directly.
+				// #9009 routes rx_queues through planKeyRXQueues so the key
+				// follows the value the planner will actually use; the field is
+				// still hashed, by a different expression.
+				if id, ok := e.Fun.(*ast.Ident); ok && id.Name == "planKeyRXQueues" {
+					add("rx_queues")
+				}
+			}
+			return true
+		})
 	}
 	sort.Strings(out)
 	return out
@@ -150,12 +197,23 @@ func goFieldToWireName8901(f string) string {
 // field belongs on one side only. Adding one to silence a failure without a
 // reason is the stale-allowlist failure this guard exists to prevent.
 var adjudicated8901 = map[string]string{
-	// `logical_only` is a Go-side ADMISSION concept: a logical-only row
-	// contributes no netdev binding, and the Rust planner never sees such a row
-	// as a candidate because `include_userspace_binding_interface` has already
-	// dropped it. Hashing it on the Go side is how Go reaches the same
-	// population Rust reaches by filtering. Not a drift.
-	"logical_only": "Go-side admission filter; Rust excludes the row upstream via include_userspace_binding_interface",
+	// `logical_only` is Go-only, and the reason recorded here until #9009 was
+	// FALSE. It claimed "Rust excludes the row upstream via
+	// include_userspace_binding_interface" — but that function tests
+	// zone-empty, local_fabric_member, userspace_unbindable_netdev and
+	// mgmt/control, and nothing about logical-only. `logical_only` appears
+	// NOWHERE in userspace-dp (positive control: `parent_unbindable` hits
+	// main_tests.rs), and InterfaceSnapshot has no such field and no
+	// deny_unknown_fields, so the wire value is silently discarded.
+	//
+	// The CONCLUSION survives, which is why the entry survives: a LogicalOnly
+	// flip also swaps the row between a real and a synthetic ifindex
+	// (shouldUseLogicalOnlyParentBoundRethVLAN), and BOTH sides hash the
+	// ifindex — so the extra field cannot move Go's key alone, and Go
+	// over-detects on nothing. What changed is that the reason is now true.
+	// A false rationale that licenses a real difference is worse than none:
+	// it is inherited as established and reasoned from.
+	"logical_only": "Go-only; a LogicalOnly flip also swaps the row's ifindex, which BOTH sides hash, so it cannot move Go's key alone (#9009 D5 — the pre-#9009 reason, 'Rust excludes it upstream', was false)",
 }
 
 // WHAT THIS GUARD DOES NOT CHECK, stated because a guard that reports
@@ -165,13 +223,18 @@ var adjudicated8901 = map[string]string{
 // found two further classes of disagreement that this cell is structurally
 // blind to, both recorded here rather than left implied:
 //
-//   1. VALUE-level. Rust hashes an EFFECTIVE rx_queues (`plan_key_rx_queues`
-//      resolves the real count from sysfs when the snapshot carries the
-//      degenerate 0, per #3007); Go hashes the raw `iface.RXQueues`. Same field
-//      name, different value. Names match, so this cell passes.
-//   2. POPULATION-level. Rust filters rows the snapshot REFUSES out of both the
-//      interface and fabric loops (#6691 r8/r9); Go's loops do not. Same fields
-//      over a different row set.
+//   1. VALUE-level. Same field name, different value on each side.
+//   2. POPULATION-level. Same fields hashed over a different ROW SET.
+//
+// BOTH CLASSES WERE REAL AND ARE NOW CLOSED (#9009), which is recorded here
+// because the previous wording named them as open and would otherwise keep
+// describing a state that no longer exists — the same rot the `logical_only`
+// adjudication above suffered. Go now resolves the effective rx_queues
+// including the orphan-VLAN re-key (`planKeyRXQueues`) and applies the refusal
+// filters to BOTH loops. THIS CELL STILL CANNOT SEE EITHER CLASS: it compares
+// field NAMES, so it would pass just as happily if they were re-opened
+// tomorrow. What actually holds them is plan_key_crossplane_9009_test.go, which
+// EXECUTES the hash over paired snapshots and asserts whether the key moves.
 //
 // THE DIRECTION OF EACH MATTERS AND IS NOT SYMMETRIC. A field RUST hashes and
 // Go does not means Go UNDER-detects: it calls a real plan change "same plan"
@@ -183,8 +246,9 @@ var adjudicated8901 = map[string]string{
 // `ethtool -L` queue change, though that is not a config commit and this key is
 // about config snapshots; (2) Go over-detects on refused rows.
 //
-// Neither is fixed here, and neither should be read as adjudicated by this
-// cell passing.
+// Neither is CHECKED here, and this cell passing must not be read as
+// adjudicating them — it never executes either hash. It forces a decision when
+// a field NAME is added to an interface tuple, and that is all it does.
 
 func TestBindingPlanKeyAgreesAcrossPlanes8901(t *testing.T) {
 	rust := rustPlanKeyIfaceFields8901(t)
