@@ -387,24 +387,11 @@ pub(in crate::afxdp) fn build_syn_cookie_syn_ack_frame(
 #[cfg_attr(not(test), allow(dead_code))]
 pub(in crate::afxdp) fn build_reject_rst_frame(frame: &[u8]) -> Option<Vec<u8>> {
     let parsed = parse_tcp_reply_source(frame)?;
-    // #3204: never reply to an L2 group/broadcast frame. The reflected RST
-    // copies the inbound destination MAC into its OWN source-MAC slot
-    // (`write_reply_eth_header`: out[6..12] = frame[0..6]), so a RST built in
-    // response to a frame addressed to a multicast/broadcast MAC would egress
-    // with a group/broadcast SOURCE MAC — an IEEE 802.3 violation that
-    // poisons/flaps switch MAC tables and can reflect/loop traffic. The
-    // ICMP-unreachable reject path already suppresses replies to L2
-    // group/broadcast frames via `l2_dst_is_group_or_broadcast`
-    // (`icmp.rs::can_generate_icmp_error_reply`); mirror it here so both
-    // reject legs agree. The L2 destination is the first 6 frame bytes
-    // (present because `parse_tcp_reply_source` validated an Ethernet L3
-    // offset). Fail closed to the silent drop the caller already performs.
-    if let Some(eth_dst) = frame.get(0..6)
-        && let Ok(eth_dst) = <&[u8; 6]>::try_from(eth_dst)
-        && crate::afxdp::frame::inspect::l2_dst_is_group_or_broadcast(eth_dst)
-    {
-        return None;
-    }
+    // #3204's L2 group/broadcast refusal now lives in `parse_tcp_reply_source`
+    // above, which this function has already called — #9111 moved it there
+    // after finding the other two reply builders were never given it. The
+    // rationale is recorded at the new site; this note exists so the #3204
+    // history is not lost from the leg it was written for.
     // Never RST-storm: do not reply to an inbound RST.
     if (parsed.flags & TCP_FLAG_RST) != 0 {
         return None;
@@ -531,6 +518,34 @@ struct TcpReplySource {
 #[cfg_attr(not(test), allow(dead_code))]
 fn parse_tcp_reply_source(frame: &[u8]) -> Option<TcpReplySource> {
     let l3 = frame_l3_offset(frame)?;
+    // #9111 (#3204 completed): NEVER build a reply to an L2 group/broadcast
+    // frame, on ANY of the three reply legs.
+    //
+    // `write_reply_eth_header` copies the inbound L2 DESTINATION into the
+    // reply's own L2 SOURCE (`out[6..12] = frame[0..6]`), so a reply built for
+    // a frame addressed to a multicast/broadcast MAC egresses with a
+    // group/broadcast SOURCE MAC. That is an IEEE 802.3 violation: switches
+    // learn the group address against this port, or raise MAC-flap alarms and
+    // err-disable it — a broadcast-domain-wide availability event rather than a
+    // firewall-local one. Any unauthenticated host on an attached segment can
+    // drive it.
+    //
+    // #3204 established this and guarded ONE of the three builders
+    // (`build_reject_rst_frame`); `build_syn_cookie_syn_ack_frame` and
+    // `build_syn_cookie_ack_rst_frame` were left reachable, which is exactly
+    // when the SYN-cookie path is armed and under attack.
+    //
+    // The check lives HERE, at the single function all three builders call
+    // first, rather than being repeated at each — a fourth reply builder
+    // inherits it instead of having to remember it, which is the property the
+    // per-site version did not have. Fails closed to the silent drop every
+    // caller already performs on None.
+    if let Some(eth_dst) = frame.get(0..6)
+        && let Ok(eth_dst) = <&[u8; 6]>::try_from(eth_dst)
+        && crate::afxdp::frame::inspect::l2_dst_is_group_or_broadcast(eth_dst)
+    {
+        return None;
+    }
     let ip = frame.get(l3..)?;
     let addr_family = match ip.first()? >> 4 {
         4 => libc::AF_INET as u8,
