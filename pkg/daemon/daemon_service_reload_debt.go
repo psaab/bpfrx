@@ -89,6 +89,27 @@ type serviceReloadDebt struct {
 	chronySourcesFailures   uint64
 	chronyThresholdFailures uint64
 	sshdFailures            uint64
+	// #9073: sshd `-t` VALIDATION failures, counted separately from reload
+	// failures on purpose.
+	//
+	// The reload counters answer "is the retry owner running and failing, or
+	// wedged" — climbing vs flat. Under a persistent `sshd -t` failure the
+	// owner runs every pass and fails every pass, and `sshdFailures` stayed
+	// FLAT, so the metric channel said "wedged" while the box was doing the
+	// opposite.
+	//
+	// Folding validation into sshdFailures was the obvious fix and is wrong.
+	// #6800 pinned that count to reload ATTEMPTS in as many words — "a
+	// validation failure is not a reload ATTEMPT, so it must not inflate the
+	// reload failure count" — and that is a real distinction: a failing reload
+	// means systemd or sshd rejected a config that PASSED validation, which is
+	// a different fault from a config that never got that far.
+	//
+	// Three states need three signals, not two states sharing one counter:
+	// wedged (both flat), reload failing (sshdFailures climbing), validation
+	// failing (this climbing). Overloading one counter would have deleted the
+	// distinction #6800 bought while buying the one #9073 asked for.
+	sshdValidationFailures uint64
 }
 
 // Managed-service identifiers used as the `service` label on the two
@@ -100,6 +121,8 @@ const (
 	svcReloadChronySources   = "chrony-sources"
 	svcReloadChronyThreshold = "chrony-threshold"
 	svcReloadSSHD            = "sshd"
+	// #9073: the sshd `-t` validation leg, distinct from the reload leg.
+	svcReloadSSHDValidate = "sshd-validate"
 )
 
 // noteRsyslogRestartResult records the outcome of one `systemctl restart
@@ -188,7 +211,23 @@ func (d *Daemon) ManagedServiceReloadFailures() map[string]uint64 {
 		svcReloadChronySources:   d.svcReloadDebt.chronySourcesFailures,
 		svcReloadChronyThreshold: d.svcReloadDebt.chronyThresholdFailures,
 		svcReloadSSHD:            d.svcReloadDebt.sshdFailures,
+		// #9073: a separate series rather than a separate accessor, so it
+		// reaches the same Prometheus surface with no new plumbing — the metric
+		// is per-service-labelled, and this is one more label value.
+		svcReloadSSHDValidate: d.svcReloadDebt.sshdValidationFailures,
 	}
+}
+
+// noteSSHDValidationFailure records one failed `sshd -t` on the retry path
+// (#9073).
+//
+// It does NOT touch sshdReload: the debt is already outstanding (this arm only
+// runs when sshdReloadOwed() is true) and nothing was reloaded, so nothing is
+// paid and nothing needs re-latching. It is purely the missing observation.
+func (d *Daemon) noteSSHDValidationFailure() {
+	d.svcReloadDebt.mu.Lock()
+	defer d.svcReloadDebt.mu.Unlock()
+	d.svcReloadDebt.sshdValidationFailures++
 }
 
 // noteSSHDReloadResult records the outcome of one `systemctl reload sshd`. A
@@ -320,6 +359,17 @@ func (d *Daemon) reassertServiceReloadDebtOnce(ctx context.Context) {
 		slog.Warn("sshd reload still owed from an earlier apply — retrying " +
 			"(the drop-in is gone but sshd has not re-read its configuration)")
 		if out, err := sshdValidateCmd(); err != nil {
+			// #9073: count the failing PASS. Without it the metric channel
+			// showed a FLAT count while the retry owner ran and failed every
+			// tick -- the exact "running and failing vs wedged" distinction
+			// these counters exist for.
+			//
+			// On its OWN series, not folded into sshdFailures. #6800 pinned
+			// that count to reload ATTEMPTS in as many words, and it is a real
+			// distinction: a failing reload means systemd or sshd rejected a
+			// config that PASSED validation, which is a different fault from
+			// one that never got that far. Three states need three signals.
+			d.noteSSHDValidationFailure()
 			slog.Error("sshd config validation failed; not reloading — will retry",
 				"err", err, "output", strings.TrimSpace(string(out)))
 		} else if out, err := sshdReloadCmd(); err != nil {
