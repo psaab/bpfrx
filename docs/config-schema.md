@@ -11862,10 +11862,41 @@ NOT flagged so a real config is not over-rejected: repeating the SAME terminal
 (e.g. two `then discard` blocks — a redundancy, one distinct terminal), and a
 non-terminating modifier co-located with exactly one terminal (`then count X
 accept` — `count`/`log`/`forwarding-class`/`loss-priority`/`dscp`/
-`traffic-class`/`policer`/`routing-instance` are NOT terminals and coexist with
-one). `then routing-instance` co-located with a terminating `discard`/`reject`
-is a separate contradiction handled by `validateFilterRoutingInstanceConflict-
-Strict` (#3308); `next term` is a fall-through control, not a terminating action.
+`traffic-class`/`policer` are NOT terminals and coexist with one). `then
+routing-instance` co-located with a terminating `discard`/`reject` is a separate
+contradiction handled by `validateFilterRoutingInstanceConflictStrict` (#3308);
+`next term` is a fall-through control, not a terminating action.
+
+**`then routing-instance` IS a terminating action (#9140).** It is not carried
+on `TerminalActions` — that slice records only the `accept`/`reject`/`discard`
+KEYWORDS — but it terminates the term in BOTH runtimes: the Rust evaluator sets
+`continue_term: snap.action.is_empty() && snap.routing_instance.is_empty()`
+(`userspace-dp/src/filter/compiler.rs`), which is false whenever the
+routing-instance is set, and `resolve_term_action` maps the empty action to
+`Accept`; the kernel lo0 nft mirror guards its fall-through arm with
+`term.RoutingInstance == ""` and renders a terminating `accept`
+(`nftRulesFromTerm`, `pkg/daemon/daemon_nft_term_lower.go`;
+`nftLo0RulesFromTerm`, `pkg/nftables/netlink_lo0.go`). Because the `next term`
+arm of the gate originally tested only `len(term.TerminalActions) > 0`,
+`then { routing-instance mgmt-vrf; next term; }` COMMITTED cleanly and then
+rendered a terminating accept for the term's whole match set, making every later
+term — an `lo0` SSH deny included — unreachable. That is the #5142 fail-open
+shape reached through a different field. The gate now treats a non-empty
+`term.RoutingInstance` as the term's terminating action when no
+`accept`/`reject`/`discard` keyword is present, and names it in the error
+(`terminating action "routing-instance mgmt-vrf" cannot be combined with
+`then next term``). A BARE `then routing-instance <x>` with no `next term`
+remains the legitimate filter-based-forwarding case and still commits, as does
+`then routing-instance <x>` + `then accept` (#3308). The two RUNTIMES agree with
+each other and were deliberately NOT changed: making the nft mirror fall through
+while the Rust evaluator terminates would break the kernel/userspace mirror
+contract stated in `daemon_nft_term_lower.go`, on a shape the tolerant path can
+still deliver. Regression coverage:
+`pkg/config/firewall_ri_nextterm_9140_test.go` (inet + inet6 rejection, the
+lenient no-brick leg, and three controls — bare routing-instance, routing-
+instance + accept, modifier-only `next term`) plus
+`pkg/daemon/lo0_ri_nextterm_mirror_9140_test.go`, which pins the mirror so the
+one-sided renderer "fix" reds.
 
 **Strict/lenient split (flag `lenientFilterTerminalConflict`, sibling of
 `lenientFilterRoutingInstanceConflict`):** strict on the commit / commit-check
