@@ -1779,6 +1779,11 @@ func ValidateConfig(cfg *Config) []string {
 	// reports as a started service with all-zero counters.
 	warnings = append(warnings, validateDHCPRelayInterfaceRefWarnings(cfg)...)
 
+	// #9407: the same class one service over. A DHCP-SERVER group member whose
+	// unit is undeclared is the one case the kernel-name resolver cannot
+	// resolve, so it is the one case that has to be said out loud.
+	warnings = append(warnings, validateDHCPServerInterfaceRefWarnings(cfg)...)
+
 	// #4455 (HI-1): a zone that admits a multicast routing protocol relies on the
 	// kernel input-chain `policy accept` fall-through to deliver that protocol's
 	// host-bound multicast PACKET-WIDE (not scoped to the zone's ingress

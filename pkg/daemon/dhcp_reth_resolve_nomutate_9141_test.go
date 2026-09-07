@@ -34,7 +34,18 @@ func rethDHCPCfg9141(t *testing.T) *config.Config {
 	t.Helper()
 	cfg := &config.Config{}
 	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
-		"reth1":    {Name: "reth1", RedundancyGroup: 1},
+		// #9407: unit 0 is DECLARED. It was not before, and that made this
+		// fixture unrepresentative in the direction that hides a defect: with
+		// no unit table, ResolveKernelIfName falls through to its verbatim
+		// arm, so the cells below could not tell the canonical resolver from
+		// the two-arm LinuxIfName(ResolveReth(...)) they were pinning. Every
+		// config that can actually serve DHCP declares the unit — that is
+		// where the address lives.
+		"reth1": {
+			Name:            "reth1",
+			RedundancyGroup: 1,
+			Units:           map[int]*config.InterfaceUnit{0: {Number: 0}},
+		},
 		"ge-0/0/1": {Name: "ge-0/0/1", RedundantParent: "reth1"},
 	}
 	pool := &config.DHCPPool{Name: "p1", Subnet: "10.0.61.0/24", RangeLow: "10.0.61.100", RangeHigh: "10.0.61.200"}
@@ -66,11 +77,18 @@ func TestResolveDHCPRethInterfacesDoesNotMutateActiveConfig9141(t *testing.T) {
 		t.Errorf("shared active config MUTATED: v6 group interface is %q, want the authored %q", got, "reth1.0")
 	}
 	// Positive control: the resolution still happens, in the returned copy.
-	if got := out.DHCPLocalServer.Groups["g1"].Interfaces[0]; got != "ge-0-0-1.0" {
-		t.Errorf("returned copy did not resolve the v4 RETH name: got %q, want %q", got, "ge-0-0-1.0")
+	//
+	// #9407 CHANGED THIS EXPECTATION, deliberately. It used to be
+	// "ge-0-0-1.0" — a dangling unit suffix, which is not a device — pinned as
+	// intended output. That was the defect being pinned, not a contract: only
+	// the CLUSTER path stripped it (#4647), so the standalone builder handed
+	// Kea a phantom device on identical config. The canonical resolver
+	// collapses unit 0, so both topologies now name ge-0-0-1.
+	if got := out.DHCPLocalServer.Groups["g1"].Interfaces[0]; got != "ge-0-0-1" {
+		t.Errorf("returned copy did not resolve the v4 RETH name: got %q, want %q", got, "ge-0-0-1")
 	}
-	if got := out.DHCPv6LocalServer.Groups["g6"].Interfaces[0]; got != "ge-0-0-1.0" {
-		t.Errorf("returned copy did not resolve the v6 RETH name: got %q, want %q", got, "ge-0-0-1.0")
+	if got := out.DHCPv6LocalServer.Groups["g6"].Interfaces[0]; got != "ge-0-0-1" {
+		t.Errorf("returned copy did not resolve the v6 RETH name: got %q, want %q", got, "ge-0-0-1")
 	}
 	// The copy must not ALIAS the source slice either — a copy that shares the
 	// backing array is mutated by the next resolve just the same.
@@ -135,8 +153,10 @@ func TestRepeatedApplyLeavesConfigStable9141(t *testing.T) {
 func TestStandaloneApplyShapeUsesResolvedCopy9141(t *testing.T) {
 	cfg := rethDHCPCfg9141(t)
 	resolved := desiredStandaloneDHCPConfig(cfg)
-	if got := resolved.DHCPLocalServer.Groups["g1"].Interfaces[0]; got != "ge-0-0-1.0" {
-		t.Errorf("Kea would be handed %q, want the resolved kernel name %q", got, "ge-0-0-1.0")
+	// #9407 changed this expectation from "ge-0-0-1.0" for the reason given at
+	// the positive control above: the dangling ".0" was never a device.
+	if got := resolved.DHCPLocalServer.Groups["g1"].Interfaces[0]; got != "ge-0-0-1" {
+		t.Errorf("Kea would be handed %q, want the resolved kernel name %q", got, "ge-0-0-1")
 	}
 	if got := cfg.System.DHCPServer.DHCPLocalServer.Groups["g1"].Interfaces[0]; got != "reth1.0" {
 		t.Errorf("standalone apply mutated the active config to %q", got)
