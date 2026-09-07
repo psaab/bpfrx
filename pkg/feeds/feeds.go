@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -1058,7 +1059,7 @@ func (m *Manager) installSnapshot(fs *feedState, res fetchResult) {
 func (m *Manager) recordFailure(fs *feedState, ferr error) {
 	m.mu.Lock()
 	now := m.now()
-	fs.lastError = ferr.Error()
+	fs.lastError = redactFeedURLInError9164(ferr.Error(), fs.url)
 
 	enteredStale := false
 	dropped := false
@@ -1113,7 +1114,10 @@ func (m *Manager) recordFailure(fs *feedState, ferr error) {
 		// failing ticks are logged at Debug to avoid flooding the journal for
 		// a persistently-down feed.
 		slog.Warn("dynamic-address: feed entered STALE — fetch failed, retaining last-good snapshot",
-			"name", fs.name, "err", ferr, "retain",
+			// #9164: the REDACTED text, not `ferr`. Go's transport error quotes
+			// the URL it dialled, and a dynamic-address feed routinely carries a
+			// per-tenant bearer token in its query string.
+			"name", fs.name, "err", fs.lastError, "retain",
 			func() string {
 				if fs.holdInterval > 0 {
 					return fs.holdInterval.String()
@@ -1124,4 +1128,57 @@ func (m *Manager) recordFailure(fs *feedState, ferr error) {
 		slog.Debug("dynamic-address: fetch failed, retaining last-good",
 			"name", fs.name, "err", ferr)
 	}
+}
+
+// redactFeedURLInError9164 removes a feed URL's credential from a transport
+// error string, leaving the rest of the diagnostic intact.
+//
+// #9164: `recordFailure` stored `ferr.Error()` verbatim into `lastError` and
+// logged the error object, and Go's transport error quotes the URL it dialled:
+//
+//	Get "https://127.0.0.1:1/list.txt?token=BEARER_TOKEN_ABC123": dial tcp ...
+//
+// so a per-tenant bearer token reached journald and every support bundle. The
+// repo states outright that this is the common shape -- "dynamic-address feeds
+// routinely carry per-tenant bearer tokens in the URL". `config.RedactURL` was
+// already called two sites away and simply not here.
+//
+// WHY NOT `config.RedactURL(ferr.Error())`, which is the obvious fix: that
+// helper is sound on a URL and NOT on arbitrary text. An error string is not a
+// URL -- it has a prefix, a quoted URL and a trailing diagnostic -- and feeding
+// it in hits exactly the unparsed-input case the helper cannot reason about.
+// Redacting the URL we ALREADY HAVE and substituting it is sound by
+// construction: `fs.url` is the operator's configured string, so
+// `config.RedactURL` gets the input it was written for.
+//
+// TWO SPELLINGS HAVE TO BE REPLACED, and that is a measurement rather than
+// caution. `net/http`'s own `stripPassword` (client.go) rewrites a basic-auth
+// PASSWORD to `***` before the error is formatted, so the error contains a
+// string that is NOT `fs.url`. Replacing only the raw URL would silently miss
+// every password case -- and leave the USERNAME, which `stripPassword` does not
+// touch. Replacing only the masked form would miss the query-token case, which
+// is the one this product actually has.
+func redactFeedURLInError9164(errText, rawURL string) string {
+	if errText == "" || rawURL == "" {
+		return errText
+	}
+	redacted := config.RedactURL(rawURL)
+	if redacted == rawURL {
+		// Nothing to hide -- no credential in the configured URL. Returning the
+		// text untouched keeps the no-credential diagnostic byte-identical,
+		// which is what the control row asserts.
+		return errText
+	}
+	out := strings.ReplaceAll(errText, rawURL, redacted)
+
+	// The password-masked spelling net/http emits. Built from the same URL so
+	// it cannot drift from what the transport actually prints.
+	if u, err := url.Parse(rawURL); err == nil && u.User != nil {
+		if _, hasPw := u.User.Password(); hasPw {
+			masked := *u
+			masked.User = url.UserPassword(u.User.Username(), "***")
+			out = strings.ReplaceAll(out, masked.String(), redacted)
+		}
+	}
+	return out
 }
