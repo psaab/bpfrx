@@ -60,7 +60,7 @@ func TestFabricSyncEndpointMoveIsRefused9121(t *testing.T) {
 func TestTheHeartbeatPairIsNotTheAuthoritativeSet9121(t *testing.T) {
 	// A fabric-transport cluster: no control link, so no heartbeat, so both
 	// sibling gates have an empty running value to compare against.
-	if err := controlEndpointDecision8965("", "10.99.14.2"); err != nil {
+	if err := controlEndpointDecision8965("", "10.99.14.2", false); err != nil {
 		t.Fatalf("fixture: #8965 is expected to no-op on an empty running "+
 			"heartbeat address; it did not (%v), so this cell is not measuring "+
 			"what it claims", err)
