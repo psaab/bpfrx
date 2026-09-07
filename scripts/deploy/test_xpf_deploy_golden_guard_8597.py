@@ -134,6 +134,16 @@ class NoImportPrintsADigestGate8597(unittest.TestCase):
     file: it binds the SHAPE of the emitted command, not its execution. What it
     can catch is the regression that actually happened — someone simplifying the
     hint back to a bare `sudo install`.
+
+    #9170: this cell also USED to assert `assertIn("expected_sha", window)`
+    under the message "the digest must be computed from the verified file". The
+    message named the property; the predicate was a substring the defective
+    code satisfied, because `expected_sha` was present and merely derived from
+    a re-hash of the public path taken after verification. It was green over
+    that defect for its whole life. A substring check cannot see where a value
+    came from, so the WHERE-FROM property is now driven end-to-end in
+    test_xpf_deploy_signed_digest_9170.py and only its residue is asserted
+    here: that the re-hash spelling has not come back.
     """
 
     def setUp(self):
@@ -157,8 +167,20 @@ class NoImportPrintsADigestGate8597(unittest.TestCase):
                       "so a mismatch STOPS the install rather than printing a "
                       "warning above it")
         self.assertIn("expected_sha", window,
-                      "the digest must be computed from the verified file, not "
-                      "left for the operator to look up")
+                      "the printed line must carry a digest, not leave it for "
+                      "the operator to look up")
+        # #9170. Necessary, not sufficient: this is one spelling of a re-hash
+        # and the source layer cannot tell where a value came from in general.
+        # The property itself is driven in
+        # test_xpf_deploy_signed_digest_9170.py, which swaps the public file
+        # after verification and reads what was printed.
+        self.assertNotIn(
+            "sign.sha256_file(qcow2_pub)", window,
+            "#9170: the printed digest is re-hashed from the PUBLIC file AFTER "
+            "signature verification finished. It must come from the signed "
+            "manifest (verify_image_artifact's return value), or a local "
+            "process that writes --out during the gap gets the operator's own "
+            "`sha256sum -c` to bless its bytes")
 
 
 if __name__ == "__main__":
