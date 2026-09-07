@@ -11612,3 +11612,329 @@ fn snat_9388_reserve_and_release_agree_on_post_dnat_port() {
         "#9388: the reserved pool port must be back on the bitmap"
     );
 }
+
+// ===========================================================================
+// #9163 — the retained-pool index remap must be O(n + m), not a nested linear
+// scan.
+//
+// `retained_pool_index_map` asked `prev.iter().position(|a| a == addr)` once
+// per NEW pool address. That is O(n·m) in the pool-address count, on the
+// snapshot-apply critical section, under the same `state` mutex that
+// serializes the control socket. The commit gate admits 1,048,576 addresses in
+// one aggregate (`MaxSourceNATAggregatePoolAddresses` = 16 ×
+// `MAX_POOL_PREFIX_HOSTS`), and a single pool may hold the whole budget.
+//
+// The harm is not the CPU. `update_ha_state` is the only refresher of the
+// helper's 10 s per-RG forwarding lease and is sent on a 3 s cadence; it queues
+// behind snapshot apply, and `is_forwarding_active` is consulted per packet.
+// A pool edit that holds the mutex past ~7 s expires the lease.
+//
+// The fix indexes the previous list once into an `FxHashMap` and probes it.
+// Nothing about the RESULT changes — which is why the equivalence cell below
+// scores the new map against a verbatim copy of the old loop rather than
+// against hand-written expectations.
+// ===========================================================================
+
+/// Verbatim copy of the pre-#9163 nested-scan formula, kept as the ORACLE for
+/// the equivalence cell and as the POSITIVE CONTROL for the bound cell.
+///
+/// It is deliberately a copy and not a call: its whole job is to answer "what
+/// did the old code produce / how long did the old code take", and a version
+/// that shared the new implementation could answer neither.
+fn nested_scan_index_map_oracle_9163(
+    prev_v4: &[Ipv4Addr],
+    prev_v6: &[Ipv6Addr],
+    new_v4: &[Ipv4Addr],
+    new_v6: &[Ipv6Addr],
+) -> rustc_hash::FxHashMap<usize, usize> {
+    let mut map = rustc_hash::FxHashMap::default();
+    let prev_v4_len = prev_v4.len();
+    let new_v4_len = new_v4.len();
+    for (new_i, addr) in new_v4.iter().enumerate() {
+        if let Some(prev_i) = prev_v4.iter().position(|a| a == addr) {
+            map.insert(prev_i, new_i);
+        }
+    }
+    for (new_i, addr) in new_v6.iter().enumerate() {
+        if let Some(prev_i) = prev_v6.iter().position(|a| a == addr) {
+            map.insert(prev_v4_len + prev_i, new_v4_len + new_i);
+        }
+    }
+    map
+}
+
+/// A `/16`-sized v4 pool member, the shape `MAX_POOL_PREFIX_HOSTS` bounds.
+fn dense_v4_pool_9163(count: usize, base: u32) -> Vec<Ipv4Addr> {
+    (0..count)
+        .map(|i| Ipv4Addr::from(base + i as u32))
+        .collect()
+}
+
+/// THE BOUND. One `MAX_POOL_PREFIX_HOSTS` prefix member (65,536 addresses)
+/// gaining a single address — the ordinary "operator widened the pool" edit —
+/// must remap in well under the 10 s HA forwarding lease, with room to spare
+/// for everything else snapshot apply does under the same mutex.
+///
+/// FAIL-ON-REVERT: the nested scan runs ~n²/2 = 2.1e9 address compares here.
+/// Measured at `--release` (which is how `make test-rust` runs): 1.2 s for the
+/// scan against ~4 ms for the indexed probe.
+///
+/// POSITIVE CONTROL, in the same run on the same machine: the oracle — a
+/// verbatim copy of the old loop — is timed over the SAME inputs and must NOT
+/// satisfy the bound. Without it a machine fast enough to run the old shape
+/// inside 250 ms would report a vacuous green, and the cell would be measuring
+/// nothing. If that control ever fires, the answer is to raise `N`, not to
+/// relax the bound.
+#[test]
+fn retained_index_map_is_bounded_at_max_prefix_hosts_9163() {
+    use std::time::{Duration, Instant};
+
+    // One MAX_POOL_PREFIX_HOSTS prefix member. The aggregate gate admits 16x
+    // this in a single pool.
+    const N: usize = 65_536;
+    const BOUND: Duration = Duration::from_millis(250);
+
+    let prev = dense_v4_pool_9163(N, 0x0a00_0000);
+    let mut new = prev.clone();
+    // The realistic edit: every previous address is retained and one is added.
+    new.push(Ipv4Addr::from(0x0b00_0000));
+
+    let start = Instant::now();
+    let map = crate::nat::retained_pool_index_map(&prev, &[], &new, &[]);
+    let fixed = start.elapsed();
+
+    assert_eq!(
+        map.len(),
+        N,
+        "every previous address is retained, so every previous index must map",
+    );
+    assert_eq!(map.get(&0), Some(&0));
+    assert_eq!(map.get(&(N - 1)), Some(&(N - 1)));
+
+    let start = Instant::now();
+    let oracle = std::hint::black_box(nested_scan_index_map_oracle_9163(&prev, &[], &new, &[]));
+    let nested = start.elapsed();
+    assert_eq!(
+        map, oracle,
+        "#9163 is a pure complexity change; the mapping must be identical",
+    );
+
+    assert!(
+        nested > BOUND,
+        "POSITIVE CONTROL FAILED: the pre-#9163 nested scan finished {nested:?} over \
+         {N} addresses, inside the {BOUND:?} bound this cell asserts. The bound can no \
+         longer distinguish the fix from the defect on this machine — raise N, do not \
+         relax the bound (#9163).",
+    );
+    assert!(
+        fixed < BOUND,
+        "retained-pool index remap over {N} addresses took {fixed:?}, over the {BOUND:?} \
+         bound (the nested-scan oracle took {nested:?} on this machine). This runs on the \
+         snapshot-apply critical section under the same mutex that serializes the control \
+         socket, and holding it past ~7 s expires the helper's 10 s per-RG forwarding \
+         lease (#9163).",
+    );
+}
+
+/// SMALL-POOL CONTROL for the bound cell: the same entry point over a
+/// two-address pool must produce the same mapping as the oracle and finish
+/// instantly. This is what says the bound cell's harness — the generator, the
+/// entry point, the oracle — is sound at a size where NEITHER algorithm can be
+/// slow, so a red in the cell above is about the algorithm and not about the
+/// scaffolding.
+#[test]
+fn retained_index_map_small_pool_control_9163() {
+    let a: Ipv4Addr = "203.0.113.10".parse().unwrap();
+    let b: Ipv4Addr = "203.0.113.11".parse().unwrap();
+    let c: Ipv4Addr = "203.0.113.12".parse().unwrap();
+
+    let map = crate::nat::retained_pool_index_map(&[a, b], &[], &[c, a], &[]);
+    assert_eq!(
+        map,
+        nested_scan_index_map_oracle_9163(&[a, b], &[], &[c, a], &[]),
+    );
+    assert_eq!(map.get(&0), Some(&1), "A must remap 0 -> 1");
+    assert_eq!(map.len(), 1);
+}
+
+/// EQUIVALENCE over the shapes that could drift, scored against the oracle
+/// rather than against hand-written expectations.
+///
+/// The cases that matter are the ones where the two formulas could legally
+/// disagree:
+///   - a DUPLICATE in the previous list. `position()` returns the FIRST match,
+///     so the hash index must record the first occurrence — `or_insert`, not
+///     `insert`. A bare `insert` moves which previous slot the address carries
+///     its live port ownership from, silently.
+///   - a DUPLICATE in the new list. Both formulas write `map[prev_i]` twice and
+///     the LAST write wins; iterating the new list in order is what preserves
+///     that.
+///   - a v6 arm with a NON-EMPTY v4 arm, which is the only place the
+///     `prev_v4_len` / `new_v4_len` offsets are observable.
+///   - either side empty, which must yield an empty map (a fully-disjoint swap
+///     must keep resetting).
+#[test]
+fn retained_index_map_matches_nested_scan_oracle_9163() {
+    let v4 = |n: u32| Ipv4Addr::from(0x0a00_0000 + n);
+    let v6 = |n: u128| Ipv6Addr::from(0x2001_0db8_0000_0000_0000_0000_0000_0000u128 + n);
+
+    let cases: Vec<(Vec<Ipv4Addr>, Vec<Ipv6Addr>, Vec<Ipv4Addr>, Vec<Ipv6Addr>)> = vec![
+        // Identity.
+        (
+            vec![v4(1), v4(2), v4(3)],
+            vec![],
+            vec![v4(1), v4(2), v4(3)],
+            vec![],
+        ),
+        // Reorder: positions must move.
+        (
+            vec![v4(1), v4(2), v4(3)],
+            vec![],
+            vec![v4(3), v4(1), v4(2)],
+            vec![],
+        ),
+        // Fully disjoint.
+        (vec![v4(1), v4(2)], vec![], vec![v4(8), v4(9)], vec![]),
+        // DUPLICATE in the previous list: first occurrence wins.
+        (
+            vec![v4(1), v4(1), v4(2)],
+            vec![],
+            vec![v4(1), v4(2)],
+            vec![],
+        ),
+        // DUPLICATE in the new list: last write wins.
+        (
+            vec![v4(1), v4(2)],
+            vec![],
+            vec![v4(1), v4(2), v4(1)],
+            vec![],
+        ),
+        // v6 only.
+        (vec![], vec![v6(1), v6(2)], vec![], vec![v6(2), v6(1)]),
+        // MIXED: the only shape where the v4-length offsets are observable.
+        (
+            vec![v4(1), v4(2), v4(3)],
+            vec![v6(1), v6(2)],
+            vec![v4(3), v4(1)],
+            vec![v6(2), v6(9), v6(1)],
+        ),
+        // v6 duplicate under a non-empty v4 arm.
+        (
+            vec![v4(1)],
+            vec![v6(1), v6(1), v6(2)],
+            vec![v4(1)],
+            vec![v6(1), v6(2)],
+        ),
+        // Empty sides.
+        (vec![], vec![], vec![v4(1)], vec![v6(1)]),
+        (vec![v4(1)], vec![v6(1)], vec![], vec![]),
+        (vec![], vec![], vec![], vec![]),
+    ];
+
+    for (i, (prev_v4, prev_v6, new_v4, new_v6)) in cases.iter().enumerate() {
+        let got = crate::nat::retained_pool_index_map(prev_v4, prev_v6, new_v4, new_v6);
+        let want = nested_scan_index_map_oracle_9163(prev_v4, prev_v6, new_v4, new_v6);
+        assert_eq!(
+            got, want,
+            "case {i}: prev_v4={prev_v4:?} prev_v6={prev_v6:?} new_v4={new_v4:?} \
+             new_v6={new_v6:?} — #9163 is a pure complexity change and must not alter \
+             which previous index maps where",
+        );
+    }
+}
+
+/// A pseudo-random sweep with a SMALL address space, so duplicates and partial
+/// overlap occur densely. Deterministic seed: a failure is reproducible.
+#[test]
+fn retained_index_map_matches_oracle_under_random_overlap_9163() {
+    let mut state: u64 = 0x9163_0000_dead_beef;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for _ in 0..400 {
+        let mk_v4 = |n: u64| Ipv4Addr::from(0x0a00_0000u32 + (n % 8) as u32);
+        let mk_v6 = |n: u64| Ipv6Addr::from(0x2001_0db8u128 << 96 | (n % 8) as u128);
+        let prev_v4: Vec<Ipv4Addr> = (0..(next() % 7)).map(|_| mk_v4(next())).collect();
+        let prev_v6: Vec<Ipv6Addr> = (0..(next() % 7)).map(|_| mk_v6(next())).collect();
+        let new_v4: Vec<Ipv4Addr> = (0..(next() % 7)).map(|_| mk_v4(next())).collect();
+        let new_v6: Vec<Ipv6Addr> = (0..(next() % 7)).map(|_| mk_v6(next())).collect();
+        assert_eq!(
+            crate::nat::retained_pool_index_map(&prev_v4, &prev_v6, &new_v4, &new_v6),
+            nested_scan_index_map_oracle_9163(&prev_v4, &prev_v6, &new_v4, &new_v6),
+            "prev_v4={prev_v4:?} prev_v6={prev_v6:?} new_v4={new_v4:?} new_v6={new_v6:?}",
+        );
+    }
+}
+
+/// WIRING BIND for the v6 arm of the `reseed_retained_pool` call site.
+///
+/// #9163 changed that call from `retained_pool_index_map(prev, ..)` to four
+/// explicit slices. Nothing covered the v6 arm end-to-end before, so passing
+/// `&[]` where `&prev.addresses_v6` belongs would have been invisible: the v4
+/// binder (`pool_change_retaining_an_address_does_not_reissue_its_live_tuple_6765`)
+/// stays green under that mutation, because a package's own cells can prove a
+/// function behaves correctly and say nothing about what its caller passes.
+///
+/// Same shape as the v4 binder, over a v6 pool: `[A, B]` -> `[A, C]` with a
+/// live translation on the RETAINED `A`.
+#[test]
+fn v6_pool_change_retaining_an_address_does_not_reissue_its_live_tuple_9163() {
+    let snapshot = |pool: Vec<&str>| SourceNATRuleSnapshot {
+        name: "snat-v6-overlap-9163".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["::/0".to_string()],
+        pool_name: "v6-overlap-pool-9163".to_string(),
+        pool_addresses: pool.into_iter().map(str::to_string).collect::<Vec<_>>(),
+        port_low: 40000,
+        port_high: 40001,
+        ..SourceNATRuleSnapshot::default()
+    };
+
+    let rules = parse_source_nat_rules(&[snapshot(vec!["2001:db8::10", "2001:db8::11"])]);
+    let first = expect_snat_decision(tuple_snat_lookup_from_src(
+        &rules,
+        "2001:db8:1::100",
+        12345,
+        "2001:4860:4860::8888",
+        53,
+        1,
+    ));
+    assert_eq!(
+        first.rewrite_src.map(|ip| ip.to_string()).as_deref(),
+        Some("2001:db8::10"),
+        "setup: the first flow must land on the address the changed pool RETAINS, or this \
+         cell is not exercising the retained-address case at all",
+    );
+
+    // ::11 is swapped for ::12; ::10 is RETAINED.
+    let refreshed = parse_source_nat_rules_with_previous(
+        &[snapshot(vec!["2001:db8::10", "2001:db8::12"])],
+        Some(&rules),
+        &crate::nat::NatCounterStore::default(),
+        10,
+    );
+    let second = expect_snat_decision(tuple_snat_lookup_from_src(
+        &refreshed,
+        "2001:db8:1::200",
+        23456,
+        "2001:4860:4860::8888",
+        53,
+        11,
+    ));
+    assert!(
+        !(second.rewrite_src == first.rewrite_src
+            && second.rewrite_src_port == first.rewrite_src_port),
+        "the rebuilt allocator reissued {}:{} — a translated tuple the pre-change flow still \
+         holds on a RETAINED v6 address. The v6 arm of the retained-index remap was not \
+         carried (#9163 / #6765)",
+        first
+            .rewrite_src
+            .map(|ip| ip.to_string())
+            .unwrap_or_default(),
+        first.rewrite_src_port.unwrap_or_default(),
+    );
+}

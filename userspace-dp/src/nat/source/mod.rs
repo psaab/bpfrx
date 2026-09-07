@@ -491,6 +491,43 @@ struct PreviousPool {
     allocator: PortAllocator,
 }
 
+/// v4-only wrapper for NAT64, whose pools carry no v6 addresses. It calls the
+/// SAME formula rather than restating the positional rule — a second copy of
+/// "which previous index is this address now at" is exactly the drift that makes
+/// a position-indexed carry-over unsafe.
+pub(crate) fn retained_pool_index_map_v4(
+    prev_v4: &[Ipv4Addr],
+    new_v4: &[Ipv4Addr],
+) -> FxHashMap<usize, usize> {
+    retained_pool_index_map(prev_v4, &[], new_v4, &[])
+}
+
+/// FIRST-occurrence index of every address in the PREVIOUS list.
+///
+/// #9163: this is the whole of the complexity fix, and `or_insert` is the whole
+/// of its equivalence with what it replaced. The old shape asked
+/// `prev.iter().position(|a| a == addr)` once per NEW address — a nested linear
+/// scan, O(n·m) in a quantity the commit gate bounds at 1,048,576
+/// (`MaxSourceNATAggregatePoolAddresses`, 16 × `MAX_POOL_PREFIX_HOSTS`), on the
+/// snapshot-apply critical section under the same `state` mutex that serializes
+/// the control socket. Measured at n = m = 65,536 (one `MAX_POOL_PREFIX_HOSTS`
+/// prefix member): 1.2 s for one pool edit. The helper's 10 s per-RG forwarding
+/// lease is refreshed only by `update_ha_state` on a 3 s cadence and queues
+/// behind that apply, and `is_forwarding_active` is consulted per packet.
+///
+/// `position()` returns the FIRST match, so a previous list holding the same
+/// address twice always resolved to its lower index. `or_insert` keeps that
+/// exactly; a bare `insert` would record the LAST occurrence and silently move
+/// which previous slot a duplicated address carries its live ownership from.
+fn first_index_by_address<T: Copy + Eq + std::hash::Hash>(prev: &[T]) -> FxHashMap<T, usize> {
+    let mut first: FxHashMap<T, usize> = FxHashMap::default();
+    first.reserve(prev.len());
+    for (i, addr) in prev.iter().enumerate() {
+        first.entry(*addr).or_insert(i);
+    }
+    first
+}
+
 /// Map PREVIOUS pool-address indices to their index in the NEW pool, for the
 /// addresses present in both.
 ///
@@ -502,37 +539,31 @@ struct PreviousPool {
 ///
 /// Returns an empty map when nothing is retained — a fully-disjoint swap, which
 /// must keep resetting.
-/// v4-only wrapper for NAT64, whose pools carry no v6 addresses. It calls the
-/// SAME formula rather than restating the positional rule — a second copy of
-/// "which previous index is this address now at" is exactly the drift that makes
-/// a position-indexed carry-over unsafe.
-pub(crate) fn retained_pool_index_map_v4(
-    prev_v4: &[Ipv4Addr],
-    new_v4: &[Ipv4Addr],
-) -> FxHashMap<usize, usize> {
-    let prev = PreviousPool {
-        addresses_v4: prev_v4.to_vec(),
-        addresses_v6: Vec::new(),
-        allocator: PortAllocator::new(0, 0, 0),
-    };
-    retained_pool_index_map(&prev, new_v4, &[])
-}
-
+///
+/// #9163: takes the previous address lists as SLICES rather than a
+/// `&PreviousPool`. The NAT64 wrapper used to synthesise a whole `PreviousPool`
+/// — cloning the previous address vector and constructing a throwaway
+/// `PortAllocator` — to reach one formula that never looked at either. Slices
+/// also make the v6 arm reachable from a test, which the `PreviousPool` shape
+/// (private to this module) did not.
 pub(crate) fn retained_pool_index_map(
-    prev: &PreviousPool,
+    prev_v4: &[Ipv4Addr],
+    prev_v6: &[Ipv6Addr],
     new_v4: &[Ipv4Addr],
     new_v6: &[Ipv6Addr],
 ) -> FxHashMap<usize, usize> {
     let mut map = FxHashMap::default();
-    let prev_v4_len = prev.addresses_v4.len();
+    let prev_v4_len = prev_v4.len();
     let new_v4_len = new_v4.len();
+    let first_v4 = first_index_by_address(prev_v4);
     for (new_i, addr) in new_v4.iter().enumerate() {
-        if let Some(prev_i) = prev.addresses_v4.iter().position(|a| a == addr) {
+        if let Some(&prev_i) = first_v4.get(addr) {
             map.insert(prev_i, new_i);
         }
     }
+    let first_v6 = first_index_by_address(prev_v6);
     for (new_i, addr) in new_v6.iter().enumerate() {
-        if let Some(prev_i) = prev.addresses_v6.iter().position(|a| a == addr) {
+        if let Some(&prev_i) = first_v6.get(addr) {
             map.insert(prev_v4_len + prev_i, new_v4_len + new_i);
         }
     }
@@ -592,7 +623,12 @@ fn reseed_retained_pool(
         );
         return;
     };
-    let map = retained_pool_index_map(prev, &rule.pool_addresses_v4, &rule.pool_addresses_v6);
+    let map = retained_pool_index_map(
+        &prev.addresses_v4,
+        &prev.addresses_v6,
+        &rule.pool_addresses_v4,
+        &rule.pool_addresses_v6,
+    );
     if map.is_empty() {
         return;
     }
