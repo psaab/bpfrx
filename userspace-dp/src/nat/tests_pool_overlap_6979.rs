@@ -777,3 +777,141 @@ fn a_pool_with_duplicate_members_is_not_its_own_peer_6979() {
         "and it must still translate normally"
     );
 }
+
+fn rule_in_instance_9389(
+    name: &str,
+    pool: &str,
+    source: &str,
+    addr: &str,
+    instance: &str,
+) -> SourceNATRuleSnapshot {
+    SourceNATRuleSnapshot {
+        name: name.to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec![source.to_string()],
+        pool_name: pool.to_string(),
+        pool_addresses: vec![format!("{addr}/32")],
+        port_low: 20000,
+        port_high: 20009,
+        from_routing_instance: instance.to_string(),
+        ..SourceNATRuleSnapshot::default()
+    }
+}
+
+/// Mint with an ingress routing instance in scope.
+///
+/// `mint` uses `NatScopeCtx::default()`, whose `ingress_routing_instance` is
+/// empty — so a rule carrying `from_routing_instance` never MATCHES through it
+/// and the rule is skipped before any allocator or peer logic runs. My first
+/// version of the cells below used it and both failed at the FIRST mint with
+/// "vrf-a must translate": the fixture could not reach the code it was about.
+/// Worth recording, because the same mistake written the other way round — an
+/// assertion that something does NOT happen — would have PASSED, for the reason
+/// that the rule never ran at all.
+fn mint_in_instance_9389(
+    rules: &[SourceNatRule],
+    src: &str,
+    src_port: u16,
+    instance: &str,
+) -> SourceNatLookup {
+    let scope = NatScopeCtx {
+        ingress_routing_instance: instance,
+        ..NatScopeCtx::default()
+    };
+    let mut counter = None;
+    match_source_nat_result_for_tuple(
+        &InterfaceNatAllocators::default(),
+        rules,
+        &scope,
+        "lan",
+        "wan",
+        src.parse().expect("src"),
+        REMOTE.parse().expect("dst"),
+        Some(PROTO_TCP),
+        src_port,
+        443,
+        None,
+        None,
+        0,
+        false,
+        false,
+        NatHolder::Untracked,
+        &mut counter,
+    )
+}
+
+/// #9389: the invariant `two_rules_naming_one_pool_are_not_peers_6979` asserts,
+/// held for rules in DIFFERENT ROUTING INSTANCES.
+///
+/// That cell was green throughout the regression, because its fixture leaves
+/// `from_routing_instance` empty — so both rules built the same allocator key
+/// and the split it was guarding against never happened in it. **A fixture that
+/// cannot express the distinguishing field cannot observe a defect keyed on it.**
+///
+/// #9062 added `from_routing_instance` to `SourceNatPoolAllocatorKey`, giving two
+/// rule-sets over ONE pool two pointer-distinct `PortAllocator`s. Since
+/// `same_allocator` is `Arc::ptr_eq`, the #6979 overlap index then read them as
+/// hostile peers and refused every mint whose candidate the other already held:
+/// measured five consecutive `PoolPeerAddressOverlap` refusals on a pool with
+/// free capacity.
+///
+/// The guard was right and the split was wrong. One pool is one set of wire
+/// identities; a `(addr, port)` can back exactly one flow whatever routing
+/// instance it came from.
+///
+/// Fail-on-revert: restore `from_routing_instance` to the allocator key and both
+/// assertions fire — `overlap_owners` becomes `Some` and the second instance's
+/// mint is refused.
+#[test]
+fn two_instances_naming_one_pool_are_not_peers_9389() {
+    let rules = parse_source_nat_rules(&[
+        rule_in_instance_9389("r1", "wan-pool", "10.0.0.0/24", SHARED, "vrf-a"),
+        rule_in_instance_9389("r2", "wan-pool", "10.1.0.0/24", SHARED, "vrf-b"),
+    ]);
+    assert!(
+        rules[0].overlap_owners.is_none() && rules[1].overlap_owners.is_none(),
+        "two rule-sets naming ONE pool from different routing instances were wired \
+         as overlap PEERS. They share one pool, so they must share one allocator \
+         and one occupancy domain — as peers, each refuses the identities the \
+         other holds and mints are dropped while the pool has free capacity"
+    );
+
+    let first = identity(&mint_in_instance_9389(&rules, "10.0.0.7", 1111, "vrf-a"))
+        .expect("vrf-a must translate");
+    let second = identity(&mint_in_instance_9389(&rules, "10.1.0.7", 2222, "vrf-b")).expect(
+        "vrf-b must translate — this is the refusal #9389 measured, five in a row \
+         on a ten-port pool",
+    );
+    assert_ne!(
+        first, second,
+        "sharing one allocator is what makes the two instances hand out DIFFERENT \
+         ports off the same address; identical identities would be the collision \
+         the overlap guard exists to prevent"
+    );
+}
+
+/// NARROWNESS. Removing the routing instance from the allocator key must not
+/// merge pools that are genuinely different.
+///
+/// This is what makes the removal safe rather than merely convenient: the key
+/// still carries `pool_addresses_v4`/`_v6`, so two pools that happen to share a
+/// NAME across instances are still discriminated by the addresses they hand out.
+/// The routing instance added no discrimination the addresses did not already
+/// provide — which is why it could be removed without reopening anything.
+#[test]
+fn same_pool_name_different_addresses_stays_independent_9389() {
+    let rules = parse_source_nat_rules(&[
+        rule_in_instance_9389("r1", "wan-pool", "10.0.0.0/24", "203.0.113.1", "vrf-a"),
+        rule_in_instance_9389("r2", "wan-pool", "10.1.0.0/24", "203.0.113.9", "vrf-b"),
+    ]);
+    let first = identity(&mint_in_instance_9389(&rules, "10.0.0.7", 1111, "vrf-a"))
+        .expect("vrf-a must translate");
+    let second = identity(&mint_in_instance_9389(&rules, "10.1.0.7", 2222, "vrf-b"))
+        .expect("vrf-b must translate");
+    assert_ne!(
+        first.0, second.0,
+        "same pool NAME over different ADDRESSES must stay two independent pools; \
+         the addresses in the allocator key are what keeps them apart"
+    );
+}
