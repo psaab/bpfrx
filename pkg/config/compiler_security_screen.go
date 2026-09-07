@@ -252,6 +252,18 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 		idsSchema := schemaForPath("security", "screen", "ids-option")
 		body := packedBody(inst.node, idsSchema)
 
+		// #9421: #6683 normalised the ids-option node's packed tail and
+		// stopped there. A FAMILY node one level in (`icmp ping-death;`,
+		// `icmp [ ping-death fragment ]`, `tcp bogus-check;`) carries its
+		// body on its own Keys with ZERO children, so every loop below runs
+		// zero times — the check compiled DISABLED and, because nothing
+		// reached UnknownLeaves, the #3318 gate never armed either. The flat
+		// spelling of the same statement builds a chain and does not lose it,
+		// so the two AST shapes disagreed on the strict verdict, on the
+		// compiled boolean and on whether the gate fired. Normalise here so
+		// both shapes reach the identical readers.
+		body = screenNormalizeFamilies(body, idsSchema)
+
 		// screenOpt normalises ONE family-option node so a sub-knob written
 		// packed (`flood threshold 500;`) is read from the same CHILD shape as
 		// the block spelling (`flood { threshold 500; }`). #7460: the two
