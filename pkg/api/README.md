@@ -2878,6 +2878,31 @@ the drop fails loudly instead of going quietly vacuous.
     HTTP 429). The HA-delegated REST clear path is gated by the gRPC handler it
     forwards to, so it is not double-charged. A keyed single-session delete (no
     walk) is a different operation and is not gated.
+
+    **#9142: the delegated refusal answers 429 too.** Being gated by the gRPC
+    handler is not the same as REPORTING what that handler decided. The
+    delegated branch flattened every error from the in-process `*grpcapi.Server`
+    to `writeError(w, http.StatusInternalServerError, err.Error())`, so the same
+    saturation of the same process-wide `sessionWalkLimiter` answered **429 on a
+    standalone node and 500 on a clustered one** — and since ordinary
+    `GET /security/sessions` scrapes are what saturate that limiter, this is a
+    routine condition, not an exotic one. A client keyed on the status class
+    (back off on 429, page a human on 5xx) therefore behaved differently based
+    only on whether the node it hit had an HA session service wired. The branch
+    now switches on `status.Code`: `ResourceExhausted` → **429**, `Unavailable` →
+    **503** (matching the handler's own dp-loaded guard, so the two routes to
+    that condition cannot disagree), everything else → **500**. The body carries
+    `status.Convert(err).Message()` rather than `err.Error()`, so the gRPC
+    framing (`rpc error: code = ... desc = ...`) — an internal detail of a
+    delegation the REST caller cannot see — stays out of the JSON payload;
+    `Convert` yields `codes.Unknown` plus the error's own text for a non-status
+    error, so the default arm loses nothing. This is the same distinction
+    `peerFetchErrorStatus` (#7294/#8308) already draws on the neighbouring
+    peer-fetch surfaces: an admission refusal is not a fault. Guards:
+    `sessions_clear_delegated_status_9142_test.go`, including the cell that
+    drives BOTH wirings against the same refusal in one run — the delegated
+    branch previously had no cell at all (`TestRESTClearSessionsConcurrencyBound`
+    pins only the `clusterSessionFn == nil` fallback, by its own comment).
   - **Bounded Total.** The offset mode's exact `total` previously forced a FULL
     v4+v6 table scan on EVERY 100-row page (O(table) per page, repeated per
     poll) just to count. The walk now caps the count at `sessionCountCap`
