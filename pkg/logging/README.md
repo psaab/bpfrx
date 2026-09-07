@@ -628,6 +628,45 @@ warning is rate-limited to ≤1/s so a flapping target cannot spam the
 log from the hot-path (CLAUDE.md logging rules). The warning's `reason`
 attribute is one of `write` / `dial` / `cooldown`.
 
+**#9165 — every transport counts a write failure, and the counters have
+a reader.** Two halves, both of which had to be true for the defect to be
+invisible.
+
+The write-failure arm only reached `noteDrop` for stream protocols
+(`if s.protocol != "udp"`), and #9025 had added a UDP arm for the
+DEADLINE EXPIRY it introduced — which is what made this look covered. A
+deadline expiry is not the failure an operator hits; a dead collector is,
+and on a CONNECTED datagram socket (`dialUDP`) Linux reports that as
+ECONNREFUSED, not as a timeout. So on the DEFAULT transport,
+`droppedWrites` stayed 0, the rate-limited warning never fired, and a
+`show` still rendered the collector as configured — three instruments
+reading healthy while every message went nowhere. Every UDP write
+failure is now counted. There is still no reconnect arm on the datagram
+path: a datagram socket has no connection to re-establish, so the
+message is still dropped and the error still returned. Only the
+ACCOUNTING changed, which is why `DroppedDials`/`DroppedCooldown` must
+stay at zero for a UDP client — an assertion the acceptance table makes.
+
+The second half is that all three accessors had **zero production
+readers**. A counted drop reached an operator through exactly one
+channel, the ≤1/s warning above, so a warning that had already been
+rate-limited away left nothing behind at all. `EventReader.SyslogDropStats()`
+snapshots every installed client, the daemon wires it as
+`api.Config.SyslogDropsFn`, and the collector emits
+`xpf_syslog_messages_dropped_total{addr,protocol,reason}` BEFORE the
+dataplane gate — syslog clients run whether or not the dataplane loaded,
+and a box that failed to load its dataplane is exactly the box whose logs
+an operator needs. All three reasons are emitted even at zero: a series
+that appears only once it becomes non-zero has no prior sample for
+`increase()`, and its absence is indistinguishable from a scrape that
+never reached the code.
+
+The log LEVEL was deliberately not changed. `ringbuf.go`'s
+`slog.Debug("syslog send failed", ...)` sits in the per-event fan-out
+loop, where CLAUDE.md mandates `slog.Debug`; raising it would reintroduce
+the log flood that rule exists to prevent. The defect was the missing
+counter, not the level.
+
 Tests (`syslog_resilience_test.go`, `syslog_reentrancy_test.go`) use
 deterministic fakes — a deadline-honouring conn, an always-fail conn, a
 timeout conn, a recording conn, a controllable clock, and a dial seam
