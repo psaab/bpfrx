@@ -643,7 +643,7 @@ func (m *Manager) publishSnapshotFailClosedLocked(publishSnap *ConfigSnapshot, s
 // classifierPlanRetainable reports whether a rejected in-place publish may roll
 // the classifier maps BACK to the retained snapshot instead of disabling ctrl.
 //
-// Pure, and separate from the action, because all three conjuncts are load
+// Pure, and separate from the action, because all four conjuncts are load
 // bearing and each fails differently:
 //
 //   - mapsMutatedInPlace: on the bootstrap path the maps were never rewritten
@@ -654,11 +654,47 @@ func (m *Manager) publishSnapshotFailClosedLocked(publishSnap *ConfigSnapshot, s
 //     enabled, hand transit to the kernel — the fail-open this whole path
 //     exists to prevent.
 //   - errors.Is(cause, errHelperRejected): ONLY an in-band {"ok":false} proves
-//     the helper still holds `retained`. On a transport error it may already be
-//     enforcing the new snapshot, and rolling the maps back would put them a
-//     generation BEHIND — the same fail-open with the sign flipped.
-func classifierPlanRetainable(mapsMutatedInPlace bool, retained *ConfigSnapshot, cause error) bool {
-	return mapsMutatedInPlace && retained != nil && errors.Is(cause, errHelperRejected)
+//     the helper still holds THE SNAPSHOT IT HELD BEFORE THE REQUEST. On a
+//     transport error it may already be enforcing the new snapshot, and rolling
+//     the maps back would put them a generation BEHIND — the same fail-open
+//     with the sign flipped.
+//   - publishedGeneration == retained.Generation (and non-zero): the snapshot
+//     the helper held before the request is m.publishedSnapshot, NOT
+//     m.lastSnapshot. Everywhere those two move together the distinction is
+//     invisible, which is why it went unnoticed — but the pendingXSKStartup
+//     deferral in applyCompiledSnapshot advances m.lastSnapshot and RETURNS,
+//     leaving the publish to syncSnapshotLocked. There m.lastSnapshot IS the
+//     snapshot being published, so without this conjunct an in-band refusal
+//     "rolls back" the classifier maps to the very plan the helper just
+//     refused — a no-op dressed as a rollback — and then leaves ctrl ENABLED
+//     because the rollback "succeeded". The shim keeps steering transit
+//     against a plan the helper never accepted while the helper enforces the
+//     previous-good one: the exact #4959 fail-open this path exists to
+//     prevent (#9337). The same hole is reachable one commit later on the
+//     ordinary Compile path — after a deferral, m.lastSnapshot is a
+//     generation the helper never received either.
+//
+// Stating the conjunct as an equality against publishedGeneration rather than
+// as "retained is not the refused snapshot" is deliberate: the latter is true
+// of that second case and still wrong there, because being a DIFFERENT plan
+// from the refused one does not make a plan the one the helper is enforcing.
+func classifierPlanRetainable(
+	mapsMutatedInPlace bool,
+	retained *ConfigSnapshot,
+	publishedGeneration uint64,
+	cause error,
+) bool {
+	if !mapsMutatedInPlace || retained == nil {
+		return false
+	}
+	// publishedGeneration == 0 means this Manager has published nothing, so the
+	// helper holds no snapshot of ours and there is no enforced plan to match.
+	// Spelled out rather than left to the equality because a zero-valued
+	// ConfigSnapshot would otherwise satisfy it.
+	if publishedGeneration == 0 || publishedGeneration != retained.Generation {
+		return false
+	}
+	return errors.Is(cause, errHelperRejected)
 }
 
 // retainPreviousClassifierPlanLocked performs the #7468 atomic retain, or falls
@@ -668,7 +704,7 @@ func classifierPlanRetainable(mapsMutatedInPlace bool, retained *ConfigSnapshot,
 // still fail the apply. What changes is whether transit keeps flowing on the
 // snapshot the helper retained, or drops to kernel-only until the next tick.
 func (m *Manager) retainPreviousClassifierPlanLocked(publishSnap *ConfigSnapshot, cause error) error {
-	if !classifierPlanRetainable(true, m.lastSnapshot, cause) {
+	if !classifierPlanRetainable(true, m.lastSnapshot, m.publishedSnapshot, cause) {
 		return m.failClosedUserspaceCtrlMapLocked(publishSnap, cause)
 	}
 	if err := m.syncUserspaceClassifierMapsLocked(m.lastSnapshot); err != nil {

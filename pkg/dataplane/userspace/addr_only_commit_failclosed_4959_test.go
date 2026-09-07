@@ -96,6 +96,16 @@ func newFailClosedManager4959(t *testing.T) (*Manager, *ebpf.Map, ConfigSnapshot
 	m := New()
 	m.proc = &exec.Cmd{Process: &os.Process{Pid: os.Getpid()}}
 	m.cfg.ControlSocket = controlSock
+	// #9337: the classifier maps are NOT loaded in this harness, so the #7468
+	// rollback attempted on an in-band refusal failed with
+	// "userspace_ingress_ifaces map not loaded" and fell through to the
+	// ctrl-disable fallback. The rejected-publish cells then asserted
+	// ctrl.Enabled==0 for a reason that does not exist in production, where the
+	// maps ARE loaded and the rollback succeeds — the guard was passing on the
+	// WRONG BRANCH and could not have seen the #9337 fail-open. The seam makes
+	// the rollback succeed, so the ctrl outcome is decided by the retain
+	// predicate, which is the thing under test.
+	m.syncClassifierMapsHook = func(*ConfigSnapshot) error { return nil }
 
 	ctrlMap, _ := injectCtrlAndBindingMaps(t, m)
 	// Seed ctrl as a running, ENABLED firewall (post-same-plan-refresh state:
@@ -240,6 +250,21 @@ func TestDeferredPublishRejectedFailsClosed4959(t *testing.T) {
 		m.publishedPlanKey = snapshotBindingPlanKey(snap)
 		m.xskLivenessProven = false
 		m.xskLivenessFailed = false
+		// #9337: a matching helper version must already have been OBSERVED.
+		// Without it ensureEgressZoneProtocolLocked re-probes the helper with a
+		// `status` request on the way to the publish, and that probe consumed
+		// the control server's single queued response — so the apply_snapshot
+		// these cells exist to exercise got none. The refusal cell then scored
+		// its ctrl-disable on a 3 s TRANSPORT TIMEOUT instead of the in-band
+		// refusal it names, and the success cell's publish never landed at all
+		// (that is the red this issue starts from: publishedSnapshot = 1,
+		// want 8). LastSnapshotGeneration stays at the published generation so
+		// the #8597 catch-up branch does not swallow the publish.
+		m.lastStatus = ProcessStatus{
+			ConfigSnapshotProtocolVersion: ProtocolVersion,
+			LastSnapshotGeneration:        1,
+		}
+		m.helperStatusObserved = true
 	}
 
 	// Core residual contract: a REJECTED deferred publish must fail closed.

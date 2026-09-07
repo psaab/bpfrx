@@ -127,36 +127,70 @@ func TestClassifierPlanRetainablePredicate7468(t *testing.T) {
 		name         string
 		mapsMutated  bool
 		retained     *ConfigSnapshot
+		published    uint64
 		cause        error
 		want         bool
 		whyItMatters string
 	}{
 		{
 			name:        "in_band_refusal_with_a_retained_snapshot_after_an_inplace_refresh",
-			mapsMutated: true, retained: retained, cause: inBand, want: true,
+			mapsMutated: true, retained: retained, published: 7, cause: inBand, want: true,
 			whyItMatters: "the only combination in which the helper is known to still hold `retained`",
 		},
 		{
 			name:        "transport_error_is_not_retainable",
-			mapsMutated: true, retained: retained, cause: transport, want: false,
+			mapsMutated: true, retained: retained, published: 7, cause: transport, want: false,
 			whyItMatters: "the helper may already be enforcing the NEW snapshot; " +
 				"rolling the maps back would leave them a generation BEHIND it (fail-open)",
 		},
 		{
 			name:        "no_retained_snapshot_is_not_retainable",
-			mapsMutated: true, retained: nil, cause: inBand, want: false,
+			mapsMutated: true, retained: nil, published: 7, cause: inBand, want: false,
 			whyItMatters: "a first apply has no previous-good plan; a rollback against nil " +
 				"would clear the classifier maps with ctrl still enabled (fail-open)",
 		},
 		{
 			name:        "bootstrap_path_is_not_retainable",
-			mapsMutated: false, retained: retained, cause: inBand, want: false,
+			mapsMutated: false, retained: retained, published: 7, cause: inBand, want: false,
 			whyItMatters: "the maps were never rewritten to the new plan and ctrl is already 0",
+		},
+		{
+			// #9337. The deferred-publish path: applyCompiledSnapshot's
+			// pendingXSKStartup branch advanced m.lastSnapshot to 7 and
+			// returned, so the helper is still enforcing generation 3.
+			// "Rolling back" to 7 rewrites the plan that was just refused
+			// and leaves ctrl enabled against a plan the helper never
+			// accepted.
+			name:        "retained_snapshot_the_helper_never_received_is_not_retainable",
+			mapsMutated: true, retained: retained, published: 3, cause: inBand, want: false,
+			whyItMatters: "an in-band refusal proves the helper still holds what it held BEFORE " +
+				"the request — m.publishedSnapshot. When m.lastSnapshot has run ahead of it " +
+				"(the pendingXSKStartup deferral) it is not a rollback target at all",
+		},
+		{
+			// The conjunct is an EQUALITY, not an ordering. `>=` / `<=` would
+			// pass a helper holding a DIFFERENT generation than `retained` in
+			// one direction and stay green at exactly the value that collides
+			// — the same shape ensureEgressZoneProtocolLocked argues for. The
+			// Manager cannot currently reach published > lastSnapshot
+			// (every site advances both together; only the pendingXSKStartup
+			// deferral separates them, and it raises lastSnapshot), so this
+			// cell pins the predicate's SHAPE rather than a reachable defect.
+			name:        "a_helper_holding_a_newer_generation_is_not_retainable",
+			mapsMutated: true, retained: retained, published: 9, cause: inBand, want: false,
+			whyItMatters: "retainability is `the helper holds exactly this plan`; an ordering " +
+				"test admits a helper holding some other plan and rolls the maps onto it",
+		},
+		{
+			name:        "nothing_published_yet_is_not_retainable",
+			mapsMutated: true, retained: &ConfigSnapshot{}, published: 0, cause: inBand, want: false,
+			whyItMatters: "publishedGeneration 0 means this Manager published nothing, so the " +
+				"helper holds no plan of ours; a zero-valued snapshot must not satisfy the equality",
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := classifierPlanRetainable(tc.mapsMutated, tc.retained, tc.cause); got != tc.want {
+			if got := classifierPlanRetainable(tc.mapsMutated, tc.retained, tc.published, tc.cause); got != tc.want {
 				t.Fatalf("classifierPlanRetainable = %v, want %v — %s", got, tc.want, tc.whyItMatters)
 			}
 		})
@@ -186,6 +220,12 @@ func TestRejectedPublishRollsMapsBackOnlyForAnInBandRefusal7468(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			m := New()
 			m.lastSnapshot = retained
+			// #9337: the retain is only legitimate when the helper is actually
+			// holding `retained` — i.e. when m.publishedSnapshot names it. The
+			// ordinary Compile path always satisfies that (m.lastSnapshot and
+			// m.publishedSnapshot advance together on success), so modelling it
+			// is modelling production, not accommodating the predicate.
+			m.publishedSnapshot = retained.Generation
 			var syncedTo []*ConfigSnapshot
 			m.syncClassifierMapsHook = func(s *ConfigSnapshot) error {
 				syncedTo = append(syncedTo, s)
@@ -242,6 +282,7 @@ func TestRejectedPublishRollsMapsBackOnlyForAnInBandRefusal7468(t *testing.T) {
 func TestRollbackFailureFallsBackToTheCtrlDisable7468(t *testing.T) {
 	m := New()
 	m.lastSnapshot = &ConfigSnapshot{Generation: 41}
+	m.publishedSnapshot = 41 // #9337: the helper is holding the retained plan
 	rollbackErr := errors.New("ingress ifindex map update: EPERM")
 	m.syncClassifierMapsHook = func(*ConfigSnapshot) error { return rollbackErr }
 	publishErr := newHelperRejection("integrity preflight rejected")

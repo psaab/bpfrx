@@ -1042,6 +1042,21 @@ is outside that fail-closed surface entirely: with no XDP program and
 unadjudicated by xpf, while the daemon reports the previous-good
 snapshot as enforced.
 
+> **#9337.** "Because the maps then match what the helper is enforcing" is
+> the precondition, and until #9337 the code did not check it. The retain
+> used `m.lastSnapshot` as "what the helper is enforcing". That is true at
+> every publish site but one: the deferred-publish branch above advances
+> `m.lastSnapshot` and returns, and `syncSnapshotLocked` then publishes
+> `m.lastSnapshot` **itself** — so an in-band refusal there "rolled back"
+> the classifier maps to the very plan the helper had just refused, a
+> no-op that reports success, and left `ctrl.Enabled=1` against a plan
+> the helper never accepted. `classifierPlanRetainable` now takes
+> `m.publishedSnapshot` and retains only when it names the retained
+> snapshot; otherwise the #4959 ctrl-disable stands. The privileged guard
+> for that path could not see it — its harness loads no classifier maps,
+> so the rollback failed on a missing map and reached `Enabled=0` through
+> the wrong branch.
+
 **The transient the new ordering opens is strictly safe.** Between a
 successful publish and the detach, an interface still carries the shim
 while the applied snapshot no longer lists it. In both ctrl states that

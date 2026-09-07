@@ -319,6 +319,27 @@ func (m *Manager) syncUserspaceClassifierMapsFailClosedLocked(snapshot *ConfigSn
 	return nil
 }
 
+// failClosedCtrlMap resolves the userspace_ctrl handle the fail-closed path
+// writes through, preferring the test seam (#9337).
+//
+// It is the same map-free seam #5486 established for the disable path and #6994
+// for applyHelperStatusLocked, added for the same measured reason: without it
+// the ONLY way to observe "a rejected publish drove ctrl to 0" is a real BPF
+// map, so every guard on this — the security property #4959 exists for — sits
+// above the CAP_BPF boundary and does not execute where the suite normally
+// runs. Unprivileged, m.bpfShim.Map returns nil and the whole function returns
+// cause unchanged, which makes "failed closed" and "never tried" identical.
+// Production leaves the hook nil.
+func (m *Manager) failClosedCtrlMap() ctrlMapUpdater {
+	if m.failClosedCtrlMapHook != nil {
+		return m.failClosedCtrlMapHook
+	}
+	if shimMap := m.bpfShim.Map(mapNameUserspaceCtrl); shimMap != nil {
+		return shimMap
+	}
+	return nil
+}
+
 // failClosedUserspaceCtrlMapLocked drives the userspace_ctrl shim to the
 // fail-closed state (Enabled=0) so the XDP shim stops redirecting transit to
 // XSK and only passes proven local/control traffic to the kernel. It is the
@@ -332,7 +353,7 @@ func (m *Manager) syncUserspaceClassifierMapsFailClosedLocked(snapshot *ConfigSn
 // (fresh boot, never enabled) is already fail-closed and returns cause
 // unchanged.
 func (m *Manager) failClosedUserspaceCtrlMapLocked(snapshot *ConfigSnapshot, cause error) error {
-	ctrlMap := m.bpfShim.Map(mapNameUserspaceCtrl)
+	ctrlMap := m.failClosedCtrlMap()
 	if ctrlMap == nil {
 		return cause
 	}

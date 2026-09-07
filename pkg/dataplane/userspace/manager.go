@@ -376,6 +376,13 @@ type Manager struct {
 	// test and therefore bound by nothing CI runs.
 	helperStatusCtrlMapHook     ctrlMapUpdater
 	helperStatusBindingsMapHook ctrlMapUpdater
+	// failClosedCtrlMapHook, when non-nil, replaces the bpfShim userspace_ctrl
+	// map in failClosedUserspaceCtrlMapLocked (#9337), so "a rejected publish
+	// drove ctrl to Enabled=0" — the #4959 security property — is observable
+	// without CAP_BPF. Production leaves it nil; unprivileged the shim map is
+	// nil and the fail-closed write silently no-ops, which is exactly the state
+	// in which a guard cannot tell fail-closed from never-tried.
+	failClosedCtrlMapHook ctrlMapUpdater
 	// syncClassifierMapsHook, when non-nil, replaces the ingress/local/
 	// interface-NAT classifier map writes in unit tests (#7468). Nil in
 	// production.
