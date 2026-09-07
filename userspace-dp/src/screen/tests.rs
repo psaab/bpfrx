@@ -811,6 +811,23 @@ fn teardrop_v6_tiny_non_first_fragment_drops() {
     // AF_INET only, so this slipped through as a PASS even though the
     // sibling ping-of-death check already screened IPv6.
     //
+    // #9426 RE-ANCHOR, not a rewrite. #3119's claim above is that the IPv6
+    // ARM EXISTS AT ALL, and that half is still true and still fail-on-revert:
+    // delete the AF_INET6 branch and this reds. What was wrong was the
+    // FIXTURE's `more: false` — that builds an explicitly TRAILING (M=0)
+    // fragment carrying 4 bytes, which is a LEGAL last fragment (every
+    // fragment except the last must be an 8-byte multiple; the last may be any
+    // size), not a teardrop. The cell's own justification said a tiny trailing
+    // fragment "is the IPv6 teardrop signature" — a factual claim about IP,
+    // and it is false. Junos specifies `tear-drop` as OVERLAP detection and
+    // says nothing about tiny tails.
+    //
+    // So the shape is corrected to `more: true` — a NON-LAST fragment carrying
+    // 4 bytes, which genuinely is malformed — and the claim, the reason and
+    // the assertion are kept verbatim. The legal case the old fixture actually
+    // described is now asserted, as a PASS, by
+    // `teardrop_v6_last_fragment_tiny_payload_passes_9426`.
+    //
     // offset 2 units = 16 bytes (non-first); payload_len=12 with a single
     // 8-byte fragment header (frag_data_off=8) → frag_data = 12 - 8 = 4
     // (< 8) → teardrop. Use UDP with udp-flood disabled and a
@@ -822,9 +839,9 @@ fn teardrop_v6_tiny_non_first_fragment_drops() {
         IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
         IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
         PROTO_UDP,
-        2,     // offset = 2 units = 16 bytes (non-first fragment)
-        false, // trailing fragment
-        12,    // payload_len; frag_data = 12 - 8 = 4 (< 8)
+        2,    // offset = 2 units = 16 bytes (non-first fragment)
+        true, // NON-LAST fragment (M=1) — #9426, see above
+        12,   // payload_len; frag_data = 12 - 8 = 4 (< 8)
         8,
     );
     assert_eq!(
@@ -5765,7 +5782,11 @@ fn teardrop_still_screened_on_flowless_path() {
         IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
         PROTO_UDP,
     );
-    pkt.ip_frag_off = 0x0001; // offset field 1 (non-first)
+    // #9426: MF=1 (0x2000). The fixture was `0x0001` — offset 1 with MF=0,
+    // a LAST fragment carrying 4 bytes, which is legal IP and is no longer
+    // dropped. This cell is about the flowless PATH (#3064), not about the
+    // teardrop boundary, so the trigger is repaired and the claim is unchanged.
+    pkt.ip_frag_off = 0x2001; // offset field 1 (non-first), MF=1 (non-last)
     pkt.ip_total_len = 24; // 20-byte header + 4-byte payload (< 8) → teardrop
     assert_eq!(
         state.check_flowless_screens("trust", &pkt, true, 1),
@@ -5902,7 +5923,9 @@ fn fabric_skip_flowless_still_runs_teardrop_4155() {
         IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
         PROTO_UDP,
     );
-    pkt.ip_frag_off = 0x0001; // offset 1 unit (non-first)
+    // #9426: MF=1, as in teardrop_still_screened_on_flowless_path. This cell
+    // is about the #4155 fabric skip, not about the teardrop boundary.
+    pkt.ip_frag_off = 0x2001; // offset 1 unit (non-first), MF=1 (non-last)
     pkt.ip_total_len = 24; // 20-byte header + 4-byte payload (< 8) → teardrop
     assert_eq!(
         state.check_flowless_screens_opts("trust", &pkt, true, NS, 1, true),
@@ -6985,4 +7008,198 @@ fn a_non_audit_profile_edit_still_inherits_the_cookie_latch_9425() {
         "a non-audit profile edit must still inherit the cookie-active latch (#4969); \
          clearing it on every update would silently disarm cookie mode mid-flood"
     );
+}
+
+// ===================== #9426: the legal last fragment =====================
+//
+// Every IP fragment except the LAST must be a multiple of 8 bytes; the last one
+// may be any size. `check_teardrop` dropped ANY non-first fragment carrying 1-7
+// bytes, so an IPv4 datagram whose length mod 1480 lands in 1-7 produced a legal
+// last fragment the firewall dropped — and the receiver's reassembly then times
+// out, so the WHOLE datagram is lost. No attacker is required.
+//
+// The discriminator was already in the struct and unused: `ip_frag_off` is the
+// raw field, so MF (v4 0x2000, v6 the Fragment header's low bit) is in hand at
+// this check. MF=0 is the last fragment.
+//
+// FAIL-ON-REVERT: remove the `more_fragments &&` gate from either arm of
+// `check_teardrop` and every PASS cell below reds as an assertion.
+
+/// A LEGAL last fragment (MF=0) at every size in the 1-7 band must PASS, on
+/// both families. Swept rather than sampled: a fix that only admitted one size
+/// would pass a single-value cell.
+#[test]
+fn teardrop_last_fragment_tiny_payload_passes_9426() {
+    for payload in 1u16..8 {
+        let mut profile = ScreenProfile::default();
+        profile.teardrop = true;
+        let mut state = make_state("trust", profile);
+        let pkt = ipv4_fragment(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+            PROTO_UDP,
+            2,     // non-first fragment (offset 2 units = 16 bytes)
+            false, // MF=0 — the LAST fragment, which may legally be any size
+            20 + payload,
+        );
+        assert_eq!(
+            state.check_packet("trust", &pkt, 1),
+            ScreenVerdict::Pass,
+            "a LAST IPv4 fragment carrying {payload} byte(s) is legal RFC 791 and must \
+             not be dropped; dropping it loses the whole datagram when reassembly \
+             times out"
+        );
+    }
+}
+
+#[test]
+fn teardrop_v6_last_fragment_tiny_payload_passes_9426() {
+    for payload in 1u16..8 {
+        let mut profile = ScreenProfile::default();
+        profile.teardrop = true;
+        profile.udp_flood_threshold = 0;
+        let mut state = make_state("trust", profile);
+        let pkt = ipv6_fragment(
+            IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
+            IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
+            PROTO_UDP,
+            2,     // non-first fragment (offset 2 units = 16 bytes)
+            false, // M=0 — the LAST fragment
+            8 + payload,
+            8,
+        );
+        assert_eq!(
+            state.check_packet("trust", &pkt, 1),
+            ScreenVerdict::Pass,
+            "a LAST IPv6 fragment carrying {payload} byte(s) is legal and must not be \
+             dropped. This is the shape the pre-#9426 fixture of \
+             teardrop_v6_tiny_non_first_fragment_drops actually described"
+        );
+    }
+}
+
+/// COMPANION: a NON-LAST fragment (MF=1) at the same sizes must STILL DROP.
+/// Without this pair the fix is indistinguishable from deleting the `< 8` check
+/// outright, which would lose a real malformed-fragment defence.
+#[test]
+fn teardrop_non_last_fragment_tiny_payload_still_drops_9426() {
+    for payload in 1u16..8 {
+        let mut profile = ScreenProfile::default();
+        profile.teardrop = true;
+        let mut state = make_state("trust", profile);
+        let pkt = ipv4_fragment(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+            PROTO_UDP,
+            2,    // non-first fragment
+            true, // MF=1 — a NON-LAST fragment must be an 8-byte multiple
+            20 + payload,
+        );
+        assert_eq!(
+            state.check_packet("trust", &pkt, 1),
+            ScreenVerdict::Drop("teardrop"),
+            "a NON-LAST IPv4 fragment carrying {payload} byte(s) violates the 8-byte \
+             multiple rule and must still drop"
+        );
+    }
+}
+
+#[test]
+fn teardrop_v6_non_last_fragment_tiny_payload_still_drops_9426() {
+    for payload in 1u16..8 {
+        let mut profile = ScreenProfile::default();
+        profile.teardrop = true;
+        profile.udp_flood_threshold = 0;
+        let mut state = make_state("trust", profile);
+        let pkt = ipv6_fragment(
+            IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
+            IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
+            PROTO_UDP,
+            2,
+            true, // M=1 — NON-LAST
+            8 + payload,
+            8,
+        );
+        assert_eq!(
+            state.check_packet("trust", &pkt, 1),
+            ScreenVerdict::Drop("teardrop"),
+            "a NON-LAST IPv6 fragment carrying {payload} byte(s) must still drop"
+        );
+    }
+}
+
+/// The #3027 arm is UNGATED and must stay so: a non-first fragment contributing
+/// ZERO (or under-length) data is malformed whatever MF says — a last fragment
+/// with nothing in it is not a legal tail. Gating this arm on MF too would be
+/// the over-correction, and this is the cell that catches it.
+#[test]
+fn teardrop_zero_payload_last_fragment_still_drops_9426() {
+    for (label, total_len) in [("zero payload", 20u16), ("under-length", 18u16)] {
+        let mut profile = ScreenProfile::default();
+        profile.teardrop = true;
+        let mut state = make_state("trust", profile);
+        let pkt = ipv4_fragment(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+            PROTO_UDP,
+            2,
+            false, // MF=0 — a LAST fragment, and still malformed
+            total_len,
+        );
+        assert_eq!(
+            state.check_packet("trust", &pkt, 1),
+            ScreenVerdict::Drop("teardrop"),
+            "{label}: the #3027 arm must NOT be gated on MF — a last fragment that \
+             contributes no data is not a legal tail"
+        );
+    }
+}
+
+#[test]
+fn teardrop_v6_zero_payload_last_fragment_still_drops_9426() {
+    let mut profile = ScreenProfile::default();
+    profile.teardrop = true;
+    profile.udp_flood_threshold = 0;
+    let mut state = make_state("trust", profile);
+    let pkt = ipv6_fragment(
+        IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
+        IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
+        PROTO_UDP,
+        2,
+        false, // M=0 — a LAST fragment
+        4,     // payload_len < frag_data_off (8) → saturating_sub → 0
+        8,
+    );
+    assert_eq!(
+        state.check_packet("trust", &pkt, 1),
+        ScreenVerdict::Drop("teardrop"),
+        "the IPv6 analogue of the #3027 arm must NOT be gated on M either"
+    );
+}
+
+/// POSITIVE CONTROL retained from the boundary: exactly 8 bytes passes on BOTH
+/// MF values. Keeps the pre-#9426 boundary cell's claim alive in the shape that
+/// survives, and proves the sweeps above are not measuring a check that stopped
+/// firing altogether.
+#[test]
+fn teardrop_eight_byte_fragment_passes_either_way_9426() {
+    for more in [false, true] {
+        let mut profile = ScreenProfile::default();
+        profile.teardrop = true;
+        let mut state = make_state("trust", profile);
+        let pkt = ipv4_fragment(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+            PROTO_UDP,
+            2,
+            more,
+            28, // 20-byte header + exactly 8 payload bytes
+        );
+        assert_eq!(
+            state.check_packet("trust", &pkt, 1),
+            ScreenVerdict::Pass,
+            "8 bytes is the first legal size for a NON-LAST fragment and is legal for a \
+             last one too (more_fragments={more})"
+        );
+    }
 }

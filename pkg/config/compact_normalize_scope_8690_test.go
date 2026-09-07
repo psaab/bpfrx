@@ -58,16 +58,31 @@ func TestCompactNormalizeScopePreservesCompiledResult8690(t *testing.T) {
 		parent := s.container[:len(s.container)-1]
 		stanza := s.container[len(s.container)-1]
 		siteKeyEarly := strings.Join(s.container, " ") + " " + s.leaf
-		v1, v2, ok := synthPair(s.node)
-		if !ok {
-			// No distinguishing pair of values, so scope cannot even be
-			// determined for this site — it is UNKNOWN, not safe.
-			unsynthesizable = append(unsynthesizable, siteKeyEarly)
-			continue
+		// #9056: a VALUELESS FLAG has no value to vary, so its discriminator is
+		// PRESENCE -- the "v2" spelling omits the leaf entirely. Without this
+		// branch synthPair refuses the shape, every flag site lands in
+		// `unsynthesizable`, and the nineteen `security` pairs this pass now
+		// normalizes would be UNMEASURED by the guard that exists to verify
+		// exactly that: a green that is silent about the pairs the same change
+		// added.
+		var v1, v2 string
+		flagSite := s.flag
+		if !flagSite {
+			var ok bool
+			v1, v2, ok = synthPair(s.node)
+			if !ok {
+				// No distinguishing pair of values, so scope cannot even be
+				// determined for this site — it is UNKNOWN, not safe.
+				unsynthesizable = append(unsynthesizable, siteKeyEarly)
+				continue
+			}
 		}
 		ctx := contextFor(parent)
 		siteKey := strings.Join(s.container, " ") + " " + s.leaf
 		elidedText := nest(parent, ctx+stanza+" "+s.leaf+" "+v1+";")
+		if flagSite {
+			elidedText = nest(parent, ctx+stanza+" "+s.leaf+";")
+		}
 
 		// ADMISSION COMES FROM THE PASS, NOT FROM A RE-DERIVED MODEL OF IT.
 		//
@@ -93,8 +108,18 @@ func TestCompactNormalizeScopePreservesCompiledResult8690(t *testing.T) {
 		if normalizeCompactStanzas(probe) == 0 {
 			continue // production leaves this site alone; not in scope
 		}
-		cb1 := compileText(t, nest(parent, ctx+stanza+" { "+s.leaf+" "+v1+"; }"))
-		cb2 := compileText(t, nest(parent, ctx+stanza+" { "+s.leaf+" "+v2+"; }"))
+		bracedV1 := nest(parent, ctx+stanza+" { "+s.leaf+" "+v1+"; }")
+		bracedV2 := nest(parent, ctx+stanza+" { "+s.leaf+" "+v2+"; }")
+		if flagSite {
+			// PRESENCE vs ABSENCE. cb2 is the flag omitted, which is also the
+			// empty skeleton -- so the vacuity guard below reads as "the
+			// presence of this flag is not observable", the same property it
+			// asserts for a valued leaf.
+			bracedV1 = nest(parent, ctx+stanza+" { "+s.leaf+"; }")
+			bracedV2 = nest(parent, ctx+stanza+" { }")
+		}
+		cb1 := compileText(t, bracedV1)
+		cb2 := compileText(t, bracedV2)
 		ce := compileText(t, nest(parent, ctx+stanza+" { }"))
 		if cb1 == nil || cb2 == nil || ce == nil {
 			// The pass DOES normalize this site (checked above), but a

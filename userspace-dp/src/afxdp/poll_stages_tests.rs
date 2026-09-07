@@ -2310,7 +2310,12 @@ const FRAG_PROTO_UDP: u8 = 17;
 /// early `Continue(Pass)` on `flow == None` turns this RED.
 #[test]
 fn flowless_teardrop_fragment_dropped_3064() {
-    let frame = ipv4_fragment_frame(0x0001, FRAG_PROTO_UDP, 4);
+    // #9426: MF=1 (0x2000) so this stays a teardrop under the corrected rule.
+    // The fixture was `0x0001` — offset 1 with MF=0, i.e. a LAST fragment
+    // carrying 4 bytes, which is LEGAL IP and is no longer dropped. This cell
+    // is about the flowless PATH, not about the teardrop boundary, so the
+    // trigger is repaired and the claim below is unchanged.
+    let frame = ipv4_fragment_frame(0x2001, FRAG_PROTO_UDP, 4);
     let meta = ipv4_fragment_meta(&frame, FRAG_PROTO_UDP);
     assert!(
         parse_session_flow_from_bytes(&frame, meta).is_none(),
@@ -2515,7 +2520,11 @@ fn fragment_screen_alarm_without_drop() -> ScreenState {
 #[test]
 fn alarm_without_drop_forwards_but_alarms_l10() {
     // (1) Flowless teardrop fragment (offset 1 unit, payload 4 < 8).
-    let frag = ipv4_fragment_frame(0x0001, FRAG_PROTO_UDP, 4);
+    // #9426: MF=1 (0x2000) so the trigger is still a teardrop. The fixture was
+    // `0x0001` — offset 1 with MF=0, a LAST fragment carrying 4 bytes, which is
+    // LEGAL IP and is no longer dropped. This cell is about
+    // alarm-without-drop, not about the teardrop boundary.
+    let frag = ipv4_fragment_frame(0x2001, FRAG_PROTO_UDP, 4);
     let frag_meta = ipv4_fragment_meta(&frag, FRAG_PROTO_UDP);
     assert!(
         parse_session_flow_from_bytes(&frag, frag_meta).is_none(),
@@ -3925,10 +3934,14 @@ fn flowless_teardrop_fragment_with_ihl_zero_is_still_dropped_8298() {
 /// A guard that reds on the mutant only proves it has power; a control on the
 /// most nearly-correct input is what proves the power is aimed right. This is
 /// the minimal legal header (IHL = 5, the value RFC 791 mandates as the floor)
-/// carrying a payload of exactly 8 — the first size the `< 8` teardrop test
-/// admits. If the floor were written `< 6`, or applied before the version
-/// check, or if `extract_screen_info` started failing closed on ordinary
-/// traffic, this cell reds while the bypass cell above stays green.
+/// carrying a payload of exactly 8. That WAS "the first size the `< 8` teardrop
+/// test admits"; since #9426 the `< 8` test applies only to a NON-LAST (MF=1)
+/// fragment, and this fixture's `0x0001` frag_off is MF=0, so an 8-byte payload
+/// is now admitted for two independent reasons. The control still does its job
+/// — it is a legitimate fragment that must survive the IHL floor. If the floor
+/// were written `< 6`, or applied before the version check, or if
+/// `extract_screen_info` started failing closed on ordinary traffic, this cell
+/// reds while the bypass cell above stays green.
 #[test]
 fn flowless_legitimate_ihl5_fragment_is_not_dropped_8298() {
     let frame = ipv4_fragment_frame(0x0001, FRAG_PROTO_UDP, 8);
@@ -4495,7 +4508,9 @@ fn inert_zone_audit_mode_forwards_the_substituted_default_9425() {
 
     // (1) Flowless: a teardrop-shaped fragment, which conservative_default()
     //     enables and which #7888 hard-drops for an inert zone.
-    let frag = ipv4_fragment_frame(0x0001, FRAG_PROTO_UDP, 4);
+    // #9426: MF=1 so the trigger is still a teardrop. This cell is about the
+    // inert zone's audit disposition, not about the teardrop boundary.
+    let frag = ipv4_fragment_frame(0x2001, FRAG_PROTO_UDP, 4);
     let frag_meta = ipv4_fragment_meta(&frag, FRAG_PROTO_UDP);
     let mut base = inert_screen(false);
     let (d0, n0) = run_stage_screen(&mut base, &frag, frag_meta, None);
@@ -4550,4 +4565,51 @@ fn inert_zone_audit_mode_forwards_the_substituted_default_9425() {
          the flow path too — fixing one consumer leaves half the packets dropping"
     );
     assert_eq!(audit2.alarm_without_drop_events(), 1);
+}
+
+/// #9426 END TO END on the live flowless path.
+///
+/// A non-first fragment is exactly the frame that `parse_session_flow_from_bytes`
+/// classifies flowless (#2344), so the flowless screen branch IS the production
+/// path for this defect — a unit test on `check_teardrop` cannot say whether the
+/// legal tail actually survives to forwarding.
+///
+/// The two legs differ in ONE bit, the MF flag, and nothing else: same offset,
+/// same 4-byte payload, same profile, same stage. The MF=1 leg is the positive
+/// control that proves the teardrop check is still armed and still firing, so
+/// the MF=0 leg's PASS is a real admission rather than a screen that stopped
+/// running.
+#[test]
+fn flowless_legal_last_fragment_tiny_payload_is_forwarded_9426() {
+    // MF=1, offset 1 unit, 4 bytes — a genuinely malformed non-last fragment.
+    let bad = ipv4_fragment_frame(0x2001, FRAG_PROTO_UDP, 4);
+    let bad_meta = ipv4_fragment_meta(&bad, FRAG_PROTO_UDP);
+    assert!(
+        parse_session_flow_from_bytes(&bad, bad_meta).is_none(),
+        "precondition: a non-first fragment is flowless (#2344)"
+    );
+    let mut screen = fragment_screen();
+    let (dropped, drops) = run_stage_screen(&mut screen, &bad, bad_meta, None);
+    assert!(
+        dropped && drops == 1,
+        "POSITIVE CONTROL: a NON-LAST fragment with 4 bytes must still be dropped, or \
+         the PASS below only proves the screen stopped running"
+    );
+
+    // MF=0, otherwise identical — a LEGAL last fragment.
+    let good = ipv4_fragment_frame(0x0001, FRAG_PROTO_UDP, 4);
+    assert_eq!(
+        bad.len(),
+        good.len(),
+        "the two legs must differ only in the MF bit"
+    );
+    let good_meta = ipv4_fragment_meta(&good, FRAG_PROTO_UDP);
+    let mut screen2 = fragment_screen();
+    let (dropped2, drops2) = run_stage_screen(&mut screen2, &good, good_meta, None);
+    assert!(
+        !dropped2 && drops2 == 0,
+        "a LAST fragment carrying 4 bytes is legal RFC 791 and must be FORWARDED; \
+         dropping it loses the whole datagram when the receiver's reassembly times out \
+         (#9426)"
+    );
 }
