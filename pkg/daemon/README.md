@@ -1058,6 +1058,43 @@ reports the last COMPLETED attempt failed, and the manager spaces retries
 (30s) — a permanently broken Kea must not be held in a continuous
 15s-bounded systemctl restart loop by a 2s tick.
 
+**The filtered result is a COPY with the narrowed fields swapped, not a
+rebuild (#9348).** `filterDHCPConfigForMasterRGs` used to construct its result
+field by field — `var result config.DHCPServerConfig` plus
+`&config.DHCPLocalServerConfig{Groups: filtered}` — which names exactly the
+fields the author knew about and silently drops the rest. Six were being
+dropped, measured:
+
+```
+v4 SocketType    src="udp" filtered=""
+v4 ExpiredLeases src=true  filtered=false
+v6 SocketType    src="udp" filtered=""
+v6 ExpiredLeases src=true  filtered=false
+DynamicDNS       src=true  filtered=false
+DynamicDNSv6     src=true  filtered=false
+```
+
+The two that MATTER are the family-level Kea scalars. A CLUSTERED node rendered
+Kea without the operator's `expired-leases-processing` (#1387 — Kea fell back to
+its built-in reclamation defaults) and without `dhcp-socket-type` (#7318 — Kea
+fell back to `raw`), while a STANDALONE node rendered both from the same
+committed config. #7318 exists precisely because `raw` does not work on some
+substrates, so on a cluster that leaf read as applied and was not.
+
+The DDNS pair is harmless, and that was checked rather than assumed: this result
+reaches only `dhcpserver.Manager`, and the DDNS policy is read straight off the
+ACTIVE config by `ddns.Manager.ReconcileScoped(ctx, &cfg.System.DHCPServer,
+opts)` — `pkg/dhcpserver` never reads `DynamicDNS` at all. They ride along
+anyway, because the point of the shape is that nobody has to make that
+judgement per field.
+
+The copy IS the guard: a field added to either struct is carried by
+construction rather than needing someone to remember this site — the same shape
+#9141 used for `resolveDHCPRethInterfaces`.
+`TestClusterFilterCarriesEveryFieldItDoesNotNarrow9348` walks the source
+reflectively and fails on any non-narrowed field that does not survive, with a
+positive control so a walk that examined nothing cannot report a clean result.
+
 **Single-sourced desired state.** `desiredClusterDHCPConfig` is the one place
 that derives the Kea desired state from (active config, current master-RG
 set); the commit path, both transition edges, and the converger all call it.
