@@ -1732,10 +1732,15 @@ def cmd_fetch(args):
 
     manifest = os.path.join(out, names["manifest"])
     sig = os.path.join(out, names["sig"])
+    # #9170: KEEP the digest each verification established. The --no-import
+    # branch below prints one for the operator to check at install time, and
+    # the only trustworthy source for it is the signed manifest entry this
+    # call already compared against — not a later re-read of a public path.
+    verified_sha = {}
     for w in want:
         path = os.path.join(out, names[w])
         try:
-            sign.verify_image_artifact(path, manifest, sig)
+            verified_sha[w] = sign.verify_image_artifact(path, manifest, sig)
             print(f"==> signature OK: {names[w]}")
         except sign.SignError as e:
             die(f"VERIFICATION FAILED for {names[w]}: {e}")
@@ -1837,10 +1842,15 @@ def cmd_fetch(args):
             # THIS path and THIS digest on one line, so it is not the cwd-relative
             # `sha256sum -c` sign.py warns about — the file being hashed is the file
             # being installed.
-            try:
-                expected_sha = sign.sha256_file(qcow2_pub)
-            except OSError as exc:
-                die(f"cannot hash the verified qcow2 {qcow2_pub} to print its digest: {exc}")
+            # #9170: the digest is the SIGNED one, taken from the verification
+            # above — NOT a re-hash of qcow2_pub. A re-hash binds the bytes in
+            # --out at print time, which is after the signature check finished,
+            # so a dir-writer who wins that window gets its bytes installed AND
+            # gets the operator's own `sha256sum -c` to bless them. The gap is
+            # not sub-millisecond: a full verify_manifest_map -> verify_and_read
+            # -> minisign subprocess, two mkdtemp/rmtree cycles and the
+            # watermark os.replace sit inside it.
+            expected_sha = verified_sha["qcow2"]
             print(f"==> verified into {out} (not imported). For libvirt/KVM, install "
                   f"it to the golden path deploy reads — RE-VERIFY at install time, "
                   f"because {out} stays writable by any local process after this "

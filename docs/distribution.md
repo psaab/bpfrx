@@ -241,9 +241,23 @@ xpf-deploy.py fetch --version <ver> --image-url ... --qcow2-only --install-libvi
 xpf-deploy.py --hypervisor libvirt deploy <appliance.yaml>
 
 # Verify only (no install): fetch prints the exact `install` command that
-# copies the verified qcow2 into the golden path.
+# copies the verified qcow2 into the golden path, gated on its digest.
 xpf-deploy.py fetch --version <ver> --image-url ... --qcow2-only
 ```
+
+**The digest that `--qcow2-only` / `--no-import` prints is the SIGNED one
+(#9170).** These two flags do not consume the image — they hand the operator a
+`sha256sum -c … && sudo install …` one-liner to run later — so the gap between
+this command's signature check and that install is unbounded, and `--out` stays
+writable by any local process for all of it. The printed digest is therefore
+taken from the signed manifest entry that authorised the artifact
+(`sign.verify_image_artifact` returns it), never re-hashed from the file in
+`--out` after verification. A re-hash would bind the bytes present at print
+time rather than the bytes that passed the signature, so a process that swapped
+`--out` in that window would get its bytes installed *and* get the operator's
+own verification command to bless them. The two importing paths do not need
+this: they consume the bytes in-process from a private staging copy
+(`_verified_private_artifacts`, #5817).
 
 `deploy --hypervisor libvirt` never boots the golden directly — it creates a
 per-VM copy-on-write overlay backed read-only by the golden. `--install-libvirt`

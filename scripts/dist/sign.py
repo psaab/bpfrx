@@ -242,7 +242,8 @@ def verify_manifest_map(manifest_path, sig_path, pubkey_path=None):
 
 
 def verify_image_artifact(path, manifest_path, sig_path, pubkey_path=None):
-    """Verify ONE artifact `path` against a signed manifest.
+    """Verify ONE artifact `path` against a signed manifest and RETURN the
+    signed digest that authorised it.
 
     1. verify+parse the manifest from its VERIFIED bytes (TOCTOU-safe).
     2. hash the EXACT `path` and compare to the manifest entry for its
@@ -250,6 +251,15 @@ def verify_image_artifact(path, manifest_path, sig_path, pubkey_path=None):
 
     Binds the bytes the caller is about to import/use, not a cwd-relative
     `sha256sum -c` (which could pass against a stale local copy).
+
+    #9170: the return value is the manifest's hex digest, not a bare `True`.
+    A caller that needs to PRINT or re-check that digest — `xpf-deploy.py
+    fetch --no-import`, which hands the operator a `sha256sum -c` line to run
+    later — must take it from HERE. Re-hashing the file afterwards binds the
+    bytes at hash time rather than the bytes that passed the signature, and
+    the artifact typically sits in a public `--out` another local process can
+    write. The value was already computed inside this call; discarding it was
+    what forced the second read.
     """
     manifest = verify_manifest_map(manifest_path, sig_path, pubkey_path)
     base = os.path.basename(path)
@@ -262,7 +272,7 @@ def verify_image_artifact(path, manifest_path, sig_path, pubkey_path=None):
         raise SignError(
             f"{base}: SHA256 MISMATCH — manifest {manifest[base]}, actual "
             f"{actual}. The file does not match the signed checksum.")
-    return True
+    return manifest[base]
 
 
 def verify_listed_artifact_bytes(path, manifest_path, sig_path, pubkey_path=None):
