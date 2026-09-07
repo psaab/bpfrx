@@ -332,8 +332,44 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 				// justified from applySystemLogin rewriting per entry. Only the
 				// key expectation moved, and it moved because the thing it was
 				// derived from moved.
+				// #9391: expand the flat-set run ONCE and read it in BOTH loops
+				// below, so the authentication probe and the property switch
+				// cannot see different sets.
+				//
+				// `uid` declares no valueType and no validator, so it is an
+				// ADMISSION HEAD: validateModifierChild has nothing to reject
+				// the following token with, and `set system login user admin
+				// uid 2001 class read-only` committed CLEAN with the class
+				// dropped. The reverse spelling is rejected (`class` is typed),
+				// so the loss is one-directional — whatever `class` is packed
+				// behind `uid` is lost and ANY PREVIOUSLY AUTHORED CLASS STANDS.
+				//
+				// That is the harmful half, and it is not the fail-closed one.
+				// An operator DEMOTING an admin:
+				//
+				//	set system login user admin class super-user      (earlier)
+				//	set system login user admin uid 2001 class read-only
+				//	  -> class="super-user"          THE DEMOTION IS DROPPED
+				//
+				// reconcileSudoers (daemon_hostauth_apply.go) keys the
+				// passwordless-root grant on `Class == "super-user"`, so the
+				// demoted admin KEEPS the xpf-<user> NOPASSWD sudoers drop-in —
+				// which is exactly the #3889 defect that revocation sweep was
+				// written to close, reached again by spelling. pkg/authz then
+				// evaluates the retained super-user class on every gRPC and REST
+				// call.
+				//
+				// expandFlatRun rather than hoistAndSplitRun8939 DELIBERATELY:
+				// the stronger helper descends into a container leaf's body, and
+				// `authentication` is one whose packed spelling the #6662 gate
+				// exists to REJECT. Lifting out of it would make the lenient path
+				// compile a shape the strict path refuses. The run this defect
+				// needs is a chain of the container's OWN leaves, which
+				// expandFlatRun covers, and it leaves `authentication` exactly as
+				// authored.
+				userProps := expandFlatRun(userInst.node.Children, loginUserSchema9391())
 				authoredAuth := false
-				for _, prop := range userInst.node.Children {
+				for _, prop := range userProps {
 					if prop.Name() == "authentication" {
 						authoredAuth = true
 						break
@@ -342,7 +378,7 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 				if authoredAuth {
 					user.EncryptedPassword = ""
 				}
-				for _, prop := range userInst.node.Children {
+				for _, prop := range userProps {
 					switch prop.Name() {
 					case "uid":
 						if v := nodeVal(prop); v != "" {
@@ -3691,6 +3727,22 @@ func sshKeyValues(node *Node) []string {
 // resolves as a schema SIBLING, and no permission name is also a login-class
 // leaf name -- asserted, not assumed, by the bracketed-list and
 // `permissions all allow-configuration ...` arms of the #8939 cell.
+// loginUserSchema9391 resolves the `system login user <name>` container out of
+// setSchema, so the run expansion is driven by the same declaration SetPath
+// walked. Mirrors loginClassSchema8939 below.
+func loginUserSchema9391() *schemaNode {
+	sys := resolveSchemaChild(setSchema, "system")
+	login := resolveSchemaChild(sys, "login")
+	usr := resolveSchemaChild(login, "user")
+	if usr == nil {
+		return nil
+	}
+	if usr.wildcard != nil {
+		return usr.wildcard
+	}
+	return usr
+}
+
 func loginClassSchema8939() *schemaNode {
 	sys := resolveSchemaChild(setSchema, "system")
 	login := resolveSchemaChild(sys, "login")
