@@ -71,11 +71,11 @@ func TestReconcileProxyARP_SweepsRemovedInterface(t *testing.T) {
 // Fail-on-revert: restoring the `return nil, nil, err` fast-path makes the
 // enabled return nil, failing the non-nil assertion.
 func TestReconcileProxyARP_PartialAddKeepsEnabledSet(t *testing.T) {
-	prevList, prevSet, prevDel := neighListSeam, neighSetSeam, neighDelSeam
-	neighListSeam = func(_, _ int) ([]netlink.Neigh, error) { return nil, nil }
+	prevList, prevSet, prevDel := neighProxyListSeam, neighSetSeam, neighDelSeam
+	neighProxyListSeam = func(_, _ int) ([]netlink.Neigh, error) { return nil, nil }
 	neighSetSeam = func(_ *netlink.Neigh) error { return errors.New("simulated netlink failure") }
 	neighDelSeam = func(_ *netlink.Neigh) error { return nil }
-	t.Cleanup(func() { neighListSeam, neighSetSeam, neighDelSeam = prevList, prevSet, prevDel })
+	t.Cleanup(func() { neighProxyListSeam, neighSetSeam, neighDelSeam = prevList, prevSet, prevDel })
 	captureProxySysctl(t, false)
 
 	cfg := &config.Config{}

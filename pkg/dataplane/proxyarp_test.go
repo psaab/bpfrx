@@ -194,9 +194,9 @@ func TestWriteProxyResponderSysctl_UnsupportedFamily(t *testing.T) {
 // the captured add/del slices.
 func captureNeigh(t *testing.T, existing []netlink.Neigh) (set, del *[]netlink.Neigh) {
 	t.Helper()
-	prevList, prevSet, prevDel := neighListSeam, neighSetSeam, neighDelSeam
+	prevList, prevSet, prevDel := neighProxyListSeam, neighSetSeam, neighDelSeam
 	var sets, dels []netlink.Neigh
-	neighListSeam = func(linkIndex, family int) ([]netlink.Neigh, error) {
+	neighProxyListSeam = func(linkIndex, family int) ([]netlink.Neigh, error) {
 		// Return only entries matching the requested family so the v4 and v6
 		// passes are properly separated, mirroring the kernel.
 		var out []netlink.Neigh
@@ -210,7 +210,7 @@ func captureNeigh(t *testing.T, existing []netlink.Neigh) (set, del *[]netlink.N
 	neighSetSeam = func(n *netlink.Neigh) error { sets = append(sets, *n); return nil }
 	neighDelSeam = func(n *netlink.Neigh) error { dels = append(dels, *n); return nil }
 	t.Cleanup(func() {
-		neighListSeam, neighSetSeam, neighDelSeam = prevList, prevSet, prevDel
+		neighProxyListSeam, neighSetSeam, neighDelSeam = prevList, prevSet, prevDel
 	})
 	return &sets, &dels
 }

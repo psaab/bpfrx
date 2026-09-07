@@ -30,14 +30,50 @@ type ProxyARPAdded struct {
 
 // netlink seams. The neighbor list/set/del operations are wrapped in package
 // vars so unit tests can exercise the family-correct install/stale-removal
-// logic (#2197 item 1) without CAP_NET_ADMIN. Production wiring is the real
+// logic (#2197 item 1) without CAP_NET_ADMIN.
+//
+// #9087 renamed the list seam from neighListSeam to neighProxyListSeam. The old
+// name was not cosmetic: it described the wrong netlink call, it matched the
+// wrong production wiring underneath it, and every reader who checked "does the
+// seam list neighbours? yes" agreed with it. The table this reconcile cares
+// about is the PROXY table, and the name now says so. Production wiring is the real
 // vishvananda/netlink calls; the kernel handles both AF_INET and AF_INET6
 // NTF_PROXY entries through the same RTM_NEWNEIGH/RTM_DELNEIGH (Family-aware,
 // To4()/To16() serialized), so no library-side family branching is required.
 var (
-	neighListSeam = netlink.NeighList
-	neighSetSeam  = netlink.NeighSet
-	neighDelSeam  = netlink.NeighDel
+	// #9087: NeighProxyList, NOT NeighList — and the difference is the whole
+	// defect. The two are one field apart in the dump request:
+	//
+	//	NeighList      -> Ndmsg{Family, Index}                 (Flags 0)
+	//	NeighProxyList -> Ndmsg{Family, Index, Flags: NTF_PROXY}
+	//
+	// The kernel keeps proxy entries in a SEPARATE table (pneigh) and dumps it
+	// only when the request carries NTF_PROXY; a plain RTM_GETNEIGH dump
+	// returns the ordinary ARP/ND table and no pneigh entry at all. So this
+	// listed a table the entries were never in, `existing` came back empty on
+	// every pass, and the two loops it feeds both broke, in opposite
+	// directions:
+	//
+	//   - the STALE-REMOVAL loop iterates `existing`, so it removed NOTHING,
+	//     EVER. The #8297 standby kept answering proxy-ARP for the pool address
+	//     indefinitely — one IP at two RETH virtual MACs — no matter how
+	//     correctly the ownership gate fired above it. That is #9087.
+	//   - the ADD loop treats every desired key as missing, so it re-issued a
+	//     NeighSet on every 30s pass forever. Measured on the loss cluster with
+	//     the entry demonstrably present in `ip neigh show proxy`:
+	//     `proxy-arp reconciled added=1 removed=0`, every 30 seconds,
+	//     indefinitely. A converged reconcile reports added=0.
+	//
+	// WHY THE UNIT TESTS COULD NOT SEE IT: they replace this seam with a fake
+	// that returns whatever the case wants, so in every test the seam behaves
+	// like NeighProxyList. The fake was the only NeighProxyList in the tree.
+	// The #8597 note further down describes a DIFFERENT cause of the same
+	// never-converging symptom (a 4-in-6 key-form mismatch) and was fixed;
+	// fixing it removed the error log that made the non-convergence visible
+	// while the `added=1` every 30s continued, so nothing prompted a re-look.
+	neighProxyListSeam = netlink.NeighProxyList
+	neighSetSeam       = netlink.NeighSet
+	neighDelSeam       = netlink.NeighDel
 	// linkByIndexSeam resolves an ifindex to its link so the procfs name for
 	// the proxy responder sysctl can be derived. Wrapped as a package var so
 	// the #6536 test can inject a transient resolution failure without
@@ -399,7 +435,7 @@ func ReconcileProxyARP(cfg *config.Config, ifaceMap, priorIfaceMap map[string]in
 	// v4-mapped form cannot be double-counted (#2197 item 1, risk R2).
 	for idx := range managedSet {
 		for _, family := range []int{unix.AF_INET, unix.AF_INET6} {
-			neighs, err := neighListSeam(idx, family)
+			neighs, err := neighProxyListSeam(idx, family)
 			if err != nil {
 				slog.Warn("proxy-arp: failed to list neighbors",
 					"ifindex", idx, "family", family, "err", err)
