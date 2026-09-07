@@ -315,9 +315,27 @@ uplink regardless of the master routing table, using an
 pattern. Operator recipe (two uplinks, ISP-A = master default via
 `reth0.50`, ISP-B = `reth0.80`):
 
+**A forwarding instance is statics-only, and that is now enforced (#9409).**
+`protocols` under `instance-type forwarding` is REJECTED at commit, naming the
+instance. It is not a gap in the recipe: a forwarding instance has no VRF
+device, so FRR has no instance to scope a protocol to. The FRR assembler
+encodes "no VRF device" by clearing `VRFName`, and the protocol renderer reads
+an empty `VRFName` as *the GLOBAL instance* — so before the gate, an
+instance-scoped OSPF/OSPFv3/IS-IS/RIP was activated in the **global** routing
+context (its learned routes landing in the main table while the instance's own
+table stayed empty) and an instance-scoped BGP neighbor silently **joined the
+global AS**, on a commit that succeeded with no warning. Junos does not accept
+the composition either. If an instance needs its own protocol, it needs its own
+VRF: use `instance-type virtual-router` (or `vrf`).
+
+The tolerant load and HA config-sync paths downgrade the rejection to a warning
+so a box already carrying such a config still boots (#1960); the assembler
+drops the stanza there, so it is inert rather than globally active.
+
 ```
 # 1. Forwarding instance for the alternate uplink. No VRF device, no
-#    interfaces — just a routing table.
+#    interfaces — just a routing table. Statics only: `protocols` here is
+#    rejected at commit (#9409).
 set routing-instances ISP-B instance-type forwarding
 set routing-instances ISP-B routing-options static route 0.0.0.0/0 next-hop 172.16.80.1
 set routing-instances ISP-B routing-options rib ISP-B.inet6.0 static route ::/0 next-hop 2001:db8:80::1

@@ -154,7 +154,8 @@ func (d *Daemon) assembleFRRConfig(cfg *config.Config, overlay []config.RouteOve
 	for _, ri := range cfg.RoutingInstances {
 		vrfName := "vrf-" + ri.Name
 		tableID := 0
-		if ri.InstanceType == "forwarding" {
+		forwarding := ri.InstanceType == "forwarding"
+		if forwarding {
 			// Forwarding instances have no VRF device; their statics
 			// render into the instance's dedicated kernel table so the
 			// kernel agrees with the FBF/PBR ip rules AND the userspace
@@ -164,7 +165,7 @@ func (d *Daemon) assembleFRRConfig(cfg *config.Config, overlay []config.RouteOve
 			vrfName = ""
 			tableID = ri.TableID
 		}
-		fc.Instances = append(fc.Instances, frr.InstanceConfig{
+		inst := frr.InstanceConfig{
 			Name:              ri.Name,
 			VRFName:           vrfName,
 			TableID:           tableID,
@@ -175,7 +176,36 @@ func (d *Daemon) assembleFRRConfig(cfg *config.Config, overlay []config.RouteOve
 			ISIS:              ri.ISIS,
 			StaticRoutes:      ri.StaticRoutes,
 			Inet6StaticRoutes: ri.Inet6StaticRoutes,
-		})
+		}
+		if forwarding {
+			// #9409: DROP the protocols rather than carry them through.
+			//
+			// The `vrfName = ""` above is correct for statics and fatal for
+			// protocols: generateProtocols reads an empty VRFName as "the
+			// GLOBAL instance", so carrying them through activated an
+			// instance-scoped IGP in the global routing context and attached an
+			// instance-scoped BGP neighbor to the GLOBAL AS. Measured before
+			// this change: TWO `router ospf` blocks, neither carrying a `vrf`
+			// suffix, and the instance's `peer-as 65002` neighbor rendered under
+			// a second `router bgp 65001`.
+			//
+			// The composition is rejected at strict commit
+			// (validateForwardingInstanceProtocolsStrict), so reaching here
+			// means the config arrived on a TOLERANT path — boot from an
+			// already-persisted config, or HA peer-sync — where #1960 forbids
+			// refusing to start. Dropping is what makes that downgrade safe:
+			// the box boots and the unsupported stanza is INERT, rather than
+			// booting and quietly rewriting the global routing table.
+			if ri.OSPF != nil || ri.OSPFv3 != nil || ri.BGP != nil ||
+				ri.RIP != nil || ri.ISIS != nil {
+				slog.Warn("dropping protocols under instance-type forwarding: "+
+					"a forwarding instance has no VRF device, so FRR would "+
+					"activate them in the GLOBAL routing instance (#9409)",
+					"instance", ri.Name)
+			}
+			inst.OSPF, inst.OSPFv3, inst.BGP, inst.RIP, inst.ISIS = nil, nil, nil, nil, nil
+		}
+		fc.Instances = append(fc.Instances, inst)
 	}
 	return fc
 }
