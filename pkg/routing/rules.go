@@ -101,7 +101,29 @@ type nextTableManager struct {
 // with next-table directives. This implements inter-VRF route leaking:
 // "route X/Y next-table Instance.inet.0" means traffic to X/Y should be
 // looked up in Instance's routing table.
-func (n *nextTableManager) Apply(routes []*config.StaticRoute, instances []*config.RoutingInstanceConfig) error {
+//
+// #9420: every emitted rule is SCOPED to an ingress interface of the routing
+// instance that authored the leak, exactly as #5117 scoped the PBR/FBF mirror
+// in this same file. next-table statics are read from the DEFAULT instance's
+// routing-options (daemon_apply_routing.go passes
+// cfg.RoutingOptions.StaticRoutes + Inet6StaticRoutes), so `ingressIfaces` is
+// the resolved kernel ifname set of the interfaces that are NOT assigned to
+// any routing instance — see DefaultInstanceIngressIfaces.
+//
+// Before #9420 the rule carried Dst + Table + Priority + Family and nothing
+// else, at priority 100-199 — AHEAD of the kernel's l3mdev rule at 1000. A
+// packet ingressing ANY other VRF whose destination fell in the leaked prefix
+// was therefore steered out of the TARGET instance's table, on the target
+// instance's device, overriding the ingress VRF's own routing. Measured on a
+// live kernel, with a control and with the sharper case where the ingress VRF
+// has its OWN route for the same prefix and still loses; the measurements are
+// reproduced in docs/log/9420.md and pinned by TestNextTableRulesIngressScope_9420.
+//
+// Fail-closed, matching BuildPBRRules: with no resolvable default-instance
+// ingress interface, NOTHING is installed and a degraded error is returned,
+// rather than installing a global iif-less rule. The fail-safe direction is an
+// under-steer (the leak is not followed) — never a cross-VRF over-steer.
+func (n *nextTableManager) Apply(routes []*config.StaticRoute, instances []*config.RoutingInstanceConfig, ingressIfaces []string) error {
 	// Build instance name → table ID map
 	tableIDs := make(map[string]int)
 	for _, inst := range instances {
@@ -157,6 +179,22 @@ func (n *nextTableManager) Apply(routes []*config.StaticRoute, instances []*conf
 	// which is what the FIB's per-family pass also preserves — is untouched.
 	routes = nextTableFamilyOrdered(routes)
 
+	// #9420 fail-closed gate. An empty ingress set means we cannot scope the
+	// rules to the instance that authored the leak; installing them unscoped is
+	// the defect this issue is about, so install nothing and report degraded.
+	// This runs AFTER clear() so a stale unscoped rule from a previous apply is
+	// still removed — leaving it installed would preserve the cross-VRF steer
+	// the gate exists to prevent.
+	if hasEligibleNextTableRoute(routes, tableIDs) && len(ingressIfaces) == 0 {
+		errs = append(errs, errors.New(
+			"next-table leak: cannot resolve any ingress interface for the routing "+
+				"instance that authored the leak; the leak is not installed "+
+				"(fail-safe under-steer) rather than installing a global iif-less "+
+				"rule that would steer traffic from every other routing instance "+
+				"into the target table (#9420)"))
+		return errors.Join(errs...)
+	}
+
 	prio := nextTableRulePriority
 	for i, sr := range routes {
 		if sr == nil || sr.NextTable == "" {
@@ -197,7 +235,13 @@ func (n *nextTableManager) Apply(routes []*config.StaticRoute, instances []*conf
 		// rejects an over-subscribed config up front; this belt catches the
 		// tolerant-load / peer-sync path where that gate is downgraded to a
 		// warning.
-		if prio >= nextTableRulePriority+maxNextTableRules {
+		// #9420: the window is drawn down LEAK-ATOMICALLY. One leak now costs
+		// len(ingressIfaces) priorities, so a leak whose full ingress expansion
+		// does not fit is dropped WHOLE rather than installed on a subset of its
+		// interfaces — a partially-scoped leak would work on some ingress
+		// interfaces and silently not on others, which is harder to diagnose
+		// than a leak that is reported as not installed.
+		if prio+len(ingressIfaces) > nextTableRulePriority+maxNextTableRules {
 			// Count only ELIGIBLE routes past the cap — those the applier WOULD
 			// have installed (known instance + parseable CIDR). An
 			// unknown-instance or unparseable route is skipped above (no prio++),
@@ -221,31 +265,145 @@ func (n *nextTableManager) Apply(routes []*config.StaticRoute, instances []*conf
 			}
 			errs = append(errs, fmt.Errorf(
 				"next-table rule limit (%d) reached; %d next-table route(s) beyond "+
-					"the limit are not leaked — reduce the number of next-table routes",
-				maxNextTableRules, dropped))
+					"the limit are not leaked — each leak costs one rule per "+
+					"default-instance ingress interface (%d here), so reduce the "+
+					"number of next-table routes",
+				maxNextTableRules, dropped, len(ingressIfaces)))
 			break
 		}
 
-		rule := netlink.NewRule()
-		rule.Dst = dst
-		rule.Table = tableID
-		rule.Priority = prio
-		rule.Family = family
+		// One rule per ingress interface of the authoring instance (#9420).
+		// ingressIfaces is pre-sorted and de-duplicated by
+		// DefaultInstanceIngressIfaces so the priorities are stable across
+		// applies despite Go map-iteration order.
+		added := 0
+		for _, iif := range ingressIfaces {
+			rule := netlink.NewRule()
+			rule.Dst = dst
+			rule.Table = tableID
+			rule.Priority = prio + added
+			rule.Family = family
+			rule.IifName = iif
 
-		if err := n.ops.RuleAdd(rule); err != nil {
-			errs = append(errs, fmt.Errorf(
-				"add next-table rule destination %s instance %s table %d: %w",
-				sr.Destination, sr.NextTable, tableID, err))
-			continue
+			if err := n.ops.RuleAdd(rule); err != nil {
+				errs = append(errs, fmt.Errorf(
+					"add next-table rule destination %s instance %s table %d iif %s: %w",
+					sr.Destination, sr.NextTable, tableID, iif, err))
+			}
+			added++
 		}
 		slog.Info("next-table rule added",
-			"destination", sr.Destination, "instance", sr.NextTable, "table", tableID)
-		prio++
+			"destination", sr.Destination, "instance", sr.NextTable, "table", tableID,
+			"ingress_interfaces", len(ingressIfaces))
+		prio += added
 	}
 	// Desired rules are re-added; surface any clear/add failure so a dropped
 	// leak rule (or the orphaned-rule window) is observable rather than
 	// silently nil (#3731 / #2273).
 	return errors.Join(errs...)
+}
+
+// hasEligibleNextTableRoute reports whether any route would actually install a
+// next-table ip rule — the same eligibility the Apply loop applies (non-nil,
+// a NextTable set, and a known target instance). It exists so the #9420
+// fail-closed gate stays SILENT for a config with no next-table leaks at all:
+// without it, every commit on a box with zero leaks and zero resolvable
+// interfaces would report a degraded next-table apply for a leak that does not
+// exist.
+//
+// The CIDR parse is deliberately not re-checked here: an unparseable
+// destination is skipped by the loop with a Warn and consumes no window slot,
+// so treating it as eligible only risks arming the gate one config earlier —
+// the fail-safe direction — and keeps this predicate cheap.
+func hasEligibleNextTableRoute(routes []*config.StaticRoute, tableIDs map[string]int) bool {
+	for _, sr := range routes {
+		if sr == nil || sr.NextTable == "" {
+			continue
+		}
+		if _, ok := tableIDs[sr.NextTable]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// DefaultInstanceIngressIfaces returns the sorted, de-duplicated kernel ifnames
+// of every configured interface unit that is NOT assigned to a routing
+// instance — i.e. the ingress interfaces of the DEFAULT routing instance.
+//
+// This is the #9420 scoping set for next-table leak rules. next-table statics
+// are authored in the default instance's routing-options
+// (daemon_apply_routing.go reads cfg.RoutingOptions.StaticRoutes and
+// Inet6StaticRoutes; a per-instance static's next-table is not passed to the
+// applier), so the default instance IS the authoring instance and its ingress
+// interfaces are the only ones whose traffic the leak may steer.
+//
+// The kernel ifname is resolved via cfg.ResolveKernelIfName — the same
+// Junos-ref → Linux-name mapping #5117 already paid the cost of for unit-0
+// collapse (ge-0/0/0 → ge-0-0-0), 802.1Q sub-units (ge-0/0/0.50) and RETH
+// members. An unresolvable unit contributes nothing rather than an empty
+// ifname, so a rule is never emitted with an empty FRA_IIFNAME.
+//
+// Loopback is deliberately EXCLUDED. An `iif lo` rule matches locally
+// generated traffic — measured, including traffic from a socket bound to
+// ANOTHER VRF, which is the first exposed path #9420 names. Including lo to
+// keep host-originated default-instance traffic following the leak would
+// therefore reintroduce the cross-VRF hijack for every VRF-bound daemon (FRR
+// peering, DHCP relay, syslog, RPM probes, IPsec). The narrowing is recorded
+// in docs/rib-group-route-leaking.md and pkg/routing/README.md.
+func DefaultInstanceIngressIfaces(cfg *config.Config) []string {
+	if cfg == nil {
+		return nil
+	}
+	claimed := make(map[string]struct{})
+	for _, inst := range cfg.RoutingInstances {
+		if inst == nil {
+			continue
+		}
+		for _, ref := range inst.Interfaces {
+			claimed[ref] = struct{}{}
+			// An instance may claim the base interface ("ge-0/0/0") or a unit
+			// ref ("ge-0/0/0.0"). Record the resolved kernel name too so a
+			// claim written in either spelling excludes the same device.
+			if k := cfg.ResolveKernelIfName(ref); k != "" {
+				claimed[k] = struct{}{}
+			}
+		}
+	}
+
+	seen := make(map[string]struct{})
+	var out []string
+	for _, ifc := range cfg.Interfaces.Interfaces {
+		if ifc == nil {
+			continue
+		}
+		if _, taken := claimed[ifc.Name]; taken {
+			continue
+		}
+		for _, unit := range ifc.Units {
+			if unit == nil {
+				continue
+			}
+			ref := fmt.Sprintf("%s.%d", ifc.Name, unit.Number)
+			if _, taken := claimed[ref]; taken {
+				continue
+			}
+			iif := cfg.ResolveKernelIfName(ref)
+			if iif == "" {
+				continue
+			}
+			if _, taken := claimed[iif]; taken {
+				continue
+			}
+			if _, dup := seen[iif]; dup {
+				continue
+			}
+			seen[iif] = struct{}{}
+			out = append(out, iif)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // nextTableFamilyOrdered returns routes stably partitioned IPv4-first, so the
