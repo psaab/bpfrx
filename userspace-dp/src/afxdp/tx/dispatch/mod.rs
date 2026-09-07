@@ -209,14 +209,39 @@ fn compute_forwarded_egress_ptb(
         }
     });
     if let Some(l3) = l3 {
-        if let EgressMtuDecision::EmitPacketTooBig { next_hop_mtu } =
-            forwarded_egress_mtu_decision(
-                source_frame,
-                l3,
-                meta.addr_family,
-                mtu,
-            )
-        {
+        let egress_decision =
+            forwarded_egress_mtu_decision(source_frame, l3, meta.addr_family, mtu);
+        // #9328: an oversized DF-CLEAR IPv4 datagram is still forwarded at full
+        // length — the behaviour is unchanged — but it is no longer booked as a
+        // plain successful forward. It used to be indistinguishable from a frame
+        // that FITS: same `Forward` value, then `enqueue_ok`, `enqueue_copy`,
+        // `pending_copy_tx_packets` and `tx_bytes_total`, and no exception. An
+        // operator debugging the downstream blackhole saw a healthy counter.
+        //
+        // The asymmetry this closes is with the TCP arm of the same outcome,
+        // which has recorded `tcp_segmentation_miss` since #1282 with the reason
+        // spelled out — "the dispatcher falls back to forwarding the original
+        // oversized frame, which the NIC/switch/peer then drops — black-holing
+        // the flow". The consequence is identical for UDP, ICMP, ESP, GRE and
+        // every forwarded IPv4 fragment; only the counter was missing.
+        //
+        // Recorded, NOT dropped. Whether to fragment (RFC 791 permits it),
+        // drop-and-count, or keep forwarding is a policy decision this does not
+        // take: the wire-level fate of the oversize submission is unmeasured, so
+        // changing behaviour on it could break a path that works today. This
+        // counter is what makes that decision answerable.
+        if matches!(egress_decision, EgressMtuDecision::ForwardOversizeNoDf) {
+            record_exception(
+                recent_exceptions,
+                ingress_ident,
+                "egress_mtu_exceeded_forwarded_no_df",
+                source_frame.len() as u32,
+                Some(meta.into()),
+                None,
+                forwarding,
+            );
+        }
+        if let EgressMtuDecision::EmitPacketTooBig { next_hop_mtu } = egress_decision {
             // RFC 792 / RFC 4443 suppression: never reply to
             // a non-first fragment or an inbound ICMP error.
             // #2472/#5856: AND a per-reason, PER-INGRESS-ZONE

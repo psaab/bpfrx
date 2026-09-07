@@ -44,6 +44,37 @@ pub(in crate::afxdp) enum EgressMtuDecision {
     /// DF set (IPv4) so the downstream may still fragment, preserving the
     /// pre-#2301 forward-and-let-the-path-fragment behaviour.
     Forward,
+    /// The frame EXCEEDS the egress MTU, but the sender did not forbid
+    /// fragmentation (IPv4 DF=0), so it is forwarded at full length anyway
+    /// (#9328).
+    ///
+    /// Behaviourally identical to [`Self::Forward`] — that is deliberate and
+    /// this variant changes no forwarding decision. It exists because the two
+    /// were the SAME value, so nothing downstream could tell "it fits" from
+    /// "it does not fit and we sent it anyway", and the second was booked as
+    /// `enqueue_ok` + `tx_bytes_total` like any healthy forward. An operator
+    /// debugging the resulting blackhole saw a HEALTHY counter — a wrong
+    /// diagnostic, not a missing one.
+    ///
+    /// WHAT HAPPENS TO THE FRAME IS UNCHANGED AND STILL WRONG. There is no
+    /// IPv4 transit fragmenter in this dataplane — verified by a
+    /// positive-controlled grep for MF/offset WRITERS, which finds the three
+    /// in `nat64.rs` (they copy MF/offset verbatim from an existing IPv6
+    /// Fragment Header; none splits a datagram) and nothing else. Nothing in
+    /// `tx/transmit/`, `tx/rings.rs` or `tx/drain/` compares a frame against an
+    /// MTU either; the only length guard on the forward path is
+    /// `copy_frame_is_oversized`, which tests the UMEM chunk (4096), not the
+    /// egress MTU. So the frame is submitted oversize and the NIC, switch or
+    /// next hop drops it.
+    ///
+    /// The policy — fragment per RFC 791, drop-and-count, or keep forwarding —
+    /// is NOT decided here and is tracked separately. Counting it first is what
+    /// makes that decision answerable: the frequency in production is unknown,
+    /// and picking a behaviour change on an unmeasured population is how a fix
+    /// becomes a regression. Note every already-fragmented IPv4 datagram is
+    /// DF-clear by construction, so forwarded non-first fragments are entirely
+    /// inside this population.
+    ForwardOversizeNoDf,
     /// The frame exceeds the egress MTU and the sender asked us not to
     /// fragment (IPv4 DF=1) or cannot be fragmented in transit (IPv6) —
     /// generate an ICMP Frag-Needed / Packet-Too-Big advertising
@@ -113,7 +144,13 @@ pub(in crate::afxdp) fn forwarded_egress_mtu_decision(
             if ipv4_df_set(packet) {
                 EgressMtuDecision::EmitPacketTooBig { next_hop_mtu }
             } else {
-                EgressMtuDecision::Forward
+                // #9328: still forwarded, now DISTINGUISHABLE. A PTB is not the
+                // answer here — ICMP Fragmentation-Needed is meaningful only to
+                // a sender that set DF, and this one did not, so it would not
+                // act on it. Forwarding is retained because the wire-level fate
+                // of the oversize submission has not been measured; dropping on
+                // that unknown could break a path that works today.
+                EgressMtuDecision::ForwardOversizeNoDf
             }
         }
         // IPv6 routers never fragment in transit (RFC 8200 §4.5) — always

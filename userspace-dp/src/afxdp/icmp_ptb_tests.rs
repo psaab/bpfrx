@@ -83,9 +83,19 @@ fn inbound_v6_udp(payload_len: usize) -> (Vec<u8>, UserspaceDpMeta) {
     frame.extend_from_slice(&payload.to_be_bytes());
     frame.push(17); // next header UDP
     frame.push(64); // hop limit
-    frame.extend_from_slice(&"2001:559:8585:bf01::20".parse::<Ipv6Addr>().unwrap().octets()); // src
-    frame.extend_from_slice(&"2001:559:8585:80::200".parse::<Ipv6Addr>().unwrap().octets()); // dst
-    // UDP header.
+    frame.extend_from_slice(
+        &"2001:559:8585:bf01::20"
+            .parse::<Ipv6Addr>()
+            .unwrap()
+            .octets(),
+    ); // src
+    frame.extend_from_slice(
+        &"2001:559:8585:80::200"
+            .parse::<Ipv6Addr>()
+            .unwrap()
+            .octets(),
+    ); // dst
+       // UDP header.
     frame.extend_from_slice(&49152u16.to_be_bytes());
     frame.extend_from_slice(&5201u16.to_be_bytes());
     frame.extend_from_slice(&((8 + payload_len) as u16).to_be_bytes());
@@ -114,7 +124,10 @@ fn oversized_v4_df_udp_emits_frag_needed() {
         EgressMtuDecision::EmitPacketTooBig { next_hop_mtu } => next_hop_mtu,
         other => panic!("expected EmitPacketTooBig, got {other:?}"),
     };
-    assert_eq!(next_hop_mtu, 1400, "advertised MTU must equal the egress MTU");
+    assert_eq!(
+        next_hop_mtu, 1400,
+        "advertised MTU must equal the egress MTU"
+    );
 
     assert!(
         !ptb_reply_suppressed(&frame, meta, l3, &ForwardingState::default()),
@@ -132,8 +145,16 @@ fn oversized_v4_df_udp_emits_frag_needed() {
     // Outer IPv4: src = ingress primary, dst = original src, proto ICMP.
     assert_eq!(out[14], 0x45);
     assert_eq!(out[23], PROTO_ICMP, "outer protocol must be ICMP");
-    assert_eq!(&out[26..30], &Ipv4Addr::new(172, 16, 80, 8).octets(), "src = ingress primary");
-    assert_eq!(&out[30..34], &Ipv4Addr::new(198, 51, 100, 20).octets(), "dst = original sender");
+    assert_eq!(
+        &out[26..30],
+        &Ipv4Addr::new(172, 16, 80, 8).octets(),
+        "src = ingress primary"
+    );
+    assert_eq!(
+        &out[30..34],
+        &Ipv4Addr::new(198, 51, 100, 20).octets(),
+        "dst = original sender"
+    );
     // ICMP: type 3 code 4, next-hop MTU in bytes 6..8 of the ICMP message.
     let icmp = 14 + 20;
     assert_eq!(out[icmp], 3, "ICMP type 3 (Dest Unreachable)");
@@ -182,7 +203,11 @@ fn oversized_v6_udp_emits_packet_too_big() {
         "MTU in the 32-bit ICMPv6 PTB field"
     );
     // Quoted original IPv6 header (version 6) follows the 8-byte header.
-    assert_eq!(out[icmp + 8] & 0xf0, 0x60, "quoted original IPv6 header present");
+    assert_eq!(
+        out[icmp + 8] & 0xf0,
+        0x60,
+        "quoted original IPv6 header present"
+    );
     // The reply must not exceed the IPv6 minimum MTU (RFC 4443 §3.2).
     assert!(out.len() - 14 <= 1280, "reply L3 size <= 1280");
 }
@@ -213,12 +238,48 @@ fn in_mtu_v6_forwards_unchanged() {
 fn oversized_v4_without_df_forwards() {
     // Oversized but DF clear: the downstream may fragment. Preserve the
     // pre-#2301 forward behaviour rather than PTB-storming the flow.
+    //
+    // #9328 SPLIT WHAT THIS CELL WAS ASSERTING. The claim above is unchanged
+    // and still holds: the frame is FORWARDED and no PTB is emitted, because
+    // ICMP Fragmentation-Needed is meaningful only to a sender that set DF and
+    // this one did not. What the cell ALSO pinned, silently, was that the
+    // outcome is INDISTINGUISHABLE from a frame that fits — both were the same
+    // `Forward` value, so the dispatcher booked an oversize submission as
+    // `enqueue_ok` + `tx_bytes_total` with no exception, and an operator
+    // debugging the downstream blackhole saw a healthy counter.
+    //
+    // That half was not a decision anyone took; it was the absence of a
+    // distinction. The variant is now separate, the behaviour is not.
     let (frame, meta) = inbound_v4_udp(1500, false);
     let l3 = meta.l3_offset as usize;
+    let decision = forwarded_egress_mtu_decision(&frame, l3, meta.addr_family, 1400);
     assert_eq!(
-        forwarded_egress_mtu_decision(&frame, l3, meta.addr_family, 1400),
+        decision,
+        EgressMtuDecision::ForwardOversizeNoDf,
+        "non-DF oversized IPv4 must still FORWARD (no PTB — the sender did not \
+         set DF and would not act on one), but it must be distinguishable from \
+         a frame that fits so the dispatcher can count it"
+    );
+    assert_ne!(
+        decision,
+        EgressMtuDecision::EmitPacketTooBig { next_hop_mtu: 1400 },
+        "PTB-storming a DF-clear flow is the regression #2301's Forward branch \
+         exists to avoid; #9328 adds a counter, not a PTB"
+    );
+
+    // CONTROL: a frame that FITS is still the plain `Forward`, or the new
+    // variant would be indistinguishable in the other direction and the
+    // exception would fire on every healthy forward.
+    let (small, small_meta) = inbound_v4_udp(1000, false);
+    assert_eq!(
+        forwarded_egress_mtu_decision(
+            &small,
+            small_meta.l3_offset as usize,
+            small_meta.addr_family,
+            1400
+        ),
         EgressMtuDecision::Forward,
-        "non-DF oversized IPv4 must forward (downstream fragments)"
+        "an in-MTU DF-clear frame must remain plain Forward"
     );
 }
 
@@ -599,14 +660,24 @@ fn ptb_still_generated_for_l2_unicast_dst() {
 #[test]
 fn l2_dst_group_broadcast_helper() {
     // Unicast: low bit of first octet clear.
-    assert!(!l2_dst_is_group_or_broadcast(&[0x02, 0xbf, 0x72, 0x00, 0x00, 0x01]));
-    assert!(!l2_dst_is_group_or_broadcast(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]));
+    assert!(!l2_dst_is_group_or_broadcast(&[
+        0x02, 0xbf, 0x72, 0x00, 0x00, 0x01
+    ]));
+    assert!(!l2_dst_is_group_or_broadcast(&[
+        0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff
+    ]));
     // IPv4 multicast MAC range (01:00:5e:..): group bit set.
-    assert!(l2_dst_is_group_or_broadcast(&[0x01, 0x00, 0x5e, 0x01, 0x02, 0x03]));
+    assert!(l2_dst_is_group_or_broadcast(&[
+        0x01, 0x00, 0x5e, 0x01, 0x02, 0x03
+    ]));
     // IPv6 multicast MAC range (33:33:..): group bit set (0x33 & 0x01).
-    assert!(l2_dst_is_group_or_broadcast(&[0x33, 0x33, 0x00, 0x00, 0x00, 0x01]));
+    assert!(l2_dst_is_group_or_broadcast(&[
+        0x33, 0x33, 0x00, 0x00, 0x00, 0x01
+    ]));
     // Broadcast (all-FF): a group address.
-    assert!(l2_dst_is_group_or_broadcast(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff]));
+    assert!(l2_dst_is_group_or_broadcast(&[
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff
+    ]));
 }
 
 // === #2367: bad-source suppression (spoofable backscatter) ===
@@ -881,7 +952,10 @@ fn post_transform_inner_mtu_gre_subtracts_outer_and_gre_header() {
     insert_tunnel_endpoint(&mut fwd, "gre", libc::AF_INET, 0);
     let decision = tunnel_decision();
     let inner = post_transform_inner_mtu(&decision, &fwd, false, libc::AF_INET as u8, 1400, None);
-    assert_eq!(inner, 1376, "GRE inner MTU = transport - outer_ip(20) - gre(4)");
+    assert_eq!(
+        inner, 1376,
+        "GRE inner MTU = transport - outer_ip(20) - gre(4)"
+    );
     assert_eq!(
         inner,
         native_gre_inner_mtu(&fwd, &decision),
@@ -894,9 +968,18 @@ fn post_transform_inner_mtu_gre_counts_key_word() {
     // A key-present endpoint adds 4 bytes of GRE header: 1400 - 28 = 1372.
     let mut fwd = forwarding_with_egress(1400);
     insert_tunnel_endpoint(&mut fwd, "gre", libc::AF_INET, 0xdead_beef);
-    let inner =
-        post_transform_inner_mtu(&tunnel_decision(), &fwd, false, libc::AF_INET as u8, 1400, None);
-    assert_eq!(inner, 1372, "key-present GRE counts the extra 4-byte key word");
+    let inner = post_transform_inner_mtu(
+        &tunnel_decision(),
+        &fwd,
+        false,
+        libc::AF_INET as u8,
+        1400,
+        None,
+    );
+    assert_eq!(
+        inner, 1372,
+        "key-present GRE counts the extra 4-byte key word"
+    );
 }
 
 #[test]
@@ -906,9 +989,18 @@ fn post_transform_inner_mtu_wireguard_is_pad_aware() {
     // 1400 - 60 - 15 = 1325. The inverse of frame::wg::wg_encapped_size.
     let mut fwd = forwarding_with_egress(1400);
     insert_tunnel_endpoint(&mut fwd, "wireguard", libc::AF_INET, 0);
-    let inner =
-        post_transform_inner_mtu(&tunnel_decision(), &fwd, false, libc::AF_INET as u8, 1400, None);
-    assert_eq!(inner, 1325, "WG inner MTU = outer_mtu - WG_OVERHEAD_V4 - max_pad");
+    let inner = post_transform_inner_mtu(
+        &tunnel_decision(),
+        &fwd,
+        false,
+        libc::AF_INET as u8,
+        1400,
+        None,
+    );
+    assert_eq!(
+        inner, 1325,
+        "WG inner MTU = outer_mtu - WG_OVERHEAD_V4 - max_pad"
+    );
     assert_eq!(
         inner,
         crate::afxdp::wg::mss::wg_inner_mtu(libc::AF_INET, 1400),
@@ -923,7 +1015,14 @@ fn post_transform_inner_mtu_unknown_tunnel_kind_fails_open() {
     let mut fwd = forwarding_with_egress(1400);
     insert_tunnel_endpoint(&mut fwd, "l2tp", libc::AF_INET, 0);
     assert_eq!(
-        post_transform_inner_mtu(&tunnel_decision(), &fwd, false, libc::AF_INET as u8, 1400, None),
+        post_transform_inner_mtu(
+            &tunnel_decision(),
+            &fwd,
+            false,
+            libc::AF_INET as u8,
+            1400,
+            None
+        ),
         0,
         "unknown tunnel mode -> 0 (fail-open)"
     );
@@ -934,8 +1033,14 @@ fn post_transform_inner_mtu_nat64_v6_to_v4_adds_header_delta() {
     // Inner v6 translated to a v4 egress: the v4 frame is 20 bytes SMALLER,
     // so a v6 inner up to egress_mtu + 20 still fits. egress 1400 -> 1420.
     let fwd = forwarding_with_egress(1400);
-    let inner =
-        post_transform_inner_mtu(&nat64_decision(true), &fwd, true, libc::AF_INET6 as u8, 1400, None);
+    let inner = post_transform_inner_mtu(
+        &nat64_decision(true),
+        &fwd,
+        true,
+        libc::AF_INET6 as u8,
+        1400,
+        None,
+    );
     assert_eq!(inner, 1420, "NAT64 v6->v4 inner MTU = egress + 20");
 }
 
@@ -944,8 +1049,14 @@ fn post_transform_inner_mtu_nat64_v4_to_v6_subtracts_header_delta() {
     // Inner v4 translated to a v6 egress: the v6 frame is 20 bytes LARGER,
     // so the v4 inner must be 20 bytes SMALLER. egress 1400 -> 1380.
     let fwd = forwarding_with_egress(1400);
-    let inner =
-        post_transform_inner_mtu(&nat64_decision(true), &fwd, true, libc::AF_INET as u8, 1400, None);
+    let inner = post_transform_inner_mtu(
+        &nat64_decision(true),
+        &fwd,
+        true,
+        libc::AF_INET as u8,
+        1400,
+        None,
+    );
     assert_eq!(inner, 1380, "NAT64 v4->v6 inner MTU = egress - 20");
 }
 
@@ -960,8 +1071,7 @@ fn post_transform_gre_oversized_v4_df_emits_inner_ptb() {
     let mut fwd = forwarding_with_egress(1400);
     insert_tunnel_endpoint(&mut fwd, "gre", libc::AF_INET, 0);
     let decision = tunnel_decision();
-    let inner_mtu =
-        post_transform_inner_mtu(&decision, &fwd, false, meta.addr_family, 1400, None);
+    let inner_mtu = post_transform_inner_mtu(&decision, &fwd, false, meta.addr_family, 1400, None);
     assert_eq!(inner_mtu, 1376);
 
     // Source-vs-egress (the WRONG pre-#2330 comparison) would advertise 1400;
@@ -971,8 +1081,16 @@ fn post_transform_gre_oversized_v4_df_emits_inner_ptb() {
         EgressMtuDecision::EmitPacketTooBig { next_hop_mtu } => next_hop_mtu,
         other => panic!("expected EmitPacketTooBig, got {other:?}"),
     };
-    assert_eq!(next_hop_mtu, 1376, "advertised MTU = GRE inner MTU, not transport MTU");
-    assert!(!ptb_reply_suppressed(&frame, meta, l3, &ForwardingState::default()));
+    assert_eq!(
+        next_hop_mtu, 1376,
+        "advertised MTU = GRE inner MTU, not transport MTU"
+    );
+    assert!(!ptb_reply_suppressed(
+        &frame,
+        meta,
+        l3,
+        &ForwardingState::default()
+    ));
     let out = build_frag_needed_v4(&frame, meta, PTB_IFINDEX, &fwd, next_hop_mtu)
         .expect("inner-source frag-needed must build");
     let icmp = 14 + 20;
@@ -983,7 +1101,11 @@ fn post_transform_gre_oversized_v4_df_emits_inner_ptb() {
         1376,
         "PTB carries the inner MTU"
     );
-    assert_eq!(&out[30..34], &Ipv4Addr::new(198, 51, 100, 20).octets(), "dst = inner source");
+    assert_eq!(
+        &out[30..34],
+        &Ipv4Addr::new(198, 51, 100, 20).octets(),
+        "dst = inner source"
+    );
 }
 
 #[test]
@@ -995,15 +1117,24 @@ fn post_transform_wireguard_oversized_v6_emits_inner_ptb() {
     let l3 = meta.l3_offset as usize;
     let mut fwd = forwarding_with_egress(1400);
     insert_tunnel_endpoint(&mut fwd, "wireguard", libc::AF_INET, 0);
-    let inner_mtu =
-        post_transform_inner_mtu(&tunnel_decision(), &fwd, false, meta.addr_family, 1400, None);
+    let inner_mtu = post_transform_inner_mtu(
+        &tunnel_decision(),
+        &fwd,
+        false,
+        meta.addr_family,
+        1400,
+        None,
+    );
     assert_eq!(inner_mtu, 1325);
     let next_hop_mtu = match forwarded_egress_mtu_decision(&frame, l3, meta.addr_family, inner_mtu)
     {
         EgressMtuDecision::EmitPacketTooBig { next_hop_mtu } => next_hop_mtu,
         other => panic!("expected EmitPacketTooBig, got {other:?}"),
     };
-    assert_eq!(next_hop_mtu, 1325, "advertised MTU = WG pad-aware inner MTU");
+    assert_eq!(
+        next_hop_mtu, 1325,
+        "advertised MTU = WG pad-aware inner MTU"
+    );
     let out = build_packet_too_big_v6(&frame, meta, PTB_IFINDEX, &fwd, next_hop_mtu as u32)
         .expect("inner-source PTB must build");
     let icmp = 14 + 40;
@@ -1022,8 +1153,14 @@ fn post_transform_nat64_v6_oversized_emits_inner_ptb() {
     let (frame, meta) = inbound_v6_udp(1400);
     let l3 = meta.l3_offset as usize;
     let fwd = forwarding_with_egress(1400);
-    let inner_mtu =
-        post_transform_inner_mtu(&nat64_decision(true), &fwd, true, meta.addr_family, 1400, None);
+    let inner_mtu = post_transform_inner_mtu(
+        &nat64_decision(true),
+        &fwd,
+        true,
+        meta.addr_family,
+        1400,
+        None,
+    );
     assert_eq!(inner_mtu, 1420, "NAT64 v6->v4 inner MTU = egress + 20");
     let next_hop_mtu = match forwarded_egress_mtu_decision(&frame, l3, meta.addr_family, inner_mtu)
     {
@@ -1049,8 +1186,14 @@ fn post_transform_in_mtu_forwards_no_ptb() {
     let l3 = meta.l3_offset as usize;
     let mut fwd = forwarding_with_egress(1400);
     insert_tunnel_endpoint(&mut fwd, "gre", libc::AF_INET, 0);
-    let inner_mtu =
-        post_transform_inner_mtu(&tunnel_decision(), &fwd, false, meta.addr_family, 1400, None);
+    let inner_mtu = post_transform_inner_mtu(
+        &tunnel_decision(),
+        &fwd,
+        false,
+        meta.addr_family,
+        1400,
+        None,
+    );
     assert_eq!(
         forwarded_egress_mtu_decision(&frame, l3, meta.addr_family, inner_mtu),
         EgressMtuDecision::Forward,
@@ -1198,11 +1341,20 @@ fn post_transform_wg_inner_mtu_uses_physical_underlay_not_logical_v4() {
     // wg0.0 MTU (1420) → wg_inner_mtu = 1345 → this assertion fails red.
     let state = build_forwarding_state(&crate::afxdp::test_fixtures::wg_outer_mtu_snapshot());
     // Sanity: the fixture really carries the distinct logical/physical MTUs.
-    assert_eq!(state.egress.get(&400).map(|e| e.mtu), Some(1420), "wg0.0 logical");
-    assert_eq!(state.egress.get(&12).map(|e| e.mtu), Some(1500), "reth0.80 physical");
+    assert_eq!(
+        state.egress.get(&400).map(|e| e.mtu),
+        Some(1420),
+        "wg0.0 logical"
+    );
+    assert_eq!(
+        state.egress.get(&12).map(|e| e.mtu),
+        Some(1500),
+        "reth0.80 physical"
+    );
 
     let decision = wg_logical_tunnel_decision(400, 1);
-    let inner_mtu = post_transform_inner_mtu(&decision, &state, false, libc::AF_INET as u8, 0, None);
+    let inner_mtu =
+        post_transform_inner_mtu(&decision, &state, false, libc::AF_INET as u8, 0, None);
     assert_eq!(
         inner_mtu, 1425,
         "WG PTB inner MTU MUST be wg_inner_mtu(physical 1500) = 1425, NOT \
@@ -1221,18 +1373,26 @@ fn post_transform_wg_inner_mtu_uses_physical_underlay_not_logical_v4() {
     // L3 (> 1425) must emit a Frag-Needed advertising 1425.
     let (frame, meta) = inbound_v4_udp(1440 - 28, true); // L3 = 20 + 8 + payload = 1440
     let l3 = meta.l3_offset as usize;
-    let next_hop_mtu = match forwarded_egress_mtu_decision(&frame, l3, meta.addr_family, inner_mtu) {
+    let next_hop_mtu = match forwarded_egress_mtu_decision(&frame, l3, meta.addr_family, inner_mtu)
+    {
         EgressMtuDecision::EmitPacketTooBig { next_hop_mtu } => next_hop_mtu,
         other => panic!("expected EmitPacketTooBig, got {other:?}"),
     };
-    assert_eq!(next_hop_mtu, 1425, "advertised v4 inner MTU = physical-derived 1425");
+    assert_eq!(
+        next_hop_mtu, 1425,
+        "advertised v4 inner MTU = physical-derived 1425"
+    );
     // The ICMP source is the ingress interface primary; use reth0.80 (ifindex
     // 12, primary 172.16.80.8) which exists in the snapshot-built state.
     let out = build_frag_needed_v4(&frame, meta, 12, &state, next_hop_mtu)
         .expect("WG inner-source frag-needed must build");
     // reth0.80 carries VLAN 80, so the reply L2 is tagged (18 bytes). Derive
     // the L3 offset from the ethertype rather than hardcoding 14.
-    let eth = if u16::from_be_bytes([out[12], out[13]]) == 0x8100 { 18 } else { 14 };
+    let eth = if u16::from_be_bytes([out[12], out[13]]) == 0x8100 {
+        18
+    } else {
+        14
+    };
     let icmp = eth + 20;
     assert_eq!(out[icmp], 3, "ICMP Frag-Needed type");
     assert_eq!(out[icmp + 1], 4, "ICMP Frag-Needed code");
@@ -1261,11 +1421,13 @@ fn post_transform_wg_inner_mtu_uses_physical_underlay_not_logical_v6() {
     // Physical reth0.80 already carries a v6 primary in the v4 fixture? No —
     // the v4 fixture's reth0.80 has only a v4 address. Give it a v6 primary so
     // the underlay route resolves on reth0.80, and add the v6 underlay route.
-    snap.interfaces[0].addresses.push(crate::InterfaceAddressSnapshot {
-        family: "inet6".to_string(),
-        address: "2001:559:8585:80::8/64".to_string(),
-        scope: 0,
-    });
+    snap.interfaces[0]
+        .addresses
+        .push(crate::InterfaceAddressSnapshot {
+            family: "inet6".to_string(),
+            address: "2001:559:8585:80::8/64".to_string(),
+            scope: 0,
+        });
     snap.routes = vec![crate::RouteSnapshot {
         table: "inet6.0".to_string(),
         family: "inet6".to_string(),
@@ -1277,10 +1439,15 @@ fn post_transform_wg_inner_mtu_uses_physical_underlay_not_logical_v6() {
     }];
 
     let state = build_forwarding_state(&snap);
-    assert_eq!(state.egress.get(&12).map(|e| e.mtu), Some(1500), "reth0.80 physical");
+    assert_eq!(
+        state.egress.get(&12).map(|e| e.mtu),
+        Some(1500),
+        "reth0.80 physical"
+    );
 
     let decision = wg_logical_tunnel_decision(400, 1);
-    let inner_mtu = post_transform_inner_mtu(&decision, &state, false, libc::AF_INET6 as u8, 0, None);
+    let inner_mtu =
+        post_transform_inner_mtu(&decision, &state, false, libc::AF_INET6 as u8, 0, None);
     assert_eq!(
         inner_mtu, 1405,
         "WG PTB inner MTU (v6 outer) MUST be wg_inner_mtu(physical 1500) = 1405, \
@@ -1296,17 +1463,25 @@ fn post_transform_wg_inner_mtu_uses_physical_underlay_not_logical_v6() {
     // exceeds 1405 must emit a Packet-Too-Big advertising 1405.
     let (frame, meta) = inbound_v6_udp(1420 - 48); // L3 = 40 + 8 + payload = 1420
     let l3 = meta.l3_offset as usize;
-    let next_hop_mtu = match forwarded_egress_mtu_decision(&frame, l3, meta.addr_family, inner_mtu) {
+    let next_hop_mtu = match forwarded_egress_mtu_decision(&frame, l3, meta.addr_family, inner_mtu)
+    {
         EgressMtuDecision::EmitPacketTooBig { next_hop_mtu } => next_hop_mtu,
         other => panic!("expected EmitPacketTooBig, got {other:?}"),
     };
-    assert_eq!(next_hop_mtu, 1405, "advertised v6 inner MTU = physical-derived 1405");
+    assert_eq!(
+        next_hop_mtu, 1405,
+        "advertised v6 inner MTU = physical-derived 1405"
+    );
     // ICMPv6 source = ingress interface primary v6; reth0.80 (ifindex 12) now
     // carries 2001:559:8585:80::8 (added to the snapshot above).
     let out = build_packet_too_big_v6(&frame, meta, 12, &state, next_hop_mtu as u32)
         .expect("WG inner-source PTB must build");
     // VLAN 80 → tagged L2 (18 bytes); derive the L3 offset from the ethertype.
-    let eth = if u16::from_be_bytes([out[12], out[13]]) == 0x8100 { 18 } else { 14 };
+    let eth = if u16::from_be_bytes([out[12], out[13]]) == 0x8100 {
+        18
+    } else {
+        14
+    };
     let icmp = eth + 40;
     assert_eq!(out[icmp], 2, "ICMPv6 Packet Too Big");
     assert_eq!(
@@ -1325,7 +1500,8 @@ fn post_transform_wg_inner_mtu_falls_back_to_logical_when_no_peer_endpoint() {
     snap.tunnel_endpoints[0].wg_peers[0].wg_endpoint = String::new(); // responder-only
     let state = build_forwarding_state(&snap);
     let decision = wg_logical_tunnel_decision(400, 1);
-    let inner_mtu = post_transform_inner_mtu(&decision, &state, false, libc::AF_INET as u8, 0, None);
+    let inner_mtu =
+        post_transform_inner_mtu(&decision, &state, false, libc::AF_INET as u8, 0, None);
     // Logical egress (400) MTU 1420 → wg_inner_mtu(1420) = 1345.
     assert_eq!(
         inner_mtu, 1345,
@@ -1406,8 +1582,16 @@ fn post_transform_wg_inner_mtu_is_per_peer_underlay() {
     let state = build_forwarding_state(&wg_two_peer_asymmetric_snapshot());
     // Sanity: the two underlays really carry distinct MTUs, so the per-peer
     // assertion below is meaningful.
-    assert_eq!(state.egress.get(&12).map(|e| e.mtu), Some(1500), "reth0.80 underlay");
-    assert_eq!(state.egress.get(&13).map(|e| e.mtu), Some(1400), "reth0.50 underlay");
+    assert_eq!(
+        state.egress.get(&12).map(|e| e.mtu),
+        Some(1500),
+        "reth0.80 underlay"
+    );
+    assert_eq!(
+        state.egress.get(&13).map(|e| e.mtu),
+        Some(1400),
+        "reth0.50 underlay"
+    );
 
     let decision = wg_logical_tunnel_decision(400, 1);
 
