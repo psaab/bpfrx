@@ -8769,3 +8769,68 @@ fn an_empty_forwarding_class_refuses_the_whole_snapshot_8442() {
     // forwarding state, so the neighbour that the control proved installable is
     // simply not installed, and nothing tells the operator.
 }
+
+/// #9425: the inert reference's AUDIT MODIFIER must survive the decode.
+///
+/// `inert_screen_profiles_reach_the_forwarding_state_7888` proves the zone and
+/// its profile name arrive. It says nothing about the flag, so dropping
+/// `alarm_without_drop: r.alarm_without_drop` from `build_screen_inert_profiles`
+/// left the ENTIRE Rust suite green while the shipped helper hard-dropped every
+/// substituted default for a zone that asked for audit mode — the defect #9425
+/// exists to fix, reinstated one layer down in the decode.
+///
+/// Both rows, because a builder that hard-codes either value passes the other
+/// one alone.
+#[test]
+fn inert_screen_profile_audit_flag_survives_the_decode_9425() {
+    for audit in [true, false] {
+        let snapshot = ConfigSnapshot {
+            screen_inert_profile_zones: vec![crate::ScreenMissingProfileRef {
+                zone: "trust".into(),
+                profile: "p".into(),
+                alarm_without_drop: audit,
+            }],
+            ..Default::default()
+        };
+        let state = build_forwarding_state(&snapshot);
+        let got = state
+            .screen_inert_profiles
+            .get("trust")
+            .unwrap_or_else(|| panic!("POSITIVE CONTROL: the inert ref must decode at all"));
+        assert_eq!(
+            got.alarm_without_drop, audit,
+            "the audit modifier must travel with the inert reference (audit={audit}); it is \
+             the ONLY channel by which an inert zone's alarm-without-drop can reach the \
+             helper, because such a zone gets no `screens` entry"
+        );
+        assert_eq!(got.profile, "p", "the profile name must still arrive (#7888)");
+    }
+}
+
+/// The mirror control: an UNDEFINED reference must never carry the flag into the
+/// helper. The wire struct is shared by both sets, so a decoder that read the
+/// field on the undefined path would let that set inherit the inert set's
+/// meaning.
+#[test]
+fn undefined_screen_profile_never_carries_an_audit_flag_9425() {
+    let snapshot = ConfigSnapshot {
+        screen_missing_profile_zones: vec![crate::ScreenMissingProfileRef {
+            zone: "trust".into(),
+            profile: "ghost".into(),
+            // Even if a malformed or hostile sender sets it, the undefined path
+            // has no field to put it in and the zone must keep hard-dropping.
+            alarm_without_drop: true,
+        }],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    assert!(
+        state.screen_inert_profiles.is_empty(),
+        "an undefined reference must not materialise an inert entry, which is the only \
+         place an audit flag could be honoured"
+    );
+    assert!(
+        state.screen_missing_profiles.contains_key("trust"),
+        "POSITIVE CONTROL: the undefined reference itself must still decode"
+    );
+}
