@@ -166,6 +166,7 @@ func TestLeafRunDifferentialGate9156(t *testing.T) {
 		skipFlat  []string // the FLAT-SET arm could not be built or compiled
 	)
 	flatCompared := 0
+	reachable := 0
 	for _, s := range sites {
 		hv, ok := leafValue9156(s.headNode)
 		if !ok {
@@ -223,16 +224,45 @@ func TestLeafRunDifferentialGate9156(t *testing.T) {
 
 		bracedDiffers := run != sep
 		flatDiffers := flatDriven && flatRun != flatSep
-		switch {
-		case bracedDiffers && flatDiffers:
-			differed = append(differed, s.key()+" {braced+flat}")
-		case bracedDiffers:
-			differed = append(differed, s.key()+" {braced}")
-		case flatDiffers:
-			differed = append(differed, s.key()+" {flat}")
-		default:
+		if !bracedDiffers && !flatDiffers {
 			agreed = append(agreed, s.key())
+			continue
 		}
+		axis := "{braced+flat}"
+		switch {
+		case bracedDiffers && !flatDiffers:
+			axis = "{braced}"
+		case flatDiffers && !bracedDiffers:
+			axis = "{flat}"
+		}
+		// REACHABILITY, computed rather than hand-measured (#9391).
+		//
+		// A differing row is only OPERATOR-REACHABLE if the strict commit walk
+		// ADMITS the one-line spelling. Where the strict gate rejects it, the
+		// loss can still happen — Load and SyncApply take the lenient path per
+		// #1960 — but it cannot be reached by committing, and that path logs a
+		// warning naming the leaf. Those are different severities and the code
+		// decides which, not a reading.
+		//
+		// The differentiator is the HEAD leaf's declaration, and the two
+		// hand-measured rows proved the register is NOT homogeneous:
+		//
+		//	system login user <u> [uid -> class]
+		//	  `uid` is untyped -> an ADMISSION HEAD -> strict ACCEPTS
+		//	  -> operator-reachable, and it silently dropped a DEMOTION
+		//	security zones security-zone <z> [description -> screen]
+		//	  `description` is scalar: true -> #3332 rejects the trailing token
+		//	  -> strict REJECTS both spellings -> lenient-only, and warned
+		//
+		// Hand-measuring 26 rows one at a time to learn that is the expensive
+		// way to ask a question the walker can answer for every row at once.
+		if strictAdmitsLeafRun9156(s.container, ctx, headStmt, tailStmt) {
+			axis += " {strict-admits}"
+			reachable++
+		} else {
+			axis += " {lenient-only}"
+		}
+		differed = append(differed, s.key()+" "+axis)
 	}
 
 	total := len(sites)
@@ -268,6 +298,10 @@ func TestLeafRunDifferentialGate9156(t *testing.T) {
 			"coverage it does not have", flatCompared, compared)
 	}
 	t.Logf("  flat-set axis driven on %d of %d compared containers", flatCompared, compared)
+	t.Logf("  of the %d differing: %d are OPERATOR-REACHABLE (the strict commit walk "+
+		"admits the one-line spelling) and %d are lenient-only (strict rejects it; the "+
+		"loss needs a config FILE or an HA sync, and that path logs a warning naming "+
+		"the leaf)", len(differed), reachable, len(differed)-reachable)
 
 	// The skip buckets are DRAINED, not counted. A row leaves this population
 	// precisely where a validator rejects the synthesized placeholder, so the
@@ -467,6 +501,31 @@ func TestTunnelSchemaResolvesBothPositions9156(t *testing.T) {
 // THREE WERE HAND-MEASURED before this file was written, because a gate row is
 // a candidate until someone looks:
 //
+// EVERY REMAINING ROW IS {lenient-only}, and that is a MEASUREMENT the gate
+// makes on each run rather than a claim in this comment. The strict commit walk
+// REJECTS the one-line spelling at all 25, so none is reachable by an operator
+// committing: the loss needs a config FILE or an HA sync, and
+// Store.compileTreeLenient logs a warning naming the leaf and saying the token
+// would be dropped (#1960's tolerate-and-warn doctrine, working).
+//
+// That reduces #9391 enormously and it was worth measuring rather than
+// hand-checking: the register is NOT homogeneous, and the differentiator is the
+// HEAD leaf's declaration. An untyped head is an ADMISSION HEAD and the gate has
+// nothing to reject the next token with; a `scalar: true` head is refused by
+// #3332's trailing-token gate. Two rows were hand-measured and they landed on
+// opposite sides of exactly that line.
+//
+// The two OPERATOR-REACHABLE rows are both fixed:
+//
+//   - `security log stream <s> [port -> category]` — FIXED (#9391). The one
+//     reachable row of the original 26, and it exists in this register ONLY
+//     because the flat-set axis was restored — the braced-only gate found 26
+//     rows of which ZERO were reachable, and missed the one that was.
+//     `port` is untyped, so `set security log stream s1 port 5514 category
+//     rt-flow` committed CLEAN with the category dropped, and Categories == 0
+//     means ALL (pkg/logging/syslog.go) — so the operator's NARROWING was
+//     silently inverted into "export every category" to a collector scoped for
+//     one. Over-export, not a blind spot.
 //   - `system login user <u> [uid -> class]` — FIXED (#9391). It was the
 //     AUTHORIZATION one, and the severity was in the DOWNGRADE direction rather
 //     than the empty-class one: a demotion written on one line was dropped, the
@@ -488,32 +547,31 @@ func TestTunnelSchemaResolvesBothPositions9156(t *testing.T) {
 // starts agreeing while still listed — so the register cannot outlive the
 // defect it describes.
 var leafRunKnownDiffer9156 = map[string]bool{
-	"bridge-domains xpfname [domain-type -> routing-interface] {braced+flat}":                                                       true,
-	"class-of-service interfaces xpfarg [output-traffic-control-profile -> priority-low-min-share] {braced+flat}":                   true,
-	"forwarding-options sampling instance xpfarg family inet output flow-server xpfarg [source-address -> port] {braced+flat}":      true,
-	"forwarding-options sampling instance xpfarg family inet6 output flow-server xpfarg [source-address -> port] {braced+flat}":     true,
-	"interfaces xpfname [bandwidth -> description] {braced+flat}":                                                                   true,
-	"interfaces xpfname aggregated-ether-options [link-speed -> minimum-links] {braced+flat}":                                       true,
-	"interfaces xpfname gigether-options [802.3ad -> redundant-parent] {braced+flat}":                                               true,
-	"interfaces xpfname tunnel wireguard [private-key -> listen-port] {braced+flat}":                                                true,
-	"interfaces xpfname tunnel wireguard peer xpfarg [endpoint -> persistent-keepalive] {braced+flat}":                              true,
-	"protocols bgp group xpfarg neighbor xpfarg [authentication-key -> description] {braced+flat}":                                  true,
-	"protocols ospf [reference-bandwidth -> router-id] {braced+flat}":                                                               true,
-	"protocols ospf3 area xpfarg interface xpfarg [cost -> dead-interval] {braced+flat}":                                            true,
-	"routing-instances xpfname [description -> instance-type] {braced+flat}":                                                        true,
-	"routing-instances xpfname protocols bgp group xpfarg neighbor xpfarg [authentication-key -> description] {braced+flat}":        true,
-	"routing-instances xpfname protocols ospf [reference-bandwidth -> router-id] {braced+flat}":                                     true,
-	"routing-instances xpfname protocols ospf3 area xpfarg interface xpfarg [cost -> dead-interval] {braced+flat}":                  true,
-	"security dynamic-address feed-server xpfarg [hostname -> hold-interval] {braced+flat}":                                         true,
-	"security flow traceoptions packet-filter xpfarg [destination-prefix -> protocol] {braced+flat}":                                true,
-	"security log stream xpfarg [port -> category] {flat}":                                                                          true,
-	"security nat nat64 rule-set xpfarg [prefix -> source-pool] {braced+flat}":                                                      true,
-	"security screen ids-option xpfarg limit-session [destination-ip-based -> source-ip-based] {braced+flat}":                       true,
-	"security screen ids-option xpfarg tcp syn-flood [alarm-threshold -> attack-threshold] {braced+flat}":                           true,
-	"security zones security-zone xpfarg [description -> screen] {braced+flat}":                                                     true,
-	"system ntp server xpfarg [routing-instance -> key] {braced}":                                                                   true,
-	"system services dhcp-local-server group xpfarg pool xpfarg static-binding xpfarg [host-name -> fixed-address] {braced+flat}":   true,
-	"system services dhcpv6-local-server group xpfarg pool xpfarg static-binding xpfarg [host-name -> fixed-address] {braced+flat}": true,
+	"bridge-domains xpfname [domain-type -> routing-interface] {braced+flat} {lenient-only}":                                                       true,
+	"class-of-service interfaces xpfarg [output-traffic-control-profile -> priority-low-min-share] {braced+flat} {lenient-only}":                   true,
+	"forwarding-options sampling instance xpfarg family inet output flow-server xpfarg [source-address -> port] {braced+flat} {lenient-only}":      true,
+	"forwarding-options sampling instance xpfarg family inet6 output flow-server xpfarg [source-address -> port] {braced+flat} {lenient-only}":     true,
+	"interfaces xpfname [bandwidth -> description] {braced+flat} {lenient-only}":                                                                   true,
+	"interfaces xpfname aggregated-ether-options [link-speed -> minimum-links] {braced+flat} {lenient-only}":                                       true,
+	"interfaces xpfname gigether-options [802.3ad -> redundant-parent] {braced+flat} {lenient-only}":                                               true,
+	"interfaces xpfname tunnel wireguard [private-key -> listen-port] {braced+flat} {lenient-only}":                                                true,
+	"interfaces xpfname tunnel wireguard peer xpfarg [endpoint -> persistent-keepalive] {braced+flat} {lenient-only}":                              true,
+	"protocols bgp group xpfarg neighbor xpfarg [authentication-key -> description] {braced+flat} {lenient-only}":                                  true,
+	"protocols ospf [reference-bandwidth -> router-id] {braced+flat} {lenient-only}":                                                               true,
+	"protocols ospf3 area xpfarg interface xpfarg [cost -> dead-interval] {braced+flat} {lenient-only}":                                            true,
+	"routing-instances xpfname [description -> instance-type] {braced+flat} {lenient-only}":                                                        true,
+	"routing-instances xpfname protocols bgp group xpfarg neighbor xpfarg [authentication-key -> description] {braced+flat} {lenient-only}":        true,
+	"routing-instances xpfname protocols ospf [reference-bandwidth -> router-id] {braced+flat} {lenient-only}":                                     true,
+	"routing-instances xpfname protocols ospf3 area xpfarg interface xpfarg [cost -> dead-interval] {braced+flat} {lenient-only}":                  true,
+	"security dynamic-address feed-server xpfarg [hostname -> hold-interval] {braced+flat} {lenient-only}":                                         true,
+	"security flow traceoptions packet-filter xpfarg [destination-prefix -> protocol] {braced+flat} {lenient-only}":                                true,
+	"security nat nat64 rule-set xpfarg [prefix -> source-pool] {braced+flat} {lenient-only}":                                                      true,
+	"security screen ids-option xpfarg limit-session [destination-ip-based -> source-ip-based] {braced+flat} {lenient-only}":                       true,
+	"security screen ids-option xpfarg tcp syn-flood [alarm-threshold -> attack-threshold] {braced+flat} {lenient-only}":                           true,
+	"security zones security-zone xpfarg [description -> screen] {braced+flat} {lenient-only}":                                                     true,
+	"system ntp server xpfarg [routing-instance -> key] {braced} {lenient-only}":                                                                   true,
+	"system services dhcp-local-server group xpfarg pool xpfarg static-binding xpfarg [host-name -> fixed-address] {braced+flat} {lenient-only}":   true,
+	"system services dhcpv6-local-server group xpfarg pool xpfarg static-binding xpfarg [host-name -> fixed-address] {braced+flat} {lenient-only}": true,
 }
 
 // TestLeafRunRegisterIsNotVacuous9156 pins that the register is a REGISTER and

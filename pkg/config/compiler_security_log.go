@@ -26,6 +26,38 @@ func validSyslogPort(n int) bool { return n >= 1 && n <= 65535 }
 // drifting: a schema move that broke the lookup would make the expansion
 // silently return the unexpanded children again, which is the original defect.
 // TestSecurityLogTransportSchemaResolves6821 fails loudly if the path moves.
+// securityLogStreamSchema9391 resolves the `security log stream <s>` body — the
+// container itself, not one of its children — so a flat-set run of its own
+// leaves can be expanded before the reader walks it.
+//
+// #9391: `port` declares no valueType and no validator, so it is an ADMISSION
+// HEAD. `set security log stream s1 port 5514 category rt-flow` COMMITS CLEAN
+// with the category dropped, and Categories == 0 means ALL
+// (pkg/logging/syslog.go), so the operator's narrowing is silently inverted
+// into "export everything" — a collector scoped for one category receives every
+// category. Same for `severity`.
+//
+// This is the ONE operator-reachable row of the 26 in #9391's register: the
+// strict commit walk ADMITS it. The other 25 are rejected at commit and reach
+// the compiler only through a config file or an HA sync, where
+// Store.compileTreeLenient logs a warning naming the leaf.
+func securityLogStreamSchema9391() *schemaNode {
+	n := setSchema
+	for _, k := range []string{"security", "log", "stream"} {
+		if n == nil {
+			return nil
+		}
+		n = n.children[k]
+	}
+	if n == nil {
+		return nil
+	}
+	if n.wildcard != nil {
+		return n.wildcard
+	}
+	return n
+}
+
 func securityLogTransportSchema() *schemaNode {
 	n := setSchema
 	for _, k := range []string{"security", "log", "stream"} {
@@ -72,7 +104,10 @@ func compileLog(node *Node, sec *SecurityConfig) error {
 			Name: inst.name,
 			Port: 514, // default
 		}
-		for _, prop := range inst.node.Children {
+		// #9391: expand the flat-set run before reading it — `port` is an
+		// untyped ADMISSION HEAD, so `port 5514 category rt-flow` arrived as a
+		// nested chain and this loop kept only the head.
+		for _, prop := range expandFlatRun(inst.node.Children, securityLogStreamSchema9391()) {
 			switch prop.Name() {
 			case "host":
 				// Flat: host 192.168.99.3;
@@ -230,7 +265,11 @@ func validateSecurityLogStreamPortsAST(nodes []*Node, prefix string, lenient boo
 			logPath := joinNodePath(secPath, []string{"log"})
 			for _, inst := range namedInstances(logNode.FindChildren("stream")) {
 				streamPath := joinNodePath(logPath, []string{"stream", inst.name})
-				for _, prop := range inst.node.Children {
+				// #9391: the same expansion the compile reader uses. If this
+				// walk saw the UNexpanded children it would validate a
+				// different set of statements than the one that gets compiled
+				// — which is how a value can be both checked and dropped.
+				for _, prop := range expandFlatRun(inst.node.Children, securityLogStreamSchema9391()) {
 					switch prop.Name() {
 					case "port":
 						if err := check(joinNodePath(streamPath, []string{"port"}), nodeVal(prop)); err != nil {
