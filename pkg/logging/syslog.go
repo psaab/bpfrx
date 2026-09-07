@@ -304,6 +304,89 @@ func NewSyslogClientTransport(host string, port int, sourceAddr, protocol string
 // "tcp", or "tls"). Exported so callers/tests can verify the configured
 // transport was honored — e.g. that an in-process CLI commit preserves a
 // TCP/TLS stream instead of downgrading it to plaintext UDP (#5712).
+// NewSyslogClientDeferred builds a client WITHOUT dialing, for callers on a
+// latency-sensitive path (#9326: the config-commit path).
+//
+// TCP/TLS ONLY, and the restriction is a correctness bound rather than caution.
+// A stream client reconnects lazily: Send -> writeMsg fails "syslog connection
+// closed" on a nil conn -> the stream branch performs one cooldown-gated
+// reconnect and retries. UDP has NO such branch — writeMsg returns the error
+// and the caller deliberately does not reconnect — so a deferred UDP client
+// would never connect at all, silently, for the life of the config. UDP
+// therefore keeps dialing at construction, which is cheap because a UDP "dial"
+// binds rather than handshakes; its only blocking term is the name lookup, now
+// bounded by dialUDP's own 5s dialer.
+//
+// Returns an error for a UDP or unsupported protocol so the restriction cannot
+// be violated silently by a future caller.
+func NewSyslogClientDeferred(host string, port int, sourceAddr, protocol string, tlsCfg *tls.Config) (*SyslogClient, error) {
+	if !supportedTransport(protocol) {
+		return nil, fmt.Errorf("%w %q", ErrUnsupportedTransport, protocol)
+	}
+	if protocol == "udp" {
+		return nil, fmt.Errorf("%w: udp cannot be deferred — it never reconnects lazily",
+			ErrUnsupportedTransport)
+	}
+	hostname, _ := os.Hostname()
+	if hostname == "" {
+		hostname = "xpf"
+	}
+	return &SyslogClient{
+		hostname:          hostname,
+		remoteAddr:        net.JoinHostPort(host, fmt.Sprintf("%d", port)),
+		sourceAddr:        sourceAddr,
+		protocol:          protocol,
+		tlsConfig:         tlsCfg,
+		Facility:          FacilityLocal0,
+		writeTimeout:      defaultWriteTimeout,
+		reconnectCooldown: defaultReconnectCooldown,
+	}, nil
+}
+
+// Connect establishes the connection if it is not already up.
+//
+// #9326: this is what lets the commit path DEFER the dial without losing the
+// #3351 operator signal ("receiver unreachable at apply"). The caller runs it
+// off the commit path; a failure is reported there rather than charged to the
+// operator's commit latency. Safe on a closed client (fails fast, #4806) and
+// safe to call concurrently with Close.
+func (s *SyslogClient) Connect() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return errSyslogClientClosed
+	}
+	if s.conn != nil {
+		return nil
+	}
+	conn, err := s.dialConn()
+	if err != nil {
+		s.lastReconnectFailure = s.now()
+		return err
+	}
+	s.conn = conn
+	return nil
+}
+
+// Connected reports whether this client currently holds a connection.
+//
+// #9326: it is what makes "the commit path did not dial" observable. A cell
+// that only checks the apply was FAST proves nothing (a fast machine, or a
+// target that refuses rather than blackholes, passes it with the dial still
+// there), and a cell against an unreachable host cannot tell a deferred client
+// from a failed dial — both end unconnected. Against a REACHABLE listener the
+// two are distinguishable, and that is the shape the daemon cell uses.
+func (s *SyslogClient) Connected() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.conn != nil
+}
+
+// RemoteAddr is the "host:port" this client targets. Read-only after
+// construction, so no lock is required (#9326: the warm path needs it for the
+// operator warning).
+func (s *SyslogClient) RemoteAddr() string { return s.remoteAddr }
+
 func (s *SyslogClient) Protocol() string { return s.protocol }
 
 // SourceAddr returns the source IP this client was constructed to bind its
@@ -373,7 +456,19 @@ func (s *SyslogClient) dialUDP() (net.Conn, error) {
 		}
 		return net.DialUDP("udp", laddr, raddr)
 	}
-	return net.Dial("udp", s.remoteAddr)
+	// #9326: the same 5s bound its TCP/TLS siblings carry. `net.Dial` on a
+	// HOSTNAME performs a resolver lookup, and with no Dialer there was no
+	// deadline and no context on it — an unbounded blocking call on the commit
+	// path. The connectionless nature of UDP is why the SEND needs no timeout;
+	// it says nothing about the NAME LOOKUP that precedes it, and conflating
+	// the two is how this one stayed asymmetric with its siblings.
+	//
+	// `security log stream <s> host` is also a typed leaf as of #9326, so a
+	// non-hostname is now refused at commit rather than handed to the resolver.
+	// This bound is the belt for the tolerant load / HA-sync ingress, which
+	// only warns.
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	return dialer.Dial("udp", s.remoteAddr)
 }
 
 func (s *SyslogClient) dialTCP() (net.Conn, error) {

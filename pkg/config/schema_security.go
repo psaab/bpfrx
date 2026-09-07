@@ -772,7 +772,13 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 		// pair-keyed admission is structurally unreachable for an arg-named
 		// container.
 		"stream": {desc: "Syslog stream name", args: 1, packedStatements: true, valueHint: ValueHintStreamName, placeholder: "<stream-name>", children: map[string]*schemaNode{
-			"host": {desc: "Syslog server address", args: 1, placeholder: "<address>", children: nil},
+			// #9326: TYPED. This was `args: 1` with no valueType and no
+			// validator, so any string reached the dialer's resolver on the
+			// commit path.
+			"host": {desc: "Syslog server address", args: 1, placeholder: "<address>",
+				valueType: ValueHostname, valueDesc: "syslog server IP address or hostname",
+				valueExamples: []string{"192.0.2.10", "logs.example.net"},
+				validator:     ValidateSyslogHost, children: nil},
 			// `port` validation (direct AND nested host{port}) lives in the
 			// validateSecurityLogStreamPortsAST compiler pass (#3349): the
 			// value has two AST locations the declarative schema walker cannot

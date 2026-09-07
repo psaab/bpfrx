@@ -645,6 +645,58 @@ constructor reverts to dropping a TCP/TLS client when the receiver is
 down at apply (`got nil` — stream permanently disabled) or if a lazy
 client never reconnects once the receiver returns.
 
+## The commit path does not dial a stream client (#9326)
+
+`applySyslogConfig` used to construct every client with `NewSyslogClientTransport`,
+which **dials**. Measured by driving the real apply:
+
+```
+one apply, 3 unreachable TCP streams          -> 15.01 s   (3 x the 5 s dialer timeout)
+four applies of an IDENTICAL 5-stream stanza  -> 20 dials  (no idempotence gate)
+```
+
+A commit is the operator's control loop. Blocking it on whether a third-party
+collector happens to be up couples config change to someone else's uptime, and
+on a cluster it widens the window in which the two nodes disagree about the
+committed config.
+
+Three changes, and the asymmetry between them is the part to keep:
+
+- **TCP/TLS construct WITHOUT dialing** (`NewSyslogClientDeferred`). Safe only
+  because a stream client reconnects lazily: `Send` → `writeMsg` fails on a nil
+  conn → the stream branch performs one cooldown-gated reconnect and retries, so
+  the connection is established on the first record.
+- **UDP keeps dialing at construction**, and `NewSyslogClientDeferred`
+  **refuses** `udp` so that cannot be lost by a later caller. UDP has no lazy
+  reconnect — `writeMsg` returns the error and the caller deliberately does not
+  reconnect — so a deferred UDP client would forward nothing, silently, for the
+  life of the config. A UDP dial is cheap anyway: it binds rather than
+  handshakes.
+- **`dialUDP` gained the 5 s dialer its siblings already had.** Its only
+  blocking term is the NAME LOOKUP, and `net.Dial` on a hostname resolves with
+  no deadline and no context. The connectionless nature of UDP bounds the send,
+  not the lookup that precedes it; conflating the two is how this stayed
+  asymmetric.
+
+The #3351 operator signal ("receiver unreachable at apply") is preserved rather
+than dropped: `warmSyslogClients` runs the connect asynchronously and logs the
+warning there, off the commit path.
+
+An **idempotence gate** (`syslogClientFingerprint`) skips the rebuild when
+nothing the client set depends on has changed — mirroring the SNMP reconcile's
+hash gate. It is scoped to the client rebuild ALONE and sits below the
+zone-name / policy-name / filter-term / interface-name wiring, which is derived
+from the apply result and netlink rather than the stanza and must be re-run on
+every apply; gating the whole function would silently stop refreshing all of it.
+The fingerprint covers the RESOLVED source addresses, because a
+source-interface's address can change with no syslog edit at all. It is
+forgotten on both teardown paths, or re-adding an unchanged stanza would
+hash-match a client set that has been closed.
+
+`security log stream <s> host` is also a typed leaf now (`ValidateSyslogHost`:
+an IP address or a DNS name, the `ValidateNTPServer` shape). It was `args: 1`
+with no valueType and no validator, so any string reached the dialer's resolver.
+
 ## Gotchas
 
 - The binary RT_FLOW format used by Junos session logging is custom; it

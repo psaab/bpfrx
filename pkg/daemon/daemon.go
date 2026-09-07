@@ -1453,6 +1453,19 @@ type Daemon struct {
 	// nudge tolerates.
 	proxyARPNudgeCh chan struct{}
 
+	// syslogWarmFn overrides the asynchronous syslog connect-warm (#9326).
+	// Test seam only; nil in production, where the warm runs in a goroutine.
+	// A cell that has to observe the warm cannot race a goroutine, and a cell
+	// that must observe that the COMMIT PATH does not dial needs the warm to be
+	// suppressible — the seam serves both.
+	syslogWarmFn func(clients []*logging.SyslogClient)
+
+	// syslogHash / syslogHashSet gate the syslog CLIENT REBUILD on a config
+	// change (#9326), mirroring the SNMP reconcile's hash gate. Written only
+	// from applySyslogConfig, which runs under applySem.
+	syslogHash    string
+	syslogHashSet bool
+
 	// archiveTransfer performs the transfer-on-commit upload of one
 	// serialized active-config file to an archive site. nil ⇒ the default
 	// scp transport (scpArchiveTransfer). Overridable so tests can capture
