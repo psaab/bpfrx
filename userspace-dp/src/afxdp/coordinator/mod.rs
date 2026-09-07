@@ -1751,6 +1751,23 @@ impl Coordinator {
         self.workers.register(worker_id, WorkerRuntimeRecord::for_test(handle), None);
         ack
     }
+
+    /// #9344: seed a live binding with `count` pending session deltas so a
+    /// control-socket-level export test can drive the CAPPED/paged path.
+    ///
+    /// The unit tests around `wait_and_collect` can build these buffers
+    /// directly; a dispatcher-level test cannot, because it only holds the
+    /// `ServerState` mutex. Without this the whole path from a
+    /// `SessionExportRequest` to `ControlResponse.session_export_more` is
+    /// untested end to end — which is exactly the seam a mutation of the
+    /// handler's one assignment line survived.
+    pub(crate) fn test_seed_binding_session_deltas(&mut self, slot: u32, count: usize) {
+        let live = std::sync::Arc::new(super::BindingLiveState::new());
+        for _ in 0..count {
+            live.push_session_delta(crate::protocol::SessionDeltaInfo::default());
+        }
+        self.workers.live.insert(slot, live);
+    }
 }
 
 // #7160 (#2387): the routing-domain accessors the session-sync handler calls.

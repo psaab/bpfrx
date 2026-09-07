@@ -311,6 +311,23 @@ type ControlResponse struct {
 	Error         string             `json:"error,omitempty"`
 	Status        *ProcessStatus     `json:"status,omitempty"`
 	SessionDeltas []SessionDeltaInfo `json:"session_deltas,omitempty"`
+	// SessionExportMore reports that an export_owner_rg_sessions answer was
+	// CAPPED by the request's Max and the helper still holds deltas from the
+	// same window (#9344).
+	//
+	// The bit is not new information — the helper's drain_session_deltas_fair
+	// has always computed it; the owner-RG call site discarded it into
+	// `_overflow`, which is why paging was not expressible and the only usable
+	// request was Max=0. Max=0 asks for the UNBOUNDED owner-RG set, which
+	// crosses MaxControlResponseBytes at roughly 7.8k sessions/worker on a
+	// six-worker box and makes the HA cold prime fail permanently.
+	//
+	// Additive and omitempty (#1961 skew-safe): an older helper omits it and an
+	// older caller ignores it, so both read false — the pre-#9344 single-shot
+	// behaviour. A caller must therefore NOT read false as proof the helper
+	// supports paging; ExportOwnerRGSessionsPaged handles that by asking for
+	// the unbounded set on the first page when it has no evidence either way.
+	SessionExportMore bool `json:"session_export_more,omitempty"`
 	// IdleLeases is the export_idle_leases result (#8121).
 	IdleLeases []IdleLeaseWire `json:"idle_leases,omitempty"`
 

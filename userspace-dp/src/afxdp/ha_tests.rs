@@ -1592,14 +1592,14 @@ fn synced_snat_install_publishes_and_delete_releases_dnat_table_entry() {
 fn kick_owner_rg_export_empty_set_is_noop_and_consumes_no_sequence() {
     let coordinator = Coordinator::new();
     let before = coordinator.sessions.export_seq.load(Ordering::Relaxed);
-    let wait = coordinator.kick_owner_rg_export(&[], 0);
+    let wait = coordinator.kick_owner_rg_export(&[], 0, false);
     assert_eq!(
         coordinator.sessions.export_seq.load(Ordering::Relaxed),
         before,
         "empty owner-RG export must not consume a sequence"
     );
     assert!(
-        wait.wait_and_collect().expect("empty export").is_empty(),
+        wait.wait_and_collect().expect("empty export").0.is_empty(),
         "empty owner-RG export must drain no deltas"
     );
 }
@@ -1618,7 +1618,7 @@ fn kick_owner_rg_export_enqueues_command_then_wait_completes_on_ack() {
         .workers
         .register(0, WorkerRuntimeRecord::for_test(handle), None);
 
-    let wait = coordinator.kick_owner_rg_export(&[1, 2], 0);
+    let wait = coordinator.kick_owner_rg_export(&[1, 2], 0, false);
 
     {
         let pending = commands.lock().expect("commands");
@@ -1640,6 +1640,7 @@ fn kick_owner_rg_export_enqueues_command_then_wait_completes_on_ack() {
     assert!(
         wait.wait_and_collect()
             .expect("export after ack")
+            .0
             .is_empty(),
         "no bindings means no deltas to drain"
     );
@@ -1789,11 +1790,18 @@ fn drain_session_deltas_from_live_is_fair_across_bindings() {
         })
         .collect();
 
-    let (drained, cursor) = drain_session_deltas_from_live(&live, 30, 0); // quantum 10
+    let (drained, cursor, more) = drain_session_deltas_from_live(&live, 30, 0); // quantum 10
     assert_eq!(
         drained.len(),
         30,
         "capped export returns exactly the budget"
+    );
+    // #9344: the bit this call site used to discard. 120 deltas were queued and
+    // 30 drained, so the answer is CAPPED and the remainder is still buffered.
+    assert!(
+        more,
+        "a capped drain that left 90 deltas behind must report more=true — \
+         without it a truncated answer and a complete one are indistinguishable"
     );
     // Cursor wrapped back to 0 after serving all three (10 each).
     assert_eq!(cursor % 3, 0, "cursor rotated through every binding");
@@ -4777,5 +4785,174 @@ fn cap_rejected_forward_leaves_no_orphan_reverse_8015() {
         0,
         "forward delete must leave ZERO entries: the pair is complete on the way \
          in and on the way out"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #9344: the owner-RG export's terminating bound.
+//
+// `max = 0` was the only COMPLETE request a caller could make, and it answers
+// with the unbounded owner-RG session set — which crosses the Go control
+// socket's 64 MiB response cap at roughly 7.8k sessions/worker on a six-worker
+// box, so the HA cold prime fails permanently on a busy cluster.
+//
+// Paging is what replaces it, and before this change nothing here drove
+// `max > 0` on this verb at all — which is how the primitive
+// (`drain_session_deltas_fair`'s overflow bit) could be computed and thrown
+// away into `_overflow` without a cell noticing.
+
+/// A capped export must report that the window is INCOMPLETE, and a
+/// CONTINUATION must drain the remainder of that same window without kicking
+/// the workers again.
+///
+/// The two halves are one cell on purpose. `more = true` alone is a bit nobody
+/// can act on if the only way to ask for the rest is a fresh export: a second
+/// ordinary call runs phase 1 again and stacks ANOTHER full set on top of the
+/// remainder, so the caller would assemble a window out of two different
+/// instants. Since #5085 the receiver reconciles authoritatively against the
+/// delimited window, so that is not a smaller bug than truncation, it is a
+/// different one.
+#[test]
+fn owner_rg_export_pages_a_capped_window_without_rekicking_the_workers() {
+    let mut coordinator = Coordinator::new();
+    let commands = Arc::new(Mutex::new(VecDeque::new()));
+    let handle = test_worker_handle(commands.clone());
+    let ack = handle.session_export_ack.clone();
+    coordinator
+        .workers
+        .register(0, WorkerRuntimeRecord::for_test(handle), None);
+
+    // One live binding holding 5 deltas.
+    let live = Arc::new(BindingLiveState::new());
+    for _ in 0..5 {
+        live.push_session_delta(SessionDeltaInfo::default());
+    }
+    coordinator.workers.live.insert(0, live.clone());
+
+    // PAGE 1: an ordinary capped export. Kicks phase 1, waits for the ack.
+    let wait = coordinator.kick_owner_rg_export(&[1], 3, false);
+    assert_eq!(
+        commands.lock().expect("commands").len(),
+        1,
+        "the first page must kick the workers — it is what PRODUCES the window"
+    );
+    let seq_after_page1 = coordinator.sessions.export_seq.load(Ordering::Relaxed);
+    ack.store(seq_after_page1, Ordering::Release);
+    let (page1, more1) = wait.wait_and_collect().expect("page 1");
+    assert_eq!(page1.len(), 3, "page 1 returns exactly the cap");
+    assert!(
+        more1,
+        "5 deltas were produced and 3 drained, so the window is INCOMPLETE. \
+         Without this bit the caller cannot tell a complete capped answer from \
+         a truncated one, which is why max=0 was the only safe request"
+    );
+
+    // PAGE 2: a CONTINUATION. It must kick nothing, consume no sequence, and
+    // not block on an ack that will never come.
+    let wait2 = coordinator.kick_owner_rg_export(&[1], 3, true);
+    assert_eq!(
+        commands.lock().expect("commands").len(),
+        1,
+        "a continuation must enqueue NO new export command — a second kick \
+         produces a whole new set on top of the remainder and the caller ends up \
+         with a window spanning two instants"
+    );
+    assert_eq!(
+        coordinator.sessions.export_seq.load(Ordering::Relaxed),
+        seq_after_page1,
+        "a continuation must consume no export sequence"
+    );
+    let (page2, more2) = wait2.wait_and_collect().expect("page 2");
+    assert_eq!(
+        page2.len(),
+        2,
+        "the continuation drains the REMAINDER of the window page 1 opened"
+    );
+    assert!(
+        !more2,
+        "the buffers are empty, so the window is complete and the caller stops"
+    );
+
+    // The two pages ADD UP to the window. A paging protocol that loses or
+    // duplicates across the seam is worse than no paging at all.
+    assert_eq!(
+        page1.len() + page2.len(),
+        5,
+        "the pages must partition the window exactly"
+    );
+    assert!(
+        !live.has_pending_session_deltas(),
+        "nothing may be left behind once the caller has seen more=false"
+    );
+}
+
+/// An UNCAPPED export drains everything and reports no remainder, which is the
+/// pre-#9344 behaviour and the fallback for a Go caller talking to a helper
+/// that predates the paging contract.
+#[test]
+fn owner_rg_export_uncapped_drains_everything_and_reports_no_more() {
+    let mut coordinator = Coordinator::new();
+    let commands = Arc::new(Mutex::new(VecDeque::new()));
+    let handle = test_worker_handle(commands.clone());
+    let ack = handle.session_export_ack.clone();
+    coordinator
+        .workers
+        .register(0, WorkerRuntimeRecord::for_test(handle), None);
+
+    let live = Arc::new(BindingLiveState::new());
+    for _ in 0..2500 {
+        live.push_session_delta(SessionDeltaInfo::default());
+    }
+    coordinator.workers.live.insert(0, live.clone());
+
+    let wait = coordinator.kick_owner_rg_export(&[1], 0, false);
+    ack.store(
+        coordinator.sessions.export_seq.load(Ordering::Relaxed),
+        Ordering::Release,
+    );
+    let (all, more) = wait.wait_and_collect().expect("uncapped export");
+    assert_eq!(all.len(), 2500, "an uncapped export drains every delta");
+    assert!(
+        !more,
+        "an uncapped export leaves nothing behind, so it must never report more \
+         — the count is drained across several internal 1024-batches and an \
+         INTERMEDIATE batch's overflow bit is true on every one of them, which \
+         is the reading this must not take"
+    );
+}
+
+/// A capped export whose cap happens to consume the window EXACTLY must report
+/// no remainder.
+///
+/// This is the boundary the paging loop terminates on, and getting it wrong in
+/// the safe-looking direction (report more) costs an extra round trip, while
+/// getting it wrong in the other direction truncates. Neither is observable
+/// from the two cells above, which cap strictly below and strictly above.
+#[test]
+fn owner_rg_export_exact_fit_reports_no_more() {
+    let mut coordinator = Coordinator::new();
+    let commands = Arc::new(Mutex::new(VecDeque::new()));
+    let handle = test_worker_handle(commands.clone());
+    let ack = handle.session_export_ack.clone();
+    coordinator
+        .workers
+        .register(0, WorkerRuntimeRecord::for_test(handle), None);
+
+    let live = Arc::new(BindingLiveState::new());
+    for _ in 0..4 {
+        live.push_session_delta(SessionDeltaInfo::default());
+    }
+    coordinator.workers.live.insert(0, live.clone());
+
+    let wait = coordinator.kick_owner_rg_export(&[1], 4, false);
+    ack.store(
+        coordinator.sessions.export_seq.load(Ordering::Relaxed),
+        Ordering::Release,
+    );
+    let (page, more) = wait.wait_and_collect().expect("exact-fit export");
+    assert_eq!(page.len(), 4, "the cap consumed the whole window");
+    assert!(
+        !more,
+        "the buffers are empty, so there is no remainder to page for"
     );
 }

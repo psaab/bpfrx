@@ -697,12 +697,54 @@ the receiver logged `reconcile stale sessions applied stale_v4=1 deleted_v4=1`.
 
 `BulkSnapshotSource` is wired in `startClusterComms` to
 `Daemon.userspaceBulkSnapshot`, which gathers the owner-RG-filtered live set from
-the helper's in-process `SessionTable` via `ExportOwnerRGSessions(rgIDs, 0)`.
+the helper's in-process `SessionTable` via `ExportOwnerRGSessionsPaged(rgIDs)`.
 That control request is synchronous — the helper enqueues the export to every
 worker, waits for their acks, and returns the drained delta set in the response
-(`afxdp/ha/export.rs`, `OwnerRgExportWait::wait_and_collect`). `max = 0` requests
-the UNBOUNDED set: a capped export would truncate the window and the peer would
-delete the remainder.
+(`afxdp/ha/export.rs`, `OwnerRgExportWait::wait_and_collect`).
+
+**The window is PAGED, and it has a terminating bound (#9344).** Until #9344 the
+caller asked for `max = 0`, the UNBOUNDED set, because a capped export truncated
+the window and the peer deleted the remainder — so the one knob the call
+exposed had exactly one safe setting. The unbounded answer is bounded only by
+the control socket's 64 MiB `MaxControlResponseBytes`, and a worst-case
+`SessionDeltaInfo` is ~1.5 kB of JSON, so the cap is crossed at roughly 7.8k
+sessions per worker on the loss cluster's six-queue VFs — at which point
+`doBulkSync` fails closed and the cold prime fails PERMANENTLY, every attempt.
+Raising the cap is not a fix: the theoretical maximum answer is
+`workers x 131072 x 1.5 kB`, which is 1 GiB at six workers and 2.8 GiB at
+sixteen, and the only source for the worker count is the helper — sizing an
+allocation bound from a value the bounded party supplies is not a bound.
+
+So the export pages:
+
+- the helper reports `session_export_more` when a `max`-capped drain left
+  deltas from the same window buffered. The bit is not new — the fair drain
+  (`drain_session_deltas_fair`, #5290) always computed it and the owner-RG call
+  site discarded it into `_overflow`;
+- pages after the first set `continuation`, which drains the remainder WITHOUT
+  re-running phase 1. An ordinary second call would kick every worker again and
+  stack a fresh full set on top of the remainder, so the caller would assemble
+  one window out of two different instants — a different bug from truncation,
+  not a smaller one;
+- the Go caller holds the manager lock across every page. The per-binding delta
+  buffers this export drains are the same ones the incremental
+  `drain_session_deltas` verb drains, so an interleaved incremental drain
+  between pages would steal part of the window;
+- the loop is bounded (`maxOwnerRGExportPages`) and fails CLOSED past it. A
+  partial window is exactly what the receiver turns into deleted sessions, so
+  "return what we have" is not an option here;
+- a helper that does not report the paging contract
+  (`session_export_paging_protocol_version`) still gets the unbounded request.
+  Such a helper honours `max` by TRUNCATING and reports no more-bit, so paging
+  it would trade a loud failure for a silent one.
+
+The verb also carries a WORK deadline floor (`controlVerbDeadlineFloors9344`).
+`controlRoundtripDeadline` sizes the control-socket round trip off the REQUEST
+body, and this request is ~60 bytes, so it landed on the 3 s small-request base
+while the helper spends up to `OWNER_RG_EXPORT_ACK_WAIT` (15 s) waiting for
+worker acks before writing its first byte — #4036's failure shape on the work
+axis instead of the size axis. The floor does not move `controlMaxDeadline` or
+the #7675 reachable bound.
 
 Two invariants hold this together:
 

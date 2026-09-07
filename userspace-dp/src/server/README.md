@@ -173,6 +173,21 @@ not take. `ownerless_fabric_parent_is_refused` is the fail-on-revert guard, and
 it carries the reference cluster's shape as its negative control: an ownerless
 parent that is NOT marked unbindable must still be planned.
 
+The helper reports `session_export_paging_protocol_version` in status (#9344).
+`export_owner_rg_sessions` answers a ~60-byte request with the owner-RG session
+set, and until #9344 the only COMPLETE request was `max = 0` — the unbounded
+set, which crosses the Go control socket's 64 MiB response cap at roughly 7.8k
+sessions per worker on a six-queue box and makes the HA cold prime fail
+permanently. Version 1 means the helper honours `SessionExportRequest`'s
+`continuation` flag and reports `session_export_more`, so the caller can PAGE
+one window across several capped responses. A continuation kicks no worker,
+consumes no export sequence and waits for no acks: every page of a window comes
+from the single phase 1 that opened it, because re-kicking would produce a
+second full set from a different instant and the receiver reconciles
+authoritatively against the delimited window (#5085). A caller seeing version 0
+must ask for the unbounded set instead — an older helper honours `max` by
+TRUNCATING and reports no more-bit, so paging it loses the remainder silently.
+
 The helper also reports `config_snapshot_protocol_version` in status so a new
 daemon can fail closed before sending snapshots that require newer runtime
 semantics to an older helper binary that predates the gate. If the daemon

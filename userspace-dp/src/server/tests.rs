@@ -3155,6 +3155,7 @@ fn export_owner_rg_does_not_hold_state_lock_during_ack_wait() {
         r.session_export = Some(SessionExportRequest {
             owner_rgs: vec![1],
             max: 0,
+            continuation: false,
         });
         run_request(export_state, r)
     });
@@ -3178,6 +3179,112 @@ fn export_owner_rg_does_not_hold_state_lock_during_ack_wait() {
     let export_resp = export_thread.join().expect("export thread");
     assert!(export_resp.ok, "export failed: {}", export_resp.error);
     ack_thread.join().expect("ack thread");
+}
+
+/// #9344: the CONTROL-SOCKET path from a capped `export_owner_rg_sessions`
+/// request to `ControlResponse.session_export_more`, and from
+/// `SessionExportRequest.continuation` to a drain that does not re-kick.
+///
+/// This cell exists because a mutation found the gap: deleting the handler's
+/// one `response.session_export_more = more;` assignment left the whole suite
+/// GREEN. The Rust unit cells drive `wait_and_collect` directly and the Go
+/// cells drive a fake helper that scripts the bit itself, so nothing connected
+/// the two — the bit could be computed correctly and never reach the wire.
+/// That is the "bind the WIRING, not the function" shape exactly.
+#[test]
+fn export_owner_rg_sessions_reports_more_and_a_continuation_pages_the_window() {
+    use std::sync::atomic::Ordering;
+
+    let state = new_state(ProcessStatus::default());
+    let ack = {
+        let mut guard = state.lock().expect("lock state");
+        let ack = guard.afxdp.test_install_export_worker(0);
+        // 5 pending deltas on one binding, against a cap of 3.
+        guard.afxdp.test_seed_binding_session_deltas(0, 5);
+        ack
+    };
+    // Ack every sequence up front so neither call blocks on the ack-wait.
+    ack.store(u64::MAX, Ordering::Release);
+
+    let mut page1_req = req("export_owner_rg_sessions");
+    page1_req.session_export = Some(SessionExportRequest {
+        owner_rgs: vec![1],
+        max: 3,
+        continuation: false,
+    });
+    let page1 = run_request(state.clone(), page1_req);
+    assert!(page1.ok, "page 1 failed: {}", page1.error);
+    assert_eq!(
+        page1.session_deltas.len(),
+        3,
+        "page 1 must return exactly the cap"
+    );
+    assert!(
+        page1.session_export_more,
+        "the response must CARRY the more-bit. Computing it correctly and not \
+         writing it to the wire leaves the caller unable to tell a complete \
+         capped answer from a truncated one, which is the whole reason max=0 \
+         was the only safe request"
+    );
+
+    let mut page2_req = req("export_owner_rg_sessions");
+    page2_req.session_export = Some(SessionExportRequest {
+        owner_rgs: vec![1],
+        max: 3,
+        continuation: true,
+    });
+    let page2 = run_request(state.clone(), page2_req);
+    assert!(page2.ok, "page 2 failed: {}", page2.error);
+    assert_eq!(
+        page2.session_deltas.len(),
+        2,
+        "the continuation must drain the REMAINDER of the window page 1 opened, \
+         not a freshly produced one"
+    );
+    assert!(
+        !page2.session_export_more,
+        "the buffers are empty, so the caller must be told to stop"
+    );
+    assert_eq!(
+        page1.session_deltas.len() + page2.session_deltas.len(),
+        5,
+        "the two pages must partition the window exactly"
+    );
+}
+
+/// The negative half, and the one that says the more-bit is not simply always
+/// true: an UNCAPPED export over the control socket drains everything and
+/// reports no remainder.
+///
+/// Without this arm, `response.session_export_more = true` unconditionally
+/// would pass the cell above and send the Go caller into a paging loop that
+/// only ends at its page bound.
+#[test]
+fn export_owner_rg_sessions_uncapped_reports_no_more() {
+    use std::sync::atomic::Ordering;
+
+    let state = new_state(ProcessStatus::default());
+    let ack = {
+        let mut guard = state.lock().expect("lock state");
+        let ack = guard.afxdp.test_install_export_worker(0);
+        guard.afxdp.test_seed_binding_session_deltas(0, 5);
+        ack
+    };
+    ack.store(u64::MAX, Ordering::Release);
+
+    let mut r = req("export_owner_rg_sessions");
+    r.session_export = Some(SessionExportRequest {
+        owner_rgs: vec![1],
+        max: 0,
+        continuation: false,
+    });
+    let resp = run_request(state, r);
+    assert!(resp.ok, "export failed: {}", resp.error);
+    assert_eq!(resp.session_deltas.len(), 5, "uncapped drains everything");
+    assert!(
+        !resp.session_export_more,
+        "an uncapped export leaves nothing behind and must never report more"
+    );
 }
 
 // --- #4054: all-sessions bulk export must not hold the ServerState lock ----

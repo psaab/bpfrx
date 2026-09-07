@@ -38,7 +38,7 @@ import (
 // (two calls, two exports — both from the wrong backend).
 
 // resyncExporterDP is a publishable backend that records whether its
-// ExportOwnerRGSessions was called, and with which RG set.
+// ExportOwnerRGSessionsPaged was called, and with which RG set.
 type resyncExporterDP struct {
 	runtimeOnlyApplyTestDP
 	name    string
@@ -50,7 +50,7 @@ func newResyncExporterDP(name string) *resyncExporterDP {
 	return &resyncExporterDP{name: name}
 }
 
-func (r *resyncExporterDP) ExportOwnerRGSessions(rgIDs []int, _ uint32) (
+func (r *resyncExporterDP) ExportOwnerRGSessionsPaged(rgIDs []int) (
 	[]dpuserspace.SessionDeltaInfo, dpuserspace.ProcessStatus, error,
 ) {
 	r.exports.Add(1)
@@ -107,7 +107,7 @@ func TestFullResyncResolvesTheExporterPerCall(t *testing.T) {
 			"this test cannot observe which backend it used")
 	}
 	if got := first.exports.Load(); got != 1 {
-		t.Fatalf("first backend's ExportOwnerRGSessions calls = %d, want 1 — the first "+
+		t.Fatalf("first backend's ExportOwnerRGSessionsPaged calls = %d, want 1 — the first "+
 			"resync did not reach the exporter at all, so the republication below "+
 			"distinguishes nothing", got)
 	}
@@ -123,14 +123,14 @@ func TestFullResyncResolvesTheExporterPerCall(t *testing.T) {
 
 	// THE PROPERTY.
 	if got := second.exports.Load(); got != 1 {
-		t.Fatalf("the CURRENTLY published backend's ExportOwnerRGSessions calls = %d, "+
+		t.Fatalf("the CURRENTLY published backend's ExportOwnerRGSessionsPaged calls = %d, "+
 			"want 1: handleEventStreamFullResync latched its exporter instead of "+
 			"resolving the #2114 cell per call, so a full resync after a rollback and "+
 			"re-arm exports the standby's catch-up state from a torn-down backend "+
 			"(#6743 r2-B8)", got)
 	}
 	if got := first.exports.Load(); got != 1 {
-		t.Fatalf("the SUPERSEDED backend's ExportOwnerRGSessions calls = %d, want it to "+
+		t.Fatalf("the SUPERSEDED backend's ExportOwnerRGSessionsPaged calls = %d, want it to "+
 			"stay 1: the second resync dispatched into a backend the daemon had already "+
 			"replaced", got)
 	}
@@ -178,7 +178,7 @@ func TestFullResyncDeclinesOnADisownedCell(t *testing.T) {
 			"retry, so the standby is left behind with no further resync attempt")
 	}
 	if got := backend.exports.Load(); got != 1 {
-		t.Fatalf("the disowned backend's ExportOwnerRGSessions calls = %d, want it to "+
+		t.Fatalf("the disowned backend's ExportOwnerRGSessionsPaged calls = %d, want it to "+
 			"stay 1: the resync dispatched into a backend the daemon no longer publishes", got)
 	}
 }

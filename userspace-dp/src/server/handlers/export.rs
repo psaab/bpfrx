@@ -20,9 +20,11 @@ pub(super) fn owner_rg_kick(
     session_export: Option<SessionExportRequest>,
 ) -> OwnerRgExportWait {
     let export_req = session_export.unwrap_or_default();
-    guard
-        .afxdp
-        .kick_owner_rg_export(&export_req.owner_rgs, export_req.max as usize)
+    guard.afxdp.kick_owner_rg_export(
+        &export_req.owner_rgs,
+        export_req.max as usize,
+        export_req.continuation,
+    )
 }
 
 /// Lock-free phase: block for the worker acks, drain the deltas, and fold the
@@ -35,8 +37,12 @@ pub(super) fn owner_rg_collect(
     persist_state: &mut bool,
 ) {
     match wait.wait_and_collect() {
-        Ok(deltas) => {
+        Ok((deltas, more)) => {
             response.session_deltas = deltas;
+            // #9344: the caller pages until this is false. It is set even when
+            // `session_deltas` is empty, so "capped at zero with a remainder"
+            // and "nothing left" cannot read alike.
+            response.session_export_more = more;
             *persist_state = true;
         }
         Err(err) => {

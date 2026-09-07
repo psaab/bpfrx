@@ -163,6 +163,13 @@ func (m *Manager) armControlIO(conn net.Conn, scaled time.Duration) {
 	if m.ctrlShutdown && d > controlShutdownCeiling {
 		d = controlShutdownCeiling
 	}
+	// #9344: record what was actually ARMED. A mutation that severed the
+	// call site in requestDetailedLocked — swapping controlWorkDeadline back
+	// for controlRoundtripDeadline — survived the whole suite, because the
+	// cell that checks the floor calls the sizing FUNCTION and nothing
+	// observed what the socket got. This is the seam that makes the wiring
+	// checkable without a timing-dependent test.
+	m.lastArmedControlDeadline = d
 	_ = conn.SetDeadline(time.Now().Add(d))
 }
 
