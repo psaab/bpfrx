@@ -718,6 +718,11 @@ func compileRoutingInstances(node *Node, cfg *Config) error {
 				ri.BGP = proto.BGP
 				ri.RIP = proto.RIP
 				ri.ISIS = proto.ISIS
+				// #9374: whatever compileProtocols built that is NOT copied
+				// above goes out of scope with `proto`. Say so, rather than
+				// letting the stanza compile to nothing in silence.
+				cfg.Warnings = append(cfg.Warnings,
+					inertPerInstanceProtocolWarnings9374(instanceName, prop)...)
 			}
 		}
 
