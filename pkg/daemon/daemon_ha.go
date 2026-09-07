@@ -2645,8 +2645,35 @@ func desiredStandaloneDHCPConfig(cfg *config.Config) config.DHCPServerConfig {
 }
 
 // resolveDHCPRethInterfaces RETURNS a copy of dhcpCfg whose DHCP server group
-// interfaces are translated from RETH logical names to their physical member
-// Linux names (Kea needs real device names). It never writes through cfg.
+// interfaces are translated from Junos logical names to the kernel devices Kea
+// must bind. It never writes through cfg.
+//
+// #9407: the translation used to be LinuxIfName(ResolveReth(ref)) — the slash
+// rewrite and the RETH member map, and nothing else. That is TWO arms short of
+// the canonical resolver, and both gaps produced a name Kea cannot bind:
+//
+//	reth1.0             -> "ge-0-0-1.0"    a dangling unit suffix; not a device
+//	reth1.80 (vlan 180) -> "ge-0-0-1.80"   the UNIT number, not the VLAN device
+//
+// Only the CLUSTER path papered over the first, with stripUntaggedUnitSuffix
+// (#4647), so the STANDALONE builder named a phantom device on identical
+// config — different behaviour by topology. Nothing covered the second on
+// either topology; it is the #5107 class RA already fixed.
+//
+// The vlan-id gap did more than misname a device: it silently defeated the
+// master-RG filter. filterDHCPConfigForMasterRGs compares the group's resolved
+// interface against rethInterfacesMatchingRG, which ALREADY derives
+// `<member>.<vlan-id>` — so a tagged group resolved to `<member>.<unit>`
+// matched neither masterIfaces nor rgScoped, and the filter's "not RG-scoped
+// implies node-local, always keep" arm kept it on a node that masters nothing.
+// Measured before this change, with no RG mastered:
+//
+//	group reth1.80 -> kept as "ge-0-0-1.80"   (should have been dropped)
+//
+// Config.ResolveKernelIfName is that canonical resolver, and it is the same one
+// rethInterfacesMatchingRG's arms reproduce — so the two sides of the filter
+// comparison now derive their names the same way instead of being asserted to
+// agree (#8994's doctrine).
 //
 // #9141: it used to take a *config.DHCPServerConfig and rewrite
 // `group.Interfaces[i]` IN PLACE. Every caller looked safe — two of them did
@@ -2698,7 +2725,7 @@ func resolveDHCPRethInterfaces(dhcpCfg config.DHCPServerConfig, cfg *config.Conf
 			if group.Interfaces != nil {
 				ifaces := make([]string, len(group.Interfaces))
 				for i, iface := range group.Interfaces {
-					ifaces[i] = config.LinuxIfName(cfg.ResolveReth(iface))
+					ifaces[i] = cfg.ResolveKernelIfName(iface)
 				}
 				cp.Interfaces = ifaces
 			}

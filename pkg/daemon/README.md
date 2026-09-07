@@ -1148,6 +1148,28 @@ must re-drive it, and a third that must NOT) and
 `dhcp-local-server` / `dhcpv6-local-server` group this node serves. Two
 properties, both wrong before #6520.
 
+**It names the kernel device, not an approximation of it (#9407).**
+`resolveDHCPRethInterfaces` used to translate with
+`LinuxIfName(ResolveReth(ref))` — the slash rewrite and the RETH member map,
+and nothing else. That is two arms short of `Config.ResolveKernelIfName`, and
+both gaps produced a name Kea cannot bind: `reth1.0` → `ge-0-0-1.0` (a dangling
+unit suffix) and `reth1.80` with `vlan-id 180` → `ge-0-0-1.80` (the unit
+number, not the VLAN device). Only the CLUSTER path papered over the first,
+with `stripUntaggedUnitSuffix` (#4647), so the STANDALONE builder named a
+phantom device on identical config.
+
+The vlan-id gap did more than misname a device. This filter compares the
+group's resolved interface against `rethInterfacesMatchingRG`, which ALREADY
+derives `<member>.<vlan-id>` — so a tagged group resolved to `<member>.<unit>`
+matched neither `masterIfaces` nor `rgScoped`, and the #6520 "not RG-scoped
+implies node-local, always keep" arm below kept a redundancy-group-owned
+segment on a node that masters nothing. Measured with no RG mastered: the group
+survived as `ge-0-0-1.80`. The derivation is now the canonical resolver, which
+is the same rule `rethInterfacesMatchingRG`'s arms reproduce, so the two sides
+of the compare derive names identically rather than being asserted to agree
+(#8994's doctrine). `TestKeaAndRGSetsDeriveNamesIdentically9407` binds that
+over a corpus rather than only on the outcomes today's cells enumerate.
+
 **It does not mutate the active config (#9141).** RETH logical names are
 translated to physical member Linux names by `resolveDHCPRethInterfaces`, which
 RETURNS a copy. It used to take a `*config.DHCPServerConfig` and rewrite
