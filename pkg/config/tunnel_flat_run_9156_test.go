@@ -56,23 +56,46 @@ func TestTunnelFlatRunSurvivesAnUntypedHead9156(t *testing.T) {
 			"no arm below can be read", oracle.Source, oracle.Destination)
 	}
 
+	// #9157 MOVED THE ADMISSION HEAD, and this is the part of the change that
+	// touches another issue's guard, so it is written down rather than absorbed.
+	//
+	// Every arm below used `keepalive-retry 5` as the untyped head. #9157 typed
+	// that leaf (ValueInteger, 1..255) because an unbounded retry count made the
+	// runtime's `Failures >= MaxRetries` check unreachable, and a TYPED head is
+	// rejected by validateModifierChild:
+	//
+	//	set … tunnel keepalive-retry 5 source 10.0.0.1 destination 10.0.0.2
+	//	  -> interfaces gr-0/0/0 unit 0 tunnel keepalive-retry:
+	//	     unknown modifier "source"
+	//
+	// So these four arms would t.Fatalf on the STRICT REJECT and stop measuring
+	// what they are for. The cell's SUBJECT is "an untyped head must not swallow
+	// the run", not "keepalive-retry specifically", and `routing-instance` is the
+	// container's OTHER untyped head -- named as such by #9156's own doc comment,
+	// still untyped, and already exercised by the sibling cell below. Re-pointing
+	// the fixture keeps the subject; deleting the arms would have removed the
+	// coverage while looking like a passing suite.
+	//
+	// The head that LEFT is pinned in the other direction by
+	// TestKeepaliveRetryHeadIsRejectedOnceTyped9157, so "keepalive-retry no
+	// longer admits a run" is asserted rather than merely no longer tested.
 	for _, tc := range []struct {
 		name  string
 		lines []string
 	}{
 		{"A: head swallows BOTH endpoints", []string{
-			"set interfaces gr-0/0/0 unit 0 tunnel keepalive-retry 5 source 10.0.0.1 destination 10.0.0.2",
+			"set interfaces gr-0/0/0 unit 0 tunnel routing-instance destination VR1 source 10.0.0.1 destination 10.0.0.2",
 		}},
 		{"B: source on its own line, DESTINATION eaten", []string{
 			"set interfaces gr-0/0/0 unit 0 tunnel source 10.0.0.1",
-			"set interfaces gr-0/0/0 unit 0 tunnel keepalive-retry 5 destination 10.0.0.2",
+			"set interfaces gr-0/0/0 unit 0 tunnel routing-instance destination VR1 destination 10.0.0.2",
 		}},
 		{"C: destination on its own line, SOURCE eaten", []string{
 			"set interfaces gr-0/0/0 unit 0 tunnel destination 10.0.0.2",
-			"set interfaces gr-0/0/0 unit 0 tunnel keepalive-retry 5 source 10.0.0.1",
+			"set interfaces gr-0/0/0 unit 0 tunnel routing-instance destination VR1 source 10.0.0.1",
 		}},
 		{"interface-level, not unit-level", []string{
-			"set interfaces gr-0/0/0 tunnel keepalive-retry 5 source 10.0.0.1 destination 10.0.0.2",
+			"set interfaces gr-0/0/0 tunnel routing-instance destination VR1 source 10.0.0.1 destination 10.0.0.2",
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

@@ -162,6 +162,14 @@ func (d *Daemon) reconcileFlowExporters(cfg *config.Config) bool {
 	}
 	v9 := d.reconcileV9Exporter(cfg)
 	ipfix := d.reconcileIPFIXExporter(cfg)
+	// #9166: a build failure here used to wait for the NEXT COMMIT, which on a
+	// stable box is never — while the two faults that cause one (unresolvable
+	// collector DNS, a pinned source bind before the interface is up) both
+	// clear on their own minutes later. Arm the autonomous retry instead.
+	//
+	// Armed HERE, outside both reconcile mutexes: armFlowExportRetry's loop
+	// re-enters reconcileFlowExporters, which takes them.
+	d.noteFlowExportBuildResult()
 	return v9 || ipfix
 }
 
@@ -172,6 +180,13 @@ func (d *Daemon) reconcileV9Exporter(cfg *config.Config) bool {
 	defer d.flowReconMu.Unlock()
 
 	ecs := d.buildFlowExportConfigs(cfg)
+	// #9166: record the CONFIGURED group count before the hash gate. It is the
+	// denominator that separates "flow export is not configured" from
+	// "configured and the build failed" — two states that produced the
+	// identical observation on every surface. len(d.flowExporters) cannot
+	// stand in for it: on a build failure with nothing previously running it
+	// is 0, which is exactly the not-configured reading.
+	d.flowConfiguredGroups.Store(int64(len(ecs)))
 	h := flowExportConfigHash(ecs)
 	if d.flowHashSet && h == d.flowHash {
 		return false // gated: healthy exporters keep running
@@ -395,6 +410,10 @@ func (d *Daemon) reconcileIPFIXExporter(cfg *config.Config) bool {
 	defer d.ipfixReconMu.Unlock()
 
 	ecs := d.buildIPFIXExportConfigs(cfg)
+	// #9166: see reconcileV9Exporter — the configured count is recorded before
+	// the hash gate so the metrics surface can tell not-configured from
+	// configured-and-failed.
+	d.ipfixConfiguredGroups.Store(int64(len(ecs)))
 	h := flowExportConfigHash(ecs)
 	if d.ipfixHashSet && h == d.ipfixHash {
 		return false

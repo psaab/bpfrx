@@ -15,6 +15,7 @@ func newCollector(srv *Server) *xpfCollector {
 	c.initControlPlaneDescriptors()
 	c.initAutomationDescriptors()
 	c.initSyslogDropDescriptors()
+	c.initFlowExportBuildDescriptors()
 	c.initIPMonitoringDescriptors()
 	c.initCoSDescriptors()
 	c.initWorkerDescriptors()

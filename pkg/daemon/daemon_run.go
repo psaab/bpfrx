@@ -111,6 +111,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// runShutdownSequence; this POST-fence re-wait runs after the HA fence has
 	// already completed, so its extra budget is harmless.
 	defer d.stopIPsecRebindLoop()
+	defer d.stopFlowExportRetryLoop() // #9166
 	defer d.stopAggregator()
 	d.startPolicySchedulerLoopLocked()
 

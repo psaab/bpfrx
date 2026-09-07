@@ -398,6 +398,24 @@ type Daemon struct {
 	// kept running so export stayed up; cleared on the next successful
 	// reconcile. Surfaced via FlowExportError().
 	flowExportErr error
+	// #9166: the CONFIGURED NetFlow v9 / IPFIX template-group counts, recorded
+	// by each reconcile BEFORE its hash gate. Without them, "not configured"
+	// and "configured but the build failed" are the same observation on every
+	// surface — the health family is omitted in both cases, and `show` renders
+	// the config as present in both. Read lock-free by the metrics collector.
+	flowConfiguredGroups  atomic.Int64
+	ipfixConfiguredGroups atomic.Int64
+	// #9166: single-flight lifecycle of the autonomous flow-exporter build
+	// retry. reconcileFlowExporters runs only from the apply tail and the boot
+	// block, so before this the retry cadence was "the next commit" — which on
+	// a stable box is never, while the two faults that cause a build failure
+	// (collector DNS, a source bind before the interface is up) both clear on
+	// their own minutes later.
+	flowRetry flowExportRetryState
+	// flowRetryActiveCfg is a test seam for the config the retry loop
+	// reconciles against; production reads the LIVE active config so a commit
+	// removing flow export converges the loop.
+	flowRetryActiveCfg func() *config.Config
 	// #4963 fixed-cardinality handoff-drop totals. Each exporter of a family
 	// is injected (SetHandoffCounter) with a pointer to the matching counter
 	// here, so a session-close record rejected because it reached an exporter

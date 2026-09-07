@@ -465,8 +465,22 @@ func vrrpGroupSchemaNode(v6 bool) *schemaNode {
 //     de-facto GRE keepalive ceiling and is far under the int64-ns
 //     overflow; the runtime also clamps (pkg/routing/tunnel.go
 //     clampKeepaliveIntervalSec) as defense-in-depth.
-//   - keepalive-retry: deliberately untyped (pass-through count consumed
-//     by the keepalive prober only when > 0; never a Duration multiply).
+//   - keepalive-retry: typed 1..255 (#9157). It WAS deliberately untyped, on
+//     the rationale that it is "a pass-through count consumed by the keepalive
+//     prober only when > 0; never a Duration multiply". That rationale is
+//     accurate and it answers a DIFFERENT question: it rules out the #5705
+//     OVERFLOW, and the harm here is REACHABILITY. `keepaliveTick` transitions
+//     the tunnel down at `state.Failures >= state.MaxRetries`
+//     (pkg/routing/tunnel_keepalive_runner.go), Failures increments once per
+//     probe tick, and the runner normalizes only `<= 0 -> 3`
+//     (startKeepalive) — so `keepalive-retry 99999999999` committed clean and
+//     left dead-peer detection permanently unreachable: the tunnel is never
+//     declared down and traffic keeps being handed to a dead peer, with the
+//     configured value rendered back by `show configuration`. The `abc` row is
+//     the other half: a typo'd value became the silent default 3 rather than a
+//     commit error, because compiler_interfaces.go discards the strconv error.
+//     1..255 is Junos's own range for this leaf; 0 is rejected rather than
+//     silently meaning "the default 3".
 func tunnelSchemaChildren() map[string]*schemaNode {
 	return map[string]*schemaNode{
 		"source": {
@@ -537,7 +551,19 @@ func tunnelSchemaChildren() map[string]*schemaNode {
 			validator:     ValidateInteger(0, 32767),
 			children:      nil,
 		},
-		"keepalive-retry": {desc: "Keepalive retry count", args: 1, placeholder: "<number>", children: nil},
+		"keepalive-retry": {
+			desc:        "Keepalive retry count",
+			args:        1,
+			placeholder: "<number>",
+			valueType:   ValueInteger,
+			valueDesc: "Consecutive failed keepalive probes before the tunnel is declared " +
+				"down (1..255, Junos range; default 3). Bounded so `Failures >= MaxRetries` " +
+				"stays REACHABLE — an unbounded count makes the dead-peer check in " +
+				"pkg/routing/tunnel_keepalive_runner.go never fire (#9157)",
+			valueExamples: []string{"3", "5"},
+			validator:     ValidateInteger(1, 255),
+			children:      nil,
+		},
 		"routing-instance": {desc: "Routing instance", children: map[string]*schemaNode{
 			"destination": {desc: "Destination routing instance", args: 1, placeholder: "<name>", children: nil},
 		}},

@@ -609,6 +609,11 @@ func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventB
 		// #2464: per-collector NetFlow v9 / IPFIX write-health for the
 		// xpf_flow_export_collector_* family + /services/flow-exporters.
 		FlowCollectorHealthFn: d.FlowCollectorHealth,
+		// #9166: per-family flow-export BUILD health. The write-health family
+		// above is omitted when its slice is empty, which is exactly what a
+		// failed build produces — so on its own it reports a dead exporter and
+		// an unconfigured box identically.
+		FlowExportBuildStateFn: d.FlowExportBuildStates,
 		// #3747: per-exporter pending-batch queue depth / high-water /
 		// dropped-at-capacity count for the xpf_flow_export_batch_* family.
 		FlowExportBatchStatsFn: d.FlowExportBatchStats,
