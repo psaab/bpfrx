@@ -547,9 +547,42 @@ func validateClassOfServiceStrict(cos *ClassOfServiceConfig) error {
 		if sched == nil {
 			continue
 		}
-		if sched.EqualFlowEnforcement && (!sched.TransmitRateExact || sched.TransmitRateBytes == 0) {
+		// #9366: the guarantee must be EXACT and must express SOME rate --
+		// but "some rate" is not only the absolute byte field.
+		//
+		// This gate read `TransmitRateBytes == 0` alone, so
+		// `transmit-rate percent <n> exact` and `transmit-rate remainder exact`
+		// were REJECTED AT COMMIT: both set `TransmitRateExact = true` and leave
+		// `TransmitRateBytes` at 0, because the rate lives in
+		// `TransmitRatePercent` / `TransmitRateRemainder`. The error then told
+		// the operator to supply the exact transmit rate they had just written
+		// as a percentage or a remainder.
+		//
+		// The gate predates #4228 Gap 2 (percent) and #6846 (remainder), which
+		// made both forms first-class, and was not revisited. Three
+		// corroborations that this is a defect rather than policy:
+		//
+		//   - The DATAPLANE resolves both forms. `forwarding_build/cos.rs`
+		//     derives `guarantee_enabled` from
+		//     `cos_effective_transmit_rate_bytes(...).or_else(remainder)` --
+		//     `Some` for percent and for remainder -- then gates
+		//     `equal_flow_enforcement` on `guarantee_enabled &&
+		//     transmit_rate_exact`. This Go gate was the sole blocker.
+		//   - The SCHEMA deliberately admits `exact` trailing a percent operand
+		//     (`validateCoSRateTail` / `coSRateSiblingSuppliesValue`).
+		//   - `surplus-sharing`, one field away, already accepts the percent
+		//     form -- so the asymmetry was not a stated policy.
+		//
+		// Deliberately still rejected: `equal-flow-enforcement` with no `exact`
+		// at all, and with an absolute rate of zero. The feature needs a
+		// guarantee to enforce against, and this predicate says which forms
+		// express one rather than assuming the absolute field is the only one.
+		if sched.EqualFlowEnforcement &&
+			(!sched.TransmitRateExact || !schedulerExpressesATransmitRate9366(sched)) {
 			return fmt.Errorf(
-				"class-of-service scheduler %q equal-flow-enforcement requires positive transmit-rate exact",
+				"class-of-service scheduler %q equal-flow-enforcement requires a positive "+
+					"transmit-rate with `exact` (an absolute rate, `percent <n>`, or "+
+					"`remainder`)",
 				sched.Name)
 		}
 		if sched.EqualFlowEnforcement && sched.SurplusSharing {
@@ -670,4 +703,27 @@ func validateClassOfServiceStrict(cos *ClassOfServiceConfig) error {
 		}
 	}
 	return nil
+}
+
+// schedulerExpressesATransmitRate9366 reports whether the scheduler names a
+// transmit rate in ANY of the three first-class forms.
+//
+// #9366: extracted rather than inlined so each form can be driven directly.
+// The predicate this replaces was a single `Bytes == 0` test, which is exactly
+// the shape that silently excludes forms added later -- percent (#4228 Gap 2)
+// and remainder (#6846) both leave `Bytes` at zero because their value lives in
+// a different field. A named predicate makes the omission of a fourth form a
+// visible edit here rather than an invisible one at every call site.
+//
+// This mirrors the dataplane's own resolution order
+// (`cos_effective_transmit_rate_bytes(...).or_else(remainder)`); the two must
+// agree, or a config the compiler accepts builds a lease the dataplane declines
+// to arm, which is the silent direction.
+func schedulerExpressesATransmitRate9366(sched *CoSScheduler) bool {
+	if sched == nil {
+		return false
+	}
+	return sched.TransmitRateBytes > 0 ||
+		sched.TransmitRatePercent > 0 ||
+		sched.TransmitRateRemainder
 }
