@@ -18,7 +18,7 @@ func (f *recordingRuleOps9420) RuleAdd(r *netlink.Rule) error {
 	f.added = append(f.added, *r)
 	return nil
 }
-func (f *recordingRuleOps9420) RuleDel(*netlink.Rule) error         { return nil }
+func (f *recordingRuleOps9420) RuleDel(*netlink.Rule) error          { return nil }
 func (f *recordingRuleOps9420) RuleList(int) ([]netlink.Rule, error) { return nil, nil }
 func (f *recordingRuleOps9420) RuleAddDSCP(r *netlink.Rule, _ uint8) error {
 	f.added = append(f.added, *r)
