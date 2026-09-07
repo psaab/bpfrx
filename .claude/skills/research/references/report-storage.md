@@ -1,7 +1,11 @@
 # Research report and workspace storage
 
-Every research run publishes its evidence, dispositions, three-reviewer coverage
-and actual issue/tagging ledger. Classify inputs by reconciled provenance, not by
+Every new research investigation publishes its evidence, dispositions,
+three-reviewer coverage and actual issue/tagging ledger. Before starting one for
+a source report, apply [repeat-safe intake](../../deep-review/references/review-lifecycle.md).
+Verified reuse, busy ownership and unchanged-blocked intake create no new run or
+result; admitted work checkpoints its progress in the shared source record.
+Classify inputs by reconciled provenance, not by
 the substring `-review`. A `research-result`, `report-` or `result-` derivative is
 prior validation evidence, not a new deep-review discovery.
 
@@ -15,6 +19,14 @@ to general questions, external reviews, deep-review validation, legacy inputs,
 mixed-input aggregates and solution planning. `/tmp` is compatibility input only,
 never a new output, workspace or staging destination. The archival procedure may
 remove exact verified legacy originals after their archive copies are complete.
+
+At setup, record the actual loaded skill/reference paths and hashes under the
+shared workflow-revision rule. Resolve and announce the work, active-report and
+finished roots and every planned source-to-output mapping before writing. Do not
+derive an output directory from a legacy input, a prior result path or a stale
+skill in the source checkout. A pushed branch is not evidence that the session or
+another checkout is using it; resolve conflicting instructions without changing
+the user's checkout automatically.
 
 ## Output names and coverage
 
@@ -33,19 +45,26 @@ Only completed-research archival subsequently relocates the exact source/result 
 The path inherits the source filename; it does **not** identify the researcher.
 Record the researching model's real `MODEL_RAW`, `MODEL_SOURCE`, `MODEL_HOST` and
 `WHOAMI` in the header/manifest, separately from original finding/discoverer IDs.
+That researching identity is `RESEARCH_WHOAMI`; it does not supply issue `model:`
+labels. Those come from each claim's bound `ORIGIN_WHOAMI` in the shared contract.
 Verify the result basename against the source, not against the researcher's model.
 
-For multiple deep-review inputs, publish one self-contained scoped result per
-distinct source in the new reports root. Include every claim's disposition and
-evidence, reviewer coverage and actual issue URLs. Retain a common research run ID,
-cross-source finding/issue mappings and other output locators; shared findings are
+For multiple deep-review inputs, provide one self-contained scoped result per
+distinct source: reuse a verified completed result that covers this request and
+publish new results only for admitted investigation/finalization work. Include
+every claim's disposition and
+evidence, reviewer coverage and actual issue URLs. Newly produced reports share
+the current research run ID; reused reports keep their immutable historical run
+IDs. The current manifest/aggregate maps each source and historical/current attempt
+to its result. Retain cross-source finding/issue mappings and other output
+locators; shared findings are
 not filed again. Reconcile copies by source identity instead of inventing discoveries.
 
 General research and non-deep-review inputs use
 `/var/tmp/deep-review-reports/result-<WHOAMI>-research-<RESEARCH_SLUG>-NNN.md`.
 A mixed-input run also writes this aggregate result for the complete investigation,
-linking the scoped
-per-source reports so external-review claims/general answers are not lost. Prior
+linking the scoped per-source reports (reused and new) so external-review claims
+and general answers are not lost. Prior
 research derivatives link back to their original inputs; never recursively publish
 `report-report-*` as a new discovery result. If researching one again, reconcile
 its original source for the next snapshot, or use the standard result when that
@@ -53,7 +72,9 @@ source cannot be resolved and record the limitation.
 
 Never overwrite a previous result. Reconcile existing results and filing history
 in the active root, finished archive and legacy locations before naming a new
-snapshot. If a verified result for this source already exists, a later run publishes an immutable
+snapshot. A verified result that covers the current request is returned without a
+new snapshot. If explicit revalidation or changed requirements need another
+assessment, publish an immutable
 snapshot in `/var/tmp/deep-review-reports/` named
 `report-<source-stem>-research-<WHOAMI>-<RESEARCH_SLUG>-NNN.md`, choosing the next
 unused number across matching active/finished/legacy basenames and linking prior snapshots.
@@ -64,7 +85,8 @@ not a report to reuse or overwrite. Concurrent collisions require the same check
 
 ## Owned scratch and atomic publication
 
-For every research run, allocate
+For admitted new/resumable investigation, after the source processing claim where
+applicable, allocate
 `mktemp -d /var/tmp/deep-review-work/research-work.XXXXXXXXXX`, after ensuring the
 parent is a real directory. Keep all worktrees (including documentation/plan
 worktrees), drafts, reviewer outputs, manifests, evidence and staging inside this
@@ -84,6 +106,11 @@ destination parent is a real directory, freeze the complete draft, then publish
 atomically create-if-absent using `ln -T -- <draft> <final>`. No symlink following,
 replacing copy or partial final pathname. Inspect any collision/ambiguous failure
 before retrying; verify the exact final bytes/header and never edit a linked draft.
+Read back the actual published file at its absolute configured-root path, not just
+the path claimed inside its header or a tool's success response. A new result
+found under `/tmp` is misplaced output, not completed publication. Record that
+failure and reconcile the owned artifact safely; do not overwrite legacy files,
+refile issues, or silently claim that the configured destination was used.
 Keep completed per-source reports immutable if another output fails. A later immutable
 aggregate or run ledger records the final per-output status.
 

@@ -15,7 +15,9 @@ reviewed revision, run ID, finding IDs, and evidenced discovering model or autho
 Record missing metadata explicitly. Keep the researcher and source-report
 coordinator separate from per-finding discoverers. A filename, host, or generic
 "GPT" description does not establish an exact model; do not inherit the current
-researcher's model or manufacture `source:research` for unknown origins.
+researcher's model or manufacture `source:research` for unknown origins. Apply
+the shared discovery-credit binding gate before disposition synthesis; the
+original report's claim-to-author mapping survives later validation results.
 
 For missing IDs, assign local intake IDs mapped to the input artifact hash and
 claim location; these are not invented historical run IDs. Copies of one report
@@ -32,7 +34,10 @@ When a claim mixes several assertions, split linked subclaims without losing
 the original ID. A wrong line number or mechanism may still point to a real
 concern; investigate it without silently rewriting the claim. Record any genuinely
 different newly discovered defect under a new research finding ID, link the lead,
-and distinguish its actual discoverer from the original report's author.
+and distinguish its actual discoverer from the original report's author. Show the
+distinct problem/corrective scope before calling it research-origin. Establishing
+the valid narrower form of a report claim, including one previously scored NEG,
+retains that report's origin; proof and discovery are not interchangeable.
 
 ## Establish and challenge the behavior
 

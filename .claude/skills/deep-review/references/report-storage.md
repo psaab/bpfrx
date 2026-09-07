@@ -22,6 +22,16 @@ research archival is the only routine relocation of its exact source/result set.
 Always reconcile original repository/run/finding keys and prior snapshots across
 both layouts. A marker or duplicate copy is not a new discovery or a final verdict.
 
+The first triage result keeps `result-<source-report-stem>.md`. When admitted
+revalidation or changed filing/output requirements need a later result, publish
+`result-<source-report-stem>-triage-<WHOAMI>-NNN.md` in the reports root. Preserve
+the source stem and full evidenced triage coordinator prefix; reconcile sequence
+numbers across active, finished and legacy roots and link prior snapshots. Reuse
+an existing verified result only when it covers the requested work. An unrelated
+occupant at the first-result path is a blocker, not a reason to evade collision
+checks with a new name. Sequenced collisions use the next reconciled number and
+an updated draft output path; never overwrite a published result.
+
 Shared review/issue indexes belong directly under `/var/tmp/deep-review-work/`;
 per-report state and locks use its `state/` and `locks/` subdirectories. Follow
 the shared contract's filing-mutex path and migration gate so older workers do
@@ -35,6 +45,10 @@ workspace, later snapshots and multi-input handling. `/tmp` is read-only legacy
 compatibility, never a new write or staging destination for any of these workflows;
 archival may remove exact legacy originals after verifying their finished copies.
 `report-` and `result-` derivatives are not new discovery inputs.
+Use [review lifecycle and progress](review-lifecycle.md) to register verified
+source finals, checkpoint research and select `PROCESS`/`RESUME`/skip outcomes.
+Its per-source JSON records, not basename markers or cached title matches, track
+completed work. Missing registration is recovered by scanning actual source finals.
 
 ## Atomic publication
 
@@ -51,7 +65,8 @@ An existing file, symlink or directory at the exact final name is a collision,
 never an overwrite target or directory to follow into. For a discovery collision,
 select the next unused number across active, finished and legacy report roots, update the
 draft/manifest output path, and retry. For an existing triage result, reconcile
-that result's identity and work instead of overwriting or assigning a new identity.
+that result's identity and work before reusing it or publishing an admitted later
+snapshot as defined above, without assigning the source a new discovery identity.
 Inspect the exact target after any ambiguous failure before retrying.
 
 Verify final bytes and header/path identity after publication. Never edit a

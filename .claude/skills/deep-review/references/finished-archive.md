@@ -32,8 +32,10 @@ identity remains a blocker, not an automatic remote-source exemption.
 
 ## Verified, resumable move
 
-Use the shared repository mutex and canonical per-report locks defined in the
-review contract, in that order. Hold them through archival reconciliation and
+Reuse the attempt's held processing claims, or acquire them through
+[review lifecycle and progress](review-lifecycle.md) for standalone resumption.
+Then use the shared repository mutex and canonical per-report locks defined in
+the review contract, in that order. Hold them through archival reconciliation and
 removal, including report-only research. Coordinate incompatible older writers
 before proceeding; inability to establish ownership is a blocker, not permission
 to race another worker. No GitHub mutation is implied by acquiring a local lock.
@@ -68,6 +70,11 @@ to race another worker. No GitHub mutation is implied by acquiring a local lock.
    verifies and every intended active original has been removed. Return both the
    archived source and result locations, or the explicit external-source exception
    above, with the retained staging/ledger for recovery.
+7. Checkpoint verified archive paths and the relocation-ledger reference in each
+   source's lifecycle record. Mark the applicable attempt `DONE` only if its other
+   required outputs/filing/review obligations are also complete. A crash before
+   this state update is recovered from the verified ledger/artifacts; it must
+   not cause the research itself to run again.
 
 This is a recoverable multi-file move, not an atomic two-file rename. After a
 crash, reconcile the ledger, hashes and actual paths before continuing. A file
@@ -89,7 +96,9 @@ or numbering. Read both archived originals and `report-`/`result-` derivatives,
 but never enqueue finished history or derivatives as fresh discoveries. Cached
 indexes are leads and must not hide archived-only findings or current issue state.
 
-Explicit re-research of an archived source reads it in place, creates any new
+Ordinary repeated intake returns the verified completed assessment through the
+lifecycle gate, without a new report or reviewer dispatch. Explicit re-research
+of an archived source reads it in place, creates any new
 result in the active reports root, and archives that new result when ready. Keep
 the original and prior snapshots in the archive; do not move them back, create
 compatibility aliases, or treat a new research run as a new discovery.

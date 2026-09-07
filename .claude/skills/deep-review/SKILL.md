@@ -18,6 +18,10 @@ state transitions, and failure, not only whether the intended path works.
 Read [the shared review contract](references/review-contract.md) before discovery
 or triage. It owns severity, evidence, dispositions, report fields, and completion
 criteria shared by this skill, `review-triage`, and code-finding research.
+Use [review lifecycle and progress](references/review-lifecycle.md) for source
+registration and repeat-safe handoff to research. Active reports use
+`/var/tmp/deep-review-reports/`, work/state use `/var/tmp/deep-review-work/`,
+and completed source/result pairs use `/var/tmp/deep-review-finished/`.
 
 ## Scope and modes
 
@@ -329,6 +333,10 @@ from `/var/tmp/deep-review-finished/`, legacy `/tmp/` reports, durable
 originals and their research-result ledgers: an archive location is not proof of
 a fix or permanent dismissal. Follow [finished-review archival](references/finished-archive.md)
 to resolve relocated paths and partial active/archive copies by source identity.
+Read the source's lifecycle record and completed research checkpoints as well as
+its reports: distinguish not yet researched, in progress, blocked and completed.
+That state prevents duplicate report processing; it does not exempt changed code
+or an unresolved protection question from this discovery scope.
 Check repository identity before deduplication. Paginate needed
 history, include relevant closed issues and fixing PRs, record freshness/limits,
 and search candidate-specific bodies and acceptance criteria. A title match,
@@ -350,7 +358,8 @@ that model is evidenced.
 Use the shared filing/provenance contract to mark each finding's actual issue
 status, originating model, issue URL and verified origin tags. When filing is
 authorized during the run, reconcile that ledger before freezing the report;
-acquire the contract's shared repository filing mutex before any per-report lock
+acquire any required source processing claims before the contract's shared
+repository filing mutex, then any per-report lock,
 and hold it through filing, readback and publication. A finding discovered here
 uses `source:deep-review`; later research does not replace its source/model credit.
 When filing happens later, return the self-contained triage result with the
@@ -383,6 +392,11 @@ Completed research later archives the source and result through the shared
 finished-review procedure; discovery must keep consulting those archived records.
 
 Verify the published report is complete and the artifact references resolve.
+Register the verified source and hash as `PENDING` in
+`/var/tmp/deep-review-work/state/reviews/<review-key>.json` through the lifecycle
+contract. Reconcile an existing record rather than resetting its progress. If
+publication succeeds but registration does not, return the exact pending state
+write; consumers recover it from the verified source, not a duplicate report.
 Preserve test-only diffs, outputs, manifest, and supporting evidence until
 archived or handed off; include the decisive evidence inline so the report does
 not depend on a worker checkout. Cleanup only recorded owned worktrees, using
