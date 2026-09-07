@@ -562,6 +562,14 @@ func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventB
 			}
 			return nil
 		},
+		// #9165: surface per-collector remote-syslog drop counters. Until
+		// this call site existed, all three SyslogClient drop accessors had
+		// zero production readers — a counted drop reached an operator only
+		// through the package's own rate-limited slog.Warn, and a warning
+		// that has been rate-limited away leaves nothing behind. Syslog is
+		// where an operator looks after an incident; a dead collector means
+		// that record does not exist while `show` still renders it present.
+		SyslogDropsFn: d.syslogDropStats,
 		// #3042: live feed-prefix overlay so the REST match-policies
 		// simulator resolves feed-backed address-names to their live
 		// CIDRs, matching what the AF_XDP helper enforces.

@@ -101,7 +101,7 @@ use super::snapshot::{ConfigSnapshot, FabricSnapshot, NeighborSnapshot, Userspac
 /// degrading to the old behaviour is a sound argument for a FEATURE; it is not
 /// sound when the old behaviour IS the defect the field was added to fix, and
 /// for those the bump is the only mechanism that refuses the pairing.
-pub(crate) const CONFIG_SNAPSHOT_PROTOCOL_VERSION: i32 = 10;
+pub(crate) const CONFIG_SNAPSHOT_PROTOCOL_VERSION: i32 = 11;
 
 /// #9344: the owner-RG session export paging contract this helper implements.
 ///

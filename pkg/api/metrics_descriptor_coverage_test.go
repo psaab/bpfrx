@@ -18,6 +18,7 @@ import (
 	"github.com/psaab/xpf/pkg/dhcp"
 	"github.com/psaab/xpf/pkg/dhcpserver"
 	"github.com/psaab/xpf/pkg/ipmon"
+	"github.com/psaab/xpf/pkg/logging"
 )
 
 // #1726: whole-collector Prometheus descriptor-coverage canary.
@@ -428,6 +429,14 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 		// xpf_ipsec_rebind_pending gauge emits and the canary covers its
 		// descriptor declaration.
 		ipsecRebindPendingFn: func() bool { return true },
+		// #9165: wire a non-nil syslog drop source so the
+		// xpf_syslog_messages_dropped_total family emits and the canary
+		// covers its descriptor declaration.
+		syslogDropsFn: func() []logging.SyslogDropStat {
+			return []logging.SyslogDropStat{
+				{RemoteAddr: "10.0.0.9:514", Protocol: "udp", Writes: 2},
+			}
+		},
 		// #1827: wire a non-nil ip-monitoring status source so the
 		// xpf_ipmon_* family emits and the canary covers its
 		// descriptor declarations.
@@ -594,6 +603,11 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 		"xpf_userspace_cos_sojourn_ewma_ns",
 		"xpf_userspace_cos_sojourn_peak_ns",
 		"xpf_userspace_cos_sojourn_windowed_min_ns",
+		// #9165: remote-syslog drop counters. The three SyslogClient drop
+		// accessors had zero production readers before this family existed,
+		// so the canary is what keeps the reader from being deleted back to
+		// nothing without a test going red.
+		"xpf_syslog_messages_dropped_total",
 	}
 	if ifaceResolvable {
 		want = append(want, "xpf_interface_packets_total") // collectInterfaceCounters (lo)

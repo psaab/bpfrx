@@ -359,6 +359,9 @@ type xpfCollector struct {
 	// gauge is 1 while a retained snapshot is being served as stale.
 	feedSecondsSinceSuccess *prometheus.Desc
 	feedStale               *prometheus.Desc
+	// #9165: per-collector remote-syslog drop counters. Control-plane —
+	// emitted before the dataplane gate.
+	syslogMessagesDropped *prometheus.Desc
 
 	// #709: CoS owner-profile telemetry (userspace dataplane only).
 	// Cardinality estimate per plan §5: num_queues (≤ 64) × num_interfaces
@@ -918,6 +921,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.eventStreamSubscriberDropped
 	ch <- c.feedSecondsSinceSuccess
 	ch <- c.feedStale
+	ch <- c.syslogMessagesDropped
 	ch <- c.cosDrainLatencyBucket
 	ch <- c.cosDrainInvocationsTotal
 	ch <- c.cosRedirectAcquireBucket
@@ -1431,6 +1435,12 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 				prometheus.GaugeValue, stale, name)
 		}
 	}
+
+	// #9165: remote-syslog drop counters. Control-plane — the syslog clients
+	// run whether or not the dataplane is loaded, and a box that failed to
+	// load its dataplane is exactly the box whose logs an operator needs, so
+	// this is emitted BEFORE the dataplane gate.
+	c.collectSyslogDrops(ch)
 
 	// #2464: per-collector flow-export write-health is a control-plane
 	// signal — the exporters run independent of the dataplane — so emit it

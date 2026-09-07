@@ -52,8 +52,16 @@ func buildScreenSnapshots(cfg *config.Config) []ScreenProfileSnapshot {
 			// Profile-wide audit/log-only modifier. Not a "check" itself —
 			// it is intentionally omitted from the emit-gate below, so a
 			// profile carrying ONLY alarm-without-drop (no enabled check)
-			// is a no-op and is not published. When any check IS enabled it
-			// rides along and flips every drop to a log-only alarm.
+			// does not make the zone enforcing and is not published here.
+			// When any check IS enabled it rides along and flips every drop
+			// to a log-only alarm.
+			//
+			// #9425: "is a no-op" was the wrong word and it hid a defect. The
+			// zone still lands in the INERT set, where #7888 substitutes
+			// `conservative_default()` and DROPS the malformed-packet set —
+			// so the modifier was not inert, it was INVERTED. The flag now
+			// travels on ScreenInertProfileRefs.AlarmWithoutDrop so the
+			// substituted checks still run and alarm instead of dropping.
 			AlarmWithoutDrop: sp.AlarmWithoutDrop,
 		}
 		if sp.ICMP.FloodThreshold > 0 {
@@ -627,6 +635,12 @@ func buildScreenInertProfileRefs(cfg *config.Config) []ScreenMissingProfileRef {
 		out = append(out, ScreenMissingProfileRef{
 			Zone:    zone.Name,
 			Profile: zone.ScreenProfile,
+			// #9425: carry the operator's audit request. The profile is
+			// DEFINED here (the undefined case returned above), so this is a
+			// statement the operator actually wrote, and it is the only route
+			// by which the dataplane can honour it — an inert zone has no
+			// `screens` entry for the resolved lookup to find.
+			AlarmWithoutDrop: cfg.Security.Screen[zone.ScreenProfile].AlarmWithoutDrop,
 		})
 	}
 	return out

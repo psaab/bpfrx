@@ -126,9 +126,19 @@ func shapeDigest8892(t *testing.T) (string, int) {
 // gate that catches it is `go test ./...`, not the packages the diff touched.
 // #9424 is the case in point: its change is entirely inside pkg/config and
 // pkg/configstore, and a scoped run over those two packages is green.
+//
+// v10 -> v11 (issue 9425): `ScreenMissingProfileRef.alarm_without_drop`. This
+// one is the OTHER arm — a real, transmitted wire field, so the version moved.
+// A zone whose screen profile is DEFINED but enables no check gets no `screens`
+// entry, so the helper's resolved `alarm_without_drop` lookup missed and the
+// #7888 substituted conservative default HARD-DROPPED. An old helper that
+// ignores the new field decodes false and keeps hard-dropping, and hard-dropping
+// IS the defect — so the answer to "is what it enforced before acceptable?" is
+// no. "Purely additive needs no bump" is a TRUE rule that would have licensed
+// exactly this regression, which is what this cell exists to refuse.
 const (
-	snapshotShapeGolden8892  = "f40353b3185bae9d6d5e95bdd017b8b647c515dc29af82441f838b231a5d143b"
-	snapshotShapeVersion8892 = 10
+	snapshotShapeGolden8892  = "92ea9bf2dcc354b6510cd85d004cd812d560c48e40a3c4f5f6ed5aeeaec8298c"
+	snapshotShapeVersion8892 = 11
 )
 
 func TestSnapshotShapeIsPinnedToProtocolVersion8892(t *testing.T) {

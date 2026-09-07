@@ -194,8 +194,33 @@ impl ZoneScreenState {
     /// still-configured one keeps its live sketch. The SYN-flood alarm cadence
     /// is reset to `u64::MAX` when the alarm is disabled (mirroring the old
     /// remove-on-disable so a later re-enable starts fresh) and otherwise
-    /// preserved. Aggregate counters, cookie active-until, standby budget, and
-    /// profile generation are inherited untouched from the retained value.
+    /// preserved. Aggregate counters, standby budget, and profile generation are
+    /// inherited untouched from the retained value.
+    ///
+    /// #9425 member 2: the SYN-cookie active-until latch is NO LONGER inherited
+    /// unconditionally. A zone under a live flood latches cookie-active for
+    /// `SynCookieCodec::EPOCH_SECS` (64 s). If the operator then commits
+    /// `alarm-without-drop` on that zone TO STOP THE DROPS, the latch was
+    /// inherited here, `locally_active` stayed true in
+    /// `validate_syn_cookie_ack_on_session_miss` (which checks `syn_cookie`,
+    /// the threshold, the protocol and `locally_active` — but never
+    /// `alarm_without_drop`), and parse-valid session-miss ACKs kept taking the
+    /// `Invalid` arm and hard-dropping for up to 64 seconds AFTER the commit
+    /// that was supposed to stop exactly that.
+    ///
+    /// The defect is in the COMPOSITION of two individually deliberate
+    /// mechanisms — #4969 preserves per-zone state across commits, #2446
+    /// selectively invalidates the cookie GENERATION — neither of which resets
+    /// this latch on an audit transition. The freshly-configured-audit case was
+    /// already guarded (`syn_flood_gate` does not set the latch under
+    /// `alarm_without_drop`, pinned by
+    /// `syn_cookie_alarm_without_drop_forwards_session_miss_ack_l10`); this is
+    /// the ENFORCE -> AUDIT transition, which that guard cannot reach because
+    /// the latch was set before the transition.
+    ///
+    /// Clearing it whenever the NEW profile is in audit mode is idempotent with
+    /// that guard: audit mode never sets the latch, so under audit the only
+    /// value it can hold is one inherited from a pre-audit epoch.
     pub(super) fn reconcile_substate(&mut self) {
         reconcile_flood_sketch(
             &mut self.icmp_dst_sketch,
@@ -219,6 +244,10 @@ impl ZoneScreenState {
         );
         if self.profile.syn_flood_alarm_threshold == 0 {
             self.syn_alarm_last_emit_sec = u64::MAX;
+        }
+        // #9425 member 2 — see the doc comment above.
+        if self.profile.alarm_without_drop {
+            self.syn_cookie_active_until_secs = 0;
         }
     }
 

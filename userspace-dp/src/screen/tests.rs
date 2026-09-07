@@ -6398,9 +6398,23 @@ fn substituted_default_excludes_icmp_fragment_7168() {
 // ---------------------------------------------------------------------------
 
 fn inert_ref_state(zone: &str, profile: &str) -> ScreenState {
+    inert_ref_state_with_audit(zone, profile, false)
+}
+
+/// #9425: the same helper, with the profile's `alarm-without-drop` modifier
+/// under the caller's control. `inert_ref_state` keeps the pre-#9425 shape
+/// (audit OFF) so every #7888 cell built on it still asserts the hard-drop
+/// posture verbatim.
+fn inert_ref_state_with_audit(zone: &str, profile: &str, audit: bool) -> ScreenState {
     let mut state = ScreenState::new();
     let mut inert = FxHashMap::default();
-    inert.insert(zone.to_string(), profile.to_string());
+    inert.insert(
+        zone.to_string(),
+        InertProfileRef {
+            profile: profile.to_string(),
+            alarm_without_drop: audit,
+        },
+    );
     state.update_inert_profiles(inert);
     state
 }
@@ -6719,5 +6733,256 @@ fn extract_leaves_a_real_caller_protocol_untouched_9114() {
         info.protocol, 6,
         "a non-sentinel caller protocol must be passed through unchanged — the \
          #9114 recovery is gated on the sentinel, not unconditional"
+    );
+}
+
+// ===================== #9425 member 1 =====================
+//
+// An INERT zone (screen profile DEFINED, no check enabled) has no `zones`
+// entry, so `alarm_without_drop`'s resolved lookup missed and every #7888
+// substituted-default drop was ENFORCED — including for the operator who wrote
+// `set security screen ids-option p alarm-without-drop` and nothing else, which
+// is both the canonical route into the inert state and an explicit request for
+// audit mode. The box did the exact inverse of what was configured, on a commit
+// that reported success with zero warnings.
+//
+// #7888's decision is NOT being contested here: it chose drop over PASS for an
+// inert zone, and that stands — the substituted checks still run, still count,
+// and still warn. This changes only drop vs ALARM, and only for a zone that
+// explicitly asked.
+
+/// The fix. Same inert zone, same LAND packet, but the profile carries
+/// `alarm-without-drop`: the verdict consumers must be told to suppress.
+#[test]
+fn inert_profile_honours_alarm_without_drop_9425() {
+    let mut state = inert_ref_state_with_audit("trust", "p", true);
+    let same = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let land = tcp_pkt(same, same, 5000, 5000, TCP_SYN);
+
+    // The check still RUNS and still produces a Drop verdict — that is what
+    // carries the reason string into the alarm event and what keeps the
+    // substituted-default counter honest. Only the consumer's disposition
+    // changes, and `alarm_without_drop` is the switch it reads.
+    assert!(
+        matches!(
+            state.check_packet("trust", &land, 1),
+            ScreenVerdict::Drop(_)
+        ),
+        "the substituted check must still run and trip — #9425 changes the terminal \
+         disposition, not whether the check happens"
+    );
+    assert_eq!(
+        state.substituted_default_drops(),
+        1,
+        "the substitute is still doing the work and must still be counted"
+    );
+    assert!(
+        state.alarm_without_drop("trust"),
+        "an INERT zone whose DEFINED profile carries alarm-without-drop must report \
+         audit mode; the consumers read exactly this to turn the Drop into a log-only \
+         alarm plus a forward. Before #9425 the `zones` lookup missed and this was \
+         false, so the operator's audit request produced hard drops"
+    );
+}
+
+/// NEGATIVE CONTROL — the same inert zone WITHOUT the modifier must keep
+/// #7888's hard-drop posture. Without this, "always return true" passes the
+/// cell above and silently reverts #7888.
+#[test]
+fn inert_profile_without_the_modifier_still_hard_drops_9425() {
+    let mut state = inert_ref_state("trust", "p");
+    let same = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let land = tcp_pkt(same, same, 5000, 5000, TCP_SYN);
+    assert!(matches!(
+        state.check_packet("trust", &land, 1),
+        ScreenVerdict::Drop(_)
+    ));
+    assert!(
+        !state.alarm_without_drop("trust"),
+        "an inert zone that did NOT ask for audit mode must keep #7888's hard-drop \
+         posture — this is the control that stops the fix from becoming a blanket \
+         revert of #7888"
+    );
+}
+
+/// SECOND NEGATIVE CONTROL — the UNDEFINED set must not inherit the meaning.
+/// `ScreenMissingProfileRef` is shared by both wire sets; on the undefined set
+/// there is no profile to have carried the modifier, so there is no operator
+/// statement to honour and the zone must keep hard-dropping. A shared marshal
+/// that leaked its meaning across the two sets would show up here.
+#[test]
+fn undefined_profile_never_reports_audit_mode_9425() {
+    let mut state = ScreenState::new();
+    let mut missing = FxHashMap::default();
+    missing.insert("trust".to_string(), "ghost".to_string());
+    state.update_missing_profiles(missing);
+    // Also seed the INERT map for a DIFFERENT zone in audit mode, so the cell
+    // fails if the lookup ever answers from the wrong set or ignores the key.
+    let mut inert = FxHashMap::default();
+    inert.insert(
+        "dmz".to_string(),
+        InertProfileRef {
+            profile: "p".to_string(),
+            alarm_without_drop: true,
+        },
+    );
+    state.update_inert_profiles(inert);
+
+    assert!(
+        !state.alarm_without_drop("trust"),
+        "a zone referencing an UNDEFINED profile has no operator audit statement to \
+         honour and must keep hard-dropping the substituted default"
+    );
+    assert!(
+        state.alarm_without_drop("dmz"),
+        "POSITIVE CONTROL at the same instant: the inert audit zone IS in audit mode, \
+         so the assertion above is a real scope boundary and not an empty map"
+    );
+}
+
+/// A RESOLVED zone must be answered from its `zones` entry, not from a stale
+/// inert reference. This is the precedence a two-source lookup can get wrong:
+/// if a zone appears in both (a malformed or mid-transition snapshot), the
+/// live profile is the authority.
+#[test]
+fn resolved_zone_profile_outranks_a_stale_inert_ref_9425() {
+    let mut profile = ScreenProfile::default();
+    profile.land = true;
+    profile.alarm_without_drop = false;
+    let mut state = make_state("trust", profile);
+    let mut inert = FxHashMap::default();
+    inert.insert(
+        "trust".to_string(),
+        InertProfileRef {
+            profile: "p".to_string(),
+            alarm_without_drop: true,
+        },
+    );
+    state.update_inert_profiles(inert);
+    assert!(
+        !state.alarm_without_drop("trust"),
+        "a zone with a published profile must be answered from that profile; the inert \
+         map is the fallback for zones that have NO entry, not an override"
+    );
+}
+
+// ===================== #9425 member 2 =====================
+//
+// `syn_cookie_active_until_secs` was inherited across `update_profiles`
+// (#4969 preserves per-zone state; #2446 invalidates only the cookie
+// GENERATION). So a zone that latched cookie-active under a live flood kept
+// `locally_active` true after the operator committed `alarm-without-drop` TO
+// STOP THE DROPS, and `validate_syn_cookie_ack_on_session_miss` — which checks
+// syn_cookie, the threshold, the protocol and locally_active, but never
+// alarm_without_drop — kept taking the `Invalid` arm for up to 64 s.
+//
+// The FRESHLY-configured audit case was already guarded and is untouched
+// (`syn_cookie_alarm_without_drop_forwards_session_miss_ack_l10`). This is the
+// ENFORCE -> AUDIT transition, which that guard cannot reach because the latch
+// was set before the transition.
+
+fn audit_transition_profile(alarm_without_drop: bool) -> ScreenProfile {
+    let mut p = ScreenProfile::default();
+    p.syn_flood_threshold = 1;
+    p.syn_cookie = true;
+    p.alarm_without_drop = alarm_without_drop;
+    p
+}
+
+#[test]
+fn enforce_to_audit_transition_clears_the_cookie_latch_9425() {
+    let mut state = make_state("trust", audit_transition_profile(false));
+    state.update_syn_cookie_master_key(Some(syn_cookie_key()));
+    state.set_syn_cookie_full_epoch_for_test(1);
+
+    let syn = tcp_pkt(
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
+        49152,
+        443,
+        TCP_SYN,
+    );
+    // Drive the zone over its attack threshold so it LATCHES cookie-active.
+    assert_eq!(
+        state.check_packet_with_zone_id("trust", 7, &syn, 128),
+        ScreenVerdict::Pass
+    );
+    assert!(matches!(
+        state.check_packet_with_zone_id("trust", 7, &syn, 128),
+        ScreenVerdict::SynCookieChallenge(_)
+    ));
+
+    // POSITIVE CONTROL, before the commit: the latch really is armed, so a
+    // parse-invalid session-miss ACK is dropped as Invalid. Without this the
+    // assertion after the commit is satisfied by a zone that was never latched.
+    let mut bogus = syn.clone();
+    bogus.tcp_flags = TCP_ACK;
+    bogus.tcp_seq = 2;
+    bogus.tcp_ack = 0xdead_beefu32;
+    assert_eq!(
+        state.validate_syn_cookie_ack_on_session_miss("trust", 7, &bogus, 128 * NS, 128),
+        SynCookieAckVerdict::Invalid,
+        "control: the zone must be latched cookie-active before the commit"
+    );
+
+    // The operator commits `alarm-without-drop` on this zone to stop the drops.
+    let mut profiles = FxHashMap::default();
+    profiles.insert("trust".to_string(), audit_transition_profile(true));
+    state.update_profiles(profiles);
+
+    // Same packet, same second. Under the defect the inherited latch kept
+    // `locally_active` true and this stayed `Invalid` — a hard drop — for up to
+    // EPOCH_SECS after the commit that was supposed to stop exactly that.
+    assert_eq!(
+        state.validate_syn_cookie_ack_on_session_miss("trust", 7, &bogus, 128 * NS, 128),
+        SynCookieAckVerdict::NotApplicable,
+        "after an ENFORCE -> AUDIT commit the inherited cookie-active latch must not \
+         keep dropping session-miss ACKs (#9425 member 2)"
+    );
+}
+
+/// NEGATIVE CONTROL for member 2 — an ordinary profile edit that does NOT turn
+/// on audit mode must still inherit the latch (#4969). Without this, "clear the
+/// latch on every update_profiles" passes the cell above while destroying the
+/// per-zone state preservation #4969 exists for.
+#[test]
+fn a_non_audit_profile_edit_still_inherits_the_cookie_latch_9425() {
+    let mut state = make_state("trust", audit_transition_profile(false));
+    state.update_syn_cookie_master_key(Some(syn_cookie_key()));
+    state.set_syn_cookie_full_epoch_for_test(1);
+
+    let syn = tcp_pkt(
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
+        49152,
+        443,
+        TCP_SYN,
+    );
+    assert_eq!(
+        state.check_packet_with_zone_id("trust", 7, &syn, 128),
+        ScreenVerdict::Pass
+    );
+    assert!(matches!(
+        state.check_packet_with_zone_id("trust", 7, &syn, 128),
+        ScreenVerdict::SynCookieChallenge(_)
+    ));
+
+    // An UNRELATED edit (enable teardrop): not a SYN-cookie-relevant field, so
+    // neither the generation nor the latch may move.
+    let mut edited = audit_transition_profile(false);
+    edited.teardrop = true;
+    let mut profiles = FxHashMap::default();
+    profiles.insert("trust".to_string(), edited);
+    state.update_profiles(profiles);
+
+    let mut bogus = syn.clone();
+    bogus.tcp_flags = TCP_ACK;
+    bogus.tcp_seq = 2;
+    bogus.tcp_ack = 0xdead_beefu32;
+    assert_eq!(
+        state.validate_syn_cookie_ack_on_session_miss("trust", 7, &bogus, 128 * NS, 128),
+        SynCookieAckVerdict::Invalid,
+        "a non-audit profile edit must still inherit the cookie-active latch (#4969); \
+         clearing it on every update would silently disarm cookie mode mid-flood"
     );
 }
