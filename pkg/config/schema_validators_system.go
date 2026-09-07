@@ -283,6 +283,30 @@ func ValidateNTPServer(raw string, _ *Config) error {
 	return validateDNSNameShape(raw, "ntp server")
 }
 
+// ValidateSyslogHost accepts a `security log stream <s> host` /
+// `system syslog host <h>` value: an IP address or a DNS hostname.
+//
+// #9326: this leaf was UNTYPED (`args: 1`, no valueType, no validator), so any
+// string an operator typed reached `net.Dial`'s resolver on the commit path —
+// including one that is not a hostname at all. The dial is now deferred for
+// TCP/TLS and bounded for UDP, so this is no longer the only thing standing
+// between a typo and a stalled commit; it is the half that gives the operator
+// the error at the point they can act on it, naming the leaf, instead of a
+// resolver failure logged later from a background warm.
+//
+// Same admission shape as ValidateNTPServer, which is the closest sibling: both
+// are "an address or a name" leaves that end up in a dialer. The noun differs so
+// the message names the leaf the operator actually typed.
+func ValidateSyslogHost(raw string, _ *Config) error {
+	if raw == "" {
+		return fmt.Errorf("missing syslog host (expected an IP address or hostname)")
+	}
+	if net.ParseIP(raw) != nil {
+		return nil
+	}
+	return validateDNSNameShape(raw, "syslog host")
+}
+
 // ValidateDNSDomain accepts a `system domain-name` / `system domain-search`
 // value: a DNS domain name (LDH labels, optional trailing dot). An empty value
 // is accepted (the compiler/renderer skips it); a space/control/malformed value

@@ -3,6 +3,8 @@ package daemon
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net"
@@ -25,6 +27,46 @@ import (
 // config and applies them to the event reader. When mode is "event", events
 // are written to a local file; when "stream" (default), events are forwarded
 // to remote syslog servers. Also updates zone name resolution for structured logging.
+// syslogClientFingerprint hashes everything applySyslogConfig's client rebuild
+// reads, so an apply that changed none of it can skip the rebuild (#9326).
+//
+// It covers the RESOLVED source addresses, not just the stanza: a
+// source-interface's address can change with no syslog edit at all (a DHCP
+// renew, an address commit elsewhere), and the client is constructed from the
+// resolved value. Hashing the stanza alone would pin a stream to a stale source
+// until an unrelated commit happened to change the syslog config.
+//
+// ok=false means "could not fingerprint" and the caller must rebuild: skipping
+// on an unknown hash would leave the previous config's clients forwarding.
+func syslogClientFingerprint(cfg *config.Config) (string, bool) {
+	if cfg == nil {
+		return "", false
+	}
+	names := make([]string, 0, len(cfg.Security.Log.Streams))
+	for name := range cfg.Security.Log.Streams {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	h := sha256.New()
+	fmt.Fprintf(h, "mode=%s\nformat=%s\nsrcif=%s\nsrcaddr=%s\n",
+		cfg.Security.Log.Mode, cfg.Security.Log.Format,
+		cfg.Security.Log.SourceInterface,
+		config.ResolveSyslogSourceAddr(cfg, cfg.Security.Log.SourceInterface))
+	for _, name := range names {
+		st := cfg.Security.Log.Streams[name]
+		if st == nil {
+			fmt.Fprintf(h, "stream=%s\nNIL\n", name)
+			continue
+		}
+		fmt.Fprintf(h, "stream=%s\nhost=%s\nport=%d\nproto=%s\nsev=%s\nfac=%s\ncat=%s\nfmt=%s\nsa=%s\nsi=%s\nrsi=%s\n",
+			name, st.Host, st.Port, st.Transport.Protocol, st.Severity, st.Facility,
+			st.Category, st.Format, st.SourceAddress, st.SourceInterface,
+			config.ResolveSyslogSourceAddr(cfg, st.SourceInterface))
+	}
+	return hex.EncodeToString(h.Sum(nil)), true
+}
+
 func (d *Daemon) applySyslogConfig(er *logging.EventReader, cfg *config.Config) {
 	if er == nil {
 		return
@@ -76,6 +118,10 @@ func (d *Daemon) applySyslogConfig(er *logging.EventReader, cfg *config.Config) 
 	// Event mode: write to local file instead of remote syslog
 	if cfg.Security.Log.Mode == "event" {
 		er.ReplaceSyslogClients(nil) // close + clear any remote clients (#3579)
+		// #9326: same reason as the no-streams teardown below — forget the
+		// fingerprint, or switching back to stream mode with an unchanged
+		// stanza would hash-match a client set that has been closed.
+		d.syslogHashSet = false
 		lw, err := logging.NewLocalLogWriter(logging.LocalLogConfig{})
 		if err != nil {
 			slog.Warn("failed to create local log writer", "err", err)
@@ -106,9 +152,47 @@ func (d *Daemon) applySyslogConfig(er *logging.EventReader, cfg *config.Config) 
 		// Closes the superseded clients' connections so a CONNECTED stream's
 		// fd is not leaked when all streams are removed (#3579).
 		er.ReplaceSyslogClients(nil)
+		// #9326: forget the fingerprint on teardown, or re-adding the SAME
+		// stanza later would hash-match the set that was just closed and
+		// install nothing.
+		d.syslogHashSet = false
 		d.applyAggregator(er, cfg)
 		return
 	}
+	// #9326 IDEMPOTENCE GATE. Rebuilding the client set tears down every live
+	// connection (ReplaceSyslogClients closes the superseded set) and builds a
+	// fresh one, so an apply that changed nothing about syslog still churned
+	// every stream. Measured before this: four applies of an IDENTICAL 5-stream
+	// stanza performed 20 dials. applySyslogConfig runs on EVERY commit, so an
+	// unrelated stanza's change paid that cost.
+	//
+	// SCOPED TO THE CLIENT REBUILD, deliberately, and this is the part that is
+	// easy to get wrong. Everything above this point — zone names, policy and
+	// app names, the filter-term syslog map, interface names — is derived from
+	// the apply RESULT and from netlink, not from the syslog stanza alone, so it
+	// must be re-wired on every apply regardless. Gating the whole function on a
+	// config hash would silently stop refreshing all of it, which is a much
+	// larger defect than the one being fixed. The gate goes here, below them.
+	//
+	// The hash covers the stanza AND the resolved source addresses, because a
+	// source-interface's ADDRESS can change with no syslog-stanza edit at all
+	// (DHCP renew, an address commit elsewhere) and the client is built from the
+	// resolved value. Hashing only the stanza would pin a stream to a stale
+	// source until something else forced a rebuild.
+	if h, ok := syslogClientFingerprint(cfg); ok {
+		if d.syslogHashSet && h == d.syslogHash {
+			d.applyAggregator(er, cfg)
+			return
+		}
+		d.syslogHash, d.syslogHashSet = h, true
+	} else {
+		// Fingerprint unavailable: fail OPEN and rebuild. An apply that skipped
+		// the rebuild because it could not compute a hash would leave the
+		// previous config's clients forwarding, which is the failure direction
+		// that matters here.
+		d.syslogHashSet = false
+	}
+
 	// Resolve global source-interface to IP (fallback for streams without source-address).
 	// Prefer PrimaryAddress from config if set on the source interface unit.
 	var globalSourceAddr string
@@ -205,7 +289,33 @@ func (d *Daemon) applySyslogConfig(er *logging.EventReader, cfg *config.Config) 
 			}
 			facility, haveFacility = f, true
 		}
-		client, err := logging.NewSyslogClientTransport(stream.Host, stream.Port, srcAddr, protocol, nil)
+		// #9326: a TCP/TLS client is built WITHOUT dialing. The dial used to
+		// happen here, synchronously, on the commit path: measured, three
+		// unreachable TCP streams added 15.01s to a single apply — exactly
+		// 3 x the 5s dialer timeout. A commit is the operator's control loop,
+		// and blocking it on a third party's reachability couples config change
+		// to a collector being up; on a cluster it also widens the window in
+		// which the two nodes disagree about the committed config.
+		//
+		// Deferring is safe for stream protocols and ONLY for them: Send ->
+		// writeMsg fails on a nil conn and the TCP/TLS branch performs one
+		// cooldown-gated reconnect and retries, so the connection is
+		// established on the first record. UDP has no such branch, so a
+		// deferred UDP client would never connect at all — it keeps dialing at
+		// construction, which is cheap (a UDP dial binds rather than
+		// handshakes) and is now bounded by dialUDP's own 5s dialer.
+		// NewSyslogClientDeferred REFUSES udp so that bound cannot be lost by a
+		// later caller.
+		//
+		// The #3351 operator signal is preserved, not dropped: the reachability
+		// probe moves to warmSyslogClients below, off the commit path.
+		var client *logging.SyslogClient
+		var err error
+		if protocol == "udp" {
+			client, err = logging.NewSyslogClientTransport(stream.Host, stream.Port, srcAddr, protocol, nil)
+		} else {
+			client, err = logging.NewSyslogClientDeferred(stream.Host, stream.Port, srcAddr, protocol, nil)
+		}
 		if err != nil {
 			if client == nil {
 				// UDP / unrecoverable construction error: skip the stream.
@@ -263,7 +373,46 @@ func (d *Daemon) applySyslogConfig(er *logging.EventReader, cfg *config.Config) 
 	// old clients must still be torn down rather than left forwarding to a
 	// stale destination.
 	er.ReplaceSyslogClients(clients)
+	d.warmSyslogClients(clients)
 	d.applyAggregator(er, cfg)
+}
+
+// warmSyslogClients connects the deferred TCP/TLS clients OFF the commit path
+// and reports an unreachable receiver (#9326, preserving the #3351 signal).
+//
+// Asynchronous by design: it is the dial this change removed from the commit
+// path, so running it inline would put it straight back. Each client's Connect
+// is mutex-guarded and fails fast once Closed (#4806), so a warm racing a
+// subsequent apply's ReplaceSyslogClients is safe — the superseded client is
+// closed and its warm becomes a no-op rather than resurrecting a torn-down
+// stream.
+//
+// A failure here is a WARN and nothing else: the client is installed in the
+// reconnecting state either way, and the first record drives the retry. That is
+// the pre-#9326 behaviour for an unreachable receiver, minus the commit stall.
+func (d *Daemon) warmSyslogClients(clients []*logging.SyslogClient) {
+	stream := make([]*logging.SyslogClient, 0, len(clients))
+	for _, c := range clients {
+		if c != nil && c.Protocol() != "udp" {
+			stream = append(stream, c)
+		}
+	}
+	if len(stream) == 0 {
+		return
+	}
+	if fn := d.syslogWarmFn; fn != nil {
+		fn(stream)
+		return
+	}
+	go func() {
+		for _, c := range stream {
+			if err := c.Connect(); err != nil {
+				slog.Warn("syslog stream receiver unreachable; installed in reconnecting "+
+					"state and will connect on the first record",
+					"remote", c.RemoteAddr(), "protocol", c.Protocol(), "err", err)
+			}
+		}
+	}()
 }
 
 // aggregationCallback is the single, stable session-aggregation handler
