@@ -138,7 +138,24 @@ func TestMultiLeafAbsorptionPopulation9206(t *testing.T) {
 	}
 	sort.Strings(rows)
 
-	const wantAbsorbing, wantDistinct = 19, 17
+	// #9351: 19 -> 23 absorbing, 17 -> 19 distinct. Making
+	// `routing-instances <n> protocols` the GLOBAL protocols node brought the
+	// whole `rip` subtree — including its closedWorld `group` — into the
+	// per-instance grammar, so `rip group <g>` {export, neighbor} now absorb
+	// there as well as globally. The two extra `absorbing` rows over the two
+	// distinct ones are the `groups <name>` rehosts of the same nodes.
+	//
+	// The GREW note below says to check whether the new absorption reaches the
+	// compiler too. MEASURED, both spellings in one run:
+	//
+	//	set routing-instances RI protocols rip group r1 neighbor [ ge-0/0/0.0 ge-0/0/1.0 ]
+	//	  -> ri.RIP.Interfaces = [ge-0/0/0.0 ge-0/0/1.0]
+	//	set protocols rip group r1 neighbor [ ge-0/0/0.0 ge-0/0/1.0 ]
+	//	  -> cfg.Protocols.RIP.Interfaces = [ge-0/0/0.0 ge-0/0/1.0]
+	//
+	// so the absorption is read, and it is read identically at both sites —
+	// which is the point of #9351, since it is now literally the same node.
+	const wantAbsorbing, wantDistinct = 23, 19
 	if absorbing != wantAbsorbing || distinct != wantDistinct {
 		t.Errorf("#9206: %d sites absorb at the schema walk (%d excluding `groups` "+
 			"rehosts), want %d (%d).\n  %s\n\n"+

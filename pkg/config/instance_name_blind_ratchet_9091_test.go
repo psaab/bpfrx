@@ -99,30 +99,252 @@ func instanceNameBlind9091() (blind, armed []string) {
 // to armed and this number drops. The equality assertion is deliberate — a
 // DROP fails too, so the ceiling cannot silently stop tracking reality after
 // someone does the work.
-const instanceNameBlindCeiling9091 = 156
+// instanceNameBlindBaseline9091 is the measured schema-blind population, stored
+// as the SET of paths rather than as a count.
+//
+// It was a bare `const ... = 156` until #9351, and the count is not the part
+// that failed. The failure report called `added9091`, which returned
+// `blind[ceiling:]` — the ALPHABETIC TAIL of the sorted slice, not the paths
+// that actually arrived. When #9351 added two entries it named
+// `/system/services/dhcpv6-local-server/group/pool/static-binding` and
+// `/system/services/dynamic-dns/provider`, which had not moved at all, and said
+// nothing about the two that had. A wrong diagnostic is worse than a missing
+// one: it points the next person at innocent paths and away from the real ones,
+// and the doc comment on that helper claimed the opposite ("turns a bare count
+// into something reviewable"). Holding the set makes the claim true.
+//
+// The two assertions below are unchanged in spirit — equality in both
+// directions, so a DROP fails too and the baseline cannot silently stop
+// tracking reality after someone arms a container.
+var instanceNameBlindBaseline9091 = []string{
+	"/applications/application",
+	"/applications/application-set",
+	"/chassis/cluster/control-ports/fpc",
+	"/chassis/cluster/redundancy-group",
+	"/chassis/cluster/redundancy-group/node",
+	"/chassis/device-map/interface",
+	"/class-of-service/classifiers/dscp",
+	"/class-of-service/classifiers/dscp/forwarding-class",
+	"/class-of-service/classifiers/dscp/forwarding-class/loss-priority",
+	"/class-of-service/classifiers/ieee-802.1",
+	"/class-of-service/classifiers/ieee-802.1/forwarding-class",
+	"/class-of-service/classifiers/ieee-802.1/forwarding-class/loss-priority",
+	"/class-of-service/classifiers/inet-precedence",
+	"/class-of-service/classifiers/inet-precedence/forwarding-class",
+	"/class-of-service/classifiers/inet-precedence/forwarding-class/loss-priority",
+	"/class-of-service/fairness/rss-expectation/interface",
+	"/class-of-service/fairness/rss-expectation/interface/queue",
+	"/class-of-service/interfaces",
+	"/class-of-service/interfaces/shaping-rate",
+	"/class-of-service/interfaces/unit",
+	"/class-of-service/interfaces/unit/shaping-rate",
+	"/class-of-service/rewrite-rules/dscp",
+	"/class-of-service/rewrite-rules/dscp/forwarding-class",
+	"/class-of-service/rewrite-rules/dscp/forwarding-class/loss-priority",
+	"/class-of-service/rewrite-rules/exp",
+	"/class-of-service/rewrite-rules/exp/forwarding-class",
+	"/class-of-service/rewrite-rules/exp/forwarding-class/loss-priority",
+	"/class-of-service/rewrite-rules/ieee-802.1",
+	"/class-of-service/rewrite-rules/ieee-802.1/forwarding-class",
+	"/class-of-service/rewrite-rules/ieee-802.1/forwarding-class/loss-priority",
+	"/class-of-service/rewrite-rules/inet-precedence",
+	"/class-of-service/rewrite-rules/inet-precedence/forwarding-class",
+	"/class-of-service/rewrite-rules/inet-precedence/forwarding-class/loss-priority",
+	"/class-of-service/scheduler-maps",
+	"/class-of-service/scheduler-maps/forwarding-class",
+	"/class-of-service/schedulers",
+	"/class-of-service/schedulers/buffer-size",
+	"/class-of-service/schedulers/transmit-rate",
+	"/class-of-service/traffic-control-profiles",
+	"/event-options/policy",
+	"/event-options/policy/within",
+	"/firewall/family/any/filter",
+	"/firewall/family/any/filter/term",
+	"/firewall/family/any/filter/term/from/flexible-match-range/range",
+	"/firewall/family/inet/filter",
+	"/firewall/family/inet/filter/term",
+	"/firewall/family/inet/filter/term/from/flexible-match-range/range",
+	"/firewall/family/inet6/filter",
+	"/firewall/family/inet6/filter/term",
+	"/firewall/family/inet6/filter/term/from/flexible-match-range/range",
+	"/firewall/policer",
+	"/firewall/three-color-policer",
+	"/forwarding-options/dhcp-relay/group",
+	"/forwarding-options/port-mirroring/instance",
+	"/forwarding-options/sampling/instance",
+	"/forwarding-options/sampling/instance/family/inet/output/flow-server",
+	"/forwarding-options/sampling/instance/family/inet6/output/flow-server",
+	"/interfaces/*/tunnel/wireguard/peer",
+	"/interfaces/*/unit",
+	"/interfaces/*/unit/family/inet/address",
+	"/interfaces/*/unit/family/inet/address/vrrp-group",
+	"/interfaces/*/unit/family/inet/address/vrrp-group/track-interface",
+	"/interfaces/*/unit/family/inet6/address",
+	"/interfaces/*/unit/family/inet6/address/vrrp-group",
+	"/interfaces/*/unit/family/inet6/address/vrrp-group/track-interface",
+	"/interfaces/*/unit/tunnel/wireguard/peer",
+	"/policy-options/community",
+	"/policy-options/policy-statement",
+	"/policy-options/policy-statement/term",
+	"/protocols/bgp/group",
+	"/protocols/bgp/group/neighbor",
+	"/protocols/isis/interface",
+	"/protocols/lldp/interface",
+	"/protocols/ospf/area",
+	"/protocols/ospf/area/interface",
+	"/protocols/ospf/area/virtual-link",
+	"/protocols/ospf3/area",
+	"/protocols/ospf3/area/interface",
+	"/protocols/router-advertisement/interface",
+	"/protocols/router-advertisement/interface/nat-prefix",
+	"/protocols/router-advertisement/interface/nat64prefix",
+	"/protocols/router-advertisement/interface/prefix",
+	// #9351 added these two, and they are recorded as blind rather than armed
+	// DELIBERATELY: they are the same nodes as `/protocols/bgp/group` and
+	// `/protocols/bgp/group/neighbor`, shared by pointer, and those two have
+	// always been blind. Arming here would arm the GLOBAL BGP grammar as a side
+	// effect — a new commit rejection for every mistyped keyword in any BGP
+	// group body on any box — which is exactly the all-at-once flip the note at
+	// the top of this file says to stage rather than take. Neither entry is a
+	// NEW blind surface: before #9351 the same tokens were silently dropped by
+	// packing instead of silently ignored by an open world, which is strictly
+	// worse. Arming both (globally, once) is the follow-up.
+	"/routing-instances/*/protocols/bgp/group",
+	"/routing-instances/*/protocols/bgp/group/neighbor",
+	"/routing-instances/*/protocols/isis/interface",
+	"/routing-instances/*/protocols/ospf/area",
+	"/routing-instances/*/protocols/ospf/area/interface",
+	"/routing-instances/*/protocols/ospf/area/virtual-link",
+	"/routing-instances/*/protocols/ospf3/area",
+	"/routing-instances/*/protocols/ospf3/area/interface",
+	"/routing-instances/*/routing-options/rib",
+	"/routing-instances/*/routing-options/rib/static/route",
+	"/routing-instances/*/routing-options/rib/static/route/next-hop",
+	"/routing-instances/*/routing-options/rib/static/route/qualified-next-hop",
+	"/routing-instances/*/routing-options/static/route",
+	"/routing-instances/*/routing-options/static/route/next-hop",
+	"/routing-instances/*/routing-options/static/route/qualified-next-hop",
+	"/routing-options/generate/route",
+	"/routing-options/rib",
+	"/routing-options/rib/static/route",
+	"/routing-options/rib/static/route/next-hop",
+	"/routing-options/rib/static/route/qualified-next-hop",
+	"/routing-options/static/route",
+	"/routing-options/static/route/next-hop",
+	"/routing-options/static/route/qualified-next-hop",
+	"/schedulers/scheduler",
+	"/security/address-book/global/address-set",
+	"/security/dynamic-address/address-name",
+	"/security/dynamic-address/feed-server",
+	"/security/dynamic-address/feed-server/feed-name",
+	"/security/flow/traceoptions/packet-filter",
+	"/security/ike/gateway",
+	"/security/ike/policy",
+	"/security/ipsec/gateway",
+	"/security/ipsec/policy",
+	"/security/ipsec/vpn",
+	"/security/log/profile",
+	"/security/log/stream",
+	"/security/nat/destination/pool",
+	"/security/nat/destination/rule-set",
+	"/security/nat/destination/rule-set/rule",
+	"/security/nat/proxy-arp/interface",
+	"/security/nat/source/pool",
+	"/security/nat/source/rule-set",
+	"/security/nat/source/rule-set/rule",
+	"/security/nat/static/rule-set",
+	"/security/nat/static/rule-set/rule",
+	"/security/policies/from-zone",
+	"/security/policies/from-zone/policy",
+	"/security/policies/global/policy",
+	"/security/screen/ids-option",
+	"/security/zones/security-zone",
+	"/security/zones/security-zone/address-book/address-set",
+	"/services/flow-monitoring/version-ipfix/template",
+	"/services/flow-monitoring/version9/template",
+	"/services/ip-monitoring/policy",
+	"/services/ip-monitoring/policy/then/preferred-route/route",
+	"/services/ip-monitoring/policy/then/preferred-route/routing-instance",
+	"/services/ip-monitoring/policy/then/preferred-route/routing-instance/route",
+	"/services/rpm/probe",
+	"/services/rpm/probe/test",
+	"/snmp/community",
+	"/snmp/trap-group",
+	"/snmp/v3/usm/local-engine/user",
+	"/system/backup-router",
+	"/system/login/class",
+	"/system/login/user",
+	"/system/ntp/server",
+	"/system/ntp/threshold",
+	"/system/services/dhcp-local-server/group",
+	"/system/services/dhcp-local-server/group/interface",
+	"/system/services/dhcp-local-server/group/pool",
+	"/system/services/dhcp-local-server/group/pool/static-binding",
+	"/system/services/dhcpv6-local-server/group",
+	"/system/services/dhcpv6-local-server/group/interface",
+	"/system/services/dhcpv6-local-server/group/pool",
+	"/system/services/dhcpv6-local-server/group/pool/static-binding",
+	"/system/services/dynamic-dns/provider",
+}
+
+// instanceNameBlindCeiling9091 is derived so the two can never disagree.
+var instanceNameBlindCeiling9091 = len(instanceNameBlindBaseline9091)
 
 // instanceNameArmedFloor9091 is the count of instance-name containers already
 // covered by a closed-world subtree. Asserted so the instrument cannot report
 // "nothing is blind" by having stopped finding anything.
-const instanceNameArmedFloor9091 = 7
+// instanceNameArmedFloor9091 is the count of instance-name containers already
+// covered by a closed-world subtree, with the SET beside it for the same reason
+// as above.
+//
+// #9351 moved it 7 -> 8: making `routing-instances <n> protocols` the GLOBAL
+// protocols node brought `rip group` — which carries closedWorld — into the
+// per-instance grammar, so `/routing-instances/*/protocols/rip/group` is armed
+// there too. That is the ratchet moving in the direction it wants.
+var instanceNameArmedBaseline9091 = []string{
+	"/protocols/ospf/area/interface/authentication/md5",
+	"/protocols/rip/group",
+	"/routing-instances/*/protocols/ospf/area/interface/authentication/md5",
+	"/routing-instances/*/protocols/rip/group",
+	"/security/ike/proposal",
+	"/security/ipsec/proposal",
+	"/security/ipsec/vpn/traffic-selector",
+	"/security/nat/nat64/rule-set",
+}
+
+var instanceNameArmedFloor9091 = len(instanceNameArmedBaseline9091)
 
 func TestInstanceNameBlindPopulationIsRatcheted9091(t *testing.T) {
 	blind, armed := instanceNameBlind9091()
 
-	if len(blind) > instanceNameBlindCeiling9091 {
+	// SET comparison, not count comparison (#9351). A count is blind to a SWAP:
+	// one container armed and one added in the same change leaves 158 == 158 and
+	// the ratchet stays green while a new blind site landed.
+	if arrived := added9091(blind); len(arrived) > 0 {
 		t.Errorf("#9091: the schema-blind instance-name container population GREW to "+
-			"%d (ceiling %d). A new container that takes an instance name, declares "+
+			"%d (baseline %d). A new container that takes an instance name, declares "+
 			"children and sits outside a closed world accepts an unknown keyword in "+
 			"its body at commit — the operator gets no value and no complaint. Arm "+
-			"it (closedWorld) or, if it is genuinely open-world, raise the ceiling "+
-			"WITH the reason.\nnew: %v",
-			len(blind), instanceNameBlindCeiling9091, added9091(blind))
+			"it (closedWorld) or, if it is genuinely open-world, add it to "+
+			"instanceNameBlindBaseline9091 WITH the reason.\nnew: %v",
+			len(blind), instanceNameBlindCeiling9091, arrived)
 	}
-	if len(blind) < instanceNameBlindCeiling9091 {
-		t.Errorf("#9091: the population SHRANK to %d (ceiling %d) — good, but lower "+
-			"the ceiling in the same change. A ceiling left above reality stops "+
-			"being a ratchet: it silently re-admits every container between the two "+
-			"numbers.", len(blind), instanceNameBlindCeiling9091)
+	if gone := removed9091(blind); len(gone) > 0 {
+		t.Errorf("#9091: the population SHRANK to %d (baseline %d) — good, but drop "+
+			"these from instanceNameBlindBaseline9091 in the same change. A baseline "+
+			"left above reality stops being a ratchet: it silently re-admits every "+
+			"container it still lists.\ngone: %v",
+			len(blind), instanceNameBlindCeiling9091, gone)
+	}
+	if a := diff9091(armed, instanceNameArmedBaseline9091); len(a) > 0 {
+		t.Errorf("#9091: newly ARMED: %v. Arming is the remedy, so this moving is "+
+			"expected — record it in instanceNameArmedBaseline9091 in the same "+
+			"change.", a)
+	}
+	if g := diff9091(instanceNameArmedBaseline9091, armed); len(g) > 0 {
+		t.Errorf("#9091: no longer ARMED: %v. A DROP means a closed world was "+
+			"disarmed and its container silently went back to accepting unknown "+
+			"keywords.", g)
 	}
 	if len(armed) != instanceNameArmedFloor9091 {
 		t.Errorf("#9091: the ARMED count moved to %d (expected %d). Arming is the "+
@@ -210,8 +432,27 @@ func TestInstanceNameBlindInstrumentStillDiscriminates9091(t *testing.T) {
 // raised. Cheap to compute and it turns a bare count into something reviewable:
 // an aggregate count is not reviewable, the list is.
 func added9091(blind []string) []string {
-	if len(blind) <= instanceNameBlindCeiling9091 {
-		return nil
+	return diff9091(blind, instanceNameBlindBaseline9091)
+}
+
+// removed9091 is the other half, and it has to exist for the same reason the
+// SHRANK branch does: a container leaving the population is news too.
+func removed9091(blind []string) []string {
+	return diff9091(instanceNameBlindBaseline9091, blind)
+}
+
+// diff9091 returns the members of a that are not in b.
+func diff9091(a, b []string) []string {
+	in := make(map[string]bool, len(b))
+	for _, x := range b {
+		in[x] = true
 	}
-	return blind[instanceNameBlindCeiling9091:]
+	var out []string
+	for _, x := range a {
+		if !in[x] {
+			out = append(out, x)
+		}
+	}
+	sort.Strings(out)
+	return out
 }

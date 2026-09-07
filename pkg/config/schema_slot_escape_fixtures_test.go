@@ -122,6 +122,31 @@ var slotEscBGP = append(append([]string{}, slotEscPolicyOptions...),
 	"set protocols bgp group G neighbor 10.0.2.2",
 )
 
+// slotEscBGPRI is the routing-instance twin of slotEscBGP (#9351). Making
+// `routing-instances <n> protocols` the GLOBAL protocols node gave three
+// already-gated BGP policy slots per-instance spellings, and this gate demands
+// a verdict per SITE, not per keyword — the same leaf reached through a
+// different container is a different site because a different compiler path
+// walks it.
+//
+// The verdict is not inherited from the global rows above. MEASURED here:
+//
+//	set routing-instances RI protocols bgp group G neighbor 10.0.2.2 export zznotdefined
+//	  -> REJECTED "routing-instance RI protocols bgp group G neighbor 10.0.2.2
+//	     export references undefined policy-statement \"zznotdefined\""
+//
+// so the definedness gate (validatePolicyReferencesStrict) already covered the
+// routing-instance path; it was the SCHEMA that made the value unreachable —
+// the tokens packed onto the neighbour's key and the gate had nothing to check.
+// The gate did not change; it became reachable.
+var slotEscBGPRI = append(append([]string{}, slotEscPolicyOptions...),
+	"set routing-options autonomous-system 65000",
+	"set routing-instances RI instance-type vrf",
+	"set routing-instances RI protocols bgp group G type external",
+	"set routing-instances RI protocols bgp group G peer-as 65001",
+	"set routing-instances RI protocols bgp group G neighbor 10.0.2.2",
+)
+
 var slotEscIPsec = []string{
 	"set security ipsec proposal esp-a protocol esp",
 	"set security ipsec proposal esp-a encryption-algorithm aes-256-cbc",
@@ -349,6 +374,13 @@ func slotEscapeRows() []slotEscapeRow {
 			"set protocols bgp group G neighbor 10.0.2.2 import", "PS", "zznotdefined"},
 		{"bgp group neighbor export", "protocols bgp group <*> neighbor <*> export", slotEscBGP,
 			"set protocols bgp group G neighbor 10.0.2.2 export", "PS", "zznotdefined"},
+		// #9351: the per-instance twins of the three rows above.
+		{"bgp import (routing instance)", "routing-instances <*> protocols bgp import", slotEscBGPRI,
+			"set routing-instances RI protocols bgp import", "PS", "zznotdefined"},
+		{"bgp group neighbor import (routing instance)", "routing-instances <*> protocols bgp group <*> neighbor <*> import", slotEscBGPRI,
+			"set routing-instances RI protocols bgp group G neighbor 10.0.2.2 import", "PS", "zznotdefined"},
+		{"bgp group neighbor export (routing instance)", "routing-instances <*> protocols bgp group <*> neighbor <*> export", slotEscBGPRI,
+			"set routing-instances RI protocols bgp group G neighbor 10.0.2.2 export", "PS", "zznotdefined"},
 		{"forwarding-table export", "routing-options forwarding-table export", slotEscPolicyOptions,
 			"set routing-options forwarding-table export", "PS", "zznotdefined"},
 

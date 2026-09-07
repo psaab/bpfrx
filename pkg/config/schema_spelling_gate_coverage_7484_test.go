@@ -304,7 +304,19 @@ func gateLeafChangesWarnings(g gateLeaf, pre string, epath []string) bool {
 // declaration the walker found nothing under the container that could change
 // output. Declaring it changed no compiler behaviour — it made an already-read
 // leaf VISIBLE to the enumeration, the same movement #9151 recorded.
-const gateCoverageFloor = 716
+// #9351 raises it 716 -> 742. `routing-instances <n> protocols` stopped being a
+// second, drifted DECLARATION of the `protocols` grammar and became the GLOBAL
+// node, shared by pointer. That made 101 previously-undeclared per-instance
+// schema paths reachable, and 26 of the leaves under them now COMPARE.
+//
+// ATTRIBUTED, not assumed: `origin/master` at this branch point runs this cell
+// GREEN, and the only schema edit on this branch is the shared-node swap.
+// The movement is spelling coverage, not new compiler behaviour — the
+// routing-instance compiler has always called the same compileProtocols; the
+// leaves were simply unreachable to a flat-set walk that had nothing to descend
+// into, so their tokens packed onto the container key. Same movement as #9323
+// and #9151: an already-read leaf becoming VISIBLE to the enumeration.
+const gateCoverageFloor = 742
 
 var gateBlindCeiling = map[gateBlindClass]int{
 	// #7492 moved leaves out of `unreachable` in two rounds. The parent
@@ -447,7 +459,22 @@ var gateBlindCeiling = map[gateBlindClass]int{
 	//   property of the leaf, not a gap in the instrument. The fifth is the
 	//   `interface-routes` container itself, whose comparable child moved the
 	//   floor above.
-	gateBlindUnreachable: 137,
+	// #9351: 137 -> 153, a NET +16 that is +17 and -1. MEASURED by diffing this
+	// cell's own classification against origin/master rather than inferred from
+	// the totals: all 17 arrivals are `routing-instances <*> protocols bgp
+	// group <*> <leaf>` — the GROUP level, not the neighbour level, whose 14
+	// leaves went straight to COMPARED. A group-level leaf probed ALONE changes
+	// no output because a group with no neighbour materialises nothing, which
+	// is the same "stanza needs a sibling" shape this ceiling already records
+	// for `security log stream <*> source-interface`.
+	//
+	// The one DEPARTURE is `routing-instances <*> protocols bgp group` itself:
+	// it was a childless leaf and now has children, so it left the enumeration
+	// exactly as `perfect-forward-secrecy` did in the #8844 note above.
+	//
+	// ATTRIBUTED: origin/master runs this cell green at the branch point and
+	// the only schema edit on this branch is the shared-node swap.
+	gateBlindUnreachable: 153,
 	// #8830: read, value deliberately ignored, advisory says so. Measured at
 	// this head: vrrp-group track-interface priority-cost (inet and inet6),
 	// security log stream transport tls-profile, system dataplane
@@ -531,7 +558,13 @@ var gateBlindCeiling = map[gateBlindClass]int{
 	// completion still offers only <[Enter]>, so it does not fix the defect. The
 	// children form was chosen on that measurement rather than on which number
 	// it moves.
-	gateBlindFlag: 217, // 209 -> 201, issue 8939; coverage cost tracked at issue 8971
+	// #9351: 217 -> 224. MEASURED, not inferred — the seven arrivals are
+	// `routing-instances <*> protocols bgp` {log-updown, multipath ibgp,
+	// multipath multiple-as} and `... group <*> neighbour <*>`
+	// {default-originate, passive, remove-private, route-reflector-client}.
+	// Every one is a value-less flag under the newly shared subtree, which is
+	// what this class is for; none of them is a leaf whose value could be lost.
+	gateBlindFlag: 224, // 209 -> 201, issue 8939; coverage cost tracked at issue 8971
 	gateBlindErr:  43,
 	// TIGHTENED 1 -> 0. The single member of this class was
 	// `policy-options policy-statement <*> then`, and it is gone because the
