@@ -195,9 +195,11 @@ func (m *Manager) ClearXfrmi() error { return m.xfrm.Clear() }
 // --- Rule domains (next-table / rib-group / PBR) ---
 
 // ApplyNextTableRules creates ip rules implementing next-table inter-VRF
-// route leaking.
-func (m *Manager) ApplyNextTableRules(routes []*config.StaticRoute, instances []*config.RoutingInstanceConfig) error {
-	return m.nextTbl.Apply(routes, instances)
+// route leaking. ingressIfaces scopes every emitted rule to an ingress
+// interface of the instance that authored the leak (#9420) — see
+// DefaultInstanceIngressIfaces and nextTableManager.Apply.
+func (m *Manager) ApplyNextTableRules(routes []*config.StaticRoute, instances []*config.RoutingInstanceConfig, ingressIfaces []string) error {
+	return m.nextTbl.Apply(routes, instances, ingressIfaces)
 }
 
 // ApplyRibGroupRules creates ip rules implementing rib-group route leaking.

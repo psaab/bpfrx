@@ -208,6 +208,61 @@ constants): `pkg/config`'s commit gate (`maxNextTableRules`), the applier
 (`pkg/routing.maxNextTableRules`), and the userspace FIB config-static mirror
 all reference that one value, so the three cannot drift.
 
+### Ingress scope on the next-table leak rules (#9420)
+
+Every next-table `ip rule` carries an **`FRA_IIFNAME` ingress selector**.
+
+Before #9420 the rule was `Dst` + `Table` + `Priority` + `Family` and nothing
+else, installed at priority 100-199 — **ahead of the kernel's l3mdev rule at
+1000**. A packet ingressing **any** routing instance whose destination fell in
+the leaked prefix was therefore routed out of the **target** instance's table,
+on the target instance's device, overriding the ingress instance's own routing.
+Measured on a live kernel, with a control, and in the sharper case where the
+ingress VRF **has its own route for the same prefix** and still loses — the
+measurement is a test, `TestNextTableIngressScopeOnRealKernel_9420` in
+`pkg/routing/rules_9420_test.go`, which reproduces the defect (B1/B2) and the
+control (B3) in the same run as the fix.
+
+This is the same defect **#5117** fixed for the PBR/FBF band, in the same file;
+`nextTableManager.Apply` was not covered by that sweep. **#4073** closed the
+broad "VRF traffic is mis-routed" claim as a false positive, correctly, on the
+grounds that the rule is destination-scoped — an argument that holds for every
+packet *outside* the leaked prefix and says nothing about one inside it.
+
+The scoping set is `routing.DefaultInstanceIngressIfaces(cfg)`: every configured
+interface unit **not** claimed by a routing instance. That is exactly the
+default instance's ingress, and the default instance is always the authoring
+instance — per-instance `next-table` is hard-rejected at commit (#5830, below),
+and the applier is fed only `cfg.RoutingOptions.StaticRoutes` +
+`Inet6StaticRoutes`.
+
+Three consequences an operator can observe:
+
+1. **One leak costs one ip rule per default-instance ingress interface.** The
+   100-slot window is drawn down **leak-atomically** — a leak whose full
+   expansion does not fit is dropped whole rather than installed on a subset of
+   its interfaces, because a partially-scoped leak works on some ingress
+   interfaces and silently not on others. The overflow error names the
+   multiplier so the reduced effective leak capacity is visible.
+2. **Fail-closed.** With no resolvable default-instance ingress interface,
+   nothing is installed and the apply reports degraded, matching
+   `BuildPBRRules`. The fail-safe direction is an under-steer (the leak is not
+   followed), never a cross-VRF over-steer.
+3. **Host-originated traffic no longer follows a next-table leak.** Loopback is
+   deliberately excluded from the scoping set. An `iif lo` rule matches locally
+   generated traffic — *including traffic from a socket bound to another VRF*,
+   which was measured directly — so keeping host-originated default-instance
+   traffic on the leak would reintroduce the cross-VRF hijack for every
+   VRF-bound daemon (FRR peering, DHCP relay, syslog, RPM probes, IPsec). This
+   is a deliberate narrowing, recorded here rather than left to be rediscovered.
+
+The **AF_XDP fast path was never exposed**: the userspace FIB follows a
+`next_table` leak only when the route is found in the ingress instance's own
+table (`userspace-dp/src/afxdp/forwarding/fib.rs`), so it is instance-scoped by
+construction. The exposure was the Linux path — host-originated traffic,
+slow-path `XDP_PASS` packets, local delivery, and any interface without native
+XDP where `redirect_capable` falls back to kernel forwarding.
+
 ### Strict rejection — undefined `next-table` target (#5693)
 
 A static route whose `next-table <target>` names a routing-instance that is

@@ -45,7 +45,7 @@ func TestNextTableApplyCapAggregatesDegradedError(t *testing.T) {
 	const over = 50 // 50 next-table routes past the cap must be reported.
 	ops := newFakeRuleOps()
 	nt := &nextTableManager{ops: ops}
-	err := nt.Apply(mkRoutes(config.NextTableRuleWindow+over), instances)
+	err := nt.Apply(mkRoutes(config.NextTableRuleWindow+over), instances, testNextTableIifs)
 	if err == nil {
 		t.Fatal("over-cap Apply must return a degraded error naming the dropped " +
 			"next-table leaks, not a bare Warn (#6467)")
@@ -87,7 +87,7 @@ func TestNextTableApplyUnderCapNoError(t *testing.T) {
 
 	ops := newFakeRuleOps()
 	nt := &nextTableManager{ops: ops}
-	if err := nt.Apply(mkRoutes(config.NextTableRuleWindow), instances); err != nil {
+	if err := nt.Apply(mkRoutes(config.NextTableRuleWindow), instances, testNextTableIifs); err != nil {
 		t.Fatalf("exactly %d next-table routes must apply without a degraded error, got %v",
 			config.NextTableRuleWindow, err)
 	}
@@ -139,7 +139,7 @@ func TestNextTableApplyDroppedCountCountsOnlyEligible(t *testing.T) {
 
 	ops := newFakeRuleOps()
 	nt := &nextTableManager{ops: ops}
-	err := nt.Apply(routes, instances)
+	err := nt.Apply(routes, instances, testNextTableIifs)
 	if err == nil {
 		t.Fatal("over-cap Apply must return a degraded error (#6467)")
 	}
@@ -197,7 +197,7 @@ func TestNextTableApplyDroppedCountExcludesMalformedCIDR(t *testing.T) {
 
 	ops := newFakeRuleOps()
 	nt := &nextTableManager{ops: ops}
-	err := nt.Apply(routes, instances)
+	err := nt.Apply(routes, instances, testNextTableIifs)
 	if err == nil {
 		t.Fatal("over-cap Apply must return a degraded error (#6467)")
 	}
@@ -273,7 +273,7 @@ func TestNextTableDrawsDownV4FirstRegardlessOfCallerOrder6583(t *testing.T) {
 	nt := &nextTableManager{ops: ops}
 	// Over-cap, so Apply returns the #6467 degraded error; that is expected
 	// here and not what this test is about.
-	_ = nt.Apply(routes, instances)
+	_ = nt.Apply(routes, instances, testNextTableIifs)
 
 	gotV4, gotV6 := ops.count(unix.AF_INET), ops.count(unix.AF_INET6)
 	if total := gotV4 + gotV6; total != config.NextTableRuleWindow {
@@ -357,7 +357,7 @@ func TestNextTableCapHoldsOnMixedFamilyFixture6583(t *testing.T) {
 
 	ops := newFakeRuleOps()
 	nt := &nextTableManager{ops: ops}
-	err := nt.Apply(routes, instances)
+	err := nt.Apply(routes, instances, testNextTableIifs)
 	if err == nil {
 		t.Fatal("over-cap mixed-family Apply must still return the #6467 degraded error")
 	}

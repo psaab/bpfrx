@@ -241,7 +241,14 @@ func (d *Daemon) applyRoutingRules(cfg *config.Config, commitOverlay []config.Ro
 			len(cfg.RoutingOptions.StaticRoutes)+len(cfg.RoutingOptions.Inet6StaticRoutes))
 		allRoutes = append(allRoutes, cfg.RoutingOptions.StaticRoutes...)
 		allRoutes = append(allRoutes, cfg.RoutingOptions.Inet6StaticRoutes...)
-		if err := d.routing.ApplyNextTableRules(allRoutes, cfg.RoutingInstances); err != nil {
+		// #9420: scope the leak rules to the ingress interfaces of the instance
+		// that authored them. allRoutes above is the DEFAULT instance's
+		// routing-options statics, so the scoping set is every configured
+		// interface unit not claimed by a routing instance. Without it the
+		// pref-100 rule sits ahead of the kernel l3mdev rule (1000) and steers a
+		// packet ingressing ANY other VRF into the target instance's table.
+		ingressIfaces := routing.DefaultInstanceIngressIfaces(cfg)
+		if err := d.routing.ApplyNextTableRules(allRoutes, cfg.RoutingInstances, ingressIfaces); err != nil {
 			slog.Warn("failed to apply next-table rules", "err", err)
 			routingErrs = append(routingErrs, fmt.Errorf("apply next-table rules: %w", err))
 		}
