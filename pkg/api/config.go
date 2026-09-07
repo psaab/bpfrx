@@ -314,27 +314,53 @@ func (s *Server) configShowHandler(w http.ResponseWriter, r *http.Request) {
 	format := r.URL.Query().Get("format")
 	target := r.URL.Query().Get("target")
 
-	// Secrets are masked on every raw-AST render endpoint (#4051), matching
-	// the #2053 typed-struct redaction; the cleartext Show* SSOT still backs
-	// HA config sync, the DR archive and persistence.
+	// #9324: an ABSENT ?target renders the ACTIVE configuration.
+	//
+	// It used to fall through to the CANDIDATE, so a PermView caller that
+	// omitted the parameter read another session's uncommitted work — and on an
+	// idle box got an empty string, so a config-backup client written without
+	// `?target=active` archived either nothing or somebody's draft and could not
+	// tell which. GET /api/v1/config/export already always renders ACTIVE, which
+	// is the in-tree precedent for what the default should be, and operational
+	// `show configuration` on Junos renders the committed configuration.
+	//
+	// Unlike the gRPC twin this surface CAN distinguish absent from explicit —
+	// `?target` is a string, not a proto3 enum whose zero value is CANDIDATE —
+	// so the default is fixed here rather than only priced. An explicit
+	// `?target=candidate` is still a legitimate request and still works; it now
+	// requires PermConfig (readAuthz, pkg/api/authz.go).
+	//
+	// An UNRECOGNISED target is refused rather than silently treated as one of
+	// them: falling through on `?target=activ` is the same fail-open shape as
+	// the default this fixes.
 	var output string
-	switch {
-	case target == "active" && format == "set":
-		output = s.store.ShowActiveSetRedacted(nil)
-	case target == "active" && format == "json":
-		output = s.store.ShowActiveJSONRedacted(nil)
-	case target == "active" && format == "xml":
-		output = s.store.ShowActiveXMLRedacted(nil)
-	case target == "active":
-		output = s.store.ShowActiveRedacted(nil)
-	case format == "set":
-		output = s.store.ShowCandidateSetRedacted(nil)
-	case format == "json":
-		output = s.store.ShowCandidateJSONRedacted(nil)
-	case format == "xml":
-		output = s.store.ShowCandidateXMLRedacted(nil)
+	switch target {
+	case "", "active":
+		switch format {
+		case "set":
+			output = s.store.ShowActiveSetRedacted(nil)
+		case "json":
+			output = s.store.ShowActiveJSONRedacted(nil)
+		case "xml":
+			output = s.store.ShowActiveXMLRedacted(nil)
+		default:
+			output = s.store.ShowActiveRedacted(nil)
+		}
+	case "candidate":
+		switch format {
+		case "set":
+			output = s.store.ShowCandidateSetRedacted(nil)
+		case "json":
+			output = s.store.ShowCandidateJSONRedacted(nil)
+		case "xml":
+			output = s.store.ShowCandidateXMLRedacted(nil)
+		default:
+			output = s.store.ShowCandidateRedacted(nil)
+		}
 	default:
-		output = s.store.ShowCandidateRedacted(nil)
+		writeError(w, http.StatusBadRequest,
+			"unsupported target: "+target+"; use active or candidate")
+		return
 	}
 	writeOK(w, TextResponse{Output: output})
 }

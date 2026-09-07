@@ -251,6 +251,17 @@ func (s *Server) authorizeRPC(ctx context.Context, fullMethod string, req any) e
 		return denyRPC(fullMethod, required, p, err)
 	}
 
+	// #9324: the method table prices ShowConfig at PermView, but ConfigTarget's
+	// proto3 zero value is CANDIDATE, so a view-only principal that omitted the
+	// target read another session's uncommitted configuration. Reading a
+	// candidate costs PermConfig — the permission that lets you be in
+	// configuration mode at all — and it is charged HERE, at the same choke
+	// point as the coarse check, so a new target-taking RPC cannot be added
+	// with its continuation ungated.
+	if err := s.authorizeRPCConfigTargetRead(cfg, p, fullMethod, req); err != nil {
+		return denyRPC(fullMethod, config.PermConfig, p, err)
+	}
+
 	// #7172 cut 5b: the class's fine-grained `deny-commands` regexes, AFTER the
 	// coarse permission bits and never instead of them — Junos authorizes the
 	// command family first and the regexes narrow within it.
