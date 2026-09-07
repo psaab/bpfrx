@@ -986,6 +986,7 @@
     "session_delete_replica_dropped": 0,
     "session_delete_stale_ignored": 0,
     "session_delta_schema_fingerprint": 0,
+    "session_export_paging_protocol_version": 0,
     "session_install_admission_refused": 0,
     "session_install_partial": 0,
     "session_install_stale_ignored": 0,
@@ -1140,6 +1141,7 @@
     "worker_id": 0
   },
   "session_export_request": {
+    "continuation": false,
     "max": 0,
     "owner_rgs": []
   },

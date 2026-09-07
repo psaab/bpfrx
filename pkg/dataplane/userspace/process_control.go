@@ -178,7 +178,12 @@ func (m *Manager) requestDetailedLocked(req ControlRequest) (ControlResponse, er
 	// TimeoutStopSec. See control_shutdown_8526.go; the census and the
 	// single-site property are asserted, not asserted-by-comment, in
 	// control_shutdown_census_8526_test.go.
-	m.armControlIO(conn, controlRoundtripDeadline(len(body)))
+	// #9344: the deadline is sized off the body AND raised to the verb's work
+	// floor. `export_owner_rg_sessions` carries a ~60-byte body and so got the
+	// 3 s small-request base, while the helper spends up to 15 s waiting for
+	// worker acks before writing its first byte — the caller could abandon a
+	// round trip the helper was still legitimately performing.
+	m.armControlIO(conn, controlWorkDeadline(req.Type, len(body)))
 	defer m.releaseControlIO(conn)
 	// Reuse the pre-flight-serialized body; the Rust receiver frames on a
 	// single trailing newline (json.Encoder appends one).

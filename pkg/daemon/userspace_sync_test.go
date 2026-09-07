@@ -180,7 +180,7 @@ type fakeUserspaceSessionExporter struct {
 	calls  int
 }
 
-func (f *fakeUserspaceSessionExporter) ExportOwnerRGSessions(rgIDs []int, max uint32) ([]dpuserspace.SessionDeltaInfo, dpuserspace.ProcessStatus, error) {
+func (f *fakeUserspaceSessionExporter) ExportOwnerRGSessionsPaged(rgIDs []int) ([]dpuserspace.SessionDeltaInfo, dpuserspace.ProcessStatus, error) {
 	f.calls++
 	return append([]dpuserspace.SessionDeltaInfo(nil), f.deltas...), dpuserspace.ProcessStatus{}, nil
 }

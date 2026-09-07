@@ -37,8 +37,8 @@ type wiringExporterDP struct {
 	exporter *recordingExporter
 }
 
-func (d *wiringExporterDP) ExportOwnerRGSessions(rgIDs []int, max uint32) ([]dpuserspace.SessionDeltaInfo, dpuserspace.ProcessStatus, error) {
-	return d.exporter.ExportOwnerRGSessions(rgIDs, max)
+func (d *wiringExporterDP) ExportOwnerRGSessionsPaged(rgIDs []int) ([]dpuserspace.SessionDeltaInfo, dpuserspace.ProcessStatus, error) {
+	return d.exporter.ExportOwnerRGSessionsPaged(rgIDs)
 }
 
 func (d *wiringExporterDP) Mode() dpuserspace.DataplaneMode { return dpuserspace.ModeUserspaceStrict }

@@ -101,6 +101,7 @@ pub(crate) fn handle_stream(
         error: String::new(),
         status: None,
         session_deltas: Vec::new(),
+        session_export_more: false,
         idle_leases: Vec::new(),
         display_leases: Vec::new(),
         session_counters: Vec::new(),

@@ -320,6 +320,19 @@ func (m *Manager) DrainSessionDeltas(max uint32) ([]SessionDeltaInfo, ProcessSta
 	return resp.SessionDeltas, status, nil
 }
 
+// ExportOwnerRGSessions issues ONE raw owner-RG export request.
+//
+// #9344: this is the low-level verb and it is NOT the way to gather a bulk HA
+// window. `max > 0` here TRUNCATES — the helper drains the first `max` deltas
+// and leaves the rest buffered — and since #5085 the receiver deletes every
+// eligible session missing from the window it is given, so a truncated window
+// destroys live sessions on the peer. `max = 0` avoids that by asking for the
+// unbounded set, which is bounded only by MaxControlResponseBytes and crosses
+// it at roughly 7.8k sessions/worker on a six-worker box.
+//
+// Use ExportOwnerRGSessionsPaged for a bulk window. It pages when the helper
+// reports the paging contract, falls back to the unbounded request when it does
+// not, and returns a COMPLETE window or an error.
 func (m *Manager) ExportOwnerRGSessions(rgIDs []int, max uint32) ([]SessionDeltaInfo, ProcessStatus, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

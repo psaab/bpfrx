@@ -9,8 +9,20 @@ import (
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
+// userspaceSessionExporter is the helper-side source of ONE complete owner-RG
+// export window.
+//
+// #9344 removed the `max` parameter deliberately. The daemon has no basis for
+// choosing a cap: the safe value depends on the helper's worker count and on
+// whether the helper implements the paging contract at all, and both are facts
+// the Manager holds and the daemon does not. Every caller here passed 0
+// (UNBOUNDED) precisely because any other value truncated the window, and since
+// #5085 the receiver DELETES every eligible session missing from the window —
+// so the one knob this interface exposed had exactly one safe setting and one
+// catastrophic one. It is gone; ExportOwnerRGSessionsPaged returns a complete
+// window or an error.
 type userspaceSessionExporter interface {
-	ExportOwnerRGSessions(rgIDs []int, max uint32) ([]dpuserspace.SessionDeltaInfo, dpuserspace.ProcessStatus, error)
+	ExportOwnerRGSessionsPaged(rgIDs []int) ([]dpuserspace.SessionDeltaInfo, dpuserspace.ProcessStatus, error)
 }
 
 type userspaceEventStreamExporter interface {
@@ -52,7 +64,7 @@ func (d *Daemon) exportUserspaceOwnerRGSessionsWithConfig(
 	if exporter == nil || cfg == nil || len(rgIDs) == 0 {
 		return 0, nil
 	}
-	deltas, _, err := exporter.ExportOwnerRGSessions(rgIDs, 0)
+	deltas, _, err := exporter.ExportOwnerRGSessionsPaged(rgIDs)
 	if err != nil {
 		return 0, err
 	}
@@ -79,11 +91,19 @@ func (d *Daemon) exportUserspaceOwnerRGSessionsWithConfig(
 // cold prime wipes exactly the live peer-owned transit sessions the standby
 // needs at failover.
 //
-// ExportOwnerRGSessions is synchronous: the helper enqueues the export to every
-// worker, waits for their acks, and returns the drained delta set in the control
-// response (userspace-dp afxdp/ha/export.rs, OwnerRgExportWait::wait_and_collect).
-// max=0 requests the UNBOUNDED set — a capped export would silently truncate the
-// window and delete the remainder on the peer.
+// ExportOwnerRGSessionsPaged is synchronous: the helper enqueues the export to
+// every worker, waits for their acks, and returns the drained delta set in the
+// control response (userspace-dp afxdp/ha/export.rs,
+// OwnerRgExportWait::wait_and_collect).
+//
+// It returns ONE COMPLETE window or an error — never a partial one. Before
+// #9344 that completeness was bought by asking for the unbounded set, which
+// crossed the helper's 64 MiB response cap at roughly 7.8k sessions/worker on a
+// six-worker box and made this cold prime fail permanently on a busy cluster.
+// It is now bought by PAGING against a helper that reports the paging contract,
+// with the unbounded request kept as the fallback for one that does not. Either
+// way a truncated window never reaches the receiver, because a truncated window
+// is what #5085 turns into deleted live sessions on the peer.
 //
 // The deltas are converted through walkUserspaceSessionDeltas, the SAME walk and
 // the SAME eligibility filter the incremental path uses, so the bulk window and
@@ -103,7 +123,7 @@ func (d *Daemon) userspaceBulkSnapshotWithConfig(
 	if cfg == nil {
 		return cluster.BulkSnapshot{}, errors.New("no active config")
 	}
-	deltas, _, err := exporter.ExportOwnerRGSessions(rgIDs, 0)
+	deltas, _, err := exporter.ExportOwnerRGSessionsPaged(rgIDs)
 	if err != nil {
 		return cluster.BulkSnapshot{}, fmt.Errorf("export owner-RG sessions: %w", err)
 	}

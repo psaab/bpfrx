@@ -19,11 +19,35 @@ impl crate::afxdp::Coordinator {
     /// (no TOCTOU). The worker THREADS only bump their ack atomics and push
     /// into their delta buffers — both `Arc`-shared and lock-free — so the
     /// wait observes their progress without the global lock.
-    pub fn kick_owner_rg_export(&self, owner_rgs: &[i32], max: usize) -> OwnerRgExportWait {
+    /// #9344: `continuation` requests the REMAINDER of a window an earlier
+    /// capped call already produced. It kicks nothing, consumes no export
+    /// sequence and captures no ack atomics, so `wait_and_collect` goes
+    /// straight to the drain — every page of one window therefore comes from
+    /// the single phase 1 that opened it. Re-kicking instead would produce a
+    /// second full set on top of the remainder and the caller would assemble a
+    /// window out of two different instants.
+    pub fn kick_owner_rg_export(
+        &self,
+        owner_rgs: &[i32],
+        max: usize,
+        continuation: bool,
+    ) -> OwnerRgExportWait {
         // Snapshot the per-binding delta buffers (same Arcs as
         // `drain_session_deltas` iterates) so the post-lock drain reads
         // exactly the buffers that existed at kick time.
         let live: Vec<Arc<BindingLiveState>> = self.workers.live.values().cloned().collect();
+        if continuation {
+            // Empty `ack_atomics` makes the wait's `.all()` trivially true, so
+            // the drain runs immediately. `skip` stays false because there IS
+            // something to drain — the remainder of the open window.
+            return OwnerRgExportWait {
+                sequence: 0,
+                max,
+                skip: false,
+                ack_atomics: Vec::new(),
+                live,
+            };
+        }
         if owner_rgs.is_empty() {
             // Preserve the pre-split early return: no export is kicked and
             // no sequence is consumed, and the wait drains nothing.
@@ -247,6 +271,20 @@ pub struct OwnerRgExportWait {
     live: Vec<Arc<BindingLiveState>>,
 }
 
+/// How long phase 2 of the owner-RG export waits for every worker to ack the
+/// export sequence before giving up (#2962).
+///
+/// #9344 NAMED this (it was a bare `Duration::from_secs(15)`) because the Go
+/// caller has to size its control-socket round-trip deadline against it, and
+/// `controlRoundtripDeadline` sizes off the REQUEST BODY — which for this verb
+/// is ~60 bytes, so the verb got the 3 s small-request base while the helper
+/// could legitimately spend 15 s here before writing its first byte. That is
+/// #4036's failure shape ("Go timed out and reported failure while the helper
+/// was doing the work") moved from the request-size axis to the WORK axis.
+/// `pkg/dataplane/userspace` reads this constant out of this file rather than
+/// restating the number, so the two cannot drift.
+pub(crate) const OWNER_RG_EXPORT_ACK_WAIT: Duration = Duration::from_secs(15);
+
 impl OwnerRgExportWait {
     /// Phase 2 of the owner-RG export (#2962): block up to 15 s for every
     /// worker to ack the export sequence, then drain the produced session
@@ -254,11 +292,16 @@ impl OwnerRgExportWait {
     /// control RPCs (status poll, session installs, snapshot/FIB bumps, HA
     /// state updates) stay responsive while one export drains. Preserves
     /// the original 15 s deadline and timeout error.
-    pub fn wait_and_collect(self) -> Result<Vec<SessionDeltaInfo>, String> {
+    /// Returns the drained deltas and, as the second element, whether the
+    /// per-binding buffers STILL hold deltas from this window because `max`
+    /// capped the drain (#9344). That bit is not newly computed here —
+    /// `drain_session_deltas_fair` has always returned it and the owner-RG call
+    /// site discarded it into `_overflow`.
+    pub fn wait_and_collect(self) -> Result<(Vec<SessionDeltaInfo>, bool), String> {
         if self.skip {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         }
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let deadline = std::time::Instant::now() + OWNER_RG_EXPORT_ACK_WAIT;
         loop {
             if self
                 .ack_atomics
@@ -281,18 +324,28 @@ impl OwnerRgExportWait {
         // low-slot binding cannot hog every 1024-batch and starve higher-slot
         // bindings within one capped export.
         let mut cursor = 0usize;
+        // #9344: only the LAST batch's verdict is the answer. An intermediate
+        // 1024-batch reports overflow whenever anything is still buffered,
+        // which is true on every batch of a large drain and says nothing about
+        // the state after the loop finishes.
+        let mut more = false;
         while remaining > 0 {
             let batch_size = remaining.min(1024);
-            let (drained, next_cursor) =
+            let (drained, next_cursor, overflow) =
                 drain_session_deltas_from_live(&self.live, batch_size, cursor);
             cursor = next_cursor;
             if drained.is_empty() {
+                // A full fair pass drained nothing, so every buffer is empty
+                // and nothing was left behind — regardless of what the last
+                // capped batch reported.
+                more = false;
                 break;
             }
             remaining = remaining.saturating_sub(drained.len());
             out.extend(drained);
+            more = overflow;
         }
-        Ok(out)
+        Ok((out, more))
     }
 }
 
@@ -307,13 +360,18 @@ impl OwnerRgExportWait {
 /// mechanism, and its completeness is governed by the caller-supplied `max`
 /// (the outer `wait_and_collect` loop drains to empty when `max == 0`). Arming
 /// a worker resync from inside a resync export would be circular.
+///
+/// #9344: the third element is `drain_session_deltas_fair`'s overflow bit —
+/// "the budget capped this drain AND a binding still holds deltas". It used to
+/// be discarded here into `_overflow`, which is the whole reason the owner-RG
+/// export had no terminating bound: without it the caller cannot tell a
+/// complete capped answer from a truncated one, so the only safe request was
+/// `max = 0`, and `max = 0` is what crosses the 64 MiB response cap.
 pub(crate) fn drain_session_deltas_from_live(
     live: &[Arc<BindingLiveState>],
     max: usize,
     start_cursor: usize,
-) -> (Vec<SessionDeltaInfo>, usize) {
+) -> (Vec<SessionDeltaInfo>, usize, bool) {
     let bindings: Vec<&BindingLiveState> = live.iter().map(|b| b.as_ref()).collect();
-    let (out, cursor, _overflow) =
-        crate::afxdp::session_delta::drain_session_deltas_fair(&bindings, max, start_cursor);
-    (out, cursor)
+    crate::afxdp::session_delta::drain_session_deltas_fair(&bindings, max, start_cursor)
 }

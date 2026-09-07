@@ -9,6 +9,23 @@ type ProcessStatus struct {
 	PID                              int `json:"pid"`
 	ConfigSnapshotProtocolVersion    int `json:"config_snapshot_protocol_version,omitempty"`
 	InjectPacketTupleProtocolVersion int `json:"inject_packet_tuple_protocol_version,omitempty"`
+	// SessionExportPagingProtocolVersion is the owner-RG session export PAGING
+	// contract the helper implements (#9344). 0 (or absent) means no paging.
+	//
+	// A helper reporting 0 honours SessionExportRequest.Max by TRUNCATING and
+	// reports no ControlResponse.SessionExportMore bit, so a caller must ask it
+	// for the unbounded set (Max=0) rather than page it. That fallback keeps
+	// the pre-#9344 behaviour exactly, including its 64 MiB failure — which
+	// #9322 made diagnosable — instead of trading a loud failure for a silent
+	// truncation, and a truncated window is what #5085's authoritative receiver
+	// turns into deleted live sessions on the peer.
+	//
+	// An explicit version rather than a probe: an answer of exactly Max deltas
+	// with SessionExportMore false is EITHER a new helper whose page consumed
+	// the window exactly OR an old helper that dropped the remainder, and the
+	// probe that would separate them is unsafe on the old helper (it ignores
+	// the unknown `continuation` field and runs a second full export).
+	SessionExportPagingProtocolVersion int `json:"session_export_paging_protocol_version,omitempty"`
 	// SessionDeltaSchemaFingerprint is the helper's DERIVED session-open delta
 	// schema identity (#7194). 0 == not advertised (helper predates the field),
 	// which CompareSessionDeltaSchema treats as unknown-and-deferred rather

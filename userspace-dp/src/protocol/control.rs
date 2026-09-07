@@ -102,6 +102,15 @@ use super::snapshot::{ConfigSnapshot, FabricSnapshot, NeighborSnapshot, Userspac
 /// sound when the old behaviour IS the defect the field was added to fix, and
 /// for those the bump is the only mechanism that refuses the pairing.
 pub(crate) const CONFIG_SNAPSHOT_PROTOCOL_VERSION: i32 = 10;
+
+/// #9344: the owner-RG session export paging contract this helper implements.
+///
+/// 1 = `SessionExportRequest.continuation` is honoured and
+/// `ControlResponse.session_export_more` is reported, so a caller may page one
+/// window across several capped responses. A helper reporting 0 (or omitting
+/// the field) honours `max` by TRUNCATING, so a caller must ask it for the
+/// unbounded set instead.
+pub(crate) const SESSION_EXPORT_PAGING_PROTOCOL_VERSION: i32 = 1;
 pub(crate) const INJECT_PACKET_TUPLE_PROTOCOL_VERSION: i32 = 1;
 
 /// #3651: one per-zone traffic-volume row inside the `ProcessStatus`-level
@@ -526,6 +535,25 @@ pub(crate) struct ControlResponse {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub session_deltas: Vec<SessionDeltaInfo>,
+    /// #9344: `true` when an `export_owner_rg_sessions` answer was CAPPED by
+    /// the request's `max` and the per-binding buffers still hold deltas from
+    /// the same window.
+    ///
+    /// The bit is not new information — `drain_session_deltas_fair` has always
+    /// computed it — it was discarded into `_overflow` at the owner-RG call
+    /// site, which is why paging was not expressible and the only usable
+    /// request was `max=0` (the UNBOUNDED set, which crosses the 64 MiB
+    /// response cap at ~7.8k sessions/worker on a 6-worker box).
+    ///
+    /// Additive and `omitempty` (#1961 skew-safe): an older helper omits it, an
+    /// older Go caller ignores it, and both read `false` — which is the
+    /// pre-#9344 single-shot behaviour.
+    #[serde(
+        rename = "session_export_more",
+        default,
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub session_export_more: bool,
     /// #8121: the `export_idle_leases` result.
     #[serde(rename = "idle_leases", default, skip_serializing_if = "Vec::is_empty")]
     pub idle_leases: Vec<IdleLeaseWire>,
@@ -917,6 +945,26 @@ pub(crate) struct SessionExportRequest {
     pub owner_rgs: Vec<i32>,
     #[serde(default)]
     pub max: u32,
+    /// #9344: drain the REMAINDER of the window an earlier capped call already
+    /// produced, instead of starting a new one.
+    ///
+    /// This flag exists because `max` alone does not express paging. The export
+    /// is two-phase: phase 1 kicks every worker to PRODUCE deltas for its live
+    /// sessions, phase 2 waits for the acks and DRAINS the per-binding buffers.
+    /// A capped phase-2 drain removes the first N and leaves the rest buffered,
+    /// so a second ordinary call would run phase 1 again and produce ANOTHER
+    /// full set on top of the remainder — successive calls would return
+    /// duplicates from two different instants, not successive pages of one
+    /// window. #5085's receiver reconciles authoritatively against the
+    /// delimited window, so a window assembled from two instants is exactly the
+    /// harm the Go caller's comment warns about.
+    ///
+    /// A continuation therefore kicks nothing, consumes no export sequence and
+    /// does not wait for acks: the deltas it drains were produced by the phase 1
+    /// of the FIRST call in the sequence, so all pages of a window come from one
+    /// instant.
+    #[serde(default)]
+    pub continuation: bool,
 }
 
 /// #7919: the 5-tuple a `session_counters` query names.

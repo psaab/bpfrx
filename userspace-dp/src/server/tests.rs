@@ -3155,6 +3155,7 @@ fn export_owner_rg_does_not_hold_state_lock_during_ack_wait() {
         r.session_export = Some(SessionExportRequest {
             owner_rgs: vec![1],
             max: 0,
+            continuation: false,
         });
         run_request(export_state, r)
     });

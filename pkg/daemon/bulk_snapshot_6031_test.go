@@ -11,19 +11,18 @@ import (
 )
 
 // recordingExporter captures the arguments the cold-prime snapshot passes to
-// ExportOwnerRGSessions so the test can assert on them, and can be made to fail.
+// ExportOwnerRGSessionsPaged so the test can assert on them, and can be made to
+// fail.
 type recordingExporter struct {
 	deltas   []dpuserspace.SessionDeltaInfo
 	err      error
 	calls    int
 	gotRGIDs []int
-	gotMax   uint32
 }
 
-func (r *recordingExporter) ExportOwnerRGSessions(rgIDs []int, max uint32) ([]dpuserspace.SessionDeltaInfo, dpuserspace.ProcessStatus, error) {
+func (r *recordingExporter) ExportOwnerRGSessionsPaged(rgIDs []int) ([]dpuserspace.SessionDeltaInfo, dpuserspace.ProcessStatus, error) {
 	r.calls++
 	r.gotRGIDs = append([]int(nil), rgIDs...)
-	r.gotMax = max
 	if r.err != nil {
 		return nil, dpuserspace.ProcessStatus{}, r.err
 	}
@@ -82,14 +81,23 @@ func hasV4(t *testing.T, snap cluster.BulkSnapshot, cfg *config.Config, delta dp
 // TestUserspaceBulkSnapshotGathersUnboundedTableTruth6031 pins the two
 // properties the cold-prime window depends on:
 //
-//   - the set comes from ExportOwnerRGSessions — the helper's in-process
-//     SessionTable — filtered to the RGs this node is primary for, NOT from the
-//     BPF conntrack display mirror BulkSync walks; and
-//   - max is 0, i.e. UNBOUNDED. A capped export truncates the window, and since
-//     #5085 every eligible session missing from the window is DELETED on the
-//     peer — so a cap silently destroys sessions N+1..end.
+//   - the set comes from the helper's in-process SessionTable, filtered to the
+//     RGs this node is primary for, NOT from the BPF conntrack display mirror
+//     BulkSync walks; and
+//   - the window is COMPLETE. Since #5085 every eligible session missing from
+//     it is DELETED on the peer, so a truncated window silently destroys
+//     sessions N+1..end.
 //
-// RED-on-revert: pass a non-zero max and the max assertion fires.
+// #9344 changed HOW the second property is held, and this cell changed with it.
+// It used to assert `max == 0` on the exporter call, because unbounded was the
+// only complete request the daemon could make. The cap knob is now gone from
+// this interface entirely — completeness is decided in the Manager, which knows
+// the helper's paging contract and pages or falls back accordingly — so the
+// assertion here is STRUCTURAL: there is no cap to get wrong at this layer.
+// The behavioural half moved to the Manager, where
+// TestOwnerRGExportPagesUntilTheHelperSaysNoMore9344 and its siblings drive it;
+// asserting `max == 0` here after the change would have been asserting a
+// parameter that no longer exists.
 func TestUserspaceBulkSnapshotGathersUnboundedTableTruth6031(t *testing.T) {
 	d, ss, cfg := snapshot6031Daemon()
 	exporter := &recordingExporter{deltas: []dpuserspace.SessionDeltaInfo{transitDelta6031(39906)}}
@@ -99,14 +107,10 @@ func TestUserspaceBulkSnapshotGathersUnboundedTableTruth6031(t *testing.T) {
 		t.Fatalf("userspaceBulkSnapshotWithConfig() error = %v", err)
 	}
 	if exporter.calls != 1 {
-		t.Fatalf("ExportOwnerRGSessions calls = %d, want 1", exporter.calls)
-	}
-	if exporter.gotMax != 0 {
-		t.Fatalf("ExportOwnerRGSessions max = %d, want 0 (UNBOUNDED) — a capped export "+
-			"truncates the authoritative window and the peer DELETES the remainder", exporter.gotMax)
+		t.Fatalf("ExportOwnerRGSessionsPaged calls = %d, want 1", exporter.calls)
 	}
 	if len(exporter.gotRGIDs) != 1 || exporter.gotRGIDs[0] != 1 {
-		t.Fatalf("ExportOwnerRGSessions rgIDs = %v, want [1]", exporter.gotRGIDs)
+		t.Fatalf("ExportOwnerRGSessionsPaged rgIDs = %v, want [1]", exporter.gotRGIDs)
 	}
 	if !hasV4(t, snap, cfg, transitDelta6031(39906)) {
 		t.Fatalf("snapshot must carry the exported transit session; got V4 = %+v", snap.V4)
