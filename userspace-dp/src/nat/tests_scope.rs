@@ -726,12 +726,40 @@ fn source_nat_flow_key_separates_routing_domains_9062() {
     assert_ne!(unscoped, a, "domain 0 and domain 1 are different scopes");
 }
 
-// The ALLOCATOR key must separate them too. Keying only the flow would still
-// leave both tenants drawing ports from ONE PortAllocator, so a port handed to
-// one is unavailable to the other -- a quieter defect than the collision, and
-// one the flow-key fix alone does not close.
+// #9389 INVERTED THIS CELL. It asserted the opposite, and it was wrong.
+//
+// The comment it replaces read: "Keying only the flow would still leave both
+// tenants drawing ports from ONE PortAllocator, so a port handed to one is
+// unavailable to the other -- a quieter defect than the collision."
+//
+// THAT IS NOT A DEFECT. It is a shared pool working correctly. A pool is a
+// finite set of wire identities, and one `(address, port)` backs exactly one
+// flow whatever routing instance its traffic came from. "Unavailable to the
+// other" is what a shared resource means.
+//
+// #9062's real defect was the OTHER half of that sentence -- two tenants with
+// identical 5-tuples resolving to one `live_by_flow` record and being handed
+// the SAME translation -- and `SourceNatFlowKey::routing_scope` closes it
+// alone. With distinct flow keys the two tenants hold two records and draw two
+// DIFFERENT ports from the one allocator, which is the correct outcome.
+//
+// Splitting the allocator as well produced two pointer-distinct `PortAllocator`s
+// over identical addresses, either of which could mint the same `(addr, port)`
+// for a different tenant. The #6979/#8115 overlap guard correctly refused that
+// (`same_allocator` is `Arc::ptr_eq`), so mints came back
+// `PoolPeerAddressOverlap` and were dropped -- measured at five consecutive
+// refusals on a pool with free capacity. The guard was right; the split was
+// wrong.
+//
+// Note what the split did NOT buy: `pool_addresses_v4`/`_v6` are already in the
+// key, so two genuinely different pools sharing a NAME across instances were
+// always discriminated by their addresses. The routing instance added no
+// discrimination that was not already there.
+//
+// See `two_instances_naming_one_pool_are_not_peers_9389` for the behavioural
+// half; this cell pins the key itself.
 #[test]
-fn source_nat_allocator_key_separates_routing_instances_9062() {
+fn source_nat_allocator_key_ignores_routing_instances_9389() {
     let mk = |ri: &str| SourceNATRuleSnapshot {
         name: format!("snat-{ri}"),
         from_zone: "lan".to_string(),
@@ -747,11 +775,14 @@ fn source_nat_allocator_key_separates_routing_instances_9062() {
     let same = parse_source_nat_rules(&[mk("tenant-a")]);
 
     let key = |rs: &[crate::nat::SourceNatRule]| rs[0].allocator_key();
-    assert_ne!(
+    assert_eq!(
         key(&vrf_a),
         key(&vrf_b),
-        "two rule-sets in DIFFERENT routing instances naming the same pool must \
-         not share one PortAllocator"
+        "two rule-sets naming ONE pool from different routing instances must share \
+         ONE PortAllocator. A pool is one set of wire identities; splitting it \
+         gives two allocators that can each mint the same (addr, port), which the \
+         #6979 overlap guard then refuses -- dropping mints while the pool has \
+         free capacity (#9389)"
     );
     // REFERENCE ARM: the same instance must still share, or every apply mints a
     // fresh allocator and every in-flight translation is forgotten.

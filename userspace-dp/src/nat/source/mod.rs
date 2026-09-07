@@ -285,15 +285,35 @@ pub(crate) struct SourceNatPoolAllocatorKey {
     pool_addresses_v6: Vec<Ipv6Addr>,
     port_low: u16,
     port_high: u16,
-    /// #9062: the rule-set's `from` routing instance. Two rule-sets scoped to
-    /// different instances that name the same pool used to share ONE
-    /// PortAllocator, so a port handed to one tenant was unavailable to the
-    /// other and -- with the flow key also domain-blind -- the second tenant's
-    /// identical 5-tuple was answered with the first's translation.
-    ///
-    /// Taken from the rule rather than from the packet: the allocator is
-    /// selected per RULE, and the rule's own scope is what the operator wrote.
-    from_routing_instance: String,
+    // #9389: `from_routing_instance` was ADDED here by #9062 and is REMOVED
+    // again. Its own rationale gave two reasons and only one was a defect:
+    //
+    //   - "a port handed to one tenant was unavailable to the other" -- that is
+    //     a shared pool WORKING CORRECTLY. One (address, port) is one identity
+    //     on the wire and can back exactly one flow, whatever routing instance
+    //     the traffic came from.
+    //   - "with the flow key also domain-blind, the second tenant's identical
+    //     5-tuple was answered with the first's translation" -- THAT was the
+    //     defect, and `SourceNatFlowKey::routing_scope` fixes it on its own.
+    //     Two tenants with identical 5-tuples now hold two `live_by_flow`
+    //     entries and are handed two DIFFERENT ports from the one allocator.
+    //
+    // Splitting the ALLOCATOR as well produced two pointer-distinct
+    // `PortAllocator`s over identical pool addresses, either of which could mint
+    // the same `(addr, port)` for a different tenant. The #6979/#8115 overlap
+    // guard correctly refused that -- `same_allocator` is `Arc::ptr_eq` -- so
+    // every mint whose candidate the peer already held came back
+    // `PoolPeerAddressOverlap` and was dropped. Measured: five consecutive
+    // refusals for the second instance on a pool with free capacity.
+    //
+    // THE GUARD WAS RIGHT AND THE SPLIT WAS WRONG. Two rule-sets naming one pool
+    // must share one allocator, because the pool is one shared resource of wire
+    // identities.
+    //
+    // Nothing is lost by removing it: `pool_addresses_v4`/`_v6` are already in
+    // this key, so two genuinely different pools that happen to share a NAME are
+    // still discriminated by the addresses they hand out. The routing instance
+    // added no discrimination the addresses did not already provide.
 }
 
 impl SourceNatRule {
@@ -353,7 +373,6 @@ impl SourceNatRule {
             pool_addresses_v6: self.pool_addresses_v6.clone(),
             port_low,
             port_high,
-            from_routing_instance: self.from_routing_instance.clone(),
         }
     }
 }
