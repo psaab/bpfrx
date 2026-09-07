@@ -482,10 +482,22 @@ fn tcp_segment_consumed_len(frame: &[u8], parsed: TcpReplySource) -> Option<u32>
 
 /// Build the RST reply for a validated SYN-cookie ACK.
 ///
-/// The current userspace contract mirrors the eBPF behavior: a valid cookie ACK
-/// is consumed, a RST is sent, and the client's next SYN takes the normal
-/// policy/NAT/session path. For ACK-bearing segments RFC 793 sets the RST
-/// sequence number from the received ACK and does not include an ACK field.
+/// The userspace contract mirrors the eBPF behavior: a valid cookie ACK is
+/// consumed, a RST is sent, and the client's NEXT CONNECTION takes the normal
+/// policy/NAT/session path via the validated-client whitelist. For ACK-bearing
+/// segments RFC 793 sets the RST sequence number from the received ACK and does
+/// not include an ACK field.
+///
+/// #9419 — read "next connection", not "next SYN". This RST is addressed to
+/// the client with `seq = parsed.ack`, i.e. exactly the client's `RCV.NXT`, so
+/// RFC 5961 accepts it without a challenge ACK and the just-ESTABLISHED socket
+/// is aborted with `ECONNRESET`. Nothing retransmits a SYN from there; the
+/// application `connect()`s again on a NEW ephemeral port. That is why the
+/// whitelist this path relies on must be keyed on the client and service and
+/// must NOT include the source port — the equivalence this comment asserts
+/// held only once the key matched the eBPF `struct validated_client_key`.
+/// See `screen::SynCookieClientKey` and
+/// `docs/syn-cookie-flood-protection.md`, "Whitelist scope and lifetime".
 #[cfg_attr(not(test), allow(dead_code))]
 pub(in crate::afxdp) fn build_syn_cookie_ack_rst_frame(frame: &[u8]) -> Option<Vec<u8>> {
     let parsed = parse_tcp_reply_source(frame)?;

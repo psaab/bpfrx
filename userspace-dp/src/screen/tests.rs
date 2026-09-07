@@ -3154,6 +3154,16 @@ fn syn_cookie_key() -> [u8; 16] {
     ]
 }
 
+/// #9419 whitelist key for the same client the `syn_cookie_tuple()` 4-tuple
+/// describes. Deliberately carries no ephemeral source port.
+fn syn_cookie_client() -> SynCookieClientKey {
+    SynCookieClientKey {
+        src_ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
+        dst_port: 443,
+    }
+}
+
 fn syn_cookie_tuple() -> SynCookieTuple {
     SynCookieTuple {
         src_ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
@@ -3576,10 +3586,18 @@ fn syn_cookie_ack_validation_marks_next_syn_bypass_without_session_creation() {
         state.check_packet_with_zone_id("trust", 7, &syn, 128),
         ScreenVerdict::SynCookieBypass
     );
+    // #9419 re-anchor. This used to assert `len() == 0` with the note
+    // "validated tuple is single-use". Single-use was the defect, not the
+    // contract: the challenge path answers the valid cookie ACK with a RST,
+    // so the retry this whitelist exists to admit arrives from a NEW
+    // ephemeral port on a NEW connection — a single-use entry is already
+    // gone by then even in the impossible case where the port matched. The
+    // entry now survives its own hit and is bounded only by the TTL and the
+    // #2446 generation.
     assert_eq!(
         state.syn_cookie_validated_len(),
-        0,
-        "validated tuple is single-use"
+        1,
+        "a validated client stays whitelisted for the TTL, not for one packet"
     );
 }
 
@@ -3591,8 +3609,9 @@ fn syn_cookie_validated_syn_bypasses_flood_gate_and_passes() {
     // stage (it now enforces at the new-flow decision in
     // poll_descriptor), and the only remaining later stateful checks
     // (port-scan / ip-sweep) key on tuple-uniqueness — which conflicts
-    // with the validated cache, that only bypasses the flood gate for the
-    // EXACT validated tuple. So we prove the load-bearing property
+    // with the validated cache, that bypasses the flood gate only for the
+    // validated CLIENT (src_ip, dst_ip, dst_port — #9419). So we prove the
+    // load-bearing property
     // directly: a cookie-validated SYN bypasses the SYN-flood gate and
     // traverses the rest of `check_packet_with_zone_id` to a clean Pass,
     // whereas the identical un-validated SYN is challenged at the gate.
@@ -3628,16 +3647,246 @@ fn syn_cookie_validated_syn_bypasses_flood_gate_and_passes() {
         SynCookieAckVerdict::Validated
     );
 
-    // The client's next SYN (identical tuple), now cookie-validated,
-    // bypasses the SYN-flood gate and runs to completion: SynCookieBypass
-    // (a Pass-equivalent that records the bypass), NOT another challenge
-    // or drop. The validated tuple is single-use, so the cache is empty
-    // again afterwards.
+    // The client's next SYN, now cookie-validated, bypasses the SYN-flood
+    // gate and runs to completion: SynCookieBypass (a Pass-equivalent that
+    // records the bypass), NOT another challenge or drop. #9419: the entry
+    // survives the hit (see `syn_cookie_retry_from_new_ephemeral_port_...`),
+    // so the cache still holds it afterwards.
     assert_eq!(
         state.check_packet_with_zone_id("trust", 7, &syn, 128),
         ScreenVerdict::SynCookieBypass
     );
-    assert_eq!(state.syn_cookie_validated_len(), 0);
+    assert_eq!(state.syn_cookie_validated_len(), 1);
+}
+
+// ===== #9419: the challenge-and-reset design's own recovery step =====
+//
+// `docs/syn-cookie-flood-protection.md` step 6 is "client retransmits SYN ->
+// passes as validated". No TCP stack does that: step 5 RSTs the client, which
+// aborts the just-ESTABLISHED socket with ECONNRESET, and the application
+// calls `connect()` again — a NEW ephemeral source port. So the ONLY shape in
+// which step 6 is observable is a retry from a DIFFERENT source port, and that
+// is what these cells drive. The pre-#9419 whitelist key carried `src_port`
+// and was consumed on hit, so both halves had to change; each cell below is
+// red under either half alone.
+//
+// FAIL-ON-REVERT: re-add `src_port` to `SynCookieClientKey`, or restore the
+// consume-on-hit in `contains_valid`, and these red as assertions.
+
+/// Step 6, in the only shape it can occur in: the retry comes from a new
+/// ephemeral port.
+#[test]
+fn syn_cookie_retry_from_new_ephemeral_port_bypasses_9419() {
+    let mut profile = ScreenProfile::default();
+    profile.syn_flood_threshold = 1;
+    profile.syn_cookie = true;
+    let mut state = make_state("trust", profile);
+    state.update_syn_cookie_master_key(Some(syn_cookie_key()));
+    state.set_syn_cookie_full_epoch_for_test(1);
+
+    let syn = tcp_pkt(
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
+        49152,
+        443,
+        TCP_SYN,
+    );
+    assert_eq!(
+        state.check_packet_with_zone_id("trust", 7, &syn, 128),
+        ScreenVerdict::Pass
+    );
+    let challenge = match state.check_packet_with_zone_id("trust", 7, &syn, 128) {
+        ScreenVerdict::SynCookieChallenge(challenge) => challenge,
+        other => panic!("expected SYN-cookie challenge, got {other:?}"),
+    };
+
+    let mut ack = syn.clone();
+    ack.tcp_flags = TCP_ACK;
+    ack.tcp_seq = 2;
+    ack.tcp_ack = challenge.cookie_isn.wrapping_add(1);
+    assert_eq!(
+        state.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128 * NS, 128),
+        SynCookieAckVerdict::Validated
+    );
+
+    // The RST landed; the application reconnects. Everything about the packet
+    // is identical EXCEPT the ephemeral source port.
+    let mut retry = syn.clone();
+    retry.src_port = 49153;
+    assert_eq!(
+        state.check_packet_with_zone_id("trust", 7, &retry, 128),
+        ScreenVerdict::SynCookieBypass,
+        "a validated client's reconnect must be admitted; it cannot reuse the \
+         ephemeral port the RST just tore down"
+    );
+}
+
+/// Not single-use: several successive reconnects, each on its own new port,
+/// are all admitted while the whitelist entry is inside its TTL.
+#[test]
+fn syn_cookie_repeated_reconnects_from_validated_client_bypass_9419() {
+    let mut profile = ScreenProfile::default();
+    profile.syn_flood_threshold = 1;
+    profile.syn_cookie = true;
+    let mut state = make_state("trust", profile);
+    state.update_syn_cookie_master_key(Some(syn_cookie_key()));
+    state.set_syn_cookie_full_epoch_for_test(1);
+
+    let syn = tcp_pkt(
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
+        49152,
+        443,
+        TCP_SYN,
+    );
+    assert_eq!(
+        state.check_packet_with_zone_id("trust", 7, &syn, 128),
+        ScreenVerdict::Pass
+    );
+    let challenge = match state.check_packet_with_zone_id("trust", 7, &syn, 128) {
+        ScreenVerdict::SynCookieChallenge(challenge) => challenge,
+        other => panic!("expected SYN-cookie challenge, got {other:?}"),
+    };
+    let mut ack = syn.clone();
+    ack.tcp_flags = TCP_ACK;
+    ack.tcp_seq = 2;
+    ack.tcp_ack = challenge.cookie_isn.wrapping_add(1);
+    assert_eq!(
+        state.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128 * NS, 128),
+        SynCookieAckVerdict::Validated
+    );
+
+    for port in 49153u16..49158 {
+        let mut retry = syn.clone();
+        retry.src_port = port;
+        assert_eq!(
+            state.check_packet_with_zone_id("trust", 7, &retry, 128),
+            ScreenVerdict::SynCookieBypass,
+            "reconnect {port} must still bypass: the whitelist is bounded by \
+             its TTL, not by a single use"
+        );
+    }
+    assert_eq!(state.syn_cookie_validated_len(), 1);
+}
+
+/// NEGATIVE CONTROL — the widening is source- and service-scoped, not blanket.
+/// A different source address and a different destination service are both
+/// still challenged, from the same state that just admitted the reconnect
+/// above. Without this, "always return true" would pass the two cells above.
+#[test]
+fn syn_cookie_whitelist_does_not_widen_past_the_validated_client_9419() {
+    let mut profile = ScreenProfile::default();
+    profile.syn_flood_threshold = 1;
+    profile.syn_cookie = true;
+    let mut state = make_state("trust", profile);
+    state.update_syn_cookie_master_key(Some(syn_cookie_key()));
+    state.set_syn_cookie_full_epoch_for_test(1);
+
+    let syn = tcp_pkt(
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
+        49152,
+        443,
+        TCP_SYN,
+    );
+    assert_eq!(
+        state.check_packet_with_zone_id("trust", 7, &syn, 128),
+        ScreenVerdict::Pass
+    );
+    let challenge = match state.check_packet_with_zone_id("trust", 7, &syn, 128) {
+        ScreenVerdict::SynCookieChallenge(challenge) => challenge,
+        other => panic!("expected SYN-cookie challenge, got {other:?}"),
+    };
+    let mut ack = syn.clone();
+    ack.tcp_flags = TCP_ACK;
+    ack.tcp_seq = 2;
+    ack.tcp_ack = challenge.cookie_isn.wrapping_add(1);
+    assert_eq!(
+        state.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128 * NS, 128),
+        SynCookieAckVerdict::Validated
+    );
+
+    // POSITIVE control, same instant: the validated client's reconnect IS
+    // admitted, so a challenge below is a real scope boundary rather than the
+    // whitelist simply being empty or the zone not being cookie-active.
+    let mut ok = syn.clone();
+    ok.src_port = 49153;
+    assert_eq!(
+        state.check_packet_with_zone_id("trust", 7, &ok, 128),
+        ScreenVerdict::SynCookieBypass
+    );
+
+    let mut other_source = syn.clone();
+    other_source.src_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11));
+    other_source.src_port = 49153;
+    assert!(
+        matches!(
+            state.check_packet_with_zone_id("trust", 7, &other_source, 128),
+            ScreenVerdict::SynCookieChallenge(_)
+        ),
+        "a DIFFERENT source must not inherit the whitelist"
+    );
+
+    let mut other_service = syn.clone();
+    other_service.dst_port = 8443;
+    other_service.src_port = 49154;
+    assert!(
+        matches!(
+            state.check_packet_with_zone_id("trust", 7, &other_service, 128),
+            ScreenVerdict::SynCookieChallenge(_)
+        ),
+        "a DIFFERENT destination service must not inherit the whitelist"
+    );
+}
+
+/// The whitelist is bounded by the TTL: once the entry ages out, a reconnect
+/// from the validated client is challenged again rather than admitted forever.
+#[test]
+fn syn_cookie_whitelist_stops_bypassing_after_ttl_9419() {
+    let mut profile = ScreenProfile::default();
+    profile.syn_flood_threshold = 1;
+    profile.syn_cookie = true;
+    let mut state = make_state("trust", profile);
+    state.update_syn_cookie_master_key(Some(syn_cookie_key()));
+    state.set_syn_cookie_full_epoch_for_test(1);
+
+    let syn = tcp_pkt(
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
+        49152,
+        443,
+        TCP_SYN,
+    );
+    assert_eq!(
+        state.check_packet_with_zone_id("trust", 7, &syn, 128),
+        ScreenVerdict::Pass
+    );
+    let challenge = match state.check_packet_with_zone_id("trust", 7, &syn, 128) {
+        ScreenVerdict::SynCookieChallenge(challenge) => challenge,
+        other => panic!("expected SYN-cookie challenge, got {other:?}"),
+    };
+    let mut ack = syn.clone();
+    ack.tcp_flags = TCP_ACK;
+    ack.tcp_seq = 2;
+    ack.tcp_ack = challenge.cookie_isn.wrapping_add(1);
+    assert_eq!(
+        state.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128 * NS, 128),
+        SynCookieAckVerdict::Validated
+    );
+
+    // Insert at 128 with a one-epoch (64s) TTL -> expires at 192.
+    let mut late = syn.clone();
+    late.src_port = 49153;
+    assert_ne!(
+        state.check_packet_with_zone_id("trust", 7, &late, 192),
+        ScreenVerdict::SynCookieBypass,
+        "the whitelist must expire; a 64s-old validation is not a standing pass"
+    );
+    assert_eq!(
+        state.syn_cookie_validated_len(),
+        0,
+        "the expired entry is reclaimed rather than left occupying a way"
+    );
 }
 
 #[test]
@@ -3997,24 +4246,27 @@ fn syn_cookie_validated_cache_is_bounded() {
     let mut cache = SynCookieValidatedCache::new(4, 64);
     assert_eq!(cache.capacity(), 4);
 
-    let mut tuple = syn_cookie_tuple();
+    // #9419: distinctness now comes from the DESTINATION port — the key
+    // carries no source port at all, so varying `src_port` would insert the
+    // same entry 32 times and this cell would measure nothing.
+    let mut client = syn_cookie_client();
     for port in 40000..40032 {
-        tuple.src_port = port;
-        cache.insert(7, 0, tuple, 100);
+        client.dst_port = port;
+        cache.insert(7, 0, client, 100);
     }
 
     assert_eq!(cache.len(), 4);
-    let mut evicted = syn_cookie_tuple();
-    evicted.src_port = 40000;
-    assert!(!cache.take_valid(7, 0, evicted, 100));
-    evicted.src_port = 40027;
-    assert!(!cache.take_valid(7, 0, evicted, 100));
+    let mut evicted = syn_cookie_client();
+    evicted.dst_port = 40000;
+    assert!(!cache.contains_valid(7, 0, evicted, 100));
+    evicted.dst_port = 40027;
+    assert!(!cache.contains_valid(7, 0, evicted, 100));
 
-    let mut retained = syn_cookie_tuple();
-    retained.src_port = 40028;
-    assert!(cache.take_valid(7, 0, retained, 100));
-    retained.src_port = 40031;
-    assert!(cache.take_valid(7, 0, retained, 100));
+    let mut retained = syn_cookie_client();
+    retained.dst_port = 40028;
+    assert!(cache.contains_valid(7, 0, retained, 100));
+    retained.dst_port = 40031;
+    assert!(cache.contains_valid(7, 0, retained, 100));
 }
 
 #[test]
@@ -4024,10 +4276,10 @@ fn syn_cookie_validated_cache_index_is_keyed() {
     let mut right = SynCookieValidatedCache::new(64, 64);
     right.set_hash_keys([0x9999_aaaa_bbbb_cccc, 0xdddd_eeee_ffff_0000]);
 
-    let mut tuple = syn_cookie_tuple();
+    let mut client = syn_cookie_client();
     let differs = (0..1024).any(|offset| {
-        tuple.src_port = 30000 + offset;
-        left.debug_set_index(7, 0, tuple) != right.debug_set_index(7, 0, tuple)
+        client.dst_port = 30000 + offset;
+        left.debug_set_index(7, 0, client) != right.debug_set_index(7, 0, client)
     });
 
     assert!(
@@ -4273,8 +4525,9 @@ fn syn_cookie_validated_cache_hit_within_same_generation() {
         ScreenVerdict::SynCookieBypass,
         "an unrelated profile edit must not invalidate a validated entry"
     );
-    // Consumed exactly once.
-    assert_eq!(state.syn_cookie_validated_len(), 0);
+    // #9419: the hit does not consume the entry — it remains whitelisted
+    // for the rest of its TTL under the same generation.
+    assert_eq!(state.syn_cookie_validated_len(), 1);
 }
 
 // #2446 unit-level: the cache treats two generations as distinct keys —
@@ -4283,18 +4536,17 @@ fn syn_cookie_validated_cache_hit_within_same_generation() {
 #[test]
 fn syn_cookie_validated_cache_generation_is_keyed() {
     let mut cache = SynCookieValidatedCache::new(64, 64);
-    let tuple = syn_cookie_tuple();
+    let client = syn_cookie_client();
 
-    cache.insert(7, 1, tuple, 100);
+    cache.insert(7, 1, client, 100);
     assert!(
-        !cache.take_valid(7, 2, tuple, 100),
+        !cache.contains_valid(7, 2, client, 100),
         "an entry from a stale generation must be a miss under the new gen"
     );
 
-    cache.insert(7, 1, tuple, 100);
     assert!(
-        cache.take_valid(7, 1, tuple, 100),
-        "an entry consumed under its own generation must still be a hit"
+        cache.contains_valid(7, 1, client, 100),
+        "an entry looked up under its own generation must still be a hit"
     );
 }
 
@@ -4319,31 +4571,37 @@ fn update_profiles_prepopulates_syn_cookie_active_state() {
 #[test]
 fn syn_cookie_validated_cache_refresh_extends_ttl() {
     let mut cache = SynCookieValidatedCache::new(4, 10);
-    let tuple_refreshed = syn_cookie_tuple();
-    let mut tuple_old = syn_cookie_tuple();
-    tuple_old.src_port += 1;
-    cache.insert(7, 0, tuple_refreshed, 100);
-    cache.insert(7, 0, tuple_old, 100);
-    cache.insert(7, 0, tuple_refreshed, 109);
-    assert!(!cache.take_valid(7, 0, tuple_old, 110));
-    assert!(cache.take_valid(7, 0, tuple_refreshed, 110));
+    let client_refreshed = syn_cookie_client();
+    let mut client_old = syn_cookie_client();
+    client_old.dst_port += 1;
+    cache.insert(7, 0, client_refreshed, 100);
+    cache.insert(7, 0, client_old, 100);
+    cache.insert(7, 0, client_refreshed, 109);
+    assert!(!cache.contains_valid(7, 0, client_old, 110));
+    assert!(cache.contains_valid(7, 0, client_refreshed, 110));
 }
 
 #[test]
 fn syn_cookie_validated_cache_expires_on_ttl_boundary() {
     let mut cache = SynCookieValidatedCache::new(4, SynCookieCodec::EPOCH_SECS);
-    let tuple = syn_cookie_tuple();
+    let client = syn_cookie_client();
 
-    cache.insert(7, 0, tuple, 128);
+    cache.insert(7, 0, client, 128);
     assert!(
-        cache.take_valid(7, 0, tuple, 191),
+        cache.contains_valid(7, 0, client, 191),
         "entry should remain valid until just before the 64s TTL boundary"
     );
 
-    cache.insert(7, 0, tuple, 128);
     assert!(
-        !cache.take_valid(7, 0, tuple, 192),
+        !cache.contains_valid(7, 0, client, 192),
         "entry expires at insertion time + one cookie epoch"
+    );
+    // #9419: the TTL is what BOUNDS the whitelist now that a hit no longer
+    // consumes the entry — an expired lookup must also reclaim the way.
+    assert_eq!(
+        cache.len(),
+        0,
+        "an expired entry is reclaimed on the lookup that observes its expiry"
     );
 }
 

@@ -7,13 +7,18 @@
 //! - `SynCookieValidation`, `SynCookieChallenge`, `SynCookieAckVerdict`
 //! - `SynCookieCodec` (mint/validate ISN, MAC derivation, epoch math)
 //! - `SipHash24` (private MAC primitive)
+//! - `SynCookieClientKey` (validated-client whitelist key: source-scoped,
+//!   NO ephemeral source port — #9419)
 //! - `SynCookieValidatedCache` (4-way set-associative recent-validated
 //!   cookie cache so the ACK+SYN bypass path doesn't re-validate per
-//!   packet). Keyed by `(zone_id, profile_gen, 4-tuple)` (#2446): the
+//!   packet). Keyed by `(zone_id, profile_gen, src_ip, dst_ip, dst_port)`
+//!   (#2446 + #9419) and consulted non-destructively: the
 //!   per-zone SYN-cookie profile generation is stamped on insert and
-//!   compared on consume, so a tuple validated under an old profile is a
+//!   compared on lookup, so a client validated under an old profile is a
 //!   miss after the zone's SYN-cookie profile changes (the new profile's
-//!   SYN-flood counter then re-sees the connection).
+//!   SYN-flood counter then re-sees the connection). Entries live for one
+//!   cookie epoch and survive being read, so the client's post-RST
+//!   `connect()` — on a NEW ephemeral port — is admitted (#9419).
 
 use std::net::IpAddr;
 
@@ -69,6 +74,42 @@ impl SynCookieTuple {
             src_ip: pkt.src_ip,
             dst_ip: pkt.dst_ip,
             src_port: pkt.src_port,
+            dst_port: pkt.dst_port,
+        }
+    }
+}
+
+/// Validated-client whitelist key (#9419).
+///
+/// Deliberately NOT `SynCookieTuple`. The cookie MAC binds the full
+/// 4-tuple (that is what makes a cookie unforgeable for a given
+/// connection), but the whitelist answers a different question: "has
+/// this SOURCE recently proved, by returning a valid cookie, that it is
+/// not spoofed?". That property belongs to the source ADDRESS and the
+/// service it reached, never to one ephemeral port.
+///
+/// Including `src_port` made the design's own recovery step
+/// (`docs/syn-cookie-flood-protection.md`, "Client retransmits SYN ->
+/// passes as validated") unreachable: the challenge path answers a valid
+/// cookie ACK with a RST, which aborts the just-ESTABLISHED socket, and
+/// no TCP stack retransmits a SYN after `ECONNRESET` — the application
+/// calls `connect()` again on a NEW ephemeral port, which missed the
+/// port-scoped whitelist and was challenged and reset again, forever.
+/// The eBPF ancestor keyed on `{src_ip, dst_ip, dst_port}` with no source
+/// port (`git show 13fa1009ea:bpf/headers/xpf_common.h` —
+/// `struct validated_client_key`); this restores that shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct SynCookieClientKey {
+    pub src_ip: IpAddr,
+    pub dst_ip: IpAddr,
+    pub dst_port: u16,
+}
+
+impl SynCookieClientKey {
+    pub(crate) fn from_packet(pkt: &ScreenPacketInfo) -> Self {
+        Self {
+            src_ip: pkt.src_ip,
+            dst_ip: pkt.dst_ip,
             dst_port: pkt.dst_port,
         }
     }
@@ -393,7 +434,8 @@ struct SynCookieValidatedKey {
     /// the new profile's SYN-flood counter then sees the connection. The
     /// master-key-change `set_hash_keys` clear remains as defense in depth.
     profile_gen: u64,
-    tuple: SynCookieTuple,
+    /// #9419: source-scoped, NOT the 4-tuple. See `SynCookieClientKey`.
+    client: SynCookieClientKey,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -450,7 +492,7 @@ impl SynCookieValidatedCache {
         &mut self,
         zone_id: u16,
         profile_gen: u64,
-        tuple: SynCookieTuple,
+        client: SynCookieClientKey,
         now_secs: u64,
     ) {
         if self.sets.is_empty() {
@@ -459,7 +501,7 @@ impl SynCookieValidatedCache {
         let key = SynCookieValidatedKey {
             zone_id,
             profile_gen,
-            tuple,
+            client,
         };
         let set_index = self.set_index(&key);
         self.clock = self.clock.wrapping_add(1);
@@ -502,11 +544,26 @@ impl SynCookieValidatedCache {
         set.entries[replace_index] = Some(new_entry);
     }
 
-    pub(super) fn take_valid(
+    /// Is this client currently whitelisted? #9419: this is a PEEK, not a
+    /// take. It was `take_valid` — a hit removed the entry, so a client was
+    /// admitted exactly once per cookie solved. Combined with the
+    /// challenge-and-reset design (the valid ACK is answered with a RST, so
+    /// the client must `connect()` again) that made a second connection
+    /// impossible even from the same 4-tuple, and every subsequent one was
+    /// re-challenged and re-reset. The whitelist is now bounded by its TTL
+    /// (`SYN_COOKIE_VALIDATED_CACHE_TTL_SECS`, one cookie epoch) and by the
+    /// #2446 profile generation, exactly like the eBPF `LRU_HASH` ancestor.
+    /// Renamed rather than edited in place so any caller still assuming
+    /// consume-on-hit fails to compile.
+    ///
+    /// Still `&mut self`: an entry that has aged out is reclaimed on the way
+    /// past, and a matched-but-expired entry is evicted rather than left to
+    /// occupy a way.
+    pub(super) fn contains_valid(
         &mut self,
         zone_id: u16,
         profile_gen: u64,
-        tuple: SynCookieTuple,
+        client: SynCookieClientKey,
         now_secs: u64,
     ) -> bool {
         if self.sets.is_empty() {
@@ -515,7 +572,7 @@ impl SynCookieValidatedCache {
         let key = SynCookieValidatedKey {
             zone_id,
             profile_gen,
-            tuple,
+            client,
         };
         let set_index = self.set_index(&key);
         let set = &mut self.sets[set_index];
@@ -527,8 +584,12 @@ impl SynCookieValidatedCache {
             };
             if entry.key == key {
                 valid = entry.expires_secs > now_secs;
-                set.entries[index] = None;
-                self.len = self.len.saturating_sub(1);
+                if !valid {
+                    // Expired: reclaim the way instead of retaining a dead
+                    // entry that would keep answering "miss".
+                    set.entries[index] = None;
+                    self.len = self.len.saturating_sub(1);
+                }
                 break;
             }
             if entry.expires_secs <= now_secs {
@@ -564,10 +625,9 @@ impl SynCookieValidatedCache {
         let mut sip = SipHash24::new(self.hash_keys[0], self.hash_keys[1]);
         sip.write_u16(key.zone_id);
         sip.write_u64(key.profile_gen);
-        sip.write_ip(key.tuple.src_ip);
-        sip.write_ip(key.tuple.dst_ip);
-        sip.write_u16(key.tuple.src_port);
-        sip.write_u16(key.tuple.dst_port);
+        sip.write_ip(key.client.src_ip);
+        sip.write_ip(key.client.dst_ip);
+        sip.write_u16(key.client.dst_port);
         sip.finish()
     }
 
@@ -586,7 +646,7 @@ impl SynCookieValidatedCache {
         &self,
         zone_id: u16,
         profile_gen: u64,
-        tuple: SynCookieTuple,
+        client: SynCookieClientKey,
     ) -> Option<usize> {
         if self.sets.is_empty() {
             return None;
@@ -594,7 +654,7 @@ impl SynCookieValidatedCache {
         Some(self.set_index(&SynCookieValidatedKey {
             zone_id,
             profile_gen,
-            tuple,
+            client,
         }))
     }
 }

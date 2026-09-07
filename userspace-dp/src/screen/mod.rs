@@ -195,7 +195,7 @@ pub(crate) use packet::{ScreenPacketInfo, ScreenProfile, ScreenVerdict};
 pub(crate) use packet::ScreenParseError;
 pub(crate) use syncookie::{
     SYN_COOKIE_MSS_VALUES, SynCookieAckVerdict, SynCookieChallenge, SynCookieCodec,
-    SynCookieTuple, SynCookieValidation,
+    SynCookieClientKey, SynCookieTuple, SynCookieValidation,
 };
 
 // Test-only re-exports — screen/tests.rs constructs SipHash24 and
@@ -853,12 +853,19 @@ impl ScreenState {
                 // validated cache is a DISJOINT `self` field, so
                 // `self.syn_cookie_validated.take_valid(..)` coexists with the
                 // `zstate` borrow.
+                //
+                // #9419: `contains_valid` (a PEEK on a source-scoped key),
+                // not the old `take_valid` on the full 4-tuple. The
+                // challenge path RSTs the client after a valid cookie ACK,
+                // so the retry that is supposed to consume this entry
+                // arrives from a NEW ephemeral port — a port-scoped,
+                // single-use entry could never match it.
                 let profile_gen = zstate.syn_cookie_profile_gen;
                 let syn_cookie_validated = syn_cookie
-                    && self.syn_cookie_validated.take_valid(
+                    && self.syn_cookie_validated.contains_valid(
                         zone_id,
                         profile_gen,
-                        SynCookieTuple::from_packet(pkt),
+                        SynCookieClientKey::from_packet(pkt),
                         now_secs,
                     );
                 if syn_cookie_validated {
@@ -1293,14 +1300,22 @@ impl ScreenState {
                 return SynCookieAckVerdict::NotApplicable;
             }
         }
+        // The cookie MAC binds the full 4-tuple (that is what makes the
+        // cookie unforgeable for this connection); the whitelist it seeds is
+        // source-scoped (#9419) because the client that comes back does so on
+        // a different ephemeral port.
         let tuple = SynCookieTuple::from_packet(pkt);
         if codec
             .validate_isn(tuple, zone_id, current_epoch, cookie_isn)
             .is_some()
         {
             let profile_gen = self.syn_cookie_profile_gen(zone);
-            self.syn_cookie_validated
-                .insert(zone_id, profile_gen, tuple, now_secs);
+            self.syn_cookie_validated.insert(
+                zone_id,
+                profile_gen,
+                SynCookieClientKey::from_packet(pkt),
+                now_secs,
+            );
             SynCookieAckVerdict::Validated
         } else if locally_active {
             SynCookieAckVerdict::Invalid
