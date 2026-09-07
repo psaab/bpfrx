@@ -265,6 +265,12 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 	bgpNode := node.FindChild("bgp")
 	if bgpNode != nil {
 		proto.BGP = &BGPConfig{}
+		// #9192: per-NEIGHBOR (not per-node) tracking of whether the neighbor
+		// has already replaced its inherited group export/import list. Scoped
+		// to this BGP instance, so a routing-instance's neighbors never share
+		// state with the main instance's.
+		ownExport9192 := map[*BGPNeighbor]bool{}
+		ownImport9192 := map[*BGPNeighbor]bool{}
 
 		// #8939, and the consequence here is not a lost setting -- it is the
 		// whole protocol. `set protocols bgp graceful-restart cluster-id
@@ -538,29 +544,44 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 									inheritInet = false
 								}
 							}
-							neighbor := &BGPNeighbor{
-								Address:          nAddr,
-								PeerAS:           peerAS,
-								LocalAS:          groupLocalAS,
-								LocalAddress:     groupLocalAddress,
-								HoldTime:         groupHoldTime,
-								Passive:          groupPassive,
-								Description:      groupDesc,
-								MultihopTTL:      groupMultihop,
-								Export:           groupExport,
-								Import:           groupImport,
-								FamilyInet:       inheritInet,
-								FamilyInet6:      inheritInet6,
-								GroupName:        groupInst.name,
-								AuthPassword:     Secret(groupAuthKey),
-								BFD:              groupBFD,
-								BFDInterval:      groupBFDInterval,
-								BFDMultiplier:    groupBFDMultiplier,
-								DefaultOriginate: groupDefaultOriginate,
-								AllowASIn:        groupAllowASIn,
-								RemovePrivateAS:  groupRemovePrivateAS,
-								PrefixLimitInet:  groupPrefixLimitInet,
-								PrefixLimitInet6: groupPrefixLimitInet6,
+							// #9192: FIND-OR-CREATE on (GroupName, Address),
+							// instead of appending one *BGPNeighbor per AST
+							// NODE. One authored neighbor can occupy several
+							// nodes -- a bare declaration and a later sub-leaf
+							// are siblings -- so ordinary flat-set authoring
+							// produced two entries for one peer. Group defaults
+							// are applied on CREATE only; re-applying them for a
+							// later node would wipe what an earlier node set.
+							// Rationale, the three boundaries and the
+							// lenient-path decision:
+							// compiler_bgp_neighbor_merge_9192.go.
+							neighbor := findBGPNeighbor9192(proto.BGP.Neighbors, groupInst.name, nAddr)
+							if neighbor == nil {
+								neighbor = &BGPNeighbor{
+									Address:          nAddr,
+									PeerAS:           peerAS,
+									LocalAS:          groupLocalAS,
+									LocalAddress:     groupLocalAddress,
+									HoldTime:         groupHoldTime,
+									Passive:          groupPassive,
+									Description:      groupDesc,
+									MultihopTTL:      groupMultihop,
+									Export:           groupExport,
+									Import:           groupImport,
+									FamilyInet:       inheritInet,
+									FamilyInet6:      inheritInet6,
+									GroupName:        groupInst.name,
+									AuthPassword:     Secret(groupAuthKey),
+									BFD:              groupBFD,
+									BFDInterval:      groupBFDInterval,
+									BFDMultiplier:    groupBFDMultiplier,
+									DefaultOriginate: groupDefaultOriginate,
+									AllowASIn:        groupAllowASIn,
+									RemovePrivateAS:  groupRemovePrivateAS,
+									PrefixLimitInet:  groupPrefixLimitInet,
+									PrefixLimitInet6: groupPrefixLimitInet6,
+								}
+								proto.BGP.Neighbors = append(proto.BGP.Neighbors, neighbor)
 							}
 							// Per-neighbor overrides. neighborOwnExport /
 							// neighborOwnImport track whether this neighbor set
@@ -571,150 +592,14 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 							// the inherited one, #5277). Subsequent same-level
 							// entries (multiple set-lines or a bracket list)
 							// accumulate into the neighbor's own ordered chain.
-							neighborOwnExport := false
-							neighborOwnImport := false
-							for _, prop := range child.Children {
-								switch prop.Name() {
-								case "description":
-									neighbor.Description = nodeVal(prop)
-								case "multihop":
-									if v := nodeVal(prop); v != "" {
-										if n, err := strconv.Atoi(v); err == nil {
-											neighbor.MultihopTTL = n
-										}
-									}
-								case "peer-as":
-									if v := nodeVal(prop); v != "" {
-										// #4713: no silent uint32 wrap — leave the
-										// inherited group peer-as in place on a
-										// negative/oversized override (inert on
-										// lenient load; the renderer skips a
-										// remote-as-0 neighbor).
-										if n, ok := parseASNumber(v); ok {
-											neighbor.PeerAS = n
-										}
-									}
-								case "local-as":
-									if v := nodeVal(prop); v != "" {
-										if n, ok := parseASNumber(v); ok {
-											neighbor.LocalAS = n
-										}
-									}
-								case "local-address":
-									neighbor.LocalAddress = nodeVal(prop)
-								case "hold-time":
-									if v := nodeVal(prop); v != "" {
-										if n, err := strconv.Atoi(v); err == nil {
-											neighbor.HoldTime = n
-										}
-									}
-								case "passive":
-									neighbor.Passive = true
-								case "authentication-key":
-									neighbor.AuthPassword = Secret(nodeVal(prop))
-								case "route-reflector-client":
-									neighbor.RouteReflectorClient = true
-								case "default-originate":
-									neighbor.DefaultOriginate = true
-								case "bfd-liveness-detection":
-									neighbor.BFD = true
-									for _, bc := range prop.Children {
-										switch bc.Name() {
-										case "minimum-interval":
-											if v := nodeVal(bc); v != "" {
-												if n, err := strconv.Atoi(v); err == nil {
-													neighbor.BFDInterval = n
-												}
-											}
-										case "multiplier":
-											if v := nodeVal(bc); v != "" {
-												if n, err := strconv.Atoi(v); err == nil {
-													neighbor.BFDMultiplier = n
-												}
-											}
-										}
-									}
-								case "loops":
-									if v := nodeVal(prop); v != "" {
-										if n, err := strconv.Atoi(v); err == nil {
-											neighbor.AllowASIn = n
-										}
-									}
-								case "remove-private":
-									neighbor.RemovePrivateAS = true
-								case "export":
-									// Per-neighbor export override (#2490 made
-									// the per-neighbor slot parseable; group-level
-									// export is already inherited above). The
-									// neighbor's OWN export REPLACES the inherited
-									// group export (Junos most-specific-LEVEL-wins,
-									// #5277): the first own entry drops the inherited
-									// group list, then this and any further
-									// neighbor-level entries accumulate as the
-									// neighbor's ordered chain. Pre-#5277 this
-									// APPENDED to the group list and the renderer
-									// kept only the last (lastNonEmpty), which both
-									// dropped a multi-policy neighbor chain AND kept
-									// the wrong policy when the neighbor overrode a
-									// group export.
-									//
-									// Multi-value leaf (#2702): a bracket-list
-									// `export [ p1 p2 ]` collapses every policy onto
-									// prop.Keys[1:] (flat-set) or onto child nodes
-									// (hierarchical). The old nodeVal-first read
-									// returned Keys[1] and dropped all but the first
-									// policy; firewallMatchValues accumulates both
-									// AST shapes.
-									if !neighborOwnExport {
-										neighbor.Export = nil
-										neighborOwnExport = true
-									}
-									neighbor.Export = append(neighbor.Export, firewallMatchValues(prop)...)
-								case "import":
-									// Per-neighbor import override (#2490/#5277):
-									// the neighbor's OWN import REPLACES the
-									// inherited group import (most-specific level
-									// wins), symmetric to export above. Multi-value
-									// (#2702) — accumulate every policy across both
-									// AST shapes via firewallMatchValues.
-									if !neighborOwnImport {
-										neighbor.Import = nil
-										neighborOwnImport = true
-									}
-									neighbor.Import = append(neighbor.Import, firewallMatchValues(prop)...)
-								case "family":
-									if len(prop.Keys) >= 2 {
-										switch prop.Keys[1] {
-										case "inet":
-											neighbor.FamilyInet = true
-											if pl := parsePrefixLimit(prop); pl > 0 {
-												neighbor.PrefixLimitInet = pl
-											}
-										case "inet6":
-											neighbor.FamilyInet6 = true
-											if pl := parsePrefixLimit(prop); pl > 0 {
-												neighbor.PrefixLimitInet6 = pl
-											}
-										}
-									} else {
-										for _, fc := range prop.Children {
-											switch fc.Name() {
-											case "inet":
-												neighbor.FamilyInet = true
-												if pl := parsePrefixLimit(fc); pl > 0 {
-													neighbor.PrefixLimitInet = pl
-												}
-											case "inet6":
-												neighbor.FamilyInet6 = true
-												if pl := parsePrefixLimit(fc); pl > 0 {
-													neighbor.PrefixLimitInet6 = pl
-												}
-											}
-										}
-									}
-								}
-							}
-							proto.BGP.Neighbors = append(proto.BGP.Neighbors, neighbor)
+							//
+							// #9192: keyed on the NEIGHBOR, not scoped to this
+							// node -- see compiler_bgp_neighbor_merge_9192.go.
+							neighborOwnExport := ownExport9192[neighbor]
+							neighborOwnImport := ownImport9192[neighbor]
+							applyBGPNeighborProps9192(neighbor, child, &neighborOwnExport, &neighborOwnImport)
+							ownExport9192[neighbor] = neighborOwnExport
+							ownImport9192[neighbor] = neighborOwnImport
 						}
 					}
 				}

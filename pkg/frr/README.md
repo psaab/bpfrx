@@ -824,7 +824,19 @@ step. Both are required — neither sees the other's case:
   rejects an `activate`/`bfd`/`peer` for a neighbor that was never declared,
   so a single lenient remote-as-0 neighbor bricked the managed `frr-reload`
   for every valid BGP peer. Unifying on `validNeighbors` makes the three loops
-  structurally unable to diverge. (The route-map DEFINITION collectors
+  structurally unable to diverge. **`validNeighbors` must NOT be given a
+  first-wins dedup (#9192).** It is the obvious place to remove the duplicate
+  `neighbor <ip> remote-as` line that one authored neighbor used to produce, and
+  doing so silently drops the POLICY-BEARING entry — deleting the `activate` and
+  `route-map … in` lines with it, on a config that still commits and a peer that
+  still comes up with the operator's route filter absent. That fix was written
+  and reverted for exactly this reason. The duplication was a COMPILER
+  representation defect — `compileBGP` appended one `*BGPNeighbor` per AST node,
+  and a bare `neighbor <ip>` declaration plus a later `neighbor <ip> <leaf>` are
+  two nodes — and it is fixed there, by find-or-create on (GroupName, Address).
+  `TestBGPNeighborMergeRendersOneDeclaration9192` asserts BOTH halves at this
+  layer: exactly one declaration line, and the `activate` / route-map lines
+  still present. (The route-map DEFINITION collectors
   `collectBGPRouteMapPolicies`/`bgpEffectiveChains` still iterate all
   neighbors — they emit no `neighbor <addr>` line, only route-map objects, so
   an unreferenced definition for a skipped neighbor is harmless valid config.)

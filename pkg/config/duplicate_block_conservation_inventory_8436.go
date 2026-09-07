@@ -98,10 +98,17 @@ var dupConservationInventory8436 = []string{
 	// regression instead of joining a list. Do not delete the section header:
 	// a future site belongs here with a reason, not silently.
 
-	// ---- Already REJECTED at strict commit (conservation by refusal) (9). ----
+	// ---- Already REJECTED at strict commit (conservation by refusal) (8). ----
+	//
+	// #9192 removed `protocols bgp group xpfname neighbor` from this section:
+	// the site now CONSERVES for a stronger reason than refusal. compileBGP
+	// does find-or-create on (GroupName, Address) instead of appending one
+	// *BGPNeighbor per AST node, so two `neighbor <ip>` blocks under one group
+	// merge into one peer that carries both blocks' statements. The line is
+	// deleted rather than re-homed because a stale entry hides the next
+	// regression at that site, which is what this file exists to prevent.
 	"applications application",
 	"chassis device-map interface",
-	"protocols bgp group xpfname neighbor",
 	"security flow traceoptions packet-filter",
 	"security ike proposal",
 	"security ipsec vpn xpfname traffic-selector",

@@ -6156,6 +6156,59 @@ the fix. Covered by `pkg/config/bgp_group_inherit_order_5270_test.go` (neighbor
 local-address/hold-time, per-neighbor override still wins in both orders, and a
 hierarchical-shape variant).
 
+### One authored neighbor may occupy SEVERAL AST nodes (#9192)
+
+`compileBGP` appended one `*BGPNeighbor` per AST NODE, and one authored neighbor
+is not always one node. `SetPath` does not reuse a node it has already marked
+`IsLeaf`, so a bare declaration followed by a sub-leaf becomes two siblings:
+
+```
+set protocols bgp group G neighbor 10.0.2.2
+set protocols bgp group G neighbor 10.0.2.2 import PS
+  -> [neighbor 10.0.2.2]
+     [neighbor 10.0.2.2] > [import PS]
+  -> neighbors=2   [0] import=[]   [1] import=[PS]
+```
+
+Both entries carry the group defaults, so the render was **redundant, not
+wrong** — FRR accepts a repeated `remote-as`, and the `activate` / route-map
+lines only entry `[1]` carried were still emitted. What made it worth fixing is
+that the duplication is invisible in the typed config's contract: **anything
+reasoning over `BGP.Neighbors` as a set of peers is wrong by construction**, and
+each new consumer has to rediscover it. Two were already caught by it while
+#9007 was being fixed — a duplicate-address check keyed on `Address` alone that
+reported a peer as "configured in more than one group (G and G)" and
+false-rejected a legitimate config, and a first-wins dedup at the renderer's
+`validNeighbors` that silently dropped the policy-bearing entry along with its
+`activate` and `route-map … in` lines.
+
+The compiler now does **find-or-create on `(GroupName, Address)`** within a BGP
+instance (`findBGPNeighbor9192`), the same shape as the #8436 OSPFv3
+area-interface merge. Group defaults are applied on CREATE only: re-applying
+them for a later node would wipe the per-neighbor overrides an earlier node set,
+which is the drop the merge exists to prevent.
+
+Three boundaries, each pinned by a cell:
+
+- **Distinct addresses never fold** — they do not share the key.
+- **The CROSS-GROUP case never folds.** Two groups naming one address with
+  divergent `peer-as`, timers and authentication keys is #9007's genuinely
+  ambiguous shape, resolved by render order and rejected at commit by PR #9191.
+  The key is the PAIR precisely so that folding it here cannot silently resolve
+  an ambiguity the operator is meant to be told about.
+- **Two `group G` blocks naming one address DO share the key**, and that config
+  is rejected at strict commit by the #5180 duplicate-block gate, so the
+  behaviour is reachable only on the lenient boot / HA-sync path. There the
+  merged neighbor keeps the FIRST block's group-level defaults and unions both
+  blocks' per-neighbor statements, instead of two entries whose group defaults
+  disagree and which the renderer emits both of.
+
+`neighborOwnExport` / `neighborOwnImport` — the #5277 most-specific-LEVEL-wins
+flags — moved from per-NODE locals to per-NEIGHBOR state. They were correct
+while one node meant one neighbor; with several nodes per neighbor a per-node
+flag makes the second node's first `export` wipe the first node's own list,
+turning the union back into a last-node-wins drop, silently.
+
 ## Duplicate host-local-address fail-closed gate (#3718, Option B)
 
 Beyond the per-leaf token allowlist above, host-inbound admission has a
