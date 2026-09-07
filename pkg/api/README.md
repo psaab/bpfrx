@@ -2049,7 +2049,21 @@ the drop fails loudly instead of going quietly vacuous.
     `ResponseWriter` that cannot carry a write deadline it frees the CHILD but
     **not** this goroutine — a partial bound, stated as such.
   - **`ribStreamLimiter` (2 concurrent)** — a bounded stream is still a vtysh
-    child, so an unbounded NUMBER of them still accumulates. Non-blocking
+    child, so an unbounded NUMBER of them still accumulates. **#9143 generalized
+    this reasoning to every other FRR read.** It was true of `?type=routes` and
+    equally true of `GET /api/v1/routing/ospf` (both branches) and this
+    endpoint's own `bgp` SUMMARY branch, which forked one uncancellable 15s child
+    per request with no admission at all — #6809 had gated exactly one branch of
+    one handler. The bound now also lives in `pkg/frr`'s single
+    `Manager.vtysh` funnel (`diagcmd.VtyshLimiter`), so every present and future
+    FRR read on BOTH surfaces is bounded by construction rather than one handler
+    at a time, and `realExecutor.Vtysh` takes the caller's context so a
+    disconnect reaps the child. `writeFRRError` renders `frr.ErrVtyshBusy` as
+    **429 + `Retry-After`**, matching this branch; gRPC renders the same event as
+    `codes.ResourceExhausted`. Additive on the status axis — every error that
+    rendered 500 before still does. `ribStreamLimiter` stays as the STREAM-shaped
+    bound on top (memory + held connection), which is a different cost from the
+    fork the funnel counts. Non-blocking
     `Acquire`: over-cap requests get **429 + `Retry-After`** rather than
     queueing, because a queued request holds the same connection it would hold
     while streaming. Local to REST on purpose — the gRPC/CLI `show route

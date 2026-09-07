@@ -27,7 +27,7 @@ type RecordingExecutor struct {
 	LastConf string
 }
 
-func (r *RecordingExecutor) Vtysh(string) (string, error) { return "", nil }
+func (r *RecordingExecutor) Vtysh(context.Context, string) (string, error) { return "", nil }
 
 func (r *RecordingExecutor) FrrReloadPy(_ context.Context, conf string) error {
 	r.ReloadCalls++

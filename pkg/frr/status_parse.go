@@ -1,6 +1,6 @@
 // status_parse.go holds the parsed Get* methods and their public types.
 //
-// All vtysh shell-outs in this file go through m.executor().Vtysh(...) so
+// All vtysh shell-outs in this file go through m.vtysh(ctx, ...) so
 // tests can inject a fake executor and exercise the parsers without a
 // real vtysh binary.
 //
@@ -35,8 +35,8 @@ type RIPRouteEntry struct {
 }
 
 // GetRIPRoutes queries FRR for RIP routes.
-func (m *Manager) GetRIPRoutes() ([]RIPRouteEntry, error) {
-	output, err := m.executor().Vtysh("show ip rip")
+func (m *Manager) GetRIPRoutes(ctx context.Context) ([]RIPRouteEntry, error) {
+	output, err := m.vtysh(ctx, "show ip rip")
 	if err != nil {
 		return nil, err
 	}
@@ -128,8 +128,8 @@ type ISISAdjacency struct {
 // controls ride inside a token untouched — tokenizing is not sanitizing. The
 // guard belongs at the display sites (see the ISISAdjacency doc); the values
 // here stay raw for machine consumers.
-func (m *Manager) GetISISAdjacency() ([]ISISAdjacency, error) {
-	output, err := m.executor().Vtysh("show isis neighbor")
+func (m *Manager) GetISISAdjacency(ctx context.Context) ([]ISISAdjacency, error) {
+	output, err := m.vtysh(ctx, "show isis neighbor")
 	if err != nil {
 		return nil, err
 	}
@@ -208,8 +208,8 @@ type OSPFNeighbor struct {
 }
 
 // GetOSPFNeighbors queries FRR for OSPF neighbor state.
-func (m *Manager) GetOSPFNeighbors() ([]OSPFNeighbor, error) {
-	output, err := m.executor().Vtysh("show ip ospf neighbor")
+func (m *Manager) GetOSPFNeighbors(ctx context.Context) ([]OSPFNeighbor, error) {
+	output, err := m.vtysh(ctx, "show ip ospf neighbor")
 	if err != nil {
 		return nil, err
 	}
@@ -298,8 +298,8 @@ type bgpPeerJSON struct {
 // single "State/PfxRcd" column and appends footer lines ("Total number
 // of neighbors N", blank/legend lines) that the old field-count scraper
 // misparsed as phantom peers with an empty PfxRcd. #3942.
-func (m *Manager) GetBGPSummary() ([]BGPPeerSummary, error) {
-	output, err := m.executor().Vtysh("show bgp summary json")
+func (m *Manager) GetBGPSummary(ctx context.Context) ([]BGPPeerSummary, error) {
+	output, err := m.vtysh(ctx, "show bgp summary json")
 	if err != nil {
 		return nil, err
 	}
@@ -433,8 +433,8 @@ func parseBGPRouteLine(line string) (BGPRoute, bool) {
 // is used by the CLI and gRPC show paths, where the caller already renders the
 // whole result. The REST endpoint uses StreamBGPRoutes instead so a full
 // internet table is never materialized whole in the HTTP handler (#5056).
-func (m *Manager) GetBGPRoutes() ([]BGPRoute, error) {
-	output, err := m.executor().Vtysh(bgpRoutesCommand)
+func (m *Manager) GetBGPRoutes(ctx context.Context) ([]BGPRoute, error) {
+	output, err := m.vtysh(ctx, bgpRoutesCommand)
 	if err != nil {
 		return nil, err
 	}
@@ -563,11 +563,11 @@ type frrNextHopJSON struct {
 // family that DID succeed is still returned. A non-nil error alongside a
 // non-empty slice therefore means "partial result" — callers must render
 // the partial and surface the error rather than dropping it (#5125).
-func (m *Manager) GetRouteDetailJSON() ([]FRRRouteDetail, error) {
+func (m *Manager) GetRouteDetailJSON(ctx context.Context) ([]FRRRouteDetail, error) {
 	var all []FRRRouteDetail
 	var errs error
 	for _, cmd := range []string{"show ip route json", "show ipv6 route json"} {
-		output, err := m.executor().Vtysh(cmd)
+		output, err := m.vtysh(ctx, cmd)
 		if err != nil {
 			errs = errors.Join(errs, fmt.Errorf("%q: %w", cmd, err))
 			continue

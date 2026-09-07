@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -256,7 +257,7 @@ func (c *CLI) showRouteDetail() error {
 		return nil
 	}
 
-	routes, err := c.frr.GetRouteDetailJSON()
+	routes, err := c.frr.GetRouteDetailJSON(context.Background())
 	if err != nil {
 		fmt.Printf("warning: partial route display (some address families unavailable): %v\n", err)
 	}
@@ -284,14 +285,14 @@ func (c *CLI) showOSPF(args []string) error {
 	switch args[0] {
 	case "neighbor":
 		if len(args) >= 2 && args[1] == "detail" {
-			output, err := c.frr.GetOSPFNeighborDetail()
+			output, err := c.frr.GetOSPFNeighborDetail(context.Background())
 			if err != nil {
 				return fmt.Errorf("OSPF neighbor detail: %w", err)
 			}
 			fmt.Print(termsafe.SanitizeBlockForDisplay(output))
 			return nil
 		}
-		neighbors, err := c.frr.GetOSPFNeighbors()
+		neighbors, err := c.frr.GetOSPFNeighbors(context.Background())
 		if err != nil {
 			return fmt.Errorf("OSPF neighbors: %w", err)
 		}
@@ -309,7 +310,7 @@ func (c *CLI) showOSPF(args []string) error {
 		return nil
 
 	case "database":
-		output, err := c.frr.GetOSPFDatabase()
+		output, err := c.frr.GetOSPFDatabase(context.Background())
 		if err != nil {
 			return fmt.Errorf("OSPF database: %w", err)
 		}
@@ -317,7 +318,7 @@ func (c *CLI) showOSPF(args []string) error {
 		return nil
 
 	case "interface":
-		output, err := c.frr.GetOSPFInterface()
+		output, err := c.frr.GetOSPFInterface(context.Background())
 		if err != nil {
 			return fmt.Errorf("OSPF interface: %w", err)
 		}
@@ -325,7 +326,7 @@ func (c *CLI) showOSPF(args []string) error {
 		return nil
 
 	case "routes":
-		output, err := c.frr.GetOSPFRoutes()
+		output, err := c.frr.GetOSPFRoutes(context.Background())
 		if err != nil {
 			return fmt.Errorf("OSPF routes: %w", err)
 		}
@@ -350,7 +351,7 @@ func (c *CLI) showBGP(args []string) error {
 
 	switch args[0] {
 	case "summary":
-		peers, err := c.frr.GetBGPSummary()
+		peers, err := c.frr.GetBGPSummary(context.Background())
 		if err != nil {
 			return fmt.Errorf("BGP summary: %w", err)
 		}
@@ -368,7 +369,7 @@ func (c *CLI) showBGP(args []string) error {
 		return nil
 
 	case "routes":
-		routes, err := c.frr.GetBGPRoutes()
+		routes, err := c.frr.GetBGPRoutes(context.Background())
 		if err != nil {
 			return fmt.Errorf("BGP routes: %w", err)
 		}
@@ -392,14 +393,14 @@ func (c *CLI) showBGP(args []string) error {
 		if len(args) >= 3 {
 			switch args[2] {
 			case "received-routes":
-				output, err := c.frr.GetBGPNeighborReceivedRoutes(ip)
+				output, err := c.frr.GetBGPNeighborReceivedRoutes(context.Background(), ip)
 				if err != nil {
 					return fmt.Errorf("BGP received routes: %w", err)
 				}
 				fmt.Print(termsafe.SanitizeBlockForDisplay(output))
 				return nil
 			case "advertised-routes":
-				output, err := c.frr.GetBGPNeighborAdvertisedRoutes(ip)
+				output, err := c.frr.GetBGPNeighborAdvertisedRoutes(context.Background(), ip)
 				if err != nil {
 					return fmt.Errorf("BGP advertised routes: %w", err)
 				}
@@ -407,7 +408,7 @@ func (c *CLI) showBGP(args []string) error {
 				return nil
 			}
 		}
-		output, err := c.frr.GetBGPNeighborDetail(ip)
+		output, err := c.frr.GetBGPNeighborDetail(context.Background(), ip)
 		if err != nil {
 			return fmt.Errorf("BGP neighbor: %w", err)
 		}
@@ -425,7 +426,7 @@ func (c *CLI) showRIP() error {
 		return nil
 	}
 
-	routes, err := c.frr.GetRIPRoutes()
+	routes, err := c.frr.GetRIPRoutes(context.Background())
 	if err != nil {
 		return fmt.Errorf("RIP routes: %w", err)
 	}
@@ -455,14 +456,14 @@ func (c *CLI) showISIS(args []string) error {
 	switch args[0] {
 	case "adjacency":
 		if len(args) >= 2 && args[1] == "detail" {
-			output, err := c.frr.GetISISAdjacencyDetail()
+			output, err := c.frr.GetISISAdjacencyDetail(context.Background())
 			if err != nil {
 				return fmt.Errorf("IS-IS adjacency detail: %w", err)
 			}
 			fmt.Print(termsafe.SanitizeBlockForDisplay(output))
 			return nil
 		}
-		adjs, err := c.frr.GetISISAdjacency()
+		adjs, err := c.frr.GetISISAdjacency(context.Background())
 		if err != nil {
 			return fmt.Errorf("IS-IS adjacency: %w", err)
 		}
@@ -494,7 +495,7 @@ func (c *CLI) showISIS(args []string) error {
 		return nil
 
 	case "database":
-		output, err := c.frr.GetISISDatabase()
+		output, err := c.frr.GetISISDatabase(context.Background())
 		if err != nil {
 			return fmt.Errorf("IS-IS database: %w", err)
 		}
@@ -502,7 +503,7 @@ func (c *CLI) showISIS(args []string) error {
 		return nil
 
 	case "routes":
-		output, err := c.frr.GetISISRoutes()
+		output, err := c.frr.GetISISRoutes(context.Background())
 		if err != nil {
 			return fmt.Errorf("IS-IS routes: %w", err)
 		}
@@ -524,7 +525,7 @@ func (c *CLI) showBFD(args []string) error {
 		return nil
 	}
 	if args[0] == "peers" {
-		output, err := c.frr.GetBFDPeers()
+		output, err := c.frr.GetBFDPeers(context.Background())
 		if err != nil {
 			return fmt.Errorf("BFD peers: %w", err)
 		}
@@ -764,7 +765,7 @@ func (c *CLI) showRouteMap() error {
 		fmt.Println("FRR manager not available")
 		return nil
 	}
-	output, err := c.frr.GetRouteMapList()
+	output, err := c.frr.GetRouteMapList(context.Background())
 	if err != nil {
 		return fmt.Errorf("get route-map: %w", err)
 	}

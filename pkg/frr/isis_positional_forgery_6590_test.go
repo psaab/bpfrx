@@ -1,6 +1,7 @@
 package frr
 
 import (
+	"context"
 	"testing"
 )
 
@@ -56,7 +57,7 @@ func TestISISHostnameWithSpacesCannotForgeColumns6590(t *testing.T) {
 		"evil peer ge-0-0-1 2 Up 27 ge-0-0-9 1 Down 99 dead.dead.dead",
 	))
 
-	adjs, err := m.GetISISAdjacency()
+	adjs, err := m.GetISISAdjacency(context.Background())
 	if err != nil {
 		t.Fatalf("GetISISAdjacency: %v", err)
 	}
@@ -104,7 +105,7 @@ func TestISISOrdinaryRowStillParses6590(t *testing.T) {
 		"rtr2                ge-0-0-2    1  Init         9        2020.2020.2021",
 	))
 
-	adjs, err := m.GetISISAdjacency()
+	adjs, err := m.GetISISAdjacency(context.Background())
 	if err != nil {
 		t.Fatalf("GetISISAdjacency: %v", err)
 	}
@@ -164,7 +165,7 @@ func TestISISMalformedRowsAreNotRendered6590(t *testing.T) {
 
 	// Short row: fewer fields than the header's trailing width + 1.
 	short := isisMgr6590(isisTable6590("rtr1 ge-0-0-1 2"))
-	adjs, err := short.GetISISAdjacency()
+	adjs, err := short.GetISISAdjacency(context.Background())
 	if err != nil {
 		t.Fatalf("GetISISAdjacency(short): %v", err)
 	}
@@ -172,7 +173,7 @@ func TestISISMalformedRowsAreNotRendered6590(t *testing.T) {
 
 	// Headerless table: width unknown.
 	headerless := isisMgr6590("Area 1:\n rtr1 ge-0-0-1 2 Up 27 2020.2020.2020\n")
-	adjs, err = headerless.GetISISAdjacency()
+	adjs, err = headerless.GetISISAdjacency(context.Background())
 	if err != nil {
 		t.Fatalf("GetISISAdjacency(headerless): %v", err)
 	}
@@ -192,7 +193,7 @@ func TestISISTrailingWidthFollowsTheHeader6590(t *testing.T) {
 		" System Id           Interface   L  State        Holdtime\n" +
 		" host with spaces ge-0-0-1 2 Up 27\n"
 
-	adjs, err := isisMgr6590(out).GetISISAdjacency()
+	adjs, err := isisMgr6590(out).GetISISAdjacency(context.Background())
 	if err != nil {
 		t.Fatalf("GetISISAdjacency: %v", err)
 	}

@@ -79,7 +79,7 @@ const evilBGPSummaryJSON6468 = `{"ipv4Unicast":{"peers":{"10.0.0.1":{` +
 // the raw block.
 type vtyshEscapeExecutor6468 struct{}
 
-func (vtyshEscapeExecutor6468) Vtysh(cmd string) (string, error) {
+func (vtyshEscapeExecutor6468) Vtysh(_ context.Context, cmd string) (string, error) {
 	switch cmd {
 	case "show isis neighbor":
 		return evilISISNeighborTable6468, nil

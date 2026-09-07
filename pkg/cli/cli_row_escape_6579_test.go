@@ -55,7 +55,7 @@ const evilBGPRouteTable6579 = "   Network          Next Hop            Metric Lo
 // raw BGP-neighbor block that these parsers would scrape into nonsense rows.
 type rowEscapeExecutor6579 struct{}
 
-func (rowEscapeExecutor6579) Vtysh(cmd string) (string, error) {
+func (rowEscapeExecutor6579) Vtysh(_ context.Context, cmd string) (string, error) {
 	switch cmd {
 	case "show ip ospf neighbor":
 		return evilOSPFNeighborTable6579, nil

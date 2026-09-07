@@ -296,7 +296,7 @@ func (s *Server) SystemAction(ctx context.Context, req *pb.SystemActionRequest) 
 		if s.frr == nil {
 			return nil, status.Errorf(codes.FailedPrecondition, "FRR manager not available")
 		}
-		if _, err := s.frr.ExecVtysh("clear ip ospf process"); err != nil {
+		if _, err := s.frr.ExecVtysh(ctx, "clear ip ospf process"); err != nil {
 			return nil, status.Errorf(codes.Internal, "clear OSPF: %v", err)
 		}
 		return &pb.SystemActionResponse{Message: "OSPF process cleared"}, nil
@@ -305,7 +305,7 @@ func (s *Server) SystemAction(ctx context.Context, req *pb.SystemActionRequest) 
 		if s.frr == nil {
 			return nil, status.Errorf(codes.FailedPrecondition, "FRR manager not available")
 		}
-		if _, err := s.frr.ExecVtysh("clear bgp * soft"); err != nil {
+		if _, err := s.frr.ExecVtysh(ctx, "clear bgp * soft"); err != nil {
 			return nil, status.Errorf(codes.Internal, "clear BGP: %v", err)
 		}
 		return &pb.SystemActionResponse{Message: "BGP sessions cleared (soft reset)"}, nil

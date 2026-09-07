@@ -371,7 +371,7 @@ func TestActuatorPublishFailureKeepsPendingBump(t *testing.T) {
 // case, where the kernel FIB still holds the previous routes.
 type hardFailFRRExec struct{}
 
-func (hardFailFRRExec) Vtysh(string) (string, error) { return "", nil }
+func (hardFailFRRExec) Vtysh(context.Context, string) (string, error) { return "", nil }
 func (hardFailFRRExec) FrrReloadPy(context.Context, string) error {
 	return errors.New("frr-reload.py boom")
 }

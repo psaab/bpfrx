@@ -60,7 +60,7 @@ func TestBGPRoutesStreamAbortsOnCanceledContext(t *testing.T) {
 		}
 	}
 	s := newBGPServer(t, makeFRRBGPOutput(routes))
-	parsed, err := s.frr.GetBGPRoutes()
+	parsed, err := s.frr.GetBGPRoutes(context.Background())
 	if err != nil {
 		t.Fatalf("GetBGPRoutes: %v", err)
 	}

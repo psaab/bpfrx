@@ -175,6 +175,69 @@ encoded the mistake.
 | `vtysh.go` | `frrExecutor` interface (Vtysh / FrrReloadPy / VtyshLoad / **VtyshStream**), `realExecutor` (production exec.Command implementation), `ExecVtysh`, and all raw-output Get* shells (`GetBFDPeers`, `GetRouteMapList`, `GetISIS*Detail`/`Database`/`Routes`, `GetOSPF*Detail`/`Database`/`Interface`/`Routes`, `GetBGPNeighbor*`). **`VtyshStream(ctx, command)` returns stdout as an `io.ReadCloser` + a `finish()` reaper** so a caller can scan a huge table incrementally instead of buffering it whole (`Vtysh`); `exec.CommandContext` kills vtysh when `ctx` is cancelled, which is how `StreamBGPRoutes` stops a full-RIB dump on client disconnect / write failure (#5056). |
 | `status_parse.go` | Parsed Get* methods + their public types (`RIPRouteEntry`, `ISISAdjacency`, `OSPFNeighbor`, `BGPPeerSummary`, `BGPRoute`, `FRRRouteDetail`, `FRRNextHop`) + `parseRouteJSON`, `parseBGPSummaryJSON`, `parseBGPRouteLine`, `FormatRouteDetail`. **`GetBGPSummary` parses `show bgp summary json`** (structured JSON, `parseBGPSummaryJSON`), NOT the text table — see the #3942 note below. **`GetBGPRoutes` buffers the whole `show bgp ipv4 unicast` table** (vtysh stdout string + parsed `[]BGPRoute`) and is used by the CLI/gRPC show paths that already render the full result. **`StreamBGPRoutes(ctx, limit, fn)` is the bounded-memory variant** (#5056): it scans vtysh stdout one line at a time via `VtyshStream`, hands each parsed route to `fn`, stops after `limit` routes (reporting `truncated`), and cancels vtysh on `ctx` cancellation or an `fn` error. Both share `parseBGPRouteLine` so they interpret the table identically. The REST `/routing/bgp?type=routes` handler uses `StreamBGPRoutes`. **`GetRouteDetailJSON` per-family error contract (#5125):** it runs `show ip route json` and `show ipv6 route json` independently and, on a per-command vtysh or JSON-parse failure, `errors.Join`s the failure (tagged with the failing command) into the returned error INSTEAD of the pre-#5125 `continue`-and-return-`nil` swallow, while still returning the family that succeeded. A non-nil error alongside a non-empty slice therefore means "partial" — the `show route detail` callers (`pkg/cli/cli_show_routing.go`, `pkg/grpcapi/server_show_routes_text.go`) render the partial and emit a non-fatal `warning: partial route display ...` line rather than dropping the whole view. This mirrors the read-side contract documented in `pkg/routing/README.md` ("Route-display read error contract"). |
 
+## Every operational vtysh shell-out is bounded and cancellable (#9143)
+
+`Manager.vtysh(ctx, command)` is the SINGLE funnel every operational FRR read in
+this package goes through. It does two things the individual `Get*` shells used
+to skip:
+
+1. **Admission.** It takes a slot from `diagcmd.VtyshLimiter`
+   (`MaxConcurrentVtyshShellOuts`, process-wide, shared by REST and gRPC).
+   Over-cap returns `frr.ErrVtyshBusy` **before forking**. Fail-fast, not
+   queued — a queued request holds the same connection it would have held while
+   running, so queueing converts a concurrency bound into a latency bound.
+2. **Cancellation.** It hands the CALLER's context to the executor.
+   `realExecutor.Vtysh` composes `context.WithTimeout(ctx, vtyshTimeout)`, so the
+   effective deadline is the earlier of the caller's and 15s, and a cancelled
+   request (HTTP client disconnect, cancelled gRPC stream) makes
+   `exec.CommandContext` kill and reap the child immediately.
+
+**Which side of "every X except one" was wrong.** Before #9143 exactly ONE
+branch of one handler was gated: #6809 put `ribStreamLimiter` on
+`GET /api/v1/routing/bgp?type=routes` because a full-RIB stream is expensive in
+memory and holds a connection. Every other FRR shell-out — REST `ospf` (both
+branches) and `bgp` summary, plus the gRPC `GetOSPFStatus` / `GetBGPStatus` /
+`GetRIPStatus` / `GetISISStatus` / `GetRoutes` RPCs — forked one child per
+request with no admission at all, and `realExecutor.Vtysh` hardcoded
+`context.Background()` so the client could not stop what it started.
+
+The gated branch was RIGHT and under-generalized; the ungated majority is the
+outlier. That is not a judgement call — `pkg/diagcmd` already asserts the same
+rule three times for this cost class: `DefaultLimiter` (#5057) bounds the
+REST+gRPC ping/traceroute handlers because they fork a child,
+`SessionWalkLimiter` (#5433/#5708) bounds every full-table walk on both
+surfaces, and `SnapshotReadLimiter` (#8151) bounds the snapshot copies. An FRR
+status read forks a child for up to 15s; it is the same class as a forking ping
+handler and was simply never gated. So generalizing the rule extends an existing
+convention rather than propagating a mistake — which is the check worth making
+before funnelling anything, since a funnel applies whatever it holds to every
+call site at once.
+
+The bound is enforced in the funnel rather than at each handler on purpose:
+gating them one at a time would leave the twentieth FRR read to be added
+unbounded again. Nothing in this package can reach `vtysh` except through
+`Manager.vtysh`.
+
+**The apply path is deliberately NOT behind it.** `FrrReloadPy` and `VtyshLoad`
+are driven by a config commit rather than by a client, and are already
+serialized by the reload lock. Putting them behind a client-facing budget would
+let a status flood refuse a commit. Pinned by
+`TestApplyPathIsNotBehindTheStatusBudget9143`.
+
+**Surface mapping.** `ErrVtyshBusy` is a REFUSAL, not a fault — the FRR daemons
+are healthy and we declined to ask. REST renders it **429 + Retry-After**
+(`writeFRRError`, `pkg/api/routing.go`), gRPC renders it
+**`codes.ResourceExhausted`** (`frrStatusErr`, `pkg/grpcapi`). The two surfaces
+classifying one event identically is the #9142 lesson applied here. Both
+mappings are ADDITIVE: every error that could be returned before #9143 still
+renders 500 / `codes.Internal`, because `ErrVtyshBusy` is a new condition only
+the new limiter can produce.
+
+Guards: `vtysh_admission_ctx_9143_test.go` (including a cell that drives all
+nineteen operational reads and asserts each is behind the funnel — coverage that
+is structural rather than a hand-picked list), `pkg/api/routing_frr_admission_9143_test.go`,
+`pkg/grpcapi/routing_frr_admission_9143_test.go`.
+
 ## Entry points
 
 - `Manager` — `manager.go`.

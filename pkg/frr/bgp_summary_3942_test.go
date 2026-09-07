@@ -1,6 +1,9 @@
 package frr
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 // bgpSummaryJSONFixture is a captured-shape "show bgp summary json" output
 // with two ESTABLISHED IPv4 peers (pfxRcd 3 and 1) plus the sibling
@@ -105,7 +108,7 @@ func TestGetBGPSummaryJSON(t *testing.T) {
 	}
 	m := &Manager{exec: fake}
 
-	peers, err := m.GetBGPSummary()
+	peers, err := m.GetBGPSummary(context.Background())
 	if err != nil {
 		t.Fatalf("GetBGPSummary: %v", err)
 	}
@@ -198,7 +201,7 @@ func TestGetBGPSummaryDualFamily(t *testing.T) {
 	}
 	m := &Manager{exec: fake}
 
-	peers, err := m.GetBGPSummary()
+	peers, err := m.GetBGPSummary(context.Background())
 	if err != nil {
 		t.Fatalf("GetBGPSummary: %v", err)
 	}
@@ -238,7 +241,7 @@ func TestGetBGPSummaryNotEstablished(t *testing.T) {
 	}
 	m := &Manager{exec: fake}
 
-	peers, err := m.GetBGPSummary()
+	peers, err := m.GetBGPSummary(context.Background())
 	if err != nil {
 		t.Fatalf("GetBGPSummary: %v", err)
 	}
@@ -272,7 +275,7 @@ func TestGetBGPSummaryNoPeers(t *testing.T) {
 			vtyshResp: map[string]string{"show bgp summary json": out},
 		}
 		m := &Manager{exec: fake}
-		peers, err := m.GetBGPSummary()
+		peers, err := m.GetBGPSummary(context.Background())
 		if err != nil {
 			t.Errorf("%s: GetBGPSummary error = %v, want nil", name, err)
 		}

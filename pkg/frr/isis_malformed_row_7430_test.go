@@ -1,6 +1,7 @@
 package frr
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -25,7 +26,7 @@ import (
 func adjsFromOutput7430(t *testing.T, output string) []ISISAdjacency {
 	t.Helper()
 	m := &Manager{exec: &fakeExecutor{vtyshResp: map[string]string{"show isis neighbor": output}}}
-	adjs, err := m.GetISISAdjacency()
+	adjs, err := m.GetISISAdjacency(context.Background())
 	if err != nil {
 		t.Fatalf("GetISISAdjacency: %v", err)
 	}
