@@ -6,6 +6,23 @@ package config
 // InterfacesConfig holds interface configuration.
 type InterfacesConfig struct {
 	Interfaces map[string]*InterfaceConfig
+
+	// MalformedAddresses records a token inside a bracketed interface address
+	// list that is neither a valid address for its family nor a declared
+	// `address` sub-statement (#9424), so
+	// validateInterfaceAddressListStrict can reject the commit and the
+	// tolerant path can warn instead (#1960). Same record-at-compile /
+	// reject-in-a-strict-gate shape as ScreenProfile.UnknownLeaves and
+	// SecurityConfig.MalformedZonePairs: the typed-leaf gate validates only
+	// the FIRST key slot of an `address` leaf, so by the time the config is
+	// compiled the bad token is gone and the unit looks like one that simply
+	// carries fewer addresses.
+	//
+	// json:"-" deliberately, for the reason MalformedZonePairs carries it:
+	// this is a COMPILE-TIME DIAGNOSTIC, not config content, and serialising
+	// it would perturb every fixture and ConfigFingerprint comparison that
+	// compares compiled configs for a field that is nil in every valid config.
+	MalformedAddresses []string `json:"-"`
 }
 
 // InterfaceConfig represents a network interface.

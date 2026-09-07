@@ -432,7 +432,14 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig, opts compileOpts, w
 					}
 					switch afName {
 					case "inet":
-						for _, addrInst := range namedInstances(afNode.FindChildren("address")) {
+						// #9424: a BRACKETED list packs every address past the
+						// first onto this leaf's Keys (hierarchical) or into a
+						// child chain (flat set), and namedInstances reads slot
+						// 0 only — so `address [ a b ]` compiled to ONE address
+						// with no error and no warning.
+						inetAddrs, inetBad := unitAddressInstances(afNode, "inet")
+						ifaces.MalformedAddresses = append(ifaces.MalformedAddresses, inetBad...)
+						for _, addrInst := range inetAddrs {
 							unit.Addresses = append(unit.Addresses, addrInst.name)
 							// Check for primary/preferred flags
 							if addrInst.node.FindChild("primary") != nil {
@@ -516,7 +523,10 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig, opts compileOpts, w
 							unit.DynamicDNSInet = ddns
 						}
 					case "inet6":
-						for _, addrInst := range namedInstances(afNode.FindChildren("address")) {
+						// #9424, the inet6 arm of the same loss.
+						inet6Addrs, inet6Bad := unitAddressInstances(afNode, "inet6")
+						ifaces.MalformedAddresses = append(ifaces.MalformedAddresses, inet6Bad...)
+						for _, addrInst := range inet6Addrs {
 							unit.Addresses = append(unit.Addresses, addrInst.name)
 							if addrInst.node.FindChild("primary") != nil && unit.PrimaryAddress == "" {
 								unit.PrimaryAddress = addrInst.name
