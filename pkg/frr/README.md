@@ -122,6 +122,36 @@ Not covered here: the `vrf <name>` clause still goes through `sanitizeFRRValue`
 — so it is the weaker belt described under #6796, but the routing-instance name
 is validated at commit and is out of this issue's scope.
 
+### `VRFName == ""` means the master table, and only the master table (#9409)
+
+`InstanceConfig.VRFName` is overloaded by construction. The daemon's
+`assembleFRRConfig` clears it for an `instance-type forwarding` instance —
+correct, because such an instance has **no VRF device** and its statics must
+render into `table <id>` so the kernel agrees with the FBF/PBR ip rules (#1827
+PR-2). But `generateProtocols` reads an empty `VRFName` as *the global
+instance*: `vrfSuffix` stays empty and every stanza renders unscoped.
+
+Carrying a forwarding instance's protocols through that produced, on a commit
+all four config channels ACCEPT with zero warnings:
+
+| composition | rendered |
+|---|---|
+| forwarding + ospf | **two** `router ospf` blocks, neither with a `vrf` suffix; the instance's interface activated in the GLOBAL instance |
+| forwarding + isis | a GLOBAL `router isis xpf` |
+| forwarding + rip | a GLOBAL `router rip` |
+| forwarding + bgp | the instance's `peer-as 65002` neighbor under a **second** `router bgp 65001` — it JOINS THE GLOBAL AS |
+
+A `virtual-router` control on the same fixture renders `router ospf vrf
+vrf-ISP-B` correctly, so this is specific to the forwarding type and not to
+per-instance protocols in general.
+
+The composition is now rejected at strict commit
+(`config.validateForwardingInstanceProtocolsStrict`), and `assembleFRRConfig`
+NILs a forwarding instance's protocol pointers before they reach this package.
+The renderer is deliberately left alone: nothing here can distinguish "the
+master table" from "a forwarding instance's table" through one empty string,
+and the fix belongs where the discriminator still exists.
+
 ### Protocol interface operands are RESOLVED, not copied (#9405)
 
 `protocols ospf area <a> interface <ref>` — and the OSPFv3 / IS-IS / RIP
