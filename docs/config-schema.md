@@ -4075,6 +4075,13 @@ anywhere in the hierarchy — `apply-groups-except` and `apply-macro` survive gr
 expansion as live nodes, so reading one as a member would false-reject a
 legitimate config.
 
+`apply-groups-except` surviving expansion is not the same as being ignored:
+since #9422 the expander CONSULTS it (`mergeNodes` skips a group's contribution
+at any destination level carrying the statement) and then deliberately leaves the
+node in the tree, because it has no compiled meaning of its own. Keeping it is
+what preserves the skip lists above as the thing that stops it being read as a
+member — a strip would make their fixtures vacuous rather than safe.
+
 
 `compileZones` iterated `prop.Children`, so every compact spelling ran the loop
 body ZERO times and the zone compiled with NO interfaces — cleanly, with no
