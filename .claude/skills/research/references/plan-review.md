@@ -5,12 +5,21 @@ Keep the established Codex + AGY + Claude subject-matter-review (SMR) gate. This
 is plan review, not implementation review; Copilot joins later on actual code
 through `/engineer`. Do not open a draft PR just to obtain a fourth plan verdict.
 
+Finding/conclusion validation has its own
+[three-way adversarial gate](adversarial-review.md). The same reviewers may handle
+both stages with separate verdicts and evidence/plan revisions. File already
+validated defects under research's default before waiting for plan convergence;
+a missing plan reviewer or PLAN-KILL cannot hold those issues back. Automatic
+defect filing does not authorize publishing planning branches or issue comments.
+
 ## Prepare the plan
 
 For issue-linked plans, use `research/<issue>-<slug>` and
 `docs/research/<issue>-<slug>/plan.md` in an owned documentation worktree under
-`.claude/worktrees/<issue>-research-<slug>`, based on the pinned intended comparison
-revision. Follow `AGENTS.md`; verify path, base SHA and write scope. Never reuse
+`<run-dir>/worktrees/<issue>-research-<slug>`, where `<run-dir>` is this run's
+`/var/tmp/deep-review-work/research-work.<unique-id>` directory. Base it on the
+pinned intended comparison revision. Follow `AGENTS.md`; verify path, base SHA
+and write scope. Never reuse
 an occupied worktree by force. Without an issue, use the research run ID instead
 of inventing an issue number. Local-only plans may stay in the owned run directory.
 Commit/push the research docs and post issue comments only within actual scope;
@@ -86,7 +95,7 @@ with the actual reviewers' verdicts (verbatim except disclosed harness-tag/secre
 redaction), plan revision/link, recommended option and why, and unresolved work.
 Otherwise include those comments as drafts in the local research result.
 
-STOP at PLAN-READY, PLAN-KILL, or BLOCKED; do not implement, open a PR, deploy, or
+STOP at PLAN-READY, PLAN-KILLED, or BLOCKED; do not implement, open a PR, deploy, or
 merge. PLAN-READY ends with: "Awaiting manual approval — type `/engineer <issue>`
 to proceed to implementation; Copilot joins on the implementation PR." With no
 issue, request an explicit implementation instruction instead of creating one.

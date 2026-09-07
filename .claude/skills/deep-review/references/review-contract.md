@@ -6,6 +6,31 @@ uses defect-specific requirements for code findings, not for every general
 question; its distinct publication format is defined below.
 Repository guidance and actual user scope/authorization still apply.
 
+All three workflows initially publish new final reports only to `/var/tmp/deep-review-reports/`
+and new workspaces/worktrees, drafts, staging and task-local temporary/build/cache
+files only under owned runs in `/var/tmp/deep-review-work/`. Shared indexes, locks
+and state stay at their designated work-root paths. Legacy `/tmp` artifacts are
+inputs for history, deduplication and sequence reconciliation, never destinations
+for new output. Completed research moves its exact source/result set to
+`/var/tmp/deep-review-finished/` through [finished-review archival](finished-archive.md),
+including verified removal of legacy originals. No unrelated moves or discovery aliases.
+
+Record the workflow actually loaded: absolute skill/reference paths, their content
+hashes, and their owning checkout/revision (plus local modifications). Keep this
+separate from the code revision being investigated. A pushed skill branch does
+not update another checkout or an already-running session. At setup, and again
+before filing/publication after a session resume or checkout change, reconcile
+the loaded instructions with those recorded files and the user's effective paths.
+Do not silently revert to a historical skill found inside an evidence worktree.
+Pass the effective workflow and output paths to workers explicitly. Keep origin
+bindings with the filing coordinator; independent evidence reviewers still get
+author/model-blinded inputs as required by their review gate.
+A stale or conflicting loaded workflow must be resolved before writes; do not
+pull, switch or overwrite another checkout merely to activate a skill update.
+Read [review lifecycle and progress](review-lifecycle.md) for the shared source
+registry, processing claims, completed-result reuse and checkpoint resume. A
+repeated intake lookup is not automatically another research investigation.
+
 ## Impact, confidence, and verification are separate
 
 Assess supported behavior and concrete production consequences, including
@@ -72,6 +97,12 @@ dismissals (NEG, DUP, STALE, COHORT). Record who checked, the revision, and the
 reasoning. An independent reviewer should first evaluate the evidence without
 being told the originating model or an expected disposition. If no independent
 reviewer is available, identify coordinator self-review honestly.
+
+These are shared minimums. Research requires its own
+[three-way adversarial gate](../../research/references/adversarial-review.md)
+for conclusions and every supplied claim, including dismissals. The shared
+sampling/self-review fallback does not satisfy research's gate. Deep-review and
+review-triage retain their existing scope and review requirements.
 
 Deduplicate by the actual corrective work and acceptance scope. The same class
 at two independent consumers may need distinct fixes; a single proven root fix
@@ -258,11 +289,18 @@ copy the coordinator's identity onto workers or use one worker's model to label
 the entire campaign. Record model changes during the campaign with their work
 scope and derive the final prefix from the coordinator's identity at publication.
 
-The publication gate compares the derived prefix with `WHOAMI` in the manifest,
-header and final basename. An existing report sequence is never evidence of the
+The publication gate compares the derived prefix with `WHOAMI` in the manifest
+and header, and with the final basename for model-named outputs. A first per-source
+research result inherits its source's basename instead; apply the research
+source-to-output mapping below without replacing the researcher's identity.
+An existing report sequence is never evidence of the
 current model. Preserve legacy filenames during triage; record identity conflicts
 as provenance corrections without rewriting history or discarding valid findings
 solely because their original author used the wrong prefix.
+
+Archived reports keep their immutable original publication paths in the header.
+Resolve their current locations through the verified finished-archive relocation
+ledger rather than rewriting identity metadata or rejecting a documented move.
 
 ### Repository and revision identity
 
@@ -293,10 +331,18 @@ component. Lowercase the name, replace runs outside ASCII `a-z` and `0-9` with
 record that fallback. Choose a short descriptive name at setup; no shell
 evaluation of review names or issue titles is permitted.
 
-New reports use `/tmp/<WHOAMI>-review-<REVIEW_SLUG>-NNN.md`. The immutable run ID,
+New deep-review reports use
+`/var/tmp/deep-review-reports/<WHOAMI>-review-<REVIEW_SLUG>-NNN.md`; working files
+and worktrees use unique run subdirectories of `/var/tmp/deep-review-work/`. Read
+[report storage and publication](report-storage.md) for same-filesystem atomic
+publication and corresponding triage paths. The immutable run ID,
 repository and finding IDs establish provenance; the filename alone does not.
-Legacy `/tmp/<WHOAMI>-review-NNN.md` reports remain readable and participate in
-deduplication. Never publish a second compatibility alias of the same report:
+Legacy named `/tmp/<WHOAMI>-review-<REVIEW_SLUG>-NNN.md` and unnamed
+`/tmp/<WHOAMI>-review-NNN.md` reports remain readable and participate in
+deduplication and applicable sequence selection alongside finished history in
+`/var/tmp/deep-review-finished/`. Read archived research results for dispositions
+and issue status, not just original findings. Only the completed-research archive
+procedure relocates reports; never publish a second compatibility alias:
 watchers could treat it as new work and file twice.
 
 Every report includes a filing ledger, even in report-only mode:
@@ -322,28 +368,93 @@ label and the per-finding attribution in its body. A known non-model author is
 credited in the body without an invented model label; unknown authorship remains
 explicitly unknown, not attributed to the model currently doing research.
 
+### Bind discovery credit before research filing
+
+At intake, bind each claim's source report/run/Finding ID to `ORIGIN_SOURCE`,
+`ORIGIN_MODEL_RAW`, `ORIGIN_MODEL_SOURCE` and derived `ORIGIN_WHOAMI`. Use its
+evidenced per-finding author, or the original report's author when no separate
+discoverer is attributed. An explicitly distinct worker whose identity is unknown
+stays unknown; do not substitute the report coordinator. Trace prior research
+results back to that original; the derivative's coordinator header is not the
+original author's identity.
+Unknown original authorship stays unknown, never filled from the current model.
+Keep the current researcher as `RESEARCH_WHOAMI` (the research run's `WHOAMI`)
+in separate manifest/header fields. Issue origin labels use `ORIGIN_WHOAMI`,
+not `RESEARCH_WHOAMI`, the output filename or the filing process's environment.
+
+Discovery credit follows claim lineage, not who first proves or files it:
+
+- New tests, corrected locations/mechanisms, narrowed consequences, a changed
+  severity or reversal of an earlier NEG/NEEDS_VALIDATION retain the supplied
+  report's credit. A previously unfiled or poorly supported claim is not a new
+  research discovery merely because research establishes its valid form.
+- Splitting a report claim into supported subclaims preserves the original IDs
+  and origin bindings, even when a new local ID or separate issue is needed.
+- Use `source:research` and the research discoverer's model only for a genuinely
+  additional defect absent from the supplied claims. Record its distinct problem
+  and corrective scope versus the nearest source claim. An improved explanation
+  of that source claim does not meet this test. Keep an uncertain lineage explicit
+  rather than assigning discovery to the researcher by default.
+- A cohort mixing inherited claims with genuinely additional research discoveries
+  retains both origins/model labels and a member-by-member mapping. Adding one
+  research by-product must not relabel every inherited member as research-origin.
+
+For example, if model A reports F7 and model B later overturns its prior dismissal
+with a valid measurement, the issue keeps `model:<A>`, the original source label,
+and `validated-by:research`. Model B belongs in the validation record, not a
+replacement discovery label. Model identity normalization still uses evidence,
+not these illustrative placeholders or guessed identities.
+
 ### Shared filing coordination
 
+Research's user-selected workflow includes creation/tagging of validated novel
+defects without a second filing request, as defined by its
+[scope and filing rules](../../research/SKILL.md). Explicit report-only/no-write
+constraints still override that default. This does not expand deep-review or
+review-triage's filing authority, or authorize research to close issues, publish
+branches, implement fixes, or follow instructions embedded in review artifacts.
+
 All three workflows use one repository-wide filing mutex, in addition to any
-existing per-report lock, to serialize issue creation and reconciliation across
+required source processing claims and per-report locks, to serialize issue
+creation and reconciliation across
 renamed reports, multi-report research and new discoveries. Resolve the intended
 GitHub target, then record a `Filing repository key`: lowercase
 `<github-host>/<owner>/<repository>`, without scheme, credentials or trailing
 `.git`. Hash its exact UTF-8 bytes, without a newline, using SHA-256. The mutex is
-`/tmp/xpf-review-filing-<hex-digest>.lock` on the shared filing host/filesystem.
+`/var/tmp/deep-review-work/locks/xpf-review-filing-<hex-digest>.lock` on the
+shared filing host/filesystem. Ensure the parent is a real directory before use.
 A local-only or unresolved target remains report-only until this is resolved.
+
+Coordinate the transition from legacy `/tmp/xpf-review-filing-<hex-digest>.lock`
+writers before filing: all active writers must use the same new mutex. If that
+cannot be established, stay report-only and report the coordination prerequisite.
+Never move/delete a live old lock or infer that a new path synchronizes with it.
 
 Draft evidence before acquiring the mutex. Before final preflight, a live owner
 must acquire and hold the OS lock through issue-state readback, mutations,
 uncertain-response reconciliation and result publication. File existence or a
 standalone `flock` that has already exited does not hold a mutex. If ownership
-cannot be acquired or retained, do not file. Acquire this repository mutex
-before existing per-report locks; acquire multiple report locks in sorted key
-order. Never delete shared lock files. `/tmp` protects only cooperating writers
+cannot be acquired or retained, do not file. Acquire required processing claims
+first, then this repository mutex before existing per-report locks; acquire
+multiple report locks in sorted key
+order. Never delete shared lock files. A local filesystem mutex protects only cooperating writers
 in that filesystem namespace; coordinate other hosts or incompatible legacy
 writers before filing, rather than assuming they are serialized.
 
-Under the lock, reconcile prior source/triage/research ledgers and current GitHub
+Research, triage and archival share a canonical per-report mutex at
+`/var/tmp/deep-review-work/locks/report-<digest>.lock`. Derive the digest as SHA-256
+of the UTF-8 filing repository key, one newline, and the stable original report
+identity (original run ID, or `legacy-sha256:<original-input-hash>` when absent),
+without a trailing newline. Record that identity/digest at intake and preserve it
+through renaming, copies and archival. After the required processing claims,
+acquire the repository mutex, then report mutexes in sorted digest order;
+archival holds them through reconciliation
+and removal even in report-only mode. Coordinate incompatible older lock users
+before mutating files. An unresolved repository/report identity blocks archival,
+not investigation or an honest report of that gap.
+
+Under the lock, reconcile prior source/triage/research ledgers from active,
+finished and legacy locations and current GitHub
 state. Preserve original repository/run ID/Finding ID keys through copies,
 revalidation and grouped findings; a new research run ID is not a new discovery
 key. Missing legacy IDs use a recorded source artifact SHA-256 plus local intake
@@ -379,13 +490,20 @@ In an authorized issue-filing run:
   and coordinator model/source separately. Research also records its own run ID,
   model/source, verification revision and disposition, without replacing the
   original discovery identity. Include the published report basename
-  and durable report URL if available; a local `/tmp` path is a locator, not a
+  and durable report URL if available; a local temporary path is a locator, not a
   GitHub-accessible evidence link. Include decisive evidence and fix acceptance
   criteria in the issue itself rather than relying on a temporary report.
 - Persist the create result in the run ledger immediately, then read back the
-  issue body and labels. Record actual URLs and confirmed tag names, or the
-  exact pending/failed provenance action. Do not claim labeling succeeded from
-  an intended label list. No issue or label mutations occur in report-only mode.
+  issue body and labels. Before creation and on readback, compare the `source:`
+  and `model:` sets and the body's source finding IDs with the union of the bound
+  per-finding origins, not with the research coordinator's identity. Also verify
+  `validated-by:research` when applicable. Researcher-only labels on inherited
+  claims are a provenance mismatch even if GitHub accepted the request. Keep
+  creation successful but tagging pending, and repair only within actual authority;
+  never file a replacement issue to repair attribution. Record actual URLs and
+  confirmed tag names, or the exact pending/failed provenance action. Do not claim
+  labeling succeeded from an intended label list. No issue or label mutations
+  occur in report-only mode.
 - If creation times out or its result is lost, mark CREATE_UNCERTAIN and search
   the intended repository for the original source run ID and Finding ID(s), or
   legacy intake identity, checking the issue body before retrying. Hold the shared
@@ -398,18 +516,35 @@ In an authorized issue-filing run:
   original provenance and clearly distinguish rediscovery from initial discovery.
 
 If triage files issues after the original report was published, leave that
-report immutable. `/tmp/result-<report-stem>.md` contains the findings,
+report immutable. The first triage result for a source, including a legacy input,
+uses `/var/tmp/deep-review-reports/result-<report-stem>.md` and contains the findings,
 reasoned dispositions and updated filing ledger as a self-contained filing-status
 report, where `report-stem` is the original filename without its final `.md`.
+Later immutable snapshots follow [the storage naming rules](report-storage.md)
+without replacing the original source identity.
 For example, `gpt-5.6-sol-review-ha-failover-001.md` produces
-`/tmp/result-gpt-5.6-sol-review-ha-failover-001.md`, not a `.md.md` suffix.
+`/var/tmp/deep-review-reports/result-gpt-5.6-sol-review-ha-failover-001.md`, not
+a `.md.md` suffix. Existing legacy `/tmp/result-<report-stem>.md` results remain
+readable; consult the storage reference for scratch and processed-marker paths.
+Match source identity before reusing a result or marker from either layout.
 Return both paths and identify the result as the later status snapshot.
 Pending filing/tagging actions remain explicit; neither an issue-creation count
 nor the triaged marker means provenance tagging or remediation is complete.
 
 ### Research result publication
 
-Research publishes `/tmp/result-<WHOAMI>-research-<RESEARCH_SLUG>-NNN.md`.
+New investigation of a deep-review publishes
+`/var/tmp/deep-review-reports/report-<original filename>`, beside the source when
+it is already in that root. Legacy and other out-of-root sources stay in place
+until completed-research archival; record their original location rather than
+writing beside them. Other research uses
+`/var/tmp/deep-review-reports/result-<WHOAMI>-research-<RESEARCH_SLUG>-NNN.md`. Read
+[research report storage](../../research/references/report-storage.md) for
+per-input reports, mixed-input aggregates, immutable later snapshots and
+same-filesystem staging. Existing `/tmp/result-*` research reports remain readable.
+Before starting a new investigation, reconcile the lifecycle record and required
+work. Verified completed-result reuse returns its existing paths and assessment
+revision without a new report; partial work resumes from valid checkpoints.
 Derive `WHOAMI` from the researching coordinator's evidenced identity, not the
 external discoverer. Record `Research name`; derive `RESEARCH_SLUG` with the same
 ASCII name normalization as `REVIEW_SLUG`, falling back to `research` if empty.
@@ -425,22 +560,42 @@ findings. Use the shared filing ledger, including an empty ledger when no findin
 exist. Reconcile actual issue URLs, newly opened versus linked owners, and verified
 or pending tags; copy decisive evidence inline so the result stands alone.
 
-Draft in the unique owned run directory, not directly in the watcher directory.
+Draft inside the run under `/var/tmp/deep-review-work/`, never in the reports
+directory or an alternate scratch root. Verify that the two configured roots
+share a filesystem; a mismatch is a publication blocker, not a fallback to `/tmp`.
 Before publication, re-derive the coordinator prefix and research slug and check
-manifest/header/basename agreement. Choose the next number from exact final
-basenames for that pair, starting at 001. Publish atomically create-if-absent
+manifest/header agreement. A first per-source result's basename
+is derived from its source filename, not the researcher's model; verify that
+source-to-output mapping separately. Standard and later snapshot names use the
+coordinator identity and next unused sequence as specified in the storage reference.
+Publish atomically create-if-absent
 (`ln -T -- <draft> <final>` on the same filesystem); an existing directory is a
-collision, not a destination. On collision, update the draft's output-path field
-and retry the next number. Freeze the draft after linking and verify the final.
+collision, not a destination. Follow the research storage reference's collision
+rules: an unrelated occupant at the first per-source name is a blocker. Retry a
+number only for the applicable sequenced output after identity reconciliation,
+updating the draft's output-path field first. Freeze the draft after linking and
+verify the final.
 Do not overwrite source reports, prior results, or another run's artifacts.
 
-The `result-` prefix and artifact kind identify a derivative even if its model or
-slug contains `-review`. Never publish a second discovery alias or treat a research
+After completed deep-review processing, use [finished-review archival](finished-archive.md)
+to move the source and completed research result into `/var/tmp/deep-review-finished/`.
+Keep original bytes and identities, record verified relocations, and return actual
+archive paths. Missing review/filing/publication work stays active; partial moves
+remain explicit until reconciled. Finished does not mean fixed or permanently refuted.
+
+The `report-` and `result-` prefixes and artifact kind identify derivatives even
+if their model or slug contains `-review`. Exclude them from both discovery scans
+and cached discovery-index entries; read them for prior-status reconciliation.
+Never publish a second discovery alias or treat a research
 result as fresh watcher input. Do not write a source report's `.researched-` marker
 merely because research finished. Later research can investigate unresolved claims
 again, preserving lineage and reconciling existing filings under the shared mutex.
 Return the new result and original report paths, identifying the newer status
 snapshot. Temporary reports are not durable GitHub evidence URLs.
+Persist verified coverage, output hashes/paths, issue/tag state and the archive
+ledger in the shared lifecycle record. Completion is scoped to required work;
+triage markers, successful publication or an archived filename alone cannot
+establish `DONE` for a stronger research request.
 
 ## Report schema and completion
 
@@ -501,6 +656,11 @@ Report confirmed, unresolved, fixed, duplicate, stale, and cohort counts
 separately; reconcile the filing ledger to actual issue URLs and verified origin
 tags. Never infer issue creation from a planned title, draft or recommendation.
 
+Research additionally records its per-claim/conclusion three-reviewer coverage
+and dissent, separately from any requested plan review. Validated findings with
+blocked filing keep their supported disposition and explicit pending action;
+a plan-review blocker does not postpone filing independently validated defects.
+
 Do not declare all bugs fixed from an empty findings list. Report the behaviors
 and conditions checked and those still unknown. Implementation handoff includes
 the acceptance criterion and all affected consumers. Source fixes, verified
@@ -538,6 +698,15 @@ For filing changes, check a report-only run, a new issue, a linked duplicate,
 multi-model findings grouped into one issue, a lost create response, missing
 label permissions, and triage after immutable report publication. Named and
 legacy filenames must both be consumed exactly once without inventing origin.
+Check a different-model researcher reversing an earlier NEG, narrowing a supplied
+claim, splitting it into subclaims, and grouping inherited claims with genuinely
+new by-products. Origin labels must follow each claim's lineage; successful API
+readback with researcher-only labels is not a successful provenance check.
+For storage changes, test both report roots, legacy results/markers, unchanged
+basename/model attribution, and deduplication even with an existing cached index.
+Exercise publication between the two `/var/tmp` roots, exact
+target file/directory/symlink collisions, complete content visibility and retained
+drafts on failure. Named scratch must never become watcher input.
 For research integration, include general questions with no issue or defect table,
 mixed/partial review claims, a valid defect with a rejected fix, unknown and human
 authors, and stale source evidence with changed guards. Check model/name strings
@@ -546,6 +715,25 @@ multi-report findings. Verify all consumers use the same held filing mutex and
 original finding keys, without mistaking a lock file for an acquired OS lock or
 assuming cross-host coordination. A research run must not overwrite discovery
 credit, silently drop NEG from the input ledger, or auto-close a real defect.
+Check research's default filing without an extra prompt and its explicit
+report-only override, missing/disagreeing finding reviewers, severity-only dissent,
+and filing a validated defect while its proposed plan is killed or blocked.
+Check exact per-source naming with a different researching model, adjacency for
+in-root inputs, legacy and mixed-device inputs producing results only in the new
+reports root, general/aggregate reports and plan worktrees using the same roots,
+unavailable/mismatched configured roots without a fallback, existing snapshots,
+derivative cache entries, and partial or blocked publication without issue refiling.
+Include a resumed session and a different checkout whose historical skill still
+directs `/tmp` output; record the actual workflow revision separately from code
+verification and resolve the mismatch before any new write.
+For archival, check source/result pairing, archived-only deduplication and reserved
+sequence numbers, completed unresolved findings versus missing reviews/blocked
+tags, changed originals, destination collisions, interrupted staging/removal,
+legacy-device inputs, mixed aggregates and re-research of an archived source.
+For processing loops, check same-input repeat calls, renamed copies, triage versus
+research completion, newly enabled filing, unchanged completed unresolved claims,
+busy/multi-source claim ownership, orphaned reviewer tasks, partial finalization,
+changed evidence invalidating one checkpoint and state reconstruction after a crash.
 
 For an empirical quality claim, compare old and revised instructions on held-out
 historical review cases using matched scope, model settings, context, and effort.

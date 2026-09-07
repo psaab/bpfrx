@@ -1,0 +1,133 @@
+# Research report and workspace storage
+
+Every new research investigation publishes its evidence, dispositions,
+three-reviewer coverage and actual issue/tagging ledger. Before starting one for
+a source report, apply [repeat-safe intake](../../deep-review/references/review-lifecycle.md).
+Verified reuse, busy ownership and unchanged-blocked intake create no new run or
+result; admitted work checkpoints its progress in the shared source record.
+Classify inputs by reconciled provenance, not by
+the substring `-review`. A `research-result`, `report-` or `result-` derivative is
+prior validation evidence, not a new deep-review discovery.
+
+All new final reports are initially published in `/var/tmp/deep-review-reports/`.
+Completed deep-review sources and their research results then move to
+`/var/tmp/deep-review-finished/` through
+[finished-review archival](../../deep-review/references/finished-archive.md).
+All new working files and worktrees use an owned run under
+`/var/tmp/deep-review-work/`. This applies
+to general questions, external reviews, deep-review validation, legacy inputs,
+mixed-input aggregates and solution planning. `/tmp` is compatibility input only,
+never a new output, workspace or staging destination. The archival procedure may
+remove exact verified legacy originals after their archive copies are complete.
+
+At setup, record the actual loaded skill/reference paths and hashes under the
+shared workflow-revision rule. Resolve and announce the work, active-report and
+finished roots and every planned source-to-output mapping before writing. Do not
+derive an output directory from a legacy input, a prior result path or a stale
+skill in the source checkout. A pushed branch is not evidence that the session or
+another checkout is using it; resolve conflicting instructions without changing
+the user's checkout automatically.
+
+## Output names and coverage
+
+For a deep-review input, the first result is named **`report-<original filename>`**
+under the new reports root, keeping the original extension once. It is adjacent
+when the source is already there. Legacy and other out-of-root inputs stay where
+they are during investigation; the new result records that source-to-output mapping
+instead of writing beside them or copying the source into the discovery directory.
+Only completed-research archival subsequently relocates the exact source/result set.
+
+| Deep-review input | First research result |
+| --- | --- |
+| `/var/tmp/deep-review-reports/gpt-5.6-sol-review-ha-001.md` | `/var/tmp/deep-review-reports/report-gpt-5.6-sol-review-ha-001.md` |
+| `/tmp/muse-spark-review-009.md` | `/var/tmp/deep-review-reports/report-muse-spark-review-009.md` |
+
+The path inherits the source filename; it does **not** identify the researcher.
+Record the researching model's real `MODEL_RAW`, `MODEL_SOURCE`, `MODEL_HOST` and
+`WHOAMI` in the header/manifest, separately from original finding/discoverer IDs.
+That researching identity is `RESEARCH_WHOAMI`; it does not supply issue `model:`
+labels. Those come from each claim's bound `ORIGIN_WHOAMI` in the shared contract.
+Verify the result basename against the source, not against the researcher's model.
+
+For multiple deep-review inputs, provide one self-contained scoped result per
+distinct source: reuse a verified completed result that covers this request and
+publish new results only for admitted investigation/finalization work. Include
+every claim's disposition and
+evidence, reviewer coverage and actual issue URLs. Newly produced reports share
+the current research run ID; reused reports keep their immutable historical run
+IDs. The current manifest/aggregate maps each source and historical/current attempt
+to its result. Retain cross-source finding/issue mappings and other output
+locators; shared findings are
+not filed again. Reconcile copies by source identity instead of inventing discoveries.
+
+General research and non-deep-review inputs use
+`/var/tmp/deep-review-reports/result-<WHOAMI>-research-<RESEARCH_SLUG>-NNN.md`.
+A mixed-input run also writes this aggregate result for the complete investigation,
+linking the scoped per-source reports (reused and new) so external-review claims
+and general answers are not lost. Prior
+research derivatives link back to their original inputs; never recursively publish
+`report-report-*` as a new discovery result. If researching one again, reconcile
+its original source for the next snapshot, or use the standard result when that
+source cannot be resolved and record the limitation.
+
+Never overwrite a previous result. Reconcile existing results and filing history
+in the active root, finished archive and legacy locations before naming a new
+snapshot. A verified result that covers the current request is returned without a
+new snapshot. If explicit revalidation or changed requirements need another
+assessment, publish an immutable
+snapshot in `/var/tmp/deep-review-reports/` named
+`report-<source-stem>-research-<WHOAMI>-<RESEARCH_SLUG>-NNN.md`, choosing the next
+unused number across matching active/finished/legacy basenames and linking prior snapshots.
+Use that same read-only sequence reconciliation for standard research results.
+The stem omits only the last `.md`.
+An unrelated file, directory or symlink at the first result path is a blocker,
+not a report to reuse or overwrite. Concurrent collisions require the same check.
+
+## Owned scratch and atomic publication
+
+For admitted new/resumable investigation, after the source processing claim where
+applicable, allocate
+`mktemp -d /var/tmp/deep-review-work/research-work.XXXXXXXXXX`, after ensuring the
+parent is a real directory. Keep all worktrees (including documentation/plan
+worktrees), drafts, reviewer outputs, manifests, evidence and staging inside this
+owned run directory. Set task-local `TMPDIR` and applicable build/cache outputs
+there; no tool-default or legacy-input exception may scatter work into `/tmp`
+or the control checkout.
+
+Ensure the reports root is a real directory and check its device identity against
+the owned draft directory. Every output, including results for legacy inputs and
+mixed-input aggregates, goes to this root; the input's device is irrelevant to
+publication. If the two configured roots differ in filesystem or are unavailable,
+retain the complete draft and report the blocker. Do not fall back to `/tmp`,
+another scratch root, or visible staging files beside the final reports.
+
+Check the source identity and exact output path in the manifest/header, ensure the
+destination parent is a real directory, freeze the complete draft, then publish
+atomically create-if-absent using `ln -T -- <draft> <final>`. No symlink following,
+replacing copy or partial final pathname. Inspect any collision/ambiguous failure
+before retrying; verify the exact final bytes/header and never edit a linked draft.
+Read back the actual published file at its absolute configured-root path, not just
+the path claimed inside its header or a tool's success response. A new result
+found under `/tmp` is misplaced output, not completed publication. Record that
+failure and reconcile the owned artifact safely; do not overwrite legacy files,
+refile issues, or silently claim that the configured destination was used.
+Keep completed per-source reports immutable if another output fails. A later immutable
+aggregate or run ledger records the final per-output status.
+
+For remote/attached inputs, retain the original URL/attachment identity and content
+hash. For a deep-review, an established original report filename permits `report-` naming
+in the reports root; without one, use the standard research result and state the
+naming/provenance limitation instead of inventing a source path. A downloaded
+scratch copy is not the user's original location. An unwritable source directory
+does not prevent publication to the configured reports root. If that destination
+is unavailable, retain the complete draft and the exact publication blocker;
+publication failure must never trigger duplicate issue creation.
+
+Return every source/output pair, the standard/aggregate path when applicable,
+prior snapshots and exact pending publications. Both `report-` and `result-`
+outputs carry `Artifact kind: research-result` and are excluded from new-discovery
+selection in both directory scans and cached indexes. They remain readable for
+reconciliation; do not write `.researched-` markers merely because research ended.
+After completed deep-review processing, return the source/result paths in the
+finished archive, resolving initial publication locations through its relocation
+ledger. Do not claim an archive move for a remote original that remains remote.

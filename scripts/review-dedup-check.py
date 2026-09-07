@@ -23,33 +23,65 @@ def normalize_whoami(raw):
     who = re.sub(r'-[0-9]{8,}$', '', who)
     return who or "unknown"
 
+def is_result_report(path):
+    """Research/triage derivatives are status evidence, not fresh discoveries."""
+    return os.path.basename(path).startswith(('report-', 'result-'))
+
 def load_review_titles():
+    cached_titles = []
+    # Current and legacy indexes are leads, not an exhaustive report inventory.
+    for index in ('/var/tmp/deep-review-work/review-index.json', '/tmp/review-index.json'):
+        try:
+            data = json.loads(open(index).read())
+            for entry in data:
+                if is_result_report(entry['filename']):
+                    continue
+                for t in entry.get('titles', []):
+                    cached_titles.append((entry['filename'], t))
+        except:
+            pass
+    # Always scan active, finished and legacy history: an older cached index may
+    # miss a newly published or archived report. Do not create discovery aliases.
+    paths = (glob.glob('/var/tmp/deep-review-reports/*-review*.md')
+             + glob.glob('/var/tmp/deep-review-finished/*-review*.md')
+             + glob.glob('/tmp/*-review*.md'))
     titles = []
-    # From review-index.json if exists (faster)
-    try:
-        data = json.loads(open('/tmp/review-index.json').read())
-        for entry in data:
-            for t in entry.get('titles', []):
-                titles.append((entry['filename'], t))
-        return titles
-    except:
-        pass
-    # Fallback: glob
-    for path in glob.glob('/tmp/*-review*.md'):
+    paths_by_basename = defaultdict(set)
+    derivatives = set()
+    for path in paths:
+        paths_by_basename[os.path.basename(path)].add(os.path.abspath(path))
+        if is_result_report(path):
+            continue
         try:
             content = open(path, 'r', errors='ignore').read()
+            if re.search(r'^Artifact kind:\s*research-result\s*$', content, re.MULTILINE | re.IGNORECASE):
+                derivatives.add(os.path.abspath(path))
+                continue
             for m in re.finditer(r'^Title\s*[:\-]\s*([^\n]+)', content, re.MULTILINE | re.IGNORECASE):
                 titles.append((os.path.basename(path), m.group(1).strip()))
         except:
             pass
-    return titles
+    retained_cache = []
+    for filename, title in cached_titles:
+        candidates = ({os.path.abspath(filename)} if os.path.dirname(filename)
+                      else paths_by_basename.get(filename, set()))
+        # A basename-only cache cannot distinguish equal names across roots.
+        # If one is a known derivative, rely on fresh original-source rows;
+        # do not guess that the cached title belongs to the other root.
+        if candidates & derivatives:
+            continue
+        retained_cache.append((filename, title))
+    return list(dict.fromkeys(retained_cache + titles))
 
 def load_issue_titles():
-    try:
-        data = json.loads(open('/tmp/issue-pr-index.json').read())
-        return [(f"ISSUE #{i['number']}", i['title']) for i in data.get('issues',[])]
-    except:
-        return []
+    titles = []
+    for index in ('/var/tmp/deep-review-work/issue-pr-index.json', '/tmp/issue-pr-index.json'):
+        try:
+            data = json.loads(open(index).read())
+            titles.extend((f"ISSUE #{i['number']}", i['title']) for i in data.get('issues', []))
+        except:
+            pass
+    return list(dict.fromkeys(titles))
 
 def check_finding(new_title, threshold=0.5):
     """Check if new_title is similar to prior review or issue"""
@@ -89,4 +121,3 @@ if __name__ == "__main__":
         print(f"Found {len(matches)} potential duplicates:")
         for fname, title, jaccard, overlap in matches:
             print(f"  - {fname}: {title[:80]} (jaccard={jaccard:.2f}, overlap={overlap})")
-

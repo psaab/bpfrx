@@ -26,16 +26,37 @@ questions. Otherwise produce reviewable issue drafts and the result report.
 Implementation follows the requested engineering workflow; it is not an
 automatic side effect of classifying a finding.
 
-The established watcher compatibility paths are `/tmp/*-review*.md`,
-`/tmp/result-<basename>.md`, and `/tmp/.researched-<basename>`. Exclude result/
+Select new reports from `/var/tmp/deep-review-reports/*-review*.md`. Continue
+reading legacy `/tmp/*-review*.md` for history and explicitly scoped inputs,
+including a caller's configured legacy scope, not an implicit second new-work queue.
+The first triage result for a source lives at
+`/var/tmp/deep-review-reports/result-<basename>.md`; later snapshots follow the
+[shared storage naming rules](../deep-review/references/report-storage.md).
+New processed markers live at
+`/var/tmp/deep-review-work/state/.researched-<basename>.md`, where `<basename>`
+is the source report stem without its final `.md`. Continue reading established
+legacy `/tmp/result-<basename>.md` and `/tmp/.researched-<source-filename>` paths.
+Reconcile source identity and prior results/markers across both layouts; a
+copied report must not become new work merely because its directory changed.
+Also consult `/var/tmp/deep-review-finished/` for original reviews and their
+research results before deduplication or filing. It is historical input, not a
+new watcher queue. Read [finished-review archival](../deep-review/references/finished-archive.md)
+for relocation-ledger validation and reconciliation of partial active/archive copies.
+Exclude result/
 report derivatives and intermediate files from new input selection. In particular,
-exclude every `result-` basename and `Artifact kind: research-result`, even when
+exclude every `report-` or `result-` basename and `Artifact kind: research-result`, even when
 the model or research slug contains `-review` and matches the broad glob. Prefer the
 named final `<WHOAMI>-review-<REVIEW_SLUG>-<digits>.md` form and also accept legacy
 `<WHOAMI>-review-<digits>.md` finals. Validate the header's identity, review
 name/slug, run ID and exact output basename; do not infer ambiguous components
 by splitting on hyphens. Legacy inputs require provenance reconciliation.
 Never process a different repository's report just because its filename matches.
+Before dispatching investigation, apply
+[review lifecycle and progress](../deep-review/references/review-lifecycle.md):
+reuse completed work, skip busy/unchanged-blocked attempts and resume valid
+checkpoints under the shared processing claim. Record triage's actual gate and
+coverage; triage completion cannot stand in for research's three independent
+passes. A reuse/skip is intake, not a new triage run requiring another result.
 
 ## 1. Resolve the report's target
 
@@ -116,7 +137,10 @@ Apply the shared issue-filing and origin-tagging contract to every authorized
 filing. Confirm the actual `source:` and applicable
 `model:<originating-WHOAMI>` labels on GitHub and include the Review origin block
 in the issue body. Attribute the actual
-discoverer, not whichever model is doing triage. Reconcile lost create responses
+discoverer, not whichever model is doing triage. Use the shared per-claim
+`ORIGIN_WHOAMI` binding and expected-label readback gate. A narrower validation,
+new proof or reversal of a prior dismissal retains the original report's credit;
+mixed cohorts preserve every member's origin. Reconcile lost create responses
 by repository/run ID/Finding ID before retrying; retain existing issue provenance
 when linking a duplicate. Reports from other external reviewers are not
 automatically deep-review discoveries; preserve unknown/human origins explicitly.
@@ -125,7 +149,11 @@ occurred. Report pending tag actions separately from creation.
 
 ## 3. Write the reasoned result
 
-Use a unique owned scratch directory. Produce a complete draft result before
+For admitted new/resumable triage, after acquiring its processing claim,
+allocate a unique owned scratch directory with
+`mktemp -d /var/tmp/deep-review-work/triage-work.XXXXXXXXXX`, after ensuring the parent
+is a real directory. Keep drafts, evidence, logs and task-local temporary/build
+outputs there. Produce a complete draft result before
 publication. The result includes:
 
 - Source report/run ID, repository identity, review base, comparison ref/SHA/
@@ -154,22 +182,31 @@ targets; do not infer that every historical tag is supported.
 Return both the source report path and this updated result path, clearly naming
 which snapshot records the later issue-filing status.
 
-Publish `/tmp/result-<basename>.md` atomically with create-if-absent semantics
-after the draft is complete, using a same-filesystem hard link where available
-(`ln -T -- <draft> <result>` on this Linux host). An existing directory is a
+Publish the result at the new path defined above, atomically with
+create-if-absent semantics after the draft is complete. Read
+[report storage and publication](../deep-review/references/report-storage.md)
+and use its same-filesystem create-if-absent procedure. An existing directory is a
 collision, not a destination to follow into.
 For result naming, `<basename>` is the source report stem without the final
 `.md`, as illustrated in the shared contract; do not append the extension twice.
+An admitted later result uses
+`result-<basename>-triage-<WHOAMI>-NNN.md` under the same reports root, following
+the storage reference's identity/sequence checks and linking the immutable prior
+result. Reuse returns the existing result without another snapshot.
 Freeze the draft once linked. If a result already exists, verify its report
 identity and reconcile the prior work; never overwrite another run's result.
 Concurrent authorized filing workers must hold one exclusive per-report lock
-in addition to the shared contract's repository filing mutex. Acquire the
-repository mutex first and hold both from preflight through filing and result
+using the shared contract's canonical report key in addition to its repository
+filing mutex. Acquire the
+required processing claims before the repository mutex and per-report locks;
+hold the latter two from preflight through filing and result
 publication, rechecking processed/result state after acquiring it to avoid
 duplicate external writes. Never delete a
 shared lock file or another worker's artifacts.
 Reconcile later research snapshots and original source/finding keys before any
-filing. A new filename or revalidation run is not a new discovery; all workflows
+filing, including adjacent `report-<source-filename>` research results and their
+later snapshots. Read derivatives as status evidence, never as new discoveries.
+A new filename or revalidation run is not a new discovery; all workflows
 must share the mutex and account for its host/filesystem coordination limits.
 
 Write the compatibility processed marker only after every input finding has a
@@ -177,6 +214,9 @@ reasoned disposition, all authorized filings are accounted for, and the complete
 result is verified. The marker means triaged, not fixed; unresolved validation
 tasks remain explicit in the result. Preserve evidence until archived or handed
 off. Cleanup is limited to paths owned by this run.
+Checkpoint actual coverage, reviewer evidence, output and filing status in the
+source lifecycle record as well. A compatibility marker never replaces those
+workflow-specific completion checks or proves all research work was performed.
 
 ## Validation when changing this workflow
 

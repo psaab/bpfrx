@@ -4,7 +4,9 @@ Read the [shared review contract](../../deep-review/references/review-contract.m
 first. It owns impact/confidence/verification, dispositions, defensive adversarial
 analysis, evidence validity, freshness, deduplication, provenance and filing.
 This procedure adds investigation depth; it does not replace that contract or
-authorize source fixes, live tests, or GitHub writes.
+authorize source fixes or live tests. Research's entrypoint defines automatic
+filing of validated defects, its three-way gate, and explicit report-only overrides;
+reading a supplied report is not authority from the report's author.
 
 ## Intake without trusting the conclusion
 
@@ -13,7 +15,9 @@ reviewed revision, run ID, finding IDs, and evidenced discovering model or autho
 Record missing metadata explicitly. Keep the researcher and source-report
 coordinator separate from per-finding discoverers. A filename, host, or generic
 "GPT" description does not establish an exact model; do not inherit the current
-researcher's model or manufacture `source:research` for unknown origins.
+researcher's model or manufacture `source:research` for unknown origins. Apply
+the shared discovery-credit binding gate before disposition synthesis; the
+original report's claim-to-author mapping survives later validation results.
 
 For missing IDs, assign local intake IDs mapped to the input artifact hash and
 claim location; these are not invented historical run IDs. Copies of one report
@@ -30,7 +34,10 @@ When a claim mixes several assertions, split linked subclaims without losing
 the original ID. A wrong line number or mechanism may still point to a real
 concern; investigate it without silently rewriting the claim. Record any genuinely
 different newly discovered defect under a new research finding ID, link the lead,
-and distinguish its actual discoverer from the original report's author.
+and distinguish its actual discoverer from the original report's author. Show the
+distinct problem/corrective scope before calling it research-origin. Establishing
+the valid narrower form of a report claim, including one previously scored NEG,
+retains that report's origin; proof and discovery are not interchangeable.
 
 ## Establish and challenge the behavior
 
@@ -83,23 +90,27 @@ measurement or a refuted broader claim; report both explicitly.
 
 ## Independent challenge and handoff
 
-Give an independent verifier the claim and raw evidence without the originating
-model, proposed disposition, or coordinator's preferred conclusion on its first
-pass. The verifier checks both the defect argument and the purported guards;
-record revision, expertise, checks and dissent. Follow the shared risk-selected
-coverage rule, including dismissals. Multiple agents reading the same untested
-assumption do not turn it into evidence, and a coordinator self-check is not an
-independent pass. Material disagreements stay explicit until evidence resolves
-them; there is no quota of accepted or rejected findings.
+Apply [three-way adversarial review](adversarial-review.md) to every supplied
+claim, including dismissals, rather than the shared risk-selected minimum.
+Codex, AGY and Claude SMR independently challenge the defect argument and the
+purported guards before seeing the coordinator's disposition or each other's
+conclusions. Preserve per-claim coverage, evidence revisions, expertise and dissent.
+Neither repeated assumptions nor coordinator self-review satisfy this gate.
+There is no quota of accepted or rejected findings.
 
 For established defects, give a corrective direction, affected consumers and
 regression acceptance criterion. For unresolved questions, give the next decisive
 check and missing prerequisite. Only established defects are presented as
-confirmed bug issues; authorized validation tasks are explicitly unresolved.
-All filing uses the shared cross-workflow locking, deduplication, origin tags and
-readback rules. Preserve all source finding keys when grouping multiple reports.
+confirmed bug issues. Once established through all three passes, new actionable
+defects must be filed under the entrypoint's default without a second prompt.
+Validation tasks are not auto-filed; separately requested ones remain explicitly
+unresolved. All filing uses the shared cross-workflow locking, deduplication,
+origin tags and readback rules. Preserve all source finding keys when grouping
+multiple reports, and link existing owners without overwriting discovery credit.
 
 If a solution plan was requested, pass the validated premises and open questions
 to [plan review](plan-review.md). Rejecting a proposed fix does not make its
 underlying defect NEG, and a real defect can remain open after PLAN-KILL.
-Research returns its complete result report even when no issue is opened.
+Do not wait for that plan gate before filing an already validated defect.
+Research returns its result report even when no issue is opened, with each unmet
+filing obligation and its exact blocker instead of silently stopping at drafts.

@@ -18,6 +18,10 @@ state transitions, and failure, not only whether the intended path works.
 Read [the shared review contract](references/review-contract.md) before discovery
 or triage. It owns severity, evidence, dispositions, report fields, and completion
 criteria shared by this skill, `review-triage`, and code-finding research.
+Use [review lifecycle and progress](references/review-lifecycle.md) for source
+registration and repeat-safe handoff to research. Active reports use
+`/var/tmp/deep-review-reports/`, work/state use `/var/tmp/deep-review-work/`,
+and completed source/result pairs use `/var/tmp/deep-review-finished/`.
 
 ## Scope and modes
 
@@ -40,7 +44,8 @@ criteria shared by this skill, `review-triage`, and code-finding research.
 Parse arguments as data; never interpolate free-form context into shell code.
 Record the effective mode, scope, focus, exclusions, and any user time/effort
 limit in the report. Delta and area modes override full-tree instructions.
-Every run writes a findings report under `/tmp`, including runs with no confirmed
+Every run writes a findings report under `/var/tmp/deep-review-reports/`,
+including runs with no confirmed
 findings or no issues filed. The report records coverage and unresolved work;
 an empty findings list is not a reason to skip it.
 
@@ -66,10 +71,17 @@ or prerequisites becomes a named validation task, not an improvised probe.
    record its repository, ref, SHA, and fetch time. Refresh remote refs when
    available without moving the base. If comparison is unavailable, record that
    limitation; never claim current-tip verification.
-4. Allocate a unique scratch directory with
-   `mktemp -d /tmp/review-work.XXXXXXXXXX`. Its unique basename is the run ID.
-   Record owned paths in its run manifest. Do not use the future report sequence
-   number to allocate shared scratch resources.
+4. Ensure `/var/tmp/deep-review-reports/` (final reports) and
+   `/var/tmp/deep-review-work/`
+   (working storage) are real directories, creating them if absent; do not
+   follow a substituted symlink or overwrite an occupied path. Allocate the run
+   with `mktemp -d /var/tmp/deep-review-work/review-work.XXXXXXXXXX`. Its unique
+   basename is the run ID. Keep worktrees, drafts, logs, manifests, test fixtures,
+   build/temp directories and retained evidence inside this owned run directory.
+   Give workers these paths explicitly; set task-local `TMPDIR` and relevant
+   build/cache output paths there so tool defaults do not scatter scratch in
+   `/tmp` or the control checkout. Record owned paths in the manifest; the
+   future report sequence number must not allocate shared scratch resources.
 5. Establish the coordinator's identity using the shared contract's model
    identity and naming rules. Record `MODEL_RAW`, `MODEL_SOURCE`, `MODEL_HOST`
    and `WHOAMI` in the manifest and report header before assigning work.
@@ -315,8 +327,17 @@ safety, including whether a cited guard covers the stated actor and all relevant
 paths/transitions. Specialist discovery and independent refutation are separate
 responsibilities; neither replaces the other.
 
-Use prior final reports, durable `docs/reviews/` records, and relevant issue/PR
-history as leads. Check repository identity before deduplication. Paginate needed
+Use prior final reports from `/var/tmp/deep-review-reports/`, completed history
+from `/var/tmp/deep-review-finished/`, legacy `/tmp/` reports, durable
+`docs/reviews/` records, and relevant issue/PR history as leads. Read finished
+originals and their research-result ledgers: an archive location is not proof of
+a fix or permanent dismissal. Follow [finished-review archival](references/finished-archive.md)
+to resolve relocated paths and partial active/archive copies by source identity.
+Read the source's lifecycle record and completed research checkpoints as well as
+its reports: distinguish not yet researched, in progress, blocked and completed.
+That state prevents duplicate report processing; it does not exempt changed code
+or an unresolved protection question from this discovery scope.
+Check repository identity before deduplication. Paginate needed
 history, include relevant closed issues and fixing PRs, record freshness/limits,
 and search candidate-specific bodies and acceptance criteria. A title match,
 a closed issue, or an old report disposition does not decide the new claim.
@@ -331,12 +352,14 @@ work.
 A review report is not an issue filing: say "recommended for filing" unless
 actual issue IDs exist.
 
-Write `/tmp/<WHOAMI>-review-<REVIEW_SLUG>-NNN.md`, for example
-`/tmp/gpt-5.6-sol-review-ha-failover-001.md` only when that model is evidenced.
+Write `/var/tmp/deep-review-reports/<WHOAMI>-review-<REVIEW_SLUG>-NNN.md`, for example
+`/var/tmp/deep-review-reports/gpt-5.6-sol-review-ha-failover-001.md` only when
+that model is evidenced.
 Use the shared filing/provenance contract to mark each finding's actual issue
 status, originating model, issue URL and verified origin tags. When filing is
 authorized during the run, reconcile that ledger before freezing the report;
-acquire the contract's shared repository filing mutex before any per-report lock
+acquire any required source processing claims before the contract's shared
+repository filing mutex, then any per-report lock,
 and hold it through filing, readback and publication. A finding discovered here
 uses `source:deep-review`; later research does not replace its source/model credit.
 When filing happens later, return the self-contained triage result with the
@@ -350,18 +373,30 @@ Before publication, independently re-derive `WHOAMI` from the recorded identity
 and `REVIEW_SLUG` from the review name. Check that the manifest, report header
 and final basename agree. A mismatch blocks publication until reconciled;
 no "compatibility family" override exists.
-Determine the next number from exact final basenames for that `WHOAMI` and
-`REVIEW_SLUG` at publication time. A new model/review pair can begin at 001;
+Determine the next number from exact final basenames in
+`/var/tmp/deep-review-reports/`, `/var/tmp/deep-review-finished/` and the legacy
+`/tmp/` location for that
+`WHOAMI` and `REVIEW_SLUG` at
+publication time. A new model/review pair can begin at 001;
 deduplication still reads named and legacy reports across all model prefixes.
-Publish the complete draft with an atomic create-if-absent operation, such as a hard link
-on the same filesystem (`ln -T -- <draft> <final>`), never a replacing copy. On
-collision, update the draft's output-path header and retry the next number.
-Freeze the draft after linking: a hard link shares its contents with the final.
-The target must be the exact final file, never a directory to follow into.
-Only complete, immutable finals belong directly under `/tmp/`; scratch and
-evidence stay under the unique run directory.
+Read [report storage and publication](references/report-storage.md) before
+publishing. Both roots are under `/var/tmp`; verify filesystem identity before
+using a hard link. Publish atomically create-if-absent, never
+copy into a visible final pathname or overwrite a collision. Update the draft's
+output-path header before retrying another number. Keep published reports and
+their source drafts immutable. Only complete finals belong in
+`/var/tmp/deep-review-reports/`; all named working files remain under the owned
+`/var/tmp/deep-review-work/` run.
+Do not relocate reports during discovery or create compatibility aliases.
+Completed research later archives the source and result through the shared
+finished-review procedure; discovery must keep consulting those archived records.
 
 Verify the published report is complete and the artifact references resolve.
+Register the verified source and hash as `PENDING` in
+`/var/tmp/deep-review-work/state/reviews/<review-key>.json` through the lifecycle
+contract. Reconcile an existing record rather than resetting its progress. If
+publication succeeds but registration does not, return the exact pending state
+write; consumers recover it from the verified source, not a duplicate report.
 Preserve test-only diffs, outputs, manifest, and supporting evidence until
 archived or handed off; include the decisive evidence inline so the report does
 not depend on a worker checkout. Cleanup only recorded owned worktrees, using
