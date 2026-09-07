@@ -282,7 +282,7 @@ func expandGroupsRecursive(nodes *[]*Node, groups map[string]*Node, ancestorPath
 				if err := budget.charge(countNodes(cached)); err != nil {
 					return err
 				}
-				if err := mergeNodes(nodes, cloneNodes(cached), ancestorPath, budget); err != nil {
+				if err := mergeNodes(nodes, cloneNodes(cached), ancestorPath, budget, name, vars); err != nil {
 					return err
 				}
 			}
@@ -334,7 +334,7 @@ func expandGroupsRecursive(nodes *[]*Node, groups map[string]*Node, ancestorPath
 		// merge a SEPARATE clone into the parent so the cache is never mutated.
 		memo[memoKey] = cloneNodes(expanded)
 		if expanded != nil {
-			if err := mergeNodes(nodes, expanded, ancestorPath, budget); err != nil {
+			if err := mergeNodes(nodes, expanded, ancestorPath, budget, name, vars); err != nil {
 				return err
 			}
 		}
@@ -391,7 +391,17 @@ func expandGroupsRecursive(nodes *[]*Node, groups map[string]*Node, ancestorPath
 // block+block UNIONED — so an inline `match application junos-http` that
 // inherited a group's `match application junos-https` silently DROPPED
 // junos-https (fable-164 L-8), narrowing a `then deny` to junos-http only.
-func mergeNodes(dst *[]*Node, src []*Node, ancestorPath [][]string, budget *groupExpandBudget) error {
+func mergeNodes(dst *[]*Node, src []*Node, ancestorPath [][]string, budget *groupExpandBudget, group string, vars map[string]string) error {
+	// #9422: `apply-groups-except <group>` at THIS hierarchy level stops the
+	// named group's inheritance here and below. Checking at every merge level
+	// (rather than pre-pruning the group body once) is what makes it correct
+	// for a `<*>` group key, whose one source subtree fans out into every
+	// matching destination container — those containers may disagree about
+	// whether they exclude the group, and the wildcard branch below recurses
+	// into each with its OWN children as dst.
+	if nodesExcludeGroup(*dst, group, vars) {
+		return nil
+	}
 	for _, s := range src {
 		// #6767: one unit per source node MERGED, so a deep group subtree is
 		// bounded by its own size rather than by the single reference that
@@ -417,7 +427,7 @@ func mergeNodes(dst *[]*Node, src []*Node, ancestorPath [][]string, budget *grou
 							return err
 						}
 						if err := mergeNodes(&peer.Children, body,
-							appendPath(ancestorPath, peer.Keys), budget); err != nil {
+							appendPath(ancestorPath, peer.Keys), budget, group, vars); err != nil {
 							return err
 						}
 						continue
@@ -451,7 +461,7 @@ func mergeNodes(dst *[]*Node, src []*Node, ancestorPath [][]string, budget *grou
 						return err
 					}
 					cloned := cloneNodes(s.Children)
-					if err := mergeNodes(&d.Children, cloned, appendPath(ancestorPath, d.Keys), budget); err != nil {
+					if err := mergeNodes(&d.Children, cloned, appendPath(ancestorPath, d.Keys), budget, group, vars); err != nil {
 						return err
 					}
 				}
@@ -478,12 +488,21 @@ func mergeNodes(dst *[]*Node, src []*Node, ancestorPath [][]string, budget *grou
 			continue
 		}
 
+		// #9422: a same-keyed destination container excludes the group. Checked
+		// across ALL same-keyed siblings, not only the one this merge would
+		// descend into, because a level spread over two blocks
+		// (`system {...} system { apply-groups-except G; ... }`) is one
+		// hierarchy level to the operator and to the compiler.
+		if siblingsExcludeGroup(*dst, s.Keys, group, vars) {
+			continue
+		}
+
 		// Container node: find matching container in dst.
 		found := false
 		for _, d := range *dst {
 			if !d.IsLeaf && keysEqual(d.Keys, s.Keys) {
 				// Merge children recursively.
-				if err := mergeNodes(&d.Children, s.Children, appendPath(ancestorPath, d.Keys), budget); err != nil {
+				if err := mergeNodes(&d.Children, s.Children, appendPath(ancestorPath, d.Keys), budget, group, vars); err != nil {
 					return err
 				}
 				found = true
