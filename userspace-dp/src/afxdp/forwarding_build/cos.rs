@@ -454,14 +454,34 @@ fn cos_effective_transmit_rate_bytes(
 /// leftover that looks right and is not, which is the failure mode this
 /// function is shaped to avoid.
 ///
-/// # Over-subscription clamps to zero, and the caller warns
+/// # Over-subscription yields `None`, and the caller warns
 ///
 /// When the siblings already claim at least the whole shaping rate there is no
-/// leftover, and the result is `Some(0)`. Over-subscription is legal to express
-/// and rejecting it would break configurations that commit today — but a
-/// silently starved queue looks configured, so the Go commit path warns
-/// (compiler_validate_warn.go). `Some(0)` is deliberately not `None`: the form
-/// RESOLVED, to zero.
+/// leftover, and the result is **`None`** — see the `share == 0` arm in the
+/// body. Over-subscription is legal to express and rejecting it would break
+/// configurations that commit today, but a silently starved queue looks
+/// configured, so the Go commit path warns (compiler_validate_warn.go).
+///
+/// ZERO IS A SENTINEL, NOT A RATE, which is why `None` rather than `Some(0)`:
+/// at the call site a `Some(0)` becomes `guarantee_enabled = true` with
+/// `transmit_rate_bytes = 0`, so the queue is promoted into guarantee service
+/// AND read as uncapped by the token bucket — the inverse of the starved queue
+/// the clamp was meant to produce.
+///
+/// #9368: this block previously asserted the opposite — that the result is
+/// `Some(0)` and that this is "deliberately not `None`". That was true of the
+/// original #6846 implementation (`596969d30`). `067d6b548` ("#6846 review
+/// F1-F4") inverted the behaviour and correctly updated both the Rust body and
+/// the Go advisory, missing only this doc block. It is called out rather than
+/// quietly rewritten because the stale text asserted its claim EMPHATICALLY,
+/// and what it asserted was precisely the fail-open a review had just removed —
+/// the shape most likely to be restored by someone "fixing" the body to match
+/// its documentation.
+///
+/// The behaviour itself is pinned by `over_subscription_is_unresolvable`
+/// (`cos/remainder_temporal_tests_6846.rs`), which carries the same reasoning
+/// and reds on a `Some(0)` restoration — so this text and that cell must be
+/// read as one statement, and a future change has to move both.
 ///
 /// # No shaping rate means genuinely unresolvable
 ///
