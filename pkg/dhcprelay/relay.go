@@ -209,7 +209,14 @@ const suboption1CircuitID byte = 1
 
 // RelayStats holds per-interface relay statistics.
 type RelayStats struct {
-	Interface        string
+	// Interface is the AUTHORED config reference ("ge-0/0/0.0", "reth0.0").
+	Interface string
+	// KernelInterface is the Linux device the relay actually bound (#9406).
+	// It is reported separately rather than replacing Interface because the
+	// two differ under the canonical Junos spelling, and an operator staring
+	// at an all-zero counter row needs to see WHICH device this relay is on —
+	// that row is otherwise indistinguishable from an idle segment.
+	KernelInterface  string
 	RequestsRelayed  uint64
 	RepliesForwarded uint64
 
@@ -325,6 +332,14 @@ type l2Replier interface {
 type relaySpec struct {
 	servers         []string // server IPs in config order
 	alwaysBroadcast bool
+	// kernelName is the LINUX DEVICE this relay binds, resolved from the
+	// authored config reference through Config.ResolveKernelIfName (#9406).
+	// It is part of the SPEC, not just a cached lookup: an edit that changes
+	// the resolved device without changing any other field — retagging a unit's
+	// `vlan-id`, or repointing a RETH at a different local member — must tear
+	// the old socket down and bind the new device, and equal() is the only
+	// thing that decides that.
+	kernelName string
 	// maxHopCount is the RFC 1542 §4.1.1 loop-protection hop limit (#4309):
 	// a client request whose hops field has reached this value is dropped.
 	// 0 = unset = the default (defaultMaxHopCount, 16). A change requires a
@@ -346,6 +361,9 @@ type relaySpec struct {
 // equal reports whether two specs would produce an identical relay session.
 func (s relaySpec) equal(o relaySpec) bool {
 	if s.alwaysBroadcast != o.alwaysBroadcast {
+		return false
+	}
+	if s.kernelName != o.kernelName {
 		return false
 	}
 	if s.maxHopCount != o.maxHopCount {
@@ -370,7 +388,20 @@ func (s relaySpec) equal(o relaySpec) bool {
 
 // interfaceRelay represents a relay goroutine bound to one interface.
 type interfaceRelay struct {
-	ifaceName        string
+	// ifaceName is the AUTHORED config reference ("ge-0/0/0.0", "reth0.0").
+	// It is this relay's IDENTITY: the Apply diff key, the Stats row, the
+	// #2456 HA master gate and the #2456 RG lookup all speak it, and
+	// relayInterfaceRG (pkg/daemon) parses it as a Junos unit ref. Do not
+	// replace it with the kernel name — that would silently open the HA gate
+	// on every RETH-owned segment, because a kernel name is not a key in
+	// cfg.Interfaces.Interfaces.
+	ifaceName string
+	// kernelName is the LINUX DEVICE this relay binds (#9406): the ifaceName
+	// resolved through Config.ResolveKernelIfName. Every kernel-facing call —
+	// SO_BINDTODEVICE, the giaddr address lookup, the #2347 ifindex drift
+	// check, the #2076 raw-L2 sender — takes THIS, because none of them can
+	// find a device whose name contains '/' or a Junos unit suffix.
+	kernelName       string
 	cancel           context.CancelFunc
 	done             chan struct{}
 	requestsRelayed  atomic.Uint64
@@ -530,6 +561,12 @@ type Manager struct {
 	// implementation is defaultL2SenderFactory.
 	newL2 l2SenderFactory
 
+	// ifNameResolver maps an authored interface reference to the Linux device
+	// to bind (#9406). Set by the daemon to Config.ResolveKernelIfName for the
+	// config being applied; nil means IDENTITY, the pre-#9406 behaviour.
+	// Guarded by mu because Apply reads it while a commit may be setting it.
+	ifNameResolverFn func(string) string
+
 	// relayGate, when non-nil, gates the upstream relay-forward on this node's
 	// VRRP/cluster MASTER state for the relay interface's redundancy group
 	// (#2456). It is read PER PACKET (under mu) so a backup→master failover is
@@ -549,6 +586,34 @@ func (m *Manager) SetMasterGate(g masterGate) {
 	m.mu.Lock()
 	m.relayGate = g
 	m.mu.Unlock()
+}
+
+// SetIfNameResolver installs the authored-reference -> Linux-device resolver
+// the desired-set builder uses to decide what each relay BINDS (#9406).
+//
+// The daemon calls this on every commit with Config.ResolveKernelIfName for the
+// config being applied, immediately before Apply, so the resolution always
+// matches the config that produced the group list. It is a Manager seam rather
+// than an Apply parameter because Apply's signature is reached from ~50 call
+// sites; the production wire is asserted at the daemon instead, where severing
+// it is what actually breaks the box.
+//
+// A nil resolver is IDENTITY — the pre-#9406 behaviour, under which a canonical
+// Junos reference like `ge-0/0/0.0` was handed straight to net.InterfaceByName
+// and never resolved to a device.
+func (m *Manager) SetIfNameResolver(fn func(string) string) {
+	m.mu.Lock()
+	m.ifNameResolverFn = fn
+	m.mu.Unlock()
+}
+
+// ifNameResolver returns the installed resolver under mu. Must NOT be called
+// with mu already held (Apply calls it before taking the lock).
+func (m *Manager) ifNameResolver() func(string) string {
+	m.mu.Lock()
+	fn := m.ifNameResolverFn
+	m.mu.Unlock()
+	return fn
 }
 
 // shouldRelay reports whether a client request received on ifaceName may be
@@ -745,9 +810,11 @@ func defaultIfindexResolver(ifaceName string) (int, error) {
 // desired-set build so a relay started from this entry never re-parses config.
 type desiredRelay struct {
 	ifaceName string
-	groupName string
-	spec      relaySpec
-	servers   []*net.UDPAddr
+	// kernelName is the resolved Linux device for ifaceName (#9406).
+	kernelName string
+	groupName  string
+	spec       relaySpec
+	servers    []*net.UDPAddr
 }
 
 // computeDesired builds the desired per-interface relay set from config. It
@@ -756,7 +823,15 @@ type desiredRelay struct {
 // desired entry — first group wins, matching the pre-#2348 dedup) but produces
 // data instead of starting goroutines, so Apply can diff it against the running
 // set. The returned map is keyed by interface name.
-func computeDesired(cfg *config.DHCPRelayConfig) map[string]desiredRelay {
+//
+// resolveIfName maps an authored interface reference to the Linux device the
+// relay must bind (#9406). A nil resolver is IDENTITY, which is the pre-#9406
+// behaviour: the direct callers in this package's tests keep working unchanged,
+// and the production wire is asserted separately at the daemon.
+func computeDesired(cfg *config.DHCPRelayConfig, resolveIfName func(string) string) map[string]desiredRelay {
+	if resolveIfName == nil {
+		resolveIfName = func(s string) string { return s }
+	}
 	desired := make(map[string]desiredRelay)
 	if cfg == nil {
 		return desired
@@ -827,12 +902,18 @@ func computeDesired(cfg *config.DHCPRelayConfig) map[string]desiredRelay {
 					"interface", ifaceName, "group", group.Name)
 				continue
 			}
+			// The DESIRED-SET key stays the authored reference: it is the
+			// relay's identity everywhere (Apply diff, Stats, the #2456 HA
+			// gate). Only the bind target is resolved.
+			kernelName := resolveIfName(ifaceName)
 			desired[ifaceName] = desiredRelay{
-				ifaceName: ifaceName,
-				groupName: group.Name,
+				ifaceName:  ifaceName,
+				kernelName: kernelName,
+				groupName:  group.Name,
 				spec: relaySpec{
 					servers:         serverIPs,
 					alwaysBroadcast: group.AlwaysBroadcast,
+					kernelName:      kernelName,
 					maxHopCount:     group.MaximumHopCount,
 					trustOption82:   group.TrustOption82,
 					maxPacketRate:   group.MaximumPacketRate,
@@ -860,7 +941,7 @@ func computeDesired(cfg *config.DHCPRelayConfig) map[string]desiredRelay {
 // (#1915 close-on-cancel + WaitGroup join) fully close the old listener before
 // the replacement binds, so a restart never races EADDRINUSE and never hangs.
 func (m *Manager) Apply(ctx context.Context, cfg *config.DHCPRelayConfig) {
-	desired := computeDesired(cfg)
+	desired := computeDesired(cfg, m.ifNameResolver())
 
 	// Phase 1 (under lock): decide which running relays to stop and which
 	// desired relays to start, mutating m.relays to the post-reconcile set.
@@ -924,6 +1005,7 @@ func (m *Manager) Apply(ctx context.Context, cfg *config.DHCPRelayConfig) {
 		pendingCapacity, pendingClamped := pendingCapacityFor(rate)
 		ir := &interfaceRelay{
 			ifaceName:       d.ifaceName,
+			kernelName:      d.kernelName,
 			cancel:          cancel,
 			done:            make(chan struct{}),
 			spec:            d.spec,
@@ -1024,6 +1106,7 @@ func (m *Manager) Stats() []RelayStats {
 	for _, ir := range m.relays {
 		stats = append(stats, RelayStats{
 			Interface:                    ir.ifaceName,
+			KernelInterface:              ir.kernelName,
 			RequestsRelayed:              ir.requestsRelayed.Load(),
 			RepliesForwarded:             ir.repliesForwarded.Load(),
 			RequestsDroppedBackup:        ir.requestsDroppedBackup.Load(),
@@ -1155,7 +1238,17 @@ func (m *Manager) runRelay(ctx context.Context, cancel context.CancelFunc,
 //     Stop()-hang risk.
 func (m *Manager) runRelaySession(ctx context.Context,
 	ir *interfaceRelay, servers []*net.UDPAddr) sessionOutcome {
+	// ifaceName is the relay's IDENTITY (the authored config reference); it is
+	// what the #2456 HA master gate and every log line speak. bindName is the
+	// LINUX DEVICE (#9406) and is what every kernel call below must take —
+	// net.InterfaceByName and SO_BINDTODEVICE cannot find `ge-0/0/0.0`. Empty
+	// kernelName falls back to ifaceName so a Manager driven without a
+	// resolver behaves exactly as it did before #9406.
 	ifaceName := ir.ifaceName
+	bindName := ir.kernelName
+	if bindName == "" {
+		bindName = ifaceName
+	}
 
 	// Per-session context. Either the manager ctx (Stop), a loop's exit
 	// (cross-cancel), or the drift watcher cancels it.
@@ -1173,7 +1266,7 @@ func (m *Manager) runRelaySession(ctx context.Context,
 	// the interface every attempt so a dynamic interface recreated under the
 	// same name (new Index) is picked up, and so a not-yet-created interface
 	// does not permanently kill the relay.
-	giaddr, ok := m.resolveGIAddrWithRetry(sctx, ifaceName)
+	giaddr, ok := m.resolveGIAddrWithRetry(sctx, bindName)
 	if !ok {
 		return sessionStop // ctx cancelled during retry; nothing created yet.
 	}
@@ -1191,7 +1284,7 @@ func (m *Manager) runRelaySession(ctx context.Context,
 	// (it would panic at session startup). nil resolver → degraded baseline 0.
 	var boundIfindex int
 	if m.resolveIfindex != nil {
-		idx, ierr := m.resolveIfindex(ifaceName)
+		idx, ierr := m.resolveIfindex(bindName)
 		if ierr != nil {
 			slog.Warn("dhcp-relay: could not capture bound ifindex (drift detection degraded)",
 				"interface", ifaceName, "err", ierr)
@@ -1203,7 +1296,7 @@ func (m *Manager) runRelaySession(ctx context.Context,
 	// Client-facing listener: 0.0.0.0:67, REUSEPORT (coexist with other
 	// interfaces), SO_BINDTODEVICE (per-interface isolation under REUSEPORT),
 	// SO_BROADCAST (deliver broadcast OFFER/ACK to 255.255.255.255:68).
-	conn, err := m.newConn(sctx, ifaceName, true, true,
+	conn, err := m.newConn(sctx, bindName, true, true,
 		&net.UDPAddr{IP: net.IPv4zero, Port: relayPort})
 	if err != nil {
 		// #2787: a bind/listen failure is TRANSIENT, not terminal — the
@@ -1269,7 +1362,7 @@ func (m *Manager) runRelaySession(ctx context.Context,
 		slog.Info("dhcp-relay: overrides always-broadcast set, raw-L2 disabled",
 			"interface", ifaceName)
 	} else {
-		l2, err = m.newL2(ifaceName)
+		l2, err = m.newL2(bindName)
 		if err != nil {
 			slog.Warn("dhcp-relay: raw-L2 sender unavailable, "+
 				"flag-clear replies will broadcast",
@@ -1331,7 +1424,7 @@ func (m *Manager) runRelaySession(ctx context.Context,
 					return
 				case <-ticker.C:
 					// #2347: ifindex drift.
-					if live, lerr := m.resolveIfindex(ifaceName); lerr != nil {
+					if live, lerr := m.resolveIfindex(bindName); lerr != nil {
 						// Tolerant: keep the listener; this is not drift.
 						slog.Debug("dhcp-relay: ifindex re-resolve failed, keeping listener",
 							"interface", ifaceName, "err", lerr)
@@ -1358,7 +1451,7 @@ func (m *Manager) runRelaySession(ctx context.Context,
 					// address. Runs every tick regardless of the ifindex result
 					// (an address can change while the ifindex is stable).
 					if m.resolveGIAddr != nil {
-						if cur, gerr := m.resolveGIAddr(ifaceName); gerr != nil {
+						if cur, gerr := m.resolveGIAddr(bindName); gerr != nil {
 							// Tolerant: a momentary unaddressed window keeps the
 							// last-known-good giaddr rather than tearing down (and
 							// so never stamps a bogus giaddr).

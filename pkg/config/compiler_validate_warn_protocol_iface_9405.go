@@ -54,20 +54,7 @@ func validateProtocolInterfaceRefWarnings(cfg *Config) []string {
 		return nil
 	}
 
-	// Declared interfaces under BOTH spellings: the config key (`ge-0/0/1`)
-	// and its Linux form (`ge-0-0-1`). An operator who copied a name out of an
-	// operational surface wrote the dash form, and it is a legitimate way to
-	// author this leaf today (#8829).
-	declared := make(map[string]*InterfaceConfig, len(cfg.Interfaces.Interfaces)*2)
-	for name, ifc := range cfg.Interfaces.Interfaces {
-		if ifc == nil {
-			continue
-		}
-		declared[name] = ifc
-		if linux := LinuxIfName(name); linux != name {
-			declared[linux] = ifc
-		}
-	}
+	declared := declaredInterfaceIndex(cfg)
 
 	var warnings []string
 	for _, r := range refs {
@@ -79,39 +66,71 @@ func validateProtocolInterfaceRefWarnings(cfg *Config) []string {
 					"explicitly (#9405).", r.scope, r.proto))
 			continue
 		}
-		// An explicitly DECLARED name outranks a parse, even when it contains
-		// a dot — the same precedence resolveKernelIfNameWith applies (#8994).
-		if _, ok := declared[r.ref]; ok {
+		reason := unresolvedInterfaceRef(declared, r.ref)
+		if reason == "" {
 			continue
 		}
-		base, unitPart, dotted := strings.Cut(r.ref, ".")
-		ifc, ok := declared[base]
-		if !ok {
-			warnings = append(warnings, fmt.Sprintf(
-				"%s %s interface %s names no configured interface — the FRR "+
-					"stanza will bind nothing and no adjacency will form "+
-					"(#9405).", r.scope, r.proto, r.ref))
-			continue
-		}
-		if !dotted {
-			continue
-		}
-		unit, err := strconv.Atoi(unitPart)
-		if err != nil {
-			warnings = append(warnings, fmt.Sprintf(
-				"%s %s interface %s has an unparseable unit — the FRR stanza "+
-					"will bind nothing and no adjacency will form (#9405).",
-				r.scope, r.proto, r.ref))
-			continue
-		}
-		if u, ok := ifc.Units[unit]; !ok || u == nil {
-			warnings = append(warnings, fmt.Sprintf(
-				"%s %s interface %s names no configured unit on %s — the FRR "+
-					"stanza will bind nothing and no adjacency will form "+
-					"(#9405).", r.scope, r.proto, r.ref, base))
-		}
+		warnings = append(warnings, fmt.Sprintf(
+			"%s %s interface %s %s — the FRR stanza will bind nothing and no "+
+				"adjacency will form (#9405).", r.scope, r.proto, r.ref, reason))
 	}
 	return warnings
+}
+
+// declaredInterfaceIndex indexes the configured interfaces under BOTH spellings
+// this tree accepts: the config key (`ge-0/0/1`) and its Linux form
+// (`ge-0-0-1`). An operator who copied a name out of an operational surface
+// wrote the dash form, and it is a legitimate way to author an interface
+// reference today (#8829), so an index keyed on one spelling would report every
+// use of the other as undefined.
+//
+// It deliberately does NOT call ResolveKernelIfName per interface: that rebuilds
+// the tunnel-name map on every call, which makes a per-interface loop quadratic
+// on the tolerant compile — the regression
+// TestTunnelNameMapBuildsAreInputSizeIndependent8862 exists to catch, and did
+// catch, in the first draft of the #9405 pass.
+func declaredInterfaceIndex(cfg *Config) map[string]*InterfaceConfig {
+	declared := make(map[string]*InterfaceConfig, len(cfg.Interfaces.Interfaces)*2)
+	for name, ifc := range cfg.Interfaces.Interfaces {
+		if ifc == nil {
+			continue
+		}
+		declared[name] = ifc
+		if linux := LinuxIfName(name); linux != name {
+			declared[linux] = ifc
+		}
+	}
+	return declared
+}
+
+// unresolvedInterfaceRef reports WHY an interface reference names nothing in
+// the configured interface set, or "" when it names something. The returned
+// clause is a sentence fragment the caller completes with its own consequence,
+// so the two advisories that use it (#9405 protocol references, #9406 DHCP
+// relay members) stay worded consistently without sharing a consequence they do
+// not share.
+func unresolvedInterfaceRef(declared map[string]*InterfaceConfig, ref string) string {
+	// An explicitly DECLARED name outranks a parse, even when it contains a
+	// dot — the same precedence resolveKernelIfNameWith applies (#8994).
+	if _, ok := declared[ref]; ok {
+		return ""
+	}
+	base, unitPart, dotted := strings.Cut(ref, ".")
+	ifc, ok := declared[base]
+	if !ok {
+		return "names no configured interface"
+	}
+	if !dotted {
+		return ""
+	}
+	unit, err := strconv.Atoi(unitPart)
+	if err != nil {
+		return "has an unparseable unit"
+	}
+	if u, ok := ifc.Units[unit]; !ok || u == nil {
+		return "names no configured unit on " + base
+	}
+	return ""
 }
 
 // protocolIfaceRef is one authored routing-protocol interface reference, with

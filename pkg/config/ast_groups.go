@@ -746,21 +746,33 @@ func leafListCarriesRange(n *Node) bool {
 // keysContainWildcard returns true if any key is the Junos wildcard "<*>".
 func keysContainWildcard(keys []string) bool {
 	for _, k := range keys {
-		if k == "<*>" {
+		// #9423: ANY `<...>`-shaped key, not only the bare `<*>`. Recognising
+		// only `<*>` sent `<ge-*>` down the ordinary container path, where a
+		// key with no destination is ADOPTED — the compiled config gained an
+		// interface literally named `<ge-*>`. Taking the wildcard branch is
+		// what makes a non-matching pattern apply nothing instead.
+		if _, ok := groupKeyPattern(k); ok {
 			return true
 		}
 	}
 	return false
 }
 
-// keysMatchWildcard checks if dst keys match src keys where "<*>" matches
-// any value. Both slices must have the same length.
+// keysMatchWildcard checks if dst keys match src keys, where a `<...>` src key
+// is a glob PATTERN matched against the dst key (#9423; `<*>` is the universal
+// case of it). Both slices must have the same length.
 func keysMatchWildcard(dst, src []string) bool {
 	if len(dst) != len(src) {
 		return false
 	}
 	for i := range src {
-		if src[i] != "<*>" && src[i] != dst[i] {
+		if pat, ok := groupKeyPattern(src[i]); ok {
+			if !globMatch(pat, dst[i]) {
+				return false
+			}
+			continue
+		}
+		if src[i] != dst[i] {
 			return false
 		}
 	}

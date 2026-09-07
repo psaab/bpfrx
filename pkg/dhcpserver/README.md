@@ -880,8 +880,22 @@ canonical config:
   trailing `.0` (untagged unit) on BOTH sides of the compare
   (`stripUntaggedUnitSuffix`) AND keeps the normalized bare member in the kept
   set — `ge-0-0-1` is the real kernel device Kea binds to; `ge-0-0-1.0` is not a
-  device. A TAGGED unit (`reth1.100` → `ge-0-0-1.100`) is left intact and still
-  matches only its VLAN member.
+  device.
+
+  **#9407 corrected the tagged half of this note, which was wrong.** It used to
+  read "a TAGGED unit (`reth1.100` → `ge-0-0-1.100`) is left intact and still
+  matches only its VLAN member". It did not match anything.
+  `rethInterfacesMatchingRG` has always emitted `<member>.<vlan-id>`, while
+  `resolveDHCPRethInterfaces` emitted `<member>.<unit-number>` — the two
+  coincide only when the operator numbers the unit after the VLAN. Measured on
+  `unit 80 { vlan-id 180; }`: the RG side produced `ge-0-0-1.180`, the Kea side
+  `ge-0-0-1.80`, so the compare missed BOTH `masterIfaces` and `rgScoped`, and
+  the filter's #6520 "not RG-scoped implies node-local, always keep" arm kept
+  the group **on a node mastering nothing** — the opposite of BUG A's symptom,
+  from the same mismatch. `resolveDHCPRethInterfaces` now uses
+  `Config.ResolveKernelIfName`, which owns the `.<vlan-id>` arm, so both sides
+  derive the same name. `stripUntaggedUnitSuffix` stays as a belt; for a
+  declared unit it is now a no-op.
 - **BUG B — runtime knob-flip was a silent no-op.** The `#2239` lease-sync push
   loop (`runDHCPLeaseSyncLoop`) was launched ONLY from the cluster
   connect-time block, gated on the knob at connect. A runtime `set chassis

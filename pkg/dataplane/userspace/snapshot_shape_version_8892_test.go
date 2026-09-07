@@ -108,14 +108,36 @@ func shapeDigest8892(t *testing.T) (string, int) {
 // observe it, and bumping the protocol for it would spend the one signal that
 // says the wire really changed.
 //
+// v10 STANDS (issue 9424): `InterfacesConfig.MalformedAddresses` was added to
+// the typed config, and ConfigSnapshot embeds the whole Config, so it moved
+// this digest for the same reason HasPreference and MalformedZonePairs did.
+// Same arm, same answer: it is tagged `json:"-"`, it is a COMPILE-TIME
+// DIAGNOSTIC recording a token inside a bracketed interface address list that
+// is neither a valid address for its family nor an `address` sub-statement, and
+// it is nil in every valid config. Nothing transmits it, so no helper of any
+// vintage can observe it, and bumping the protocol for it would spend the one
+// signal that says the wire really changed.
+//
 // Recorded here rather than only in a commit message because this is now the
-// THIRD field to reach this cell by embedding, and the third to need the same
-// paragraph. The general rule the three share: a field added to ANY pkg/config
+// FOURTH field to reach this cell by embedding, and the fourth to need the same
+// paragraph. The general rule the four share: a field added to ANY pkg/config
 // struct lands on the helper wire via ConfigSnapshot, so it is answerable to
 // this cell whether or not the author was thinking about the helper -- and the
 // gate that catches it is `go test ./...`, not the packages the diff touched.
+// #9424 is the case in point: its change is entirely inside pkg/config and
+// pkg/configstore, and a scoped run over those two packages is green.
+//
+// v10 -> v11 (issue 9425): `ScreenMissingProfileRef.alarm_without_drop`. This
+// one is the OTHER arm — a real, transmitted wire field, so the version moved.
+// A zone whose screen profile is DEFINED but enables no check gets no `screens`
+// entry, so the helper's resolved `alarm_without_drop` lookup missed and the
+// #7888 substituted conservative default HARD-DROPPED. An old helper that
+// ignores the new field decodes false and keeps hard-dropping, and hard-dropping
+// IS the defect — so the answer to "is what it enforced before acceptable?" is
+// no. "Purely additive needs no bump" is a TRUE rule that would have licensed
+// exactly this regression, which is what this cell exists to refuse.
 const (
-	snapshotShapeGolden8892  = "2d484660b1ab90528770d0f7f72987c5731027e0a5c9eed380364af383477e82"
+	snapshotShapeGolden8892  = "92ea9bf2dcc354b6510cd85d004cd812d560c48e40a3c4f5f6ed5aeeaec8298c"
 	snapshotShapeVersion8892 = 11
 )
 
