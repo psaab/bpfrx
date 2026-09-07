@@ -142,6 +142,14 @@ func (d *Daemon) assembleFRRConfig(cfg *config.Config, overlay []config.RouteOve
 		IPv6NextHopInterfaces: inferIPv6StaticNextHopInterfaces(cfg, overlay),
 		ClusterMode:           d.cluster != nil,
 		PreferredRoutes:       overlay,
+		// #9405: protocol interface references are stored as the AUTHORED
+		// Junos reference (`ge-0/0/1.0`, `reth0.50`). The FRR renderer wrote
+		// them verbatim, so `interface ge-0/0/1.0` never bound a netdev and no
+		// OSPF/OSPFv3/IS-IS/RIP adjacency formed — on a commit that succeeded
+		// with no warning. ResolveKernelIfName is the canonical resolver the
+		// RA path already uses (daemon_ra.go), so the two protocol consumers
+		// name the same device.
+		IfNameResolver: cfg.ResolveKernelIfName,
 	}
 	for _, ri := range cfg.RoutingInstances {
 		vrfName := "vrf-" + ri.Name

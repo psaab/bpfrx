@@ -1210,6 +1210,35 @@ groups {
 }
 ```
 
+**xpf implementation (#9423).** A group key of the form `<pattern>` is matched
+as a glob against the instance name, so a PARTIAL wildcard selects a subset:
+
+```
+groups { uplinks { interfaces { <ge-*> { description UPLINK; } } } }
+```
+
+`*` matches any run of characters **including `/`**, which is required because
+every interface name here contains one (`ge-0/0/0`). `?` is not supported and
+cannot be authored — the lexer rejects it (`unexpected character: ?`). A `[...]`
+character class survives lexing as part of the token and is matched literally,
+so it selects nothing rather than mis-selecting.
+
+**A pattern that matches nothing applies nothing.** Before #9423 only the exact
+token `<*>` was recognised as a wildcard, so `<ge-*>` took the ordinary
+container path, found no destination with that literal name, and was **adopted
+as a new instance**: the compiled config gained an interface literally named
+`<ge-*>` carrying the group's content, while the real interface got none of it.
+That mattered beyond the template not applying — xpfd owns every interface on
+the box and reconciles the configured set against the kernel, and a zone or
+policy can reference the phantom by name.
+
+The channels disagreed about it by SLOT, not by pattern: `configstore.CheckText`
+refused the interfaces case only because the typed interface-name validator
+rejects `<` as a name character, while a `security-zone <tr*>` phantom reached
+the operator commit path with zero warnings. Recognising every `<...>`-shaped
+key as a wildcard removes the phantom by construction — that branch merges into
+each matching destination and never appends.
+
 ### 7.5 Rollback History
 
 The `compare rollback` completion shows full commit history with timestamps,

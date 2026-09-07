@@ -464,7 +464,7 @@ func TestNextTableRulesApply_Fake(t *testing.T) {
 		{Name: "dmz-vr", TableID: 101},
 	}
 
-	if err := nt.Apply(routes, instances); err != nil {
+	if err := nt.Apply(routes, instances, testNextTableIifs); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 
@@ -503,7 +503,7 @@ func TestNextTableApplyAggregatesAddErrors(t *testing.T) {
 	ops := newFakeRuleOps()
 	ops.addErr = errors.New("netlink ENOBUFS")
 	nt := &nextTableManager{ops: ops}
-	if err := nt.Apply(routes, instances); err == nil {
+	if err := nt.Apply(routes, instances, testNextTableIifs); err == nil {
 		t.Fatal("Apply must return a non-nil error when RuleAdd fails (#3731)")
 	}
 	if ops.count(unix.AF_INET) != 0 || ops.count(unix.AF_INET6) != 0 {
@@ -517,7 +517,7 @@ func TestNextTableApplyAggregatesAddErrors(t *testing.T) {
 	ops2 := newFakeRuleOps()
 	ops2.failAdd(unix.AF_INET, errors.New("netlink EPERM on v4"))
 	nt2 := &nextTableManager{ops: ops2}
-	if err := nt2.Apply(routes, instances); err == nil {
+	if err := nt2.Apply(routes, instances, testNextTableIifs); err == nil {
 		t.Fatal("Apply must return non-nil when the v4 add fails (#3731)")
 	}
 	if ops2.count(unix.AF_INET) != 0 {
@@ -543,13 +543,13 @@ func TestNextTableApplyIdempotentReapply(t *testing.T) {
 	}
 	instances := []*config.RoutingInstanceConfig{{Name: "dmz-vr", TableID: 101}}
 
-	if err := nt.Apply(routes, instances); err != nil {
+	if err := nt.Apply(routes, instances, testNextTableIifs); err != nil {
 		t.Fatalf("clean Apply must return nil, got %v", err)
 	}
 	if got := ops.count(unix.AF_INET) + ops.count(unix.AF_INET6); got != 2 {
 		t.Fatalf("expected 2 rules after clean apply, got %d", got)
 	}
-	if err := nt.Apply(routes, instances); err != nil {
+	if err := nt.Apply(routes, instances, testNextTableIifs); err != nil {
 		t.Fatalf("idempotent re-apply must return nil, got %v", err)
 	}
 	if got := ops.count(unix.AF_INET) + ops.count(unix.AF_INET6); got != 2 {
@@ -581,7 +581,7 @@ func TestNextTableRulesPriorityCap(t *testing.T) {
 	t.Run("at-limit", func(t *testing.T) {
 		ops := newFakeRuleOps()
 		nt := &nextTableManager{ops: ops}
-		if err := nt.Apply(mkRoutes(config.NextTableRuleWindow), instances); err != nil {
+		if err := nt.Apply(mkRoutes(config.NextTableRuleWindow), instances, testNextTableIifs); err != nil {
 			t.Fatalf("Apply: %v", err)
 		}
 		total := ops.count(unix.AF_INET) + ops.count(unix.AF_INET6)
@@ -598,7 +598,7 @@ func TestNextTableRulesPriorityCap(t *testing.T) {
 		ops := newFakeRuleOps()
 		nt := &nextTableManager{ops: ops}
 		over := config.NextTableRuleWindow + 50
-		if err := nt.Apply(mkRoutes(over), instances); err == nil {
+		if err := nt.Apply(mkRoutes(over), instances, testNextTableIifs); err == nil {
 			t.Fatal("over-limit Apply must return a degraded error naming the cap (#6467)")
 		}
 		total := ops.count(unix.AF_INET) + ops.count(unix.AF_INET6)
@@ -611,7 +611,7 @@ func TestNextTableRulesPriorityCap(t *testing.T) {
 		// clear()'s window, so clear-then-add keeps the count stable. A
 		// leaked rule at prio >= the window top would survive clear() and grow
 		// the set. The degraded error still surfaces on every over-limit apply.
-		if err := nt.Apply(mkRoutes(over), instances); err == nil {
+		if err := nt.Apply(mkRoutes(over), instances, testNextTableIifs); err == nil {
 			t.Fatal("re-apply over-limit must still surface the degraded error (#6467)")
 		}
 		total = ops.count(unix.AF_INET) + ops.count(unix.AF_INET6)
@@ -884,7 +884,7 @@ func TestNextTableRibGroupClearDelFailureSurfaced(t *testing.T) {
 			prio: nextTableRulePriority + 3,
 			run: func(ops *fakeRuleOps) error {
 				// nil routes → no re-adds; the only activity is clear().
-				return (&nextTableManager{ops: ops}).Apply(nil, nil)
+				return (&nextTableManager{ops: ops}).Apply(nil, nil, testNextTableIifs)
 			},
 		},
 		{
@@ -928,7 +928,7 @@ func TestNextTableRibGroupClearDelNotFoundIdempotent(t *testing.T) {
 			name: "next-table",
 			prio: nextTableRulePriority + 4,
 			run: func(ops *fakeRuleOps) error {
-				return (&nextTableManager{ops: ops}).Apply(nil, nil)
+				return (&nextTableManager{ops: ops}).Apply(nil, nil, testNextTableIifs)
 			},
 		},
 		{
@@ -1004,7 +1004,7 @@ func TestRulesClearListErrorSurfaced(t *testing.T) {
 				nt := &nextTableManager{ops: ops}
 				// No routes carry a next-table directive → no re-adds; the
 				// only work clear() does is delete-in-window.
-				return nt.Apply(nil, nil)
+				return nt.Apply(nil, nil, testNextTableIifs)
 			},
 		},
 		{
@@ -1106,3 +1106,10 @@ func TestPBRApplyRoutesDSCPThroughRuleAddDSCP7796(t *testing.T) {
 		t.Errorf("expected 3 installed IPv4 rules total, got %d", total)
 	}
 }
+
+// testNextTableIifs is the #9420 ingress-scoping set the pre-#9420 next-table
+// cells are re-anchored on: exactly ONE default-instance ingress interface, so
+// each leak still costs exactly one ip rule and every priority / count / cap
+// assertion those cells make is preserved verbatim. The scoping itself is
+// exercised by TestNextTableRulesIngressScope_9420 in rules_9420_test.go.
+var testNextTableIifs = []string{"ge-0-0-0"}

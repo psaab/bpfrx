@@ -1625,6 +1625,10 @@ func ValidateConfig(cfg *Config) []string {
 	warnings = append(warnings, validateContentFreeSystemLoginWarnings(cfg)...)
 
 	warnings = append(warnings, validateRibGroupLeakWarnings(cfg)...)
+
+	// #9405: a routing-protocol interface reference that names no configured
+	// interface renders an FRR stanza that binds nothing, silently.
+	warnings = append(warnings, validateProtocolInterfaceRefWarnings(cfg)...)
 	// #7512: a `routing-options rib <name>` the compiler does not implement
 	// discarded its static routes. Warn rather than reject — see
 	// validateUnhandledRibWarnings for the #1960 reasoning.
@@ -1769,6 +1773,16 @@ func ValidateConfig(cfg *Config) []string {
 
 	// #4309 (fable-review-167 I-4): DHCP relay overrides accepted-only advisory.
 	warnings = append(warnings, validateDHCPRelayParityWarnings(cfg)...)
+
+	// #9406: a relay group member that names no configured interface or unit
+	// binds nothing, and the runtime cannot say so — it retries forever and
+	// reports as a started service with all-zero counters.
+	warnings = append(warnings, validateDHCPRelayInterfaceRefWarnings(cfg)...)
+
+	// #9407: the same class one service over. A DHCP-SERVER group member whose
+	// unit is undeclared is the one case the kernel-name resolver cannot
+	// resolve, so it is the one case that has to be said out loud.
+	warnings = append(warnings, validateDHCPServerInterfaceRefWarnings(cfg)...)
 
 	// #4455 (HI-1): a zone that admits a multicast routing protocol relies on the
 	// kernel input-chain `policy accept` fall-through to deliver that protocol's

@@ -294,6 +294,76 @@ appear in the measured `testdata/compact_block_divergences_2419.txt` inventory,
 and a valueless boolean flag cannot appear there at all — which is issue 9056's
 whole finding. 9056 owns that general class (83 sites) and is not closed by this.
 
+### Bracketed lists: when to ACCUMULATE and when to REFUSE (9424)
+
+The lexer strips `[`/`]`, so a bracketed list collapses onto ONE leaf's `Keys`
+in the hierarchical shape and into a CHAIN in the flat-set shape, and a reader
+taking `Keys[1]` alone keeps the first element and drops the rest. That is the
+#2419 class. Four members of it are now closed, and they did NOT all get the
+same remedy — the choice is not a matter of taste:
+
+| issue | site | remedy |
+|---|---|---|
+| #8794 | `security-zone [ a b ]` | REFUSE |
+| #9246 | policy `to-zone [ a b ]` | REFUSE |
+| #8810 | `device-map interface [ a b ]` | REFUSE |
+| #9424 | `family inet address [ a b ]` | **ACCUMULATE** |
+
+**The rule: REFUSE when expanding would invent a semantics the platform does
+not have; ACCUMULATE when the bracket is a spelling of something the platform
+already supports.** A policy name living in several zone-pair contexts, or one
+device mapped twice, is undefined — there is no correct expansion to write. A
+logical unit with two addresses is ordinary, and the two-separate-stanzas
+spelling compiles exactly it, which is both the argument for accumulating and
+the positive control that keeps the cell honest.
+
+**Accumulating needs a discriminator, because the packed shape is AMBIGUOUS
+with the brace-elided sub-statement spelling.** These parse identically:
+
+```
+address 10.0.0.1/24 10.0.0.2/24;   a bracketed list  -> two ADDRESSES
+address 10.0.0.1/24 primary;       an elided body    -> one address + a flag
+```
+
+so a detector keyed on "the node carries extra `Keys`" refuses the legal
+spelling too — the false-positive shape #9246 hit twice. Take the discriminator
+from the **schema**, never from a hand-written keyword list: a trailing token is
+a VALUE if the node's own `keyValidator` accepts it, a SUB-STATEMENT if it names
+a declared child, and MALFORMED otherwise.
+
+**And stop at the first sub-statement keyword.** Everything after one is that
+sub-statement's body, not more list elements. `address 10.0.0.1/24 vrrp-group 1
+virtual-address 10.0.0.100/24;` is a VRRP stanza whose tail is token-for-token
+indistinguishable from a list: without the stop, `1` classifies as malformed
+(so a config an earlier binary accepted starts failing at commit) and
+`10.0.0.100/24` classifies as an address — the VIP installed on the interface as
+a real address. That was caught by the repo's own #8662 drop-shape census
+flipping two sites from `empty` to `partial`, **not** by any cell written for
+the issue: a guard that scans by CONTENT sees what per-issue cells cannot, which
+is why a `pkg/config` change is validated with `go test ./...` and never a
+package list.
+
+**The malformed arm is not optional.** The typed-leaf gate validates only the
+FIRST key slot of a multi-value leaf, so accumulating the valid extras while
+ignoring the invalid ones turns one silent drop into another — and the second is
+worse, because the config now looks complete. Record the bad token on the
+compiled struct (`json:"-"`, it is a diagnostic and would otherwise perturb
+every golden) and refuse it in a strict gate with the #1960 lenient downgrade,
+the same shape as `ScreenProfile.UnknownLeaves` and
+`SecurityConfig.MalformedZonePairs`.
+
+**Watch the flat shape's nesting: it is not uniform.** `SetPath` does not nest a
+three-element list three deep. The second element has no schema children, so it
+ABSORBS the third onto its own `Keys`:
+
+```
+[ a b ]      ->  [address a] > [b]
+[ a b c ]    ->  [address a] > [b c]
+```
+
+A chain walk that reads only each link's `Keys[0]` recovers `b` and loses `c` —
+the #2419 defect reintroduced by the #2419 fix. Read `Keys[1:]` at every link.
+
 ### Which flat runs an operator can actually COMMIT (8939)
 
 A compiler that drops the tail of a flat run is a defect at every container, but
@@ -4145,6 +4215,13 @@ it is legitimate body content (`system-services` / `protocols`, derived from
 anywhere in the hierarchy — `apply-groups-except` and `apply-macro` survive group
 expansion as live nodes, so reading one as a member would false-reject a
 legitimate config.
+
+`apply-groups-except` surviving expansion is not the same as being ignored:
+since #9422 the expander CONSULTS it (`mergeNodes` skips a group's contribution
+at any destination level carrying the statement) and then deliberately leaves the
+node in the tree, because it has no compiled meaning of its own. Keeping it is
+what preserves the skip lists above as the thing that stops it being read as a
+member — a strip would make their fixtures vacuous rather than safe.
 
 
 `compileZones` iterated `prop.Children`, so every compact spelling ran the loop

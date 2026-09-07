@@ -21,6 +21,11 @@ to the interface name.
 - `SetMasterGate(g)` — `relay.go`. Installs the per-interface HA master-state
   gate (#2456); the daemon passes `Daemon.relayMasterGateOpen`. nil = always
   relay (standalone). Read per packet, so failover is followed live.
+- `SetIfNameResolver(fn)` — `relay.go`. Installs the authored-reference →
+  Linux-device resolver the desired-set builder uses (#9406); the daemon passes
+  `Config.ResolveKernelIfName` for the config being applied, immediately before
+  `Apply`. nil = identity (the pre-#9406 behaviour). See "Interface identity vs
+  bind name" below.
 
 ## Callers
 
@@ -31,6 +36,59 @@ to the interface name.
 `pkg/config`, `github.com/insomniacslk/dhcp`, and `golang.org/x/sys/unix`
 (the last for the AF_PACKET raw-L2 reply socket — see "Reply delivery
 model" below). No dependency on other `pkg/*` packages.
+
+## Interface identity vs bind name (#9406)
+
+A relay carries **two** interface names and they are not interchangeable.
+
+| | value | who reads it |
+|---|---|---|
+| `ifaceName` | the AUTHORED config reference — `ge-0/0/0.0`, `reth0.0` | the #2348 `Apply` diff key, the `RelayStats` row, `shouldRelay`/the #2456 master gate, and `pkg/daemon`'s `relayInterfaceRG`, which parses it as a **Junos unit ref** to find the owning redundancy group |
+| `kernelName` | the LINUX DEVICE — `ge-0-0-0`, `ge-0-0-0.180`, `ge-0-0-2` | `SO_BINDTODEVICE`, the giaddr address lookup, the #2347 ifindex drift check, the #2076 raw-L2 sender |
+
+Before #9406 there was only the first, and it was used for both. Linux
+`dev_valid_name()` forbids `/`, and a Junos unit suffix is not a device, so
+under the canonical spelling `net.InterfaceByName("ge-0/0/0.0")` failed: **no
+listener bound, no giaddr resolved, nothing was relayed** — on a commit that
+`configstore.CheckText`, `CompileConfig`, `CompileConfigLenient` and
+`SchemaValidate` all ACCEPT. The relay schema leaf is free-form (`args:1,
+multi:true`, no `valueType`, no `validator`), and every relay test used the
+dash form, so the defect lived exactly in the untested compiler-spelling →
+runtime-bind seam.
+
+This is the **#4049 class** — the same silent name mismatch fixed for LLDP —
+but **not the #4049 remedy**. LLDP references are physical interfaces, so
+`config.LinuxIfName` (slash→dash) sufficed there. A relay member is a LOGICAL
+interface, and `LinuxIfName("ge-0/0/0.0")` is `ge-0-0-0.0`, which is still not
+a device. The relay needs the canonical resolver's other two arms:
+
+```
+LinuxIfName("ge-0/0/0.0")          = "ge-0-0-0.0"    <- still not a device
+ResolveKernelIfName("ge-0/0/0.0")  = "ge-0-0-0"      <- unit-0 collapse
+ResolveKernelIfName("ge-0/0/0.80") = "ge-0-0-0.180"  <- .<vlan-id>, not .80
+ResolveKernelIfName("reth0.0")     = "<local member>"
+```
+
+**Why the identity is not simply replaced by the kernel name.** It is the
+tempting one-line fix and it silently breaks HA. `relayInterfaceRG`
+(`pkg/daemon/daemon_dhcp.go`) strips the unit suffix and looks the base up in
+`cfg.Interfaces.Interfaces` — a map keyed by the AUTHORED name. A kernel name
+is not a key there, so every RETH-owned segment would resolve to RG 0, the
+#2456 gate would read "not RG-owned → always relay", and **both** cluster nodes
+would relay the same client broadcast upstream with different giaddrs.
+
+`kernelName` is part of `relaySpec`, not a cached lookup beside it: retagging a
+unit's `vlan-id`, or repointing a RETH at a different local member, changes the
+device to bind without changing any other field, and `relaySpec.equal` is the
+only thing that decides whether the reconcile rebinds.
+
+`show services dhcp relay` prints the bound device beside the configured
+interface. That is not cosmetic: every counter in `RelayStats` is a forwarding
+counter, so a relay bound to nothing shows an all-zero row that is
+indistinguishable from an idle segment — which is how this stayed invisible.
+`config.validateDHCPRelayInterfaceRefWarnings` closes the other half at commit,
+warning when a member names no configured interface or unit. Advisory, not a
+gate, per #1960.
 
 ## Relayed client message types
 

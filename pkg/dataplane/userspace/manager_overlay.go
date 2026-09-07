@@ -2,9 +2,11 @@ package userspace
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sort"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -313,16 +315,34 @@ func routeOnlyPublishHybrid(cfg, applied *config.Config) bool {
 //     DeepEqual compares them. These are derived from exported fields, so the
 //     coarsening is benign (arguably more correct).
 //
-// This coarsening is SAFE and correct for THIS guard: routeOnlyPublishHybrid
-// governs only what the helper's route-overlay snapshot contains, and the helper
-// ALWAYS receives the redacted JSON encoding (process_control.go) — it never sees
-// raw secrets. A secret-only change is therefore invisible to the snapshot the
-// helper gets, so it genuinely is NOT a route-overlay hybrid (the former
-// DeepEqual was over-strict, refusing a publish over a change the helper could
-// not observe). Secret-bearing subsystems (strongSwan/FRR/vrrp/cluster) apply on
-// separate paths, and the recorded appliedSnapshot.Config self-heals on the next
-// full apply. Do NOT restore this to a claim of full semantic preservation on
-// this fail-closed guard.
+// This coarsening is SAFE for every secret the helper CANNOT see, and #9161
+// found the exception.
+//
+// The paragraph that stood here said the helper "ALWAYS receives the redacted
+// JSON encoding — it never sees raw secrets", and listed strongSwan / FRR / vrrp
+// / cluster as the secret-bearing subsystems that apply on separate paths.
+// **WireGuard is not on that list and does not apply on a separate path.**
+// `protocol_tunnels.go` declares `WgLocalPrivkeyHex` and `WgPresharedKeyHex` as
+// PLAIN strings with json tags, and `tunnels.go` fills them with `.Reveal()` —
+// so the helper receives raw WireGuard key material in the very snapshot this
+// guard governs.
+//
+// The consequence was that an operator's key ROTATION compared EQUAL here: the
+// #5680 refusal did not fire, the snapshot was marked applied carrying the OLD
+// keys, and the operator was told the rotation had landed while the tunnel ran
+// on the previous material.
+//
+// The rest of the original reasoning stands and is deliberately preserved: the
+// former DeepEqual was over-strict, and a secret-only change the helper cannot
+// observe genuinely is NOT a route-overlay hybrid. So this is NOT a return to
+// full semantic preservation — the redacted marshal still does the coarsening it
+// was chosen for, and only the secrets that DEMONSTRABLY reach the helper are
+// added back, via `helperVisibleSecretDigest9161`.
+//
+// Do NOT restore this to a claim of full semantic preservation on this
+// fail-closed guard, and do NOT widen the digest to secrets the helper does not
+// receive — either change re-creates the over-strictness this coarsening exists
+// to avoid.
 //
 // A marshal error is never observed in practice — the very same object is
 // marshaled to the helper on each apply — but if one occurred we cannot prove
@@ -337,5 +357,47 @@ func configsContentEqual(a, b *config.Config) bool {
 	if err != nil {
 		return false
 	}
-	return bytes.Equal(ab, bb)
+	if !bytes.Equal(ab, bb) {
+		return false
+	}
+	// #9161: the redacted marshal cannot see a secret the helper CAN see.
+	return helperVisibleSecretDigest9161(a) == helperVisibleSecretDigest9161(b)
+}
+
+// helperVisibleSecretDigest9161 digests exactly the secret material that reaches
+// the helper, so a rotation of it is visible to configsContentEqual.
+//
+// Scoped to WireGuard on purpose: those are the only secrets `tunnels.go`
+// `.Reveal()`s into the snapshot the helper receives. Secrets belonging to
+// strongSwan, FRR, vrrp and cluster apply on separate paths and stay invisible
+// here, which is the coarsening this guard was designed around.
+//
+// It enumerates through `config.EmitTunnelEndpointNames` — the SAME enumerator
+// the snapshot builder uses — rather than walking the interface map itself, so
+// the set it digests cannot drift from the set the helper is sent. A second
+// traversal would be a second definition of "which tunnels exist".
+//
+// Peers are sorted by public key before hashing, matching the snapshot builder's
+// own sort, so two configs that differ only in authoring order digest equal.
+// Without that this guard would report a difference for a reordering the helper
+// cannot observe — the over-strictness the redacted marshal exists to avoid.
+func helperVisibleSecretDigest9161(cfg *config.Config) [sha256.Size]byte {
+	h := sha256.New()
+	for _, ep := range config.EmitTunnelEndpointNames(cfg) {
+		if ep.Tunnel == nil {
+			continue
+		}
+		fmt.Fprintf(h, "t:%s:%s\n", ep.Name, ep.Tunnel.WgLocalPrivkeyHex.Reveal())
+		peers := make([]config.WgPeerConfig, len(ep.Tunnel.WgPeers))
+		copy(peers, ep.Tunnel.WgPeers)
+		sort.Slice(peers, func(i, j int) bool {
+			return peers[i].PublicKeyHex < peers[j].PublicKeyHex
+		})
+		for _, p := range peers {
+			fmt.Fprintf(h, "p:%s:%s\n", p.PublicKeyHex, p.PresharedKeyHex.Reveal())
+		}
+	}
+	var out [sha256.Size]byte
+	copy(out[:], h.Sum(nil))
+	return out
 }

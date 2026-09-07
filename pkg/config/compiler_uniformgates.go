@@ -65,5 +65,14 @@ func runUniformGates(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 	if err := runUniformGatesRoutingRibRPM(tree, cfg, opts); err != nil {
 		return err
 	}
+	// #9424: appended at the END of the phase deliberately. The source order of
+	// the gates is observable — on the strict path the FIRST failing gate wins
+	// the returned error slot (invariant #6) — so a NEW gate inserted between
+	// existing ones would change which error an operator is shown for a config
+	// that trips two. Last means it can only claim the slot when nothing else
+	// failed.
+	if err := runUniformGatesInterfaceAddr(tree, cfg, opts); err != nil {
+		return err
+	}
 	return nil
 }

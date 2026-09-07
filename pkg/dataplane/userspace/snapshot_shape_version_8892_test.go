@@ -108,19 +108,27 @@ func shapeDigest8892(t *testing.T) (string, int) {
 // observe it, and bumping the protocol for it would spend the one signal that
 // says the wire really changed.
 //
-// Recorded here rather than only in a commit message because this is now the
-// THIRD field to reach this cell by embedding, and the third to need the same
-// paragraph. The general rule the three share: a field added to ANY pkg/config
-// struct lands on the helper wire via ConfigSnapshot, so it is answerable to
-// this cell whether or not the author was thinking about the helper -- and the
-// gate that catches it is `go test ./...`, not the packages the diff touched.
+// v10 STANDS (issue 9424): `InterfacesConfig.MalformedAddresses` was added to
+// the typed config, and ConfigSnapshot embeds the whole Config, so it moved
+// this digest for the same reason HasPreference and MalformedZonePairs did.
+// Same arm, same answer: it is tagged `json:"-"`, it is a COMPILE-TIME
+// DIAGNOSTIC recording a token inside a bracketed interface address list that
+// is neither a valid address for its family nor an `address` sub-statement, and
+// it is nil in every valid config. Nothing transmits it, so no helper of any
+// vintage can observe it, and bumping the protocol for it would spend the one
+// signal that says the wire really changed.
+//
 // v10 STANDS (issue 9408): `OSPFConfig.ReferenceBandwidth` was RENAMED to
-// `ReferenceBandwidthMbps` so the compiled field carries the unit that separates
-// the Junos leaf (bits/s) from the FRR directive it feeds (Mbps). A rename is a
-// stronger change than the two additions above -- the field has NO json tag, so
-// its Go name IS its wire key, and an old helper looking for the old key would
-// find nothing. It is nonetheless invisible to every helper, and this was
-// MEASURED rather than assumed:
+// `ReferenceBandwidthMbps`, so the compiled field carries the unit that
+// separates the Junos leaf (bits per second) from the FRR directive it feeds
+// (megabits per second).
+//
+// THIS ONE IS NOT LIKE THE THREE ABOVE, and the difference is why it is
+// spelled out rather than pointed at them. Those were ADDITIONS of `json:"-"`
+// fields -- nothing transmits them, so the reasoning is one sentence. This is a
+// RENAME of a field with NO json tag, which means its Go name IS its wire key:
+// an old helper looking for the old key would find nothing, which is the shape
+// this cell exists to refuse. So the invisibility was MEASURED, not argued:
 //
 //   - the Rust side models this whole subtree as ONE opaque value --
 //     `pub config: serde_json::Value` in userspace-dp/src/protocol/snapshot.rs.
@@ -129,14 +137,24 @@ func shapeDigest8892(t *testing.T) (string, int) {
 //   - `grep -rn "reference_bandwidth\|ReferenceBandwidth" userspace-dp/src/`
 //     returns ZERO hits. Nothing in the dataplane reads it, of any vintage;
 //   - the field's only consumer is pkg/frr, which renders the FRR managed
-//     section Go-side. Every Go reader is compiler-checked by the rename.
+//     section Go-side, and every Go reader is compiler-checked by the rename.
 //
-// So bumping ProtocolVersion here would make a mixed-base pair REFUSE to apply
-// any snapshot (the handler gates on exact equality) in exchange for a wire
-// change no helper can observe -- spending the one signal that says the wire
-// really moved. Fourth field to reach this cell, third to take this arm.
+// Bumping ProtocolVersion here would make a mixed-base pair REFUSE to apply any
+// snapshot (the handler gates on exact equality) in exchange for a wire change
+// no helper can observe -- spending the one signal that says the wire really
+// moved.
+//
+// Recorded here rather than only in a commit message because this is now the
+// FIFTH field to reach this cell by embedding, and the fifth to need the same
+// paragraph. The general rule the five share: a field added to -- or renamed
+// in -- ANY pkg/config struct lands on the helper wire via ConfigSnapshot, so
+// it is answerable to this cell whether or not the author was thinking about
+// the helper -- and the gate that catches it is `go test ./...`, not the
+// packages the diff touched. #9424 and #9408 are both cases in point: #9424 is
+// entirely inside pkg/config and pkg/configstore, #9408 inside pkg/config and
+// pkg/frr, and a scoped run over either diff's own packages is green.
 const (
-	snapshotShapeGolden8892  = "59c6b4651bd205a117ee01fd333b2011af38c79117ee2d0c8cbc84ca286a2347"
+	snapshotShapeGolden8892  = "c6d969f03e0f3204838bae8c80d0f82be34e202fee469b1dad76ff167a3aebca"
 	snapshotShapeVersion8892 = 10
 )
 

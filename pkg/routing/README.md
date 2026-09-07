@@ -364,6 +364,53 @@ delegate to the owning domain. Exported types:
   FIB's per-family pass also preserves — is untouched; a correct grouping
   that shuffled inside the group would match on counts and still install
   a different SET.
+
+  **Every rule in this band carries an ingress scope (`FRA_IIFNAME`,
+  #9420).** Before that, the rule was `Dst` + `Table` + `Priority` +
+  `Family` and nothing else, at priority 100–199 — *ahead of the kernel's
+  l3mdev rule at 1000*. A packet ingressing **any** other routing
+  instance whose destination fell in the leaked prefix was therefore
+  routed out of the **target** instance's table, on the target
+  instance's device, overriding the ingress instance's own routing — and
+  it won even when the ingress instance had its **own** route for the
+  same prefix. This is the same defect #5117 fixed for the PBR band
+  below, in the same file; `nextTableManager.Apply` was not covered by
+  that sweep. `#4073` closed the broad "VRF traffic is mis-routed" claim
+  as a false positive, correctly, on the grounds that the rule is
+  destination-scoped — an argument that holds for every packet *outside*
+  the leaked prefix and says nothing about one inside it.
+
+  The scoping set is `DefaultInstanceIngressIfaces(cfg)`: every
+  configured interface unit **not** claimed by a routing instance.
+  `next-table` statics are read from the default instance's
+  routing-options (`daemon_apply_routing.go` passes
+  `cfg.RoutingOptions.StaticRoutes` + `Inet6StaticRoutes`), so the
+  default instance is the authoring instance. Consequences:
+
+  - **One leak now costs one rule per default-instance ingress
+    interface**, and the 100-slot window is drawn down **leak-atomically**
+    — a leak whose full expansion does not fit is dropped whole rather
+    than installed on a subset of its interfaces. The overflow error
+    names the multiplier.
+  - **Fail-closed**, matching `BuildPBRRules`: with no resolvable ingress
+    interface, nothing is installed and the apply reports degraded. The
+    fail-safe direction is an under-steer, never a cross-VRF over-steer.
+  - **Loopback is deliberately excluded**, so host-originated traffic no
+    longer follows a `next-table` leak. That is a narrowing, and it is
+    deliberate: an `iif lo` rule matches locally generated traffic
+    *including traffic from a socket bound to another VRF* — measured —
+    which is the first exposed path #9420 names (FRR peering, DHCP relay,
+    syslog, RPM probes, IPsec sourced in a tenant VRF). Adding `lo` back
+    to keep host-originated default-instance traffic on the leak would
+    reintroduce the cross-VRF hijack for every VRF-bound daemon.
+
+  The AF\_XDP fast path was never exposed: the userspace FIB follows a
+  `next_table` leak only when the route is found in the **ingress
+  instance's own** table (`userspace-dp/src/afxdp/forwarding/fib.rs`), so
+  it is instance-scoped by construction. The exposure was the Linux path
+  — host-originated traffic, slow-path `XDP_PASS` packets, local
+  delivery, and any interface without native XDP where
+  `redirect_capable` falls back to kernel forwarding.
 - `31000–31999`: PBR (firewall-filter `routing-instance` action).
   `pbrRulePriority` in `rules.go`. **Kernel FBF support matrix (#3730):**
   `BuildPBRRules` mirrors only the term `from` predicates an `ip rule` can

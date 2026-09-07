@@ -513,6 +513,18 @@ func (d *Daemon) reconcileDHCPRelay(cfg *config.Config) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// #9406: the relay's group `interface` list carries the AUTHORED reference
+	// (`ge-0/0/0.0`, `reth0.0`). net.InterfaceByName and SO_BINDTODEVICE cannot
+	// find a device whose name contains '/' or a Junos unit suffix, so before
+	// this the relay bound NOTHING under the canonical spelling — no listener,
+	// no giaddr, no relayed packet, on a green commit. Install the resolver for
+	// THIS config immediately before Apply so the resolution always matches the
+	// group list Apply is about to read.
+	//
+	// This is the SOLE production Apply site on purpose: the boot path
+	// (daemon_run.go) routes through here rather than calling Apply itself, so
+	// there is one place to wire rather than two to remember.
+	d.dhcpRelay.SetIfNameResolver(cfg.ResolveKernelIfName)
 	d.dhcpRelay.Apply(ctx, cfg.ForwardingOptions.DHCPRelay)
 }
 

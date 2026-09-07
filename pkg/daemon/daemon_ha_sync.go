@@ -1293,6 +1293,10 @@ func (d *Daemon) stopClusterComms() {
 	// cancelled, so it is already stopping; clear the cancel handle so the
 	// next comms session's connect-time launch starts a fresh loop.
 	d.resetDHCPLeaseSyncLoop()
+	// #9176: the IPsec sibling. Its absence left `loopCancel` set across a
+	// comms teardown, so the next `ensureIPsecSASyncLoop` took its
+	// already-running early return against a dead context.
+	d.resetIPsecSASyncLoop()
 	if d.cluster != nil {
 		d.cluster.StopHeartbeat()
 	}
