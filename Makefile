@@ -97,10 +97,69 @@ test: test-go test-rust
 # aggregate — the gate now says what it did not examine instead of implying it
 # examined everything.
 .PHONY: test-root
-test-root: test-shim-run
+test-root: test-shim-run test-memlock-guards
 	@echo "make test-root: the privilege-gated legs ran."
 	@echo "  NOTE: some cells skip BECAUSE you are root (10 at last census)."
 	@echo "  No single run examines every cell; see 'make go-skip-census'."
+
+# #9337: the leg the 42 memlock-gated guards defer to.
+#
+# pkg/memlockcensus enumerates every test that goes inert without the privilege
+# to create a BPF map and defers enforcement to "a privileged CI leg, gated on
+# XPF_REQUIRE_MEMLOCK_GUARDS=1". THAT LEG DID NOT EXIST. `.github/` holds only
+# `instructions/` — there is no CI in this repository at all — and nothing
+# anywhere set the variable. 42 guards had been deferring to a name.
+#
+# CAP_BPF, not CAP_SYS_RESOURCE. Measured (#9337): with only the memlock rlimit
+# raised, the census reported "memlock is available here — all 42 registered
+# guards execute" and every guard then failed at `map create: operation not
+# permitted`. A leg built to the old remedy text would have gone red with 42
+# map-creation errors that look nothing like the defects the guards catch. The
+# census now probes a trivial map create, so a run in that state is refused up
+# front rather than mistaken for a regression.
+#
+# BY NAME, for the reason test-shim-run records: a `-run` predicate is a claim
+# about names, and it fails silently in the only direction that matters — a
+# guard whose name stops matching is not skipped-and-reported, it is invisible.
+# Every registry row naming a `Test...` function must appear as a `=== RUN`
+# line, and the package set is DERIVED from the registry rather than written
+# down, so adding a guard in a new package cannot leave it unrun.
+#
+# TMPDIR is pinned to /tmp: several of these guards bind an AF_UNIX control
+# socket under the temp dir, and a long TMPDIR pushes the path past the
+# 108-byte sun_path limit — "bind: invalid argument", which reads like a
+# dataplane defect and is not one.
+.PHONY: test-memlock-guards
+test-memlock-guards:
+	@if [ "$$(id -u)" != "0" ]; then \
+		echo "test-memlock-guards: needs CAP_BPF (BPF map creation). Re-run with sudo."; \
+		echo "  CAP_SYS_RESOURCE alone is NOT enough — it raises the memlock rlimit,"; \
+		echo "  so the guards stop skipping and start failing at map creation."; \
+		exit 1; \
+	fi
+	@pkgs=$$(sed -n 's/.*File: "\([^"]*\)".*/\1/p' pkg/memlockcensus/registry.go \
+		| xargs -n1 dirname | sort -u | sed 's#^#./#'); \
+	if [ -z "$$pkgs" ]; then \
+		echo "test-memlock-guards: derived NO packages from pkg/memlockcensus/registry.go."; \
+		echo "  The row format changed and this target would have run nothing while"; \
+		echo "  reporting success."; \
+		exit 1; \
+	fi; \
+	echo "test-memlock-guards: packages $$pkgs"; \
+	out=$$(TMPDIR=/tmp XPF_REQUIRE_MEMLOCK_GUARDS=1 $(GO) test -count=1 -v $$pkgs ./pkg/memlockcensus/ 2>&1); \
+	status=$$?; \
+	echo "$$out"; \
+	missing=''; \
+	for n in $$(sed -n 's/.*Test: "\(Test[A-Za-z0-9_]*\)".*/\1/p' pkg/memlockcensus/registry.go | sort -u); do \
+		echo "$$out" | grep -q "^=== RUN   $$n$$" || missing="$$missing $$n"; \
+	done; \
+	if [ -n "$$missing" ]; then \
+		echo "test-memlock-guards: these REGISTERED guards did not run:$$missing"; \
+		echo "  A guard that cannot run is indistinguishable from a guard that passes."; \
+		exit 1; \
+	fi; \
+	if [ $$status -ne 0 ]; then exit $$status; fi; \
+	echo "test-memlock-guards: every registered guard executed."
 
 # Go suite. Invocation preserved exactly from the pre-#4006 `test` target.
 # #7494: behavioural coverage for the shim's own control flow, via
