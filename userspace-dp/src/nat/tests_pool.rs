@@ -11251,3 +11251,148 @@ fn releasing_the_reusing_worker_first_must_not_free_9145() {
         "both holders released and the port stayed occupied"
     );
 }
+
+// ── #9327 item 2: does the recycled-phase spike actually amortize? ──────────
+//
+// The in-code comment on the recycled phase says K out-of-band-reserved tokens
+// "cost O(K) ONCE and then migrate behind the free ones — the HA-churn spike
+// amortizes itself". Re-derived here rather than taken on trust.
+//
+// The mechanism: retained tokens are pushed to the BACK, so after the K
+// reserved tokens are walked, the F free ones are in front of them — for
+// exactly F claims. Once those F are consumed the K reserved are at the head
+// again. Total pops over a full F-claim cycle is K+F, i.e. (K+F)/F per claim.
+// That is O(K/F) amortized, NOT O(K) once, and at F=1 it does not amortize at
+// all: every claim pays the full K.
+//
+// Ignored by default (a measurement, not an assertion):
+//   cargo test --bin xpf-userspace-dp recycle_amortization_9327 -- --ignored --nocapture
+#[test]
+#[ignore]
+fn recycle_amortization_9327() {
+    for (k, f) in [(15usize, 1usize), (12, 4)] {
+        let pool_ip: Ipv4Addr = "203.0.113.1".parse().unwrap();
+        let addrs = [pool_ip];
+        let range_lo = 1024u16;
+        let range_hi = range_lo + (k + f) as u16 - 1;
+        let alloc = PortAllocator::new(1, range_lo, range_hi);
+        // Sequential cursor past the range: only the recycle ring is consulted.
+        alloc.debug_set_cursor(0, (k + f) as u32);
+
+        // FIFO: the K reserved tokens first, then the F free ones.
+        let mut queue: Vec<u16> = Vec::new();
+        for i in 0..k {
+            queue.push(range_lo + i as u16);
+        }
+        for i in 0..f {
+            queue.push(range_lo + (k + i) as u16);
+        }
+        alloc.debug_set_recycled(0, queue);
+        // The K are occupied out-of-band, so each pop collides and is retained.
+        for i in 0..k {
+            alloc.debug_seed_owner(0, IpAddr::V4(pool_ip), range_lo + i as u16);
+        }
+
+        let mut per_claim: Vec<u64> = Vec::new();
+        let mut last = alloc.debug_recycle_scan_pops(0);
+        for c in 0..(2 * f) {
+            let flow = SourceNatFlowKey {
+                protocol: 6,
+                src_ip: "10.0.61.51".parse().unwrap(),
+                dst_ip: "8.8.8.8".parse().unwrap(),
+                src_port: 40000 + c as u16,
+                dst_port: 443,
+                routing_scope: 0,
+            };
+            let got = alloc.allocate_translation(
+                flow,
+                PoolAddressFamily::V4(&addrs),
+                0,
+                false,
+                false,
+                PersistentNatPermit::TargetHostPort,
+                0,
+                1_000,
+                NatHolder::Untracked,
+            );
+            let now = alloc.debug_recycle_scan_pops(0);
+            per_claim.push(now - last);
+            last = now;
+            // Free it again so the token returns to the ring and the cycle can
+            // repeat — this is the steady state, not a one-off drain.
+            if let Ok(t) = got {
+                alloc.debug_free_recycle(0, t.port);
+            }
+        }
+        eprintln!("pops per claim (K={k}, F={f}): {per_claim:?}");
+    }
+}
+
+/// #9327 item 2: PIN the real recycled-phase cost so the "amortizes itself"
+/// claim cannot come back.
+///
+/// The in-code comment used to say K out-of-band-reserved tokens cost O(K)
+/// ONCE. Retained tokens go to the BACK, which buys exactly F cheap claims
+/// before the K are at the head again — so a full cycle is K+F pops for F
+/// claims, i.e. (K+F)/F per claim, and at F=1 there is no amortization at all.
+///
+/// This asserts the SHAPE, not a timing: pops are counted, and the F=1 case is
+/// the one that falsifies "amortizes itself" outright.
+#[test]
+fn the_recycled_phase_does_not_amortize_at_f_equals_one_9327() {
+    let (k, f) = (15usize, 1usize);
+    let pool_ip: Ipv4Addr = "203.0.113.1".parse().unwrap();
+    let addrs = [pool_ip];
+    let range_lo = 1024u16;
+    let alloc = PortAllocator::new(1, range_lo, range_lo + (k + f) as u16 - 1);
+    alloc.debug_set_cursor(0, (k + f) as u32);
+    let mut queue: Vec<u16> = (0..k).map(|i| range_lo + i as u16).collect();
+    queue.push(range_lo + k as u16);
+    alloc.debug_set_recycled(0, queue);
+    for i in 0..k {
+        alloc.debug_seed_owner(0, IpAddr::V4(pool_ip), range_lo + i as u16);
+    }
+
+    let mut per_claim: Vec<u64> = Vec::new();
+    let mut last = alloc.debug_recycle_scan_pops(0);
+    for c in 0..3 {
+        let flow = SourceNatFlowKey {
+            protocol: 6,
+            src_ip: "10.0.61.51".parse().unwrap(),
+            dst_ip: "8.8.8.8".parse().unwrap(),
+            src_port: 40000 + c as u16,
+            dst_port: 443,
+            routing_scope: 0,
+        };
+        let got = alloc.allocate_translation(
+            flow,
+            PoolAddressFamily::V4(&addrs),
+            0,
+            false,
+            false,
+            PersistentNatPermit::TargetHostPort,
+            0,
+            1_000,
+            NatHolder::Untracked,
+        );
+        let now = alloc.debug_recycle_scan_pops(0);
+        per_claim.push(now - last);
+        last = now;
+        let t = got.expect("one free token remains, so the claim must succeed");
+        alloc.debug_free_recycle(0, t.port);
+    }
+
+    assert!(
+        per_claim.iter().all(|&p| p as usize >= k),
+        "#9327: with K={k} reserved tokens and F={f} free, EVERY claim must pay \
+         ~K pops — the retained tokens go to the back and are immediately at the \
+         head again. pops per claim = {per_claim:?}.\n\
+         If this now shows a single expensive claim followed by cheap ones, the \
+         walk gained a bound or an ordering change: update the comment on the \
+         recycled phase, which states this cost explicitly."
+    );
+    assert!(
+        per_claim.len() > 1,
+        "NON-VACUITY: a single claim cannot show whether the cost amortizes"
+    );
+}

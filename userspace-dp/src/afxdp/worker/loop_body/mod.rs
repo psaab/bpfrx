@@ -412,6 +412,10 @@ pub(crate) fn worker_loop(
     // pass.
     let mut last_delete_drop_epoch =
         crate::afxdp::session_glue::session_delete_drop_epoch(worker_id);
+    // #9327: the delete-drop sweep is resumable and budgeted. Declared beside
+    // the epoch it is armed by, and carried across passes so no single pass
+    // exceeds the RX-ring fill time.
+    let mut delete_drop_sweep = crate::afxdp::session_glue::DeleteDropSweep::default();
     let mut dbg_last_report_ns = monotonic_nanos();
     // #1776: the per-interval cfg(debug-log) dbg_* counters are
     // consolidated into debug_report::DbgCounters (single-line
@@ -1320,12 +1324,19 @@ pub(crate) fn worker_loop(
             crate::afxdp::session_glue::session_delete_drop_epoch(worker_id);
         if delete_drop_epoch != last_delete_drop_epoch {
             last_delete_drop_epoch = delete_drop_epoch;
+            // #9327: ARM the sweep; do not run it here. The whole-table walk
+            // measured 6.47 ms at 60k sessions even when it finds NOTHING, and
+            // 39 ms when everything is stale — against a ~1.97 ms RX-ring fill.
+            // The epoch gate bounds how often this fires, not what one firing
+            // costs, and one refused cross-worker DeleteSynced arms it.
+            delete_drop_sweep.arm();
+        }
+        // Step the sweep every pass while it is running, bounded by
+        // DELETE_DROP_SWEEP_BUDGET slab slots. A no-op with no sweep armed.
+        {
             let mut evicted_keys: Vec<crate::session::SessionKey> = Vec::new();
-            let reconciled = crate::afxdp::session_glue::reconcile_peer_synced_against_shared(
-                &mut sessions,
-                &shared_sessions,
-                &mut evicted_keys,
-            );
+            let reconciled =
+                delete_drop_sweep.step(&mut sessions, &shared_sessions, &mut evicted_keys);
             if reconciled > 0 {
                 crate::afxdp::worker::invalidate_flow_cache_slots_for_keys(
                     &mut bindings,

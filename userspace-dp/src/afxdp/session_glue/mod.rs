@@ -1,8 +1,10 @@
 use super::*;
 
 pub(in crate::afxdp) mod commands;
+mod delete_drop_sweep;
 mod promote;
 
+pub(in crate::afxdp) use delete_drop_sweep::{DeleteDropSweep, DELETE_DROP_SWEEP_BUDGET};
 use promote::{
     SharedSessionRefs, maybe_promote_synced_session, purge_translated_synced_hit,
     should_keep_synced_hit_transient,
@@ -1370,32 +1372,27 @@ pub(super) fn replicate_session_delete_repairing(
 /// the table walk: the walk clones candidate keys first. Sibling workers take
 /// that same lock on their packet path, and a full-table walk under it would
 /// stall them for the length of this worker's session table.
+/// Run the delete-drop reconcile to completion.
+///
+/// #9327: the worker loop no longer calls this — it steps a [`DeleteDropSweep`]
+/// across passes so no single pass exceeds the ring-fill budget. This wrapper
+/// is the whole-table semantics in one call, which is what the behavioural
+/// cells (#8586: which ORIGINS are swept) want to assert without modelling the
+/// pacing. Keeping the semantics and the pacing testable separately is the
+/// point: a cell that had to drive the cursor to check an origin rule would be
+/// asserting two things at once.
 pub(in crate::afxdp) fn reconcile_peer_synced_against_shared(
     sessions: &mut SessionTable,
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     evicted_keys: &mut Vec<SessionKey>,
 ) -> usize {
-    let mut candidates: Vec<SessionKey> = Vec::new();
-    sessions.iter_with_origin(|key, _decision, _metadata, origin| {
-        if origin.is_peer_synced() {
-            candidates.push(key.clone());
-        }
-    });
-    if candidates.is_empty() {
-        return 0;
+    let mut sweep = DeleteDropSweep::default();
+    sweep.arm();
+    let mut total = 0;
+    while sweep.is_running() {
+        total += sweep.step(sessions, shared_sessions, evicted_keys);
     }
-    let stale: Vec<SessionKey> = {
-        let shared = lock_shared_recover(shared_sessions);
-        candidates
-            .into_iter()
-            .filter(|key| !shared.contains_key(key))
-            .collect()
-    };
-    for key in &stale {
-        sessions.delete(key);
-        evicted_keys.push(key.clone());
-    }
-    stale.len()
+    total
 }
 
 pub(super) fn should_teardown_tcp_rst(_meta: UserspaceDpMeta, _flow: Option<&SessionFlow>) -> bool {

@@ -9279,3 +9279,229 @@ fn only_a_refused_delete_moves_the_worker_epoch_8586() {
          its table for a delete it did receive"
     );
 }
+
+// ── #9327 item 1: re-derivation of the delete-drop reconcile cost ───────────
+//
+// Independent of the issue's numbers: this rebuilds the measurement from
+// scratch so the fix is aimed at a cliff I have seen, not one I was told about.
+// Ignored by default (it is a measurement, not an assertion); run with
+//   cargo test --release --bin xpf-userspace-dp reconcile_cost_9327 -- --ignored --nocapture
+#[test]
+#[ignore]
+fn reconcile_cost_9327() {
+    use std::time::Instant;
+    eprintln!("size_of::<SessionKey>() = {}", std::mem::size_of::<SessionKey>());
+    for n in [4096usize, 16384, 60000] {
+        // FINDS NOTHING: every peer-synced session is still in the shared map,
+        // so `stale` is empty and the sweep deletes nothing. This is the case
+        // the dismissal called cheap.
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let mut sessions = SessionTable::new();
+        for i in 0..n {
+            let k = key9327(i);
+            install8586(&mut sessions, &k, SessionOrigin::SyncImport);
+            publish8586(&shared_sessions, &k);
+        }
+        let mut evicted = Vec::new();
+        let t = Instant::now();
+        let swept = reconcile_peer_synced_against_shared(&mut sessions, &shared_sessions, &mut evicted);
+        let el = t.elapsed();
+        eprintln!("n={n:<6} swept={swept:<6} elapsed={el:?}   (finds-nothing)");
+    }
+    for n in [16384usize, 60000] {
+        // ALL-STALE: the shared map is empty, so every session is swept.
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let mut sessions = SessionTable::new();
+        for i in 0..n {
+            install8586(&mut sessions, &key9327(i), SessionOrigin::SyncImport);
+        }
+        let mut evicted = Vec::new();
+        let t = Instant::now();
+        let swept = reconcile_peer_synced_against_shared(&mut sessions, &shared_sessions, &mut evicted);
+        let el = t.elapsed();
+        eprintln!("ALL-STALE n={n:<6} swept={swept:<6} elapsed={el:?}");
+    }
+}
+
+fn key9327(i: usize) -> SessionKey {
+    let mut k = test_key();
+    k.src_port = (i % 65535) as u16;
+    k.dst_port = ((i / 65535) % 65535) as u16;
+    k.src_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::from((i as u32).wrapping_add(0x0a00_0000)));
+    k
+}
+
+// ── #9327 item 1: the sweep is budgeted ────────────────────────────────────
+//
+// The prior validation scored this NEG on the grounds that the epoch gate makes
+// the sweep rare. The gate bounds FREQUENCY, not COST, and one refused
+// cross-worker `DeleteSynced` — ordinary RG-activation churn — arms it.
+// Re-measured independently on this tree before fixing anything:
+//
+//	n=16384 finds-nothing   1.745 ms    <- already at the ~1.97 ms RX-ring fill
+//	n=60000 finds-nothing   6.466 ms    <- 3x the fill
+//	n=60000 all-stale      39.148 ms    <- ~20x the fill
+//
+// against this crate's own standard: WORKER_COMMAND_DRAIN_BUDGET is 256 and is
+// justified against that fill time, because the worker does not service its
+// AF_XDP rings while it sweeps.
+//
+// THESE ASSERT A BOUND, NOT A DURATION. A wall-time assertion is a property of
+// the machine that ran it — it passes on a fast box with the cliff intact, which
+// is how a cost defect hides. The per-pass visited bound is size-independent and
+// is the thing that actually keeps the rings serviced.
+
+/// One pass must sweep at most the budget, however much work is outstanding.
+#[test]
+fn one_sweep_pass_is_bounded_by_the_budget_9327() {
+    let n = super::DELETE_DROP_SWEEP_BUDGET * 40; // >> budget, so a whole-table
+                                                  // walk is plainly distinguishable
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let mut sessions = SessionTable::new();
+    for i in 0..n {
+        install8586(&mut sessions, &key9327(i), SessionOrigin::SyncImport);
+    }
+    assert!(
+        shared_sessions.lock().expect("shared").is_empty(),
+        "fixture: an EMPTY shared map makes every session stale, which is the \
+         worst case and the one that measured 39 ms"
+    );
+
+    let mut sweep = super::DeleteDropSweep::default();
+    sweep.arm();
+    let mut evicted = Vec::new();
+    let first = sweep.step(&mut sessions, &shared_sessions, &mut evicted);
+
+    assert!(
+        first <= super::DELETE_DROP_SWEEP_BUDGET,
+        "#9327: one pass swept {first} sessions with a budget of {}. The worker \
+         does not service its AF_XDP RX/TX rings while it sweeps, so an \
+         unbounded pass is wall-clock time the rings go unserviced — measured \
+         39 ms at 60k sessions against a ~1.97 ms ring fill.",
+        super::DELETE_DROP_SWEEP_BUDGET
+    );
+    assert!(
+        first > 0,
+        "NON-VACUITY: the pass swept NOTHING, so the bound above is satisfied by \
+         a sweep that does no work at all and proves nothing"
+    );
+    assert!(
+        sweep.is_running(),
+        "with {n} stale sessions and a budget of {}, one pass cannot have \
+         finished — if it reports done, the sweep is silently dropping the rest",
+        super::DELETE_DROP_SWEEP_BUDGET
+    );
+}
+
+/// PROGRESS: stepping to completion sweeps everything, so the bound above buys
+/// pacing rather than lost work. Without this, a sweep that budgets by giving up
+/// would satisfy the bound.
+#[test]
+fn the_budgeted_sweep_still_sweeps_everything_9327() {
+    let n = super::DELETE_DROP_SWEEP_BUDGET * 7 + 13; // deliberately not a multiple
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let mut sessions = SessionTable::new();
+    for i in 0..n {
+        install8586(&mut sessions, &key9327(i), SessionOrigin::SyncImport);
+    }
+
+    let mut sweep = super::DeleteDropSweep::default();
+    sweep.arm();
+    let mut evicted = Vec::new();
+    let mut total = 0usize;
+    let mut passes = 0usize;
+    while sweep.is_running() {
+        total += sweep.step(&mut sessions, &shared_sessions, &mut evicted);
+        passes += 1;
+        assert!(
+            passes < n + 16,
+            "the sweep did not terminate after {passes} passes — a cursor that \
+             never reaches the end wedges the worker loop into sweeping forever"
+        );
+    }
+    assert_eq!(
+        total, n,
+        "every stale peer-synced session must be swept across the passes; \
+         budgeting must pace the work, not discard it"
+    );
+    assert!(
+        passes > 1,
+        "NON-VACUITY: {n} sessions were swept in {passes} pass(es), so the \
+         multi-pass path this cell exists to check never ran"
+    );
+    assert_eq!(evicted.len(), n, "every swept key must reach the flow-cache eviction list");
+}
+
+/// NO PER-PASS ALLOCATION. The pre-#9327 code allocated two full key-clone Vecs
+/// on the worker loop every firing; at 60k sessions and a 52-byte key that is
+/// two ~3.1 MB allocations. The retained buffer is cleared, not dropped.
+///
+/// THE OBSERVABLE IS CAPACITY SURVIVING AN EMPTY PASS, not capacity equality
+/// across passes — and the difference is the whole cell. Measured: replacing
+/// `self.stale.clear()` with `self.stale = Vec::new()` SURVIVED an
+/// equality-across-passes check, because every pass refilled the fresh Vec to
+/// the same length and so to the same capacity. A pass that collects NOTHING
+/// distinguishes them: a cleared buffer keeps the capacity it earned, a
+/// reallocated one is back to zero.
+#[test]
+fn the_sweep_reuses_its_buffer_across_passes_9327() {
+    let budget = super::DELETE_DROP_SWEEP_BUDGET;
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let mut sessions = SessionTable::new();
+    // Slab slots are handed out in insert order, so the first window is all
+    // STALE (absent from shared) and the later windows are all present.
+    for i in 0..budget {
+        install8586(&mut sessions, &key9327(i), SessionOrigin::SyncImport);
+    }
+    for i in budget..(budget * 3) {
+        let k = key9327(i);
+        install8586(&mut sessions, &k, SessionOrigin::SyncImport);
+        publish8586(&shared_sessions, &k);
+    }
+
+    let mut sweep = super::DeleteDropSweep::default();
+    sweep.arm();
+    let mut evicted = Vec::new();
+
+    let first = sweep.step(&mut sessions, &shared_sessions, &mut evicted);
+    let cap_after_first = sweep.stale_capacity_for_test();
+    assert!(
+        first > 0 && cap_after_first > 0,
+        "NON-VACUITY: the first pass collected {first} keys and left capacity          {cap_after_first}; the reuse assertion below needs a buffer that          actually grew"
+    );
+
+    let second = sweep.step(&mut sessions, &shared_sessions, &mut evicted);
+    assert_eq!(
+        second, 0,
+        "fixture: the second window is entirely present in the shared map, so          this pass must collect NOTHING — that is what makes a retained buffer          distinguishable from a fresh one"
+    );
+    assert!(
+        sweep.stale_capacity_for_test() >= cap_after_first,
+        "#9327: the stale buffer lost its capacity across a pass that collected          nothing, so it is being REALLOCATED rather than cleared. The pre-#9327          code allocated two multi-megabyte key-clone Vecs on the worker loop          every firing; retaining the buffer is what removes that."
+    );
+}
+
+/// Arming mid-sweep restarts from the top rather than continuing. The epoch says
+/// the shared map CHANGED, so slots already visited under the old map have to be
+/// re-examined; continuing would leave them judged against a stale authority.
+#[test]
+fn arming_restarts_an_in_flight_sweep_9327() {
+    let n = super::DELETE_DROP_SWEEP_BUDGET * 4;
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let mut sessions = SessionTable::new();
+    for i in 0..n {
+        install8586(&mut sessions, &key9327(i), SessionOrigin::SyncImport);
+    }
+    let mut sweep = super::DeleteDropSweep::default();
+    sweep.arm();
+    let mut evicted = Vec::new();
+    sweep.step(&mut sessions, &shared_sessions, &mut evicted);
+    assert!(sweep.cursor_for_test() > 0, "fixture: the first pass must advance the cursor");
+    sweep.arm();
+    assert_eq!(
+        sweep.cursor_for_test(),
+        0,
+        "#9327: an epoch bump must restart the sweep. The shared map changed, so \
+         every slot already judged against the previous map has to be re-examined."
+    );
+}
