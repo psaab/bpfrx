@@ -1095,6 +1095,37 @@ construction rather than needing someone to remember this site — the same shap
 reflectively and fails on any non-narrowed field that does not survive, with a
 positive control so a walk that examined nothing cannot report a clean result.
 
+**`Daemon.dhcpServer` is an INTERFACE so the apply wiring is drivable (#9349).**
+It was a concrete `*dhcpserver.Manager` whose test seams (`runSystemctl`,
+`unitActive`, `confPath4`/`confPath6`, `warn`) are unexported, so a `pkg/daemon`
+test could not construct a harmless one. The consequence was measured by mutation
+during #9141: BOTH DHCP derivation calls in `applyServicesReconcile` could be
+severed —
+
+```go
+desired := cfg.System.DHCPServer      // instead of desiredStandaloneDHCPConfig(cfg)
+dhcpCfg := &cfg.System.DHCPServer     // instead of d.desiredClusterDHCPConfig(cfg)
+```
+
+— and the ENTIRE Go suite stayed green. Neither is subtle. **Standalone**, Kea is
+handed RETH *logical* names (`reth1.0`), which are not kernel devices, so DHCP
+fails on every RETH-backed segment. **Clustered**, Kea is handed the unfiltered
+config, so both nodes serve every group regardless of RG mastership — dual-DHCP,
+the exact failure #1835 F3 / #6520 exist to prevent.
+
+The functions BELOW those call sites were already well covered (#6520/#4647 on
+the filter, #9141 on the resolver, #6535 on the converger). What had no cell was
+the WIRING between the apply and the applier — and a cell for a function is blind
+to its caller not calling it. `dhcp_apply_wiring_9349_test.go` drives
+`applyServicesReconcile` with a RECORDING applier and asserts on the config that
+actually reaches `Apply` / `ApplyClusterCommit`; the recorder deliberately
+re-implements nothing, because a fake that supplied the derivation could not
+observe production failing to.
+
+`pkg/grpcapi`'s `Config.DHCPServer` became a three-method `DHCPServerStatus`
+interface in the same change: leaving it concrete would have forced a type
+assertion at the hand-off and reintroduced the coupling this removes.
+
 **Single-sourced desired state.** `desiredClusterDHCPConfig` is the one place
 that derives the Kea desired state from (active config, current master-RG
 set); the commit path, both transition edges, and the converger all call it.

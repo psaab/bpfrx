@@ -74,17 +74,30 @@ const maxRecvMsgSize = 16 << 20 // 16 MiB
 const maxConcurrentStreams = 256
 
 // Config configures the gRPC server.
+// DHCPServerStatus is the DHCP read surface this package uses (#9349).
+// *dhcpserver.Manager satisfies it; so does the daemon's dhcpApplier.
+type DHCPServerStatus interface {
+	IsRunning() bool
+	GetLeasesWithSource4() ([]dhcpserver.Lease, dhcpserver.LeaseSource)
+	GetLeasesWithSource6() ([]dhcpserver.Lease, dhcpserver.LeaseSource)
+}
+
 type Config struct {
-	Store         *configstore.Store
-	DP            grpcRuntime
-	EventBuf      *logging.EventBuffer
-	GC            *conntrack.GC
-	Routing       *routing.Manager
-	FRR           *frr.Manager
-	IPsec         *ipsec.Manager
-	Cluster       *cluster.Manager
-	DHCP          *dhcp.Manager
-	DHCPServer    *dhcpserver.Manager
+	Store    *configstore.Store
+	DP       grpcRuntime
+	EventBuf *logging.EventBuffer
+	GC       *conntrack.GC
+	Routing  *routing.Manager
+	FRR      *frr.Manager
+	IPsec    *ipsec.Manager
+	Cluster  *cluster.Manager
+	DHCP     *dhcp.Manager
+	// DHCPServer is the read surface `show dhcp server` needs, as an INTERFACE
+	// rather than *dhcpserver.Manager (#9349). The daemon's own field became an
+	// interface so applyServicesReconcile could be driven by a test; keeping
+	// this one concrete would have forced a type assertion at the hand-off and
+	// reintroduced the coupling.
+	DHCPServer    DHCPServerStatus
 	RPMResultsFn  func() []*rpm.ProbeResult   // returns live RPM results
 	IPMonStatusFn func() []ipmon.PolicyStatus // returns live ip-monitoring policy status (#1827)
 	// NATPoolAlarmsFn returns the active NAT pool-utilization alarms for
@@ -200,7 +213,7 @@ type Server struct {
 	ipsec                   *ipsec.Manager
 	cluster                 *cluster.Manager
 	dhcp                    *dhcp.Manager
-	dhcpServer              *dhcpserver.Manager
+	dhcpServer              DHCPServerStatus
 	rpmResultsFn            func() []*rpm.ProbeResult
 	ipmonStatusFn           func() []ipmon.PolicyStatus
 	natPoolAlarmsFn         func() []natpoolalarm.ActiveAlarm

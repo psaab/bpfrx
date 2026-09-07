@@ -215,7 +215,10 @@ type Daemon struct {
 	// not propagate at all, and the per-function cells stay green if the join
 	// is removed again.
 	reconcileDNSFn func(*config.Config, bool) error
-	dhcpServer     *dhcpserver.Manager
+	// dhcpServer is an INTERFACE, not *dhcpserver.Manager (#9349), so a test
+	// can drive applyServicesReconcile and assert on the config that actually
+	// reaches the applier. Production assigns dhcpserver.New().
+	dhcpServer dhcpApplier
 	// ddns is the always-on DHCP dynamic-DNS manager (#1387 inc-2). It is
 	// constructed UNCONDITIONALLY at daemon start (plan §4.2) — even when
 	// DDNS is disabled — so an enabled→disabled commit always has a running
