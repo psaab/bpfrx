@@ -129,4 +129,34 @@ resurrect the defect with #3889's own suite green.
 
 ## Mutation table
 
-(filled in below)
+Five mutants, all KILLED (one VOID first, rebuilt).
+
+**The backup discipline changed for this round, because of what happened
+above.** Backups are taken from `git show HEAD:<file>` and a restore is
+verified with `git diff --quiet HEAD -- pkg/` — the tree must equal the
+COMMIT. A `cp` snapshot is a moment, and `diff <file> <snapshot>` is satisfied
+by a file that was wrongly reverted TO that snapshot, which is exactly how the
+second axis was lost. Comparing against HEAD cannot be satisfied that way,
+because HEAD carries the intended state rather than an arbitrary earlier one.
+
+| # | mutation | site | result | cells red |
+|---|---|---|---|---|
+| M1 | revert the fix — read `userInst.node.Children` in both loops | `compiler_system.go` | **KILLED** | 5 — all three config cells, the sudoers CONSEQUENCE cell, and the #9156 gate |
+| M2 | delete the empty-class denial so it falls through to the class evaluator | `pkg/authz/authz.go` | **KILLED** | the authz cell, on all six permissions |
+| M3 | grant sudoers on the wrong predicate (`Class == ""` instead of `!= "super-user"`) | `daemon_hostauth_apply.go` | **KILLED** | the sudoers consequence cell |
+| M4 | **the exact defect that shipped**: the flat axis silently off | the gate | VOID, then **KILLED** | the new `flatCompared == 0` VOID assertion, naming it |
+| M5 | the flat arm RUNS but measures the braced text — vacuous, not absent | the gate helper | **KILLED** | the register: both single-axis rows vanish and the ratchet reports them stale |
+
+**M1 red the gate**, which the braced-only version did not — that is the
+second axis doing its job on the container it was blind to.
+
+**M4 is the regression test for the incident.** It reproduces exactly what
+shipped — the helper present, the wiring gone — and the assertion added in this
+change names it: *"the FLAT-SET axis was never driven. Every verdict above is
+the braced axis alone."*
+
+**M5 is the subtler half of the same class.** An axis that runs but measures the
+wrong text increments every counter and passes the VOID check. What catches it
+is the REGISTER: the two single-axis rows stop differing and the ratchet reports
+them stale. The `{flat}` row is the canary, which is one more reason the axis
+label belongs in the key rather than in a comment.
