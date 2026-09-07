@@ -148,9 +148,19 @@ func (c *CLI) showDHCPRelay() error {
 		stats := c.dhcpRelay.Stats()
 		if len(stats) > 0 {
 			fmt.Println("\nRelay statistics:")
-			fmt.Printf("  %-16s %-18s %-18s %-18s %s\n", "Interface", "Requests relayed", "Replies forwarded", "Dropped (max-hops)", "Dropped (rate-limit)")
+			// #9406: the BOUND DEVICE is shown beside the configured
+			// interface. The two differ under the canonical Junos spelling
+			// (`ge-0/0/0.0` binds `ge-0-0-0`), and an all-zero counter row is
+			// otherwise indistinguishable from an idle segment — which is
+			// exactly how the relay being bound to nothing at all stayed
+			// invisible.
+			fmt.Printf("  %-16s %-16s %-18s %-18s %-18s %s\n", "Interface", "Bound device", "Requests relayed", "Replies forwarded", "Dropped (max-hops)", "Dropped (rate-limit)")
 			for _, s := range stats {
-				fmt.Printf("  %-16s %-18d %-18d %-18d %d\n", s.Interface, s.RequestsRelayed, s.RepliesForwarded, s.RequestsDroppedMaxHops, s.RequestsDroppedRateLimit)
+				bound := s.KernelInterface
+				if bound == "" {
+					bound = s.Interface
+				}
+				fmt.Printf("  %-16s %-16s %-18d %-18d %-18d %d\n", s.Interface, bound, s.RequestsRelayed, s.RepliesForwarded, s.RequestsDroppedMaxHops, s.RequestsDroppedRateLimit)
 			}
 			// Reply-delivery breakdown (#2076). L2-fallback is the one to
 			// alert on: it means the raw-L2 path failed (CAP_NET_RAW,

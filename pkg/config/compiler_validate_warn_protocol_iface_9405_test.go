@@ -35,7 +35,7 @@ interfaces {
         unit 0 { family inet { address 10.0.1.1/24; } }
     }
     ge-0/0/2 {
-        redundant-parent reth0;
+        gigether-options { redundant-parent reth0; }
     }
     reth0 {
         unit 0 { family inet { address 10.0.2.1/24; } }

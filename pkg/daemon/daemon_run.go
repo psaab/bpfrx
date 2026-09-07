@@ -499,8 +499,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// becomes master starts relaying immediately. Standalone / non-RG-owned
 	// interfaces always relay (the gate returns true).
 	d.dhcpRelay.SetMasterGate(d.relayMasterGateOpen)
+	// Boot goes through the SAME reconcile the day-2 commit path uses (#9406)
+	// rather than calling Apply directly. Apply needs an interface-name
+	// resolver wired for the config being applied, and two call sites is two
+	// places to forget it — the boot one being the one that matters, since a
+	// box that boots with a relay configured never sees a commit. d.daemonCtx
+	// is already set (line 72) and is the ctx this call passed anyway.
 	if cfg := d.store.ActiveConfig(); cfg != nil {
-		d.dhcpRelay.Apply(ctx, cfg.ForwardingOptions.DHCPRelay)
+		d.reconcileDHCPRelay(cfg)
 	}
 
 	// Port mirroring

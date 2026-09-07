@@ -1774,6 +1774,11 @@ func ValidateConfig(cfg *Config) []string {
 	// #4309 (fable-review-167 I-4): DHCP relay overrides accepted-only advisory.
 	warnings = append(warnings, validateDHCPRelayParityWarnings(cfg)...)
 
+	// #9406: a relay group member that names no configured interface or unit
+	// binds nothing, and the runtime cannot say so — it retries forever and
+	// reports as a started service with all-zero counters.
+	warnings = append(warnings, validateDHCPRelayInterfaceRefWarnings(cfg)...)
+
 	// #4455 (HI-1): a zone that admits a multicast routing protocol relies on the
 	// kernel input-chain `policy accept` fall-through to deliver that protocol's
 	// host-bound multicast PACKET-WIDE (not scoped to the zone's ingress
