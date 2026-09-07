@@ -8601,12 +8601,16 @@ fn inert_screen_profiles_reach_the_forwarding_state_7888() {
         screen_inert_profile_zones: vec![crate::ScreenMissingProfileRef {
             zone: "trust".into(),
             profile: "p".into(),
+            alarm_without_drop: false,
         }],
         ..Default::default()
     };
     let state = build_forwarding_state(&snapshot);
     assert_eq!(
-        state.screen_inert_profiles.get("trust").map(String::as_str),
+        state
+            .screen_inert_profiles
+            .get("trust")
+            .map(|r| r.profile.as_str()),
         Some("p"),
         "the inert set must reach the forwarding state with its profile name intact — the \
          runtime WARN names the profile, and a WARN that cannot name it sends the operator \
@@ -8628,6 +8632,7 @@ fn undefined_screen_profiles_do_not_leak_into_the_inert_map_7888() {
         screen_missing_profile_zones: vec![crate::ScreenMissingProfileRef {
             zone: "trust".into(),
             profile: "ghost".into(),
+            alarm_without_drop: false,
         }],
         ..Default::default()
     };

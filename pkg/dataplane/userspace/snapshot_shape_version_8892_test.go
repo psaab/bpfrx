@@ -115,8 +115,8 @@ func shapeDigest8892(t *testing.T) (string, int) {
 // this cell whether or not the author was thinking about the helper -- and the
 // gate that catches it is `go test ./...`, not the packages the diff touched.
 const (
-	snapshotShapeGolden8892  = "55f649e57165590eccb5ae4b07f439b4bbd3f67e1d059334d599d01e551e0ff2"
-	snapshotShapeVersion8892 = 10
+	snapshotShapeGolden8892  = "2d484660b1ab90528770d0f7f72987c5731027e0a5c9eed380364af383477e82"
+	snapshotShapeVersion8892 = 11
 )
 
 func TestSnapshotShapeIsPinnedToProtocolVersion8892(t *testing.T) {
