@@ -41,3 +41,25 @@
   mutation, report relocation, or live firewall operation was performed.
 - **Local file edit**: Created this action log; preserved the pending canonical
   skill and action-log changes from the preceding work.
+
+## Validation of the /var/tmp storage contract (muse-xpf)
+
+- **Timestamp**: 2026-09-07 05:11:32 UTC
+- **Action**: Validated the committed /var/tmp storage contract in this
+  checkout, found the identical bundle already on origin/master
+  (`ddd270ade`, #9356), and withdrew the redundant local commit.
+- **Detail**: Re-derived the bundle revisions of
+  `.claude/skills/deep-review/SKILL.md`,
+  `.claude/skills/deep-review/references/review-contract.md` and
+  `scripts/review-dedup-check.py` for comparison; all seven
+  skill/script files compared byte-identical to the pushed bundle, so
+  the local commit was dropped instead of pushed. Edit made in the
+  dedicated `muse-xpf-skill-log` worktree, not the control checkout.
+- **Validation**:
+  - `python3 -B scripts/test_review_storage.py`: 18 tests pass
+    (14 failed against the pre-bundle dedup helper).
+  - `git diff --check`: clean.
+  - Audited every `/tmp` reference in the deep-review skill: legacy
+    reads, migration coordination, and explicit never-write rules
+    only. All local Markdown cross-references resolve.
+- **File(s)**: `docs/log/review-skill-activation.md` (this note only).
