@@ -25,6 +25,13 @@ use super::*;
 /// DF bit set. `l3_payload` is the total L3 length excluding the 14-byte
 /// Ethernet header.
 fn large_udp_v4_df_frame(l3_payload: usize) -> Vec<u8> {
+    large_udp_v4_frame(l3_payload, true)
+}
+
+/// #9328: the same builder with the DF bit parameterised, so a cell can drive
+/// the DF-CLEAR oversize case — the population that is forwarded at full length
+/// and, before #9328, booked as a plain successful forward.
+fn large_udp_v4_frame(l3_payload: usize, df: bool) -> Vec<u8> {
     assert!(l3_payload >= 28, "need room for IP+UDP headers");
     let mut frame = Vec::with_capacity(14 + l3_payload);
     // L2: dst = firewall NIC, src = sender. EtherType IPv4.
@@ -36,7 +43,7 @@ fn large_udp_v4_df_frame(l3_payload: usize) -> Vec<u8> {
     frame.push(0x00);
     frame.extend_from_slice(&(l3_payload as u16).to_be_bytes());
     frame.extend_from_slice(&[0x00, 0x01]); // ID
-    frame.extend_from_slice(&0x4000u16.to_be_bytes()); // DF=1
+    frame.extend_from_slice(&(if df { 0x4000u16 } else { 0x0000u16 }).to_be_bytes());
     frame.extend_from_slice(&[64, 17, 0x00, 0x00]); // TTL, proto UDP, csum
     frame.extend_from_slice(&[198, 51, 100, 20]); // src
     frame.extend_from_slice(&[203, 0, 113, 9]); // dst
@@ -107,13 +114,27 @@ fn run_ptb_dispatch_with_forwarding_and_vlan(
     BatchCounters,
     Vec<String>,
 ) {
+    run_ptb_dispatch_full(forwarding, ingress_vlan_id, true)
+}
+
+/// #9328: the harness with the ingress frame's DF bit parameterised.
+fn run_ptb_dispatch_full(
+    forwarding: ForwardingState,
+    ingress_vlan_id: u16,
+    df: bool,
+) -> (
+    Vec<BindingWorker>,
+    DebugPollCounters,
+    BatchCounters,
+    Vec<String>,
+) {
     let mut bindings = vec![
         BindingWorker::new_for_mirror_test(0, 0, 11, 0),
         BindingWorker::new_for_mirror_test(1, 0, 22, 0),
     ];
     // 1600-byte L3 payload -> 1614-byte frame. Fits a 4096 UMEM frame but
     // exceeds a 1400 egress MTU.
-    let frame = large_udp_v4_df_frame(1600);
+    let frame = large_udp_v4_frame(1600, df);
     unsafe { bindings[0].umem.area().slice_mut_unchecked(0, frame.len()) }
         .expect("ingress frame")
         .copy_from_slice(&frame);
@@ -288,7 +309,8 @@ fn forwarding_for_ptb_with_output_term(
         }],
         "",
         "",
-    ).expect("filter state compiles");
+    )
+    .expect("filter state compiles");
     forwarding.tx_selection_enabled_v4 = true;
     forwarding
 }
@@ -541,8 +563,8 @@ fn ptb_parse_failure_fails_closed_with_parse_error_verdict() {
 #[test]
 fn ptb_unbuildable_missing_egress_does_not_drain_token_5567() {
     use crate::afxdp::icmp_ratelimit::{
-        GeneratedErrorReason, allow_generated_error_at, global_bucket_test_lock,
-        rate_limited_count, reset_bucket_for_test,
+        allow_generated_error_at, global_bucket_test_lock, rate_limited_count,
+        reset_bucket_for_test, GeneratedErrorReason,
     };
     let _g = global_bucket_test_lock();
     let far_future = u64::MAX / 2;
@@ -587,8 +609,8 @@ fn ptb_unbuildable_missing_egress_does_not_drain_token_5567() {
 #[test]
 fn ptb_buildable_respects_and_consumes_token_5567() {
     use crate::afxdp::icmp_ratelimit::{
-        GeneratedErrorReason, allow_generated_error_at, global_bucket_test_lock,
-        rate_limited_count, reset_bucket_for_test,
+        allow_generated_error_at, global_bucket_test_lock, rate_limited_count,
+        reset_bucket_for_test, GeneratedErrorReason,
     };
     let _g = global_bucket_test_lock();
 
@@ -628,4 +650,72 @@ fn ptb_buildable_respects_and_consumes_token_5567() {
     );
     assert!(reasons.iter().any(|r| r == "egress_mtu_exceeded"));
     reset_bucket_for_test(GeneratedErrorReason::PacketTooBig, 0);
+}
+
+/// #9328: an oversized DF-CLEAR IPv4 datagram is FORWARDED at full length and
+/// must now be COUNTED, not booked as a plain successful forward.
+///
+/// This binds the CALL SITE. Measured: with only the decision-level cell in
+/// `icmp_ptb_tests.rs`, severing the `record_exception` in the dispatcher
+/// SURVIVED — that cell proves the decision is distinguishable and says nothing
+/// about whether anything acts on it. Fifth instance of that shape in this
+/// campaign, and the reason the counter is the whole deliverable here: a
+/// distinguishable decision nothing records is exactly the silence being fixed.
+///
+/// Behaviour is deliberately UNCHANGED: the frame still forwards, and no PTB is
+/// generated (ICMP Fragmentation-Needed is meaningful only to a sender that set
+/// DF, and this one did not). What changes is that the outcome stops looking
+/// healthy.
+#[test]
+fn oversized_no_df_is_forwarded_and_counted_9328() {
+    let (bindings, _dbg, _counters, reasons) =
+        run_ptb_dispatch_full(forwarding_for_ptb(1400), 0, false);
+
+    assert!(
+        reasons
+            .iter()
+            .any(|r| r == "egress_mtu_exceeded_forwarded_no_df"),
+        "#9328: an oversized DF-clear datagram forwarded at full length must be \
+         recorded. Before this it bumped enqueue_ok / tx_bytes_total and nothing \
+         else, so an operator debugging the downstream blackhole saw a HEALTHY \
+         counter — a wrong diagnostic, not a missing one. reasons: {reasons:?}"
+    );
+    // NO PTB: the sender did not set DF and would not act on one. This is the
+    // #2301 decision and it is unchanged.
+    assert_eq!(
+        bindings[0].tx_pipeline.pending_tx_local.len(),
+        0,
+        "a DF-clear sender must not be PTB-stormed"
+    );
+    assert!(
+        !reasons.iter().any(|r| r == "egress_mtu_exceeded"),
+        "the DF-set exception must NOT fire for a DF-clear frame, or the two \
+         populations are indistinguishable in the counters too: {reasons:?}"
+    );
+    // STILL FORWARDED. The policy question (fragment / drop / keep forwarding)
+    // is not taken here, so the frame must still reach the egress binding —
+    // silently changing it to a drop on an unmeasured population is how a
+    // counter-only fix becomes a forwarding regression.
+    let egress_tx = bindings[1].tx_pipeline.pending_tx_local.len()
+        + bindings[1].tx_pipeline.pending_tx_prepared.len();
+    assert_eq!(
+        egress_tx, 1,
+        "the oversized DF-clear frame must still be forwarded — #9328 adds a \
+         counter, not a drop"
+    );
+}
+
+/// CONTROL: an in-MTU DF-clear frame records NOTHING. Without it, an exception
+/// that fired on every forward would satisfy the cell above and drown the
+/// signal it exists to provide.
+#[test]
+fn in_mtu_no_df_records_no_exception_9328() {
+    let (_bindings, _dbg, _counters, reasons) =
+        run_ptb_dispatch_full(forwarding_for_ptb(9000), 0, false);
+    assert!(
+        !reasons
+            .iter()
+            .any(|r| r == "egress_mtu_exceeded_forwarded_no_df"),
+        "an in-MTU DF-clear frame must record no oversize exception: {reasons:?}"
+    );
 }
