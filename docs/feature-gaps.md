@@ -329,6 +329,43 @@ counter. SYN-cookie flood protection (`security flow syn-flood-protection-mode
 syn-cookie`) is a separate stateless mechanism, not one of the 16. These are
 additional vSRX screen options.
 
+### `tear-drop` scope, and what it deliberately does NOT detect (#9426)
+
+`check_teardrop` drops a non-first fragment that carries **zero or under-length**
+payload, and a non-first **NON-LAST** fragment carrying fewer than 8 data bytes.
+The More-Fragments bit is the discriminator (IPv4 `0x2000`; IPv6 the Fragment
+header's low bit), read off the raw `ip_frag_off` the struct already carried.
+
+Before #9426 the `< 8` test applied to **every** non-first fragment, and its
+comment called that "the classic overlapping-fragment signature". That was wrong
+twice: a tiny tail is not an overlapping fragment, and the tiny-fragment
+heuristic it resembles is RFC 1858's, which applies to the **first** fragment.
+The cost was legal traffic — every IP fragment except the last must be an 8-byte
+multiple, and the last may be any size, so an IPv4 datagram whose length mod 1480
+lands in 1-7 produces a **legal** 1-7 byte last fragment that the screen dropped.
+The receiver's reassembly then times out and the whole datagram is lost. No
+attacker is required: any UDP application that fragments (DNS with large
+responses, IKE, RADIUS, NFS, VXLAN, GTP) emits one for about 0.5% of datagram
+sizes — deterministically per size, so an application with a fixed message size
+is either always broken or never affected. It compounded with `conservative_default()`,
+which enables `teardrop`, so a zone the operator never intended to enforce
+teardrop on could drop these tails (#7168/#7888).
+
+Juniper specifies `tear-drop` as **overlap** detection — "when the sum of the
+offset and size of one fragmented packet differs from that of the next
+fragmented packet, the packets overlap… The tear-drop IDS option identifies and
+drops fragmented IP packets that overlap" — and says nothing about tiny tails, so
+xpf was dropping traffic SRX does not.
+
+**Still a gap, deliberately:** this is not an overlap detector. Detecting a real
+teardrop needs offset/length state across fragments, and the only fragment-state
+module in the tree (`userspace-dp/src/fragment_assoc/`) states in its own doc
+that it ASSOCIATES rather than RFC-reassembles — it carries a first fragment's
+policy decision to its tails for NAT64. That is a design limitation of a
+stateless screen and is scoped OUT of #9426, which fixed the false positive
+only. Recorded here rather than left in the code comment, which asserted the
+opposite.
+
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
 | **Session Limiting (source-ip)** | `security screen ids-option ... limit-session source-ip-based N` | Limit max concurrent sessions from single source IP (1-8M). Prevents session table exhaustion. | High | **Done** (#2134) -- the userspace dataplane `SessionTable` keeps a per-source-IP count of PRESENT forward sessions (incremented at the two create sinks -- fresh install AND peer-synced import (#3122) -- decremented at the sole removal sink, evict-on-zero; the in-place HA promote/demote origin flips are count-neutral). **#3122:** the count is origin-agnostic -- HA-peer-synced sessions count too, so the limit stays enforced after a failover (previously synced sessions were excluded, letting a client exceed its cap on the standby-turned-active -- a limit bypass). The limit is enforced at the new-flow / session-MISS decision in `poll_descriptor`: the (limit+1)-th new flow from an over-limit IP is dropped + counted (`session-limit-src`). Pre-#2134 the count was computed but never wired, so the limit was a no-op. **Per-worker cap (#2186):** the count is maintained per-worker (per RX queue), so with RSS the effective admitted cap is `N × configured` where N = number of RX queues/workers (live: `limit 2` admitted 12 on a 6-worker cluster) -- consistent with the rest of the per-worker dataplane, NOT a global cap. Size the configured value as a per-worker ceiling. |
