@@ -26,7 +26,7 @@ func TestComputeDesired_DropsIPv6Server_5557(t *testing.T) {
 		},
 	}
 
-	desired := computeDesired(cfg)
+	desired := computeDesired(cfg, nil)
 	dr, ok := desired["ge-0-0-0"]
 	if !ok {
 		t.Fatal("computeDesired: no relay entry for ge-0-0-0")
