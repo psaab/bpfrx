@@ -26,7 +26,40 @@ func (m *Manager) hasBusyBindingsWedgeLocked(repaired bool) bool {
 	if !m.lastStatus.ForwardingArmed || m.deferWorkers {
 		return false
 	}
-	if m.xskLivenessProven || m.xskLivenessFailed {
+	// #9331: `m.xskLivenessProven` used to sit in this condition, and it is
+	// BOX-WIDE. On any box where at least ONE queue ever proved live — every
+	// healthy box — wedge detection was therefore off for EVERY queue, so a
+	// queue that binds and then goes RX-dead, or one of sixteen that never
+	// bound while the other fifteen did, was never detected and never
+	// repaired. The tree already stated the masking in two places written for
+	// other work (`pkg/api/metrics_dataplane_silent_skips_9019.go`,
+	// `process_napi.go`). Combined with #8384 — binding readiness cannot see a
+	// bound-but-dead queue — a masked queue had NO detection, NO recovery and
+	// NO readiness signal: the box reports healthy and silently drops whatever
+	// RSS hashes to it.
+	//
+	// THE ISSUE PROPOSED PER-BINDING LIVENESS HERE. It is not implemented,
+	// because measuring it showed both readings are wrong:
+	//
+	//   * REPORTED per-binding RX is VACUOUS. `zero_unbound_slot`
+	//     (userspace-dp coordinator/refresh_bindings.rs) sets
+	//     `binding.rx_packets = 0` on every unbound slot, so a binding that is
+	//     registered+armed+unbound ALWAYS reports RX 0. A "has this binding
+	//     received" term would be false for every binding this predicate can
+	//     count, i.e. dead code.
+	//   * REMEMBERED per-binding liveness is HARMFUL. A map that survives the
+	//     unbind would exclude precisely the binding that WAS live and went
+	//     RX-dead — the exact case #9331 exists to detect — turning the fix
+	//     into a new mask with the same shape as the old one.
+	//
+	// What actually answers "is this queue live" is already in the loop below
+	// and is per-binding by construction: `Registered && Armed && !Bound`. An
+	// unbound binding is not receiving; no extra liveness term can say more.
+	//
+	// `xskLivenessFailed` STAYS, and stays box-wide, because it is a different
+	// claim: XSK is proven broken for this box, so a rebind cannot repair
+	// anything and firing one only tears down whatever still works.
+	if m.xskLivenessFailed {
 		return false
 	}
 	bindings := m.lastStatus.Bindings
@@ -136,6 +169,32 @@ func (m *Manager) hasBusyBindingsWedgeLocked(repaired bool) bool {
 // rebind is repeating an action that has already failed twice for a fault it
 // evidently cannot repair, and continuing buys nothing while tearing down every
 // healthy binding on each attempt.
+//
+// #9331 RE-DERIVED THIS RATHER THAN INHERITING IT, because removing the
+// box-wide liveness gate widens when the predicate can fire — it can now be
+// true on a box that has proven live, which it never could before.
+//
+// The derivation survives, and its cost term gets STRONGER. What a rebind can
+// repair is unchanged: a teardown race, which resolves within one retry. What
+// changes is what an attempt costs. Before #9331 the predicate could only fire
+// while the box had proven nothing, so a rebind tore down bindings that were
+// not yet known to work. Now it can fire on a box with fifteen healthy queues
+// and one wedged one, and the rebind is GLOBAL (`handlers/rebind.rs`) — it
+// tears down all sixteen. So "beyond that a rebind is repeating an action that
+// has already failed twice" now costs proven-good forwarding, and three is if
+// anything generous rather than tight.
+//
+// The budget is per-BOX and per-EPISODE, not per-wedge, and that is deliberate
+// under per-binding detection: the rebind is one global action whatever set of
+// bindings is wedged, so N simultaneous wedges still consume one attempt per
+// cycle, not N. `consecutiveFailedAutoRebinds` resets when the predicate goes
+// false, so a cleared wedge restores the full budget for the next one.
+//
+// What per-binding detection DOES change is how often the predicate stays
+// true: a single durable single-queue wedge now holds it true indefinitely
+// instead of being masked, so the counter reaches the cap, gives up once, and
+// stays given-up until the wedge clears. That is the intended behaviour and it
+// is observable — the give-up arm bumps the #9043 counter.
 //
 // THAT DERIVATION IS NOT ENFORCED BY ANY TEST. The cells read this constant on
 // both sides of their assertions — deliberately, so a legitimate retune does

@@ -90,9 +90,16 @@ func (m *Manager) bootstrapNAPIQueuesAsyncLocked(reason string) {
 // successfully". That is what made it expensive rather than merely incomplete,
 // because nothing else covers it either — the binding wedge recovery keys on
 // `Registered && Armed && !Bound`, a bind FAILURE, and its own give-up message
-// records that "binding readiness cannot see a queue that is bound-but-dead";
-// and the XSK liveness gate is box-wide, so one live queue sets
-// `xskLivenessProven` for the whole box and masks a cold one.
+// records that "binding readiness cannot see a queue that is bound-but-dead".
+//
+// The second half of that sentence used to read "and the XSK liveness gate is
+// box-wide, so one live queue sets `xskLivenessProven` for the whole box and
+// masks a cold one". #9331 REMOVED that masking: `xskLivenessProven` is gone
+// from the wedge predicate, which now decides per binding. The point this
+// paragraph is making SURVIVES it — wedge recovery keys on a bind FAILURE, and
+// a queue with no NAPI probe target BINDS FINE and is simply never woken, so it
+// is not a wedge in any sense the predicate can see. That is why this counter
+// is still the only signal for its case.
 //
 // Both lookups now ask for FAMILY_ALL and `deriveNAPIProbeTarget` applies the
 // priority (v4 gateway, v4 neighbour, v6 gateway, v6 neighbour), so an

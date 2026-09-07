@@ -27,9 +27,12 @@ import (
 //     derive a probe target for, so its queues got no synthetic hardware RX
 //     event. Nothing else covers this -- the binding wedge recovery keys on a
 //     bind FAILURE and its own give-up message records that "binding readiness
-//     cannot see a queue that is bound-but-dead", and the XSK liveness gate is
-//     box-wide, so one live queue sets xskLivenessProven for the whole box and
-//     masks a cold one. A non-zero value here is the only signal that a segment
+//     cannot see a queue that is bound-but-dead". (That clause used to continue
+//     "and the XSK liveness gate is box-wide, so one live queue sets
+//     xskLivenessProven for the whole box and masks a cold one"; #9331 removed
+//     that masking. The conclusion is unchanged: a queue with no NAPI probe
+//     target BINDS successfully and is merely never woken, so it is not a wedge
+//     the predicate can see at all.) A non-zero value here is the only signal that a segment
 //     may be silently dropping redirected traffic on a path the shim believes
 //     is healthy.
 //

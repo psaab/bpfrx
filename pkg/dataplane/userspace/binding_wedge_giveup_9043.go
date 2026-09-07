@@ -17,10 +17,16 @@ import "sync/atomic"
 // it is gone from a ring buffer by the time anyone looks, and its absence is
 // indistinguishable from a box that never wedged.
 //
-// The counter does not fix the blind spot — see the box-wide `xskLivenessProven`
-// masking, split out of #9043 as its own issue. It makes the GIVE-UP state
+// The counter does not fix the blind spot; it makes the GIVE-UP state
 // observable, which is the difference between an operator who can ask "is any
 // queue in this state" and one who has to already suspect it.
+//
+// The blind spot itself — the box-wide `xskLivenessProven` masking split out of
+// #9043 — was closed by #9331, which removed that flag from the wedge
+// predicate. This counter is what keeps the newly-detected wedges observable
+// once recovery exhausts its budget on them, and
+// `TestTheGiveupCounterMovesForAPreviouslyMaskedWedge9331` binds the two
+// together.
 var bindingWedgeGiveups atomic.Uint64
 
 // BindingWedgeGiveups reports the process-lifetime count of auto-rebind
