@@ -230,7 +230,17 @@ fn reserve_synced_source_nat_allocation_with_holder(
         src_ip: key.src_ip,
         dst_ip: nat.rewrite_dst.unwrap_or(key.dst_ip),
         src_port: key.src_port,
-        dst_port: key.dst_port,
+        // #9388: the POST-DNAT destination port. See the twin line in
+        // `release.rs` for the full reasoning — this is the RESERVE half of the
+        // same record, and the two must be keyed identically or the standby
+        // books a reservation the active's teardown can never free. It also
+        // feeds PASS 1's `matches_ignoring_scope` filter below, so with the
+        // pre-translation port the standby could select a rule the active never
+        // matched whenever two rule-sets discriminate on `match
+        // destination-port`.
+        //
+        // MUST move together with `release.rs`.
+        dst_port: nat.rewrite_dst_port.unwrap_or(key.dst_port),
         // #9062: the same domain the session layer stamped, so this key matches
         // the one the match path built.
         routing_scope: key.routing_domain,
@@ -238,7 +248,12 @@ fn reserve_synced_source_nat_allocation_with_holder(
     // #6211 PASS 1 — reserve on a rule the ACTIVE node could actually have
     // matched. `flow` is byte-identical to the active's SNAT-match tuple
     // (`nat_match_flow.forward_key` in `poll_descriptor`: original source,
-    // POST-DNAT destination, original ports), so feeding it back through the
+    // POST-DNAT destination ADDRESS **and PORT**, original source port).
+    // #9388: the port half of that claim was FALSE between #9034 and #9388 —
+    // #9034 moved the active's match/allocate tuple onto `policy_dst_port`
+    // while this key stayed on the pre-translation `key.dst_port`. It is true
+    // again because the `dst_port` line above now reads `rewrite_dst_port`.
+    // Feeding it back through the
     // SAME `matches_*` predicate reproduces the active's rule choice on every
     // axis the standby can see — and, like the active's
     // `match_source_nat_result_for_tuple`, takes the FIRST matching rule in

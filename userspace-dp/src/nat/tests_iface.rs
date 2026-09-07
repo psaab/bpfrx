@@ -740,3 +740,104 @@ fn interface_snat_registry_resolves_one_allocator_per_address_6751() {
     );
     assert_eq!(reg.retained_len(), 2);
 }
+
+// #9388 — the interface-mode identity leaks on exactly the same key miss.
+//
+// `release_source_nat_allocation_with_mode` builds ONE `flow` and uses it for
+// both the pool sweep and the interface-registry free 90 lines below, so a
+// key that misses `live_by_flow` in the pool domain misses the interface
+// registry identically. Interface-mode SNAT composed with a port-moving DNAT
+// therefore held its translated identity for the node's lifetime, and the
+// registry's capacity check (`allocate_interface_identity`, allocator.rs) is
+// what eventually refuses new admissions.
+//
+// The admission runs through the real `match_source_nat_result_for_tuple`
+// entry point on the POST-DNAT tuple (10.10.10.7:8443) — what `policy_dst_port`
+// carries since #9034 — and the teardown through the INSTALLED session key
+// (198.51.100.7:443).
+//
+// POSITIVE CONTROL, same run, same helpers: the address-only DNAT (no port
+// move) frees. It is green on both sides of #9388 and is what separates "the
+// release is broken" from "this fixture never minted anything".
+#[test]
+fn interface_snat_9388_release_frees_a_post_dnat_port_identity() {
+    let rules = iface_rules();
+    let post_dnat_dst = "10.10.10.7";
+    let orig_dst = "198.51.100.7";
+
+    // CONTROL: DNAT rewrites the ADDRESS only, so the wire port and the policy
+    // port agree and the pre-#9388 key was already correct.
+    {
+        let reg = InterfaceNatAllocators::default();
+        let mut nat = decision(admit(
+            &reg,
+            &rules,
+            "10.0.61.101",
+            5555,
+            post_dnat_dst,
+            443,
+            PROTO_TCP_U8,
+            false,
+        ));
+        nat.rewrite_dst = Some(post_dnat_dst.parse().unwrap());
+        nat.rewrite_dst_port = None;
+        let alloc = reg
+            .allocator_if_present(EGRESS.parse().unwrap())
+            .expect("the admission must have created the egress allocator");
+        assert_eq!(alloc.live_flow_count(), 1);
+
+        release_source_nat_allocation(
+            &reg,
+            &rules,
+            &key("10.0.61.101", 5555, orig_dst, 443),
+            nat,
+            false,
+            2_000,
+        );
+        assert_eq!(
+            alloc.live_flow_count(),
+            0,
+            "CONTROL: an address-only DNAT must still free the identity"
+        );
+    }
+
+    // UNDER TEST: the DNAT moves the port (443 -> 8443).
+    let reg = InterfaceNatAllocators::default();
+    let mut nat = decision(admit(
+        &reg,
+        &rules,
+        "10.0.61.101",
+        5555,
+        post_dnat_dst,
+        8443,
+        PROTO_TCP_U8,
+        false,
+    ));
+    nat.rewrite_dst = Some(post_dnat_dst.parse().unwrap());
+    nat.rewrite_dst_port = Some(8443);
+    let alloc = reg
+        .allocator_if_present(EGRESS.parse().unwrap())
+        .expect("the admission must have created the egress allocator");
+    assert_eq!(
+        alloc.live_flow_count(),
+        1,
+        "fixture premise: the admission recorded exactly one interface identity"
+    );
+
+    release_source_nat_allocation(
+        &reg,
+        &rules,
+        // The INSTALLED session key: the ORIGINAL, pre-DNAT destination.
+        &key("10.0.61.101", 5555, orig_dst, 443),
+        nat,
+        false,
+        2_000,
+    );
+    assert_eq!(
+        alloc.live_flow_count(),
+        0,
+        "#9388: the interface-mode identity free shares the pool sweep's `flow` \
+         key, so it misses on the same pre-translation dst_port and holds the \
+         translated identity for the node's lifetime"
+    );
+}
