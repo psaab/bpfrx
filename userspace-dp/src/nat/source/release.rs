@@ -213,7 +213,32 @@ fn release_source_nat_allocation_with_mode(
         src_ip: key.src_ip,
         dst_ip: nat.rewrite_dst.unwrap_or(key.dst_ip),
         src_port: key.src_port,
-        dst_port: key.dst_port,
+        // #9388: the POST-DNAT destination port, for the same reason the line
+        // above takes the post-DNAT destination ADDRESS. #9034 moved the
+        // source-NAT match/allocate call site onto `policy_dst_port`
+        // (`pre_routing_dnat.rewrite_dst_port.unwrap_or(forward_key.dst_port)`,
+        // `afxdp/poll_descriptor/mod.rs`), so `live_by_flow` is now INSERTED
+        // under the translated port. This teardown is handed the installed
+        // `SessionKey`, whose `dst_port` is the ORIGINAL wire port, so keeping
+        // it here made every ordinary expiry of a port-moving twice-NAT flow
+        // (`198.51.100.7:443` -> `10.10.10.7:8443`, the VIP shape) miss the
+        // record it was meant to free — a permanent `(pool_addr, port)` +
+        // `live_by_flow` slot leak counted against `max_tracked_flows`, and, on
+        // a `persistent-nat` rule, a lease refcount that never reaches idle so
+        // no GC path can reclaim the pinned pool ADDRESS either. It also leaks
+        // the interface-mode identity 90 lines below, which shares this `flow`.
+        //
+        // Idempotent on the ROLLBACK callers, which pass
+        // `nat_match_flow.forward_key` (already post-DNAT on BOTH axes): there
+        // `rewrite_dst_port` either equals `key.dst_port` or is `None`, so this
+        // reproduces the value #9034's own analysis relies on.
+        //
+        // MUST move together with the identical line in `synced.rs` — the two
+        // sites are the reserve and the release of ONE record, and fixing
+        // either alone leaves them keyed differently while the whole `nat::`
+        // suite stays green. `snat_9388_reserve_and_release_agree_on_post_dnat_port`
+        // is the cell that reds on a one-file landing.
+        dst_port: nat.rewrite_dst_port.unwrap_or(key.dst_port),
         // #9062: the same domain the session layer stamped, so this key matches
         // the one the match path built.
         routing_scope: key.routing_domain,

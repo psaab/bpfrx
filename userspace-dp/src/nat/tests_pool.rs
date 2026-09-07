@@ -11396,3 +11396,219 @@ fn the_recycled_phase_does_not_amortize_at_f_equals_one_9327() {
         "NON-VACUITY: a single claim cannot show whether the cost amortizes"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #9388 — the source-NAT allocation key must carry the POST-DNAT destination
+// PORT on the teardown and HA-reserve sites, because #9034 moved the
+// match/allocate site onto it.
+//
+// Shape of the defect: `poll_descriptor` allocates under
+// `nat_match_flow.forward_key`, whose `dst_port` is
+// `pre_routing_dnat.rewrite_dst_port.unwrap_or(wire dst_port)`, while the
+// session is installed under the UNTRANSLATED `flow.forward_key`. Every
+// post-install site (expiry, delete, promote, synced upsert/delete, worker
+// sweep, HA import) rebuilds the allocation key from that installed
+// `SessionKey` and, before this change, corrected the destination ADDRESS and
+// left the PORT — so on the ordinary port-translating VIP shape
+// (198.51.100.7:443 -> 10.10.10.7:8443) the release looked up a key nothing
+// was ever stored under.
+// ---------------------------------------------------------------------------
+
+/// Build the pool rule the two #9388 cells share: one address, a 100-port
+/// range, matching any source in `lan -> wan`.
+fn pool_rule_9388() -> Vec<SourceNatRule> {
+    parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "snat-9388".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "pool-9388".to_string(),
+        pool_addresses: vec!["203.0.113.10/32".to_string()],
+        port_low: 20000,
+        port_high: 20099,
+        ..SourceNATRuleSnapshot::default()
+    }])
+}
+
+/// Run the PRODUCTION allocate site's tuple through the real match/allocate
+/// entry point. `dst_port` here is `policy_dst_port` — what
+/// `afxdp/poll_descriptor` passes since #9034.
+fn allocate_9388(rules: &[SourceNatRule], dst_ip: &str, dst_port: u16) -> NatDecision {
+    let mut counter = None;
+    expect_snat_decision(match_source_nat_result_for_tuple(
+        &InterfaceNatAllocators::default(),
+        rules,
+        &NatScopeCtx::default(),
+        "lan",
+        "wan",
+        "10.0.61.50".parse().expect("src"),
+        dst_ip.parse().expect("dst"),
+        Some(PROTO_TCP),
+        40000,
+        dst_port,
+        None,
+        None,
+        1_000,
+        false,
+        false,
+        NatHolder::Untracked,
+        &mut counter,
+    ))
+}
+
+// #9388 CELL 1 — THE DEFECT ITSELF. RED at the parent of this change.
+//
+// The allocation is made through the real match path on the POST-DNAT tuple
+// (10.10.10.7:8443, what `policy_dst_port` carries), and torn down through
+// `release_source_nat_allocation` with the INSTALLED `SessionKey`
+// (198.51.100.7:443) plus the composed decision that names both halves of the
+// destination rewrite. Before #9388 the release built `dst_port = 443`, missed
+// `live_by_flow`, freed nothing, and left the `(pool_addr, port)` held for the
+// process lifetime.
+//
+// The POSITIVE CONTROL runs in the same test with the same helpers and the
+// same assertions, differing ONLY in that the DNAT does not move the port. It
+// is what distinguishes "the release path is broken" from "this harness built
+// a decision the allocator never saw" — those are the same observation
+// otherwise, and the control is green on BOTH sides of the fix.
+#[test]
+fn snat_9388_release_frees_a_pool_allocation_made_on_the_post_dnat_port() {
+    // CONTROL: address-only DNAT (198.51.100.7:443 -> 10.10.10.7:443). The
+    // wire port and the policy port agree, so the pre-#9388 key was already
+    // correct here.
+    {
+        let rules = pool_rule_9388();
+        let mut nat = allocate_9388(&rules, "10.10.10.7", 443);
+        nat.rewrite_dst = Some("10.10.10.7".parse().unwrap());
+        nat.rewrite_dst_port = None;
+        let port = nat.rewrite_src_port.expect("TCP must allocate a port");
+        assert_eq!(rules[0].pool_allocator.live_flow_count(), 1);
+
+        let freed = release_source_nat_allocation(
+            &InterfaceNatAllocators::default(),
+            &rules,
+            &session_key_from_src("10.0.61.50", 40000, "198.51.100.7", 443),
+            nat,
+            false,
+            2_000,
+        );
+        assert!(freed, "CONTROL: an address-only DNAT must still free");
+        assert_eq!(rules[0].pool_allocator.live_flow_count(), 0);
+        assert!(
+            !rules[0].pool_allocator.debug_is_port_occupied(0, port),
+            "CONTROL: the pool port must be back on the bitmap"
+        );
+    }
+
+    // UNDER TEST: the DNAT moves the port (443 -> 8443).
+    let rules = pool_rule_9388();
+    let mut nat = allocate_9388(&rules, "10.10.10.7", 8443);
+    nat.rewrite_dst = Some("10.10.10.7".parse().unwrap());
+    nat.rewrite_dst_port = Some(8443);
+    let port = nat.rewrite_src_port.expect("TCP must allocate a port");
+    assert_eq!(
+        rules[0].pool_allocator.live_flow_count(),
+        1,
+        "fixture premise: the allocate path recorded exactly one live flow"
+    );
+
+    let freed = release_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        // The INSTALLED session key: the ORIGINAL, pre-DNAT destination.
+        &session_key_from_src("10.0.61.50", 40000, "198.51.100.7", 443),
+        nat,
+        false,
+        2_000,
+    );
+    assert!(
+        freed,
+        "#9388: the teardown must rebuild the allocation key on the POST-DNAT \
+         destination PORT (8443), the port #9034 moved the allocate site onto. \
+         Keying on the installed SessionKey's pre-translation 443 misses \
+         live_by_flow entirely and leaks the (pool_addr, port) permanently"
+    );
+    assert_eq!(
+        rules[0].pool_allocator.live_flow_count(),
+        0,
+        "#9388: the live_by_flow slot must be reclaimed — it counts against \
+         max_tracked_flows until the allocator reports AllocatorExhausted"
+    );
+    assert!(
+        !rules[0].pool_allocator.debug_is_port_occupied(0, port),
+        "#9388: the pool port bit must be freed — free_translated_port runs \
+         only on the unlink paths this key miss skipped"
+    );
+}
+
+// #9388 CELL 2 — THE TWO-FILE BINDING, and the reason this cell exists at all.
+//
+// `release.rs` and `synced.rs` build the SAME key for the SAME record: one is
+// the standby's reserve, the other is its release. Master keys both on the
+// pre-translation port — wrong, but AGREEING, so this cell is GREEN at the
+// parent. Land the fix in only one of the two files and they disagree, this
+// cell turns RED, and every other cell in the 483-cell `nat::` suite stays
+// green. That asymmetry is the whole point: a one-file landing passes the
+// entire suite while moving the leak from the active onto the standby.
+//
+// Directional by construction — it reds on a `release.rs`-only landing AND on
+// a `synced.rs`-only landing, because it asserts the two sites agree rather
+// than asserting either one's value.
+#[test]
+fn snat_9388_reserve_and_release_agree_on_post_dnat_port() {
+    let rules = pool_rule_9388();
+
+    // The peer's synced row: the installed (pre-DNAT) key plus the composed
+    // decision, exactly what `upsert_synced` hands the reserve.
+    let key = session_key_from_src("10.0.61.50", 40000, "198.51.100.7", 443);
+    let nat = NatDecision {
+        rewrite_src: Some("203.0.113.10".parse().unwrap()),
+        rewrite_src_port: Some(20000),
+        rewrite_dst: Some("10.10.10.7".parse().unwrap()),
+        rewrite_dst_port: Some(8443),
+        ..NatDecision::default()
+    };
+
+    reserve_synced_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &key,
+        nat,
+        false,
+        Some(("lan", "wan")),
+        1_000,
+    );
+    assert!(
+        rules[0].pool_allocator.debug_is_port_occupied(0, 20000),
+        "fixture premise: the synced reserve must have booked the identity"
+    );
+    assert_eq!(rules[0].pool_allocator.live_flow_count(), 1);
+
+    // The SAME row's teardown, through the release site.
+    let freed = release_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &key,
+        nat,
+        false,
+        2_000,
+    );
+    assert!(
+        freed,
+        "#9388 TWO-FILE BINDING: the synced reserve (nat/source/synced.rs) and \
+         the teardown (nat/source/release.rs) key ONE record. Landing the \
+         post-DNAT dst_port in only one of them leaves them disagreeing and \
+         this release frees nothing — while the rest of the nat:: suite stays \
+         green. Both lines move together or neither does"
+    );
+    assert_eq!(
+        rules[0].pool_allocator.live_flow_count(),
+        0,
+        "#9388: a reservation the standby booked must be releasable by the \
+         standby's own teardown"
+    );
+    assert!(
+        !rules[0].pool_allocator.debug_is_port_occupied(0, 20000),
+        "#9388: the reserved pool port must be back on the bitmap"
+    );
+}
