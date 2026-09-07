@@ -2797,11 +2797,11 @@ Consequences to hold on to:
 Active IKE/child-SA connection names ride the session-sync channel so the
 standby can re-initiate the primary's tunnels on takeover:
 
-- **Send** — `syncIPsecSAPeriodic` (`pkg/daemon/daemon_ha.go`) runs on the
-  RG0-primary and, every 30s, reads the active set from
+- **Send** — `syncIPsecSAPeriodic` (`pkg/daemon/daemon_ha.go`) runs on any node
+  primary for ANY redundancy group and, every 30s, reads the active set from
   `ipsec.ActiveConnectionNames()` (live `swanctl --list-sas`) and advertises it
   via `SessionSync.QueueIPsecSA` (wire type `syncMsgIPsecSA`,
-  `encode/decodeIPsecSAPayload`).
+  `encode/decodeIPsecSAPayload`). The gate is `ipsecSAAdvertiseEligible`.
 - **Hold** — the standby stores the peer's set wholesale in `peerIPsecSAs`
   (`sync_conn.go` overwrites, not merges), readable via `PeerIPsecSAs()`.
 - **Full-set ordering (#5706)** — because the set is REPLACED wholesale and both
@@ -2816,8 +2816,47 @@ standby can re-initiate the primary's tunnels on takeover:
   peer's fresh set (lower monotonic incarnation) is re-accepted. A legacy peer
   sends no trailer → `(0,0)` → accept-always (mixed-version compat). See
   `docs/sync-protocol.md` "Full-set state-sync ordering (#5706)".
-- **Re-initiate on takeover** — `reinitiateIPsecSAs` reads `PeerIPsecSAs()` and
-  `InitiateConnection`s each name when this node becomes RG0-primary.
+- **Re-initiate on takeover** — `reinitiateIPsecSAs` reads `PeerIPsecSAs()`,
+  narrows it with `ipsecSAsToReinitiate`, and `InitiateConnection`s what remains.
+  It runs on BOTH takeover edges: `applyRG0OwnershipTransition` for RG0 and
+  `applyRethServicesForRG` for a data RG.
+- **Per-redundancy-group attribution (#9139)** — both halves above were
+  hardcoded to RG0, and active/active is a supported configuration
+  (`docs/active-active-new-connections.md`; `make test-active-active`). In the
+  asymmetric case — RG0 primary node 0, RG1 primary node 1, IPsec anchored on an
+  RG1 reth — NEITHER half ran:
+  - node 1 holds the SAs and short-circuited on `IsLocalPrimary(0)`, so it never
+    advertised;
+  - node 0 advertised its OWN set, which is empty, and `ipsecSASyncAdvertise`
+    suppresses a steady-empty set — nothing on the wire either way;
+  - node 1 dies, node 0 takes RG1, and there is NO RG0 transition (node 0 was
+    already RG0 primary), so `reinitiateIPsecSAs` never fired.
+
+  charon does not cover for it: `pkg/ipsec/policy.go` emits `start_action =
+  start` only for `establish-tunnels immediately`, so on the default setting the
+  tunnel waits for the REMOTE peer. This is the shape #3764 already fixed once
+  for the ip-monitoring overlay in `daemon_ipmon.go`.
+
+  Attribution is evaluated at INITIATE time, not advertise time: a node
+  advertises its whole active set, and the RECEIVER asks whether it owns the
+  redundancy group that owns each connection's `external-interface`
+  (`ipsecConnRedundancyGroup` -> gateway -> reth ->
+  `redundant-ether-options redundancy-group`). That is a local question with a
+  local answer and needs no new wire field. Widening the advertise gate ALONE
+  would be wrong: `reinitiateIPsecSAs` initiates the peer's whole set, so on a
+  per-RG failover where the peer is still ALIVE and still owns another RG, the
+  taking node would raise a second IKE SA to the same remote from a different
+  local address. Trading a missed re-initiation for a duplicate one is not a fix.
+
+  **RG0 need not be DECLARED.** `Manager.UpdateConfig` creates a group only for
+  an RG the config declares, so `IsLocalPrimary(0)` is permanently FALSE on a
+  config carrying only `redundancy-group 1`. An unanchored connection (a gateway
+  on a plain physical port) therefore resolves through `LocalGroupPrimary(0)`
+  (#8640, which distinguishes "not primary" from "no such group") and falls back
+  to "primary for anything" only when RG0 is absent. Where RG0 IS declared the
+  narrower answer is the honest one: a node taking only a data RG while the peer
+  keeps RG0 must not initiate a tunnel bound to an interface the peer still
+  holds.
 - **Empty-set / tunnel-down handling (#4385)** — a NON-EMPTY set is advertised
   every tick (a heartbeat re-push — the only mechanism that seeds a freshly
   reconnected/restarted standby, so it must keep pushing even when unchanged).

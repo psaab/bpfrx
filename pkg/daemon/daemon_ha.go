@@ -817,7 +817,11 @@ func (d *Daemon) handleClusterEvent(ctx context.Context, ev cluster.ClusterEvent
 		})
 	}
 
-	// RG0-specific: config ownership and IPsec SA re-initiation.
+	// RG0-specific: config ownership, plus the RG0 half of IPsec SA
+	// re-initiation. #9139: the DATA-RG half lives in applyRethServicesForRG,
+	// and each leg is scoped by ownsIPsecConn to the connections whose external
+	// interface belongs to an RG this node owns — so the two do not overlap and
+	// neither initiates the other's tunnels.
 	if ev.GroupID == 0 {
 		d.applyRG0OwnershipTransition(ev.NewState)
 	}
@@ -1804,6 +1808,27 @@ func (d *Daemon) applyRethServicesForRG(rgID int) {
 	// #2691 P2: a MASTER takeover changes which RG scopes this node may
 	// publish for Surface A too — nudge it to (re)publish its RG records.
 	d.nudgeSurfaceADDNSReconcile()
+
+	// #9139: re-initiate the peer's IPsec SAs that belong to THIS RG.
+	//
+	// This leg did not exist. reinitiateIPsecSAs was wired ONLY to
+	// applyRG0OwnershipTransition(StatePrimary), so on a DATA-RG failover it
+	// never ran — and in the asymmetric case (this node already RG0 primary,
+	// taking RG1 from a dead peer) there is no RG0 transition at all, so
+	// nothing re-initiated the tunnels anchored on the reth whose VIP just
+	// moved here. With the default `establish-tunnels` setting charon emits no
+	// start_action, so the tunnel then waits for the REMOTE peer.
+	//
+	// ownsIPsecConn scopes the set to this RG, so this is not a second
+	// unconditional initiate-everything: RG0's own transition still handles
+	// RG0-anchored connections, and neither leg touches the other's.
+	//
+	// ASYNC for the reason the DHCP lease seed above is async: this runs on the
+	// VRRP event loop, and InitiateConnection shells out to swanctl per
+	// connection. Blocking here delays every subsequent VRRP event on the node.
+	if cc := d.clusterConfig(); cc != nil && cc.IPsecSASync && d.getSessionSync() != nil {
+		go d.reinitiateIPsecSAs()
+	}
 }
 
 // clearRethServicesForRG withdraws RA senders and stops DHCP server only
@@ -2350,15 +2375,41 @@ func ipsecSANextFP(push, sendConfirmed bool, fp, lastFP string) string {
 // a no-op (returns lastFP unchanged) on a non-primary node, when the feature is
 // disabled, when the active-SA read fails, or when the send does not reach an
 // active conn.
+// ipsecSAAdvertiseEligible reports whether this node should be advertising its
+// active IPsec SA set to the peer at all.
+//
+// #9139: IsLocalPrimaryAny(), not IsLocalPrimary(0). Active/active is a
+// supported configuration, and gating on RG0 meant the node that actually HOLDS
+// the SAs — the RG1 primary, when IPsec is anchored on an RG1 reth —
+// short-circuited and never advertised, while the RG0 primary advertised its own
+// empty set (which ipsecSASyncAdvertise then suppresses). The standby therefore
+// learned nothing and re-initiated nothing on failover. This mirrors #3764,
+// which replaced a lowest-data-RG gate with IsLocalPrimaryAny() in
+// daemon_ipmon.go for the identical reason.
+//
+// Extracted from advertiseIPsecSAOnce so the GATE can be driven without a live
+// swanctl: the rest of that function shells out, and a gate nothing can exercise
+// is how this one was wrong for so long.
+func (d *Daemon) ipsecSAAdvertiseEligible() bool {
+	if d.cluster == nil {
+		return false
+	}
+	return d.cluster.IsLocalPrimaryAny()
+}
+
 func (d *Daemon) advertiseIPsecSAOnce(lastFP string, force bool) string {
-	if d.cluster == nil || !d.cluster.IsLocalPrimary(0) {
+	// The set advertised is this node's WHOLE active set. Attribution to a
+	// specific RG happens at INITIATE time (ownsIPsecConn, #9139), because what
+	// matters there is whether the RECEIVER owns the interface the connection
+	// binds to — a local question the sender cannot answer.
+	if !d.ipsecSAAdvertiseEligible() {
 		return lastFP
 	}
 	cc := d.clusterConfig()
 	if cc == nil || !cc.IPsecSASync {
 		return lastFP
 	}
-	names, err := d.ipsec.ActiveConnectionNames()
+	names, err := d.ipsecActiveNames()
 	if err != nil {
 		slog.Debug("cluster: failed to get IPsec connection names", "err", err)
 		return lastFP
@@ -2415,8 +2466,15 @@ func (d *Daemon) syncIPsecSAPeriodic(ctx context.Context) {
 	}
 }
 
-// reinitiateIPsecSAs re-initiates all IPsec connections that were synced from the
-// previous primary. Called when this node becomes primary after failover.
+// reinitiateIPsecSAs re-initiates the IPsec connections synced from the peer
+// that belong to a redundancy group THIS node now owns.
+//
+// Called from BOTH takeover edges (#9139): applyRG0OwnershipTransition for RG0
+// and applyRethServicesForRG for a data RG. It used to be wired to the RG0 edge
+// alone, which never fires on an asymmetric per-RG failover — the node taking
+// RG1 was already RG0 primary, so there was no RG0 transition and no tunnel came
+// back. Both legs call this same function; ownsIPsecConn is what keeps them from
+// initiating each other's connections.
 func (d *Daemon) reinitiateIPsecSAs() {
 	ss := d.getSessionSync()
 	if ss == nil {
@@ -2426,14 +2484,87 @@ func (d *Daemon) reinitiateIPsecSAs() {
 	if len(names) == 0 {
 		return
 	}
-	slog.Info("cluster: re-initiating IPsec SAs after failover", "count", len(names))
-	for _, name := range names {
-		if err := d.ipsec.InitiateConnection(name); err != nil {
+	owned := d.ipsecSAsToReinitiate(names)
+	if len(owned) == 0 {
+		return
+	}
+	slog.Info("cluster: re-initiating IPsec SAs after failover", "count", len(owned))
+	initiate := d.ipsecInitiate
+	for _, name := range owned {
+		if err := initiate(name); err != nil {
 			slog.Warn("cluster: failed to initiate IPsec SA", "name", name, "err", err)
 		} else {
 			slog.Info("cluster: IPsec SA initiated", "name", name)
 		}
 	}
+}
+
+// ipsecSAsToReinitiate filters the peer's advertised set to the connections
+// whose external interface belongs to a redundancy group THIS node owns.
+//
+// #9139: the peer advertises its whole active set, and on a per-RG failover the
+// peer may still be ALIVE and still own another RG — initiating its whole set
+// would raise a second IKE SA to the same remote from a different local address.
+// Trading a missed re-initiation for a duplicate one is not a fix. This also
+// tightens the pre-#9139 RG0 path, which initiated everything the peer
+// advertised regardless of what this node holds.
+//
+// Split from the effect so the DECISION can be driven without swanctl.
+func (d *Daemon) ipsecSAsToReinitiate(names []string) []string {
+	var cfg *config.Config
+	if d.store != nil {
+		cfg = d.store.ActiveConfig()
+	}
+	owned := make([]string, 0, len(names))
+	var skipped []string
+	for _, name := range names {
+		if d.ownsIPsecConn(cfg, name) {
+			owned = append(owned, name)
+		} else {
+			skipped = append(skipped, name)
+		}
+	}
+	if len(skipped) > 0 {
+		// Not a warning: on an asymmetric cluster this is the CORRECT outcome
+		// and it fires on every partial failover. It is logged because a tunnel
+		// that did not come back is the first thing an operator looks for, and
+		// "we deliberately did not initiate it, the peer still owns its RG" is
+		// the answer they need.
+		slog.Info("cluster: skipping peer IPsec SAs whose redundancy group this "+
+			"node does not own", "skipped", skipped)
+	}
+	return owned
+}
+
+// ipsecInitiate is the swanctl call, behind a test seam.
+//
+// #9139 added it because BOTH halves of that fix are wiring — an advertise gate
+// and a per-RG re-initiate CALL SITE — and neither was drivable: d.ipsec is a
+// concrete *ipsec.Manager whose InitiateConnection shells out. Measured, the
+// three mutations that matter (revert the gate, delete the per-RG leg, drop the
+// scoping) all SURVIVED a suite that tested only the filter function. A seam
+// that makes the call site observable is the difference between guarding the
+// fix and guarding a helper the fix happens to call.
+// ipsecActiveNames is the swanctl active-SA read, behind a test seam.
+//
+// #9139: it is the FIRST thing advertiseIPsecSAOnce touches after the gate, so
+// observing whether it was called is how a cell can tell that the gate actually
+// ran. Measured: severing the gate's CALL SITE — leaving the gate function
+// itself perfectly correct and fully unit-tested — SURVIVED the suite. Binding
+// a helper is not binding the wiring that calls it, and this seam is what makes
+// the difference falsifiable.
+func (d *Daemon) ipsecActiveNames() ([]string, error) {
+	if fn := d.ipsecActiveNamesFn; fn != nil {
+		return fn()
+	}
+	return d.ipsec.ActiveConnectionNames()
+}
+
+func (d *Daemon) ipsecInitiate(name string) error {
+	if fn := d.ipsecInitiateFn; fn != nil {
+		return fn(name)
+	}
+	return d.ipsec.InitiateConnection(name)
 }
 
 // desiredStandaloneDHCPConfig returns the DHCP server config the STANDALONE
