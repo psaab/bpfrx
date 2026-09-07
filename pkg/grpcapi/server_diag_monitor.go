@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -416,9 +415,14 @@ func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.S
 
 	// resolveToKernel converts a config-level interface name to its kernel name.
 	// e.g. "ge-0/0/0" → "ge-0-0-0", "reth0" → physical member's kernel name.
+	//
+	// This closure captures the OPEN-time cfg deliberately. It feeds the
+	// stream-ENTRY decisions below (single-interface resolution, the RETH
+	// proxy-to-peer dispatch), which are settled once and must not move
+	// mid-stream — see monitorSummaryInterfaces for the per-tick path and
+	// the reasoning for the split.
 	resolveToKernel := func(cfgName string) string {
-		resolved := cfg.ResolveReth(cfgName)
-		return config.LinuxIfName(resolved)
+		return monitorResolveToKernel(cfg, cfgName)
 	}
 
 	// isRethName returns true if the name is a RETH interface (reth0, reth1, etc).
@@ -494,22 +498,7 @@ func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.S
 	}
 
 	summaryInterfaces := func() ([]string, map[string]string) {
-		if names, kernelNames := monitoriface.TrafficSummaryInterfaces(cfg); len(names) > 0 {
-			return names, kernelNames
-		}
-
-		c := s.store.ActiveConfig()
-		if c == nil || c.Interfaces.Interfaces == nil {
-			return nil, nil
-		}
-		names := make([]string, 0, len(c.Interfaces.Interfaces))
-		kernelNames := make(map[string]string, len(c.Interfaces.Interfaces))
-		for name := range c.Interfaces.Interfaces {
-			names = append(names, name)
-			kernelNames[name] = monitoriface.ResolvePhysicalParent(resolveToKernel(name))
-		}
-		sort.Strings(names)
-		return names, kernelNames
+		return s.monitorSummaryInterfaces(cfg)
 	}
 
 	startTime := time.Now()
