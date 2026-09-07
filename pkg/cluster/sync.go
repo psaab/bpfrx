@@ -304,12 +304,10 @@ type SyncStats struct {
 	// they belonged to a peer boot incarnation that a re-prime has replaced
 	// (#5084 rule 3) — the defect this fence exists to close, made countable.
 	ConfigsDeadIncarnationDropped atomic.Uint64
-	// BulkEndsDeadIncarnationDropped counts BulkEnd frames refused because the
-	// boot incarnation they carried differed from the one that started the bulk
-	// in progress (#9174 V013). A refusal that nothing counts is a refusal
-	// nobody can tell happened — and this one silently changes whether the VRRP
-	// sync hold is released, which is the difference between a standby that is
-	// synced and one that only believes it is.
+	// BulkEndsDeadIncarnationDropped counts BulkEnd frames refused for carrying
+	// a boot incarnation other than the one that started the bulk in progress
+	// (#9174 V013). Counted because the refusal decides whether the VRRP sync
+	// hold is released.
 	BulkEndsDeadIncarnationDropped atomic.Uint64
 	// ConfigsApplyFailed counts config-sync messages that were admitted by the
 	// #3931 ordering guard but whose apply did NOT take effect on this node —
@@ -472,11 +470,9 @@ type SyncStatsSnapshot struct {
 	// both halves are counted: primes that arrived without an incarnation
 	// (the peer is old, or half-upgraded and hiding), and payloads dropped
 	// because their incarnation was replaced (the fence doing its job).
-	BulkPrimesWithoutIncarnation  uint64
-	ConfigsDeadIncarnationDropped uint64
-	// #9174 V013: BulkEnd frames refused for carrying a boot incarnation other
-	// than the one that started the bulk in progress.
-	BulkEndsDeadIncarnationDropped uint64
+	BulkPrimesWithoutIncarnation   uint64
+	ConfigsDeadIncarnationDropped  uint64
+	BulkEndsDeadIncarnationDropped uint64 // #9174 V013
 	// PeerBootIncarnation renders the boot id of the peer incarnation that
 	// most recently primed, or "none". It travels in the snapshot rather than
 	// through a new Manager accessor because the Manager holds only the
@@ -1094,16 +1090,10 @@ type SessionSync struct {
 	bulkInProgress bool
 	bulkRecvEpoch  uint64
 	// bulkRecvIncarnation is the peer boot incarnation that started the bulk
-	// `bulkRecvEpoch` names (#9174 V013). BulkStart has carried the sender's
-	// incarnation since #5084; BulkEnd did not, so the end marker was matched
-	// on EPOCH ALONE — and the peer's epoch counter restarts at zero on reboot,
-	// so a BulkEnd buffered on a dead boot's still-ESTABLISHED socket could
-	// complete the bulk a REPLACEMENT had just started. The standby then
-	// reconciled against a partly-received table and released the VRRP sync
-	// hold. Recorded on the ACCEPTED BulkStart path only, beside bulkRecvEpoch,
-	// and compared in the BulkEnd arm. The zero value means "this bulk was
-	// primed without an incarnation", which fails open exactly as #5084
-	// specifies. Guarded by bulkMu.
+	// `bulkRecvEpoch` names, so a BulkEnd can be matched on more than the epoch
+	// (#9174 V013 — reasoning at the two sites, sync_conn_read.go's BulkEnd arm
+	// and sync_bulk.go's end-marker write). Zero = primed without one, fail
+	// open. Guarded by bulkMu.
 	bulkRecvIncarnation        bootIncarnation
 	bulkRecvV4                 map[dataplane.SessionKey]struct{}
 	bulkRecvV6                 map[dataplane.SessionKeyV6]struct{}
