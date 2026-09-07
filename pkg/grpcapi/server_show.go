@@ -379,7 +379,7 @@ func (s *Server) showText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 
 	case "route-detail":
 		// #1043 Phase 9: case body extracted to server_show_routes_text.go
-		if err := s.showRouteDetail(&buf); err != nil {
+		if err := s.showRouteDetail(ctx, &buf); err != nil {
 			return nil, err
 		}
 
@@ -559,12 +559,12 @@ func (s *Server) showText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 		s.showWireguardPublicKey(&buf)
 
 	case "bfd-peers":
-		if err := s.showBFDPeers(&buf); err != nil {
+		if err := s.showBFDPeers(ctx, &buf); err != nil {
 			return nil, err
 		}
 
 	case "route-map":
-		if err := s.showRouteMap(cfg, &buf); err != nil {
+		if err := s.showRouteMap(ctx, cfg, &buf); err != nil {
 			return nil, err
 		}
 

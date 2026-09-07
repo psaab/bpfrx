@@ -11,6 +11,7 @@
 package grpcapi
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"strings"
@@ -20,8 +21,6 @@ import (
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"github.com/psaab/xpf/pkg/routing"
 	"github.com/psaab/xpf/pkg/termsafe"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 // showRouteAll renders the per-VRF route tables (main + each routing
@@ -89,12 +88,12 @@ func (s *Server) showRouteTerse(buf *strings.Builder) error {
 }
 
 // showRouteDetail renders the FRR JSON-backed detailed route view.
-func (s *Server) showRouteDetail(buf *strings.Builder) error {
+func (s *Server) showRouteDetail(ctx context.Context, buf *strings.Builder) error {
 	if s.frr == nil {
 		fmt.Fprintln(buf, "FRR manager not available")
 		return nil
 	}
-	routes, err := s.frr.GetRouteDetailJSON()
+	routes, err := s.frr.GetRouteDetailJSON(ctx)
 	if err != nil {
 		fmt.Fprintf(buf, "warning: partial route display (some address families unavailable): %v\n", err)
 	}
@@ -115,7 +114,7 @@ func (s *Server) showRouteTable(req *pb.ShowTextRequest, cfg *config.Config, buf
 	} else {
 		entries, err := s.routing.GetTableRoutes(tableName)
 		if err != nil {
-			return nil, status.Errorf(codes.Internal, "get table routes: %v", err)
+			return nil, frrStatusErr("get table routes", err)
 		}
 		if len(entries) == 0 {
 			fmt.Fprintf(buf, "No routes in table %s\n", tableName)
@@ -258,7 +257,7 @@ func (s *Server) showTestRouting(req *pb.ShowTextRequest, buf *strings.Builder) 
 			// failure still has a usable table — warn in-band and continue the
 			// lookup rather than dropping it (#5125).
 			if len(entries) == 0 {
-				return nil, status.Errorf(codes.Internal, "get routes: %v", err)
+				return nil, frrStatusErr("get routes", err)
 			}
 			fmt.Fprintf(buf, "warning: partial route data (some address families unavailable): %v\n", err)
 		}
@@ -539,13 +538,13 @@ func (s *Server) showRouteInstance(filter string, cfg *config.Config, buf *strin
 	}
 }
 
-func (s *Server) showRouteMap(cfg *config.Config, buf *strings.Builder) error {
+func (s *Server) showRouteMap(ctx context.Context, cfg *config.Config, buf *strings.Builder) error {
 	if s.frr == nil {
 		buf.WriteString("FRR not available\n")
 	} else {
-		output, err := s.frr.GetRouteMapList()
+		output, err := s.frr.GetRouteMapList(ctx)
 		if err != nil {
-			return status.Errorf(codes.Internal, "route-map: %v", err)
+			return frrStatusErr("route-map", err)
 		}
 		if output == "" {
 			buf.WriteString("No route-maps configured\n")
@@ -559,13 +558,13 @@ func (s *Server) showRouteMap(cfg *config.Config, buf *strings.Builder) error {
 	return nil
 }
 
-func (s *Server) showBFDPeers(buf *strings.Builder) error {
+func (s *Server) showBFDPeers(ctx context.Context, buf *strings.Builder) error {
 	if s.frr == nil {
 		buf.WriteString("FRR not available\n")
 	} else {
-		output, err := s.frr.GetBFDPeers()
+		output, err := s.frr.GetBFDPeers(ctx)
 		if err != nil {
-			return status.Errorf(codes.Internal, "BFD peers: %v", err)
+			return frrStatusErr("BFD peers", err)
 		}
 		if output == "" {
 			buf.WriteString("No BFD peers\n")

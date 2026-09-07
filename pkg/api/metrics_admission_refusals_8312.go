@@ -36,31 +36,32 @@ func (c *xpfCollector) describeAdmissionRefusals(ch chan<- *prometheus.Desc) {
 
 // admissionLimiters is the set sampled, with the label each carries.
 //
-// It is a function rather than a package var so a test can observe the SAME
-// mapping the collector uses instead of restating it — a second list of the
-// same fact is the drift this codebase has been bitten by, and the limiters
-// themselves are process-wide singletons whose identity is the thing under
-// test.
-func admissionLimiters() []struct {
-	name    string
-	limiter *diagcmd.Limiter
-} {
-	return []struct {
-		name    string
-		limiter *diagcmd.Limiter
-	}{
-		{"session_walk", diagcmd.SessionWalkLimiter},
-		{"remote_walk", diagcmd.RemoteWalkLimiter},
-		{"diagnostic", diagcmd.DefaultLimiter},
-	}
+// #9143 moved the LIST to diagcmd.AllLimiters, beside the limiters themselves,
+// and this is now a thin pass-through. The list being a function here was meant
+// to stop "a second list of the same fact" from drifting — but the list still
+// lived in a different package from the `var`s it had to contain, and it had
+// already drifted: SnapshotReadLimiter (#8151) was added to
+// pkg/diagcmd/limiter.go and never reached this list, so its refusals were
+// exported as a permanent 0. That is the worst possible direction for #8312,
+// whose whole argument rests on a 0 being trustworthy ("if these stay at 0 in
+// the field the weighting changes nothing that can be observed") — an
+// unregistered limiter is indistinguishable from one that never refuses.
+//
+// Keeping the registry three lines from the declarations removes the decision
+// rather than adding a step to remember, and
+// TestAllLimitersIsExhaustive9143 (pkg/diagcmd) fails when a limiter is
+// declared without being registered. snapshot_read and vtysh are both exported
+// now.
+func admissionLimiters() []diagcmd.NamedLimiter {
+	return diagcmd.AllLimiters()
 }
 
 func (c *xpfCollector) emitAdmissionRefusals(ch chan<- prometheus.Metric) {
 	for _, l := range admissionLimiters() {
-		if l.limiter == nil {
+		if l.Limiter == nil {
 			continue
 		}
 		ch <- prometheus.MustNewConstMetric(c.admissionRefusalsTotal,
-			prometheus.CounterValue, float64(l.limiter.Refusals()), l.name)
+			prometheus.CounterValue, float64(l.Limiter.Refusals()), l.Name)
 	}
 }

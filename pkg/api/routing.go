@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -230,6 +231,22 @@ func appendStaticRoutes(result []RouteInfo, routes []*config.StaticRoute, family
 	return result
 }
 
+// writeFRRError renders an FRR shell-out failure with the right status class
+// (#9143). frr.ErrVtyshBusy is the process-wide vtysh admission bound refusing
+// the request: the FRR daemons are healthy and we declined to ask, so it is a
+// 429 with Retry-After — the same shape #6809's ribStreamLimiter branch already
+// uses on this endpoint's sibling, and the same distinction #9142 drew for the
+// delegated session clear. Everything else stays 500.
+func writeFRRError(w http.ResponseWriter, err error) {
+	if errors.Is(err, frr.ErrVtyshBusy) {
+		w.Header().Set("Retry-After", "5")
+		writeError(w, http.StatusTooManyRequests,
+			"FRR status concurrency limit reached; retry shortly")
+		return
+	}
+	writeError(w, http.StatusInternalServerError, err.Error())
+}
+
 func (s *Server) ospfHandler(w http.ResponseWriter, r *http.Request) {
 	if s.frr == nil {
 		writeOK(w, TextResponse{Output: "FRR not available"})
@@ -238,16 +255,16 @@ func (s *Server) ospfHandler(w http.ResponseWriter, r *http.Request) {
 	typ := r.URL.Query().Get("type")
 	switch typ {
 	case "database":
-		output, err := s.frr.GetOSPFDatabase()
+		output, err := s.frr.GetOSPFDatabase(r.Context())
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
+			writeFRRError(w, err)
 			return
 		}
 		writeOK(w, TextResponse{Output: output})
 	default:
-		neighbors, err := s.frr.GetOSPFNeighbors()
+		neighbors, err := s.frr.GetOSPFNeighbors(r.Context())
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
+			writeFRRError(w, err)
 			return
 		}
 		var b strings.Builder
@@ -399,9 +416,9 @@ func (s *Server) bgpHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	default:
 		var b strings.Builder
-		peers, err := s.frr.GetBGPSummary()
+		peers, err := s.frr.GetBGPSummary(r.Context())
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
+			writeFRRError(w, err)
 			return
 		}
 		fmt.Fprintf(&b, "%-20s %-13s %-8s %-9s %-9s %-11s %-12s %s\n",

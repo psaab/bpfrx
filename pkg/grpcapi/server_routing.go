@@ -30,7 +30,7 @@ import (
 // branches that build a structured table instead of returning raw stdout pay
 // nothing: clean text takes the sanitizer's allocation-free fast path.
 
-func (s *Server) GetRoutes(_ context.Context, _ *pb.GetRoutesRequest) (*pb.GetRoutesResponse, error) {
+func (s *Server) GetRoutes(ctx context.Context, _ *pb.GetRoutesRequest) (*pb.GetRoutesResponse, error) {
 	if s.routing == nil {
 		return &pb.GetRoutesResponse{}, nil
 	}
@@ -43,7 +43,7 @@ func (s *Server) GetRoutes(_ context.Context, _ *pb.GetRoutesRequest) (*pb.GetRo
 		// surface the failure via logging and still return the family that
 		// succeeded rather than dropping the partial (#5125).
 		if len(entries) == 0 {
-			return nil, status.Errorf(codes.Internal, "get routes: %v", err)
+			return nil, frrStatusErr("get routes", err)
 		}
 		slog.Warn("GetRoutes returning partial route dump", "error", err)
 	}
@@ -76,7 +76,7 @@ func (s *Server) GetRoutes(_ context.Context, _ *pb.GetRoutesRequest) (*pb.GetRo
 	return resp, nil
 }
 
-func (s *Server) GetOSPFStatus(_ context.Context, req *pb.GetOSPFStatusRequest) (*pb.GetOSPFStatusResponse, error) {
+func (s *Server) GetOSPFStatus(ctx context.Context, req *pb.GetOSPFStatusRequest) (*pb.GetOSPFStatusResponse, error) {
 	if s.frr == nil {
 		return &pb.GetOSPFStatusResponse{Output: "FRR not available"}, nil
 	}
@@ -84,17 +84,17 @@ func (s *Server) GetOSPFStatus(_ context.Context, req *pb.GetOSPFStatusRequest) 
 	var err error
 	switch req.Type {
 	case "neighbor-detail":
-		output, err = s.frr.GetOSPFNeighborDetail()
+		output, err = s.frr.GetOSPFNeighborDetail(ctx)
 	case "database":
-		output, err = s.frr.GetOSPFDatabase()
+		output, err = s.frr.GetOSPFDatabase(ctx)
 	case "interface":
-		output, err = s.frr.GetOSPFInterface()
+		output, err = s.frr.GetOSPFInterface(ctx)
 	case "routes":
-		output, err = s.frr.GetOSPFRoutes()
+		output, err = s.frr.GetOSPFRoutes(ctx)
 	default:
-		neighbors, nerr := s.frr.GetOSPFNeighbors()
+		neighbors, nerr := s.frr.GetOSPFNeighbors(ctx)
 		if nerr != nil {
-			return nil, status.Errorf(codes.Internal, "%v", nerr)
+			return nil, frrStatusErr("", nerr)
 		}
 		var b strings.Builder
 		for _, n := range neighbors {
@@ -105,21 +105,21 @@ func (s *Server) GetOSPFStatus(_ context.Context, req *pb.GetOSPFStatusRequest) 
 		output = b.String()
 	}
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "%v", err)
+		return nil, frrStatusErr("", err)
 	}
 	return &pb.GetOSPFStatusResponse{Output: termsafe.SanitizeBlockForDisplay(output)}, nil
 }
 
-func (s *Server) GetBGPStatus(_ context.Context, req *pb.GetBGPStatusRequest) (*pb.GetBGPStatusResponse, error) {
+func (s *Server) GetBGPStatus(ctx context.Context, req *pb.GetBGPStatusRequest) (*pb.GetBGPStatusResponse, error) {
 	if s.frr == nil {
 		return &pb.GetBGPStatusResponse{Output: "FRR not available"}, nil
 	}
 	var b strings.Builder
 	switch req.Type {
 	case "routes":
-		routes, err := s.frr.GetBGPRoutes()
+		routes, err := s.frr.GetBGPRoutes(ctx)
 		if err != nil {
-			return nil, status.Errorf(codes.Internal, "%v", err)
+			return nil, frrStatusErr("", err)
 		}
 		for _, r := range routes {
 			fmt.Fprintf(&b, "%-24s %-20s %s\n",
@@ -178,9 +178,9 @@ func (s *Server) GetBGPStatus(_ context.Context, req *pb.GetBGPStatusRequest) (*
 			if net.ParseIP(ip) == nil {
 				return nil, status.Errorf(codes.InvalidArgument, "invalid neighbor IP %q", ip)
 			}
-			output, err := s.frr.GetBGPNeighborReceivedRoutes(ip)
+			output, err := s.frr.GetBGPNeighborReceivedRoutes(ctx, ip)
 			if err != nil {
-				return nil, status.Errorf(codes.Internal, "%v", err)
+				return nil, frrStatusErr("", err)
 			}
 			return &pb.GetBGPStatusResponse{Output: termsafe.SanitizeBlockForDisplay(output)}, nil
 		}
@@ -190,9 +190,9 @@ func (s *Server) GetBGPStatus(_ context.Context, req *pb.GetBGPStatusRequest) (*
 			if net.ParseIP(ip) == nil {
 				return nil, status.Errorf(codes.InvalidArgument, "invalid neighbor IP %q", ip)
 			}
-			output, err := s.frr.GetBGPNeighborAdvertisedRoutes(ip)
+			output, err := s.frr.GetBGPNeighborAdvertisedRoutes(ctx, ip)
 			if err != nil {
-				return nil, status.Errorf(codes.Internal, "%v", err)
+				return nil, frrStatusErr("", err)
 			}
 			return &pb.GetBGPStatusResponse{Output: termsafe.SanitizeBlockForDisplay(output)}, nil
 		}
@@ -207,15 +207,15 @@ func (s *Server) GetBGPStatus(_ context.Context, req *pb.GetBGPStatusRequest) (*
 			if ip != "" && net.ParseIP(ip) == nil {
 				return nil, status.Errorf(codes.InvalidArgument, "invalid neighbor IP %q", ip)
 			}
-			output, err := s.frr.GetBGPNeighborDetail(ip)
+			output, err := s.frr.GetBGPNeighborDetail(ctx, ip)
 			if err != nil {
-				return nil, status.Errorf(codes.Internal, "%v", err)
+				return nil, frrStatusErr("", err)
 			}
 			return &pb.GetBGPStatusResponse{Output: termsafe.SanitizeBlockForDisplay(output)}, nil
 		}
-		peers, err := s.frr.GetBGPSummary()
+		peers, err := s.frr.GetBGPSummary(ctx)
 		if err != nil {
-			return nil, status.Errorf(codes.Internal, "%v", err)
+			return nil, frrStatusErr("", err)
 		}
 		fmt.Fprintf(&b, "%-20s %-13s %-8s %-9s %-9s %-11s %-12s %s\n",
 			"Neighbor", "AF", "AS", "MsgRcvd", "MsgSent", "Up/Down", "State", "PfxRcd")
@@ -228,13 +228,13 @@ func (s *Server) GetBGPStatus(_ context.Context, req *pb.GetBGPStatusRequest) (*
 	return &pb.GetBGPStatusResponse{Output: termsafe.SanitizeBlockForDisplay(b.String())}, nil
 }
 
-func (s *Server) GetRIPStatus(_ context.Context, _ *pb.GetRIPStatusRequest) (*pb.GetRIPStatusResponse, error) {
+func (s *Server) GetRIPStatus(ctx context.Context, _ *pb.GetRIPStatusRequest) (*pb.GetRIPStatusResponse, error) {
 	if s.frr == nil {
 		return &pb.GetRIPStatusResponse{Output: "FRR not available"}, nil
 	}
-	routes, err := s.frr.GetRIPRoutes()
+	routes, err := s.frr.GetRIPRoutes(ctx)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "%v", err)
+		return nil, frrStatusErr("", err)
 	}
 	var b strings.Builder
 	if len(routes) == 0 {
@@ -249,34 +249,34 @@ func (s *Server) GetRIPStatus(_ context.Context, _ *pb.GetRIPStatusRequest) (*pb
 	return &pb.GetRIPStatusResponse{Output: b.String()}, nil
 }
 
-func (s *Server) GetISISStatus(_ context.Context, req *pb.GetISISStatusRequest) (*pb.GetISISStatusResponse, error) {
+func (s *Server) GetISISStatus(ctx context.Context, req *pb.GetISISStatusRequest) (*pb.GetISISStatusResponse, error) {
 	if s.frr == nil {
 		return &pb.GetISISStatusResponse{Output: "FRR not available"}, nil
 	}
 	var b strings.Builder
 	switch req.Type {
 	case "adjacency-detail":
-		output, err := s.frr.GetISISAdjacencyDetail()
+		output, err := s.frr.GetISISAdjacencyDetail(ctx)
 		if err != nil {
-			return nil, status.Errorf(codes.Internal, "%v", err)
+			return nil, frrStatusErr("", err)
 		}
 		b.WriteString(output)
 	case "routes":
-		output, err := s.frr.GetISISRoutes()
+		output, err := s.frr.GetISISRoutes(ctx)
 		if err != nil {
-			return nil, status.Errorf(codes.Internal, "%v", err)
+			return nil, frrStatusErr("", err)
 		}
 		b.WriteString(output)
 	case "database":
-		output, err := s.frr.GetISISDatabase()
+		output, err := s.frr.GetISISDatabase(ctx)
 		if err != nil {
-			return nil, status.Errorf(codes.Internal, "%v", err)
+			return nil, frrStatusErr("", err)
 		}
 		b.WriteString(output)
 	default:
-		adjs, err := s.frr.GetISISAdjacency()
+		adjs, err := s.frr.GetISISAdjacency(ctx)
 		if err != nil {
-			return nil, status.Errorf(codes.Internal, "%v", err)
+			return nil, frrStatusErr("", err)
 		}
 		if len(adjs) == 0 {
 			b.WriteString("No IS-IS adjacencies\n")
@@ -313,7 +313,7 @@ func (s *Server) GetIPsecSA(_ context.Context, _ *pb.GetIPsecSARequest) (*pb.Get
 	}
 	sas, err := s.ipsec.GetSAStatus()
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "%v", err)
+		return nil, frrStatusErr("", err)
 	}
 	var b strings.Builder
 	for _, sa := range sas {

@@ -35,7 +35,7 @@ type fakeBGPExecutor struct {
 	vtyshOut string
 }
 
-func (f fakeBGPExecutor) Vtysh(string) (string, error)                      { return f.vtyshOut, nil }
+func (f fakeBGPExecutor) Vtysh(context.Context, string) (string, error)     { return f.vtyshOut, nil }
 func (f fakeBGPExecutor) FrrReloadPy(context.Context, string) error         { return nil }
 func (f fakeBGPExecutor) VtyshLoad(context.Context, string) ([]byte, error) { return nil, nil }
 
@@ -111,7 +111,7 @@ func TestBGPRoutesStreamWireFormat(t *testing.T) {
 			s := newBGPServer(t, makeFRRBGPOutput(tc.routes))
 
 			// Golden: parse via the real code path, then render the buffered form.
-			parsed, err := s.frr.GetBGPRoutes()
+			parsed, err := s.frr.GetBGPRoutes(context.Background())
 			if err != nil {
 				t.Fatalf("GetBGPRoutes: %v", err)
 			}
@@ -195,7 +195,7 @@ func TestBGPRoutesStreamNonBuffering(t *testing.T) {
 		}
 	}
 	s := newBGPServer(t, makeFRRBGPOutput(routes))
-	parsed, err := s.frr.GetBGPRoutes()
+	parsed, err := s.frr.GetBGPRoutes(context.Background())
 	if err != nil {
 		t.Fatalf("GetBGPRoutes: %v", err)
 	}

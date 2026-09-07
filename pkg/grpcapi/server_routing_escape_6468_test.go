@@ -73,7 +73,7 @@ const evilBGPSummaryJSON6468 = `{"ipv4Unicast":{"peers":{"10.0.0.1":{` +
 // the raw block.
 type vtyshEscapeExecutor6468 struct{}
 
-func (vtyshEscapeExecutor6468) Vtysh(cmd string) (string, error) {
+func (vtyshEscapeExecutor6468) Vtysh(_ context.Context, cmd string) (string, error) {
 	switch cmd {
 	case "show isis neighbor":
 		return evilISISNeighborTable6468, nil
@@ -248,7 +248,7 @@ func TestGetBGPStatus_RemoteCLIEscapesParsedSummaryRow_6468(t *testing.T) {
 func TestShowBFDPeers_RemoteCLIEscapesVtyshOutput_6468(t *testing.T) {
 	s := escapeVtyshServer6468(t)
 	var buf strings.Builder
-	if err := s.showBFDPeers(&buf); err != nil {
+	if err := s.showBFDPeers(context.Background(), &buf); err != nil {
 		t.Fatalf("showBFDPeers: %v", err)
 	}
 	assertVtyshOutputSanitized6468(t, "showBFDPeers", buf.String())
@@ -257,7 +257,7 @@ func TestShowBFDPeers_RemoteCLIEscapesVtyshOutput_6468(t *testing.T) {
 func TestShowRouteMap_RemoteCLIEscapesVtyshOutput_6468(t *testing.T) {
 	s := escapeVtyshServer6468(t)
 	var buf strings.Builder
-	if err := s.showRouteMap(nil, &buf); err != nil {
+	if err := s.showRouteMap(context.Background(), nil, &buf); err != nil {
 		t.Fatalf("showRouteMap: %v", err)
 	}
 	assertVtyshOutputSanitized6468(t, "showRouteMap", buf.String())

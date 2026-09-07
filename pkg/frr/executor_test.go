@@ -48,7 +48,7 @@ type fakeExecutor struct {
 	vtyshLoadCtxLiveAtCall bool
 }
 
-func (f *fakeExecutor) Vtysh(command string) (string, error) {
+func (f *fakeExecutor) Vtysh(_ context.Context, command string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.vtyshCalls++
@@ -115,7 +115,7 @@ func TestExecVtyshUsesExecutor(t *testing.T) {
 		vtyshResp: map[string]string{"show whatever": "canned output"},
 	}
 	m := &Manager{exec: fake}
-	out, err := m.ExecVtysh("show whatever")
+	out, err := m.ExecVtysh(context.Background(), "show whatever")
 	if err != nil {
 		t.Fatalf("ExecVtysh: %v", err)
 	}
@@ -141,7 +141,7 @@ Network            Next Hop         Metric From            Tag Time
 		vtyshResp: map[string]string{"show ip rip": canned},
 	}
 	m := &Manager{exec: fake}
-	routes, err := m.GetRIPRoutes()
+	routes, err := m.GetRIPRoutes(context.Background())
 	if err != nil {
 		t.Fatalf("GetRIPRoutes: %v", err)
 	}
@@ -276,5 +276,5 @@ func TestZeroValueManagerExecVtyshNoPanic(t *testing.T) {
 	}()
 	// Don't assert on success — in CI there's likely no vtysh binary.
 	// We just want to confirm no nil-deref via the accessor.
-	_, _ = m.ExecVtysh("show version")
+	_, _ = m.ExecVtysh(context.Background(), "show version")
 }

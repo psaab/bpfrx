@@ -309,3 +309,71 @@ const MaxConcurrentSnapshotReads = 4
 // refuse a session scan, and saturating SessionWalkLimiter must not refuse a
 // snapshot read.
 var SnapshotReadLimiter = NewLimiter(MaxConcurrentSnapshotReads)
+
+// MaxConcurrentVtyshShellOuts bounds how many FRR `vtysh -c` shell-outs may run
+// at once across EVERY control surface that exposes FRR status (#9143).
+//
+// Every operational FRR read forks a `vtysh` child that runs for up to
+// vtyshTimeout (15s, pkg/frr). Before this bound, ONE branch of ONE handler was
+// gated: #6809 put ribStreamLimiter on `GET /api/v1/routing/bgp?type=routes`
+// because a full-RIB stream is expensive in memory and holds a connection. Every
+// other FRR shell-out — REST ospf (both branches) and bgp summary, and the gRPC
+// GetOSPFStatus / GetBGPStatus / GetRIPStatus / GetISISStatus / GetRoutes
+// status RPCs — forked one child per request with no admission at all, so a
+// client chose the concurrency and the server paid up to 15s of forked process
+// per request whether or not the client stayed to read the answer.
+//
+// The one gated branch was RIGHT and UNDER-GENERALIZED, which this package
+// already demonstrates twice: DefaultLimiter bounds the other REST/gRPC handlers
+// that fork a child (ping/traceroute, #5057, for exactly the "cannot exhaust
+// host PIDs/FDs/goroutines" reason), and SessionWalkLimiter bounds every
+// full-table walk on both surfaces (#5433/#5708). A forking FRR status handler
+// is the same class as a forking ping handler; it was simply never gated.
+//
+// The bound is enforced in pkg/frr's single Manager.vtysh funnel rather than at
+// each handler, so a future FRR read is bounded by construction and cannot
+// re-open the gap by being added without a gate.
+//
+// Sized independently of MaxConcurrentDiagnostics: a monitoring system polling
+// `show ip ospf neighbor` must not refuse an operator's ping, and vice versa.
+// The value is deliberately small — legitimate use is a handful of concurrent
+// status reads — while the 15s per-child cap plus this aggregate bound together
+// cap the worst-case footprint at MaxConcurrentVtyshShellOuts children.
+const MaxConcurrentVtyshShellOuts = 4
+
+// VtyshLimiter is the process-wide limiter for FRR vtysh shell-outs, shared by
+// the REST and gRPC FRR status surfaces so one aggregate cap covers both.
+// Mirrors DefaultLimiter and SessionWalkLimiter.
+var VtyshLimiter = NewLimiter(MaxConcurrentVtyshShellOuts)
+
+// NamedLimiter pairs a process-wide limiter with the label it is exported under
+// (xpf_admission_refusals_total{limiter="..."}).
+type NamedLimiter struct {
+	Name    string
+	Limiter *Limiter
+}
+
+// AllLimiters returns every process-wide admission limiter this package
+// defines, with its metric label.
+//
+// It lives HERE, beside the limiters themselves, rather than in the metrics
+// collector that consumes it, because the registry had already drifted: the
+// collector's list named session_walk, remote_walk and diagnostic, and
+// SnapshotReadLimiter — added later, in this same file — was never added to it.
+// Its refusals therefore read as a permanent 0, which is precisely the reading
+// #8312 exists to make trustworthy ("if these stay at 0 the weighting buys
+// nothing"): an unregistered limiter is indistinguishable from a never-refusing
+// one.
+//
+// Keeping the list three lines from the `var` it must contain removes the
+// decision instead of adding a step to remember. TestAllLimitersIsExhaustive
+// (pkg/diagcmd) fails if a limiter defined in this file is missing here.
+func AllLimiters() []NamedLimiter {
+	return []NamedLimiter{
+		{"session_walk", SessionWalkLimiter},
+		{"remote_walk", RemoteWalkLimiter},
+		{"diagnostic", DefaultLimiter},
+		{"snapshot_read", SnapshotReadLimiter},
+		{"vtysh", VtyshLimiter},
+	}
+}

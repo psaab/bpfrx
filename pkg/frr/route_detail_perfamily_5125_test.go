@@ -1,6 +1,7 @@
 package frr
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -43,7 +44,7 @@ func TestGetRouteDetailJSONPerFamilyFailureSurfaces(t *testing.T) {
 	}
 	m := &Manager{exec: fake}
 
-	routes, err := m.GetRouteDetailJSON()
+	routes, err := m.GetRouteDetailJSON(context.Background())
 	if err == nil {
 		t.Fatal("got nil error on a failed IPv6 dump; a per-family failure must surface")
 	}
@@ -74,7 +75,7 @@ func TestGetRouteDetailJSONParseFailureSurfaces(t *testing.T) {
 	}
 	m := &Manager{exec: fake}
 
-	routes, err := m.GetRouteDetailJSON()
+	routes, err := m.GetRouteDetailJSON(context.Background())
 	if err == nil {
 		t.Fatal("got nil error on a malformed IPv6 JSON payload; the parse failure must surface")
 	}
@@ -103,7 +104,7 @@ func TestGetRouteDetailJSONBothFamiliesOKNoError(t *testing.T) {
 	}
 	m := &Manager{exec: fake}
 
-	routes, err := m.GetRouteDetailJSON()
+	routes, err := m.GetRouteDetailJSON(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error when both families succeed: %v", err)
 	}

@@ -19,6 +19,7 @@ package cli
 // (#4527 / #2084 / #4524) moved verbatim.
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -107,7 +108,7 @@ func (c *CLI) handleRequestProtocols(args []string) error {
 		if c.frr == nil {
 			return fmt.Errorf("FRR manager not available")
 		}
-		output, err := c.frr.ExecVtysh("clear ip ospf process")
+		output, err := c.frr.ExecVtysh(context.Background(), "clear ip ospf process")
 		if err != nil {
 			return fmt.Errorf("clear OSPF: %w", err)
 		}
@@ -133,7 +134,7 @@ func (c *CLI) handleRequestProtocols(args []string) error {
 		if c.frr == nil {
 			return fmt.Errorf("FRR manager not available")
 		}
-		output, err := c.frr.ExecVtysh("clear bgp * soft")
+		output, err := c.frr.ExecVtysh(context.Background(), "clear bgp * soft")
 		if err != nil {
 			return fmt.Errorf("clear BGP: %w", err)
 		}

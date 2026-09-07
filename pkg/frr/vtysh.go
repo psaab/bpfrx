@@ -18,12 +18,15 @@ package frr
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os/exec"
 	"syscall"
 	"time"
+
+	"github.com/psaab/xpf/pkg/diagcmd"
 )
 
 // vtyshTimeout bounds every `vtysh -c` shell-out. Vtysh backs the
@@ -45,6 +48,22 @@ const vtyshTimeout = 15 * time.Second
 // machinery keeps the unit state untouched.
 const frrReloadScript = "/usr/lib/frr/frr-reload.py"
 
+// vtyshBinary is the `vtysh` executable realExecutor runs. It is a package var
+// rather than a literal ONLY so a test can point it at a real, controllable
+// child (a shell script that sleeps) and exercise realExecutor's own context
+// handling — the code that actually reaps the process.
+//
+// #9143 added it because the mutation matrix caught a hole the cells could not
+// see: every existing pkg/frr test injects a FAKE frrExecutor, so
+// realExecutor.Vtysh — the only place the caller's context is composed with
+// vtyshTimeout and handed to exec.CommandContext — had no coverage at all.
+// Reverting it to context.Background() left the whole suite green. A guard that
+// cannot be driven is not a guard, so the production path is made exercisable
+// rather than excused.
+//
+// Production never assigns it; the tests that do restore it with t.Cleanup.
+var vtyshBinary = "vtysh"
+
 // frrReloadOutputTail bounds how much frr-reload.py output a failure
 // message carries (the interesting part is at the tail).
 const frrReloadOutputTail = 1024
@@ -55,9 +74,17 @@ const frrReloadOutputTail = 1024
 // minimal: it covers only the three call shapes that exist in pkg/frr
 // today.
 type frrExecutor interface {
-	// Vtysh runs `vtysh -c <command>` and returns stdout. Errors include
-	// the captured stderr in the message string.
-	Vtysh(command string) (string, error)
+	// Vtysh runs `vtysh -c <command>` under ctx and returns stdout. Errors
+	// include the captured stderr in the message string.
+	//
+	// #9143: ctx is a PARAMETER, not context.Background(). Before, every
+	// buffered FRR read hardcoded context.Background() with a 15s timeout, so
+	// a client that abandoned its request left the forked vtysh child running
+	// to completion — the server paid the full budget for an answer nobody
+	// would read, at a concurrency the client chose. The 15s cap is still
+	// applied ON TOP of ctx, so a caller with no deadline is bit-identical to
+	// before and a caller with a shorter deadline wins.
+	Vtysh(ctx context.Context, command string) (string, error)
 
 	// FrrReloadPy runs `frr-reload.py --reload <conf>` with the supplied
 	// context (which carries the 15s reload timeout). The config path is
@@ -92,14 +119,19 @@ type frrExecutor interface {
 // accessor on Manager.
 type realExecutor struct{}
 
-// Vtysh runs `vtysh -c <command>` under vtyshTimeout and returns
-// stdout. Output/error shape is identical to the historical vtyshCmd
-// free function (frr.go:1597-1605 pre-split); the timeout bound was
-// added in #1800 (U3).
-func (realExecutor) Vtysh(command string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), vtyshTimeout)
+// Vtysh runs `vtysh -c <command>` under the CALLER's ctx, capped at
+// vtyshTimeout, and returns stdout. Output/error shape is identical to the
+// historical vtyshCmd free function (frr.go:1597-1605 pre-split); the timeout
+// bound was added in #1800 (U3) and the caller's context in #9143.
+//
+// WithTimeout(ctx, ...) composes: the effective deadline is the EARLIER of the
+// caller's and 15s, and cancelling ctx (an HTTP client disconnect, a cancelled
+// gRPC stream) makes exec.CommandContext kill and reap the child immediately
+// rather than letting it run out the budget.
+func (realExecutor) Vtysh(ctx context.Context, command string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, vtyshTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "vtysh", "-c", command)
+	cmd := exec.CommandContext(ctx, vtyshBinary, "-c", command)
 	// WaitDelay caps the post-SIGKILL pipe-drain window.
 	cmd.WaitDelay = 5 * time.Second
 	var stdout, stderr bytes.Buffer
@@ -119,7 +151,7 @@ func (realExecutor) Vtysh(command string) (string, error) {
 // table nobody will read. WaitDelay bounds the post-kill pipe-drain
 // window, matching Vtysh.
 func (realExecutor) VtyshStream(ctx context.Context, command string) (io.ReadCloser, func() error, error) {
-	cmd := exec.CommandContext(ctx, "vtysh", "-c", command)
+	cmd := exec.CommandContext(ctx, vtyshBinary, "-c", command)
 	cmd.WaitDelay = 5 * time.Second
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -174,61 +206,102 @@ func (realExecutor) FrrReloadPy(ctx context.Context, conf string) error {
 // VtyshLoad runs `vtysh -f <conf>` under ctx and returns CombinedOutput.
 // Mirrors the historical reload() fallback (frr.go:1068-1069 pre-split).
 func (realExecutor) VtyshLoad(ctx context.Context, conf string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, "vtysh", "-f", conf)
+	cmd := exec.CommandContext(ctx, vtyshBinary, "-f", conf)
 	// WaitDelay caps the post-SIGKILL pipe-drain window (apply-reachable
 	// via the FRR reload fallback).
 	cmd.WaitDelay = 5 * time.Second
 	return cmd.CombinedOutput()
 }
 
+// ErrVtyshBusy is returned when the process-wide FRR shell-out admission bound
+// (diagcmd.VtyshLimiter) is already at capacity. Callers map it to their
+// surface's overload signal: HTTP 429 (REST) / codes.ResourceExhausted (gRPC),
+// the same mapping diagcmd.ErrBusy already gets for ping/traceroute.
+//
+// It is a REFUSAL, not a fault: the FRR daemons are healthy and we declined to
+// ask. Reporting it as a 5xx would send an operator debugging FRR after a load
+// condition (the mistake #9142 fixed on the session-clear surface, and the one
+// peerFetchErrorStatus (#7294/#8308) exists to avoid on the peer surfaces).
+var ErrVtyshBusy = errors.New("FRR vtysh concurrency limit reached")
+
+// vtysh is the SINGLE funnel every operational FRR shell-out in this package
+// goes through. It applies the process-wide admission bound and then hands the
+// caller's context to the executor.
+//
+// #9143: the bound lives here, not at each handler, and that placement is the
+// point. #6809 gated ONE branch of ONE handler (the REST full-RIB stream) and
+// every other FRR read stayed unbounded — REST ospf (both branches) and bgp
+// summary, plus the gRPC OSPF/BGP/RIP/IS-IS/route status RPCs. Gating them one
+// at a time would leave the twentieth FRR read to be added unbounded again. A
+// funnel makes every present AND future FRR read bounded by construction:
+// nothing in this package can reach vtysh except through here.
+//
+// Admission is FAIL-FAST, mirroring diagcmd.Limiter's contract and #6809's
+// stated reason: a queued request holds the same connection it would have held
+// while running, so queueing converts a concurrency bound into a latency bound
+// and buys nothing.
+//
+// It bounds the operational read path only. FrrReloadPy and VtyshLoad are the
+// APPLY path, are driven by the daemon rather than by a client, and are already
+// serialized by the reload lock — putting them behind a client-facing budget
+// would let a status flood refuse a config commit.
+func (m *Manager) vtysh(ctx context.Context, command string) (string, error) {
+	release, err := diagcmd.VtyshLimiter.Acquire()
+	if err != nil {
+		return "", ErrVtyshBusy
+	}
+	defer release()
+	return m.executor().Vtysh(ctx, command)
+}
+
 // ExecVtysh runs an arbitrary vtysh command and returns the output.
-func (m *Manager) ExecVtysh(command string) (string, error) {
-	return m.executor().Vtysh(command)
+func (m *Manager) ExecVtysh(ctx context.Context, command string) (string, error) {
+	return m.vtysh(ctx, command)
 }
 
 // GetBFDPeers returns BFD peer status from FRR.
-func (m *Manager) GetBFDPeers() (string, error) {
-	return m.executor().Vtysh("show bfd peers")
+func (m *Manager) GetBFDPeers(ctx context.Context) (string, error) {
+	return m.vtysh(ctx, "show bfd peers")
 }
 
 // GetRouteMapList returns the route-map configuration from FRR.
-func (m *Manager) GetRouteMapList() (string, error) {
-	return m.executor().Vtysh("show route-map")
+func (m *Manager) GetRouteMapList(ctx context.Context) (string, error) {
+	return m.vtysh(ctx, "show route-map")
 }
 
 // GetISISAdjacencyDetail returns detailed IS-IS adjacency output.
-func (m *Manager) GetISISAdjacencyDetail() (string, error) {
-	return m.executor().Vtysh("show isis neighbor detail")
+func (m *Manager) GetISISAdjacencyDetail(ctx context.Context) (string, error) {
+	return m.vtysh(ctx, "show isis neighbor detail")
 }
 
 // GetISISDatabase returns raw IS-IS link-state database output.
-func (m *Manager) GetISISDatabase() (string, error) {
-	return m.executor().Vtysh("show isis database detail")
+func (m *Manager) GetISISDatabase(ctx context.Context) (string, error) {
+	return m.vtysh(ctx, "show isis database detail")
 }
 
 // GetISISRoutes returns raw IS-IS route output.
-func (m *Manager) GetISISRoutes() (string, error) {
-	return m.executor().Vtysh("show isis route")
+func (m *Manager) GetISISRoutes(ctx context.Context) (string, error) {
+	return m.vtysh(ctx, "show isis route")
 }
 
 // GetOSPFNeighborDetail returns detailed OSPF neighbor output.
-func (m *Manager) GetOSPFNeighborDetail() (string, error) {
-	return m.executor().Vtysh("show ip ospf neighbor detail")
+func (m *Manager) GetOSPFNeighborDetail(ctx context.Context) (string, error) {
+	return m.vtysh(ctx, "show ip ospf neighbor detail")
 }
 
 // GetOSPFDatabase returns raw OSPF database output.
-func (m *Manager) GetOSPFDatabase() (string, error) {
-	return m.executor().Vtysh("show ip ospf database")
+func (m *Manager) GetOSPFDatabase(ctx context.Context) (string, error) {
+	return m.vtysh(ctx, "show ip ospf database")
 }
 
 // GetOSPFInterface returns raw OSPF interface output.
-func (m *Manager) GetOSPFInterface() (string, error) {
-	return m.executor().Vtysh("show ip ospf interface")
+func (m *Manager) GetOSPFInterface(ctx context.Context) (string, error) {
+	return m.vtysh(ctx, "show ip ospf interface")
 }
 
 // GetOSPFRoutes returns raw OSPF route output.
-func (m *Manager) GetOSPFRoutes() (string, error) {
-	return m.executor().Vtysh("show ip ospf route")
+func (m *Manager) GetOSPFRoutes(ctx context.Context) (string, error) {
+	return m.vtysh(ctx, "show ip ospf route")
 }
 
 // GetBGPNeighborReceivedRoutes returns received routes for a BGP neighbor.
@@ -241,11 +314,11 @@ func (m *Manager) GetOSPFRoutes() (string, error) {
 // (sanitizeFRRValue/validateNodesControlChars, #4097/#1798), never went
 // through a sanitizer. net.ParseIP rejects empty, spaces, and embedded
 // newlines while accepting both IPv4 and IPv6 neighbors (#4588).
-func (m *Manager) GetBGPNeighborReceivedRoutes(ip string) (string, error) {
+func (m *Manager) GetBGPNeighborReceivedRoutes(ctx context.Context, ip string) (string, error) {
 	if net.ParseIP(ip) == nil {
 		return "", fmt.Errorf("invalid neighbor IP %q", ip)
 	}
-	return m.executor().Vtysh("show bgp neighbor " + ip + " received-routes")
+	return m.vtysh(ctx, "show bgp neighbor "+ip+" received-routes")
 }
 
 // GetBGPNeighborAdvertisedRoutes returns advertised routes for a BGP neighbor.
@@ -253,11 +326,11 @@ func (m *Manager) GetBGPNeighborReceivedRoutes(ip string) (string, error) {
 // The neighbor IP is validated with net.ParseIP before it reaches the
 // vtysh command line — see GetBGPNeighborReceivedRoutes for the rationale
 // (unauthenticated local gRPC show path, no config-style sanitizer, #4588).
-func (m *Manager) GetBGPNeighborAdvertisedRoutes(ip string) (string, error) {
+func (m *Manager) GetBGPNeighborAdvertisedRoutes(ctx context.Context, ip string) (string, error) {
 	if net.ParseIP(ip) == nil {
 		return "", fmt.Errorf("invalid neighbor IP %q", ip)
 	}
-	return m.executor().Vtysh("show bgp neighbor " + ip + " advertised-routes")
+	return m.vtysh(ctx, "show bgp neighbor "+ip+" advertised-routes")
 }
 
 // GetBGPNeighborDetail returns detailed info for a specific BGP neighbor,
@@ -266,7 +339,7 @@ func (m *Manager) GetBGPNeighborAdvertisedRoutes(ip string) (string, error) {
 // An empty ip is legal (it selects every neighbor). A non-empty ip is
 // validated with net.ParseIP so no raw token reaches the vtysh command
 // line — see GetBGPNeighborReceivedRoutes for the rationale (#4588).
-func (m *Manager) GetBGPNeighborDetail(ip string) (string, error) {
+func (m *Manager) GetBGPNeighborDetail(ctx context.Context, ip string) (string, error) {
 	cmd := "show bgp neighbor"
 	if ip != "" {
 		if net.ParseIP(ip) == nil {
@@ -274,5 +347,5 @@ func (m *Manager) GetBGPNeighborDetail(ip string) (string, error) {
 		}
 		cmd += " " + ip
 	}
-	return m.executor().Vtysh(cmd)
+	return m.vtysh(ctx, cmd)
 }

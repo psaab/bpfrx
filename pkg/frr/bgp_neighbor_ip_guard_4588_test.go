@@ -1,6 +1,7 @@
 package frr
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -29,7 +30,7 @@ func TestBGPNeighborReceivedRoutesRejectsUnvalidatedIP(t *testing.T) {
 	for _, bad := range badIPs {
 		fake := &fakeExecutor{}
 		m := &Manager{exec: fake}
-		out, err := m.GetBGPNeighborReceivedRoutes(bad)
+		out, err := m.GetBGPNeighborReceivedRoutes(context.Background(), bad)
 		if err == nil {
 			t.Errorf("GetBGPNeighborReceivedRoutes(%q): expected error, got nil (out=%q)", bad, out)
 		}
@@ -46,7 +47,7 @@ func TestBGPNeighborAdvertisedRoutesRejectsUnvalidatedIP(t *testing.T) {
 	fake := &fakeExecutor{}
 	m := &Manager{exec: fake}
 	bad := "2001:db8::1\nconfigure terminal"
-	if _, err := m.GetBGPNeighborAdvertisedRoutes(bad); err == nil {
+	if _, err := m.GetBGPNeighborAdvertisedRoutes(context.Background(), bad); err == nil {
 		t.Errorf("GetBGPNeighborAdvertisedRoutes(%q): expected error, got nil", bad)
 	}
 	if fake.vtyshCalls != 0 {
@@ -62,7 +63,7 @@ func TestBGPNeighborDetailRejectsUnvalidatedIP(t *testing.T) {
 	fake := &fakeExecutor{}
 	m := &Manager{exec: fake}
 	bad := "1.1.1.1\nno router bgp 65000"
-	if _, err := m.GetBGPNeighborDetail(bad); err == nil {
+	if _, err := m.GetBGPNeighborDetail(context.Background(), bad); err == nil {
 		t.Errorf("GetBGPNeighborDetail(%q): expected error, got nil", bad)
 	}
 	if fake.vtyshCalls != 0 {
@@ -74,7 +75,7 @@ func TestBGPNeighborDetailRejectsUnvalidatedIP(t *testing.T) {
 		vtyshResp: map[string]string{"show bgp neighbor": "all neighbors output"},
 	}
 	mAll := &Manager{exec: fakeAll}
-	out, err := mAll.GetBGPNeighborDetail("")
+	out, err := mAll.GetBGPNeighborDetail(context.Background(), "")
 	if err != nil {
 		t.Fatalf("GetBGPNeighborDetail(\"\"): unexpected error: %v", err)
 	}
@@ -92,7 +93,7 @@ func TestBGPNeighborDetailRejectsUnvalidatedIP(t *testing.T) {
 func TestBGPNeighborValidIPsPass(t *testing.T) {
 	cases := []struct {
 		name    string
-		call    func(m *Manager, ip string) (string, error)
+		call    func(m *Manager, ctx context.Context, ip string) (string, error)
 		ip      string
 		wantCmd string
 	}{
@@ -109,7 +110,7 @@ func TestBGPNeighborValidIPsPass(t *testing.T) {
 				vtyshResp: map[string]string{tc.wantCmd: "ok"},
 			}
 			m := &Manager{exec: fake}
-			out, err := tc.call(m, tc.ip)
+			out, err := tc.call(m, context.Background(), tc.ip)
 			if err != nil {
 				t.Fatalf("%s(%q): unexpected error: %v", tc.name, tc.ip, err)
 			}
