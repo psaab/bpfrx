@@ -6121,6 +6121,70 @@ member keywords for the strict syntax gate). Pinned by
 hierarchical bracket lists, nested-set bracket list, deny-policy expansion, and
 a single-member negative control), RED on revert to `Keys[1]`.
 
+## `routing-instances <name>` — a SCOPED child-keyword gate, not a closed world (#9323)
+
+`routing-instances <name>` was an OPEN-WORLD container at every config channel,
+so a `security`, `firewall` or entirely bogus subtree nested under a routing
+instance committed clean, rendered back in `show configuration`, and compiled to
+NOTHING. Measured through `configstore.CheckText` (the operator commit gate) and
+`compileTreeStrict`, flat-set and braced alike:
+
+| statement | before #9323 | after |
+|---|---|---|
+| `set routing-instances VRF-A security nat nat64 rule-set rs1 prefix 64:ff9b::/96` | ACCEPT, `nat64 rule-sets compiled=0`, no error, no warning | **REJECT**, naming the keyword |
+| `set routing-instances VRF-A totally-bogus-keyword foo bar` | ACCEPT, zero objects | **REJECT** |
+| `set routing-instances VRF-A firewall filter f1 term t1 then discard` | ACCEPT, zero objects | **REJECT** |
+
+Why an operator writes it: Junos-style per-instance scoping is the natural way
+to make NAT64 or a filter apply only inside a VRF, and there is **no supported
+way to do it** — `routing_domain` is stamped from the INGRESS INTERFACE
+(`userspace-dp/src/afxdp/forwarding/mod.rs`), never from the NAT rule-set, and
+`NAT64RuleSnapshot` carries no routing-scope field at all. The spelling an
+operator would reach for is exactly the one that silently did nothing. The
+sibling it would most be confused with, `security nat nat64`, is
+`closedWorld: true` for precisely this reason ("a silent drop here is a real
+footgun").
+
+**`closedWorld: true` on the wildcard was tried and backed out, and the
+measurement that backed it out is the point.** The flag INHERITS, which is what
+made the same flip wrong at the config root (9 of 10 shipped configs rejected)
+and at `firewall family` (#9017). Here the WHOLE-SUITE measurement said it was
+safe — `go test ./...` with it armed rejected **zero** configs, a clean board.
+That reading was wrong. A targeted over-reach probe then found
+
+```
+set routing-instances VRF-A protocols bgp group g1 neighbor 10.0.0.1 peer-as 65001
+```
+
+REJECTED, because the per-instance `protocols bgp group` subtree does not
+declare `neighbor` while the shared compiler (`compileProtocols`, whose result
+is copied into `ri.BGP`) handles it fully. **No fixture in the tree configures a
+BGP neighbour inside a routing instance**, so the green suite was evidence about
+the corpus, not about the change. Arming the wildcard exposes every
+incompleteness in the per-instance protocol grammar — a long tail, and #9351
+tracks it as a defect in its own right (the same schema gap silently DROPS a
+per-instance `neighbor <ip> local-address <ip>` in the flat-set form while the
+identical global spelling works).
+
+The gate is therefore `validateRoutingInstanceChildTokensAST`
+(`compiler_routing_children_9323.go`), a compiler prewalk check beside the
+#9017 family-token gate, scoped to the instance level and inheriting nothing.
+Strict commit / commit-check hard-rejects; the tolerant Load / SyncApply path
+warns and boots (#1960). Its permitted set is READ FROM THE SCHEMA, so
+declaring a new routing-instance keyword permits it automatically.
+
+**Four keywords were declared BEFORE the gate landed, because gating without
+them is a regression the suite cannot see.** `description`, `vrf-target`,
+`vrf-table-label` and `route-distinguisher` are all admitted by the compiler
+(`isRoutingInstanceKeyword8787`) and `description` is compiled into
+`RoutingInstanceConfig.Description` — but the schema declared only four of the
+compiler's eight. Measured: with the gate armed and those four still undeclared,
+`go test ./...` rejects nothing at all, because no fixture writes any of them; a
+targeted probe is what found it.
+`TestRoutingInstanceSchemaAndCompilerAgree9323` now holds the schema and
+`isRoutingInstanceKeyword8787` to the SAME SET in both directions — the drift
+the #8787 note beside that function warns about in prose, asserted.
+
 ## Per-subtree closed-world keyword validation (#4313)
 
 The scalar-arity gate (#3332, above) is a token-level fix: it catches an

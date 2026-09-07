@@ -253,6 +253,20 @@ func runPreWalkGates(tree *ConfigTree, opts compileOpts) ([]string, error) {
 	fwFilterFamilyWarnings = append(fwFilterFamilyWarnings, fwFamilyTokenWarnings...)
 	fwFilterFamilyWarnings = append(fwFilterFamilyWarnings, selfRepeatWarnings...)
 
+	// #9323 undeclared routing-instance child keyword. Same AST-level reason as
+	// the two family gates above: an unknown subtree under a routing instance
+	// compiles to nothing, so by the time cfg.RoutingInstances exists there is
+	// no trace of it left to validate. Scoped to the instance level — NOT
+	// `closedWorld: true` on the wildcard, which inherits and rejects
+	// `protocols bgp group <g> neighbor <ip>` (see
+	// compiler_routing_children_9323.go).
+	riChildWarnings, err := validateRoutingInstanceChildTokensAST(
+		tree.Children, opts.lenientRoutingInstanceChildTokens)
+	if err != nil {
+		return nil, err
+	}
+	fwFilterFamilyWarnings = append(fwFilterFamilyWarnings, riChildWarnings...)
+
 	// #4296 firewall-filter family-any specific-match gate. #4287 dual-compiles a
 	// `family any` filter into BOTH the inet and inet6 pools; a family-specific
 	// match under `family any` (a v4/v6 source/destination-address literal or a
