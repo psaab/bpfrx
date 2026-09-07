@@ -186,7 +186,7 @@ fn restrict_socket_mode(path: &str) -> Result<(), String> {
 /// The own-uid arm exists so a non-root test binary can drive the real accept
 /// path against a socket it bound itself. In production both ends are root and
 /// the arm never fires.
-fn reject_unprivileged_peer(
+pub(crate) fn reject_unprivileged_peer(
     kind: &str,
     stream: &std::os::unix::net::UnixStream,
 ) -> Result<(), String> {
@@ -219,12 +219,36 @@ fn reject_unprivileged_peer(
     }
     // SAFETY: geteuid(2) has no failure mode and no preconditions.
     let self_uid = unsafe { libc::geteuid() };
-    if cred.uid != 0 && cred.uid != self_uid {
+    peer_uid_refusal(kind, cred.uid, cred.gid, cred.pid, self_uid)
+}
+
+/// The DECISION, split from the syscall shell above (#9171).
+///
+/// The shell cannot be driven by an unprivileged test: exercising a refusal
+/// needs a peer running as a DIFFERENT uid, and becoming one needs a capability
+/// the test binary does not have. So the arms were unreachable from any cell,
+/// and a mutation making the check unreachable survived every source-level
+/// assertion — the checker's NAME was still in the file.
+///
+/// This mirrors what `runtimeDirTrustError` does on the Go side for the same
+/// reason, and that function says so outright: the project rule is that a test
+/// needing a kernel capability STUBS it rather than skipping on it (#6675),
+/// because a skip is indistinguishable from a pass in every summary line.
+/// Making the decision a pure function of the credentials is that stub — the
+/// shell supplies real values in production and the cells supply hostile ones.
+pub(crate) fn peer_uid_refusal(
+    kind: &str,
+    peer_uid: u32,
+    peer_gid: u32,
+    peer_pid: i32,
+    self_uid: u32,
+) -> Result<(), String> {
+    if peer_uid != 0 && peer_uid != self_uid {
         return Err(format!(
-            "refusing {kind} connection from uid {} (gid {}, pid {}): not root and not this \
-             process (uid {self_uid}). The control protocol carries the WireGuard private key \
-             and every preshared key in cleartext, and its handlers are unauthenticated.",
-            cred.uid, cred.gid, cred.pid
+            "refusing {kind} connection from uid {peer_uid} (gid {peer_gid}, pid {peer_pid}): \
+             not root and not this process (uid {self_uid}). The control protocol carries the \
+             WireGuard private key and every preshared key in cleartext, and its handlers are \
+             unauthenticated."
         ));
     }
     Ok(())
@@ -1037,5 +1061,63 @@ mod socket_trust_9003_tests {
                 "default helper path {p} is under the temp directory — that is the #9003 defect"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod peer_uid_refusal_9171_tests {
+    use super::peer_uid_refusal;
+
+    /// #9171: the peer-credential decision, driven directly.
+    ///
+    /// The syscall shell around it cannot be exercised unprivileged — a refusal
+    /// needs a peer running as a different uid — so before this split the arms
+    /// were unreachable from any cell, and a mutation making the whole check
+    /// unreachable survived every source-level assertion because the checker's
+    /// NAME was still in the file.
+    #[test]
+    fn peer_uid_decision_table_9171() {
+        const SELF: u32 = 1000;
+        for (name, uid, want_refusal) in [
+            ("root peer is accepted", 0u32, false),
+            ("our own uid is accepted", SELF, false),
+            ("a FOREIGN uid is refused", 4242u32, true),
+            ("uid 1 is refused — non-zero is not privileged", 1u32, true),
+            ("a high foreign uid is refused", 65534u32, true),
+        ] {
+            let got = peer_uid_refusal("event stream socket", uid, 100, 7, SELF);
+            assert_eq!(
+                got.is_err(),
+                want_refusal,
+                "{name}: peer_uid_refusal(uid={uid}, self={SELF}) = {got:?}"
+            );
+            if let Err(msg) = got {
+                // Assert the MESSAGE, not merely the refusal: a refusal reached
+                // through the wrong arm reads exactly like a working guard.
+                assert!(
+                    msg.contains(&uid.to_string()),
+                    "{name}: refusal must name the offending uid: {msg}"
+                );
+                assert!(
+                    msg.contains("event stream socket"),
+                    "{name}: refusal must name which socket: {msg}"
+                );
+            }
+        }
+    }
+
+    /// NARROWNESS. `self_uid` is what makes "our own uid" acceptable, so a build
+    /// that ignored it would accept every uid. Same peer, different self.
+    #[test]
+    fn the_self_uid_actually_discriminates_9171() {
+        assert!(
+            peer_uid_refusal("k", 1000, 0, 1, 1000).is_ok(),
+            "uid 1000 must be accepted when we ARE uid 1000"
+        );
+        assert!(
+            peer_uid_refusal("k", 1000, 0, 1, 2000).is_err(),
+            "uid 1000 must be refused when we are uid 2000 — otherwise the check \
+             compares nothing and accepts anyone"
+        );
     }
 }

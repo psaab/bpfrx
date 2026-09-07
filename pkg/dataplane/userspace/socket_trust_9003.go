@@ -119,7 +119,8 @@ func verifyTrustedRuntimeDir(kind, dir string) error {
 	if err := unix.Fstat(fd, &st); err != nil {
 		return fmt.Errorf("inspect %s directory %s: %w", kind, dir, err)
 	}
-	if err := runtimeDirTrustError(kind, dir, st.Uid, st.Mode, uint32(os.Geteuid())); err != nil {
+	if err := runtimeDirTrustError(kind, dir, st.Uid, st.Gid, st.Mode,
+		uint32(os.Geteuid()), uint32(os.Getegid())); err != nil {
 		return err
 	}
 	return verifyAncestorsNotSwappable(kind, dir)
@@ -134,7 +135,7 @@ func verifyTrustedRuntimeDir(kind, dir string) error {
 // because a skip is indistinguishable from a pass in every summary line. Making
 // the decision a pure function of (uid, mode, self) is that stub: the shell
 // supplies real values in production and the cells supply the hostile ones.
-func runtimeDirTrustError(kind, dir string, uid, mode, self uint32) error {
+func runtimeDirTrustError(kind, dir string, uid, gid, mode, self, selfGid uint32) error {
 	if uid != 0 && uid != self {
 		return fmt.Errorf("%w: %s directory %s is owned by uid %d, not root (uid 0) or this daemon (uid %d) — "+
 			"an unprivileged owner can replace the socket xpfd is about to talk to, which carries the "+
@@ -147,6 +148,29 @@ func runtimeDirTrustError(kind, dir string, uid, mode, self uint32) error {
 			"so any local user can replace the socket xpfd is about to talk to; "+
 			"point `set system dataplane control-socket` at a root-owned directory such as %s",
 			errUntrustedRuntimeDir, kind, dir, mode&0o7777, DefaultRuntimeDir)
+	}
+	// #9171: the GROUP-writable arm. This check tested S_IWOTH only, so a
+	// root-owned but group-writable directory passed — and every member of that
+	// group can then unlink the socket and bind their own.
+	//
+	// It matters more than it looks because it was the half that made a SECOND
+	// bounded finding reachable: the helper's event-socket CLIENT is the one leg
+	// of six with no peer verification, and that gap was dismissed as needing
+	// "write access to a root-owned directory, i.e. root already". Group-write
+	// is exactly the case where that premise fails. **Each of the two findings
+	// was dismissed by assuming the other held.**
+	//
+	// gid 0 and the daemon's own egid are accepted, mirroring the uid arm
+	// directly above: membership of the root group is already root-equivalent on
+	// any system where this check could help, and refusing the daemon's own
+	// group would refuse the directory the daemon itself creates.
+	if mode&unix.S_IWGRP != 0 && mode&unix.S_ISVTX == 0 && gid != 0 && gid != selfGid {
+		return fmt.Errorf("%w: %s directory %s has mode %04o and group %d — it is group-writable "+
+			"without the sticky bit and the group is neither root (0) nor this daemon's (%d), "+
+			"so any member of that group can replace the socket xpfd is about to talk to and "+
+			"receive the live session-delta stream; point `set system dataplane control-socket` "+
+			"at a root-owned directory such as %s",
+			errUntrustedRuntimeDir, kind, dir, mode&0o7777, gid, selfGid, DefaultRuntimeDir)
 	}
 	return nil
 }
@@ -176,6 +200,16 @@ func verifyAncestorsNotSwappable(kind, dir string) error {
 				"the sticky bit, so any local user can move it aside and substitute their own; "+
 				"point `set system dataplane control-socket` at a path under a root-owned directory such as %s",
 				errUntrustedRuntimeDir, kind, dir, p, st.Mode&0o7777, DefaultRuntimeDir)
+		}
+		// #9171: an ancestor is as good as the directory itself — moving a
+		// parent aside substitutes the whole subtree. Same gid exemptions.
+		if st.Mode&unix.S_IWGRP != 0 && st.Mode&unix.S_ISVTX == 0 &&
+			st.Gid != 0 && st.Gid != uint32(os.Getegid()) {
+			return fmt.Errorf("%w: %s directory %s has ancestor %s with mode %04o and group %d — "+
+				"group-writable without the sticky bit and not a trusted group, so any member of "+
+				"that group can move it aside and substitute their own; point "+
+				"`set system dataplane control-socket` at a path under a root-owned directory such as %s",
+				errUntrustedRuntimeDir, kind, dir, p, st.Mode&0o7777, st.Gid, DefaultRuntimeDir)
 		}
 		if p == "/" || p == "." {
 			return nil

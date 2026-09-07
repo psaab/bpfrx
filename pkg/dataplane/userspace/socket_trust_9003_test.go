@@ -84,24 +84,43 @@ func TestDefaultHelperPathsAreNotInATempDirectory9003(t *testing.T) {
 // MkdirAll-and-assume code never made.
 func TestRuntimeDirTrustDecision9003(t *testing.T) {
 	const self = 1000
+	const selfGid = 1000
 	for _, tc := range []struct {
 		name    string
 		uid     uint32
+		gid     uint32
 		mode    uint32
 		wantSub string
 	}{
-		{"root-owned 0750 is trusted", 0, unix.S_IFDIR | 0o750, ""},
-		{"own-uid 0700 is trusted (a non-root test binary)", self, unix.S_IFDIR | 0o700, ""},
-		{"root-owned 0755 is trusted", 0, unix.S_IFDIR | 0o755, ""},
-		{"sticky world-writable root-owned is trusted (/tmp itself)", 0, unix.S_IFDIR | unix.S_ISVTX | 0o777, ""},
+		{"root-owned 0750 is trusted", 0, 0, unix.S_IFDIR | 0o750, ""},
+		{"own-uid 0700 is trusted (a non-root test binary)", self, selfGid, unix.S_IFDIR | 0o700, ""},
+		{"root-owned 0755 is trusted", 0, 0, unix.S_IFDIR | 0o755, ""},
+		{"sticky world-writable root-owned is trusted (/tmp itself)", 0, 0, unix.S_IFDIR | unix.S_ISVTX | 0o777, ""},
 		// THE #9003 CASE. The attacker won the mkdir race, so they own it.
-		{"foreign-owned is refused", 4242, unix.S_IFDIR | 0o755, "owned by uid 4242"},
+		{"foreign-owned is refused", 4242, 0, unix.S_IFDIR | 0o755, "owned by uid 4242"},
 		// The other half: ours, but anyone may write it.
-		{"world-writable without sticky is refused", 0, unix.S_IFDIR | 0o777, "world-writable without the sticky bit"},
-		{"foreign-owned AND world-writable is refused by ownership first", 4242, unix.S_IFDIR | 0o777, "owned by uid 4242"},
+		{"world-writable without sticky is refused", 0, 0, unix.S_IFDIR | 0o777, "world-writable without the sticky bit"},
+		{"foreign-owned AND world-writable is refused by ownership first", 4242, 0, unix.S_IFDIR | 0o777, "owned by uid 4242"},
+
+		// #9171 — THE GROUP-WRITABLE ARM. This check tested S_IWOTH only, so a
+		// root-owned but group-writable directory passed, and every member of
+		// that group could unlink the socket and bind their own.
+		//
+		// It is the half that made a SECOND bounded finding reachable: the
+		// helper's event-socket CLIENT has no peer verification, dismissed as
+		// needing "write access to a root-owned directory, i.e. root already".
+		// Group-write is exactly where that premise fails.
+		{"root-owned but group-writable by a FOREIGN group is refused", 0, 4242, unix.S_IFDIR | 0o770, "group-writable"},
+		{"group-writable and world-writable is refused by the world arm first", 0, 4242, unix.S_IFDIR | 0o777, "world-writable without the sticky bit"},
+		// EXEMPTIONS, mirroring the uid arm directly above.
+		{"group-writable by ROOT group is trusted", 0, 0, unix.S_IFDIR | 0o770, ""},
+		{"group-writable by the daemon's OWN group is trusted", 0, selfGid, unix.S_IFDIR | 0o770, ""},
+		{"sticky group-writable is trusted", 0, 4242, unix.S_IFDIR | unix.S_ISVTX | 0o770, ""},
+		// NARROWNESS: group-READABLE is not group-writable.
+		{"group-readable only is trusted", 0, 4242, unix.S_IFDIR | 0o750, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := runtimeDirTrustError("control socket", "/somewhere", tc.uid, tc.mode, self)
+			err := runtimeDirTrustError("control socket", "/somewhere", tc.uid, tc.gid, tc.mode, self, selfGid)
 			if tc.wantSub == "" {
 				if err != nil {
 					t.Fatalf("runtimeDirTrustError(uid=%d, mode=%04o) = %v, want trusted", tc.uid, tc.mode&0o7777, err)

@@ -84,13 +84,60 @@ pub(super) fn io_thread_main(
 
 /// Try to connect to the daemon event socket, retrying every 100ms.
 /// Returns None if stop is requested.
+///
+/// #9171: THE PEER IS VERIFIED HERE, and this was the one leg of six that did
+/// not. Five siblings check -- three Go dials, one Go accept and two Rust
+/// accepts -- and this client simply connected.
+///
+/// A CLIENT has to authenticate its server. `SO_PEERCRED` on a connected socket
+/// returns the credentials of the other end whichever end asked, so the same
+/// helper the accept paths use answers the question here; it is reused rather
+/// than re-spelled, because two readings of one syscall are how they diverge.
+///
+/// What this closes is not hypothetical. The gap was dismissed as needing
+/// "write access to a root-owned, non-world-writable directory, i.e. root
+/// already" -- and the runtime-dir trust check tested only `S_IWOTH`, so a
+/// root-owned GROUP-writable directory passed it. Each finding was dismissed by
+/// assuming the other held. Together: a member of that group unlinks the socket,
+/// binds their own, and this loop hands them the live session-delta stream plus
+/// a `FullResync` -- the firewall's session table, addresses, ports and zone
+/// identity -- and accepts forged ACKs back.
+///
+/// On refusal the connection is DROPPED and the loop keeps retrying rather than
+/// giving up: an impostor holding the path must not be able to terminate the
+/// stream permanently, and the real socket returning must heal it. The refusal
+/// is logged ONCE per takeover episode -- at 100 ms retries an unconditional
+/// warning would emit ten lines a second and bury itself, which is the shape a
+/// reader learns to filter out.
 fn try_connect(path: &str, shared: &Arc<EventStreamShared>) -> Option<UnixStream> {
+    let mut warned = false;
     loop {
         if shared.stop.load(Ordering::Acquire) {
             return None;
         }
         match UnixStream::connect(path) {
-            Ok(stream) => return Some(stream),
+            Ok(stream) => match crate::server::lifecycle::reject_unprivileged_peer(
+                "event stream socket",
+                &stream,
+            ) {
+                Ok(()) => {
+                    warned = false;
+                    return Some(stream);
+                }
+                Err(e) => {
+                    if !warned {
+                        warned = true;
+                        eprintln!(
+                            "xpf-event-stream: REFUSING to stream session state to an \
+                             untrusted peer on {path}: {e} -- something other than the \
+                             daemon is bound to this path; retrying, and not sending \
+                             until it is the daemon again"
+                        );
+                    }
+                    drop(stream);
+                    thread::sleep(Duration::from_millis(100));
+                }
+            },
             Err(_) => {
                 thread::sleep(Duration::from_millis(100));
             }
