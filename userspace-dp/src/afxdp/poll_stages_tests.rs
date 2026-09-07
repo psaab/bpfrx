@@ -423,12 +423,31 @@ fn session_miss_ack_stage_invokes_syn_cookie_runtime_validation() {
         ScreenVerdict::SynCookieBypass,
         "poll-stage session-miss ACK handling must invoke SYN-cookie validation"
     );
+    // #9419 re-anchor. This used to assert that the SECOND matching SYN is
+    // challenged again — "validated SYN-cookie bypass must be single-use".
+    // Single-use was the defect: the validated ACK is answered with a RST, so
+    // the client's next SYN comes from a NEW ephemeral port on a NEW
+    // connection, and a single-use entry has already been burned by the
+    // reconnect that follows. What this cell is actually FOR — that the poll
+    // stage invokes SYN-cookie validation at all — is the assertion above.
+    // The bound is kept here in the form that survives: the bypass is scoped
+    // to the validated CLIENT, so a different source is still challenged.
+    let mut reconnect = syn_info.clone();
+    reconnect.src_port = 49153;
+    assert_eq!(
+        screen.check_packet_with_zone_id("lan", TEST_LAN_ZONE_ID, &reconnect, TEST_NOW_SECS),
+        ScreenVerdict::SynCookieBypass,
+        "the validated client's post-RST reconnect must be admitted (#9419)"
+    );
+    let mut other_source = syn_info.clone();
+    other_source.src_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 99));
+    other_source.src_port = 49154;
     assert!(
         matches!(
-            screen.check_packet_with_zone_id("lan", TEST_LAN_ZONE_ID, &syn_info, TEST_NOW_SECS),
+            screen.check_packet_with_zone_id("lan", TEST_LAN_ZONE_ID, &other_source, TEST_NOW_SECS),
             ScreenVerdict::SynCookieChallenge(_)
         ),
-        "validated SYN-cookie bypass must be single-use"
+        "the SYN-cookie bypass must not widen past the validated client"
     );
 }
 

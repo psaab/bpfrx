@@ -6,7 +6,9 @@ When `security flow syn-flood-protection-mode syn-cookie` is configured, SYN
 floods trigger cookie-based source validation in XDP instead of dropping all SYNs
 indiscriminately. Legitimate sources pass after a single extra round-trip;
 spoofed sources fail validation. Once validated, a source has zero per-packet
-overhead for subsequent connections during the flood.
+overhead for subsequent connections during the flood — the whitelist is keyed
+on the client and service, not on one ephemeral port, and survives being read
+(see "Whitelist scope and lifetime (#9419)").
 
 **Commit:** `8cbf31a`
 
@@ -279,8 +281,10 @@ SYN flood detected (rate > threshold)
         2. XDP_TX the SYN-ACK back to sender
         3. Legitimate client responds with ACK containing cookie
         4. validate_syncookie checks ACK via bpf_tcp_raw_check_syncookie_ipv4/v6
-        5. On success: add source to validated_clients LRU, send RST
-        6. Client retransmits SYN → passes as validated → normal session creation
+        5. On success: whitelist the CLIENT (src_ip, dst_ip, dst_port — NOT
+           the ephemeral source port), send RST
+        6. Client reconnects (a new ephemeral port) → passes as validated →
+           normal session creation
 
 SYN rate drops below threshold/2 in a new window
   → synproxy_active deactivated
@@ -503,6 +507,37 @@ xpf_screen_syncookie_total{type="bypass"}    # Validated sources bypassing chall
   implemented. Only syn-cookie mode is supported.
 - The `validated_clients` LRU map has a fixed size of 65536 entries. Under
   extremely high cardinality attacks, legitimate entries may be evicted.
+
+### Whitelist scope and lifetime (#9419)
+
+Step 6 above says "client reconnects", not "client retransmits the SYN", and
+the distinction is load-bearing. Step 5 sends a RST, which aborts the
+just-ESTABLISHED socket with `ECONNRESET`. No TCP stack retransmits a SYN from
+that state — the application calls `connect()` again, which allocates a **new
+ephemeral source port**. So the only shape in which the recovery step can
+occur is a NEW connection from the same client.
+
+The whitelist is therefore keyed on `(zone_id, profile_gen, src_ip, dst_ip,
+dst_port)` — deliberately **no source port** — and a hit does **not** consume
+the entry. It is bounded instead by:
+
+- a TTL of one cookie epoch (`SynCookieCodec::EPOCH_SECS`, 64 s), refreshed on
+  each new validation; and
+- the #2446 per-zone SYN-cookie profile generation, so a SYN-cookie-relevant
+  commit invalidates every prior validation.
+
+The cookie MAC itself still binds the full 4-tuple including the source port;
+only the whitelist that the validated ACK seeds is source-scoped. This matches
+the eBPF ancestor's `struct validated_client_key`
+(`git show 13fa1009ea:bpf/headers/xpf_common.h`), which likewise carried no
+source port and lived in a TTL'd `LRU_HASH`.
+
+Before #9419 the whitelist key included `src_port` and the lookup was a
+single-use `take`. Step 6 was consequently unreachable: the reconnect arrived
+on a port that had never been whitelisted, was challenged and reset again, and
+every legitimate TCP client to a zone in cookie mode looped on `ECONNRESET` for
+as long as an attacker held the zone above its attack threshold — strictly
+worse than leaving the feature off.
 - IPv6 SYN-ACK MSS is 1440 (vs 1460 for IPv4) to account for the larger header.
 - Userspace SYN-cookie challenge, secret-unavailable, SYN-ACK, ACK-RST, budget,
   valid, invalid, and bypass counters are visible in helper status. Live
