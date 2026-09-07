@@ -780,6 +780,62 @@ Putting `gre` first makes the dropped value and the fallback identical, so a rea
 divergence reads as EQUIVALENT and the #2419 inventory entry looks stale. A
 fixture must never use the value the bug falls back to.
 
+### `interfaces <if> tunnel keepalive-retry` — a bound for REACHABILITY, not overflow (#9157)
+
+`key`, `ttl` and `keepalive` under `tunnel` each carry `valueType: ValueInteger`
+plus an explicit `ValidateInteger` range. `keepalive-retry` carried neither, and
+it was the only one of the four that did not — an omission among typed siblings,
+which is the shape a per-leaf test cannot see.
+
+`schema_walk.go` builds a value checker exactly when `n.validator != nil`, so an
+untyped leaf is walked and waved through. Measured on `SchemaValidate`, with the
+sibling as the in-container positive control:
+
+```
+keepalive-retry 99999999999   accepted   -> KeepaliveRetry = 99999999999
+keepalive-retry abc           accepted   -> 0, normalized at runtime to 3
+keepalive-retry -5            accepted   -> -5, normalized at runtime to 3
+CONTROL keepalive 99999999999 REJECTED   integer out of range [0..32767]
+CONTROL keepalive 30          accepted
+```
+
+**The harm is REACHABILITY, and the leaf's own comment used to say why it did not
+need a bound.** That comment — "a pass-through count consumed by the keepalive
+prober only when > 0; never a Duration multiply" — is accurate, and it answers
+the #5705 OVERFLOW question rather than this one. `keepaliveTick` transitions the
+tunnel down at `state.Failures >= state.MaxRetries`
+(`pkg/routing/tunnel_keepalive_runner.go`), `Failures` increments once per probe
+tick, and `startKeepalive` normalizes only `<= 0 -> 3`. A large enough count
+makes that comparison unreachable: the tunnel is never declared down and routes
+over it keep forwarding into a dead peer, on a commit that reported success. The
+reachable spelling is `set … tunnel keepalive 30 keepalive-retry 99999999999`,
+since the runner is gated on `tc.Keepalive > 0`.
+
+Bounded to **1..255**, Junos's own range. `0` is rejected rather than silently
+meaning the runtime default 3, and `abc` is rejected rather than becoming 3
+through the discarded `strconv.Atoi` error in `compiler_interfaces.go`.
+`ValidateIntegerMin` was NOT used: an explicit upper bound is the point, and
+`ValidateInteger(1, 0)` is the reversed-range trap #8358 already paid for.
+
+**Typing this leaf REMOVED an admission head, and that is a behaviour change
+worth stating.** `validateModifierChild` rejects a flat run whose head leaf is
+TYPED, so `keepalive-retry` and `routing-instance` were the `tunnel` container's
+two UNTYPED heads: a run headed by either carried every later statement past the
+strict gate (#9156 V020). #9156 fixed the READER so such a run expands correctly
+rather than being dropped; typing the leaf means the `keepalive-retry`-headed
+spelling is now REJECTED at commit instead, which agrees with the typed-head
+order (`destination B keepalive-retry 5`) that has always been refused.
+`routing-instance` remains untyped and is still an admission head, so #9156's
+cells keep their subject — they were re-pointed at it rather than deleted, and
+`TestKeepaliveRetryHeadIsRejectedOnceTyped9157` pins the head that left so the
+narrowing is asserted rather than merely no longer tested.
+
+**Coverage, not one leaf.** `TestEveryTunnelValueLeafIsTyped9157` walks the
+container from `setSchema` and requires every childless value leaf under
+`interfaces <*> tunnel` to declare a `valueType` AND a validator, so a leaf added
+later without one reds there instead of waiting for somebody to notice the
+asymmetry again.
+
 ### `protocols {isis,rip} authentication-type` — a typo DOWNGRADES md5 to plaintext (#8443)
 
 Untyped in `setSchema` across **five** copies (RIP, IS-IS router-level, IS-IS

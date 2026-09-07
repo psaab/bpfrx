@@ -828,6 +828,24 @@ peer behind a valid route read up forever and the fail-safe
   panicked `time.NewTicker` — a commit-reachable, self-inflicted xpfd
   crash. The runtime clamp is defense-in-depth for a value that reaches
   the dataplane un-gated (stale DB, a path bypassing `SchemaValidate`).
+- **Retry bound (#9157)**: the configured `keepalive-retry <count>` is
+  bounded to `1..255` at commit-check (`pkg/config` `tunnelSchemaChildren`,
+  `ValidateInteger(1, 255)` — Junos's own range; default 3). It was the
+  only UNTYPED leaf of the four under `tunnel` until then, and the harm is
+  REACHABILITY rather than the #5705 overflow: `keepaliveTick` transitions
+  the tunnel down at `state.Failures >= state.MaxRetries`, `Failures`
+  increments once per tick, and `startKeepalive` normalizes only
+  `<= 0 -> 3` — so `keepalive-retry 99999999999` committed clean and left
+  the dead-peer check permanently unreachable. The tunnel is never
+  declared down, the anchor stays up, and routes over it keep forwarding
+  into a dead peer while `show configuration` renders the value the
+  operator wrote. `0` and a negative are rejected rather than silently
+  meaning the runtime default 3, and a NON-NUMERIC value (`abc`) is
+  rejected rather than becoming 3 through the discarded `strconv.Atoi`
+  error in `compiler_interfaces.go`. There is no runtime clamp for this
+  one and none is owed: unlike the interval it never reaches a
+  `time.Duration` multiply, so an un-gated value from a stale DB
+  degrades to a slow tear-down rather than to a panic.
 - **Reply match**: `Seq` + a per-probe random **Data-nonce** — NOT the
   ICMP ID. Datagram ("ping") sockets rewrite the outbound id to the
   socket source port, so id is advisory only.
