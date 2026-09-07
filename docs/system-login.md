@@ -1181,6 +1181,56 @@ defense-in-depth should a lower class ever gain config-view access. The raw
 redacted before display and fails **closed** — a parse error returns an error
 rather than the cleartext bytes.
 
+**Reading the CANDIDATE configuration requires `PermConfig` (#9324).**
+
+`ConfigTarget`'s proto3 **zero value is `CANDIDATE`**, and both config-read
+surfaces were priced `PermView`. A read-only caller that omitted the target
+therefore received another session's **uncommitted** configuration. Measured
+against a session holding a staged edit:
+
+```
+REST show, no ?target        -> "... security-zone SECRET-WIP-ZONE ..."
+REST show, ?target=active    -> "system { host-name COMMITTED-ACTIVE; }"
+REST compare (no selector)   -> "+ security-zone SECRET-WIP-ZONE"
+```
+
+Two failure modes. **Disclosure:** topology, zones, policies and address books
+of work in progress (secrets are separately redacted, so this is not #4099).
+**Silent wrong answer:** on an idle box the same call returns an EMPTY string, so
+a config-backup client written without `?target=active` archives either nothing
+or somebody's draft and cannot tell which.
+
+The rule now, on both surfaces:
+
+| request | permission |
+| --- | --- |
+| `ShowConfig` with `Target: ACTIVE`; `GET /api/v1/config/show` with no `?target` or `?target=active`; `GET /api/v1/config/export` | `PermView` |
+| `ShowConfig` with `Target: CANDIDATE` **or omitted**; `GET /api/v1/config/show?target=candidate`; `GET /api/v1/config/compare` (any `?rollback`) | **`PermConfig`** |
+
+That is the Junos reading: operational `show configuration` renders the
+**committed** configuration, and seeing a candidate is a configure-mode activity
+a class without `configure` cannot reach.
+
+**Why the two surfaces are fixed differently.** REST's `?target` is a string, so
+an ABSENT parameter is distinguishable from an explicit one: the default there is
+now `active` (matching `GET /api/v1/config/export`, which has always rendered
+ACTIVE), and an unrecognised `?target` is a 400 rather than a fall-through. gRPC
+cannot do that — proto3 does not distinguish an omitted enum from an explicit
+zero, so defaulting to ACTIVE would also rewrite an *explicit* `CANDIDATE`
+request, which `cmd/cli` sends for its config-mode view. Renumbering the enum to
+add an `UNSPECIFIED` sentinel is a wire **redefinition** and a rolling-upgrade
+hazard. So gRPC is fixed by **price** alone, and both surfaces agree on that
+price.
+
+`GET /api/v1/config/show-rollback` was checked and is **unaffected**: it reads the
+committed rollback archive (`ShowRollbackRedacted` → `rollbackEntry`), not the
+candidate, so it stays `PermView`.
+
+Enforcement lives at the two choke points that already adjudicate — `readAuthz`
+(`pkg/api/authz.go`) and the gRPC principal interceptor beside
+`authorizeRPCConfigMutation` (`pkg/grpcapi/authz.go`) — not in the handlers, so a
+new target-taking route cannot be added with its read ungated.
+
 **SNMP community masking in status commands (#4111).** The #4099 redaction
 above covers the config-render surfaces (they route through the `RedactedClone`
 renderers). Two **operational status** commands, however, format the typed

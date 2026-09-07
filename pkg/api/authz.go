@@ -862,11 +862,46 @@ func readPermissionFor(method, path string) (config.LoginClassPermission, bool) 
 	return 0, false
 }
 
+// candidateConfigReadPermission returns the permission a request requires when
+// it selects the CANDIDATE configuration, and ok=false otherwise (#9324).
+//
+// The (method, path) table cannot express this: one route serves both targets,
+// and the target is in the query string. Resolving it HERE keeps the table
+// keyed on the route as it is served — the same reasoning the #9134 HEAD-alias
+// fix records above — instead of asking every config handler to remember its
+// own authorization.
+//
+// Reading a candidate costs PermConfig: it is another session's uncommitted
+// work, and on Junos seeing a candidate is a configure-mode activity that a
+// class without `configure` cannot reach.
+func candidateConfigReadPermission(r *http.Request) (config.LoginClassPermission, bool) {
+	switch r.URL.Path {
+	case "/api/v1/config/compare":
+		// compare renders candidate-vs-active (or candidate-vs-rollback): both
+		// branches read s.candidate, so work-in-progress is the only thing this
+		// route can produce. There is no target parameter that would make the
+		// answer right for a view-only caller, so the route is priced, not
+		// defaulted.
+		return config.PermConfig, true
+	case "/api/v1/config/show":
+		if strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("target")), "candidate") {
+			return config.PermConfig, true
+		}
+	}
+	return 0, false
+}
+
 func (s *Server) readAuthz(w http.ResponseWriter, r *http.Request, next http.Handler) {
 	required, known := readPermissionFor(r.Method, r.URL.Path)
 	if !known {
 		next.ServeHTTP(w, r)
 		return
+	}
+	// #9324: a candidate-configuration read is priced above the route's table
+	// entry. Applied after the lookup so an unguarded route stays unguarded
+	// (/health, /metrics) and a guarded one can only get STRICTER here.
+	if candidatePerm, isCandidateRead := candidateConfigReadPermission(r); isCandidateRead {
+		required = candidatePerm
 	}
 	cfg, p, _ := s.authorizeInputs(r)
 	if err := authz.Authorize(cfg, p, required); err != nil {

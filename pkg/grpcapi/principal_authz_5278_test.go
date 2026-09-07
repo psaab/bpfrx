@@ -266,8 +266,24 @@ func TestReadOnlyClassIsAllowedAViewRPC_5278(t *testing.T) {
 	_, err := client.GetStatus(ctx, &pb.GetStatusRequest{})
 	assertNotDenied(t, "GetStatus", err)
 
+	// #9324 SPLIT THIS ASSERTION rather than inverting it. This cell's stated
+	// job — "without it, a gate that denied EVERYTHING would pass every denial
+	// assertion in this file" — is unchanged and still needs a ShowConfig that
+	// SUCCEEDS. What changed is which ShowConfig a read-only class is entitled
+	// to: ConfigTarget's proto3 zero value is CANDIDATE, so the bare
+	// `&pb.ShowConfigRequest{}` this line used to send was a request for another
+	// session's UNCOMMITTED configuration. Naming ACTIVE keeps the control doing
+	// exactly what it was written to do, on the request a read-only principal is
+	// actually entitled to.
+	_, err = client.ShowConfig(ctx, &pb.ShowConfigRequest{Target: pb.ConfigTarget_ACTIVE})
+	assertNotDenied(t, "ShowConfig{ACTIVE}", err)
+
+	// The other half of the split: the request this line used to send is now
+	// refused. Kept HERE, beside the control it came from, so the two cannot
+	// drift apart — a later edit that relaxes the gate reds this, and a later
+	// edit that broadens it reds the arm above.
 	_, err = client.ShowConfig(ctx, &pb.ShowConfigRequest{})
-	assertNotDenied(t, "ShowConfig", err)
+	assertDenied(t, "ShowConfig{omitted target == CANDIDATE}", err)
 
 	_, err = client.Complete(ctx, &pb.CompleteRequest{Line: "show "})
 	assertNotDenied(t, "Complete", err)
