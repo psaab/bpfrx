@@ -298,7 +298,13 @@ func TestCompileClassOfServiceEqualFlowEnforcementRequiresPositiveExactRate(t *t
 			if err == nil {
 				t.Fatal("CompileConfig succeeded, want equal-flow-enforcement validation error")
 			}
-			if !strings.Contains(err.Error(), "equal-flow-enforcement requires positive transmit-rate exact") {
+			// #9366: the message widened to name the three first-class rate
+			// forms. All three rows above still REJECT — the behaviour this
+			// cell exists to pin is unchanged; only the wording moved. The
+			// message is still asserted rather than dropped, because a
+			// rejection reached through the WRONG branch reads as a working
+			// guard when only the failure is checked.
+			if !strings.Contains(err.Error(), "equal-flow-enforcement requires a positive transmit-rate") {
 				t.Fatalf("CompileConfig error = %v, want equal-flow-enforcement validation", err)
 			}
 		})
@@ -2164,5 +2170,89 @@ func TestCompileClassOfServiceUnitInheritsLevelRateAndBurstHB166G10(t *testing.T
 	}
 	if u.BurstSizeBytes != parseBurstSizeLimit("200000") {
 		t.Fatalf("unit inheriting the rate must also inherit the level burst: got %d, want %d", u.BurstSizeBytes, parseBurstSizeLimit("200000"))
+	}
+}
+
+// #9366: `transmit-rate percent <n> exact` and `transmit-rate remainder exact`
+// were REJECTED AT COMMIT. Both set `TransmitRateExact = true` and leave
+// `TransmitRateBytes` at 0 — their value lives in `TransmitRatePercent` /
+// `TransmitRateRemainder` — so a gate reading only the absolute byte field
+// fired, and told the operator to supply the exact rate they had just written
+// as a percentage or a remainder.
+//
+// The gate predates #4228 Gap 2 (percent) and #6846 (remainder), which made
+// both forms first-class, and was not revisited. The DATAPLANE already resolves
+// both: `forwarding_build/cos.rs` derives `guarantee_enabled` from
+// `cos_effective_transmit_rate_bytes(...).or_else(remainder)`. This Go gate was
+// the sole blocker on a shipped, documented fairness feature.
+//
+// Fail-on-revert: restore `sched.TransmitRateBytes == 0` and both accept rows
+// go red with the commit refusal.
+func TestEqualFlowEnforcementAcceptsEveryRateForm9366(t *testing.T) {
+	base := []string{
+		"set class-of-service interfaces ge-0/0/2 unit 0 shaping-rate 1g",
+		"set class-of-service interfaces ge-0/0/2 unit 0 scheduler-map sm",
+		"set class-of-service scheduler-maps sm forwarding-class ef scheduler ef-sched",
+		"set class-of-service forwarding-classes queue 5 ef",
+	}
+	for _, tc := range []struct {
+		name       string
+		rate       []string
+		wantReject bool
+	}{
+		{
+			name: "absolute exact — accepted before and after",
+			rate: []string{"set class-of-service schedulers ef-sched transmit-rate 500m exact"},
+		},
+		{
+			name: "percent exact — THE DEFECT",
+			rate: []string{"set class-of-service schedulers ef-sched transmit-rate percent 50 exact"},
+		},
+		{
+			name: "remainder exact — THE DEFECT",
+			rate: []string{"set class-of-service schedulers ef-sched transmit-rate remainder exact"},
+		},
+		{
+			// NARROWNESS: still refused. The feature needs a guarantee to
+			// enforce against, and a percent rate WITHOUT `exact` does not
+			// express one. Without this row the change is satisfied by a gate
+			// that accepts everything.
+			name:       "percent without exact — must still be refused",
+			rate:       []string{"set class-of-service schedulers ef-sched transmit-rate percent 50"},
+			wantReject: true,
+		},
+		{
+			name:       "no transmit rate at all — must still be refused",
+			rate:       nil,
+			wantReject: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tree := &ConfigTree{}
+			lines := append(append([]string{}, base...), tc.rate...)
+			lines = append(lines, "set class-of-service schedulers ef-sched equal-flow-enforcement")
+			for _, line := range lines {
+				path, err := ParseSetCommand(line)
+				if err != nil {
+					t.Fatalf("ParseSetCommand(%q): %v", line, err)
+				}
+				if err := tree.SetPath(path); err != nil {
+					t.Fatalf("SetPath(%q): %v", line, err)
+				}
+			}
+			_, err := CompileConfig(tree)
+			if tc.wantReject {
+				if err == nil {
+					t.Fatal("committed clean; equal-flow-enforcement with no exact " +
+						"guarantee has nothing to enforce against")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("REJECTED a legitimate config: %v\n\nThe operator wrote the "+
+					"rate this error says is missing, in a form the schema admits and "+
+					"the dataplane resolves.", err)
+			}
+		})
 	}
 }
