@@ -837,164 +837,218 @@ var schemaBridgeDomains = &schemaNode{desc: "Bridge domain configuration", wildc
 	"domain-type":       {args: 1, desc: "Bridge domain type", children: nil},
 }}}
 
-var schemaRoutingInstances = &schemaNode{desc: "Routing instance configuration", wildcard: &schemaNode{desc: "Routing instance name", placeholder: "<instance-name>", children: map[string]*schemaNode{
-	// #8787: instance-type and interface ARE declared here, and the rationale
-	// that used to sit in this spot -- "NOT listed here -> they become leaf
-	// nodes" -- was true when written and stopped being true when packed-tail
-	// resolution landed.
+var schemaRoutingInstances = &schemaNode{desc: "Routing instance configuration", // #9323: the admissible children of `routing-instances <name>` are gated by
+	// validateRoutingInstanceChildTokensAST (compiler_routing_children_9323.go),
+	// NOT by `closedWorld: true` on this wildcard.
 	//
-	// An undeclared keyword still becomes a leaf in the BRACED spelling, which
-	// is what that note observed. But the packed reader resolves a stanza's
-	// tail THROUGH THE SCHEMA, so an undeclared keyword there terminates the
-	// walk and the whole stanza is dropped. Measured before this change:
-	//
-	//	routing-instances { ri1 { instance-type forwarding; } }   1 instance, type=forwarding
-	//	routing-instances { ri1 instance-type forwarding; }       0 instances
-	//	routing-instances { ri1 interface ge-0/0/0.0; }           0 instances
-	//
-	// Not a lost leaf -- the entire routing instance vanishes, on a commit
-	// that reports success. The harmful direction is `forwarding`:
-	// InstanceType == "forwarding" is what makes the daemon SKIP VRF creation
-	// (daemon_apply_interfaces.go), so a dropped value creates a VRF the
-	// operator asked NOT to have and moves interfaces into it.
-	//
-	// Reachable from a loaded or peer-synced config FILE, not from flat `set`
-	// (which builds a chain and compiles correctly) -- so the boot and HA-sync
-	// paths, not the CLI.
-	//
-	// `interface` is multi: the compiler reads it with firewallMatchValues,
-	// and the #3904 note there records that reading only the first value
-	// stranded the remaining ports outside the instance -- a VRF isolation
-	// break. Declaring it single-valued would reintroduce that.
-	"instance-type": {desc: "Routing instance type", args: 1, placeholder: "<type>", children: nil},
-	"interface":     {desc: "Interfaces bound to this routing instance", args: 1, multi: true, placeholder: "<interface>", children: nil},
-	"routing-options": {desc: "Routing options", children: map[string]*schemaNode{
-		"static": {desc: "Static routes", children: map[string]*schemaNode{
-			"route": staticRouteNode(),
-		}},
-		"rib": {desc: "Routing information base", args: 1, placeholder: "<rib-name>", children: map[string]*schemaNode{
-			"static": {desc: "Static routes", children: map[string]*schemaNode{
-				"route": staticRouteNode(),
-			}},
-		}},
-		"interface-routes": {desc: "Interface routes", children: map[string]*schemaNode{
+	// That was the first attempt and it is wrong for the same reason it was wrong
+	// at the config root and at `firewall family` (#9017): the flag INHERITS down
+	// every level. MEASURED with it armed — `go test ./...` rejected zero configs,
+	// which reads like a clean board, and a targeted over-reach probe then found
+	// `routing-instances <n> protocols bgp group <g> neighbor <ip> peer-as <n>`
+	// REJECTED, because the per-instance `protocols bgp group` subtree does not
+	// declare `neighbor` while the shared compiler (compileProtocols) handles it
+	// fully. BGP neighbours inside a VRF are ordinary configuration and no fixture
+	// in the tree writes one, so the suite was blind to it. Arming here exposes
+	// every incompleteness in the per-instance protocol grammar; the gate below
+	// is scoped to this level and inherits nothing.
+	wildcard: &schemaNode{desc: "Routing instance name", placeholder: "<instance-name>", children: map[string]*schemaNode{
+		// #8787: instance-type and interface ARE declared here, and the rationale
+		// that used to sit in this spot -- "NOT listed here -> they become leaf
+		// nodes" -- was true when written and stopped being true when packed-tail
+		// resolution landed.
+		//
+		// An undeclared keyword still becomes a leaf in the BRACED spelling, which
+		// is what that note observed. But the packed reader resolves a stanza's
+		// tail THROUGH THE SCHEMA, so an undeclared keyword there terminates the
+		// walk and the whole stanza is dropped. Measured before this change:
+		//
+		//	routing-instances { ri1 { instance-type forwarding; } }   1 instance, type=forwarding
+		//	routing-instances { ri1 instance-type forwarding; }       0 instances
+		//	routing-instances { ri1 interface ge-0/0/0.0; }           0 instances
+		//
+		// Not a lost leaf -- the entire routing instance vanishes, on a commit
+		// that reports success. The harmful direction is `forwarding`:
+		// InstanceType == "forwarding" is what makes the daemon SKIP VRF creation
+		// (daemon_apply_interfaces.go), so a dropped value creates a VRF the
+		// operator asked NOT to have and moves interfaces into it.
+		//
+		// Reachable from a loaded or peer-synced config FILE, not from flat `set`
+		// (which builds a chain and compiles correctly) -- so the boot and HA-sync
+		// paths, not the CLI.
+		//
+		// `interface` is multi: the compiler reads it with firewallMatchValues,
+		// and the #3904 note there records that reading only the first value
+		// stranded the remaining ports outside the instance -- a VRF isolation
+		// break. Declaring it single-valued would reintroduce that.
+		// #9323: DECLARED BEFORE the closed world was armed, because arming it
+		// without them is a REGRESSION, and the test suite is blind to that —
+		// measured: `go test ./...` with closedWorld armed and these four still
+		// undeclared rejects nothing at all, because no fixture writes them. A
+		// targeted probe is what found it.
+		//
+		// All four are admitted by the COMPILER (isRoutingInstanceKeyword8787,
+		// compiler_routing.go), and `description` is read into
+		// RoutingInstanceConfig.Description, so rejecting it would refuse a value
+		// the tree stores. The other three are accepted-and-inert — standard Junos
+		// L3VPN keywords the compiler admits and compiles to no field, exactly as
+		// routingInstanceKeywordOwnsBody9055 records. Their descs say so, so
+		// completion offers them with their real status rather than implying
+		// support (the `interface-specific` convention in schema_cos.go).
+		//
+		// The schema and isRoutingInstanceKeyword8787 must now agree EXACTLY;
+		// TestRoutingInstanceSchemaAndCompilerAgree9323 binds that, which is the
+		// drift the #8787 note beside that function warns about but nothing
+		// enforced.
+		// #9323: MEASURED, not derived. `interface-routes` appears DIRECTLY under a
+		// routing instance in the shipped contract — `set routing-instances dmz-vr
+		// interface-routes rib-group inet dmz-leak` is the #2226 rib-group
+		// reference test's own spelling, in both AST shapes — while the schema
+		// declared it only under `routing-options` and
+		// `isRoutingInstanceKeyword8787` does not name it at all. Neither of those
+		// two sources is the admissible set; the corpus is. Enumerating it is what
+		// found this (and `apply-macro`, handled as a universal meta keyword in the
+		// gate rather than declared here).
+		"interface-routes": {desc: "Interface routes (rib-group leaking) for this instance", children: map[string]*schemaNode{
 			"rib-group": {desc: "RIB group", children: map[string]*schemaNode{
 				"inet":  {desc: "IPv4 RIB group", args: 1, placeholder: "<group-name>", children: nil},
 				"inet6": {desc: "IPv6 RIB group", args: 1, placeholder: "<group-name>", children: nil},
 			}},
 		}},
-	}},
-	"protocols": {desc: "Protocols configuration", children: map[string]*schemaNode{
-		"ospf": {desc: "OSPF configuration", children: map[string]*schemaNode{
-			"reference-bandwidth": {desc: "Reference bandwidth", args: 1, placeholder: "<bandwidth>", children: nil},
-			"passive":             {desc: "Passive mode", children: nil},
-			"area": {desc: "OSPF area", args: 1, placeholder: "<area-id>", keyValidator: ValidateOSPFArea, children: map[string]*schemaNode{
-				"interface": {desc: "Interface", args: 1, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: map[string]*schemaNode{
-					"passive":    {desc: "Passive interface", children: nil},
-					"no-passive": {desc: "Non-passive interface", children: nil},
-					"interface-type": {desc: "Interface type", args: 1, placeholder: "<type>",
-						// #8481: typed. The token is written VERBATIM into the FRR managed
-						// section (`ip ospf network %s`), and one line vtysh rejects fails
-						// the entire reload — see schema_ospf_interface_type_8481.go.
-						valueType: ValueEnumOf, valueDesc: "OSPF network type",
-						valueExamples: OSPFNetworkTypes,
-						validator:     ValidateOSPFInterfaceType, children: nil},
-					// #8443: modeled ONLY so it is REFUSED — see
-					// schema_ospf_authentication_8443.go.
-					"authentication-type": unmodeledOSPFAuthTypeLeaf(),
-					"cost":                {desc: "Interface cost", args: 1, placeholder: "<cost>", children: nil},
-					"hello-interval":      {desc: "Hello interval (seconds)", args: 1, valueType: ValueInteger, placeholder: "<seconds>", validator: ValidateInteger(1, 65535), children: nil},
-					"dead-interval":       {desc: "Dead interval (seconds)", args: 1, valueType: ValueInteger, placeholder: "<seconds>", validator: ValidateInteger(1, 65535), children: nil},
-					"retransmit-interval": {desc: "Retransmit interval (seconds)", args: 1, valueType: ValueInteger, placeholder: "<seconds>", validator: ValidateInteger(1, 65535), children: nil},
-					"priority":            {desc: "Router priority for DR election", args: 1, valueType: ValueInteger, placeholder: "<priority>", validator: ValidateInteger(0, 255), children: nil},
-					// #8443: closed-world. The child keyword IS the algorithm selector
-					// (compiler_protocols.go assigns AuthType only from a matched
-					// `md5` / `simple-password`), so an unmatched keyword here does
-					// not misconfigure authentication — it removes it, silently.
-					"authentication": {desc: "Authentication", closedWorld: true, children: map[string]*schemaNode{
-						"md5": {desc: "MD5 authentication", args: 1, placeholder: "<key-id>", children: map[string]*schemaNode{
-							"key": {desc: "Authentication key", args: 1, placeholder: "<key>", children: nil},
+		"description":         {desc: "Routing instance description", args: 1, placeholder: "<text>", children: nil},
+		"vrf-target":          {desc: "VRF route target (accepted; xpf compiles no BGP/MPLS VPN state from it)", args: 1, placeholder: "<target>", children: nil},
+		"vrf-table-label":     {desc: "VRF table label (accepted; xpf compiles no BGP/MPLS VPN state from it)", children: nil},
+		"route-distinguisher": {desc: "VRF route distinguisher (accepted; xpf compiles no BGP/MPLS VPN state from it)", args: 1, placeholder: "<rd>", children: nil},
+
+		"instance-type": {desc: "Routing instance type", args: 1, placeholder: "<type>", children: nil},
+		"interface":     {desc: "Interfaces bound to this routing instance", args: 1, multi: true, placeholder: "<interface>", children: nil},
+		"routing-options": {desc: "Routing options", children: map[string]*schemaNode{
+			"static": {desc: "Static routes", children: map[string]*schemaNode{
+				"route": staticRouteNode(),
+			}},
+			"rib": {desc: "Routing information base", args: 1, placeholder: "<rib-name>", children: map[string]*schemaNode{
+				"static": {desc: "Static routes", children: map[string]*schemaNode{
+					"route": staticRouteNode(),
+				}},
+			}},
+			"interface-routes": {desc: "Interface routes", children: map[string]*schemaNode{
+				"rib-group": {desc: "RIB group", children: map[string]*schemaNode{
+					"inet":  {desc: "IPv4 RIB group", args: 1, placeholder: "<group-name>", children: nil},
+					"inet6": {desc: "IPv6 RIB group", args: 1, placeholder: "<group-name>", children: nil},
+				}},
+			}},
+		}},
+		"protocols": {desc: "Protocols configuration", children: map[string]*schemaNode{
+			"ospf": {desc: "OSPF configuration", children: map[string]*schemaNode{
+				"reference-bandwidth": {desc: "Reference bandwidth", args: 1, placeholder: "<bandwidth>", children: nil},
+				"passive":             {desc: "Passive mode", children: nil},
+				"area": {desc: "OSPF area", args: 1, placeholder: "<area-id>", keyValidator: ValidateOSPFArea, children: map[string]*schemaNode{
+					"interface": {desc: "Interface", args: 1, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: map[string]*schemaNode{
+						"passive":    {desc: "Passive interface", children: nil},
+						"no-passive": {desc: "Non-passive interface", children: nil},
+						"interface-type": {desc: "Interface type", args: 1, placeholder: "<type>",
+							// #8481: typed. The token is written VERBATIM into the FRR managed
+							// section (`ip ospf network %s`), and one line vtysh rejects fails
+							// the entire reload — see schema_ospf_interface_type_8481.go.
+							valueType: ValueEnumOf, valueDesc: "OSPF network type",
+							valueExamples: OSPFNetworkTypes,
+							validator:     ValidateOSPFInterfaceType, children: nil},
+						// #8443: modeled ONLY so it is REFUSED — see
+						// schema_ospf_authentication_8443.go.
+						"authentication-type": unmodeledOSPFAuthTypeLeaf(),
+						"cost":                {desc: "Interface cost", args: 1, placeholder: "<cost>", children: nil},
+						"hello-interval":      {desc: "Hello interval (seconds)", args: 1, valueType: ValueInteger, placeholder: "<seconds>", validator: ValidateInteger(1, 65535), children: nil},
+						"dead-interval":       {desc: "Dead interval (seconds)", args: 1, valueType: ValueInteger, placeholder: "<seconds>", validator: ValidateInteger(1, 65535), children: nil},
+						"retransmit-interval": {desc: "Retransmit interval (seconds)", args: 1, valueType: ValueInteger, placeholder: "<seconds>", validator: ValidateInteger(1, 65535), children: nil},
+						"priority":            {desc: "Router priority for DR election", args: 1, valueType: ValueInteger, placeholder: "<priority>", validator: ValidateInteger(0, 255), children: nil},
+						// #8443: closed-world. The child keyword IS the algorithm selector
+						// (compiler_protocols.go assigns AuthType only from a matched
+						// `md5` / `simple-password`), so an unmatched keyword here does
+						// not misconfigure authentication — it removes it, silently.
+						"authentication": {desc: "Authentication", closedWorld: true, children: map[string]*schemaNode{
+							"md5": {desc: "MD5 authentication", args: 1, placeholder: "<key-id>", children: map[string]*schemaNode{
+								"key": {desc: "Authentication key", args: 1, placeholder: "<key>", children: nil},
+							}},
+							"simple-password": {desc: "Simple password", args: 1, placeholder: "<password>", children: nil},
 						}},
-						"simple-password": {desc: "Simple password", args: 1, placeholder: "<password>", children: nil},
+						"bfd-liveness-detection": {desc: "BFD liveness detection", children: map[string]*schemaNode{
+							"minimum-interval": {desc: "Minimum interval (milliseconds)", args: 1, valueType: ValueInteger, placeholder: "<milliseconds>", validator: ValidateInteger(10, 60000), children: nil},
+							"multiplier":       {desc: "Multiplier", args: 1, valueType: ValueInteger, placeholder: "<multiplier>", validator: ValidateInteger(2, 255), children: nil},
+						}},
 					}},
-					"bfd-liveness-detection": {desc: "BFD liveness detection", children: map[string]*schemaNode{
-						"minimum-interval": {desc: "Minimum interval (milliseconds)", args: 1, valueType: ValueInteger, placeholder: "<milliseconds>", validator: ValidateInteger(10, 60000), children: nil},
-						"multiplier":       {desc: "Multiplier", args: 1, valueType: ValueInteger, placeholder: "<multiplier>", validator: ValidateInteger(2, 255), children: nil},
+					"area-type": {desc: "Area type", children: map[string]*schemaNode{
+						"stub": {desc: "Stub area", children: map[string]*schemaNode{
+							"no-summaries": {desc: "No summaries", children: nil},
+						}},
+						"nssa": {desc: "NSSA area", children: map[string]*schemaNode{
+							"no-summaries": {desc: "No summaries", children: nil},
+						}},
 					}},
-				}},
-				"area-type": {desc: "Area type", children: map[string]*schemaNode{
-					"stub": {desc: "Stub area", children: map[string]*schemaNode{
-						"no-summaries": {desc: "No summaries", children: nil},
+					"virtual-link": {desc: "Virtual link", args: 1, placeholder: "<router-id>", children: map[string]*schemaNode{
+						"transit-area": {desc: "Transit area", args: 1, placeholder: "<area-id>", children: nil},
 					}},
-					"nssa": {desc: "NSSA area", children: map[string]*schemaNode{
-						"no-summaries": {desc: "No summaries", children: nil},
-					}},
-				}},
-				"virtual-link": {desc: "Virtual link", args: 1, placeholder: "<router-id>", children: map[string]*schemaNode{
-					"transit-area": {desc: "Transit area", args: 1, placeholder: "<area-id>", children: nil},
 				}},
 			}},
-		}},
-		"ospf3": {desc: "OSPFv3 configuration", children: map[string]*schemaNode{
-			"router-id": {desc: "Router ID", args: 1, placeholder: "<address>", children: nil},
-			"export":    {desc: "Export policy", args: 1, multi: true, placeholder: "<policy-name>", children: nil},
-			"area": {desc: "OSPFv3 area", args: 1, placeholder: "<area-id>", keyValidator: ValidateOSPFArea, children: map[string]*schemaNode{
+			"ospf3": {desc: "OSPFv3 configuration", children: map[string]*schemaNode{
+				"router-id": {desc: "Router ID", args: 1, placeholder: "<address>", children: nil},
+				"export":    {desc: "Export policy", args: 1, multi: true, placeholder: "<policy-name>", children: nil},
+				"area": {desc: "OSPFv3 area", args: 1, placeholder: "<area-id>", keyValidator: ValidateOSPFArea, children: map[string]*schemaNode{
+					"interface": {desc: "Interface", args: 1, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: map[string]*schemaNode{
+						"passive":             {desc: "Passive interface", children: nil},
+						"cost":                {desc: "Interface cost", args: 1, placeholder: "<cost>", children: nil},
+						"hello-interval":      {desc: "Hello interval (seconds)", args: 1, valueType: ValueInteger, placeholder: "<seconds>", validator: ValidateInteger(1, 65535), children: nil},
+						"dead-interval":       {desc: "Dead interval (seconds)", args: 1, valueType: ValueInteger, placeholder: "<seconds>", validator: ValidateInteger(1, 65535), children: nil},
+						"retransmit-interval": {desc: "Retransmit interval (seconds)", args: 1, valueType: ValueInteger, placeholder: "<seconds>", validator: ValidateInteger(1, 65535), children: nil},
+						"priority":            {desc: "Router priority for DR election", args: 1, valueType: ValueInteger, placeholder: "<priority>", validator: ValidateInteger(0, 255), children: nil},
+						"bfd-liveness-detection": {desc: "BFD liveness detection", children: map[string]*schemaNode{
+							"minimum-interval": {desc: "Minimum interval (milliseconds)", args: 1, valueType: ValueInteger, placeholder: "<milliseconds>", validator: ValidateInteger(10, 60000), children: nil},
+							"multiplier":       {desc: "Multiplier", args: 1, valueType: ValueInteger, placeholder: "<multiplier>", validator: ValidateInteger(2, 255), children: nil},
+						}},
+					}},
+				}},
+			}},
+			"bgp": {desc: "BGP configuration", children: map[string]*schemaNode{
+				"graceful-restart": {desc: "Graceful restart", children: nil},
+				"damping": {desc: "Route damping", children: map[string]*schemaNode{
+					"half-life":    {desc: "Half life (minutes)", args: 1, valueType: ValueInteger, placeholder: "<minutes>", validator: ValidateInteger(1, 45), children: nil},
+					"reuse":        {desc: "Reuse threshold", args: 1, valueType: ValueInteger, placeholder: "<value>", validator: ValidateInteger(1, 20000), children: nil},
+					"suppress":     {desc: "Suppress threshold", args: 1, valueType: ValueInteger, placeholder: "<value>", validator: ValidateInteger(1, 20000), children: nil},
+					"max-suppress": {desc: "Max suppress time (minutes)", args: 1, valueType: ValueInteger, placeholder: "<minutes>", validator: ValidateInteger(1, 255), children: nil},
+				}},
+				"group": {desc: "BGP group", args: 1, placeholder: "<group-name>", children: nil},
+			}},
+			"isis": {desc: "IS-IS configuration", children: map[string]*schemaNode{
+				"net": {desc: "NET address", args: 1, placeholder: "<net-address>", children: nil},
+				// #8446: same typing as the top-level copy; see there.
+				"level": {desc: "IS-IS level (alias of is-type)", args: 1, placeholder: "<level>",
+					valueType: ValueEnumOf, valueDesc: "IS-IS level",
+					valueExamples: ISISLevelSpellings(), validator: ValidateISISLevel, children: nil},
+				"is-type": {desc: "IS type (alias of level)", args: 1, placeholder: "<type>",
+					valueType: ValueEnumOf, valueDesc: "IS-IS level",
+					valueExamples: ISISLevelSpellings(), validator: ValidateISISLevel, children: nil},
+				"export": {desc: "Export policy", args: 1, multi: true, placeholder: "<policy-name>", children: nil},
 				"interface": {desc: "Interface", args: 1, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: map[string]*schemaNode{
-					"passive":             {desc: "Passive interface", children: nil},
-					"cost":                {desc: "Interface cost", args: 1, placeholder: "<cost>", children: nil},
-					"hello-interval":      {desc: "Hello interval (seconds)", args: 1, valueType: ValueInteger, placeholder: "<seconds>", validator: ValidateInteger(1, 65535), children: nil},
-					"dead-interval":       {desc: "Dead interval (seconds)", args: 1, valueType: ValueInteger, placeholder: "<seconds>", validator: ValidateInteger(1, 65535), children: nil},
-					"retransmit-interval": {desc: "Retransmit interval (seconds)", args: 1, valueType: ValueInteger, placeholder: "<seconds>", validator: ValidateInteger(1, 65535), children: nil},
-					"priority":            {desc: "Router priority for DR election", args: 1, valueType: ValueInteger, placeholder: "<priority>", validator: ValidateInteger(0, 255), children: nil},
+					// #8450: same typing as the other copy; see there.
+					"level": {desc: "IS-IS circuit type for this interface", args: 1, placeholder: "<level>",
+						valueType: ValueEnumOf, valueDesc: "IS-IS interface level",
+						valueExamples: ISISCircuitTypeSpellings(), validator: ValidateISISCircuitType, children: nil},
+					"passive":            {desc: "Passive interface", children: nil},
+					"metric":             {desc: "Metric", args: 1, placeholder: "<value>", children: nil},
+					"authentication-key": {desc: "Authentication key", args: 1, placeholder: "<key>", children: nil},
+					"authentication-type": {desc: "Authentication type", args: 1, placeholder: "<type>",
+						valueType: ValueEnumOf, valueDesc: "authentication type",
+						valueExamples: AuthTypeSpellings(), validator: ValidateAuthType, children: nil},
 					"bfd-liveness-detection": {desc: "BFD liveness detection", children: map[string]*schemaNode{
 						"minimum-interval": {desc: "Minimum interval (milliseconds)", args: 1, valueType: ValueInteger, placeholder: "<milliseconds>", validator: ValidateInteger(10, 60000), children: nil},
 						"multiplier":       {desc: "Multiplier", args: 1, valueType: ValueInteger, placeholder: "<multiplier>", validator: ValidateInteger(2, 255), children: nil},
 					}},
 				}},
-			}},
-		}},
-		"bgp": {desc: "BGP configuration", children: map[string]*schemaNode{
-			"graceful-restart": {desc: "Graceful restart", children: nil},
-			"damping": {desc: "Route damping", children: map[string]*schemaNode{
-				"half-life":    {desc: "Half life (minutes)", args: 1, valueType: ValueInteger, placeholder: "<minutes>", validator: ValidateInteger(1, 45), children: nil},
-				"reuse":        {desc: "Reuse threshold", args: 1, valueType: ValueInteger, placeholder: "<value>", validator: ValidateInteger(1, 20000), children: nil},
-				"suppress":     {desc: "Suppress threshold", args: 1, valueType: ValueInteger, placeholder: "<value>", validator: ValidateInteger(1, 20000), children: nil},
-				"max-suppress": {desc: "Max suppress time (minutes)", args: 1, valueType: ValueInteger, placeholder: "<minutes>", validator: ValidateInteger(1, 255), children: nil},
-			}},
-			"group": {desc: "BGP group", args: 1, placeholder: "<group-name>", children: nil},
-		}},
-		"isis": {desc: "IS-IS configuration", children: map[string]*schemaNode{
-			"net": {desc: "NET address", args: 1, placeholder: "<net-address>", children: nil},
-			// #8446: same typing as the top-level copy; see there.
-			"level": {desc: "IS-IS level (alias of is-type)", args: 1, placeholder: "<level>",
-				valueType: ValueEnumOf, valueDesc: "IS-IS level",
-				valueExamples: ISISLevelSpellings(), validator: ValidateISISLevel, children: nil},
-			"is-type": {desc: "IS type (alias of level)", args: 1, placeholder: "<type>",
-				valueType: ValueEnumOf, valueDesc: "IS-IS level",
-				valueExamples: ISISLevelSpellings(), validator: ValidateISISLevel, children: nil},
-			"export": {desc: "Export policy", args: 1, multi: true, placeholder: "<policy-name>", children: nil},
-			"interface": {desc: "Interface", args: 1, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: map[string]*schemaNode{
-				// #8450: same typing as the other copy; see there.
-				"level": {desc: "IS-IS circuit type for this interface", args: 1, placeholder: "<level>",
-					valueType: ValueEnumOf, valueDesc: "IS-IS interface level",
-					valueExamples: ISISCircuitTypeSpellings(), validator: ValidateISISCircuitType, children: nil},
-				"passive":            {desc: "Passive interface", children: nil},
-				"metric":             {desc: "Metric", args: 1, placeholder: "<value>", children: nil},
 				"authentication-key": {desc: "Authentication key", args: 1, placeholder: "<key>", children: nil},
 				"authentication-type": {desc: "Authentication type", args: 1, placeholder: "<type>",
 					valueType: ValueEnumOf, valueDesc: "authentication type",
 					valueExamples: AuthTypeSpellings(), validator: ValidateAuthType, children: nil},
-				"bfd-liveness-detection": {desc: "BFD liveness detection", children: map[string]*schemaNode{
-					"minimum-interval": {desc: "Minimum interval (milliseconds)", args: 1, valueType: ValueInteger, placeholder: "<milliseconds>", validator: ValidateInteger(10, 60000), children: nil},
-					"multiplier":       {desc: "Multiplier", args: 1, valueType: ValueInteger, placeholder: "<multiplier>", validator: ValidateInteger(2, 255), children: nil},
-				}},
+				"wide-metrics-only": {desc: "Wide metrics only", children: nil},
+				"overload":          {desc: "Overload", children: nil},
 			}},
-			"authentication-key": {desc: "Authentication key", args: 1, placeholder: "<key>", children: nil},
-			"authentication-type": {desc: "Authentication type", args: 1, placeholder: "<type>",
-				valueType: ValueEnumOf, valueDesc: "authentication type",
-				valueExamples: AuthTypeSpellings(), validator: ValidateAuthType, children: nil},
-			"wide-metrics-only": {desc: "Wide metrics only", children: nil},
-			"overload":          {desc: "Overload", children: nil},
 		}},
-	}},
-}}}
+	}}}

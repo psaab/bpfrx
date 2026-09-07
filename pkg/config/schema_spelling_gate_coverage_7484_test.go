@@ -297,7 +297,14 @@ func gateLeafChangesWarnings(g gateLeaf, pre string, epath []string) bool {
 // and read as value-less flags -- are now compared. `enumerated` is unchanged
 // at 1098, which is what says the movement is spelling coverage rather than a
 // change in the population.
-const gateCoverageFloor = 715
+// #9323 raises it 715 -> 716. Declaring `interface-routes` directly under the
+// routing-instance wildcard made ONE more spelling comparable: the #2226
+// rib-group contract writes `set routing-instances <ri> interface-routes
+// rib-group inet <g>` and the compiler has always read it, but with no schema
+// declaration the walker found nothing under the container that could change
+// output. Declaring it changed no compiler behaviour — it made an already-read
+// leaf VISIBLE to the enumeration, the same movement #9151 recorded.
+const gateCoverageFloor = 716
 
 var gateBlindCeiling = map[gateBlindClass]int{
 	// #7492 moved leaves out of `unreachable` in two rounds. The parent
@@ -428,7 +435,19 @@ var gateBlindCeiling = map[gateBlindClass]int{
 	//   enumeration. A leaf leaving `unreachable` for `compared` is the
 	//   good direction, and it is why gateCoverageFloor rises 692 -> 694
 	//   in the same change: two new spellings became comparable.
-	gateBlindUnreachable: 132,
+	//   #9323 raises it 132 -> 137, DELIBERATELY, and the five are named
+	//   because a ceiling raised without them is just slack. Four are the
+	//   routing-instance keywords the compiler admits and compiles to no
+	//   field — `vrf-target`, `vrf-table-label`, `route-distinguisher` and
+	//   (for the spelling differential's purposes) `description`; they are
+	//   declared so the #9323 gate's permitted set, which is read from the
+	//   schema, does not reject configuration the compiler accepts. An
+	//   accepted-and-inert leaf CANNOT change output by construction, so the
+	//   differential can never move it out of `unreachable` — that is a
+	//   property of the leaf, not a gap in the instrument. The fifth is the
+	//   `interface-routes` container itself, whose comparable child moved the
+	//   floor above.
+	gateBlindUnreachable: 137,
 	// #8830: read, value deliberately ignored, advisory says so. Measured at
 	// this head: vrrp-group track-interface priority-cost (inet and inet6),
 	// security log stream transport tls-profile, system dataplane

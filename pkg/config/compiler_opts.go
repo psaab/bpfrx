@@ -803,6 +803,19 @@ type compileOpts struct {
 	// lenientApplicationNameCollisions.
 	lenientFirewallFilterFamilyCollisions bool
 
+	// lenientRoutingInstanceChildTokens (#9323) downgrades the
+	// routing-instance child-keyword gate
+	// (validateRoutingInstanceChildTokensAST) from a hard compile error to a
+	// cfg.Warnings entry. `routing-instances <name>` was open-world at every
+	// channel, so a `security nat nat64`, `firewall filter` or entirely bogus
+	// subtree nested under an instance committed clean, rendered back in
+	// `show configuration`, and compiled to NOTHING. The strict commit /
+	// commit-check path hard-rejects it; the tolerant load / peer-sync paths
+	// downgrade to a warning so an already-persisted or peer-synced config an
+	// older binary silently accepted still BOOTS (#1960 no-brick). Same
+	// doctrine as lenientFirewallFilterFamilyCollisions.
+	lenientRoutingInstanceChildTokens bool
+
 	// lenientFirewallFilterFamilyAnyMatches (#4296, fable-review-167 F-1
 	// residual) downgrades the firewall-filter family-any specific-match gate
 	// (validateFirewallFilterFamilyAnyMatchesAST) from a hard compile error to a
@@ -2651,6 +2664,7 @@ func lenientCompileOpts() compileOpts {
 		lenientApplicationNameCollisions:       true,
 		lenientReservedApplicationNames:        true,
 		lenientFirewallFilterFamilyCollisions:  true,
+		lenientRoutingInstanceChildTokens:      true,
 		lenientFirewallFilterFamilyAnyMatches:  true,
 		lenientFilterProtocols:                 true,
 		lenientFilterCrossField:                true,

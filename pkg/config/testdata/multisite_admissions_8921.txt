@@ -80,7 +80,7 @@ interface level	protocols/isis/interface,routing-instances/*/protocols/isis/inte
 interface metric	protocols/isis/interface,routing-instances/*/protocols/isis/interface
 interface priority	protocols/ospf/area/interface,protocols/ospf3/area/interface,routing-instances/*/protocols/ospf/area/interface,routing-instances/*/protocols/ospf3/area/interface
 interface retransmit-interval	protocols/ospf/area/interface,protocols/ospf3/area/interface,routing-instances/*/protocols/ospf/area/interface,routing-instances/*/protocols/ospf3/area/interface
-interface-routes rib-group	routing-instances/*/routing-options/interface-routes,routing-options/interface-routes
+interface-routes rib-group	routing-instances/*/interface-routes,routing-instances/*/routing-options/interface-routes,routing-options/interface-routes
 interfaces unit	class-of-service/interfaces,interfaces/*
 isis authentication-key	protocols/isis,routing-instances/*/protocols/isis
 isis authentication-type	protocols/isis,routing-instances/*/protocols/isis
@@ -136,8 +136,8 @@ qualified-next-hop preference	routing-instances/*/routing-options/rib/static/rou
 rewrite-rules dscp	class-of-service/interfaces/rewrite-rules,class-of-service/interfaces/unit/rewrite-rules,class-of-service/rewrite-rules
 rewrite-rules ieee-802.1	class-of-service/interfaces/rewrite-rules,class-of-service/interfaces/unit/rewrite-rules,class-of-service/rewrite-rules
 rib static	routing-instances/*/routing-options/rib,routing-options/rib
-rib-group inet	routing-instances/*/routing-options/interface-routes/rib-group,routing-options/interface-routes/rib-group
-rib-group inet6	routing-instances/*/routing-options/interface-routes/rib-group,routing-options/interface-routes/rib-group
+rib-group inet	routing-instances/*/interface-routes/rib-group,routing-instances/*/routing-options/interface-routes/rib-group,routing-options/interface-routes/rib-group
+rib-group inet6	routing-instances/*/interface-routes/rib-group,routing-instances/*/routing-options/interface-routes/rib-group,routing-options/interface-routes/rib-group
 route next-hop	routing-instances/*/routing-options/rib/static/route,routing-instances/*/routing-options/static/route,routing-options/rib/static/route,routing-options/static/route,services/ip-monitoring/policy/then/preferred-route/route,services/ip-monitoring/policy/then/preferred-route/routing-instance/route
 route next-table	routing-instances/*/routing-options/rib/static/route,routing-instances/*/routing-options/static/route,routing-options/rib/static/route,routing-options/static/route
 route preference	routing-instances/*/routing-options/rib/static/route,routing-instances/*/routing-options/static/route,routing-options/rib/static/route,routing-options/static/route
