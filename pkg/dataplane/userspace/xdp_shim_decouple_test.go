@@ -2,6 +2,8 @@ package userspace
 
 import (
 	"encoding/binary"
+	"fmt"
+	"net"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -14,6 +16,7 @@ import (
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
+	"golang.org/x/sys/unix"
 )
 
 func TestProgramBootstrapMapsDoesNotRequireLegacyFallbackProgram(t *testing.T) {
@@ -36,10 +39,24 @@ func TestXSKLivenessFailureRestoresUserspaceShimEntry(t *testing.T) {
 	m := &Manager{
 		bpfShim:        dataplane.New(),
 		configuredMode: ModeUserspaceCompat,
-		haGroups:       make(map[int]HAGroupStatus),
+		// #9337: an ACTIVE data redundancy group. Since #6429 an expired probe
+		// with no RX resolves three ways, and "liveness failed" — the branch
+		// this cell is named for and asserts — is only one of them:
+		// shouldExtendXSKLivenessIdleLocked EXTENDS the probe instead whenever
+		// the node has no active data RG, which an empty haGroups map means.
+		// With that map empty the cell measured the extension path while
+		// asserting the failure path's outcome. It is memlock-gated, so the
+		// drift never surfaced under `make test-go`.
+		haGroups: map[int]HAGroupStatus{1: {RGID: 1, Active: true}},
 	}
 	injectShimProgramName(t, m.bpfShim, userspaceXDPEntryProg)
 	injectCtrlAndBindingMaps(t, m)
+	// #9337: applyHelperStatusLocked re-syncs the ingress/local/interface-NAT
+	// classifier maps (#6994), which this fixture does not load — under CAP_BPF
+	// it failed with "userspace_ingress_ifaces map not loaded" before reaching
+	// anything this cell asserts. Unprivileged the whole test skips, so the gap
+	// was invisible. The seam is the established remedy (#7468).
+	m.syncClassifierMapsHook = func(*ConfigSnapshot) error { return nil }
 	m.neighborsPrewarmed = true
 	m.xskProbeStart = time.Now().Add(-11 * time.Second)
 
@@ -147,8 +164,13 @@ func TestUserspaceXDPBindingNotReadyDropsTransitButPassesLocalControl(t *testing
 				QueueCount:         1,
 				HeartbeatTimeoutMS: 30000,
 			})
-			updateUserspaceXDPTestIngress(t, coll, 0)
-			updateUserspaceXDPTestBinding(t, coll, 0, userspaceBindingValue{
+			// #9337: the ingress ifindex and binding index must be the ones
+			// BPF_PROG_TEST_RUN actually presents (see
+			// userspaceXDPTestRunIfindex). Seeded at 0, the shim never
+			// recognised the ingress interface and XDP_PASSed with no
+			// degraded reason at all.
+			updateUserspaceXDPTestIngress(t, coll, userspaceXDPTestRunIfindex(t))
+			updateUserspaceXDPTestBinding(t, coll, userspaceXDPTestRunBindingIndex(t, 0), userspaceBindingValue{
 				Slot:  0,
 				Flags: 2, // non-zero but not userspaceBindingReady
 			})
@@ -206,11 +228,14 @@ func TestUserspaceXDPNDPUsesCPUMapWhenAvailable(t *testing.T) {
 		Flags:              userspaceCtrlFlagCPUMap,
 		HeartbeatTimeoutMS: 30000,
 	})
-	updateUserspaceXDPTestIngress(t, coll, 0)
-	updateUserspaceXDPTestBinding(t, coll, 0, userspaceBindingValue{
+	// #9337: see userspaceXDPTestRunIfindex — seeded at 0 these two lines
+	// described an interface the run never arrives on.
+	updateUserspaceXDPTestIngress(t, coll, userspaceXDPTestRunIfindex(t))
+	updateUserspaceXDPTestBinding(t, coll, userspaceXDPTestRunBindingIndex(t, 0), userspaceBindingValue{
 		Slot:  0,
 		Flags: userspaceBindingReady,
 	})
+	updateUserspaceXDPTestHeartbeat(t, coll, 0)
 
 	ret := runUserspaceXDPTestPacket(t, coll, icmpv6TestPacket(
 		[16]byte{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10},
@@ -380,6 +405,61 @@ func updateUserspaceXDPTestIngress(t *testing.T, coll *ebpf.Collection, ifindex 
 	updateUserspaceXDPTestMap(t, coll, "userspace_ingress_ifaces", ifindex, uint8(1))
 }
 
+// userspaceXDPTestRunIfindex is the ingress ifindex BPF_PROG_TEST_RUN presents
+// to an XDP program (#9337).
+//
+// It is NOT zero. bpf_prog_test_run_xdp registers the calling netns's LOOPBACK
+// device as the run's RX queue (xdp_rxq_info_reg(..., net->loopback_dev, ...)),
+// so ctx->ingress_ifindex is lo's, and the binding coordinate the shim derives
+// from it is `ifindex * BINDING_QUEUES_PER_IFACE + rx_queue_index`, not 0.
+//
+// The two cells that seeded ifindex 0 therefore missed userspace_ingress_ifaces
+// entirely: the shim treated the packet as arriving on an interface it does not
+// manage and returned XDP_PASS with NO degraded reason recorded — which is why
+// "binding-not-ready transit action = 2, want 1" was the symptom rather than a
+// wrong reason code. They are memlock-gated, so this never showed under
+// `make test-go`; measured only once #9337 ran the guards under CAP_BPF.
+//
+// Derived rather than hard-coded to 1: lo's index is conventionally 1 but is a
+// property of the netns, not a constant.
+func userspaceXDPTestRunIfindex(t *testing.T) uint32 {
+	t.Helper()
+	lo, err := net.InterfaceByName("lo")
+	if err != nil {
+		t.Fatalf("look up the loopback device BPF_PROG_TEST_RUN attaches the run to: %v", err)
+	}
+	return uint32(lo.Index)
+}
+
+// userspaceXDPTestRunBindingIndex is the binding-array index the shim resolves
+// for a BPF_PROG_TEST_RUN packet on the given RX queue. Mirrors binding_slot in
+// userspace-xdp/src/binding_index.rs.
+func userspaceXDPTestRunBindingIndex(t *testing.T, rxQueue uint32) uint32 {
+	t.Helper()
+	return userspaceXDPTestRunIfindex(t)*bindingQueuesPerIface + rxQueue
+}
+
+// updateUserspaceXDPTestHeartbeat seeds userspace_heartbeat for a binding slot
+// with a FRESH timestamp on the clock the shim reads (#9337).
+//
+// The shim's degraded gates are an ordered chain, and the heartbeat pair
+// (missing, then stale) sits immediately after the binding-ready check. A cell
+// whose binding IS ready therefore cannot reach anything past it without this:
+// the array defaults to 0, `bpf_ktime_get_ns() - 0` exceeds any timeout, and
+// the packet leaves as heartbeat_stale. CLOCK_MONOTONIC, not the manager's
+// CLOCK_BOOTTIME helper — bpf_ktime_get_ns() is CLOCK_MONOTONIC, and seeding a
+// BOOTTIME value on a host that has suspended writes a timestamp in the shim's
+// future, which its `now_ns < *last_heartbeat` guard reads as stale.
+func updateUserspaceXDPTestHeartbeat(t *testing.T, coll *ebpf.Collection, slot uint32) {
+	t.Helper()
+	var ts unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts); err != nil {
+		t.Fatalf("clock_gettime(CLOCK_MONOTONIC): %v", err)
+	}
+	now := uint64(ts.Sec)*1_000_000_000 + uint64(ts.Nsec)
+	updateUserspaceXDPTestMap(t, coll, "userspace_heartbeat", slot, now)
+}
+
 func updateUserspaceXDPTestLocalV4(t *testing.T, coll *ebpf.Collection, ip [4]byte) {
 	t.Helper()
 	updateUserspaceXDPTestMap(t, coll, "userspace_local_v4", binary.BigEndian.Uint32(ip[:]), uint8(1))
@@ -436,8 +516,34 @@ func runUserspaceXDPTestPacket(t *testing.T, coll *ebpf.Collection, packet []byt
 func assertUserspaceXDPDegradedPathStat(t *testing.T, coll *ebpf.Collection, name string) {
 	t.Helper()
 	if got := userspaceXDPDegradedPathStat(t, coll, name); got == 0 {
-		t.Fatalf("degraded path stat %q = 0, want incremented", name)
+		// #9337: name the reason that DID fire. "stat X = 0" says the expected
+		// gate did not run and nothing about which one did, and the shim's
+		// degraded gates are an ORDERED chain — the answer is almost always
+		// "an earlier gate diverted the packet", which the counter set states
+		// directly. Diagnosing this from the bare message cost a full source
+		// read of userspace-xdp/src/lib.rs.
+		t.Fatalf("degraded path stat %q = 0, want incremented. Reasons that DID "+
+			"fire: %s", name, userspaceXDPDegradedPathStatsSummary(t, coll))
 	}
+}
+
+// userspaceXDPDegradedPathStatsSummary renders every non-zero degraded-path
+// reason, in the shim's own gate order.
+func userspaceXDPDegradedPathStatsSummary(t *testing.T, coll *ebpf.Collection) string {
+	t.Helper()
+	var parts []string
+	for _, reason := range degradedPathReasonNames {
+		if reason == "" {
+			continue
+		}
+		if got := userspaceXDPDegradedPathStat(t, coll, reason); got != 0 {
+			parts = append(parts, fmt.Sprintf("%s=%d", reason, got))
+		}
+	}
+	if len(parts) == 0 {
+		return "none — the packet never reached a degraded gate"
+	}
+	return strings.Join(parts, " ")
 }
 
 func assertUserspaceXDPDegradedPathStatAbsent(t *testing.T, coll *ebpf.Collection, name string) {

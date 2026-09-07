@@ -611,6 +611,12 @@ func TestApplyHelperStatusAcceptsIfindexWithinCap(t *testing.T) {
 	m.bpfShim.SelectUserspaceXDPShimEntryProgram()
 	injectCtrlAndBindingMaps(t, m)
 	injectUserspaceSessionMap(t, m)
+	// #9337: applyHelperStatusLocked re-syncs the ingress/local/interface-NAT
+	// classifier maps (#6994), which this fixture does not load — under CAP_BPF
+	// it failed with "userspace_ingress_ifaces map not loaded" before reaching
+	// anything this cell asserts. Unprivileged the whole test skips, so the gap
+	// was invisible. The seam is the established remedy (#7468).
+	m.syncClassifierMapsHook = func(*ConfigSnapshot) error { return nil }
 	m.neighborsPrewarmed = true
 	m.xskLivenessProven = true
 	m.publishedSnapshot = 1

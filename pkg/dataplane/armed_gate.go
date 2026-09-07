@@ -87,15 +87,22 @@ var registryLookupHook func()
 
 // muAcquireProbeHook, when non-nil, runs at the ENTRY of the contended
 // m.mu surfaces — BEFORE the m.mu.Lock call — in lookupMapLocked,
-// lookupProgramLocked, publishShimRegistryLocked, and XDPEntryProgram
-// (#2114 A3 test seam, Codex PR #6743 r3-8). The blocking legs signal
-// arrival from here: a handshake closed BEFORE the goroutine's contended
-// call leaves a preemption window in which the non-completion timeout
-// can pass without the goroutine ever reaching the mutex (a false-green
-// "it blocked" proof); the in-call pre-lock signal proves the goroutine
-// arrived at the contended acquisition. The site argument names the
-// function so a test can filter. Production leaves it nil (one nil
+// lookupProgramLocked, publishShimRegistryLocked, XDPEntryProgram and
+// xdpLinkFor (#2114 A3 test seam, Codex PR #6743 r3-8). The blocking legs
+// signal arrival from here: a handshake closed BEFORE the goroutine's
+// contended call leaves a preemption window in which the non-completion
+// timeout can pass without the goroutine ever reaching the mutex (a
+// false-green "it blocked" proof); the in-call pre-lock signal proves the
+// goroutine arrived at the contended acquisition. The site argument names
+// the function so a test can filter. Production leaves it nil (one nil
 // check per call, control plane only).
+//
+// THE SET IS A CLAIM ABOUT THE CALLERS, not about these functions (#9337).
+// A leg waiting on the probe is asserting that the path it drives reaches
+// one of these surfaces FIRST. Move a plain m.mu acquisition ahead of a
+// probed one — as 01409c1f did for DetachXDP by guarding the link maps —
+// and the wait becomes an unbounded deadlock, not a failure. Every such
+// wait is bounded for that reason; do not remove the bound.
 var muAcquireProbeHook func(site string)
 
 // lookupMapLocked performs the uniform #2114 A3 registry access for

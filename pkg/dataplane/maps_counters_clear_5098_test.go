@@ -37,7 +37,14 @@ func Test_clear_global_counters_read_equation_zero_5098(t *testing.T) {
 	numCPUs := ebpf.MustPossibleCPU()
 	arr := make([]uint64, numCPUs)
 	arr[0] = 7
-	if err := gc.Update(idx, arr, ebpf.UpdateAny); err != nil {
+	// #9337: uint32(idx), not idx. `const idx = GlobalCtrRxPackets` is an
+	// UNTYPED constant, so passing it to Update's interface{} key boxes it as
+	// `int` and cilium/ebpf refuses with "some values are not fixed-sized in
+	// type int" — the map key is 4 bytes. The sibling calls below take a typed
+	// parameter and convert implicitly, which is why only this one failed. The
+	// cell needs a real BPF map, so it skips unprivileged and this never
+	// surfaced under `make test-go`.
+	if err := gc.Update(uint32(idx), arr, ebpf.UpdateAny); err != nil {
 		t.Fatalf("seed global_counters array: %v", err)
 	}
 	if err := m.IncrementGlobalCounter(idx, 100); err != nil {
