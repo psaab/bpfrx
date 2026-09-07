@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
 	"sort"
 	"strings"
@@ -156,7 +157,22 @@ func collectAppliedTunnels(cfg *config.Config) []*config.TunnelConfig {
 		// special-cases the missing source
 		// (pkg/dataplane/userspace/tunnels.go); this is the routing-side
 		// twin.
-		if ifc.Tunnel != nil && (ifc.Tunnel.Source != "" || ifc.Tunnel.Mode == "wireguard") {
+		// #9156: ONE predicate, shared with EmitTunnelEndpointNames. This gate
+		// used to be `Source != "" || Mode == "wireguard"`, which admitted a
+		// tunnel with a source and NO destination — while the emitter, which
+		// requires both, gave the dataplane no endpoint for it. The device was
+		// created, brought up and addressed, and every packet routed into it
+		// disappeared. Refusing to create it turns a silent blackhole into an
+		// absent interface plus this warning.
+		if ifc.Tunnel != nil && !config.TunnelHasUsableEndpoints(ifc.Tunnel) {
+			slog.Warn("tunnel not applied: missing endpoint",
+				"interface", ifc.Tunnel.Name,
+				"mode", ifc.Tunnel.Mode,
+				"source", ifc.Tunnel.Source,
+				"destination", ifc.Tunnel.Destination,
+				"issue", "#9156")
+		}
+		if ifc.Tunnel != nil && config.TunnelHasUsableEndpoints(ifc.Tunnel) {
 			tc := *ifc.Tunnel
 			tc.AnchorOnly = anchorOnly
 			tc.MTU = ifc.MTU
@@ -165,6 +181,19 @@ func collectAppliedTunnels(cfg *config.Config) []*config.TunnelConfig {
 		}
 		for _, unit := range ifc.Units {
 			if unit == nil || unit.Tunnel == nil {
+				continue
+			}
+			// #9156: the per-unit loop screened NOTHING. A unit tunnel with no
+			// endpoints at all reached applyAnchorLocked, which has no endpoint
+			// check either, so it was created and brought up. This is the same
+			// shared predicate the interface-level arm and the emitter use.
+			if !config.TunnelHasUsableEndpoints(unit.Tunnel) {
+				slog.Warn("unit tunnel not applied: missing endpoint",
+					"interface", unit.Tunnel.Name,
+					"mode", unit.Tunnel.Mode,
+					"source", unit.Tunnel.Source,
+					"destination", unit.Tunnel.Destination,
+					"issue", "#9156")
 				continue
 			}
 			tc := *unit.Tunnel

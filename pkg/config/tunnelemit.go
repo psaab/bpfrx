@@ -76,7 +76,13 @@ func EmitTunnelEndpointNames(cfg *Config) []TunnelEndpointName {
 		// non-WireGuard tunnel without both endpoints is never emitted.
 		// WireGuard carries its peer in WgEndpoint and needs no
 		// Source/Destination (#1432 S2a).
-		if tunnel.Mode != "wireguard" && (tunnel.Source == "" || tunnel.Destination == "") {
+		//
+		// #9156: the predicate is shared with the ROUTING side's
+		// collectAppliedTunnels, which used to screen on Source alone (and on
+		// nothing at all for per-unit tunnels). The two disagreeing is what let
+		// a destination-less tunnel be created and brought up while this
+		// emitter gave the dataplane no endpoint for it.
+		if !TunnelHasUsableEndpoints(tunnel) {
 			return
 		}
 		out = append(out, TunnelEndpointName{Name: name, Tunnel: tunnel})

@@ -198,7 +198,10 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig, opts compileOpts, w
 				Name: LinuxIfName(ifName),
 				Mode: defaultMode,
 			}
-			for _, prop := range tunnelNode.Children {
+			// #9156: expand the flat-set run before reading it. An untyped head
+			// (`keepalive-retry`, `routing-instance`) admits the whole run past
+			// the strict gate and this loop would then read only the head.
+			for _, prop := range tunnelRunChildren9156(tunnelNode) {
 				switch prop.Name() {
 				case "source":
 					if len(prop.Keys) >= 2 {
@@ -318,7 +321,8 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig, opts compileOpts, w
 				if ifc.Tunnel != nil {
 					tc = ifc.Tunnel.cloneForUnit(linuxName)
 				}
-				for _, prop := range tunnelNode.Children {
+				// #9156: same expansion as the interface-level reader above.
+				for _, prop := range tunnelRunChildren9156(tunnelNode) {
 					switch prop.Name() {
 					case "source":
 						if v := nodeVal(prop); v != "" {
