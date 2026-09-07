@@ -320,11 +320,12 @@ func (c *CLI) applyToDataplane(cfg *config.Config) error {
 			// the instance's dedicated kernel table.
 			vrfName := "vrf-" + ri.Name
 			tableID := 0
-			if ri.InstanceType == "forwarding" {
+			forwarding := ri.InstanceType == "forwarding"
+			if forwarding {
 				vrfName = ""
 				tableID = ri.TableID
 			}
-			fc.Instances = append(fc.Instances, frr.InstanceConfig{
+			inst := frr.InstanceConfig{
 				Name:         ri.Name,
 				VRFName:      vrfName,
 				TableID:      tableID,
@@ -332,7 +333,15 @@ func (c *CLI) applyToDataplane(cfg *config.Config) error {
 				OSPFv3:       ri.OSPFv3,
 				BGP:          ri.BGP,
 				StaticRoutes: ri.StaticRoutes,
-			})
+			}
+			if forwarding {
+				// #9409: same drop as the daemon's assembleFRRConfig. An empty
+				// VRFName means "the GLOBAL instance" to generateProtocols, so
+				// carrying an instance's protocols through here would activate
+				// them globally.
+				inst.OSPF, inst.OSPFv3, inst.BGP = nil, nil, nil
+			}
+			fc.Instances = append(fc.Instances, inst)
 		}
 		if err := c.frr.ApplyFull(fc); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: FRR apply failed: %v\n", err)

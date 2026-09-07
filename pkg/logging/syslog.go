@@ -756,6 +756,7 @@ func (s *SyslogClient) Send(severity int, msg string) error {
 		// no connection to re-establish, so it returns the error — but it is
 		// now a BOUNDED error: #9025 armed the same write deadline on the
 		// datagram path, so "UDP never blocks" is not asserted here either.
+		// Nor is it a SILENT error: #9165 counts every UDP write failure below.
 		if s.protocol != "udp" {
 			// A write-deadline TIMEOUT was already bounded by the deadline;
 			// do NOT reconnect+retry (that would re-arm another writeTimeout,
@@ -790,14 +791,23 @@ func (s *SyslogClient) Send(severity int, msg string) error {
 			s.clearReconnectCooldown()
 			return nil
 		}
-		// #9025: a UDP deadline expiry is a NEW failure mode, created by arming
-		// the deadline, so counting it changes no pre-existing accounting — and
-		// not counting it would trade a silent stall for a silent drop, which is
-		// worse because it is indistinguishable from success. Other UDP write
-		// errors keep their existing behaviour.
-		if isTimeout(err) {
-			pendingWarn = s.noteDrop(dropWrite, err)
-		}
+		// #9025 counted the UDP DEADLINE EXPIRY it had just introduced. #9165:
+		// count every UDP write failure, not only that one.
+		//
+		// UDP is the DEFAULT transport, and the socket is CONNECTED
+		// (dialUDP), so Linux delivers the ICMP port-unreachable from a dead
+		// collector back as ECONNREFUSED on the next write. That is a real,
+		// observable failure and it is exactly the incident an operator needs
+		// to see. Under the old gate it was neither counted nor warned: on the
+		// default transport `droppedWrites` stayed 0 while every message went
+		// nowhere, so all three instruments — the counter, the rate-limited
+		// warning, and a `show` rendering the collector as configured — read
+		// healthy at once.
+		//
+		// There is no reconnect arm to add here: a datagram socket has no
+		// connection to re-establish, so the message is still dropped and the
+		// error still returned. Only the ACCOUNTING changes.
+		pendingWarn = s.noteDrop(dropWrite, err)
 		return err
 	}
 	return nil
@@ -825,10 +835,13 @@ func isTimeout(err error) bool {
 // stream's teardown into a path that cannot need it — how a correct-looking
 // generalisation acquires a wrong branch.
 //
-// A deadline expiry surfaces as os.ErrDeadlineExceeded, which satisfies
-// isTimeout, so the Send path counts it as a drop rather than letting it
-// vanish. That is the point: volume backpressure already existed (#3478);
-// LATENCY backpressure did not, and a hung write never returned to be counted.
+// A deadline expiry surfaces as os.ErrDeadlineExceeded, and the Send path
+// counts it as a drop rather than letting it vanish. That is the point: volume
+// backpressure already existed (#3478); LATENCY backpressure did not, and a
+// hung write never returned to be counted. Since #9165 the Send path counts
+// EVERY datagram write error, so this no longer depends on isTimeout — the
+// ECONNREFUSED a connected UDP socket gets back from a dead collector is
+// counted on the same footing.
 func (s *SyslogClient) datagramWrite(b []byte) error {
 	if s.writeTimeout > 0 {
 		// Best-effort, as in streamWrite: a conn that does not support
@@ -951,14 +964,13 @@ func (s *SyslogClient) SendBinary(data []byte) error {
 			s.clearReconnectCooldown()
 			return nil
 		}
-		// #9025: a UDP deadline expiry is a NEW failure mode, created by arming
-		// the deadline, so counting it changes no pre-existing accounting — and
-		// not counting it would trade a silent stall for a silent drop, which is
-		// worse because it is indistinguishable from success. Other UDP write
-		// errors keep their existing behaviour.
-		if isTimeout(err) {
-			pendingWarn = s.noteDrop(dropWrite, err)
-		}
+		// #9165: count every UDP write failure, not only the #9025 deadline
+		// expiry. See Send for the full reasoning — UDP is the default, the
+		// socket is connected so a dead collector surfaces ECONNREFUSED, and
+		// leaving it uncounted made the default transport silent on all three
+		// instruments at once. There is no reconnect arm on a datagram socket;
+		// only the accounting changes.
+		pendingWarn = s.noteDrop(dropWrite, err)
 		return err
 	}
 	return nil

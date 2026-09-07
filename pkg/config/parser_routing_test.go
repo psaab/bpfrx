@@ -1572,43 +1572,60 @@ func TestISISWideMetricsOverloadSetSyntax(t *testing.T) {
 	}
 }
 
+// #9408: this test USED to author `reference-bandwidth 10g` and then assert
+// only that `ospf != nil`. It exercised exactly the spelling that was being
+// silently dropped and said nothing about whether the value survived — the
+// tree's own coverage concealed the defect it walked through. It now asserts
+// the compiled value, in the unit the compiled field names.
 func TestOSPFReferenceBandwidthSetSyntax(t *testing.T) {
-	cmds := []string{"set protocols ospf reference-bandwidth 10g", "set protocols ospf area 0.0.0.0 interface trust0"}
-	tree := &ConfigTree{}
-	for _, cmd := range cmds {
-		path, err := ParseSetCommand(cmd)
-		if err != nil {
-			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+	compileRefBw := func(t *testing.T, token string) (*Config, error) {
+		t.Helper()
+		tree := &ConfigTree{}
+		for _, cmd := range []string{
+			"set protocols ospf reference-bandwidth " + token,
+			"set protocols ospf area 0.0.0.0 interface trust0",
+		} {
+			path, err := ParseSetCommand(cmd)
+			if err != nil {
+				t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+			}
+			if err := tree.SetPath(path); err != nil {
+				t.Fatalf("SetPath(%v): %v", path, err)
+			}
 		}
-		if err := tree.SetPath(path); err != nil {
-			t.Fatalf("SetPath(%v): %v", path, err)
-		}
+		return CompileConfig(tree)
 	}
-	cfg, err := CompileConfig(tree)
+
+	// The SUFFIX form. Junos units are bits/s, so 10g is 10 Gbps, which is
+	// 10000 Mbps in FRR's `auto-cost reference-bandwidth`.
+	cfg, err := compileRefBw(t, "10g")
 	if err != nil {
-		t.Fatalf("CompileConfig: %v", err)
+		t.Fatalf("CompileConfig(10g): %v", err)
 	}
 	ospf := cfg.Protocols.OSPF
 	if ospf == nil {
 		t.Fatal("OSPF config is nil")
 	}
-	cmds2 := []string{"set protocols ospf reference-bandwidth 10000", "set protocols ospf area 0.0.0.0 interface trust0"}
-	tree2 := &ConfigTree{}
-	for _, cmd := range cmds2 {
-		path, err := ParseSetCommand(cmd)
-		if err != nil {
-			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
-		}
-		if err := tree2.SetPath(path); err != nil {
-			t.Fatalf("SetPath(%v): %v", path, err)
-		}
+	if ospf.ReferenceBandwidthMbps != 10000 {
+		t.Errorf("ReferenceBandwidthMbps for 10g: got %d, want 10000 (10 Gbps in FRR's Mbps unit)", ospf.ReferenceBandwidthMbps)
 	}
-	cfg2, err := CompileConfig(tree2)
+
+	// The PLAIN-INTEGER form naming the same bandwidth. Junos units are
+	// bits/s, so 10 Gbps is 10000000000 — NOT 10000, which names 10 kbps and
+	// is rejected by the #9408 gate (covered in
+	// TestOSPFReferenceBandwidth9408).
+	cfg2, err := compileRefBw(t, "10000000000")
 	if err != nil {
-		t.Fatalf("CompileConfig: %v", err)
+		t.Fatalf("CompileConfig(10000000000): %v", err)
 	}
-	if cfg2.Protocols.OSPF.ReferenceBandwidth != 10000 {
-		t.Errorf("ReferenceBandwidth: got %d, want 10000", cfg2.Protocols.OSPF.ReferenceBandwidth)
+	if cfg2.Protocols.OSPF.ReferenceBandwidthMbps != 10000 {
+		t.Errorf("ReferenceBandwidthMbps for 10000000000: got %d, want 10000", cfg2.Protocols.OSPF.ReferenceBandwidthMbps)
+	}
+
+	// The two spellings name ONE bandwidth and must compile identically.
+	if ospf.ReferenceBandwidthMbps != cfg2.Protocols.OSPF.ReferenceBandwidthMbps {
+		t.Errorf("suffix and plain-integer spellings of 10 Gbps disagree: %d vs %d",
+			ospf.ReferenceBandwidthMbps, cfg2.Protocols.OSPF.ReferenceBandwidthMbps)
 	}
 }
 

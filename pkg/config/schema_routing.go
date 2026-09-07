@@ -315,10 +315,23 @@ const (
 
 var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map[string]*schemaNode{
 	"ospf": {desc: "OSPF configuration", children: map[string]*schemaNode{
-		"router-id":           {desc: "Router ID", args: 1, placeholder: "<address>", children: nil},
-		"reference-bandwidth": {desc: "Reference bandwidth", args: 1, placeholder: "<bandwidth>", children: nil},
-		"passive":             {desc: "Passive mode", children: nil},
-		"export":              {desc: "Export policy", args: 1, multi: true, placeholder: "<policy-name>", children: nil},
+		"router-id": {desc: "Router ID", args: 1, placeholder: "<address>", children: nil},
+		// #9408: typed. The value is BITS PER SECOND (Junos units) and is
+		// converted to FRR's Mbps `auto-cost reference-bandwidth (1-4294967)`
+		// by ospfReferenceBandwidthMbps, the SSOT this validator and
+		// compileProtocols share. Untyped, the suffix form (`1g`, `100m`) hit
+		// a discarded strconv.Atoi error and silently rendered NO auto-cost
+		// line, while a bare integer was passed verbatim into a directive
+		// whose unit is Mbps. isTypedLeaf() is `valueType != ValueAny`, so the
+		// valueType is what makes the validator RUN at all.
+		"reference-bandwidth": {desc: "Reference bandwidth", args: 1,
+			valueType:     ValueRate,
+			valueDesc:     "OSPF auto-cost reference bandwidth in BITS PER SECOND (Junos units; 100 Mbps is 100m or 100000000). Must be a whole number of Mbps in 1000000..4294967000000, the window FRR's auto-cost reference-bandwidth (1-4294967 Mbps) can express",
+			valueExamples: []string{"100m", "1g", "10g", "100000000"},
+			validator:     ValidateOSPFReferenceBandwidth,
+			placeholder:   "<bandwidth>", children: nil},
+		"passive": {desc: "Passive mode", children: nil},
+		"export":  {desc: "Export policy", args: 1, multi: true, placeholder: "<policy-name>", children: nil},
 		"area": {desc: "OSPF area", args: 1, placeholder: "<area-id>", keyValidator: ValidateOSPFArea, children: map[string]*schemaNode{
 			"interface": {desc: "Interface", args: 1, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: map[string]*schemaNode{
 				"passive":    {desc: "Passive interface", children: nil},
