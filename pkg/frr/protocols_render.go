@@ -56,8 +56,14 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 		if validRouterID(ospf.RouterID) {
 			fmt.Fprintf(&b, " ospf router-id %s\n", ospf.RouterID)
 		}
-		if ospf.ReferenceBandwidth > 0 {
-			fmt.Fprintf(&b, " auto-cost reference-bandwidth %d\n", ospf.ReferenceBandwidth)
+		// #9408: ReferenceBandwidthMbps is ALREADY in FRR's unit (Mbps) and
+		// already range-checked against `auto-cost reference-bandwidth
+		// (1-4294967)` — the bits/s -> Mbps conversion and the range gate both
+		// live in pkg/config (ospfReferenceBandwidthMbps). Render verbatim; do
+		// not re-scale here, and do not accept a raw operator token at this
+		// layer.
+		if ospf.ReferenceBandwidthMbps > 0 {
+			fmt.Fprintf(&b, " auto-cost reference-bandwidth %d\n", ospf.ReferenceBandwidthMbps)
 		}
 		if ospf.PassiveDefault {
 			b.WriteString(" passive-interface default\n")

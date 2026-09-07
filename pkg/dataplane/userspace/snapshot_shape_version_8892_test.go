@@ -136,8 +136,38 @@ func shapeDigest8892(t *testing.T) (string, int) {
 // IS the defect — so the answer to "is what it enforced before acceptable?" is
 // no. "Purely additive needs no bump" is a TRUE rule that would have licensed
 // exactly this regression, which is what this cell exists to refuse.
+//
+// v11 STANDS (issue 9408): `OSPFConfig.ReferenceBandwidth` was RENAMED to
+// `ReferenceBandwidthMbps`, so the compiled field carries the unit that
+// separates the Junos leaf (bits per second) from the FRR directive it feeds
+// (megabits per second).
+//
+// THIS IS NOT LIKE THE THREE "STANDS" ENTRIES ABOVE, and the difference is why
+// it is spelled out rather than pointed at them. Those were ADDITIONS of
+// `json:"-"` fields -- nothing transmits them, so the reasoning is one
+// sentence. This is a RENAME of a field with NO json tag, which means its Go
+// name IS its wire key: an old helper looking for the old key would find
+// nothing, which is exactly the shape this cell exists to refuse. So the
+// invisibility was MEASURED, not argued by analogy:
+//
+//   - the Rust side models this whole subtree as ONE opaque value --
+//     `pub config: serde_json::Value` in userspace-dp/src/protocol/snapshot.rs.
+//     It names no field inside it, so no deserialization can break and
+//     `deny_unknown_fields` cannot bite;
+//   - `grep -rn "reference_bandwidth\|ReferenceBandwidth" userspace-dp/src/`
+//     returns ZERO hits. Nothing in the dataplane reads it, of any vintage;
+//   - the field's only consumer is pkg/frr, which renders the FRR managed
+//     section Go-side, and every Go reader is compiler-checked by the rename.
+//
+// Bumping here would make a mixed-base pair REFUSE to apply any snapshot (the
+// handler gates on exact equality) in exchange for a wire change no helper can
+// observe -- spending the one signal that says the wire really moved. It is the
+// FIFTH field to reach this cell by embedding, and #9424's "the gate that
+// catches it is `go test ./...`, not the packages the diff touched" applies
+// unchanged: this change lives in pkg/config and pkg/frr, and a scoped run over
+// those two packages is green.
 const (
-	snapshotShapeGolden8892  = "92ea9bf2dcc354b6510cd85d004cd812d560c48e40a3c4f5f6ed5aeeaec8298c"
+	snapshotShapeGolden8892  = "cd22be373f9ba8678dc22ca482d9d3fad348118e7e14822100c615d574af2900"
 	snapshotShapeVersion8892 = 11
 )
 

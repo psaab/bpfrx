@@ -2782,10 +2782,15 @@ func TestGenerateProtocols_RIPAuthText(t *testing.T) {
 	}
 }
 
+// #9408: the field is MEGABITS PER SECOND — FRR's own unit for `auto-cost
+// reference-bandwidth (1-4294967)` — and the renderer emits it verbatim. This
+// pin said "int in, int out" and was silent about the unit, which is how the
+// leaf's bits/s -> Mbps conversion could be missing for so long without any
+// cell noticing. 10000 here is 10 Gbps.
 func TestGenerateProtocols_OSPFReferenceBandwidth(t *testing.T) {
 	m := New()
 	ospf := &config.OSPFConfig{
-		ReferenceBandwidth: 10000,
+		ReferenceBandwidthMbps: 10000,
 		Areas: []*config.OSPFArea{
 			{ID: "0.0.0.0", Interfaces: []*config.OSPFInterface{{Name: "trust0"}}},
 		},
@@ -2793,6 +2798,12 @@ func TestGenerateProtocols_OSPFReferenceBandwidth(t *testing.T) {
 	got := m.generateProtocols(ospf, nil, nil, nil, nil, "", 1, nil, nil)
 	if !strings.Contains(got, "auto-cost reference-bandwidth 10000\n") {
 		t.Errorf("missing reference-bandwidth in:\n%s", got)
+	}
+	// The rendered number must be within the grammar FRR actually accepts:
+	// `auto-cost reference-bandwidth (1-4294967)`. A pin that only checks the
+	// substring cannot tell a renderable value from one vtysh rejects.
+	if ospf.ReferenceBandwidthMbps < 1 || ospf.ReferenceBandwidthMbps > 4294967 {
+		t.Errorf("fixture premise: %d Mbps is outside FRR's 1..4294967 grammar", ospf.ReferenceBandwidthMbps)
 	}
 }
 

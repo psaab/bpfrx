@@ -474,11 +474,19 @@ type RAPrefix struct {
 
 // OSPFConfig holds OSPF routing configuration.
 type OSPFConfig struct {
-	RouterID           string // e.g. "10.0.0.1"
-	ReferenceBandwidth int    // Mbps for auto-cost calculation (0 = FRR default 100)
-	PassiveDefault     bool   // all interfaces passive by default
-	Areas              []*OSPFArea
-	Export             []string // export policy names (future)
+	RouterID string // e.g. "10.0.0.1"
+	// #9408: MEGABITS PER SECOND — the unit FRR's `auto-cost
+	// reference-bandwidth (1-4294967)` takes, NOT the bits/s the Junos leaf
+	// is written in. The name carries the unit because the two differ by
+	// 10^6 and the field is the boundary between them: the operator's token
+	// is parsed and converted by ospfReferenceBandwidthMbps in
+	// compileProtocols, and pkg/frr renders this field verbatim. 0 means
+	// unset — no auto-cost line is emitted and FRR's own default (100 Mbps)
+	// applies.
+	ReferenceBandwidthMbps int
+	PassiveDefault         bool // all interfaces passive by default
+	Areas                  []*OSPFArea
+	Export                 []string // export policy names (future)
 }
 
 // OSPFArea defines an OSPF area.

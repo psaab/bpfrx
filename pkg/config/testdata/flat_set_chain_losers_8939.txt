@@ -1,4 +1,4 @@
-# counts: losers=19 walked=84 vacuous=45 unmeasured=76
+# counts: losers=19 walked=85 vacuous=44 unmeasured=76
 # collector reach: 369 containers walked, 135 reached the census (137 dropped: no eligible leaf, 97 dropped: only one)
 firewall policer arg1 if-exceeding  [bandwidth-limit | burst-size-limit]  total  lenient-only
 protocols router-advertisement interface arg1 prefix arg1  [autonomous | no-autonomous | no-onlink]  total  lenient-only

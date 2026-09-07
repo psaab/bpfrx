@@ -525,7 +525,7 @@ Gap audit: `docs/archived/userspace-forwarding-and-failover-gap-audit.md` (PR #3
 - All wired to local CLI, remote CLI, gRPC, cmdtree
 
 #### OSPF Reference-Bandwidth, BGP Graceful-Restart, DPDK Sync (`8f9d4db`)
-- **OSPF reference-bandwidth:** `auto-cost reference-bandwidth` in FRR
+- **OSPF reference-bandwidth:** `auto-cost reference-bandwidth` in FRR. The leaf is **bits per second** (Junos units) and FRR's directive is **Mbps**; the conversion, the range gate and the k/m/g suffix grammar landed in #9408 — see `docs/config-schema.md` "`protocols ospf reference-bandwidth` — the leaf and the renderer use DIFFERENT UNITS"
 - **BGP graceful-restart:** Parsed + compiled to FRR config
 - **DPDK struct sync:** `scan_track_key`/`scan_track_value` structs, documented `pad_meta`/`ip_ihl` divergence
 

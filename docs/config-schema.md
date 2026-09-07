@@ -860,6 +860,77 @@ byte-identical, which is how a fix lands at one site and leaves seven.
 paths — including through `wildcard` children, without which it reached only 14
 of the leaves and its own positive control caught that.
 
+### `protocols ospf reference-bandwidth` — the leaf and the renderer use DIFFERENT UNITS (#9408)
+
+The sibling of #9012, and the reason it needed a compiler change where #9012 did
+not: this leaf's bound is not merely FRR's grammar, it is a **unit conversion**.
+
+| layer | unit | range |
+|---|---|---|
+| Junos `[edit protocols ospf] reference-bandwidth` | **bits per second** | 9 600 .. 100 000 000 000 000, default 100 Mbps |
+| FRR `auto-cost reference-bandwidth` | **megabits per second** | 1 .. 4 294 967 |
+
+The leaf was declared `args: 1` with no `valueType` and no `validator`, and the
+compiler stored the operator's token with a bare `strconv.Atoi` whose error was
+**discarded**. Two silent failures followed, in opposite directions:
+
+- every **suffixed** spelling — `1g`, `100m`, the forms Junos documentation and
+  every worked example use — failed `Atoi`, compiled to `0`, and rendered **no
+  `auto-cost` line at all**. The operator's cost basis stayed at FRR's default
+  and nothing said so. `-5` behaved identically;
+- the **bare-integer** spelling was passed through **verbatim** into an Mbps
+  directive, so a Junos-faithful value is three to six orders of magnitude too
+  large for the grammar it lands in.
+
+`ospfReferenceBandwidthMbps` (`pkg/config/schema_ospf_reference_bandwidth_9408.go`)
+is the single source of truth for the parse, the conversion and the range, and
+both the schema validator and `compileProtocols` call it — a schema behind the
+compiler drops values, a compiler behind the schema under-offers completion, and
+one function cannot be behind itself.
+
+The accepted window is the intersection, expressed in the leaf's own unit: a
+**whole number of Mbps** in `1000000 .. 4294967000000` bits/s. Values Junos
+accepts but FRR cannot express are REJECTED with a message naming the unit
+rather than truncated — truncating 1.5 Mbps to 1 Mbps silently changes every
+interface cost, which is the class of failure this leaf already had.
+
+**Both channels, and they move in opposite directions:**
+
+    Store.Commit / CheckText -> compileTreeStrict  -> SchemaValidate  REJECT
+    Store.Load / SyncApply   -> compileTreeLenient -> the same validation,
+                                                     downgraded to a slog.Warn
+
+Unlike #9012 the compiler must ALSO fail safe, because the tolerant path reaches
+it with a value the gate rejected: it leaves `ReferenceBandwidthMbps` at 0, which
+renders no `auto-cost` line, so a config persisted under the pre-#9408 reading
+boots on FRR's own default instead of putting an out-of-grammar line into the
+managed section.
+
+**SEMANTIC CHANGE.** A bare integer now means bits per second.
+`reference-bandwidth 10000` used to render `auto-cost reference-bandwidth 10000`
+(10 Gbps) and now names 10 kbps, which is rejected at commit. Write `10g` or
+`10000000000`.
+
+**The tree's own two cells concealed both halves**, which is worth recording
+because it is the reusable part: `pkg/frr` pinned `ReferenceBandwidth: 10000` ->
+`"auto-cost reference-bandwidth 10000"`, an int-in/int-out pin that says nothing
+about units, and `pkg/config`'s `TestOSPFReferenceBandwidthSetSyntax` **authored
+`10g`** — the exact spelling being dropped — and then asserted only that
+`ospf != nil`. Neither layer's pin crossed the unit boundary, and nothing drove a
+token through the compiler INTO the renderer. That missing edge is now
+`TestOSPFReferenceBandwidthCompilesAndRenders9408`.
+
+**And typing the leaf made a SECOND, older defect measurable.** `set protocols
+ospf passive reference-bandwidth 1g` is one command, and `SetPath` nests
+`reference-bandwidth` UNDER `passive`, so `compileProtocols`' direct-children
+loop dropped it on a commit that reports success. The #8939 census had recorded
+that container as `vacuous` rather than as a loss, because the leaf compiled to
+`0` in BOTH spellings — two equal-but-empty compiles prove nothing. `#9408`
+therefore also routes the OSPF children through `expandFlatRun`
+(`pkg/config/compiler_protocols_ospf_flat_run_9408.go`); the census row moved
+from `vacuous` to `walked`, and the two `leafRunKnownDiffer9156` rows for this
+container were removed.
+
 ### `protocols isis level` / `is-type` — the enum mirrors what the RENDERER can express (#8446)
 
 Both leaves spell one concept and both compile into `ISISConfig.Level`. Neither
