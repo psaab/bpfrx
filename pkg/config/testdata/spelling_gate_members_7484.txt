@@ -968,6 +968,7 @@ err (parent stanza does not compile)	services rpm probe <*> test <*> thresholds 
 unreachable (leaf changed nothing)	services rpm probe-limit
 COMPARED	snmp community <*> authorization
 COMPARED	snmp community <*> clients
+COMPARED	snmp community <*> routing-instance <*> clients
 COMPARED	snmp trap-group <*> categories
 COMPARED	snmp trap-group <*> targets
 COMPARED	snmp trap-group <*> version

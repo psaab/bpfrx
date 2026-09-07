@@ -222,7 +222,18 @@ var dupConservationSkipped8436 = []string{
 	"services ip-monitoring policy",
 	"services ip-monitoring policy xpfname then preferred-route routing-instance",
 	"services rpm probe",
-	"snmp community",
+	// #9416: `snmp community` left this list. It became PROBEABLE when
+	// `client-list-name` was declared — the census needs two distinct
+	// synthesizable body statements to build a duplicate fixture, and
+	// `authorization` (an enum) plus `clients` (multi) did not give it one.
+	// A stale skip entry claims the census cannot see a site it now checks, so
+	// the line is deleted rather than kept "just in case".
+	//
+	// Its replacement is one level down: the community's own
+	// `routing-instance` body, which the census still cannot build a fixture
+	// for. Listed by name rather than left in a skip COUNT, which is the whole
+	// point of this file.
+	"snmp community xpfname routing-instance",
 	"snmp trap-group",
 	"system backup-router",
 	"system ntp threshold",

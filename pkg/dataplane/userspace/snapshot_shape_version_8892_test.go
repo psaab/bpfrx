@@ -166,8 +166,31 @@ func shapeDigest8892(t *testing.T) (string, int) {
 // catches it is `go test ./...`, not the packages the diff touched" applies
 // unchanged: this change lives in pkg/config and pkg/frr, and a scoped run over
 // those two packages is green.
+// v11 STANDS (issue 9416): `SNMPCommunity.ClientListNames` and
+// `SNMPConfig.ClientLists` were added to the typed config, and ConfigSnapshot
+// embeds the whole Config, so they moved this digest.
+//
+// UNLIKE the three "STANDS" entries above these are NOT `json:"-"` — they are
+// serialized, so an old helper really does receive two new keys. They are
+// nonetheless unobservable to it, and this was MEASURED rather than argued from
+// the additive-field rule (a rule that is TRUE and would have licensed a
+// regression once already):
+//
+//   - the Rust side models this whole subtree as ONE opaque value --
+//     `pub config: serde_json::Value` in userspace-dp/src/protocol/snapshot.rs
+//     (line 560). It names no field inside it, so a new key cannot break a
+//     deserialization and `deny_unknown_fields` cannot bite;
+//   - `grep -rn "ClientList\|client_list" userspace-dp/src/` returns ZERO
+//     hits, as does a search for `snmp` in the snapshot protocol -- the
+//     dataplane does not serve SNMP at all;
+//   - the fields' only consumers are pkg/config (resolution), pkg/snmp (the
+//     agent, in-process) and pkg/daemon (the reconcile hash), all Go-side.
+//
+// The snapshot handler gates on EXACT version equality, so bumping for a field
+// no helper can observe would make a mixed-base pair refuse every snapshot in
+// exchange for nothing -- spending the one signal that says the wire moved.
 const (
-	snapshotShapeGolden8892  = "cd22be373f9ba8678dc22ca482d9d3fad348118e7e14822100c615d574af2900"
+	snapshotShapeGolden8892  = "9f2fc4a986b0049610502fd566289b81aa063d6e753f61a3b93ea0732bb0caa0"
 	snapshotShapeVersion8892 = 11
 )
 

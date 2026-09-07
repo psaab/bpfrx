@@ -345,6 +345,44 @@ var notAValueList = map[string]string{
 	"applications application-set":  "named container: `application-set <name> { ... }`, not a value list",
 	"policy-options prefix-list":    "named container: `prefix-list <name> { <prefix>; }`",
 	"security nat destination pool": "named container: `pool <name> { ... }`",
+	// #9416: `snmp client-list <name> { <prefix>; }` is a NAMED CONTAINER whose
+	// first token is the list IDENTITY, not a list member. `multi: true` carries
+	// its body (a run of free-form CIDR prefixes with no modelled keywords, so
+	// there is nothing to declare as children), which is what makes this gate
+	// read it as a value leaf.
+	//
+	// VERIFIED WHERE THE EXTRA TOKENS LAND, as this map's contract requires,
+	// rather than asserted from the shape — compiled with CompileConfigLenient
+	// so a malformed prefix quarantines instead of aborting:
+	//
+	//	client-list [ a b ];        ClientLists{a:[]}       b is a's PREFIX, malformed -> a quarantined, 1 warning
+	//	client-list a { b; }        ClientLists{a:[]}       same: b is a's prefix
+	//	client-list a; client-list b;  ClientLists{a:[] b:[]}  a SECOND LIST, not a second value
+	//	client-list { a; b; }       ClientLists{}           NO name at all — not authorable Junos
+	//	client-list L { 10.0.0.0/8; 172.16.0.0/12; }        BOTH prefixes, ONE list
+	//
+	// So the tail IS a value list and the head is not part of it, which is why
+	// the gate's two-element verdict is meaningless here: its second value is
+	// the first ELEMENT, not a second element. The last row is the one that says
+	// the reader is not simply broken.
+	"snmp client-list": "named container: `client-list <name> { <prefix>; }` — the first token is the list IDENTITY; a repeated statement names a SECOND LIST, not a second value",
+	// #9416: `client-list-name` is `args: 1` — a community references exactly
+	// one list per statement, and repeating the statement adds a reference
+	// rather than extending a value. Read through `nodeVal`, this compiler's
+	// SSOT for a single-valued leaf, so every spelling agrees on one value.
+	//
+	// VERIFIED: with `client-list L { 10.0.0.0/8; }` defined,
+	//
+	//	client-list-name [ L x ];    ClientListNames=[L]   x DISCARDED, commits clean
+	//	client-list-name L { x; }    ClientListNames=[L]   x DISCARDED, commits clean
+	//	client-list-name L;          ClientListNames=[L]
+	//
+	// The silent discard of a trailing token on an args:1 leaf is the same
+	// pre-existing behaviour the `then count` / `then dscp` entries above
+	// record — malformed input rather than a lost list — and is not changed
+	// here.
+	"snmp community <*> client-list-name":                      "args:1 — one list name per statement; extra tokens are DISCARDED, verified below",
+	"snmp community <*> routing-instance <*> client-list-name": "args:1 — one list name per statement; extra tokens are DISCARDED, same reader as the community-level leaf",
 
 	"chassis cluster redundancy-group <*> preempt": "flag with an optional sub-block (`preempt { delay N; }`)",
 

@@ -301,6 +301,12 @@ var instanceNameBlindCeiling9091 = len(instanceNameBlindBaseline9091)
 // protocols node brought `rip group` — which carries closedWorld — into the
 // per-instance grammar, so `/routing-instances/*/protocols/rip/group` is armed
 // there too. That is the ratchet moving in the direction it wants.
+// #9416 moved it 8 -> 9: `snmp community <c> routing-instance <ri>` is a new
+// instance-name container, and every keyword it can absorb is a SOURCE
+// RESTRICTION (`clients`, `client-list-name`). An unmodelled keyword there
+// would commit clean and leave the community answering EVERY source — the
+// defect #9416 exists to close, one level deeper — so the body was declared
+// leaf-complete and armed rather than added to the blind baseline.
 var instanceNameArmedBaseline9091 = []string{
 	"/protocols/ospf/area/interface/authentication/md5",
 	"/protocols/rip/group",
@@ -310,6 +316,7 @@ var instanceNameArmedBaseline9091 = []string{
 	"/security/ipsec/proposal",
 	"/security/ipsec/vpn/traffic-selector",
 	"/security/nat/nat64/rule-set",
+	"/snmp/community/routing-instance",
 }
 
 var instanceNameArmedFloor9091 = len(instanceNameArmedBaseline9091)

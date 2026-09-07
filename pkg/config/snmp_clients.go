@@ -77,7 +77,26 @@ func (c *SNMPCommunity) AllowsSource(srcIP net.IP) bool {
 	if c == nil {
 		return false
 	}
-	if len(c.Clients) == 0 {
+	// #9416: "no restriction was authored" is `Clients` empty AND `clientNets`
+	// nil — not `Clients` empty alone.
+	//
+	// The two came apart when a community could be QUARANTINED with an empty
+	// `Clients`. #5833's quarantine overrides only `clientNets` (deliberately:
+	// the operator's config text stays intact for display and hashing), and it
+	// worked because a malformed INLINE token still leaves that token in
+	// `Clients`, so the length check below never fired. An unresolvable
+	// `client-list-name` has no such residue: the reference resolves to nothing,
+	// `Clients` stays empty, and the community was returning ALLOW-ALL through
+	// this line while carrying an explicit deny-all match set two fields over.
+	// The quarantine was armed and unreachable.
+	//
+	// `clientNets` is the exact predicate for "a restriction was authored":
+	// compileClientNets returns nil ONLY for an empty allowlist, and returns a
+	// non-nil (possibly empty) slice for a populated one — a distinction its own
+	// doc comment already calls out, so that a populated-but-fully-inert list
+	// default-denies rather than opening. A directly-constructed community that
+	// never went through the compiler has clientNets nil and is unaffected.
+	if len(c.Clients) == 0 && c.clientNets == nil {
 		return true // no restriction — allow-all (Junos default)
 	}
 	if srcIP == nil {

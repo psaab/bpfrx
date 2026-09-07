@@ -1736,6 +1736,66 @@ func compileSNMP(node *Node, sys *SystemConfig, cfg *Config, lenient bool) error
 		Communities: make(map[string]*SNMPCommunity),
 		TrapGroups:  make(map[string]*SNMPTrapGroup),
 		V3Users:     make(map[string]*SNMPv3User),
+		ClientLists: make(map[string][]SNMPClient),
+	}
+
+	// #9416: read the `snmp` stanza's own PACKED body, not `node.Children`.
+	//
+	// `snmp client-list trusted 10.0.0.0/8;` written with the outer brace
+	// elided puts the whole run on the snmp node's OWN Keys with no Children at
+	// all, and a loop over Children sees an empty body -- the #2419 class, and
+	// the reason `snmp client-list` appeared as a NEW compact-blind site the
+	// moment this compiler learned the keyword. The inline `clients` sibling is
+	// NOT compact-blind (compileSNMP has a bespoke Keys scan for the community
+	// body), so registering the named form in the divergence inventory would
+	// have shipped it strictly worse than the spelling it is meant to match.
+	//
+	// packedBodyChildren resolves the tail THROUGH THE SCHEMA and returns
+	// node.Children unchanged when there is no tail, so the ordinary braced
+	// spelling is bit-identical.
+	snmpChildren := packedBodyChildren(node, resolveSchemaChild(setSchema, "snmp"))
+
+	// #9416 PRE-PASS: collect every `snmp client-list <name>` definition BEFORE
+	// the community loop. A community may reference a list that is written
+	// AFTER it -- Junos imposes no ordering, and `show configuration` sorts
+	// `client-list` before `community` anyway, but a persisted or peer-synced
+	// tree carries whatever order it was built in. Resolving inside the
+	// community loop would make an ordering the operator cannot see decide
+	// whether the restriction applies or the community is quarantined.
+	//
+	// Same-name blocks ACCUMULATE rather than overwrite, for the reason #5472
+	// established on the community side: a later empty block must not be able
+	// to erase an earlier block's prefixes, because an emptied list resolves to
+	// the unresolved arm and (lenient) quarantines every community that
+	// references it.
+	for _, child := range snmpChildren {
+		if child.Name() != "client-list" {
+			continue
+		}
+		listName := snmpClientListName(child)
+		if listName == "" {
+			continue
+		}
+		snmp.ClientLists[listName] = append(snmp.ClientLists[listName], parseSNMPClientListPrefixes(child)...)
+	}
+	// #9416: a malformed prefix inside a NAMED list gets the SAME treatment as
+	// one inside an inline `clients` run (#4834/#5833) -- strict rejects naming
+	// the token, lenient warns and the list is quarantined by emptying it, which
+	// routes every referencing community to the unresolved arm below and thence
+	// to deny-all. A named list is where this matters MOST: one typo'd
+	// `restrict` would otherwise degrade a deny-except entry to a plain allow
+	// for every community that references the list, not just one.
+	for _, listName := range sortedClientListNames9416(snmp.ClientLists) {
+		listWarnings, listMalformed, err := validateSNMPClients(snmp.ClientLists[listName], lenient)
+		if err != nil {
+			return fmt.Errorf("snmp client-list %q: %w", listName, err)
+		}
+		if cfg != nil {
+			cfg.Warnings = append(cfg.Warnings, listWarnings...)
+		}
+		if listMalformed {
+			snmp.ClientLists[listName] = nil
+		}
 	}
 
 	// #5833: communities whose `clients` allowlist carried a malformed token on
@@ -1746,7 +1806,7 @@ func compileSNMP(node *Node, sys *SystemConfig, cfg *Config, lenient bool) error
 	// before it can be recorded here).
 	quarantinedComms := map[string]bool{}
 
-	for _, child := range node.Children {
+	for _, child := range snmpChildren {
 		switch child.Name() {
 		case "location":
 			snmp.Location = nodeVal(child)
@@ -1784,18 +1844,69 @@ func compileSNMP(node *Node, sys *SystemConfig, cfg *Config, lenient bool) error
 				// `clients` node's own children hold its VALUE tokens (prefixes
 				// and `restrict`), which parseSNMPClients reads and which must
 				// not be mistaken for statements.
+				//
+				// #9416: `client-list-name` and `routing-instance` join the
+				// descent set. They are not decoration -- a keyword this walk
+				// does not name is silently skipped, which is precisely how the
+				// named-list spelling reached AllowsSource as an empty (=
+				// allow-all) allowlist. `routing-instance` carries its own
+				// `clients` / `client-list-name` body, so the descent continues
+				// through it and those statements are collected as the
+				// community's own; the SCOPING is not enforced and
+				// snmpInertKnobWarnings says so.
+				//
+				// #9416: expandFlatRun FIRST. A flat `set` builds a CHAIN and
+				// packs its tail onto ONE node's Keys, so
+				//   set snmp community c client-list-name L authorization read-only
+				// arrives as a single node with
+				//   Keys = [client-list-name, L, authorization, read-only]
+				// and a reader that treats Keys[1:] as the leaf's values would
+				// take "authorization" and "read-only" as two more list NAMES --
+				// which then resolve to nothing and quarantine the community.
+				// That is fail-closed rather than fail-open, but it rejects a
+				// config the operator wrote correctly.
+				//
+				// The expansion is schema-gated: `clients` is `multi: true` so
+				// its value run is never cut, `routing-instance` declares
+				// children so its subtree stays whole, and `client-list-name`
+				// is `args: 1` so exactly one token follows it. That is the same
+				// information the SetPath walk already had; this reader simply
+				// never asked for it.
+				commChildren = expandFlatRun(commChildren, snmpCommunitySchema9416())
 				var stmts []*Node
 				var collect func(nodes []*Node)
 				collect = func(nodes []*Node) {
 					for _, n := range nodes {
 						switch n.Name() {
-						case "authorization", "clients":
+						case "authorization", "clients", "client-list-name":
 							stmts = append(stmts, n)
 							collect(n.Children)
+						case "routing-instance":
+							stmts = append(stmts, n)
+							// The instance body has TWO packed shapes and both
+							// drop the restriction if unread.
+							//
+							// packedBodyChildren handles `routing-instance ri
+							// clients 10.0.0.0/8;` -- the brace-elided spelling,
+							// where the whole run sits on this node's own Keys
+							// and Children is empty (#2419).
+							//
+							// expandFlatRun handles the flat-set CHAIN, where
+							// `set ... routing-instance ri clients X
+							// client-list-name L` nests each leaf under the
+							// previous one instead of beside it (#8939).
+							//
+							// They are different shapes, not two names for one:
+							// the first is extra tokens on ONE node, the second
+							// is a chain of nodes. Reading only one leaves the
+							// other silently allow-all.
+							riSchema := snmpRoutingInstanceSchema9416()
+							collect(expandFlatRun(packedBodyChildren(n, riSchema), riSchema))
 						}
 					}
 				}
 				collect(commChildren)
+				blockListRefs := snmpCommunityListRefs(stmts)
 				for _, prop := range stmts {
 					switch prop.Name() {
 					case "authorization":
@@ -1829,22 +1940,66 @@ func compileSNMP(node *Node, sys *SystemConfig, cfg *Config, lenient bool) error
 				// than parsed here, so the `restrict` modifier and the #5898
 				// orphan-`restrict` fail-closed path behave identically to the
 				// braced spelling instead of being reimplemented beside them.
+				//
+				// #9416: `client-list-name` and `routing-instance` are cut
+				// points here for the same reason they are descent keywords
+				// above. Without them the `clients` run-scan would swallow a
+				// trailing `client-list-name L` as two more PREFIXES -- both
+				// unparseable, which (#4834) hard-rejects on the strict path
+				// and quarantines on the lenient one. That is fail-closed
+				// rather than fail-open, but it rejects a valid config, so the
+				// keyword set here must stay in step with the descent set.
+				snmpCommunityKeyword9416 := func(tok string) bool {
+					switch tok {
+					case "authorization", "clients", "client-list-name", "routing-instance":
+						return true
+					}
+					return false
+				}
 				for i := 2; i < len(child.Keys); i++ {
 					switch child.Keys[i] {
 					case "authorization":
 						if i+1 < len(child.Keys) {
 							blockAuth = child.Keys[i+1]
 						}
+					case "client-list-name":
+						if i+1 < len(child.Keys) {
+							blockListRefs = append(blockListRefs, child.Keys[i+1])
+						}
+					case "routing-instance":
+						// Skip the instance NAME; its body's keywords are read
+						// by the following iterations exactly as if they had
+						// been written at community level.
+						i++
 					case "clients":
 						j := i + 1
-						for j < len(child.Keys) &&
-							child.Keys[j] != "authorization" && child.Keys[j] != "clients" {
+						for j < len(child.Keys) && !snmpCommunityKeyword9416(child.Keys[j]) {
 							j++
 						}
 						run := append([]string{"clients"}, child.Keys[i+1:j]...)
 						blockClients = append(blockClients, parseSNMPClients(&Node{Keys: run})...)
 						i = j - 1
 					}
+				}
+				// #9416: resolve the named lists into the SAME `Clients` field
+				// the inline form populates, so AllowsSource, compileClientNets,
+				// the API surface and the reconcile hash all keep working on one
+				// field rather than acquiring a parallel enforcement path.
+				//
+				// An UNRESOLVABLE or EMPTY reference must never fall through to
+				// allow-all: strict hard-rejects, lenient warns and quarantines
+				// the community to deny-all, the same two-channel shape #5833
+				// settled on for a malformed inline token.
+				resolvedClients, unresolvedRefs := resolveSNMPClientListRefs(blockListRefs, snmp.ClientLists)
+				blockClients = append(blockClients, resolvedClients...)
+				if len(unresolvedRefs) > 0 {
+					if !lenient {
+						return snmpUnresolvedClientListError(unresolvedRefs)
+					}
+					if cfg != nil {
+						cfg.Warnings = append(cfg.Warnings, snmpUnresolvedClientListMessage(unresolvedRefs, true))
+					}
+					quarantinedComms[commName] = true
 				}
 				// #4834: reject/warn on an unparseable `clients` entry before
 				// it reaches compileClientNets. See validateSNMPClients for
@@ -1887,6 +2042,18 @@ func compileSNMP(node *Node, sys *SystemConfig, cfg *Config, lenient bool) error
 					snmp.Communities[commName] = comm
 				}
 				comm.Clients = append(comm.Clients, blockClients...)
+				// #9416: preserve the authored references. This is what the
+				// reconcile hash reads -- a community whose only restriction is
+				// an UNRESOLVABLE reference has an empty Clients and is
+				// quarantined through clientNets, which the hash cannot see, so
+				// without this an edit that added such a reference to a
+				// previously-unrestricted community would hash EQUAL and the
+				// running agent would keep serving every source.
+				for _, ref := range blockListRefs {
+					if !containsString9416(comm.ClientListNames, ref) {
+						comm.ClientListNames = append(comm.ClientListNames, ref)
+					}
+				}
 				// A later block updates the authorization only when it
 				// explicitly states one; an omitted authorization must NOT
 				// clear a value an earlier block established (do not let an
@@ -2051,6 +2218,35 @@ func snmpInertKnobWarnings(node *Node) []string {
 			if nodeHasSub(child, "view") {
 				add("snmp community view: per-community MIB view scoping is accepted but NOT enforced (the community answers the full ifTable)")
 			}
+			// #9416: the SIXTH spelling of the source restriction. Its
+			// `clients` / `client-list-name` body IS applied to the community
+			// (compileSNMP descends into it) — leaving it out would mean
+			// allow-all, which is strictly worse than applying it on the wrong
+			// instance. What is NOT honoured is the SCOPING: xpf's SNMP agent
+			// binds one socket in the default instance and has no
+			// routing-instance awareness, so the restriction applies to every
+			// query rather than only to queries arriving via <ri>. Say which
+			// half landed, because "accepted but not enforced" would be false
+			// about the half that is.
+			if nodeHasSub(child, "routing-instance") {
+				add("snmp community routing-instance: the routing-instance SCOPING is accepted but NOT enforced (the agent answers in the default instance only) — any `clients` / `client-list-name` inside the block IS applied to the community, so the source restriction holds even though the scoping does not")
+			}
+			// xpf has no logical systems at all, so a logical-system-scoped
+			// community is not merely unscoped — its whole body, including any
+			// source restriction nested under it, is invisible to the compiler.
+			if nodeHasSub(child, "logical-system") {
+				add("snmp community logical-system: accepted but NOT implemented (xpf has no logical systems) — any `clients` / `client-list-name` nested inside the logical-system block is NOT applied, so the community is answerable from every source unless it also carries a restriction at community level")
+			}
+		case "interface", "filter-interfaces":
+			// #9416: a DIFFERENT source-restriction axis from the `clients` /
+			// `client-list-name` family — by arrival interface rather than by
+			// source address — and unmodelled in the same silent way the named
+			// client list was. Named rather than implemented: the agent binds a
+			// wildcard UDP socket and does not resolve an incoming datagram's
+			// arrival interface, so there is nothing to enforce against yet.
+			add("snmp interface / filter-interfaces: restricting which interfaces the SNMP agent answers on is accepted but NOT enforced (the agent answers on every interface); use `community <c> clients` or `client-list-name` to restrict by SOURCE address instead")
+		case "routing-instance-access":
+			add("snmp routing-instance-access: accepted but NOT enforced (the agent serves the default routing instance only)")
 		}
 	}
 	return warnings

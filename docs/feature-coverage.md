@@ -386,6 +386,29 @@ the userspace dataplane admission boundary is in
   (`snmpQuarantineClientNets` → deny-all) instead of fail-open, while the rest of
   the config loads with a warning; the strict commit path rejects it outright,
   naming the token. A well-formed `<prefix> restrict` is unaffected.
+  The NAMED spelling of the same restriction is ENFORCED too (#9416):
+  `snmp client-list <name> { <prefix> [restrict]; }` plus
+  `community <c> client-list-name <name>` resolves the referenced list into the
+  SAME allowlist the inline `clients` form populates, so one enforcement path
+  serves both spellings. It appeared nowhere in `pkg/config` or `pkg/snmp`
+  before #9416, so the named form committed clean on all four config channels,
+  compiled to an empty allowlist, and left the community answering EVERY source
+  — the fifth spelling of a fail-open the inline sibling had already had
+  repaired five times (#4289, #5472, #5833, #5898, #8778), every one of which
+  assumed the restriction is written inline. An UNRESOLVABLE or EMPTY reference
+  is REJECTED at strict commit and QUARANTINES the community to deny-all on the
+  tolerant path — never allow-all, which an empty allowlist would otherwise
+  mean. The per-routing-instance spelling
+  `community <c> routing-instance <ri> { clients | client-list-name }` — the
+  SIXTH, found by censusing the family instead of fixing the fifth, and measured
+  fail-open in exactly the same way — applies its source restriction to the
+  community and carries a commit advisory saying the routing-instance SCOPING
+  itself is not enforced (the agent binds one socket in the default instance).
+  The remaining SNMP source-restriction axes are named at commit rather than
+  silently ignored: `snmp interface` / `filter-interfaces` (restrict by arrival
+  interface), `snmp routing-instance-access`, and `community <c> logical-system`
+  (xpf has no logical systems, so a restriction nested inside one is NOT
+  applied).
   Trap-group `categories` ENFORCED (#5522): `snmp trap-group <g> categories
   [ <cat> ]` scopes which notification categories a group receives — a link
   up/down trap (category `link`) is dispatched to a group only if the group

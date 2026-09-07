@@ -1285,6 +1285,15 @@ func TestUnadmittedTopLevelPairsAreAdjudicated8925(t *testing.T) {
 		"system login":                             reasonLoud,
 		"system services":                          reason6966,
 		"chassis cluster":                          reasonSame,
+		// #9416: `snmp client-list <name> { <prefix>; }` declares no schema
+		// CHILDREN — its body is a run of free-form CIDR prefixes carried by
+		// `multi: true`, not modelled keywords — so there is no body to strand
+		// and this reason is re-derived from the schema on every run, not
+		// trusted. The prefixes themselves are not lost when the outer brace is
+		// elided: compileSNMP reads the `snmp` stanza's own packed tail via
+		// packedBodyChildren, which is what keeps `snmp client-list` out of the
+		// #2419 divergence inventory.
+		"snmp client-list": reasonNoBody,
 	}
 
 	got := map[string]string{}
@@ -1402,7 +1411,27 @@ func TestDepth2UnadmittedPopulation8929(t *testing.T) {
 	// UN-admitted population: 25 -> 24. A shrink here is the intended
 	// direction — the ratchet reds on it precisely so an admission cannot
 	// pass unremarked. Re-derived at this base.
-	wantPopulation = 24
+	//
+	// #9416 grew it by ONE: `(community, routing-instance)`, the per-routing-
+	// instance spelling of the SNMP source restriction. The pair was MEASURED
+	// before this constant moved, as this ratchet's own message demands —
+	// braced vs the spelling that elides HEAD's brace under MID (not the
+	// parent's), against a baseline with no restriction at all:
+	//
+	//	                     Clients            AllowsSource(203.0.113.9)
+	//	braced               [10.0.0.0/8]       false
+	//	HEAD-elided          [10.0.0.0/8]       false
+	//	baseline (no body)   []                 true
+	//
+	//	braced, named list   [10.0.0.0/8] L     false
+	//	HEAD-elided, named   [10.0.0.0/8] L     false
+	//
+	// It reads SAME in both its spellings — compileSNMP resolves the instance
+	// body through packedBodyChildren for exactly this reason — so it does not
+	// drop and does not belong in knownDropping. The baseline row is what makes
+	// the SAME verdict non-vacuous: without it, "both spellings agree" would
+	// also be satisfied by both compiling to nothing.
+	wantPopulation = 25
 
 	parentAdmitted := func(mid string) bool {
 		for stanza := range setSchema.children {
