@@ -297,6 +297,10 @@ func (c *CLI) applyToDataplane(cfg *config.Config) error {
 			StaticRoutes:          cfg.RoutingOptions.StaticRoutes,
 			InterfaceBandwidths:   ifaceBandwidths,
 			InterfacePointToPoint: ifaceP2P,
+			// #9405: same canonical resolver the daemon's assembleFRRConfig
+			// wires, so this legacy standalone-CLI apply path cannot render a
+			// protocol interface operand the kernel has no device for.
+			IfNameResolver: cfg.ResolveKernelIfName,
 		}
 		if c.dhcp != nil {
 			for _, lease := range c.dhcp.Leases() {

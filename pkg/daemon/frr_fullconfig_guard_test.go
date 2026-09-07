@@ -112,3 +112,76 @@ func TestFRRFullConfigConstructedOnlyByAssembler(t *testing.T) {
 			strings.Join(offenders, "\n  "))
 	}
 }
+
+// TestEveryFRRFullConfigConstructorWiresIfNameResolver9405 closes the second
+// constructor.
+//
+// TestFRRFullConfigConstructedOnlyByAssembler above proves the set of
+// production FullConfig constructors is exactly frrFullConfigAllowlist. Each
+// one must set IfNameResolver, because pkg/frr treats a nil resolver as
+// IDENTITY — a deliberate compatibility default so the 86 direct
+// generateProtocols callers in frr_test.go stay byte-identical — and identity
+// is precisely the pre-#9405 defect: the managed section goes back to naming
+// devices Linux dev_valid_name() rejects, and every IGP silently fails to
+// attach.
+//
+// A behavioural cell can only cover the constructor it can drive.
+// TestAssembleFRRConfigWiresProtocolIfNameResolver9405 drives the daemon's;
+// the legacy standalone-CLI path (pkg/cli/apply.go) needs a CLI with a live
+// FRR manager to reach, so this AST cell covers BOTH — and, unlike either
+// behavioural cell, it also covers a THIRD constructor nobody has written yet.
+func TestEveryFRRFullConfigConstructorWiresIfNameResolver9405(t *testing.T) {
+	t.Parallel()
+
+	repoRoot := filepath.Join("..", "..")
+	fset := token.NewFileSet()
+	var offenders []string
+	seen := 0
+
+	for rel := range frrFullConfigAllowlist {
+		path := filepath.Join(repoRoot, filepath.FromSlash(rel))
+		file, err := parser.ParseFile(fset, path, nil, parser.AllErrors)
+		if err != nil {
+			t.Fatalf("parse %s: %v", rel, err)
+		}
+		ast.Inspect(file, func(n ast.Node) bool {
+			cl, ok := n.(*ast.CompositeLit)
+			if !ok {
+				return true
+			}
+			sel, ok := cl.Type.(*ast.SelectorExpr)
+			if !ok || sel.Sel == nil || sel.Sel.Name != "FullConfig" {
+				return true
+			}
+			seen++
+			for _, elt := range cl.Elts {
+				kv, ok := elt.(*ast.KeyValueExpr)
+				if !ok {
+					continue
+				}
+				if key, ok := kv.Key.(*ast.Ident); ok && key.Name == "IfNameResolver" {
+					return true
+				}
+			}
+			offenders = append(offenders, rel+":"+itoa(fset.Position(cl.Pos()).Line))
+			return true
+		})
+	}
+
+	// Non-vacuity: an empty walk would satisfy "no offenders" while measuring
+	// nothing, which is exactly how a guard keyed on a moved file goes green
+	// forever.
+	if seen == 0 {
+		t.Fatalf("found no frr.FullConfig composite literal in the allowlist %v — "+
+			"this guard measured nothing", frrFullConfigAllowlist)
+	}
+	if len(offenders) > 0 {
+		t.Fatalf("frr.FullConfig constructed without IfNameResolver at:\n  %s\n"+
+			"pkg/frr treats a nil resolver as IDENTITY, so this renders the AUTHORED\n"+
+			"Junos interface reference (`ge-0/0/1.0`) into the managed section. Linux\n"+
+			"dev_valid_name() forbids '/', so the stanza binds no netdev and no OSPF /\n"+
+			"OSPFv3 / IS-IS / RIP adjacency forms — on a commit that succeeds with no\n"+
+			"warning. Set IfNameResolver: cfg.ResolveKernelIfName (#9405).",
+			strings.Join(offenders, "\n  "))
+	}
+}

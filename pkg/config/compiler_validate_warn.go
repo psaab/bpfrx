@@ -1625,6 +1625,10 @@ func ValidateConfig(cfg *Config) []string {
 	warnings = append(warnings, validateContentFreeSystemLoginWarnings(cfg)...)
 
 	warnings = append(warnings, validateRibGroupLeakWarnings(cfg)...)
+
+	// #9405: a routing-protocol interface reference that names no configured
+	// interface renders an FRR stanza that binds nothing, silently.
+	warnings = append(warnings, validateProtocolInterfaceRefWarnings(cfg)...)
 	// #7512: a `routing-options rib <name>` the compiler does not implement
 	// discarded its static routes. Warn rather than reject — see
 	// validateUnhandledRibWarnings for the #1960 reasoning.
