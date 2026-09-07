@@ -189,8 +189,15 @@ type Daemon struct {
 	routing  *routing.Manager
 	frr      *frr.Manager
 	ipsec    *ipsec.Manager
-	ra       *ra.Manager
-	dhcp     *dhcp.Manager
+	// ipsecInitiateFn overrides the swanctl initiate call. Test seam only
+	// (#9139); nil in production. See Daemon.ipsecInitiate.
+	ipsecInitiateFn func(name string) error
+	// ipsecActiveNamesFn overrides the swanctl active-SA read. Test seam only
+	// (#9139); nil in production. See Daemon.ipsecActiveNames — it exists so
+	// the ADVERTISE GATE'S CALL SITE is observable, not just the gate function.
+	ipsecActiveNamesFn func() ([]string, error)
+	ra                 *ra.Manager
+	dhcp               *dhcp.Manager
 	// dnsBootDone gates the #1715 DNS boot policy. It is false during the
 	// single boot-time applyConfig (which runs before DHCP clients start,
 	// so the lease set is empty) and set true immediately after. While
