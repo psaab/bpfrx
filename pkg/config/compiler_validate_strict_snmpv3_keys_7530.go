@@ -65,6 +65,23 @@ func validateSNMPv3UserKeyMaterialStrict(cfg *Config) error {
 				"genuinely noAuthNoPriv user (#7530)",
 				name, u.AuthProtocol, name)
 		}
+		// #9155 Hole B: privacy without authentication. USM has no privacy-only
+		// level -- RFC 3414 defines noAuthNoPriv, authNoPriv and authPriv, and
+		// there is no noAuthPriv -- and key derivation for BOTH keys is gated on
+		// the AUTH hash function, so this user derives no privacy key either.
+		// The arm below cannot catch it: a privacy-password IS present, so
+		// `PrivPassword == ""` is false. The result is an authPriv-looking
+		// configuration served with an unencrypted scopedPDU.
+		if u.PrivProtocol != "" && u.AuthProtocol == "" {
+			return fmt.Errorf("snmp v3 usm local-engine user %q names privacy protocol %q "+
+				"with no authentication protocol. USM has no privacy-only security level "+
+				"(RFC 3414 defines noAuthNoPriv, authNoPriv and authPriv -- there is no "+
+				"noAuthPriv), and this agent derives the privacy key with the AUTHENTICATION "+
+				"hash, so %q gets NO privacy key and its scopedPDU is answered UNENCRYPTED "+
+				"while the configuration reads authPriv. Add an `authentication-*` protocol "+
+				"and password, or remove the privacy protocol (#9155)",
+				name, u.PrivProtocol, name)
+		}
 		if u.PrivProtocol != "" && string(u.PrivPassword) == "" {
 			return fmt.Errorf("snmp v3 usm local-engine user %q names privacy protocol %q "+
 				"but carries no privacy-password. With no privacy key the agent applies no "+
