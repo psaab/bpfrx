@@ -80,6 +80,27 @@ func collectLeafRunSites9156() []leafRunSite9156 {
 		if len(s.container) == 0 || strings.HasPrefix(s.container[0], "groups") {
 			continue
 		}
+		// #9056: the VALUELESS-FLAG shape entered collectCompactSites' population
+		// when the #2419 census learned to enumerate it. It is deliberately kept
+		// OUT of this gate's population, and the exclusion is
+		// population-preserving rather than a narrowing: every site this walk
+		// could previously see declared `args >= 1` or a wildcard, because those
+		// were the only shapes the census emitted. A flag satisfies
+		// isAdmissionHead9156 (no children, no wildcard, no type, no validator)
+		// and isSwallowableLeaf9156 alike, so admitting it silently re-picks
+		// `heads[0]` / `tails[0]` for many containers -- measured: five recorded
+		// containers changed verdict and 26 more were skipped for "no
+		// synthesizable value", because a flag HAS no value slot and this gate's
+		// mechanism is a head whose value slot swallows the next token.
+		//
+		// Whether an argless head can carry a flat run past validateModifierChild
+		// is a real question on THIS gate's axis, and a different one from the
+		// brace-elision drop #9056 measures. The flat-run spelling of the
+		// `security flow` flags specifically is already covered by
+		// security_flow_packed_run_8939_test.go.
+		if s.flag {
+			continue
+		}
 		k := strings.Join(s.container, "\x00")
 		if _, ok := byContainer[k]; !ok {
 			order = append(order, k)

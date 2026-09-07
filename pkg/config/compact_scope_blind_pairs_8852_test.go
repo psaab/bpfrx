@@ -150,7 +150,6 @@ var knownBlindScopePairs8852 = map[string]string{
 	// confirmations that makes assuming the fifth feel safe.
 	"class-of-service forwarding-classes": "plain-container",
 	"policy-options as-path":              "multi-arg",
-	"services application-identification": "zero-arg-leaf",
 	"system internet-options":             "plain-container",
 	// #8879 batch 9, shapes derived by the sentinel method.
 	"forwarding-options port-mirroring": "plain-container",
@@ -263,10 +262,22 @@ var knownBlindScopePairs8852 = map[string]string{
 	"gateway remote-identity": "multi-arg",
 	"policies from-zone":      "multi-arg",
 	"policy pre-shared-key":   "multi-arg",
-	// Head is a leaf that takes no arg of its own.
-	"flow tcp-mss":                       "zero-arg-leaf",
-	"match destination-address-excluded": "zero-arg-leaf",
-	"match source-address-excluded":      "zero-arg-leaf",
+	// #9056 RETIRED FOUR `zero-arg-leaf` ENTRIES, and the retirement is the
+	// change working rather than a loosening. `flow tcp-mss`, `match
+	// {source,destination}-address-excluded` and `services
+	// application-identification` were blind because collectCompactSites
+	// admitted a site only when the head declared an `args` token or a
+	// wildcard, so a VALUELESS head yielded nothing to adjudicate. The census
+	// now enumerates that shape with a PRESENCE discriminator, so all four are
+	// adjudicated by TestCompactNormalizeScopePreservesCompiledResult8690 and a
+	// registration for them would be a claim that is no longer true.
+	//
+	// The `zero-arg-leaf` branch of blindShape8852 is KEPT: it still describes
+	// the shape correctly, and the classifier must be able to name it if a
+	// future change re-narrows the census. A branch with no current member is
+	// not the same as a wrong branch, and deleting it would mean the next
+	// re-narrowing reported "a reason this model does not explain" instead of
+	// naming the cause.
 }
 
 // blindShape8852 classifies WHY the census emits no site for a head node,
