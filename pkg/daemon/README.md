@@ -2731,6 +2731,42 @@ never lock an operator out of a remote box it manages.
   unconfigured, since a signal that keeps firing after the fix gets muted. Tests:
   `pkg/daemon/proxyarp_unresolved_debt_7685_test.go`.
 
+  **The loop also wakes on an RG ownership change (#9087), and the ticker alone
+  was the whole latency budget.** Proxy-ARP ownership is decided per redundancy
+  group (#8297), but nothing drove the reconcile when that ownership MOVED: the
+  apply path runs on a commit and a failover is not a commit. So for up to
+  `proxyARPReassertInterval` after a transition the new owner had not installed
+  the entry and the old owner had not swept it. Measured on the loss cluster
+  right after a crash-failover plus manual failback: `fw0=0 fw1=1` — the only
+  answerer being the node that no longer owns the address, which mis-steers
+  pool-mode NAT return traffic for the window. `nudgeProxyARPReassert` is now
+  fired from BOTH edges, because they fix different ends of the same window:
+  `applyRethServicesForRG` (MASTER) so the new owner installs, and
+  `clearRethServicesForRG` (BACKUP) so the demoted node sweeps. The demote nudge
+  deliberately precedes that function's store/config early returns — those are
+  about RA/Kea state and say nothing about whether a sweep is owed, and a node
+  whose config is unreadable still holds the stale kernel entry. The send is
+  non-blocking depth-1: the callers are on the VRRP event loop and the reconcile
+  takes `applySem`, so a blocking send would stall every later transition behind
+  a commit. Tests: `pkg/daemon/proxyarp_ownership_nudge_9087_test.go`, which
+  binds both call sites AND the nudge→reconcile link — deleting the loop's nudge
+  arm survived the call-site cells, because they only proved the channel
+  received a wakeup.
+
+  **The sweep listed the wrong kernel table until #9087.**
+  `dataplane.ReconcileProxyARP` read existing entries with `netlink.NeighList`,
+  whose dump request carries `Flags: 0` and returns the ordinary ARP/ND table.
+  Proxy entries live in the kernel's separate pneigh table, dumped only for a
+  request carrying `NTF_PROXY` — `netlink.NeighProxyList`. `existing` was
+  therefore always empty and both loops it feeds broke in opposite directions:
+  the stale-removal loop removed nothing EVER (the #8297 gate fired correctly on
+  the demoted standby every 30 s while the kernel entry survived indefinitely),
+  and the add loop re-issued a `NeighSet` every tick forever. Every unit test
+  replaces that seam with a fake returning what the case wants, so in every test
+  it behaved like `NeighProxyList` — which is why a well-covered function
+  carried a production-only defect, and why the guard asserts the wiring by
+  function identity.
+
   **sshd is the third instance, and the one the "already covered" reading
   misses.** `applySSHConfig`'s UPDATE path does have a retry owner: #2062's
   `revertDropIn` restores the prior content on a failed reload, so the file no

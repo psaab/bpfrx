@@ -1809,6 +1809,15 @@ func (d *Daemon) applyRethServicesForRG(rgID int) {
 	// publish for Surface A too — nudge it to (re)publish its RG records.
 	d.nudgeSurfaceADDNSReconcile()
 
+	// #9087: this node now owns rgID, so it must ANSWER proxy-ARP for the pool
+	// addresses on that RG's interfaces. Nothing drove that before: the
+	// apply-path reconcile runs on a commit and a failover is not a commit, so
+	// the new owner stayed silent until the 30s re-assert ticker happened to
+	// fire. Measured immediately after a crash-failover plus manual failback:
+	// `fw0=0 fw1=1` — the only answerer was the node that no longer owns the
+	// address, which mis-steers pool-mode NAT return traffic for the window.
+	d.nudgeProxyARPReassert()
+
 	// #9139: re-initiate the peer's IPsec SAs that belong to THIS RG.
 	//
 	// This leg did not exist. reinitiateIPsecSAs was wired ONLY to
@@ -1835,6 +1844,15 @@ func (d *Daemon) applyRethServicesForRG(rgID int) {
 // for RETH interfaces belonging to the given RG. Called on VRRP BACKUP
 // transition. If other RGs are still MASTER, their services remain active.
 func (d *Daemon) clearRethServicesForRG(rgID int) {
+	// #9087: nudged FIRST, and before the early returns, because the demote
+	// side of the window is the one that leaves a wrong answerer on the wire.
+	// This node no longer owns rgID, so the #8297 gate will now suppress its
+	// proxy-ARP entries and the reconcile must SWEEP them; until it runs, the
+	// demoted node keeps answering for the pool address. The early returns
+	// below are about RA/Kea state and say nothing about whether a sweep is
+	// owed, so gating the nudge behind them would drop it on exactly the
+	// config-less paths where the stale entry still sits in the kernel.
+	d.nudgeProxyARPReassert()
 	if d.store == nil {
 		return
 	}

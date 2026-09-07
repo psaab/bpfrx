@@ -61,12 +61,12 @@ func TestReconcileProxyARP_LinkResolutionFallbackKeepsEnabledEntry(t *testing.T)
 			t.Cleanup(func() { linkByIndexSeam = prevLink })
 
 			// Keep the neighbor operations off the host.
-			prevList, prevSet, prevDel := neighListSeam, neighSetSeam, neighDelSeam
-			neighListSeam = func(int, int) ([]netlink.Neigh, error) { return nil, nil }
+			prevList, prevSet, prevDel := neighProxyListSeam, neighSetSeam, neighDelSeam
+			neighProxyListSeam = func(int, int) ([]netlink.Neigh, error) { return nil, nil }
 			neighSetSeam = func(*netlink.Neigh) error { return nil }
 			neighDelSeam = func(*netlink.Neigh) error { return nil }
 			t.Cleanup(func() {
-				neighListSeam, neighSetSeam, neighDelSeam = prevList, prevSet, prevDel
+				neighProxyListSeam, neighSetSeam, neighDelSeam = prevList, prevSet, prevDel
 			})
 
 			var wrote []string
