@@ -260,18 +260,27 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		// simply not consulted by the code that needed it. Across an
 		// incarnation change, keep accept-and-reset: that IS the #2198 case.
 		// Within one incarnation, a BulkStart must be strictly newer.
-		if !switched && s.bulkInProgress && epoch <= s.bulkRecvEpoch {
+		//
+		// #9174 V015: the same question is asked BETWEEN bulks, where the
+		// original guard could not reach. See bulkStartStaleLocked.
+		if s.bulkStartStaleLocked(epoch, inc, switched) {
 			inProgress := s.bulkRecvEpoch
+			active := s.bulkInProgress
 			v4, v6 := len(s.bulkRecvV4), len(s.bulkRecvV6)
 			s.bulkMu.Unlock()
 			slog.Warn("cluster sync: ignoring stale BulkStart within the same boot incarnation",
 				"in_progress_epoch", inProgress, "got_epoch", epoch,
+				"bulk_in_progress", active,
 				"accumulated_v4", v4, "accumulated_v6", v6,
 				"peer_incarnation", inc)
 			break
 		}
 		s.bulkInProgress = true
 		s.bulkRecvEpoch = epoch
+		// #9174 V013: remember WHICH BOOT started this bulk, so its end marker
+		// can be matched on more than the epoch. Recorded on the accepted path
+		// only, beside the epoch it belongs to.
+		s.bulkRecvIncarnation = inc
 		s.bulkRecvV4 = make(map[dataplane.SessionKey]struct{})
 		s.bulkRecvV6 = make(map[dataplane.SessionKeyV6]struct{})
 		s.bulkZoneSnapshot = zoneSnap
@@ -334,6 +343,10 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		if len(payload) >= 8 {
 			epoch = binary.LittleEndian.Uint64(payload[:8])
 		}
+		// #9174 V013: the sender's boot incarnation, when it sent one. Same
+		// length-gated trailing extension BulkStart has carried since #5084;
+		// the legacy 8-byte form parses to the zero value and fails open.
+		endInc := parseBootIncarnation(payload)
 		s.bulkMu.Lock()
 		if !s.bulkInProgress {
 			// #5272: a BulkEnd with NO bulk transfer actually in progress
@@ -362,6 +375,30 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 			want := s.bulkRecvEpoch
 			s.bulkMu.Unlock()
 			slog.Warn("cluster sync: ignoring BulkEnd with mismatched epoch", "expected", want, "got", epoch)
+			break
+		}
+		// #9174 V013: the epoch alone does not identify a bulk. The peer's send
+		// counter restarts at zero when it reboots, so an end marker buffered on
+		// the DEAD boot's still-ESTABLISHED socket can carry the same epoch as
+		// the bulk its own replacement has just started — and completing it here
+		// reconciles against a partly-received table, latches bulkEverCompleted
+		// and releases the VRRP sync hold. The node becomes MASTER-eligible
+		// while forwarding with sessions it never received.
+		//
+		// FAIL OPEN on either side being un-incarnated, which is a decision and
+		// not a default: a peer on an older build sends the 8-byte form, and a
+		// bulk primed without an incarnation recorded nothing to compare
+		// against. In both cases this is exactly today's epoch-only matching —
+		// the #5084 posture, for the same reason (failing closed would strand
+		// the standby for the whole rolling-upgrade window).
+		if endInc.known() && s.bulkRecvIncarnation.known() && endInc != s.bulkRecvIncarnation {
+			started := s.bulkRecvIncarnation
+			s.bulkMu.Unlock()
+			s.stats.BulkEndsDeadIncarnationDropped.Add(1)
+			slog.Warn("cluster sync: ignoring BulkEnd from a retired peer boot incarnation",
+				"epoch", epoch, "end_incarnation", endInc.String(),
+				"bulk_started_by", started.String(),
+				"local", connLocalAddrString(conn), "remote", connRemoteAddrString(conn))
 			break
 		}
 		s.bulkMu.Unlock()

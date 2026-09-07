@@ -804,7 +804,24 @@ func (s *SessionSync) installConn(fabricIdx int, conn net.Conn) connColdPrimeDec
 	// supersession edge instead of the disconnect edge. Re-priming is
 	// idempotent (the receiver upserts and prunes), so the cost of being wrong
 	// is one redundant bulk.
-	if d.wasDisconnected || supersededCurrent {
+	// #9174 V014: `epochReboot` belongs here too, and its absence was the gap.
+	// installConn already ACTS on that evidence forty lines above — it advances
+	// the incarnation and evicts the corpse — but the obligation to REFILL the
+	// replacement's empty table was still gated on the two signals a
+	// dial-into-the-empty-alternate-slot reboot does not produce. #7762's own
+	// text names the residual: such a connection "supersedes nothing and leaves
+	// the registry non-empty, so it satisfies neither that flag nor
+	// d.wasDisconnected". A rebooted peer's session table is EMPTY, so without
+	// this the standby holds nothing and the next failover to it blackholes
+	// every established flow — the #5480 blackhole, reached through the epoch
+	// edge instead of the disconnect edge.
+	//
+	// epochReboot is peer-supplied ORDERED evidence (a raised boot epoch on the
+	// authenticated heartbeat), not a local inference from slot shape, and it is
+	// already computed above rather than re-derived: re-calling
+	// peerEpochRebootLocked here would consume the observation a second time and
+	// compare against the baseline this call already advanced.
+	if d.wasDisconnected || supersededCurrent || epochReboot {
 		s.needColdPrime.Store(true)
 	}
 	d.becameActive = d.activeAfter == fabricIdx
@@ -1147,6 +1164,10 @@ func (s *SessionSync) handleDisconnect(conn net.Conn) {
 		hadBulkInProgress := s.bulkInProgress
 		s.bulkInProgress = false
 		s.bulkRecvEpoch = 0
+		// #9174: the epoch high-water and the incarnation that set it are one
+		// fact; clearing one without the other would leave a stale boot id
+		// gating the next peer's end markers.
+		s.bulkRecvIncarnation = bootIncarnation{}
 		s.bulkRecvV4 = nil
 		s.bulkRecvV6 = nil
 		s.bulkZoneSnapshot = nil
