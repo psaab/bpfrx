@@ -242,21 +242,7 @@ func TestLeafRunDifferentialGate9156(t *testing.T) {
 	// RATCHET. The register below is a DEBT REGISTER, not an acceptance: the
 	// gate fails on any container that starts differing AND on any recorded one
 	// that starts agreeing, so the list cannot rot in either direction.
-	var unrecorded, fixed []string
-	for _, d := range differed {
-		if !leafRunKnownDiffer9156[d] {
-			unrecorded = append(unrecorded, d)
-		}
-	}
-	seenDiffer := map[string]bool{}
-	for _, d := range differed {
-		seenDiffer[d] = true
-	}
-	for k := range leafRunKnownDiffer9156 {
-		if !seenDiffer[k] {
-			fixed = append(fixed, k)
-		}
-	}
+	unrecorded, fixed := ratchetLeafRunDiffers9156(differed)
 	sort.Strings(fixed)
 	if len(fixed) > 0 {
 		t.Errorf("#9156: %d recorded container(s) no longer differ: %v.\n"+
@@ -497,6 +483,30 @@ func TestLeafRunRegisterIsNotVacuous9156(t *testing.T) {
 				"indistinguishable from no fix", k)
 		}
 	}
+	// THE REGISTER MUST BE CONSULTED, not merely small. A mutation that made the
+	// gate accept every difference as recorded left the whole suite green while
+	// this cell still passed on size alone — so the decision is driven here with
+	// a fabricated input instead of being inferred from the gate's colour.
+	var anyRecorded string
+	for k := range leafRunKnownDiffer9156 {
+		anyRecorded = k
+		break
+	}
+	const fabricated = "xpf-not-a-real-container [xpfhead -> xpftail] {flat}"
+	unrec, _ := ratchetLeafRunDiffers9156([]string{fabricated, anyRecorded})
+	if len(unrec) != 1 || unrec[0] != fabricated {
+		t.Errorf("the ratchet returned %v for one UNREGISTERED and one REGISTERED "+
+			"difference; it must return exactly the unregistered one. A ratchet that "+
+			"admits an unregistered difference is disarmed, and the gate is green "+
+			"either way", unrec)
+	}
+	_, stale := ratchetLeafRunDiffers9156(nil)
+	if len(stale) != len(leafRunKnownDiffer9156) {
+		t.Errorf("with NOTHING differing the ratchet reported %d stale entries, want "+
+			"all %d — otherwise a fixed container can keep its row forever",
+			len(stale), len(leafRunKnownDiffer9156))
+	}
+
 	sites := collectLeafRunSites9156()
 	if len(leafRunKnownDiffer9156) >= len(sites) {
 		t.Errorf("the register holds %d rows against %d enumerated containers. An "+
