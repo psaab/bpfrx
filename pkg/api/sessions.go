@@ -888,7 +888,41 @@ func (s *Server) clearSessionsHandler(w http.ResponseWriter, r *http.Request) {
 	if svc := s.clusterSession(); svc != nil {
 		resp, err := svc.ClearSessions(r.Context(), &pb.ClearSessionsRequest{})
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
+			// #9142: CLASSIFY the delegate's gRPC status instead of flattening
+			// every failure to 500. The delegate is the in-process
+			// *grpcapi.Server, and its ClearSessions handler refuses an
+			// over-cap clear with codes.ResourceExhausted from the SAME
+			// process-wide sessionWalkLimiter the local-only fallback below
+			// acquires — where the refusal answers 429. So before this, the
+			// identical condition answered 429 on a standalone node and 500 on
+			// a node with an HA session service wired, and a client keyed on
+			// the status class (back off on 429, page a human on 5xx) behaved
+			// differently based only on whether HA was wired.
+			//
+			// The message uses status.Convert(err).Message(), not err.Error():
+			// the latter emits the gRPC FRAMING ("rpc error: code = ... desc =
+			// ...") into a REST JSON body, which is an internal transport
+			// detail of a delegation the REST caller cannot see. Convert also
+			// handles a NON-status error — it yields codes.Unknown and the
+			// error's own text, so the default 500 arm loses nothing.
+			//
+			// This is the same distinction peerFetchErrorStatus (#7294/#8308)
+			// already draws on the neighbouring peer-fetch surfaces: an
+			// admission refusal is not a fault.
+			st := status.Convert(err)
+			code := http.StatusInternalServerError
+			switch st.Code() {
+			case codes.ResourceExhausted:
+				code = http.StatusTooManyRequests
+			case codes.Unavailable:
+				// The dp-loaded guard at the top of this handler already
+				// answers 503, so this arm is reachable only through a
+				// sub-millisecond TOCTOU (or a future Unavailable from the
+				// delegate). Mapping it keeps the two routes to the same
+				// condition from disagreeing.
+				code = http.StatusServiceUnavailable
+			}
+			writeError(w, code, st.Message())
 			return
 		}
 		writeOK(w, ClearSessionsResult{

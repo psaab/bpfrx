@@ -17,9 +17,13 @@ import (
 // and returns canned responses so the tests can assert the REST endpoints
 // route cross-node session operations through it.
 type fakeClusterSessionService struct {
-	clearCalled   bool
-	clearReq      *pb.ClearSessionsRequest
-	clearResp     *pb.ClearSessionsResponse
+	clearCalled bool
+	clearReq    *pb.ClearSessionsRequest
+	clearResp   *pb.ClearSessionsResponse
+	// clearErr (#9142) lets a cell drive the DELEGATED error path, which had
+	// no coverage at all: TestRESTClearSessionsConcurrencyBound pins only the
+	// clusterSessionFn == nil fallback, by its own comment.
+	clearErr      error
 	getCalled     bool
 	getReq        *pb.GetSessionsRequest
 	getResp       *pb.GetSessionsResponse
@@ -39,6 +43,9 @@ type fakeClusterSessionService struct {
 func (f *fakeClusterSessionService) ClearSessions(_ context.Context, req *pb.ClearSessionsRequest) (*pb.ClearSessionsResponse, error) {
 	f.clearCalled = true
 	f.clearReq = req
+	if f.clearErr != nil {
+		return nil, f.clearErr
+	}
 	return f.clearResp, nil
 }
 
