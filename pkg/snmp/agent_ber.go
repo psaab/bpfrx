@@ -408,6 +408,29 @@ func decodePDUFields(data []byte) (requestID int, field2 int, field3 int, oids [
 	}
 
 	// Decode each varbind (SEQUENCE { OID, value }).
+	//
+	// #9333: a varbind this loop cannot decode is an ERROR, not something to
+	// skip. It used to `continue` past five malformed shapes and `break` out of
+	// a sixth, so the handler received a SHORTER OID list than the client sent
+	// and answered `noError` with it. MEASURED: a two-varbind v1 GET with one
+	// undecodable OID returned a response carrying ONE varbind, indistinguishable
+	// from a request that only ever asked for one.
+	//
+	// That violates RFC 1157 §4.1.2 — the GetResponse's variable-bindings must
+	// name the same variables the request did — and a manager that pairs values
+	// to requests BY POSITION, which is the normal implementation, then reads the
+	// wrong value for every varbind after the dropped one.
+	//
+	// Discarding the whole PDU is what BOTH standards prescribe for a message
+	// that cannot be parsed (RFC 1157 §4.1, RFC 3416 §4.1), and it is what this
+	// function ALREADY does for a malformed request-id, error-status,
+	// error-index or varbind-list header — every caller turns an error here into
+	// a dropped datagram. The six varbind arms were the only inconsistent ones.
+	//
+	// NOT changed, and asserted by TestWireVarbindByteFloors_6551: a varbind
+	// carrying NO value TLV at all (`SEQUENCE { OID }`, 5 bytes) is still
+	// accepted and its OID still delivered. It is well-formed — it reaches none
+	// of the arms below — and #6551's densest-packing bound depends on it.
 	remaining := vbListBody
 	for len(remaining) > 0 {
 		tag, vbBody, err := berDecodeHeader(remaining)
@@ -415,34 +438,54 @@ func decodePDUFields(data []byte) (requestID int, field2 int, field3 int, oids [
 			return 0, 0, 0, nil, fmt.Errorf("varbind: not a SEQUENCE")
 		}
 		// Advance past this varbind in the remaining buffer.
-		consumed := len(remaining) - len(vbBody)
-		// We need to figure out total consumed length including value.
-		// Re-decode to get the exact offset.
 		vbTotalLen := berEncodedLen(remaining)
 		if vbTotalLen <= 0 || vbTotalLen > len(remaining) {
-			break
+			// UNREACHABLE, by construction rather than by inspection — and the
+			// mutation matrix says so: reverting this to its original `break`
+			// kills no cell, because no input reaches it.
+			//
+			// The proof is that `berDecodeHeader` (called above, on this same
+			// slice) and `berEncodedLen` compute the SAME quantity from the SAME
+			// bytes, and the header's check is strictly stronger. If the header
+			// succeeded then len(remaining) >= 2, berDecodeLength succeeded, and
+			// 1+lenBytes+length <= len(remaining) — which is exactly
+			// berEncodedLen's return, so it is >= 2 and <= len(remaining).
+			//
+			// It is nonetheless an ERROR rather than the original `break`,
+			// because the two functions are only equivalent while they stay in
+			// lockstep. A `break` degrades silently if they ever diverge — it
+			// drops this varbind AND every one after it, so the response is
+			// short by an arbitrary number — and an error degrades into the
+			// discard the rest of this loop already performs. Same cost, and the
+			// failure mode is the one the rest of #9333 is about.
+			return 0, 0, 0, nil, fmt.Errorf(
+				"varbind: unreadable length (encoded len %d, %d bytes remain)",
+				vbTotalLen, len(remaining))
 		}
 		remaining = remaining[vbTotalLen:]
-		_ = consumed // unused
 
 		// Decode OID from varbind body.
 		if len(vbBody) < 2 {
-			continue
+			return 0, 0, 0, nil, fmt.Errorf("varbind: body too short (%d bytes)", len(vbBody))
 		}
 		if vbBody[0] != tagObjectIdentifier {
-			continue
+			return 0, 0, 0, nil, fmt.Errorf(
+				"varbind: first element is tag 0x%02x, not an OBJECT IDENTIFIER (0x%02x)",
+				vbBody[0], tagObjectIdentifier)
 		}
 		oidLen, oidLenBytes, err := berDecodeLength(vbBody[1:])
 		if err != nil {
-			continue
+			return 0, 0, 0, nil, fmt.Errorf("varbind: OID length: %w", err)
 		}
 		oidHeaderLen := 1 + oidLenBytes
 		if oidHeaderLen+oidLen > len(vbBody) {
-			continue
+			return 0, 0, 0, nil, fmt.Errorf(
+				"varbind: OID value truncated (need %d, have %d)",
+				oidHeaderLen+oidLen, len(vbBody))
 		}
 		oid, err := berDecodeOID(vbBody[oidHeaderLen : oidHeaderLen+oidLen])
 		if err != nil {
-			continue
+			return 0, 0, 0, nil, fmt.Errorf("varbind: OID: %w", err)
 		}
 		oids = append(oids, oid)
 	}
