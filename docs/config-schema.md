@@ -237,6 +237,68 @@ mechanism — `SetPath` nests the tokens into a chain before any pass runs, so
 there is no packed tail to split and `normalizeCompactStanzas` correctly folds
 nothing. That is a grammar-side question, tracked separately as issue 8939.
 
+### A VALUELESS BOOLEAN FLAG was outside the census population (#9056)
+
+The #2419 census (`collectCompactSites`, `compact_block_equivalence_2419_test.go`)
+admits a site only when the folded token declares an `args` value or a wildcard:
+
+```
+(wildcard == nil && args == 1) || (args == 0 && wildcard != nil) || (args >= 1 && wildcard != nil)
+```
+
+A **valueless boolean flag** — `allow-dns-reply;`, `tcp-rst;`, `no-syn-check;` —
+is `args:0, wildcard:nil, children:nil` and satisfies **none** of the three. It
+was therefore never enumerated, appeared in **no skip bucket**, and its absence
+was indistinguishable from a clean verdict. That is the WRONG-POPULATION failure
+mode: a control at the census's own layer interrogates what the filter passed and
+cannot interrogate what the filter removed.
+
+The cause was not a scope decision. The site model was built around `synthPair`,
+which needs two distinct VALUES, so the one shape that has no value at all fell
+out of the population rather than out of a bucket. **The discriminator for a flag
+is PRESENCE**: `stanza { flag; }` against `stanza { }`. `compactSite.flag` carries
+it and `runCompactBlockCensus` uses it, which makes the existing vacuity guard read
+as "the presence of this flag is not observable in the typed config" — the same
+property it already asserts for a valued leaf.
+
+Measured when the arm was added: **511 flag sites, 93 divergent**, none of them in
+the inventory beforehand.
+
+Two consequences worth keeping:
+
+- **`synthPair` now REFUSES the shape** (`return "", "", false`). Before, an
+  undeclared `valueType` is `ValueAny` — the zero value — so a flag fell through
+  to the `ValueIdentifier, ValueAny` arm and got back `"xpfaaa"/"xpfbbb"`. The
+  fixture built from that is `allow-dns-reply xpfaaa;`, which is not a spelling of
+  anything: `FindChild` sees the leaf either way, both probes compile alike, the
+  vacuity guard fires, and the site is recorded "leaf value not observable" — a
+  verdict about the SYNTHESISER, not the leaf. Refusing it means the fourteen other
+  consumers of `collectCompactSites()` skip flags on `!ok` exactly as they did when
+  the shape was outside the population, so widening the shared walker did not
+  re-baseline their populations. The censuses that CAN rule on a flag branch on
+  `compactSite.flag` instead: `runCompactBlockCensus`, the #7653 depth census, and
+  both #8690 scope-safety guards.
+- **A flag pair IS reachable to `compactNormalizeInScope`.** The claim that a
+  valueless flag cannot satisfy the scope table's admission precondition is FALSE,
+  measured by running the pass with a recording predicate:
+  `security { flow allow-dns-reply; }` asks `("flow", "allow-dns-reply")` and a
+  scope entry for it converges the site. The blindness was the CENSUS's, not the
+  scope table's, and the two are different mechanisms.
+
+The nineteen `security`-subtree flag sites are normalized (see the `#9056` block at
+the end of `compactNormalizeInScope`); the other 74 are recorded with per-class
+reasons in `testdata/compact_block_permanent_exclusions_8690.txt`.
+
+**The family's negative control is `security policies … then permit` / `then
+reject`.** They are valueless flags of exactly the admitted shape and they diverge,
+and they are deliberately NOT admitted: on a complete policy fixture the braced
+spelling is ACCEPTED at the strict commit gate and the elided spelling is REJECTED
+by the #3043 terminal-action gate. Admitting the pair would convert a loud
+rejection into a silent acceptance — the #8868 shape. They are classed
+`gate-open-question`, because #3043 refuses the CONSEQUENCE of the drop rather than
+the packed SPELLING, and `TestPolicyTerminalActionElisionStaysRejected9056` pins
+the rejection so the exclusion cannot be reversed by adding a line to a table.
+
 ### Normalising ONE depth is not normalising the stanza (9421)
 
 `packedBody(node, schema)` normalises the tail of the node it is handed and
@@ -717,6 +779,62 @@ drops the value and `Mode` falls back to the parser's default, which is `gre`.
 Putting `gre` first makes the dropped value and the fallback identical, so a real
 divergence reads as EQUIVALENT and the #2419 inventory entry looks stale. A
 fixture must never use the value the bug falls back to.
+
+### `interfaces <if> tunnel keepalive-retry` — a bound for REACHABILITY, not overflow (#9157)
+
+`key`, `ttl` and `keepalive` under `tunnel` each carry `valueType: ValueInteger`
+plus an explicit `ValidateInteger` range. `keepalive-retry` carried neither, and
+it was the only one of the four that did not — an omission among typed siblings,
+which is the shape a per-leaf test cannot see.
+
+`schema_walk.go` builds a value checker exactly when `n.validator != nil`, so an
+untyped leaf is walked and waved through. Measured on `SchemaValidate`, with the
+sibling as the in-container positive control:
+
+```
+keepalive-retry 99999999999   accepted   -> KeepaliveRetry = 99999999999
+keepalive-retry abc           accepted   -> 0, normalized at runtime to 3
+keepalive-retry -5            accepted   -> -5, normalized at runtime to 3
+CONTROL keepalive 99999999999 REJECTED   integer out of range [0..32767]
+CONTROL keepalive 30          accepted
+```
+
+**The harm is REACHABILITY, and the leaf's own comment used to say why it did not
+need a bound.** That comment — "a pass-through count consumed by the keepalive
+prober only when > 0; never a Duration multiply" — is accurate, and it answers
+the #5705 OVERFLOW question rather than this one. `keepaliveTick` transitions the
+tunnel down at `state.Failures >= state.MaxRetries`
+(`pkg/routing/tunnel_keepalive_runner.go`), `Failures` increments once per probe
+tick, and `startKeepalive` normalizes only `<= 0 -> 3`. A large enough count
+makes that comparison unreachable: the tunnel is never declared down and routes
+over it keep forwarding into a dead peer, on a commit that reported success. The
+reachable spelling is `set … tunnel keepalive 30 keepalive-retry 99999999999`,
+since the runner is gated on `tc.Keepalive > 0`.
+
+Bounded to **1..255**, Junos's own range. `0` is rejected rather than silently
+meaning the runtime default 3, and `abc` is rejected rather than becoming 3
+through the discarded `strconv.Atoi` error in `compiler_interfaces.go`.
+`ValidateIntegerMin` was NOT used: an explicit upper bound is the point, and
+`ValidateInteger(1, 0)` is the reversed-range trap #8358 already paid for.
+
+**Typing this leaf REMOVED an admission head, and that is a behaviour change
+worth stating.** `validateModifierChild` rejects a flat run whose head leaf is
+TYPED, so `keepalive-retry` and `routing-instance` were the `tunnel` container's
+two UNTYPED heads: a run headed by either carried every later statement past the
+strict gate (#9156 V020). #9156 fixed the READER so such a run expands correctly
+rather than being dropped; typing the leaf means the `keepalive-retry`-headed
+spelling is now REJECTED at commit instead, which agrees with the typed-head
+order (`destination B keepalive-retry 5`) that has always been refused.
+`routing-instance` remains untyped and is still an admission head, so #9156's
+cells keep their subject — they were re-pointed at it rather than deleted, and
+`TestKeepaliveRetryHeadIsRejectedOnceTyped9157` pins the head that left so the
+narrowing is asserted rather than merely no longer tested.
+
+**Coverage, not one leaf.** `TestEveryTunnelValueLeafIsTyped9157` walks the
+container from `setSchema` and requires every childless value leaf under
+`interfaces <*> tunnel` to declare a `valueType` AND a validator, so a leaf added
+later without one reds there instead of waiting for somebody to notice the
+asymmetry again.
 
 ### `protocols {isis,rip} authentication-type` — a typo DOWNGRADES md5 to plaintext (#8443)
 
@@ -6037,6 +6155,59 @@ the fix. Covered by `pkg/config/bgp_group_inherit_order_5270_test.go` (neighbor
 -before-export inherits, both orders identical across export/peer-as/
 local-address/hold-time, per-neighbor override still wins in both orders, and a
 hierarchical-shape variant).
+
+### One authored neighbor may occupy SEVERAL AST nodes (#9192)
+
+`compileBGP` appended one `*BGPNeighbor` per AST NODE, and one authored neighbor
+is not always one node. `SetPath` does not reuse a node it has already marked
+`IsLeaf`, so a bare declaration followed by a sub-leaf becomes two siblings:
+
+```
+set protocols bgp group G neighbor 10.0.2.2
+set protocols bgp group G neighbor 10.0.2.2 import PS
+  -> [neighbor 10.0.2.2]
+     [neighbor 10.0.2.2] > [import PS]
+  -> neighbors=2   [0] import=[]   [1] import=[PS]
+```
+
+Both entries carry the group defaults, so the render was **redundant, not
+wrong** — FRR accepts a repeated `remote-as`, and the `activate` / route-map
+lines only entry `[1]` carried were still emitted. What made it worth fixing is
+that the duplication is invisible in the typed config's contract: **anything
+reasoning over `BGP.Neighbors` as a set of peers is wrong by construction**, and
+each new consumer has to rediscover it. Two were already caught by it while
+#9007 was being fixed — a duplicate-address check keyed on `Address` alone that
+reported a peer as "configured in more than one group (G and G)" and
+false-rejected a legitimate config, and a first-wins dedup at the renderer's
+`validNeighbors` that silently dropped the policy-bearing entry along with its
+`activate` and `route-map … in` lines.
+
+The compiler now does **find-or-create on `(GroupName, Address)`** within a BGP
+instance (`findBGPNeighbor9192`), the same shape as the #8436 OSPFv3
+area-interface merge. Group defaults are applied on CREATE only: re-applying
+them for a later node would wipe the per-neighbor overrides an earlier node set,
+which is the drop the merge exists to prevent.
+
+Three boundaries, each pinned by a cell:
+
+- **Distinct addresses never fold** — they do not share the key.
+- **The CROSS-GROUP case never folds.** Two groups naming one address with
+  divergent `peer-as`, timers and authentication keys is #9007's genuinely
+  ambiguous shape, resolved by render order and rejected at commit by PR #9191.
+  The key is the PAIR precisely so that folding it here cannot silently resolve
+  an ambiguity the operator is meant to be told about.
+- **Two `group G` blocks naming one address DO share the key**, and that config
+  is rejected at strict commit by the #5180 duplicate-block gate, so the
+  behaviour is reachable only on the lenient boot / HA-sync path. There the
+  merged neighbor keeps the FIRST block's group-level defaults and unions both
+  blocks' per-neighbor statements, instead of two entries whose group defaults
+  disagree and which the renderer emits both of.
+
+`neighborOwnExport` / `neighborOwnImport` — the #5277 most-specific-LEVEL-wins
+flags — moved from per-NODE locals to per-NEIGHBOR state. They were correct
+while one node meant one neighbor; with several nodes per neighbor a per-node
+flag makes the second node's first `export` wipe the first node's own list,
+turning the union back into a last-node-wins drop, silently.
 
 ## Duplicate host-local-address fail-closed gate (#3718, Option B)
 

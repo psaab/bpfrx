@@ -775,6 +775,10 @@ type xpfCollector struct {
 	flowExportCollectorHealthy            *prometheus.Desc
 	flowExportCollectorLastSuccessSeconds *prometheus.Desc
 	flowExportCollectorLastFailureSeconds *prometheus.Desc
+	// #9166: build health. Without these, a failed exporter build and an
+	// unconfigured box are the same observation on every surface.
+	flowExportConfiguredGroups *prometheus.Desc
+	flowExportBuildFailed      *prometheus.Desc
 
 	// #3747: per-exporter pending-batch queue depth / high-water / drop count.
 	// The export batch was unbounded; a stalled or overrun drain grew memory
@@ -1158,6 +1162,8 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.flowExportCollectorHealthy
 	ch <- c.flowExportCollectorLastSuccessSeconds
 	ch <- c.flowExportCollectorLastFailureSeconds
+	ch <- c.flowExportConfiguredGroups
+	ch <- c.flowExportBuildFailed
 	ch <- c.flowExportBatchDepth
 	ch <- c.flowExportBatchMaxDepth
 	ch <- c.flowExportBatchDroppedTotal
@@ -1447,6 +1453,11 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	// BEFORE the dataplane gate. A collector that has gone unreachable must
 	// stay visible even when the dataplane is not loaded.
 	c.collectFlowExportMetrics(ch)
+	// #9166: flow-export BUILD health, beside the write health above. The
+	// write-health family is omitted when the health slice is empty, which is
+	// exactly what a failed build produces — so on its own it cannot tell a
+	// dead exporter from an unconfigured box.
+	c.collectFlowExportBuildState(ch)
 
 	// #3361: kernel nftables host-inbound DROP counters, per zone/family. The
 	// `inet xpf_hostinbound` chain is installed by the daemon INDEPENDENT of

@@ -408,6 +408,13 @@ type Config struct {
 	// last-error/last-success state are surfaced here. Optional; if nil (or
 	// it returns nil), the family is omitted.
 	FlowCollectorHealthFn func() []flowexport.ExporterCollectorHealth
+	// FlowExportBuildStateFn surfaces per-family flow-export BUILD health for
+	// the xpf_flowexport_configured_groups / xpf_flowexport_build_failed gauges
+	// (#9166). FlowCollectorHealthFn above cannot answer this: its family is
+	// omitted when the health slice is empty, which is exactly what a failed
+	// build produces, so a dead exporter and an unconfigured box read the same.
+	// Optional; if nil, the build-health gauges are omitted.
+	FlowExportBuildStateFn func() []flowexport.BuildState
 	// FlowExportBatchStatsFn surfaces the per-exporter pending-batch queue
 	// stats (current depth, high-water depth, dropped-at-capacity count) for
 	// the xpf_flow_export_batch_* metric family (#3747). The export batch used
@@ -563,6 +570,7 @@ type Server struct {
 	ddnsStatsFn                          func() *dhcpserver.DDNSStats
 	surfaceAStatsFn                      func() *ddns.SurfaceAStats
 	flowCollectorHealthFn                func() []flowexport.ExporterCollectorHealth
+	flowExportBuildStateFn               func() []flowexport.BuildState
 	flowExportBatchStatsFn               func() []flowexport.ExporterBatchStats
 	feedOverlayFn                        func() map[string][]string
 	policySchedActiveFn                  func() (map[string]bool, bool)
@@ -684,6 +692,7 @@ func NewServer(cfg Config) *Server {
 		ddnsStatsFn:                          cfg.DDNSStatsFn,
 		surfaceAStatsFn:                      cfg.SurfaceAStatsFn,
 		flowCollectorHealthFn:                cfg.FlowCollectorHealthFn,
+		flowExportBuildStateFn:               cfg.FlowExportBuildStateFn,
 		flowExportBatchStatsFn:               cfg.FlowExportBatchStatsFn,
 		feedOverlayFn:                        cfg.FeedOverlayFn,
 		policySchedActiveFn:                  cfg.PolicySchedulerActiveStateFn,

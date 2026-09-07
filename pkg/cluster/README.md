@@ -3833,6 +3833,24 @@ outside the monitor loop:
   one does NOT re-arm: same peer, and re-priming there would re-bulk on every
   routine fabric flap (#466).
 
+  **A RAISED BOOT EPOCH re-arms it too (#9174 V014).** The two signals above are
+  the two a supersession or a full disconnect produces, and a replacement that
+  dials the **empty alternate slot** while the dead process's socket still sits
+  ESTABLISHED produces neither — #7762's own text says so: it "supersedes
+  nothing and leaves the registry non-empty". #7762 taught `installConn` to
+  RETIRE that incarnation on the raised epoch (`if supersededCurrent ||
+  epochReboot`), but the same evidence never reached the arming condition forty
+  lines below, so the corpse was evicted and the replacement was never refilled.
+  A rebooted peer's session table is EMPTY, so the standby held nothing and the
+  next failover to it blackholed every established flow — the #5480 blackhole,
+  reached through the epoch edge instead of the disconnect edge. The arm is
+  `d.wasDisconnected || supersededCurrent || epochReboot`, reusing the value
+  already computed above rather than re-calling `peerEpochRebootLocked` (which
+  records as it reads, so a second call would compare against the baseline the
+  first one just advanced). An install with no epoch source wired, or during the
+  unlatched race window where the floor reads 0 because no heartbeat has landed,
+  arms nothing.
+
   **Atomicity of the ack is bound, not merely asserted (#5718 fold r3).** Every
   scenario test calls `installConn` and `handleMessage` in sequence, so none of
   them opens the window `s.mu` exists to close — an implementation that checks

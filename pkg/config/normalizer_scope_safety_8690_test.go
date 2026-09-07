@@ -78,11 +78,26 @@ func TestNormalizerScopeNeverCoversAPartialSite8690(t *testing.T) {
 		}
 		parent := s.container[:len(s.container)-1]
 		stanza := s.container[len(s.container)-1]
-		v1, _, ok := synthPair(s.node)
-		if !ok {
-			continue
+		// #9056: a VALUELESS FLAG site has no value to vary, so synthPair
+		// refuses it and the site would be SKIPPED -- which the reconciliation
+		// below correctly reports as UNCHECKED rather than safe. Five of the
+		// sixteen partial sites are flags (`interfaces <if> disable`,
+		// `vlan-tagging`, `flexible-vlan-tagging`, `gratuitous-arp-reply`,
+		// `no-gratuitous-arp-request`), so without this branch the guard covers
+		// 11 of 16 and says so.
+		//
+		// The elided spelling of a flag is the leaf alone; appending an empty
+		// value would spell `... disable ;`, which is not the operator's line.
+		elided := ""
+		if s.flag {
+			elided = nest(parent, contextFor(parent)+stanza+" "+s.leaf+";")
+		} else {
+			v1, _, ok := synthPair(s.node)
+			if !ok {
+				continue
+			}
+			elided = nest(parent, contextFor(parent)+stanza+" "+s.leaf+" "+v1+";")
 		}
-		elided := nest(parent, contextFor(parent)+stanza+" "+s.leaf+" "+v1+";")
 		probe, perrs := NewParser(elided).Parse()
 		if len(perrs) > 0 || probe == nil {
 			continue

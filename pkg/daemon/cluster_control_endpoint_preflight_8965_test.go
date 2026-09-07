@@ -44,17 +44,26 @@ func TestControlEndpointMoveIsRefused8965(t *testing.T) {
 	// THE DECISION ITSELF, which is what the earlier version of this cell
 	// failed to reach: it exercised only the message builder, so neutering the
 	// gate to `return nil` left it green.
+	// #9178 CORRECTED ONE ROW OF THIS TABLE. "candidate leaves it unset" was
+	// scored as allowed on the reasoning quoted in the gate — "unset on either
+	// side means there is no live endpoint to strand". That reasoning covers
+	// have=="" (an addition) and is FALSE for want=="" (a deletion), where the
+	// live endpoint being stranded is the one being removed. The row now
+	// carries the fabric-fallback column that decides it; the full four-cell
+	// enumeration lives in the #9178 cell below.
 	for _, tc := range []struct {
 		name, have, want string
+		fabric           bool
 		refuse           bool
 	}{
-		{"a real move is refused", "10.99.0.2", "10.99.5.2", true},
-		{"unchanged is allowed", "10.99.0.2", "10.99.0.2", false},
-		{"no running endpoint yet", "", "10.99.5.2", false},
-		{"candidate leaves it unset", "10.99.0.2", "", false},
+		{"a real move is refused", "10.99.0.2", "10.99.5.2", false, true},
+		{"unchanged is allowed", "10.99.0.2", "10.99.0.2", false, false},
+		{"no running endpoint yet", "", "10.99.5.2", false, false},
+		{"candidate deletes it, no fallback", "10.99.0.2", "", false, true},
+		{"candidate deletes it, fabric fallback", "10.99.0.2", "", true, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := controlEndpointDecision8965(tc.have, tc.want)
+			err := controlEndpointDecision8965(tc.have, tc.want, tc.fabric)
 			if tc.refuse && err == nil {
 				t.Errorf("have=%q want=%q must be REFUSED: applying it restarts "+
 					"comms on the new address before the peer can be told (#8965)",
@@ -74,7 +83,7 @@ func TestControlEndpointMoveIsRefused8965(t *testing.T) {
 // is the same partition by hand. A refusal without a path is worse than the
 // defect it prevents.
 func TestControlEndpointRefusalNamesTheRemedy8965(t *testing.T) {
-	err := controlEndpointDecision8965("10.99.0.2", "10.99.5.2")
+	err := controlEndpointDecision8965("10.99.0.2", "10.99.5.2", false)
 	if err == nil {
 		t.Fatal("a control-endpoint move on a running cluster must be refused (#8965)")
 	}

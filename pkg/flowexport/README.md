@@ -708,6 +708,57 @@ Two nearby behaviours are deliberately NOT changed:
   construction; per-collector unreachability is handled afterwards by the
   #2464 write-health path below.
 
+**#9166 — a transient failure was invisible, and nothing retried.** The
+availability design above is right, and it left two gaps.
+
+*It was invisible.* A failed build produced the SAME observation as "flow
+export is not configured" on every surface: the daemon's
+`FlowExportError()` had zero production readers; the
+`xpf_flow_export_collector_*` family is omitted entirely when the health
+slice is empty, which is exactly what a failed build produces; and `show`
+renders the configuration as present, because the config IS present. So
+"flow export is dead" and "flow export was never turned on" read
+identically — and only one of those is worth waking someone for. NetFlow
+is frequently the only record of what traversed the box, and its absence
+looks exactly like a deployment where it was never enabled, which is why
+nobody investigates.
+
+`BuildState` (this package) carries `ConfiguredGroups` and `BuildFailed`
+per family; the daemon fills it from a count recorded by each reconcile
+BEFORE its hash gate, and the collector emits
+`xpf_flowexport_configured_groups{family}` and
+`xpf_flowexport_build_failed{family}` — both for both families on every
+scrape, **including at zero**. That is what makes the three states three
+distinguishable observations:
+
+| observation | meaning |
+|---|---|
+| `configured=0, failed=0` | not configured |
+| `configured>0, failed=0` | configured and healthy |
+| `configured>0, failed=1` | configured, and the build FAILED |
+
+The count of RUNNING exporters cannot stand in for `ConfiguredGroups`: on
+a build failure with nothing previously running it is also 0, which is
+the not-configured reading.
+
+*Nothing retried.* `reconcileFlowExporters` runs only from the apply tail
+and the boot block, so the retry cadence was "the next commit" — which on
+a stable box is never, while both faults the design cites (a pinned
+source bind before the interface is up, collector DNS) clear on their own
+minutes later. `armFlowExportRetry` now starts a single-flight loop that
+re-reconciles every 30s against the **live active config** — reading the
+live config, not the config captured at failure, so a commit that removes
+flow export converges the loop instead of resurrecting deleted config
+(the same reason `activeConfigForRebind` exists, #4899). The loop is
+cancelled and JOINED at shutdown under a bounded timeout, so a late tick
+cannot reconcile against a torn-down subsystem and a pathological tick
+cannot push the stop sequence past the systemd `TimeoutStopSec` and get
+the process SIGKILLed before the HA takeover fence runs.
+
+Not changed: the `d.flowHashSet = false` on the failure path. The finding
+narrated that as the defect; it is the FIX — without it the next commit
+would be hash-gated into a permanently dead family.
+
 The `if fs.Port > 0` guard before `net.JoinHostPort` is kept even though
 the exclusion makes `Port >= 1` on every path that reaches it. It is the
 fail-loud leg: if the exclusion is ever moved or bypassed, a bare address

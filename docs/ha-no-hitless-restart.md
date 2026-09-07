@@ -237,6 +237,40 @@ ends of a point-to-point control link atomically from one end of it.**
   the control link to another interface and carries the same address
   across leaves it unchanged.
 
+**#9178 — the address gate passed the DELETION case.** #8965's decision
+returned nil whenever *either* side was empty, on the reasoning that
+"unset on either side means there is no live endpoint to strand". That
+sentence is true for `have == ""` — an **addition**, where the heartbeat
+has not started — and **false** for `want == ""`, a **deletion**, where
+the live endpoint being stranded is the one being removed. Two of the
+four `(have, want)` combinations were decided by a justification that
+covered one of them.
+
+Severity is set by the fabric, not by the deletion:
+
+- **With `fabric-interface` + `fabric-peer-address`**, `clusterSyncTransport`
+  falls back to the fabric, so the config push still has a transport and
+  the deletion **propagates**. The heartbeat dies on both nodes — which
+  is what the operator asked for — and there is no partition. Admitted.
+- **On a control-link-only cluster**, which the strict compiler gate
+  accepts, there is no fallback: no heartbeat **and** no sync transport.
+  That is exactly #8965's apply-then-push partition, and it is durable
+  because the peer never learns why. Reachable with an ordinary
+  `delete chassis cluster peer-address` followed by `commit`. Refused.
+
+The decision is now **total** over the four combinations, with the fabric
+fallback passed in as a third argument — it is a property of the
+*candidate config*, not of the two addresses, which is why the gate could
+not stay a two-string function and be total at the same time.
+
+`fabricFallbackConfigured9178` mirrors the condition
+`daemon_ha_sync.go` actually gates the sync goroutine on —
+`syncIface != "" && syncPeerAddr != ""` — **not** the transport label.
+`clusterSyncTransport` returns `"fabric"` whenever the control link is
+incomplete, *including when the fabric is incomplete too*, so a check
+reading the label would report a transport that never starts and admit a
+deletion into a config with no sync at all.
+
 **Peer-sync is a no-op for both, for *different* reasons**, and the
 distinction matters because assuming #8965's reason transferred would
 have refused legitimate syncs. `peer-address` is **per-node** — each

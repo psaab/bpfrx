@@ -11,11 +11,60 @@ import (
 
 // ---- value synthesis ------------------------------------------------------
 
+// isValuelessFlag9056 reports whether a schema node is a VALUELESS BOOLEAN FLAG:
+// a childless, wildcard-less, non-multi leaf that takes no argument AND declares
+// no value metadata of any kind.
+//
+// The metadata clause is not decoration. `args` is the field that says a leaf
+// takes a value, but a hand-built fixture node can declare a valueType, a
+// placeholder or a valueHint while leaving `args` at its zero value -- and
+// synth_value_hints_8662_test.go is full of exactly those, deliberately, because
+// it pins the synthesiser's PATHS rather than the shipped schema. Refusing on
+// `args == 0` alone made every one of those cases report "synthPair refused to
+// synthesise", which is a claim about this predicate rather than about a flag.
+//
+// Measured over the shipped schema at 1748e11a2: 511 nodes match the shape and
+// ZERO of them declare any value metadata, so the clause changes no verdict on
+// real config and only excludes the fixture shape it was added for. One
+// predicate is used by BOTH collectCompactSites and synthPair so the population
+// and the refusal cannot drift apart -- a flag the census enumerates but
+// synthPair still values would get the fixture `allow-dns-reply xpfaaa;`, and a
+// flag synthPair refuses but the census does not enumerate would be skipped
+// everywhere with no bucket to show for it.
+func isValuelessFlag9056(n *schemaNode) bool {
+	return n != nil &&
+		n.args == 0 && n.wildcard == nil && len(n.children) == 0 && !n.multi &&
+		n.valueType == ValueAny && n.validator == nil &&
+		n.placeholder == "" && n.valueHint == ValueHintNone &&
+		len(n.valueExamples) == 0 && n.valueDesc == ""
+}
+
 // synthPair returns two DISTINCT plausible values for a valued leaf. Two are
 // needed for the vacuity guard: if the compiled config is identical for both,
 // this leaf's value is not observable in the typed config and the cell cannot
 // prove anything.
 func synthPair(n *schemaNode) (string, string, bool) {
+	// #9056: a VALUELESS BOOLEAN FLAG has no value to vary, and this function's
+	// contract is two distinct values for a VALUED leaf.
+	//
+	// Without this it fell through to the `ValueIdentifier, ValueAny` arm --
+	// ValueAny is the zero value of valueType, so an undeclared type reads as
+	// "any" -- and handed back "xpfaaa"/"xpfbbb". The fixture built from that is
+	// `allow-dns-reply xpfaaa;`, which is not a spelling of anything: the
+	// compiler's FindChild sees the leaf either way, so both probe values
+	// compile alike, the vacuity guard fires, and the site is recorded
+	// "leaf value not observable" -- a verdict about the SYNTHESISER, not about
+	// the leaf.
+	//
+	// Returning false instead is what lets the flag shape be enumerated by
+	// collectCompactSites without every site-walking consumer inheriting a
+	// meaningless fixture: they skip on !ok exactly as they did when the shape
+	// was outside the population, and the two censuses that CAN rule on a flag
+	// (runCompactBlockCensus and the scope-safety guards) branch on
+	// compactSite.flag and use PRESENCE as the discriminator instead.
+	if isValuelessFlag9056(n) {
+		return "", "", false
+	}
 	// #8662: a folded token that is a WILDCARD-NAMED container carries no leaf
 	// value of its own — the token after it is the INSTANCE NAME, and that is
 	// what the compact spelling packs onto the parent. Vary the name.
@@ -368,6 +417,16 @@ type compactSite struct {
 	container []string // token path of the enclosing container
 	leaf      string
 	node      *schemaNode
+	// flag marks a VALUELESS BOOLEAN LEAF -- args:0, no wildcard, no children
+	// (`allow-dns-reply;`, `tcp-rst;`, `no-syn-check;`). #9056.
+	//
+	// It exists because such a leaf has no VALUE to vary, and every probe in
+	// this file was built around varying one. synthPair needs two distinct
+	// values and a flag has none, so the discriminator for a flag site is
+	// PRESENCE: `stanza { flag; }` against `stanza { }`. Same question -- does
+	// the elided spelling reach the compiler -- asked with the only axis the
+	// shape offers.
+	flag bool
 }
 
 // A site is compactable when the innermost container is EITHER a plain keyword
@@ -478,12 +537,32 @@ func collectCompactSites() []compactSite {
 			// containers wide rather than a re-baselining of every lane's
 			// population.
 			argNamedWithBody := ch.args >= 1 && ch.wildcard != nil
-			if (ch.wildcard == nil && ch.args == 1 || wildcardNamed || argNamedWithBody) && len(path) >= 1 {
+			// #9056: THE FOURTH SHAPE, and the one whose exclusion was the most
+			// completely silent -- a VALUELESS BOOLEAN FLAG.
+			//
+			//	args == 0 && wildcard == nil && children == nil
+			//
+			// `allow-dns-reply;`, `security-zone <z> tcp-rst;`, `tcp-session
+			// no-syn-check;`. Every clause above requires either an `args` token
+			// or a wildcard, so a flag satisfies NONE of them: it was never
+			// enumerated, appeared in no skip bucket, and its absence was
+			// indistinguishable from a clean verdict. Measured at the time of
+			// this widening: 511 flag sites in the schema, of which 93 DIVERGE.
+			//
+			// The exclusion was not a scope decision. It is an artefact of the
+			// site model having been built around synthPair, which needs two
+			// distinct VALUES -- so the shape that has no value at all fell out
+			// of the population rather than out of a bucket. The discriminator
+			// for these sites is PRESENCE, and runCompactBlockCensus supplies
+			// it; see compactSite.flag.
+			flagLeaf := isValuelessFlag9056(ch)
+			if (ch.wildcard == nil && ch.args == 1 || wildcardNamed || argNamedWithBody || flagLeaf) && len(path) >= 1 {
 				key := strings.Join(path, "/") + "|" + name
 				if !seen[key] {
 					seen[key] = true
 					out = append(out, compactSite{
 						container: append([]string(nil), path...), leaf: name, node: ch,
+						flag: flagLeaf,
 					})
 				}
 			}
@@ -853,11 +932,15 @@ func runCompactBlockCensus(t *testing.T) censusResult {
 			res.state[siteKey] = "skipped: under groups"
 			continue
 		}
-		v1, v2, ok := synthPair(s.node)
-		if !ok {
-			res.skipped["no two distinct synthesizable values"]++
-			res.state[siteKey] = "skipped: no two distinct synthesizable values"
-			continue
+		var v1, v2 string
+		if !s.flag {
+			var ok bool
+			v1, v2, ok = synthPair(s.node)
+			if !ok {
+				res.skipped["no two distinct synthesizable values"]++
+				res.state[siteKey] = "skipped: no two distinct synthesizable values"
+				continue
+			}
 		}
 		// contextForStanza / preambleFor are keyed on the CANONICAL path (the
 		// one carrying "xpfarg"), so existing scaffold entries keep matching;
@@ -874,6 +957,16 @@ func runCompactBlockCensus(t *testing.T) censusResult {
 		blockV1 := pre + nest(parent, ctx+stanza+" { "+s.leaf+" "+v1+"; }")
 		blockV2 := pre + nest(parent, ctx+stanza+" { "+s.leaf+" "+v2+"; }")
 		compact := pre + nest(parent, ctx+stanza+" "+s.leaf+" "+v1+";")
+		if s.flag {
+			// #9056: a valueless flag has no second VALUE, so the "b" spelling
+			// omits the leaf. The vacuity guard below then reads as "the
+			// presence of this flag is not observable in the typed config",
+			// which is the same property it asserts for a valued leaf and the
+			// only one this shape can express.
+			blockV1 = pre + nest(parent, ctx+stanza+" { "+s.leaf+"; }")
+			blockV2 = pre + nest(parent, ctx+stanza+" { }")
+			compact = pre + nest(parent, ctx+stanza+" "+s.leaf+";")
+		}
 
 		cb1, cb2, cc := compileText(t, blockV1), compileText(t, blockV2), compileText(t, compact)
 		if cb1 == nil || cb2 == nil || cc == nil {

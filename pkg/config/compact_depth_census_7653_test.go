@@ -63,7 +63,14 @@ func compactAtDepth(container []string, leaf, val string, j int) (string, bool) 
 	pre := renderScaffold(preambleFor(parent, stanza), container, rendered)
 	rparent := rendered[:len(rendered)-j]
 	rtail := rendered[len(rendered)-j:]
+	// #9056: a VALUELESS FLAG site carries no value, so the tail ends at the
+	// leaf. Appending an empty `val` would spell `... allow-dns-reply ;`, which
+	// is not the operator's line and would measure the fixture rather than the
+	// fold.
 	rinner := strings.Join(rtail, " ") + " " + leaf + " " + val + ";"
+	if val == "" {
+		rinner = strings.Join(rtail, " ") + " " + leaf + ";"
+	}
 	return pre + nest(rparent, ctx+rinner), true
 }
 
@@ -85,9 +92,20 @@ func runDepthCensus7653(t *testing.T) (map[int]*depthOutcome, int, map[string]bo
 		if len(s.container) > 0 && strings.HasPrefix(s.container[0], "groups") {
 			continue // same exclusion as the base census: schema re-host, duplicate coverage
 		}
-		v1, v2, ok := synthPair(s.node)
-		if !ok {
-			continue
+		// #9056: a flag site has no value to vary; its discriminator is
+		// PRESENCE, exactly as in runCompactBlockCensus. Without this branch
+		// synthPair refuses the shape, the site is skipped, and depth 1 stops
+		// agreeing with the base census -- which the cell below asserts, so the
+		// disagreement is what pointed here.
+		var v1, v2 string
+		if s.flag {
+			v1, v2 = "", ""
+		} else {
+			var ok bool
+			v1, v2, ok = synthPair(s.node)
+			if !ok {
+				continue
+			}
 		}
 		parent := s.container[:len(s.container)-1]
 		stanza := s.container[len(s.container)-1]
@@ -98,6 +116,10 @@ func runDepthCensus7653(t *testing.T) (map[int]*depthOutcome, int, map[string]bo
 		rstanza := rendered[len(rendered)-1]
 		blockV1 := pre + nest(rparent, ctx+rstanza+" { "+s.leaf+" "+v1+"; }")
 		blockV2 := pre + nest(rparent, ctx+rstanza+" { "+s.leaf+" "+v2+"; }")
+		if s.flag {
+			blockV1 = pre + nest(rparent, ctx+rstanza+" { "+s.leaf+"; }")
+			blockV2 = pre + nest(rparent, ctx+rstanza+" { }")
+		}
 		cb1, cb2 := compileText(t, blockV1), compileText(t, blockV2)
 		if cb1 == nil || cb2 == nil {
 			continue

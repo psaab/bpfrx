@@ -226,7 +226,28 @@ func clusterControlEndpointCommitPreflight(running *cluster.Manager, newCfg *con
 		return nil
 	}
 	return controlEndpointDecision8965(running.HeartbeatPeerAddr(),
-		newCfg.Chassis.Cluster.PeerAddress)
+		newCfg.Chassis.Cluster.PeerAddress,
+		// #9166-class denominator, #9178 specifically: the DELETION arm needs
+		// to know whether anything else can carry the config push. That is a
+		// property of the CANDIDATE config, not of the two addresses, so it has
+		// to be passed in — which is why the decision could not stay a
+		// two-string function and still be total.
+		fabricFallbackConfigured9178(newCfg.Chassis.Cluster))
+}
+
+// fabricFallbackConfigured9178 reports whether the candidate still has a fabric
+// transport after the control endpoint is removed.
+//
+// It mirrors clusterSyncTransport's own fallback condition
+// (daemon_ha_comms_wiring.go) — control link when interface AND peer address
+// are both set, else fabric — hoisted from runtime to commit time. Keeping the
+// two in agreement is the point: a deletion is safe exactly when the runtime
+// would fall back, so the gate must ask the same question the runtime asks.
+func fabricFallbackConfigured9178(cc *config.ClusterConfig) bool {
+	if cc == nil {
+		return false
+	}
+	return cc.FabricInterface != "" && cc.FabricPeerAddress != ""
 }
 
 // controlEndpointDecision8965 is the DECISION, split from the accessor plumbing
@@ -240,14 +261,63 @@ func clusterControlEndpointCommitPreflight(running *cluster.Manager, newCfg *con
 // unexercised: neutering the gate to `return nil` left the cell GREEN. A seam
 // that bypasses the thing under test is worse than no seam, because it reads as
 // coverage. This one is the decision itself, so the same mutation reds.
-func controlEndpointDecision8965(have, want string) error {
-	if want == "" || have == "" || want == have {
-		// Unset on either side means there is no live endpoint to strand --
-		// the heartbeat has not started, or the candidate leaves it to the
-		// runtime default. Equal means this is not a move.
+// #9178 MADE IT TOTAL, AND THE ORIGINAL JUSTIFICATION WAS HALF TRUE. The first
+// version returned nil whenever EITHER side was empty, on the reasoning that
+// "unset on either side means there is no live endpoint to strand". That is
+// true for `have == ""` -- an ADDITION, where the heartbeat has not started --
+// and false for `want == ""`, a DELETION, where the live endpoint being
+// stranded is the one being removed. Two of the four (have, want) combinations
+// were decided by a sentence that only covered one of them.
+//
+// A deletion is admitted only when the candidate still has a FABRIC transport.
+// That is not leniency: clusterSyncTransport falls back to the fabric when the
+// control link is not fully configured, so the config push still lands and the
+// deletion propagates -- the heartbeat dies on both nodes, which is what the
+// operator asked for, and there is no partition. On a control-link-only
+// cluster (which the strict compiler gate accepts) there is no fallback: no
+// heartbeat AND no sync transport, which is exactly #8965's apply-then-push
+// partition, and it is durable because the peer never learns why. That is
+// reachable with an ordinary `delete chassis cluster peer-address` + `commit`.
+func controlEndpointDecision8965(have, want string, fabricFallback bool) error {
+	switch {
+	case have == "":
+		// ADDITION (or still unset): the heartbeat has not started on an old
+		// address, so there is genuinely nothing live to strand.
 		return nil
+	case want == have:
+		// Not a move.
+		return nil
+	case want == "":
+		// DELETION of a LIVE endpoint.
+		if fabricFallback {
+			return nil
+		}
+		return controlEndpointDeleteRefusal9178(have)
+	default:
+		return controlEndpointMoveRefusal8965(have, want)
 	}
-	return controlEndpointMoveRefusal8965(have, want)
+}
+
+// controlEndpointDeleteRefusal9178 is the operator-facing text for the deletion
+// arm, factored for the same reason the move refusal is: the cell asserting it
+// and the gate producing it cannot drift apart.
+//
+// It names the procedure. A refusal without a path is worse than the defect it
+// prevents -- an operator mid-maintenance who is told only "no" finds the way
+// around it, and the way around it (committing on each node separately while
+// both run) is the same partition by hand.
+func controlEndpointDeleteRefusal9178(have string) error {
+	return fmt.Errorf("commit rejected: removing the chassis cluster control-link "+
+		"peer address (%s) on a running cluster with no fabric transport "+
+		"configured cannot be done — applying it stops this node's heartbeat AND "+
+		"leaves no transport to push the config to the peer, which is still "+
+		"configured for the control link, so the peer never receives the change "+
+		"and the two nodes are durably partitioned.\n"+
+		"To remove the control link: configure `chassis cluster fabric-interface` "+
+		"and `fabric-peer-address` first so the sync has a fallback path, or take "+
+		"the cluster down before the change. Do NOT commit the deletion on each "+
+		"node separately while both are running — that produces the same partition "+
+		"by hand", have)
 }
 
 // controlEndpointMoveRefusal8965 is the operator-facing text, factored so the

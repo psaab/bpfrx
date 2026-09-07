@@ -304,6 +304,11 @@ type SyncStats struct {
 	// they belonged to a peer boot incarnation that a re-prime has replaced
 	// (#5084 rule 3) — the defect this fence exists to close, made countable.
 	ConfigsDeadIncarnationDropped atomic.Uint64
+	// BulkEndsDeadIncarnationDropped counts BulkEnd frames refused for carrying
+	// a boot incarnation other than the one that started the bulk in progress
+	// (#9174 V013). Counted because the refusal decides whether the VRRP sync
+	// hold is released.
+	BulkEndsDeadIncarnationDropped atomic.Uint64
 	// ConfigsApplyFailed counts config-sync messages that were admitted by the
 	// #3931 ordering guard but whose apply did NOT take effect on this node —
 	// a compile/promote failure (a mixed-build ISSU syntax error, a store
@@ -465,8 +470,9 @@ type SyncStatsSnapshot struct {
 	// both halves are counted: primes that arrived without an incarnation
 	// (the peer is old, or half-upgraded and hiding), and payloads dropped
 	// because their incarnation was replaced (the fence doing its job).
-	BulkPrimesWithoutIncarnation  uint64
-	ConfigsDeadIncarnationDropped uint64
+	BulkPrimesWithoutIncarnation   uint64
+	ConfigsDeadIncarnationDropped  uint64
+	BulkEndsDeadIncarnationDropped uint64 // #9174 V013
 	// PeerBootIncarnation renders the boot id of the peer incarnation that
 	// most recently primed, or "none". It travels in the snapshot rather than
 	// through a new Manager accessor because the Manager holds only the
@@ -1079,10 +1085,16 @@ type SessionSync struct {
 	// full-disconnect epoch's arm is cleared by an older epoch's success
 	// self-heals via forceResync / the #4090 survivor re-drive / the next
 	// reconnect.
-	needColdPrime              atomic.Bool
-	bulkMu                     sync.Mutex
-	bulkInProgress             bool
-	bulkRecvEpoch              uint64
+	needColdPrime  atomic.Bool
+	bulkMu         sync.Mutex
+	bulkInProgress bool
+	bulkRecvEpoch  uint64
+	// bulkRecvIncarnation is the peer boot incarnation that started the bulk
+	// `bulkRecvEpoch` names, so a BulkEnd can be matched on more than the epoch
+	// (#9174 V013 — reasoning at the two sites, sync_conn_read.go's BulkEnd arm
+	// and sync_bulk.go's end-marker write). Zero = primed without one, fail
+	// open. Guarded by bulkMu.
+	bulkRecvIncarnation        bootIncarnation
 	bulkRecvV4                 map[dataplane.SessionKey]struct{}
 	bulkRecvV6                 map[dataplane.SessionKeyV6]struct{}
 	bulkZoneSnapshot           map[uint16]bool
@@ -1616,7 +1628,7 @@ func (s *SessionSync) Stats() SyncStatsSnapshot {
 		activeFabric = -1
 	}
 	s.mu.Unlock()
-	return SyncStatsSnapshot{SessionsSent: s.stats.SessionsSent.Load(), SweepSessionsSent: s.stats.SweepSessionsSent.Load(), SessionsReceived: s.stats.SessionsReceived.Load(), SessionsInstalled: s.stats.SessionsInstalled.Load(), DeletesSent: s.stats.DeletesSent.Load(), DeletesReceived: s.stats.DeletesReceived.Load(), BulkSyncs: s.stats.BulkSyncs.Load(), ConfigsSent: s.stats.ConfigsSent.Load(), ConfigsReceived: s.stats.ConfigsReceived.Load(), ConfigsStaleIgnored: s.stats.ConfigsStaleIgnored.Load(), BulkPrimesWithoutIncarnation: s.stats.BulkPrimesWithoutIncarnation.Load(), PeerBootIncarnation: s.PeerBootIncarnation().String(), ConfigsDeadIncarnationDropped: s.stats.ConfigsDeadIncarnationDropped.Load(), ConfigsApplyFailed: s.stats.ConfigsApplyFailed.Load(), ImportsRefusedByHelper: s.stats.ImportsRefusedByHelper.Load(), ConfigsQueueFullDropped: s.stats.ConfigsQueueFullDropped.Load(), ConfigApplyNacksReceived: s.stats.ConfigApplyNacksReceived.Load(), IPsecSASent: s.stats.IPsecSASent.Load(), IPsecSAReceived: s.stats.IPsecSAReceived.Load(), IPsecSAStaleIgnored: s.stats.IPsecSAStaleIgnored.Load(), DHCPLeasesSent: s.stats.DHCPLeasesSent.Load(), DHCPLeasesReceived: s.stats.DHCPLeasesReceived.Load(), DHCPLeasesStaleIgnored: s.stats.DHCPLeasesStaleIgnored.Load(), DHCPLeasesSeeded: s.stats.DHCPLeasesSeeded.Load(), FencesSent: s.stats.FencesSent.Load(), FencesReceived: s.stats.FencesReceived.Load(), FenceAcksSent: s.stats.FenceAcksSent.Load(), FenceAcksReceived: s.stats.FenceAcksReceived.Load(), FenceAcksTimedOut: s.stats.FenceAcksTimedOut.Load(), Errors: s.stats.Errors.Load(), DeletesDropped: s.stats.DeletesDropped.Load(), DeletesStaleIgnored: s.stats.DeletesStaleIgnored.Load(), InstallsStaleIgnored: s.stats.InstallsStaleIgnored.Load(), SessionsStaleConfigIgnored: s.stats.SessionsStaleConfigIgnored.Load(), GenMapOverflow: s.stats.GenMapOverflow.Load(), PreAuthRejected: s.stats.PreAuthRejected.Load(), Connected: s.stats.Connected.Load(), ActiveFabric: activeFabric, BulkSyncStartTime: s.stats.BulkSyncStartTime.Load(), BulkSyncEndTime: s.stats.BulkSyncEndTime.Load(), BulkSyncSessions: s.stats.BulkSyncSessions.Load(), LastConfigSyncTime: s.stats.LastConfigSyncTime.Load(), LastConfigSyncSize: s.stats.LastConfigSyncSize.Load(), LastFenceSeq: s.stats.LastFenceSeq.Load(), LastFenceAckAt: s.stats.LastFenceAckAt.Load()}
+	return SyncStatsSnapshot{SessionsSent: s.stats.SessionsSent.Load(), SweepSessionsSent: s.stats.SweepSessionsSent.Load(), SessionsReceived: s.stats.SessionsReceived.Load(), SessionsInstalled: s.stats.SessionsInstalled.Load(), DeletesSent: s.stats.DeletesSent.Load(), DeletesReceived: s.stats.DeletesReceived.Load(), BulkSyncs: s.stats.BulkSyncs.Load(), ConfigsSent: s.stats.ConfigsSent.Load(), ConfigsReceived: s.stats.ConfigsReceived.Load(), ConfigsStaleIgnored: s.stats.ConfigsStaleIgnored.Load(), BulkPrimesWithoutIncarnation: s.stats.BulkPrimesWithoutIncarnation.Load(), PeerBootIncarnation: s.PeerBootIncarnation().String(), ConfigsDeadIncarnationDropped: s.stats.ConfigsDeadIncarnationDropped.Load(), BulkEndsDeadIncarnationDropped: s.stats.BulkEndsDeadIncarnationDropped.Load(), ConfigsApplyFailed: s.stats.ConfigsApplyFailed.Load(), ImportsRefusedByHelper: s.stats.ImportsRefusedByHelper.Load(), ConfigsQueueFullDropped: s.stats.ConfigsQueueFullDropped.Load(), ConfigApplyNacksReceived: s.stats.ConfigApplyNacksReceived.Load(), IPsecSASent: s.stats.IPsecSASent.Load(), IPsecSAReceived: s.stats.IPsecSAReceived.Load(), IPsecSAStaleIgnored: s.stats.IPsecSAStaleIgnored.Load(), DHCPLeasesSent: s.stats.DHCPLeasesSent.Load(), DHCPLeasesReceived: s.stats.DHCPLeasesReceived.Load(), DHCPLeasesStaleIgnored: s.stats.DHCPLeasesStaleIgnored.Load(), DHCPLeasesSeeded: s.stats.DHCPLeasesSeeded.Load(), FencesSent: s.stats.FencesSent.Load(), FencesReceived: s.stats.FencesReceived.Load(), FenceAcksSent: s.stats.FenceAcksSent.Load(), FenceAcksReceived: s.stats.FenceAcksReceived.Load(), FenceAcksTimedOut: s.stats.FenceAcksTimedOut.Load(), Errors: s.stats.Errors.Load(), DeletesDropped: s.stats.DeletesDropped.Load(), DeletesStaleIgnored: s.stats.DeletesStaleIgnored.Load(), InstallsStaleIgnored: s.stats.InstallsStaleIgnored.Load(), SessionsStaleConfigIgnored: s.stats.SessionsStaleConfigIgnored.Load(), GenMapOverflow: s.stats.GenMapOverflow.Load(), PreAuthRejected: s.stats.PreAuthRejected.Load(), Connected: s.stats.Connected.Load(), ActiveFabric: activeFabric, BulkSyncStartTime: s.stats.BulkSyncStartTime.Load(), BulkSyncEndTime: s.stats.BulkSyncEndTime.Load(), BulkSyncSessions: s.stats.BulkSyncSessions.Load(), LastConfigSyncTime: s.stats.LastConfigSyncTime.Load(), LastConfigSyncSize: s.stats.LastConfigSyncSize.Load(), LastFenceSeq: s.stats.LastFenceSeq.Load(), LastFenceAckAt: s.stats.LastFenceAckAt.Load()}
 }
 
 // IsConnected reports whether a peer sync connection is currently established.

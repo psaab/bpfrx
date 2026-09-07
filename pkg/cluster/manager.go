@@ -968,3 +968,23 @@ func (m *Manager) Stop() {
 			"must not block on one)", "waited", bootEpochStopJoinBudget)
 	}
 }
+
+// SetHeartbeatEndpointForTesting records the running heartbeat's local/peer
+// addresses and control interface WITHOUT starting a heartbeat. Test-only,
+// mirroring SetGroupStateForTesting; not for production callers.
+//
+// It exists because the #8965 / #8987 / #9178 commit preflights compare the
+// CANDIDATE config against the RUNNING endpoint, and the only production writer
+// of that endpoint is StartHeartbeat — which opens two UDP sockets on a real
+// interface. A daemon-side cell therefore could not drive the preflight at all,
+// only the decision function underneath it, which left the call site's own
+// arguments unbound: a mutation replacing one of them with a constant failed
+// nothing. That is the shape those gates exist to prevent, so leaving it
+// untestable was the wrong trade.
+func (m *Manager) SetHeartbeatEndpointForTesting(localAddr, peerAddr, controlIface string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.hbLocalAddr = localAddr
+	m.hbPeerAddr = peerAddr
+	m.hbControlIface = controlIface
+}

@@ -63,6 +63,7 @@ gateway local-address	security/ike/gateway,security/ipsec/gateway
 gateway local-certificate	security/ike/gateway,security/ipsec/gateway
 gateway local-identity	security/ike/gateway,security/ipsec/gateway
 gateway nat-traversal	security/ike/gateway,security/ipsec/gateway
+gateway no-nat-traversal	security/ike/gateway,security/ipsec/gateway
 gateway remote-identity	security/ike/gateway,security/ipsec/gateway
 gateway version	security/ike/gateway,security/ipsec/gateway
 group authentication-key	protocols/bgp/group,routing-instances/*/protocols/bgp/group
