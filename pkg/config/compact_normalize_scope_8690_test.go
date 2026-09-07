@@ -462,6 +462,30 @@ func TestCompactNormalizeScopePreservesCompiledResult8690(t *testing.T) {
 			"neighbor requires a peer-as\"; with the pass enabled the value survives and " +
 			"the same gate accepts. Braced is accepted either way. The gate names the " +
 			"absent value, so it is objecting to the drop and the pass repairs it.",
+		// #9351 made `routing-instances <n> protocols` the GLOBAL protocols node,
+		// so the peer-as site above acquired a per-instance twin. RE-MEASURED
+		// here rather than inherited: same four-leg table, same gate, and the
+		// gate's message names the MISSING VALUE (not the spelling), which is
+		// what makes it benign.
+		//
+		//	BRACED passDisabled=true   <nil>
+		//	BRACED passDisabled=false  <nil>
+		//	ELIDED passDisabled=true   REJECTED "routing-instance V protocols bgp
+		//	                           group g1 neighbor 10.0.0.2: missing/invalid
+		//	                           peer-as — a BGP neighbor requires a peer-as"
+		//	ELIDED passDisabled=false  <nil>
+		//
+		// Before #9351 this site did not exist in the schema, so the elided
+		// spelling packed and the peer-as was dropped with NO pass able to
+		// repair it — the rejection above was the only thing standing between
+		// an operator and a silently AS-less neighbour.
+		"routing-instances xpfname protocols bgp group xpfarg neighbor xpfarg peer-as": "the gate refuses the " +
+			"CONSEQUENCE of the drop (#9351). Measured with the pass disabled, elided " +
+			"`neighbor 10.0.0.2 peer-as 65001;` inside a routing instance loses the peer-as " +
+			"and BGP rejects with \"missing/invalid peer-as — a BGP neighbor requires a " +
+			"peer-as\"; with the pass enabled the value survives and the same gate accepts. " +
+			"Braced is accepted either way. Identical shape to the global twin above, and " +
+			"hand-measured separately rather than assumed from it.",
 		"security dynamic-address feed-server xpfarg hostname": "the gate refuses the CONSEQUENCE of the drop. " +
 			"Measured with the pass disabled, elided `feed-server f1 hostname " +
 			"\"feeds.example.com\";` loses the hostname and the compiler rejects with " +
@@ -1063,6 +1087,31 @@ var knownFixtureLimited8690 = map[string]string{
 
 	"protocols bgp group xpfarg neighbor xpfarg export": "HAND-MEASURED: SAFE. With a policy-statement defined and the group given a type and peer-as, BOTH spellings compile cleanly -- there is no gate here at all, and the arm read it as undecidable only because its minimal fixture lacked the referenced policy.",
 	"protocols bgp group xpfarg neighbor xpfarg import": "HAND-MEASURED: SAFE. With a policy-statement defined and the group given a type and peer-as, BOTH spellings compile cleanly -- there is no gate here at all, and the arm read it as undecidable only because its minimal fixture lacked the referenced policy.",
+
+	// #9351 admitted `routing-instances <n> protocols bgp ...` by making the
+	// per-instance protocols grammar the GLOBAL node, so the two sites above
+	// acquired per-instance twins. HAND-MEASURED separately rather than
+	// inherited from the global rows -- a twin is a hypothesis, and the
+	// routing-instance compiler is a different call path (compileProtocols is
+	// shared, but compileRoutingInstances wraps it and copies the result).
+	// Written out with a policy-statement defined and peer-as at the GROUP
+	// level so the neighbour body is free, then compiled with the pass OFF and
+	// ON:
+	//
+	//	BRACED off <nil>   on <nil>
+	//	ELIDED off <nil>   on <nil>      <- no gate fires in ANY of the four
+	//
+	// and reading the compiled value back rather than only the verdict, which
+	// is where the two differ:
+	//
+	//	BRACED         off export=[pol1]  on export=[pol1]
+	//	ELIDED export  off export=[]      on export=[pol1]
+	//
+	// So there is no gate to disarm here, and the pass is what makes the
+	// elided spelling mean what the operator wrote. The OFF/elided row is the
+	// #9351 defect itself: the value silently dropped with nothing objecting.
+	"routing-instances xpfname protocols bgp group xpfarg neighbor xpfarg export": "HAND-MEASURED: SAFE (#9351). No gate fires in any of the four legs; the pass is what carries the policy onto the neighbour (elided reads export=[] with the pass off and export=[pol1] with it on, matching braced). The arm read it as undecidable only because its minimal fixture lacks the referenced policy-statement.",
+	"routing-instances xpfname protocols bgp group xpfarg neighbor xpfarg import": "HAND-MEASURED: SAFE (#9351). No gate fires in any of the four legs; the pass is what carries the policy onto the neighbour (elided reads import=[] with the pass off and import=[pol1] with it on, matching braced). The arm read it as undecidable only because its minimal fixture lacks the referenced policy-statement.",
 
 	"security nat static rule-set xpfarg rule xpfarg match source-address": "HAND-MEASURED: NO DISARM POSSIBLE. With a complete static rule-set both spellings are REJECTED IDENTICALLY, so the pass changes no verdict here.",
 	// HAND-MEASURED. lane-8015 showed this bucket hides live disarms — it
