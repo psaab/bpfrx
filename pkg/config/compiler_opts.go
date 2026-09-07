@@ -2242,6 +2242,20 @@ type compileOpts struct {
 	// refusing to boot would cost availability with no gain in security --
 	// while a warning gets the operator to the fix (#1960 no-brick).
 	lenientSNMPv3KeyMaterial bool
+
+	// lenientSNMPv3SecurityKeyword (#9155) downgrades the unknown-protocol-
+	// keyword rejection on the tolerant ingress. A DEDICATED flag rather than a
+	// reuse of the one above, although both gates guard the same property and
+	// share the #1960 no-brick reasoning: sharing one switch means a future
+	// change to either gate's tolerant behaviour silently changes the other's,
+	// and these two fire on different evidence (a keyword in the AST vs a
+	// protocol/password pair in the compiled config).
+	//
+	// The tolerant downgrade is SAFE here only because pkg/snmp's runtime floor
+	// was fixed in the same change to key on configured intent rather than key
+	// presence. Without that, warning on this path would mean a persisted
+	// pre-gate config still serves an authPriv user in clear.
+	lenientSNMPv3SecurityKeyword bool
 	// lenientPolicyASPathRef (#7471) downgrades the dangling `from as-path`
 	// rejection to a warning on the tolerant Load / SyncApply ingress, so an
 	// already-persisted or peer-synced config carrying the typo still boots
@@ -2744,6 +2758,7 @@ func lenientCompileOpts() compileOpts {
 		lenientEmptySecurityIdentity:           true,
 		lenientPolicyCommunityRef:              true,
 		lenientSNMPv3KeyMaterial:               true,
+		lenientSNMPv3SecurityKeyword:           true,
 		lenientPolicyASPathRef:                 true,
 		lenientPolicyASPathRegex:               true,
 		lenientPolicyCommunityRegex:            true,

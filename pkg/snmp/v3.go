@@ -269,14 +269,11 @@ func (a *Agent) handleV3Packet(msgBody []byte) []byte {
 	// cannot produce an authenticated reply at a level the sender declined and an
 	// unauthenticated report would itself be unverifiable. (noAuthPriv — priv
 	// without auth — is already rejected above.)
-	if user.authKey != nil && msgFlags&msgFlagAuth == 0 {
-		slog.Debug("SNMPv3: request below user minimum security level (auth required), dropping",
-			"user", userName)
-		return nil
-	}
-	if user.privKey != nil && msgFlags&msgFlagPriv == 0 {
-		slog.Debug("SNMPv3: request below user minimum security level (priv required), dropping",
-			"user", userName)
+	// #9155: THE FLOOR IS KEYED ON CONFIGURED INTENT, NOT ON DERIVED KEY
+	// PRESENCE, and that distinction is the whole defect. See
+	// usmUserServableAtLevel9155 for the reasoning and the table that drives it.
+	if reason := usmUserServableAtLevel9155(user, msgFlags); reason != "" {
+		slog.Debug("SNMPv3: refusing request", "user", userName, "reason", reason)
 		return nil
 	}
 
@@ -1210,4 +1207,53 @@ type V3UserDisplay struct {
 	Name      string
 	AuthProto string
 	PrivProto string
+}
+
+// usmUserServableAtLevel9155 reports why a request must be refused, or "" when
+// it may proceed.
+//
+// #9155: the floor used to read `user.authKey != nil` / `user.privKey != nil`.
+// A key is derived only from a password, and BOTH keys are derived with the
+// AUTH hash function -- so any configuration that named a protocol but produced
+// no key had NO FLOOR AT ALL and was answered at whatever level the request
+// asked for. Two ordinary commits reach that state (an unrecognised protocol
+// spelling, and privacy without authentication), and a config persisted before
+// those commit gates existed reaches it through Store.Load regardless.
+//
+// So a key-derivation FAILURE degraded to clear. Keyed on the configured
+// protocol it fails closed instead.
+//
+// EXTRACTED RATHER THAN LEFT INLINE, and the reason is a measurement. Inline,
+// the two "configured but no key" arms SURVIVED mutation: with the flags set,
+// the downstream auth check and decryptPDU already refuse, so nothing could
+// observe the difference and a mutant deleting them killed no cell. They are
+// not decoration -- they are the only place that says WHICH user and WHICH
+// protocol, and a silent drop is the shape an operator cannot diagnose -- but a
+// guard whose rejected input cannot be driven is a guard nobody can check.
+// Pulled out as a pure function, every arm is drivable and the mutants die.
+//
+// The commit gates in pkg/config are not redundant with this: they tell the
+// operator at commit time, and this refuses to serve a config already on disk
+// or arriving by peer sync, which no commit gate can reach.
+func usmUserServableAtLevel9155(user *usmUser, msgFlags byte) string {
+	if user == nil {
+		return "unknown user"
+	}
+	if user.authProto != "" {
+		if msgFlags&msgFlagAuth == 0 {
+			return "request below user minimum security level (auth required)"
+		}
+		if user.authKey == nil {
+			return "user names an authentication protocol but has no derived key"
+		}
+	}
+	if user.privProto != "" {
+		if msgFlags&msgFlagPriv == 0 {
+			return "request below user minimum security level (priv required)"
+		}
+		if user.privKey == nil {
+			return "user names a privacy protocol but has no derived key"
+		}
+	}
+	return ""
 }

@@ -200,6 +200,19 @@ func runUniformGatesLogFeedRouting(tree *ConfigTree, cfg *Config, opts compileOp
 	// derived from the KEY, so a protocol with no material behind it has no
 	// floor and serves below the configured level. Enforce the configured
 	// INTENT here rather than degrading at serve time.
+	// #9155 Hole A: an unrecognised authentication-*/privacy-* keyword. Runs
+	// BEFORE the key-material gate deliberately -- an unknown spelling leaves
+	// the protocol empty, so the #7530 gate cannot fire on it and would let the
+	// config through; this one names the actual mistake the operator made
+	// rather than staying silent.
+	if err := validateSNMPv3SecurityKeywordStrict(tree); err != nil {
+		if opts.lenientSNMPv3SecurityKeyword {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("snmpv3 security keyword (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
 	if err := validateSNMPv3UserKeyMaterialStrict(cfg); err != nil {
 		if opts.lenientSNMPv3KeyMaterial {
 			cfg.Warnings = append(cfg.Warnings,
