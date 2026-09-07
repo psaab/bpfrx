@@ -2149,6 +2149,43 @@ func compileSNMPv3(node *Node, snmp *SNMPConfig) {
 		if len(child.Keys) > 2 {
 			parseSNMPv3UserKeys(child.Keys[2:], user)
 		}
+		// #9155-R02: EXPAND THE FLAT RUN before walking the user's body.
+		//
+		// `SetPath` builds a flat-set line as a NESTED CHAIN, not a packed run
+		// on one node. For
+		//
+		//   set snmp v3 usm local-engine user alice \
+		//       authentication-sha256 authentication-password A \
+		//       privacy-aes128 privacy-password P
+		//
+		// the tree is
+		//
+		//   [user alice] > [authentication-sha256] > [authentication-password A]
+		//                                             > [privacy-aes128 privacy-password P]
+		//
+		// so the privacy stanza is a GRANDCHILD of the password node and this
+		// loop -- which iterates the user's own children -- never reached it.
+		// The user compiled with authProto set and privProto EMPTY: the
+		// operator configured authPriv, the commit succeeded, and the agent
+		// served authNoPriv.
+		//
+		// IT EVADED BOTH #9155 COMMIT GATES, and the reason is structural: they
+		// read the COMPILED config and key on a protocol being NAMED, so
+		// `PrivProtocol != "" && PrivPassword == ""` cannot fire on a protocol
+		// the compiler discarded before the gate ran. A gate downstream of a
+		// dropping compiler is blind to exactly what it drops -- which is why
+		// this fix belongs here and not in a third gate.
+		//
+		// The schema already declares every cut point (`user` names all five
+		// protocol children, each with its `*-password`), so the shared #8939
+		// splitter needs no shim for this container -- only to be called.
+		// hoistAndSplitRun8939 rather than expandFlatRun: `authentication-sha256`
+		// legitimately OWNS A BODY (its declared `authentication-password`
+		// child), and expandFlatRun leaves body-owning leaves alone by design.
+		// The privacy stanza is nested UNDER that body, which is exactly the
+		// case hoistAndSplitRun8939 exists to lift.
+		userChildren = hoistAndSplitRun8939(userChildren,
+			schemaForPath("snmp", "v3", "usm", "local-engine", "user"))
 		for _, prop := range userChildren {
 			// #6822: the compact spelling
 			//   authentication-sha256 authentication-password "s3cret";
