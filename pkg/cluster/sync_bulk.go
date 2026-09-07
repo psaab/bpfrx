@@ -290,10 +290,24 @@ func (s *SessionSync) bulkSyncWindow(walk *bulkWalk) error {
 	s.pendingBulkAckEpoch.Store(epoch)
 	s.pendingBulkAckSince.Store(time.Now().UnixNano())
 
-	// Send bulk end marker with matching epoch.
+	// Send bulk end marker with matching epoch, plus this node's boot
+	// incarnation (#9174 V013). The payload grows 8 -> 24 bytes as a
+	// length-gated trailing extension, exactly as BulkStart's did in #5084 and
+	// the delete frames' generations did in #2170: an old receiver reads
+	// payload[:8] and ignores the tail, so a mixed-version pair keeps working
+	// for the whole rolling upgrade. ADDING a field, never redefining one.
+	//
+	// Why BulkEnd needs it at all: the epoch counter restarts at zero when the
+	// peer reboots, so an end marker buffered on a dead boot's socket can carry
+	// the SAME epoch as the bulk its own replacement has just started. Matched
+	// on epoch alone that frame completes the live transfer, and the standby
+	// reconciles against a partly-received table and releases the VRRP sync
+	// hold. A node that cannot read its own boot id appends nothing and gets
+	// today's epoch-only matching (appendBootIncarnation's fail-open arm).
+	endPayload := appendBootIncarnation(epochBuf[:], localBootIncarnation())
 	slog.Info("cluster sync: bulk sync writing end marker", "epoch", epoch, "source", walk.source, "sessions", count, "skipped", walk.skipped)
 	s.writeMu.Lock()
-	err = writeMsg(conn, syncMsgBulkEnd, epochBuf[:])
+	err = writeMsg(conn, syncMsgBulkEnd, endPayload)
 	s.writeMu.Unlock()
 	if err != nil {
 		s.pendingBulkAckEpoch.Store(0)
@@ -531,4 +545,57 @@ func (s *SessionSync) WaitForPeerBarriersDrained(timeout time.Duration) error {
 			)
 		}
 	}
+}
+
+// bulkStartStaleLocked reports whether an inbound BulkStart must be REFUSED as
+// stale. Caller holds s.bulkMu.
+//
+// #8966 established the within-a-bulk half: BulkEnd refuses an epoch that does
+// not match the in-progress one, BulkStart compared nothing, so a delayed or
+// reordered start carrying a lower epoch discarded the newer bulk's accumulated
+// receive set and the newer BulkEnd was then rejected as mismatched.
+//
+// #9174 V015 is the half that guard could not reach. `reconcileStaleSessions`
+// clears `bulkInProgress` at BulkEnd and leaves `bulkRecvEpoch` standing, so
+// BETWEEN two bulks the `s.bulkInProgress` conjunct made the whole condition
+// false and any epoch was accepted — reopening a receive window for a transfer
+// that had already finished, resetting the accumulators, and driving a reconcile
+// against a set that was never received. Two consecutive bulks CAN pin different
+// fabrics (`BulkSync` pins `getActiveConn` once), which is the ordinary route to
+// a reordered pair.
+//
+// THE BETWEEN-BULKS ARM REQUIRES AN INCARNATION ON THE FRAME, and that is the
+// load-bearing part of this predicate rather than a hedge. Within a bulk,
+// refusing a not-newer start costs at most one re-prime, because a bulk is
+// already in flight. Between bulks there is nothing in flight, so a wrong
+// refusal is terminal for that transfer — and a peer that REBOOTED legitimately
+// restarts its epoch counter lower (#2198 F2). `switched` separates the two, but
+// only when the peer sends an incarnation at all. With no incarnation on the
+// wire, "the peer rebooted and restarted its counter" and "this start is stale"
+// are the same bytes, so the answer is today's accept: the #5084 fail-open, for
+// the same reason (failing closed strands the standby of a peer on an older
+// build for the whole rolling-upgrade window).
+//
+// `bulkRecvEpoch != 0` keeps a peer that never sent an epoch at all out of the
+// arm: its high-water stays 0, so its epoch-0 starts are never compared against
+// a value they cannot exceed.
+func (s *SessionSync) bulkStartStaleLocked(epoch uint64, inc bootIncarnation, switched bool) bool {
+	if switched {
+		// #2198 F2: across a boot-incarnation change a LOWER epoch is
+		// legitimate — the peer rebooted and its counter restarted — and
+		// accept-and-reset is the correct treatment.
+		return false
+	}
+	if epoch > s.bulkRecvEpoch {
+		// Strictly newer is always admissible.
+		return false
+	}
+	if s.bulkInProgress {
+		// #8966: within one bulk, a start that is not strictly newer is a
+		// retransmit or a cross-fabric reorder. `<=` rather than `<` because a
+		// duplicate at the SAME epoch resets the accumulators for a bulk
+		// already in progress and then fails its own BulkEnd.
+		return true
+	}
+	return s.bulkRecvEpoch != 0 && inc.known()
 }

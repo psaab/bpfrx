@@ -570,6 +570,12 @@ func (m *Manager) FormatInformation() string {
 		if syncStats.ConfigsDeadIncarnationDropped > 0 {
 			fmt.Fprintf(&b, "  Configs dead-incarnation-dropped: %d\n", syncStats.ConfigsDeadIncarnationDropped)
 		}
+		// #9174 V013: same posture as the two lines above — a refusal the
+		// operator can see. A nonzero value means a BulkEnd from a retired peer
+		// boot was stopped from completing a live transfer.
+		if syncStats.BulkEndsDeadIncarnationDropped > 0 {
+			fmt.Fprintf(&b, "  Bulk ends dead-incarnation-dropped: %d\n", syncStats.BulkEndsDeadIncarnationDropped)
+		}
 	} else {
 		fmt.Fprintln(&b, "  Not configured")
 	}

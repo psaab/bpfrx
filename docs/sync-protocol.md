@@ -39,7 +39,7 @@ All multi-byte integers in the wire format are **little-endian**, matching the n
 | 3    | DeleteV4         | Primary→Secondary | 16 or 24 bytes      | Delete IPv4 session |
 | 4    | DeleteV6         | Primary→Secondary | 40 or 48 bytes      | Delete IPv6 session |
 | 5    | BulkStart        | Primary→Secondary | 8 or 24 bytes       | Marks start of bulk transfer: 8B epoch, plus the sender's 16B boot incarnation (#5084) when it has one |
-| 6    | BulkEnd          | Primary→Secondary | 0                   | Marks end of bulk transfer |
+| 6    | BulkEnd          | Primary→Secondary | 8 or 24 bytes       | Marks end of bulk transfer: 8B epoch, plus the sender's 16B boot incarnation (#9174) when it has one |
 | 7    | Heartbeat        | Bidirectional     | 0                   | Keepalive (sent on 30s idle) |
 | 8    | Config           | Primary→Secondary | Variable (UTF-8) + 16B gen framing | Full config text + monotonic config generation (#3931) |
 | 9    | IPsecSA          | Primary→Secondary | Variable (UTF-8) + 1B delim + 24B seq framing | Newline-separated connection names + `\n` delimiter + full-set (incarnation, seq) ordering trailer (#5706) |
@@ -1002,6 +1002,31 @@ A node whose own `boot_id` is unreadable appends **nothing** rather than 16 zero
 bytes, so it presents as an un-incarnated (old-build) sender rather than as a
 distinct boot that changes on every read.
 
+### The incarnation rides on `BulkEnd` too (#9174 V013)
+
+`BulkStart` carried the incarnation from #5084; `BulkEnd` did not, so the end
+marker was matched on **epoch alone**. The epoch is `bulkSendNext.Add(1)` on the
+sender, and that counter **restarts at zero when the peer reboots** — so an end
+marker buffered on a dead boot's still-ESTABLISHED socket can carry the same
+epoch as the bulk the peer's *replacement* has just started. Completing it there
+reconciles the standby against a partly-received table, latches
+`bulkEverCompleted` and releases the VRRP sync hold: MASTER-eligible while
+forwarding with sessions it never received, invisible until the failover that
+drops them.
+
+The receiver records the incarnation that started the accepted bulk
+(`bulkRecvIncarnation`, beside `bulkRecvEpoch` under `bulkMu`) and refuses a
+`BulkEnd` whose incarnation is known, differs from it, and the started-with
+value is known. The frame is ignored; the live bulk stays **open**, so its own
+end marker can still complete it.
+
+Same field, same length gate, same fail-open table as `BulkStart` above — an
+8-byte `BulkEnd` from an older peer is exactly today's epoch-only matching, and a
+bulk primed without an incarnation has nothing to compare against and completes.
+Refusals are counted in `BulkEndsDeadIncarnationDropped` and rendered by `show
+chassis cluster` as `Bulk ends dead-incarnation-dropped`, because a refusal that
+silently changes whether the sync hold is released must not itself be silent.
+
 **Contingency, recorded deliberately:** if a future requirement demands that an
 un-incarnated peer be REFUSED, that forces either a flag day or making the keyed
 handshake mandatory — an upgraded receiver cannot distinguish "old peer that
@@ -1141,6 +1166,40 @@ connectLoop() establishes TCP connection
     → record pendingBulkAckEpoch=epoch   // record-then-send (#3912): BEFORE BulkEnd
     → writeMsg(BulkEnd, epoch)           // solicit peer BulkAck(epoch)
 ```
+
+#### A `BulkStart` must be strictly newer, BETWEEN bulks as well as within one (#8966, #9174 V015)
+
+`bulkStartStaleLocked` owns the whole decision. #8966 gave `BulkStart` the
+epoch check `BulkEnd` already had: within a bulk, a start that is not strictly
+newer is a retransmit or a cross-fabric reorder, and accepting it discards the
+in-flight receive set and then fails that bulk's own `BulkEnd`.
+
+`reconcileStaleSessions` clears `bulkInProgress` at `BulkEnd` and leaves
+`bulkRecvEpoch` standing, so the `bulkInProgress` conjunct made the guard
+**unreachable between bulks** — a stale full pair reordered off the other fabric
+was accepted there, reopening a window for a transfer that had already finished
+and driving a reconcile against a set that was never received (mass delete, then
+resurrection on the next sync). Two consecutive bulks can pin different fabrics,
+because `BulkSync` pins `getActiveConn` once, which is the ordinary route to a
+reordered pair.
+
+The between-bulks arm requires an incarnation on the frame, and that is
+load-bearing rather than a hedge. Within a bulk a wrong refusal costs one
+re-prime, because a transfer is already in flight. Between bulks nothing is in
+flight, so a wrong refusal is terminal for that transfer — and a peer that
+rebooted legitimately restarts its epoch counter lower (#2198 F2). `switched`
+separates those two cases, but only when the peer sends an incarnation at all;
+without one, "the peer rebooted" and "this start is stale" are the same bytes,
+and the answer is today's accept.
+
+| in progress? | incarnation on the frame | epoch vs high-water | verdict |
+|---|---|---|---|
+| yes | any | `>` | accept |
+| yes | any | `<=` | **refuse** (#8966) |
+| no | present, switched | any | accept (#2198 F2 re-prime) |
+| no | present, same boot | `>` | accept (the next bulk) |
+| no | present, same boot | `<=`, high-water non-zero | **refuse** (#9174 V015) |
+| no | absent | any | accept (fail open) |
 
 The pending-ack epoch is recorded **before** the `BulkEnd` write, not after.
 `BulkEnd` solicits the peer's `BulkAck`, which is processed on the read
