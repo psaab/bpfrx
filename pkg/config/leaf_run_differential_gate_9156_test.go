@@ -163,7 +163,9 @@ func TestLeafRunDifferentialGate9156(t *testing.T) {
 		skipNoVal []string
 		skipRunNC []string // the one-line form did not compile
 		skipSepNC []string // the separate-lines ORACLE did not compile
+		skipFlat  []string // the FLAT-SET arm could not be built or compiled
 	)
+	flatCompared := 0
 	for _, s := range sites {
 		hv, ok := leafValue9156(s.headNode)
 		if !ok {
@@ -195,11 +197,42 @@ func TestLeafRunDifferentialGate9156(t *testing.T) {
 			skipRunNC = append(skipRunNC, s.key())
 			continue
 		}
-		if run == sep {
-			agreed = append(agreed, s.key())
-			continue
+
+		// THE SECOND AXIS. The braced and flat-set spellings of the SAME
+		// statement build DIFFERENT ASTs, and a gate that drives one says
+		// nothing about the other:
+		//
+		//	braced    tunnel { keepalive-retry 5 destination 10.0.0.2; }
+		//	          -> [keepalive-retry 5 destination 10.0.0.2]      PACKED KEYS
+		//	flat-set  set … tunnel keepalive-retry 5 destination 10.0.0.2
+		//	          -> [keepalive-retry 5] > [destination 10.0.0.2]  NESTED CHAIN
+		//
+		// The remedies differ accordingly — `packedStatements` splits the first
+		// and cannot see the second — so a container can be correct on one axis
+		// and lose on the other. #9156's own defect is on the FLAT-SET axis, and
+		// the braced-only version of this gate stayed GREEN when that fix was
+		// reverted: it was blind to its own subject.
+		flatSep, flatSepErr := gateCompileFlatSet9156(s.container, ctx, headStmt, tailStmt, false)
+		flatRun, flatRunErr := gateCompileFlatSet9156(s.container, ctx, headStmt, tailStmt, true)
+		flatDriven := flatSepErr == nil && flatRunErr == nil
+		if !flatDriven {
+			skipFlat = append(skipFlat, s.key())
+		} else {
+			flatCompared++
 		}
-		differed = append(differed, s.key())
+
+		bracedDiffers := run != sep
+		flatDiffers := flatDriven && flatRun != flatSep
+		switch {
+		case bracedDiffers && flatDiffers:
+			differed = append(differed, s.key()+" {braced+flat}")
+		case bracedDiffers:
+			differed = append(differed, s.key()+" {braced}")
+		case flatDiffers:
+			differed = append(differed, s.key()+" {flat}")
+		default:
+			agreed = append(agreed, s.key())
+		}
 	}
 
 	total := len(sites)
@@ -218,6 +251,23 @@ func TestLeafRunDifferentialGate9156(t *testing.T) {
 		t.Fatalf("VOID: nothing was compared, so the verdict below is about the " +
 			"fixture and not about the schema")
 	}
+	// THE FLAT-SET ARM MUST HAVE RUN. `gateCompileFlatSet9156` shipped once with
+	// ZERO call sites — a restore from a mutation backup silently reverted the
+	// wiring, the helper stayed in the file, Go does not flag an unused
+	// function, and the gate went back to braced-only while its comment and its
+	// PR both said otherwise. A helper that exists is not a helper that is
+	// CALLED, and this is the assertion that tells the difference.
+	if flatCompared == 0 {
+		t.Fatalf("VOID: the FLAT-SET axis was never driven. Every verdict above is the "+
+			"braced axis alone, which is blind to the nested-chain shape this gate "+
+			"exists for (%d containers compared on the braced axis)", compared)
+	}
+	if flatCompared*2 < compared {
+		t.Errorf("the flat-set axis was driven on only %d of %d compared containers; "+
+			"below half, the axis is more absent than present and the totals read as "+
+			"coverage it does not have", flatCompared, compared)
+	}
+	t.Logf("  flat-set axis driven on %d of %d compared containers", flatCompared, compared)
 
 	// The skip buckets are DRAINED, not counted. A row leaves this population
 	// precisely where a validator rejects the synthesized placeholder, so the
@@ -238,6 +288,7 @@ func TestLeafRunDifferentialGate9156(t *testing.T) {
 	report("no synthesizable value", skipNoVal)
 	report("one-line form did not compile", skipRunNC)
 	report("ORACLE did not compile", skipSepNC)
+	report("flat-set arm not compilable (braced arm still compared)", skipFlat)
 
 	// RATCHET. The register below is a DEBT REGISTER, not an acceptance: the
 	// gate fails on any container that starts differing AND on any recorded one
@@ -416,10 +467,12 @@ func TestTunnelSchemaResolvesBothPositions9156(t *testing.T) {
 // THREE WERE HAND-MEASURED before this file was written, because a gate row is
 // a candidate until someone looks:
 //
-//   - `system login user <u> [uid -> class]` — AUTHORIZATION. The user is
-//     created with class="". Since #5278 the gRPC server evaluates the caller's
-//     `system login class` on every RPC, so a class-less user is a principal
-//     whose authorization input is empty.
+//   - `system login user <u> [uid -> class]` — FIXED (#9391). It was the
+//     AUTHORIZATION one, and the severity was in the DOWNGRADE direction rather
+//     than the empty-class one: a demotion written on one line was dropped, the
+//     user kept `super-user`, and reconcileSudoers keeps the passwordless-root
+//     grant for exactly that class. Its row is gone from this register and the
+//     ratchet is what required removing it.
 //   - `security zones security-zone <z> [description -> screen]` — SECURITY.
 //     The zone's IDS/DoS screen profile is dropped, while `show configuration`
 //     renders the operator's own line back.
@@ -435,32 +488,32 @@ func TestTunnelSchemaResolvesBothPositions9156(t *testing.T) {
 // starts agreeing while still listed — so the register cannot outlive the
 // defect it describes.
 var leafRunKnownDiffer9156 = map[string]bool{
-	"bridge-domains xpfname [domain-type -> routing-interface]":                                                       true,
-	"class-of-service interfaces xpfarg [output-traffic-control-profile -> priority-low-min-share]":                   true,
-	"forwarding-options sampling instance xpfarg family inet output flow-server xpfarg [source-address -> port]":      true,
-	"forwarding-options sampling instance xpfarg family inet6 output flow-server xpfarg [source-address -> port]":     true,
-	"interfaces xpfname [bandwidth -> description]":                                                                   true,
-	"interfaces xpfname aggregated-ether-options [link-speed -> minimum-links]":                                       true,
-	"interfaces xpfname gigether-options [802.3ad -> redundant-parent]":                                               true,
-	"interfaces xpfname tunnel wireguard [private-key -> listen-port]":                                                true,
-	"interfaces xpfname tunnel wireguard peer xpfarg [endpoint -> persistent-keepalive]":                              true,
-	"protocols bgp group xpfarg neighbor xpfarg [authentication-key -> description]":                                  true,
-	"protocols ospf [reference-bandwidth -> router-id]":                                                               true,
-	"protocols ospf3 area xpfarg interface xpfarg [cost -> dead-interval]":                                            true,
-	"routing-instances xpfname [description -> instance-type]":                                                        true,
-	"routing-instances xpfname protocols bgp group xpfarg neighbor xpfarg [authentication-key -> description]":        true,
-	"routing-instances xpfname protocols ospf [reference-bandwidth -> router-id]":                                     true,
-	"routing-instances xpfname protocols ospf3 area xpfarg interface xpfarg [cost -> dead-interval]":                  true,
-	"security dynamic-address feed-server xpfarg [hostname -> hold-interval]":                                         true,
-	"security flow traceoptions packet-filter xpfarg [destination-prefix -> protocol]":                                true,
-	"security nat nat64 rule-set xpfarg [prefix -> source-pool]":                                                      true,
-	"security screen ids-option xpfarg limit-session [destination-ip-based -> source-ip-based]":                       true,
-	"security screen ids-option xpfarg tcp syn-flood [alarm-threshold -> attack-threshold]":                           true,
-	"security zones security-zone xpfarg [description -> screen]":                                                     true,
-	"system login user xpfarg [uid -> class]":                                                                         true,
-	"system ntp server xpfarg [routing-instance -> key]":                                                              true,
-	"system services dhcp-local-server group xpfarg pool xpfarg static-binding xpfarg [host-name -> fixed-address]":   true,
-	"system services dhcpv6-local-server group xpfarg pool xpfarg static-binding xpfarg [host-name -> fixed-address]": true,
+	"bridge-domains xpfname [domain-type -> routing-interface] {braced+flat}":                                                       true,
+	"class-of-service interfaces xpfarg [output-traffic-control-profile -> priority-low-min-share] {braced+flat}":                   true,
+	"forwarding-options sampling instance xpfarg family inet output flow-server xpfarg [source-address -> port] {braced+flat}":      true,
+	"forwarding-options sampling instance xpfarg family inet6 output flow-server xpfarg [source-address -> port] {braced+flat}":     true,
+	"interfaces xpfname [bandwidth -> description] {braced+flat}":                                                                   true,
+	"interfaces xpfname aggregated-ether-options [link-speed -> minimum-links] {braced+flat}":                                       true,
+	"interfaces xpfname gigether-options [802.3ad -> redundant-parent] {braced+flat}":                                               true,
+	"interfaces xpfname tunnel wireguard [private-key -> listen-port] {braced+flat}":                                                true,
+	"interfaces xpfname tunnel wireguard peer xpfarg [endpoint -> persistent-keepalive] {braced+flat}":                              true,
+	"protocols bgp group xpfarg neighbor xpfarg [authentication-key -> description] {braced+flat}":                                  true,
+	"protocols ospf [reference-bandwidth -> router-id] {braced+flat}":                                                               true,
+	"protocols ospf3 area xpfarg interface xpfarg [cost -> dead-interval] {braced+flat}":                                            true,
+	"routing-instances xpfname [description -> instance-type] {braced+flat}":                                                        true,
+	"routing-instances xpfname protocols bgp group xpfarg neighbor xpfarg [authentication-key -> description] {braced+flat}":        true,
+	"routing-instances xpfname protocols ospf [reference-bandwidth -> router-id] {braced+flat}":                                     true,
+	"routing-instances xpfname protocols ospf3 area xpfarg interface xpfarg [cost -> dead-interval] {braced+flat}":                  true,
+	"security dynamic-address feed-server xpfarg [hostname -> hold-interval] {braced+flat}":                                         true,
+	"security flow traceoptions packet-filter xpfarg [destination-prefix -> protocol] {braced+flat}":                                true,
+	"security log stream xpfarg [port -> category] {flat}":                                                                          true,
+	"security nat nat64 rule-set xpfarg [prefix -> source-pool] {braced+flat}":                                                      true,
+	"security screen ids-option xpfarg limit-session [destination-ip-based -> source-ip-based] {braced+flat}":                       true,
+	"security screen ids-option xpfarg tcp syn-flood [alarm-threshold -> attack-threshold] {braced+flat}":                           true,
+	"security zones security-zone xpfarg [description -> screen] {braced+flat}":                                                     true,
+	"system ntp server xpfarg [routing-instance -> key] {braced}":                                                                   true,
+	"system services dhcp-local-server group xpfarg pool xpfarg static-binding xpfarg [host-name -> fixed-address] {braced+flat}":   true,
+	"system services dhcpv6-local-server group xpfarg pool xpfarg static-binding xpfarg [host-name -> fixed-address] {braced+flat}": true,
 }
 
 // TestLeafRunRegisterIsNotVacuous9156 pins that the register is a REGISTER and
