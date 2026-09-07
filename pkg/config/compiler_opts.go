@@ -2602,6 +2602,19 @@ type compileOpts struct {
 	// compiler's own check ever ran. Same doctrine as lenientSNMPTrapGroup.
 	lenientBridgeDomainVlanID bool
 
+	// lenientInterfaceAddressList (#9424) downgrades the bracketed
+	// interface-address-list gate — a token inside `address [ ... ]` that is
+	// neither a valid address for its family nor a declared `address`
+	// sub-statement — from a hard compile error to a cfg.Warnings entry. Set
+	// ONLY on the tolerant load / peer-sync paths so an already-persisted or
+	// peer-synced config still boots (#1960 no-brick); the compiled unit
+	// carries the addresses that DID parse, which is strictly more than the
+	// pre-#9424 behaviour of keeping only the first. Candidate commit /
+	// commit-check stay strict, because the typed-leaf gate validates only the
+	// first key slot of an `address` leaf and would otherwise let the garbage
+	// through unremarked — the same silence the issue is about.
+	lenientInterfaceAddressList bool
+
 	// nodeAware / stampNodeID (#4329) carry the runtime cluster node
 	// identity (from /etc/xpf/node-id, or `-node-id` on `xpfd
 	// check-config`) into compileExpanded so it can be stamped onto the
@@ -2793,5 +2806,6 @@ func lenientCompileOpts() compileOpts {
 		lenientLoginClassDeny:                  true,
 		lenientInterfaceRangeBudget:            true,
 		lenientFabricMemberDefined:             true,
+		lenientInterfaceAddressList:            true,
 	}
 }
