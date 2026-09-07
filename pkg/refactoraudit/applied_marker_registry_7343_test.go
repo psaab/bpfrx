@@ -172,9 +172,15 @@ var markerFiles7343 = map[string]markerFile{
 	"pkg/configstore/store.go": {
 		Driver: "ActiveApplied", DriverPkg: "pkg/configstore",
 		Why: "caller contract: MarkAppliedDigest is called only on full success and an empty " +
-			"digest is a no-op that deliberately does not clear a prior one",
+			"digest is a no-op that deliberately does not clear a prior one. #9175 adds the " +
+			"SECOND zero-reset: InvalidateAppliedDigest, called from applyConfigLocked's " +
+			"error path. A zero-reset is the safe direction — it forces a re-converge and " +
+			"can never claim a convergence that did not happen — and it is what makes the " +
+			"caller contract above sufficient: before it, a FAILED apply left the previous " +
+			"success standing, so a re-promotion of a text applied earlier in the process " +
+			"read as converged for a dataplane that never took it",
 		Stmts: []markerStmt{
-			{`s.appliedDigest = ""`, 1},
+			{`s.appliedDigest = ""`, 2},
 			{`s.appliedDigest = configTextDigest(s.active.Format())`, 1},
 			{`s.appliedDigest = digest`, 1},
 		},

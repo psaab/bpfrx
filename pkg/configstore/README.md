@@ -180,9 +180,35 @@ inline archive-site passwords).
   promoter (a local commit / commit-confirmed rollback) mutating `s.active` in
   what used to be a post-semaphore-release window can no longer make the marker
   key a different, never-applied tree. `ActiveDigest` returns exactly the value
-  `ActiveApplied` compares against (`configTextDigest(s.active.Format())`). The
-  marker is keyed on config text, so a stale value can only cause an idempotent
-  re-apply, never a false convergence.
+  `ActiveApplied` compares against (`configTextDigest(s.active.Format())`).
+- **`InvalidateAppliedDigest` — a FAILED apply un-records the marker (#9175).**
+  "The marker is keyed on config text, so a stale value can only cause an
+  idempotent re-apply, never a false convergence" USED TO STAND HERE, and it was
+  false. It holds for a FORWARD sequence, where each promotion moves the active
+  text away from the stamped digest. It does not hold for RE-PROMOTION of a text
+  that already applied once in this process:
+
+  | step | active | `ActiveApplied()` | |
+  |---|---|---|---|
+  | A applied | A | `true` | |
+  | B promoted, apply FAILS | B | `false` | correct — the digest no longer matches |
+  | A re-promoted, apply FAILS | A | **`true`** | **falsely converged** |
+
+  The two stamps were the digest's only writers, so it recorded a success and
+  nothing ever unrecorded one, and step 1's digest matches the active text again
+  at step 3. `handleConfigSync` then takes its converged shortcut, returns nil,
+  and the HA config high-water advances past a generation the dataplane never
+  took — the #4957 fail-open re-entered through the remedy #4957 prescribed,
+  visible only at failover. `pkg/daemon`'s `applyConfigLocked` now calls
+  `InvalidateAppliedDigest` from a deferred close over its named return, so
+  EVERY failing apply in the daemon clears the marker: that function is the one
+  choke point the boot/background path, the commit path, the peer config-sync
+  path and the commit-confirmed auto-rollback all go through, and every early
+  return inside it is covered without a caller having to remember. The clear is
+  unconditional rather than keyed to the failing text — the failing path does not
+  always hold a digest (a context abort bails before any capture), and the wrong
+  answer in that direction is the falsely-converged state, while the wrong answer
+  in the other costs one idempotent re-apply.
 - **`LoadOverride` accepts flat set input as well as hierarchical (#7527).**
   It used to call the hierarchical parser unconditionally and then atomically
   replace the candidate with the result. The parser treats newlines as

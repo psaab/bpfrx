@@ -977,3 +977,33 @@ func (s *Store) MarkAppliedDigest(digest string) {
 	defer s.mu.Unlock()
 	s.appliedDigest = digest
 }
+
+// InvalidateAppliedDigest clears the applied marker because an apply FAILED
+// (#9175). It is the missing counterpart to the two stamps above: they were the
+// only writers, so the digest recorded a success and nothing ever unrecorded it.
+//
+// Why "keyed on the config text" was not enough. A promotion moves the active
+// text away from a stale digest, so in a FORWARD sequence the marker can only be
+// over-conservative — which is what the field comment claimed and what #4957
+// relied on. Re-promotion breaks that: if A applied, B was promoted and failed,
+// and A is promoted again and ALSO fails, the digest from A's original success
+// still matches the active text and `ActiveApplied()` reports converged for a
+// dataplane that never took the config.
+//
+// The invalidation is deliberately UNCONDITIONAL rather than conditioned on the
+// failing config being the stamped one. Deciding "which text failed" needs a
+// digest the failing path does not always hold (a context abort bails before any
+// capture), and being wrong in THAT direction is exactly the falsely-converged
+// state this exists to prevent. Being wrong in the other direction costs one
+// idempotent re-apply — the same cost the #4957 shortcut avoids, and the correct
+// side to be wrong on.
+//
+// Called from `applyConfigLocked`'s error path, the single choke point every
+// apply in the daemon goes through. Putting it there rather than at each
+// caller's failure branch is what keeps a future apply site from silently
+// inheriting the defect.
+func (s *Store) InvalidateAppliedDigest() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.appliedDigest = ""
+}
