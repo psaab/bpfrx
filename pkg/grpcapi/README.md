@@ -762,6 +762,54 @@ contract.
 - Server-streaming RPCs (Ping, Traceroute, MonitorPacketDrop,
   MonitorInterface) must drain on client disconnect; cancel the context
   to free buffered output.
+- **MonitorInterface re-reads the config every tick for DISPLAY NAMES (#9144).**
+  `MonitorInterface` took `cfg := s.store.ActiveConfig()` once at stream open and
+  its 1s loop used that snapshot for the life of the stream. The interface SET and
+  the COUNTERS were never stale — `monitoriface.TrafficSummaryInterfaces` calls
+  `ListTrafficInterfaces()` first, a fresh netlink walk every tick, and reads
+  counters by live kernel name. What was stale is the config-derived DISPLAY NAME:
+  `applyConfiguredSummaryChoices` maps configured names onto live kernel devices,
+  so a commit that re-points an alias (a device-map edit, a RETH member change)
+  left live counters rendered under a name that now belongs to something else — a
+  wrong label on real data, which is worse than a missing row because nothing
+  about it looks wrong. Measured through the real store and a real commit:
+  kernel `lo` stayed labelled `reth0` after the config had renamed the alias to
+  `reth9`. The per-tick derivation now lives in `monitorSummaryInterfaces`, which
+  re-reads the active config on every call and degrades to the opening frame only
+  when the re-read returns nil — a monitor stream that dies on a config blip is a
+  worse failure than one stale label.
+
+  **This is NOT the #9051 shape and its remedy does not transplant.** #9051 fixed
+  a long-lived stream holding open-time state by re-checking at the INTERCEPTOR
+  rather than in each handler's loop, because loops cover the streams that exist
+  and silently omit the next one. That works there because the property is
+  UNIFORM — "is this principal still authorized for this method?" comes from the
+  peer identity and the method name, both of which the interceptor holds — and the
+  enforcement action is uniform: cancel the stream. A config snapshot is the
+  opposite on both counts: the derivation is handler-SPECIFIC (this handler alone
+  derives a kernel-name resolver, a RETH predicate, an RG lookup and a
+  display-name mapping from `cfg`, and an interceptor cannot re-derive closures
+  inside a handler body), and there is no uniform enforcement action — cancelling
+  an operator's `monitor interface` because someone committed is plainly wrong. The
+  "omits the next one" concern is answered by SCOPE instead: `MonitorInterface` is
+  the only stream that renders live data under a config-derived label pinned at
+  open. `MonitorPacketDrop` also reads the config at open, but only to validate the
+  request's zone/interface filters and resolve the requested alias set — pinning
+  the interpretation of what the operator asked for is correct there, and it
+  renders no config-derived label.
+
+  **Deliberately NOT refreshed**, so the fix does not half-land: `singleKernelName`
+  (single-interface mode) stays resolved at open, because the rate columns are
+  deltas against baselines held for a SPECIFIC kernel device and re-resolving
+  mid-stream would swap the device under those baselines and render garbage rates
+  — replacing a wrong label with wrong numbers; and `isRethName` / `rethRG`, which
+  feed the serve-local vs proxy-to-peer dispatch settled once before the loop.
+  Guards: `monitor_cfg_refresh_9144_test.go`, including a cell that drives the real
+  handler across a real mid-stream commit and asserts the RENDERED FRAMES change
+  (the direct-call cells all stay green if the loop stops calling the helper), and
+  a control asserting the fixture's alias actually reaches the display-name
+  mapping — without it the whole file would pass on a config the summary path never
+  consults.
 - **MonitorInterface peer proxy — one-hop bound (#5497).** For a RETH (or
   a peer-owned physical member) `MonitorInterface` may forward the stream
   to the cluster peer (`proxyMonitorInterface` → `dialPeer`). Two invariants
