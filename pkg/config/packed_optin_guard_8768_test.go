@@ -108,6 +108,12 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 				"nat-traversal":      "nat-traversal disable",
 				"local-identity":     "local-identity hostname foo",
 				"remote-identity":    "remote-identity hostname bar",
+				// #9056: a VALUELESS FLAG admitted to the elision scope. It
+				// carries no value, so it needs no `second` fixture (the
+				// same-leaf loop excludes args==0 by construction) -- but it
+				// does need a statement here, or its packed spelling is never
+				// compared against its braced one at all.
+				"no-nat-traversal": "no-nat-traversal",
 			},
 			second: map[string]string{
 				"address":            "address 192.0.2.9",
@@ -123,9 +129,9 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 			read: func(c *Config) string {
 				out := ""
 				for _, g := range c.Security.IPsec.Gateways {
-					out += fmt.Sprintf("addr=%q la=%q pol=%q ext=%q cert=%q ver=%q nat=%q local=%q/%q remote=%q/%q",
+					out += fmt.Sprintf("addr=%q la=%q pol=%q ext=%q cert=%q ver=%q nat=%q nonat=%v local=%q/%q remote=%q/%q",
 						g.Address, g.LocalAddress, g.IKEPolicy, g.ExternalIface,
-						g.LocalCertificate, g.Version, g.NATTraversal,
+						g.LocalCertificate, g.Version, g.NATTraversal, g.NoNATTraversal,
 						g.LocalIDType, g.LocalIDValue, g.RemoteIDType, g.RemoteIDValue)
 				}
 				if out == "" {
@@ -148,6 +154,12 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 				"nat-traversal":      "nat-traversal disable",
 				"local-identity":     "local-identity hostname foo",
 				"remote-identity":    "remote-identity hostname bar",
+				// #9056: a VALUELESS FLAG admitted to the elision scope. It
+				// carries no value, so it needs no `second` fixture (the
+				// same-leaf loop excludes args==0 by construction) -- but it
+				// does need a statement here, or its packed spelling is never
+				// compared against its braced one at all.
+				"no-nat-traversal": "no-nat-traversal",
 			},
 			second: map[string]string{
 				"address":            "address 192.0.2.9",
@@ -163,9 +175,9 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 			read: func(c *Config) string {
 				out := ""
 				for _, g := range c.Security.IPsec.Gateways {
-					out += fmt.Sprintf("addr=%q la=%q pol=%q ext=%q cert=%q ver=%q nat=%q local=%q/%q remote=%q/%q",
+					out += fmt.Sprintf("addr=%q la=%q pol=%q ext=%q cert=%q ver=%q nat=%q nonat=%v local=%q/%q remote=%q/%q",
 						g.Address, g.LocalAddress, g.IKEPolicy, g.ExternalIface,
-						g.LocalCertificate, g.Version, g.NATTraversal,
+						g.LocalCertificate, g.Version, g.NATTraversal, g.NoNATTraversal,
 						g.LocalIDType, g.LocalIDValue, g.RemoteIDType, g.RemoteIDValue)
 				}
 				if out == "" {
@@ -234,6 +246,8 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 			stmts: map[string]string{
 				"destination-ip":   "destination-ip 1.2.3.4",
 				"source-interface": "source-interface ge-0/0/0",
+				// #9056: valueless flag, see the gateway note above.
+				"optimized": "optimized",
 			},
 			second: map[string]string{
 				"destination-ip":   "destination-ip 5.6.7.8",
@@ -242,8 +256,9 @@ func packedOptInCases8768() map[string]packedOptInCase8768 {
 			read: func(c *Config) string {
 				out := ""
 				for _, v := range c.Security.IPsec.VPNs {
-					out += fmt.Sprintf("mon=%v src=%q dst=%q",
-						v.VPNMonitor, v.VPNMonitorSourceInterface, v.VPNMonitorDestinationIP)
+					out += fmt.Sprintf("mon=%v src=%q dst=%q opt=%v",
+						v.VPNMonitor, v.VPNMonitorSourceInterface, v.VPNMonitorDestinationIP,
+						v.VPNMonitorOptimized)
 				}
 				return out
 			},

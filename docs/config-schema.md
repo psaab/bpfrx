@@ -237,6 +237,68 @@ mechanism — `SetPath` nests the tokens into a chain before any pass runs, so
 there is no packed tail to split and `normalizeCompactStanzas` correctly folds
 nothing. That is a grammar-side question, tracked separately as issue 8939.
 
+### A VALUELESS BOOLEAN FLAG was outside the census population (#9056)
+
+The #2419 census (`collectCompactSites`, `compact_block_equivalence_2419_test.go`)
+admits a site only when the folded token declares an `args` value or a wildcard:
+
+```
+(wildcard == nil && args == 1) || (args == 0 && wildcard != nil) || (args >= 1 && wildcard != nil)
+```
+
+A **valueless boolean flag** — `allow-dns-reply;`, `tcp-rst;`, `no-syn-check;` —
+is `args:0, wildcard:nil, children:nil` and satisfies **none** of the three. It
+was therefore never enumerated, appeared in **no skip bucket**, and its absence
+was indistinguishable from a clean verdict. That is the WRONG-POPULATION failure
+mode: a control at the census's own layer interrogates what the filter passed and
+cannot interrogate what the filter removed.
+
+The cause was not a scope decision. The site model was built around `synthPair`,
+which needs two distinct VALUES, so the one shape that has no value at all fell
+out of the population rather than out of a bucket. **The discriminator for a flag
+is PRESENCE**: `stanza { flag; }` against `stanza { }`. `compactSite.flag` carries
+it and `runCompactBlockCensus` uses it, which makes the existing vacuity guard read
+as "the presence of this flag is not observable in the typed config" — the same
+property it already asserts for a valued leaf.
+
+Measured when the arm was added: **511 flag sites, 93 divergent**, none of them in
+the inventory beforehand.
+
+Two consequences worth keeping:
+
+- **`synthPair` now REFUSES the shape** (`return "", "", false`). Before, an
+  undeclared `valueType` is `ValueAny` — the zero value — so a flag fell through
+  to the `ValueIdentifier, ValueAny` arm and got back `"xpfaaa"/"xpfbbb"`. The
+  fixture built from that is `allow-dns-reply xpfaaa;`, which is not a spelling of
+  anything: `FindChild` sees the leaf either way, both probes compile alike, the
+  vacuity guard fires, and the site is recorded "leaf value not observable" — a
+  verdict about the SYNTHESISER, not the leaf. Refusing it means the fourteen other
+  consumers of `collectCompactSites()` skip flags on `!ok` exactly as they did when
+  the shape was outside the population, so widening the shared walker did not
+  re-baseline their populations. The censuses that CAN rule on a flag branch on
+  `compactSite.flag` instead: `runCompactBlockCensus`, the #7653 depth census, and
+  both #8690 scope-safety guards.
+- **A flag pair IS reachable to `compactNormalizeInScope`.** The claim that a
+  valueless flag cannot satisfy the scope table's admission precondition is FALSE,
+  measured by running the pass with a recording predicate:
+  `security { flow allow-dns-reply; }` asks `("flow", "allow-dns-reply")` and a
+  scope entry for it converges the site. The blindness was the CENSUS's, not the
+  scope table's, and the two are different mechanisms.
+
+The nineteen `security`-subtree flag sites are normalized (see the `#9056` block at
+the end of `compactNormalizeInScope`); the other 74 are recorded with per-class
+reasons in `testdata/compact_block_permanent_exclusions_8690.txt`.
+
+**The family's negative control is `security policies … then permit` / `then
+reject`.** They are valueless flags of exactly the admitted shape and they diverge,
+and they are deliberately NOT admitted: on a complete policy fixture the braced
+spelling is ACCEPTED at the strict commit gate and the elided spelling is REJECTED
+by the #3043 terminal-action gate. Admitting the pair would convert a loud
+rejection into a silent acceptance — the #8868 shape. They are classed
+`gate-open-question`, because #3043 refuses the CONSEQUENCE of the drop rather than
+the packed SPELLING, and `TestPolicyTerminalActionElisionStaysRejected9056` pins
+the rejection so the exclusion cannot be reversed by adding a line to a table.
+
 ### Normalising ONE depth is not normalising the stanza (9421)
 
 `packedBody(node, schema)` normalises the tail of the node it is handed and

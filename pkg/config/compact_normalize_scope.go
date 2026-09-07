@@ -1625,7 +1625,70 @@ func compactNormalizeInScope(containerKeyword, head string) bool {
 		"vpn-monitor source-interface",
 		"wednesday start-time",
 		"wednesday stop-time",
-		"zones security-zone":
+		"zones security-zone",
+		// #9056: the SECURITY-SUBTREE VALUELESS-FLAG family.
+		//
+		// Every pair below names a leaf that carries NO VALUE at all -- args:0,
+		// no wildcard, no children. That shape satisfied none of the #2419
+		// census's three site arms (each requires an `args` token or a
+		// wildcard), so these sites were never enumerated, appeared in no skip
+		// bucket, and their absence was indistinguishable from a clean verdict.
+		// The census now enumerates them with a PRESENCE discriminator
+		// (compactSite.flag); measured at that widening, 93 valueless-flag sites
+		// diverge, of which the 19 below are the `security` subtree's.
+		//
+		// EVERY ENTRY WAS MEASURED, to the same rule every family above obeys:
+		// the elided spelling compiles identically to the EMPTY stanza (a
+		// positive measurement that no reader consumes the packed tail today,
+		// so moving it cannot break one) AND is SILENT -- strict accepts, and
+		// lenient emits no warning the admission would quiet. Per-pair evidence
+		// in docs/log/9056.md.
+		//
+		// WHAT THE DROP COSTS, since it is not uniform and "flag" reads as
+		// cosmetic. `tcp-session no-syn-check` / `strict-syn-check` decide
+		// whether a TCP session may be seeded by a non-SYN packet;
+		// `security-zone <z> tcp-rst` decides whether a denied TCP flow is
+		// RST-ed or blackholed; `nat source address-persistent` decides whether
+		// one internal host keeps one external address; `{ike,ipsec} gateway
+		// <g> no-nat-traversal` decides whether NAT-T is negotiated. Each was
+		// silently absent in the elided spelling on a commit reporting success,
+		// with `show configuration` rendering exactly what the operator typed.
+		//
+		// #8921 COLLISION CHECK, per pair: one schema site each, except
+		// (gateway, no-nat-traversal) which has TWO -- `security ike gateway`
+		// and `security ipsec gateway`. Both are the same leaf with the same
+		// meaning and both measure empty+silent, so the pair is adjudicated
+		// where it fires.
+		//
+		// DELIBERATELY EXCLUDED, and this is the family's negative control:
+		// (then, permit) and (then, reject) under `security policies`. They are
+		// valueless flags of exactly this shape and they diverge -- but the
+		// elided spelling is REJECTED at strict commit by the #3043
+		// terminal-action gate ("no terminal action; every policy must specify
+		// exactly one of `then permit` ..."), while the braced spelling is
+		// accepted. Admitting them would convert a LOUD rejection into a silent
+		// acceptance, which is the #8868 regression-shaped-like-a-fix. They stay
+		// in the inventory, classed `gate`, and
+		// TestSecurityFlagElisionFamily9056 pins the rejection so the exclusion
+		// cannot be quietly reversed.
+		"flow allow-dns-reply",
+		"flow allow-embedded-icmp",
+		"flow force-ip-reassembly",
+		"flow gre-performance-acceleration",
+		"flow power-mode-disable",
+		"flow preserve-incoming-fragment-size",
+		"flow sync-icmp-session",
+		"gateway no-nat-traversal",
+		"natv6v4 no-v6-frag-header",
+		"profile default-profile",
+		"security-zone tcp-rst",
+		"source address-persistent",
+		"tcp-session no-sequence-check",
+		"tcp-session no-syn-check",
+		"tcp-session no-syn-check-in-tunnel",
+		"tcp-session rst-invalidate-session",
+		"tcp-session strict-syn-check",
+		"vpn-monitor optimized":
 		return true
 	}
 	return false
