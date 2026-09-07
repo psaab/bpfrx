@@ -1,0 +1,1180 @@
+# #7484: every enumerated spelling-gate leaf and the bucket it lands in.
+#
+# SITE LIST, not counts (#9094 / #8921). The three numbers in
+# TestSchemaSpellingGateCoverageIsGated_7484 are the ratchet; this is the
+# diagnostic they never had. A count cannot see a SUBSTITUTION — a leaf
+# moving between two blind classes holds every total steady while the thing
+# each ceiling describes has changed completely.
+#
+# Regenerate: UPDATE_7484=1 go test ./pkg/config/ -run TestSpellingGateMembersAreRecorded7484
+# Never run it to make a failure go away — read the named arrivals first.
+#
+COMPARED	applications application <*> alg
+COMPARED	applications application <*> description
+COMPARED	applications application <*> destination-port
+COMPARED	applications application <*> icmp-code
+COMPARED	applications application <*> icmp-type
+COMPARED	applications application <*> inactivity-timeout
+COMPARED	applications application <*> protocol
+COMPARED	applications application <*> source-port
+COMPARED	applications application <*> term
+COMPARED	applications application <*> timeout
+COMPARED	applications application-set <*> application
+COMPARED	applications application-set <*> application-set
+err (parent stanza does not compile)	apply-groups
+COMPARED	bridge-domains <*> domain-type
+COMPARED	bridge-domains <*> routing-interface
+COMPARED	bridge-domains <*> vlan-id-list
+COMPARED	chassis cluster additional-authentication-key
+COMPARED	chassis cluster authentication-key
+COMPARED	chassis cluster cluster-id
+flag (read, but value-less)	chassis cluster configuration-synchronize
+COMPARED	chassis cluster control-interface
+flag (read, but value-less)	chassis cluster control-link-recovery
+unreachable (leaf changed nothing)	chassis cluster control-ports fpc <*> port
+flag (read, but value-less)	chassis cluster dhcp-lease-synchronization
+COMPARED	chassis cluster fabric-interface
+COMPARED	chassis cluster fabric-peer-address
+COMPARED	chassis cluster fabric1-interface
+COMPARED	chassis cluster fabric1-peer-address
+COMPARED	chassis cluster heartbeat-interval
+COMPARED	chassis cluster heartbeat-threshold
+flag (read, but value-less)	chassis cluster hitless-restart
+flag (read, but value-less)	chassis cluster ipsec-session-synchronization
+flag (read, but value-less)	chassis cluster nat-state-synchronization
+flag (read, but value-less)	chassis cluster no-private-rg-election
+flag (read, but value-less)	chassis cluster no-reth-vrrp
+COMPARED	chassis cluster node
+COMPARED	chassis cluster peer-address
+COMPARED	chassis cluster peer-fencing
+unreachable (leaf changed nothing)	chassis cluster private-rg-election
+COMPARED	chassis cluster redundancy-group <*> gratuitous-arp-count
+COMPARED	chassis cluster redundancy-group <*> interface-monitor
+COMPARED	chassis cluster redundancy-group <*> ip-monitoring family inet <*> weight
+COMPARED	chassis cluster redundancy-group <*> ip-monitoring global-threshold
+COMPARED	chassis cluster redundancy-group <*> ip-monitoring global-weight
+COMPARED	chassis cluster redundancy-group <*> node <*> priority
+flag (read, but value-less)	chassis cluster redundancy-group <*> strict-vip-ownership
+COMPARED	chassis cluster reth-advertise-interval
+COMPARED	chassis cluster reth-count
+flag (read, but value-less)	chassis cluster strict-session-auth
+COMPARED	chassis cluster takeover-hold-time
+COMPARED	chassis device-map interface <*> key
+COMPARED	chassis device-map interface <*> mac
+COMPARED	chassis device-map interface <*> pci
+COMPARED	chassis device-map unmapped-interface-policy
+COMPARED	class-of-service classifiers dscp <*> forwarding-class <*> loss-priority <*> code-points
+COMPARED	class-of-service classifiers ieee-802.1 <*> forwarding-class <*> loss-priority <*> code-points
+COMPARED	class-of-service classifiers inet-precedence <*> forwarding-class <*> loss-priority <*> code-points
+err (parent stanza does not compile)	class-of-service fairness rss-expectation interface <*> queue <*> active-workers
+err (parent stanza does not compile)	class-of-service fairness rss-expectation interface <*> queue <*> any
+err (parent stanza does not compile)	class-of-service fairness rss-expectation interface <*> queue <*> at-least-active-workers
+err (parent stanza does not compile)	class-of-service fairness rss-expectation interface <*> queue <*> balanced
+err (parent stanza does not compile)	class-of-service fairness rss-expectation interface <*> queue <*> cstruct
+err (parent stanza does not compile)	class-of-service fairness rss-expectation interface <*> queue <*> cstruct-max
+err (parent stanza does not compile)	class-of-service fairness rss-expectation interface <*> queue <*> max-worker-flow-share
+COMPARED	class-of-service interfaces <*> classifiers dscp
+COMPARED	class-of-service interfaces <*> classifiers ieee-802.1
+COMPARED	class-of-service interfaces <*> output-traffic-control-profile
+COMPARED	class-of-service interfaces <*> oversubscription-policy guarantee-rate
+flag (read, but value-less)	class-of-service interfaces <*> oversubscription-policy proportional
+COMPARED	class-of-service interfaces <*> priority-low-min-share
+COMPARED	class-of-service interfaces <*> rewrite-rules dscp
+COMPARED	class-of-service interfaces <*> rewrite-rules ieee-802.1
+COMPARED	class-of-service interfaces <*> scheduler-map
+COMPARED	class-of-service interfaces <*> shaping-rate <*> burst-size
+unreachable (leaf changed nothing)	class-of-service interfaces <*> unit <*> classifiers dscp
+unreachable (leaf changed nothing)	class-of-service interfaces <*> unit <*> classifiers ieee-802.1
+unreachable (leaf changed nothing)	class-of-service interfaces <*> unit <*> classifiers inet-precedence
+unreachable (leaf changed nothing)	class-of-service interfaces <*> unit <*> output-traffic-control-profile
+unreachable (leaf changed nothing)	class-of-service interfaces <*> unit <*> oversubscription-policy guarantee-rate
+unreachable (leaf changed nothing)	class-of-service interfaces <*> unit <*> oversubscription-policy proportional
+unreachable (leaf changed nothing)	class-of-service interfaces <*> unit <*> priority-low-min-share
+unreachable (leaf changed nothing)	class-of-service interfaces <*> unit <*> rewrite-rules dscp
+unreachable (leaf changed nothing)	class-of-service interfaces <*> unit <*> rewrite-rules ieee-802.1
+unreachable (leaf changed nothing)	class-of-service interfaces <*> unit <*> scheduler-map
+unreachable (leaf changed nothing)	class-of-service interfaces <*> unit <*> shaping-rate <*> burst-size
+COMPARED	class-of-service rewrite-rules dscp <*> forwarding-class <*> loss-priority <*> code-point
+unreachable (leaf changed nothing)	class-of-service rewrite-rules exp <*> forwarding-class <*> loss-priority <*> code-point
+unreachable (leaf changed nothing)	class-of-service rewrite-rules exp <*> forwarding-class <*> loss-priority <*> code-points
+COMPARED	class-of-service rewrite-rules ieee-802.1 <*> forwarding-class <*> loss-priority <*> code-point
+unreachable (leaf changed nothing)	class-of-service rewrite-rules inet-precedence <*> forwarding-class <*> loss-priority <*> code-point
+unreachable (leaf changed nothing)	class-of-service rewrite-rules inet-precedence <*> forwarding-class <*> loss-priority <*> code-points
+COMPARED	class-of-service scheduler-maps <*> forwarding-class <*> scheduler
+unreachable (leaf changed nothing)	class-of-service schedulers <*> buffer-size <*> temporal
+COMPARED	class-of-service schedulers <*> codel-target
+err (parent stanza does not compile)	class-of-service schedulers <*> equal-flow-enforcement
+unreachable (leaf changed nothing)	class-of-service schedulers <*> equal-flow-target-policy
+COMPARED	class-of-service schedulers <*> priority
+flag (read, but value-less)	class-of-service schedulers <*> surplus-sharing
+COMPARED	class-of-service schedulers <*> transmit-rate <*> exact
+COMPARED	class-of-service schedulers <*> transmit-rate <*> percent
+flag (read, but value-less)	class-of-service schedulers <*> transmit-rate <*> remainder
+COMPARED	class-of-service traffic-control-profiles <*> delay-buffer-rate
+COMPARED	class-of-service traffic-control-profiles <*> guaranteed-rate
+COMPARED	class-of-service traffic-control-profiles <*> scheduler-map
+COMPARED	class-of-service traffic-control-profiles <*> shaping-rate
+COMPARED	event-options policy <*> attributes-match
+COMPARED	event-options policy <*> events
+COMPARED	event-options policy <*> then change-configuration commands
+unreachable (leaf changed nothing)	event-options policy <*> within <*> trigger
+flag (read, but value-less)	firewall family any filter <*> interface-specific
+COMPARED	firewall family any filter <*> term <*> from destination-address
+COMPARED	firewall family any filter <*> term <*> from destination-port
+COMPARED	firewall family any filter <*> term <*> from destination-port-except
+COMPARED	firewall family any filter <*> term <*> from destination-prefix-list
+COMPARED	firewall family any filter <*> term <*> from dscp
+COMPARED	firewall family any filter <*> term <*> from flexible-match-range range <*> bit-length
+COMPARED	firewall family any filter <*> term <*> from flexible-match-range range <*> byte-offset
+COMPARED	firewall family any filter <*> term <*> from flexible-match-range range <*> match-mask
+COMPARED	firewall family any filter <*> term <*> from flexible-match-range range <*> match-start
+COMPARED	firewall family any filter <*> term <*> from flexible-match-range range <*> match-value
+COMPARED	firewall family any filter <*> term <*> from flexible-match-range range <*> range
+COMPARED	firewall family any filter <*> term <*> from icmp-code
+COMPARED	firewall family any filter <*> term <*> from icmp-type
+flag (read, but value-less)	firewall family any filter <*> term <*> from is-fragment
+COMPARED	firewall family any filter <*> term <*> from next-header
+COMPARED	firewall family any filter <*> term <*> from protocol
+COMPARED	firewall family any filter <*> term <*> from source-address
+COMPARED	firewall family any filter <*> term <*> from source-port
+COMPARED	firewall family any filter <*> term <*> from source-port-except
+COMPARED	firewall family any filter <*> term <*> from source-prefix-list
+COMPARED	firewall family any filter <*> term <*> from tcp-flags
+COMPARED	firewall family any filter <*> term <*> from traffic-class
+flag (read, but value-less)	firewall family any filter <*> term <*> then reject administratively-prohibited
+flag (read, but value-less)	firewall family any filter <*> term <*> then reject bad-host-tos
+flag (read, but value-less)	firewall family any filter <*> term <*> then reject bad-network-tos
+flag (read, but value-less)	firewall family any filter <*> term <*> then reject host-prohibited
+flag (read, but value-less)	firewall family any filter <*> term <*> then reject host-unreachable
+flag (read, but value-less)	firewall family any filter <*> term <*> then reject network-prohibited
+flag (read, but value-less)	firewall family any filter <*> term <*> then reject network-unreachable
+flag (read, but value-less)	firewall family any filter <*> term <*> then reject port-unreachable
+flag (read, but value-less)	firewall family any filter <*> term <*> then reject precedence-cutoff
+flag (read, but value-less)	firewall family any filter <*> term <*> then reject precedence-violation
+flag (read, but value-less)	firewall family any filter <*> term <*> then reject protocol-unreachable
+flag (read, but value-less)	firewall family any filter <*> term <*> then reject source-host-isolated
+flag (read, but value-less)	firewall family any filter <*> term <*> then reject source-route-failed
+flag (read, but value-less)	firewall family any filter <*> term <*> then reject tcp-reset
+flag (read, but value-less)	firewall family inet filter <*> interface-specific
+COMPARED	firewall family inet filter <*> term <*> from destination-address
+COMPARED	firewall family inet filter <*> term <*> from destination-port
+COMPARED	firewall family inet filter <*> term <*> from destination-port-except
+COMPARED	firewall family inet filter <*> term <*> from destination-prefix-list
+COMPARED	firewall family inet filter <*> term <*> from dscp
+COMPARED	firewall family inet filter <*> term <*> from flexible-match-range range <*> bit-length
+COMPARED	firewall family inet filter <*> term <*> from flexible-match-range range <*> byte-offset
+COMPARED	firewall family inet filter <*> term <*> from flexible-match-range range <*> match-mask
+COMPARED	firewall family inet filter <*> term <*> from flexible-match-range range <*> match-start
+COMPARED	firewall family inet filter <*> term <*> from flexible-match-range range <*> match-value
+COMPARED	firewall family inet filter <*> term <*> from flexible-match-range range <*> range
+COMPARED	firewall family inet filter <*> term <*> from icmp-code
+COMPARED	firewall family inet filter <*> term <*> from icmp-type
+flag (read, but value-less)	firewall family inet filter <*> term <*> from is-fragment
+COMPARED	firewall family inet filter <*> term <*> from next-header
+COMPARED	firewall family inet filter <*> term <*> from protocol
+COMPARED	firewall family inet filter <*> term <*> from source-address
+COMPARED	firewall family inet filter <*> term <*> from source-port
+COMPARED	firewall family inet filter <*> term <*> from source-port-except
+COMPARED	firewall family inet filter <*> term <*> from source-prefix-list
+COMPARED	firewall family inet filter <*> term <*> from tcp-flags
+COMPARED	firewall family inet filter <*> term <*> from traffic-class
+flag (read, but value-less)	firewall family inet filter <*> term <*> then reject administratively-prohibited
+flag (read, but value-less)	firewall family inet filter <*> term <*> then reject bad-host-tos
+flag (read, but value-less)	firewall family inet filter <*> term <*> then reject bad-network-tos
+flag (read, but value-less)	firewall family inet filter <*> term <*> then reject host-prohibited
+flag (read, but value-less)	firewall family inet filter <*> term <*> then reject host-unreachable
+flag (read, but value-less)	firewall family inet filter <*> term <*> then reject network-prohibited
+flag (read, but value-less)	firewall family inet filter <*> term <*> then reject network-unreachable
+flag (read, but value-less)	firewall family inet filter <*> term <*> then reject port-unreachable
+flag (read, but value-less)	firewall family inet filter <*> term <*> then reject precedence-cutoff
+flag (read, but value-less)	firewall family inet filter <*> term <*> then reject precedence-violation
+flag (read, but value-less)	firewall family inet filter <*> term <*> then reject protocol-unreachable
+flag (read, but value-less)	firewall family inet filter <*> term <*> then reject source-host-isolated
+flag (read, but value-less)	firewall family inet filter <*> term <*> then reject source-route-failed
+flag (read, but value-less)	firewall family inet filter <*> term <*> then reject tcp-reset
+flag (read, but value-less)	firewall family inet6 filter <*> interface-specific
+COMPARED	firewall family inet6 filter <*> term <*> from destination-address
+COMPARED	firewall family inet6 filter <*> term <*> from destination-port
+COMPARED	firewall family inet6 filter <*> term <*> from destination-port-except
+COMPARED	firewall family inet6 filter <*> term <*> from destination-prefix-list
+COMPARED	firewall family inet6 filter <*> term <*> from dscp
+COMPARED	firewall family inet6 filter <*> term <*> from flexible-match-range range <*> bit-length
+COMPARED	firewall family inet6 filter <*> term <*> from flexible-match-range range <*> byte-offset
+COMPARED	firewall family inet6 filter <*> term <*> from flexible-match-range range <*> match-mask
+COMPARED	firewall family inet6 filter <*> term <*> from flexible-match-range range <*> match-start
+COMPARED	firewall family inet6 filter <*> term <*> from flexible-match-range range <*> match-value
+COMPARED	firewall family inet6 filter <*> term <*> from flexible-match-range range <*> range
+COMPARED	firewall family inet6 filter <*> term <*> from icmp-code
+COMPARED	firewall family inet6 filter <*> term <*> from icmp-type
+flag (read, but value-less)	firewall family inet6 filter <*> term <*> from is-fragment
+COMPARED	firewall family inet6 filter <*> term <*> from next-header
+COMPARED	firewall family inet6 filter <*> term <*> from protocol
+COMPARED	firewall family inet6 filter <*> term <*> from source-address
+COMPARED	firewall family inet6 filter <*> term <*> from source-port
+COMPARED	firewall family inet6 filter <*> term <*> from source-port-except
+COMPARED	firewall family inet6 filter <*> term <*> from source-prefix-list
+COMPARED	firewall family inet6 filter <*> term <*> from tcp-flags
+COMPARED	firewall family inet6 filter <*> term <*> from traffic-class
+flag (read, but value-less)	firewall family inet6 filter <*> term <*> then reject administratively-prohibited
+flag (read, but value-less)	firewall family inet6 filter <*> term <*> then reject bad-host-tos
+flag (read, but value-less)	firewall family inet6 filter <*> term <*> then reject bad-network-tos
+flag (read, but value-less)	firewall family inet6 filter <*> term <*> then reject host-prohibited
+flag (read, but value-less)	firewall family inet6 filter <*> term <*> then reject host-unreachable
+flag (read, but value-less)	firewall family inet6 filter <*> term <*> then reject network-prohibited
+flag (read, but value-less)	firewall family inet6 filter <*> term <*> then reject network-unreachable
+flag (read, but value-less)	firewall family inet6 filter <*> term <*> then reject port-unreachable
+flag (read, but value-less)	firewall family inet6 filter <*> term <*> then reject precedence-cutoff
+flag (read, but value-less)	firewall family inet6 filter <*> term <*> then reject precedence-violation
+flag (read, but value-less)	firewall family inet6 filter <*> term <*> then reject protocol-unreachable
+flag (read, but value-less)	firewall family inet6 filter <*> term <*> then reject source-host-isolated
+flag (read, but value-less)	firewall family inet6 filter <*> term <*> then reject source-route-failed
+flag (read, but value-less)	firewall family inet6 filter <*> term <*> then reject tcp-reset
+COMPARED	firewall policer <*> if-exceeding bandwidth-limit
+COMPARED	firewall policer <*> if-exceeding burst-size-limit
+flag (read, but value-less)	firewall policer <*> logical-interface-policer
+flag (read, but value-less)	firewall policer <*> then discard
+COMPARED	firewall policer <*> then loss-priority
+err (parent stanza does not compile)	firewall three-color-policer <*> single-rate color-aware
+err (parent stanza does not compile)	firewall three-color-policer <*> single-rate color-blind
+err (parent stanza does not compile)	firewall three-color-policer <*> single-rate committed-burst-size
+err (parent stanza does not compile)	firewall three-color-policer <*> single-rate committed-information-rate
+err (parent stanza does not compile)	firewall three-color-policer <*> single-rate excess-burst-size
+err (parent stanza does not compile)	firewall three-color-policer <*> then discard
+err (parent stanza does not compile)	firewall three-color-policer <*> then loss-priority
+err (parent stanza does not compile)	firewall three-color-policer <*> two-rate color-aware
+err (parent stanza does not compile)	firewall three-color-policer <*> two-rate color-blind
+err (parent stanza does not compile)	firewall three-color-policer <*> two-rate committed-burst-size
+err (parent stanza does not compile)	firewall three-color-policer <*> two-rate committed-information-rate
+err (parent stanza does not compile)	firewall three-color-policer <*> two-rate peak-burst-size
+err (parent stanza does not compile)	firewall three-color-policer <*> two-rate peak-information-rate
+flag (read, but value-less)	forwarding-options allow-dataplane-sleep
+COMPARED	forwarding-options dhcp-relay group <*> active-server-group
+COMPARED	forwarding-options dhcp-relay group <*> interface
+flag (read, but value-less)	forwarding-options dhcp-relay group <*> overrides always-broadcast
+flag (read, but value-less)	forwarding-options dhcp-relay group <*> overrides forward-only
+COMPARED	forwarding-options dhcp-relay group <*> overrides maximum-hop-count
+COMPARED	forwarding-options dhcp-relay group <*> overrides maximum-packet-rate
+flag (read, but value-less)	forwarding-options dhcp-relay group <*> overrides relay-agent-option
+flag (read, but value-less)	forwarding-options dhcp-relay group <*> overrides trust-option-82
+COMPARED	forwarding-options dhcp-relay server-group
+COMPARED	forwarding-options family inet6 mode
+unreachable (leaf changed nothing)	forwarding-options port-mirroring instance <*> input ingress
+unreachable (leaf changed nothing)	forwarding-options port-mirroring instance <*> output
+COMPARED	forwarding-options sampling instance <*> family inet output flow-server <*> port
+COMPARED	forwarding-options sampling instance <*> family inet output flow-server <*> source-address
+COMPARED	forwarding-options sampling instance <*> family inet output flow-server <*> version-ipfix template
+COMPARED	forwarding-options sampling instance <*> family inet output flow-server <*> version-ipfix-template
+COMPARED	forwarding-options sampling instance <*> family inet output flow-server <*> version9 template
+COMPARED	forwarding-options sampling instance <*> family inet output flow-server <*> version9-template
+flag (read, but value-less)	forwarding-options sampling instance <*> family inet output inline-jflow
+COMPARED	forwarding-options sampling instance <*> family inet output source-address
+COMPARED	forwarding-options sampling instance <*> family inet6 output flow-server <*> port
+COMPARED	forwarding-options sampling instance <*> family inet6 output flow-server <*> source-address
+COMPARED	forwarding-options sampling instance <*> family inet6 output flow-server <*> version-ipfix template
+COMPARED	forwarding-options sampling instance <*> family inet6 output flow-server <*> version-ipfix-template
+COMPARED	forwarding-options sampling instance <*> family inet6 output flow-server <*> version9 template
+COMPARED	forwarding-options sampling instance <*> family inet6 output flow-server <*> version9-template
+flag (read, but value-less)	forwarding-options sampling instance <*> family inet6 output inline-jflow
+COMPARED	forwarding-options sampling instance <*> family inet6 output source-address
+COMPARED	forwarding-options sampling instance <*> input rate
+flag (read, but value-less)	interfaces <*> aggregated-ether-options lacp active
+flag (read, but value-less)	interfaces <*> aggregated-ether-options lacp passive
+COMPARED	interfaces <*> aggregated-ether-options lacp periodic
+COMPARED	interfaces <*> aggregated-ether-options link-speed
+COMPARED	interfaces <*> aggregated-ether-options minimum-links
+COMPARED	interfaces <*> bandwidth
+COMPARED	interfaces <*> description
+flag (read, but value-less)	interfaces <*> disable
+COMPARED	interfaces <*> duplex
+COMPARED	interfaces <*> encapsulation
+COMPARED	interfaces <*> fabric-options member-interfaces
+flag (read, but value-less)	interfaces <*> flexible-vlan-tagging
+COMPARED	interfaces <*> gigether-options 802.3ad
+COMPARED	interfaces <*> gigether-options redundant-parent
+flag (read, but value-less)	interfaces <*> gratuitous-arp-reply
+COMPARED	interfaces <*> mtu
+COMPARED	interfaces <*> native-vlan-id
+flag (read, but value-less)	interfaces <*> no-gratuitous-arp-request
+COMPARED	interfaces <*> redundant-ether-options redundancy-group
+COMPARED	interfaces <*> speed
+COMPARED	interfaces <*> tunnel destination
+COMPARED	interfaces <*> tunnel keepalive
+COMPARED	interfaces <*> tunnel keepalive-retry
+COMPARED	interfaces <*> tunnel key
+COMPARED	interfaces <*> tunnel mode
+COMPARED	interfaces <*> tunnel routing-instance destination
+COMPARED	interfaces <*> tunnel source
+COMPARED	interfaces <*> tunnel ttl
+COMPARED	interfaces <*> tunnel wireguard listen-port
+COMPARED	interfaces <*> tunnel wireguard peer <*> allowed-ips
+COMPARED	interfaces <*> tunnel wireguard peer <*> endpoint
+COMPARED	interfaces <*> tunnel wireguard peer <*> persistent-keepalive
+COMPARED	interfaces <*> tunnel wireguard peer <*> preshared-key
+COMPARED	interfaces <*> tunnel wireguard private-key
+COMPARED	interfaces <*> unit <*> description
+flag (read, but value-less)	interfaces <*> unit <*> family inet address <*> preferred
+flag (read, but value-less)	interfaces <*> unit <*> family inet address <*> primary
+flag (read, but value-less)	interfaces <*> unit <*> family inet address <*> vrrp-group <*> accept-data
+COMPARED	interfaces <*> unit <*> family inet address <*> vrrp-group <*> advertise-interval
+COMPARED	interfaces <*> unit <*> family inet address <*> vrrp-group <*> authentication-key
+COMPARED	interfaces <*> unit <*> family inet address <*> vrrp-group <*> authentication-type
+COMPARED	interfaces <*> unit <*> family inet address <*> vrrp-group <*> preempt hold-time
+COMPARED	interfaces <*> unit <*> family inet address <*> vrrp-group <*> priority
+advisory (read, value ignored, warning says so)	interfaces <*> unit <*> family inet address <*> vrrp-group <*> track-interface <*> priority-cost
+COMPARED	interfaces <*> unit <*> family inet address <*> vrrp-group <*> track-priority-cost
+COMPARED	interfaces <*> unit <*> family inet address <*> vrrp-group <*> virtual-address
+flag (read, but value-less)	interfaces <*> unit <*> family inet dhcp force-discover
+COMPARED	interfaces <*> unit <*> family inet dhcp lease-time
+COMPARED	interfaces <*> unit <*> family inet dhcp retransmission-attempt
+COMPARED	interfaces <*> unit <*> family inet dhcp retransmission-interval
+COMPARED	interfaces <*> unit <*> family inet dynamic-dns address-source
+COMPARED	interfaces <*> unit <*> family inet dynamic-dns hostname
+COMPARED	interfaces <*> unit <*> family inet dynamic-dns provider
+COMPARED	interfaces <*> unit <*> family inet dynamic-dns source-address
+COMPARED	interfaces <*> unit <*> family inet dynamic-dns ttl
+COMPARED	interfaces <*> unit <*> family inet filter input
+COMPARED	interfaces <*> unit <*> family inet filter output
+COMPARED	interfaces <*> unit <*> family inet mtu
+flag (read, but value-less)	interfaces <*> unit <*> family inet sampling input
+flag (read, but value-less)	interfaces <*> unit <*> family inet sampling output
+flag (read, but value-less)	interfaces <*> unit <*> family inet targeted-broadcast
+COMPARED	interfaces <*> unit <*> family inet unnumbered-address
+flag (read, but value-less)	interfaces <*> unit <*> family inet6 address <*> preferred
+flag (read, but value-less)	interfaces <*> unit <*> family inet6 address <*> primary
+flag (read, but value-less)	interfaces <*> unit <*> family inet6 address <*> vrrp-group <*> accept-data
+COMPARED	interfaces <*> unit <*> family inet6 address <*> vrrp-group <*> advertise-interval
+COMPARED	interfaces <*> unit <*> family inet6 address <*> vrrp-group <*> authentication-key
+COMPARED	interfaces <*> unit <*> family inet6 address <*> vrrp-group <*> authentication-type
+COMPARED	interfaces <*> unit <*> family inet6 address <*> vrrp-group <*> preempt hold-time
+COMPARED	interfaces <*> unit <*> family inet6 address <*> vrrp-group <*> priority
+advisory (read, value ignored, warning says so)	interfaces <*> unit <*> family inet6 address <*> vrrp-group <*> track-interface <*> priority-cost
+COMPARED	interfaces <*> unit <*> family inet6 address <*> vrrp-group <*> track-priority-cost
+COMPARED	interfaces <*> unit <*> family inet6 address <*> vrrp-group <*> virtual-address
+flag (read, but value-less)	interfaces <*> unit <*> family inet6 dad-disable
+COMPARED	interfaces <*> unit <*> family inet6 dhcpv6-client client-ia-type
+COMPARED	interfaces <*> unit <*> family inet6 dhcpv6-client client-identifier duid-type
+COMPARED	interfaces <*> unit <*> family inet6 dhcpv6-client client-type
+COMPARED	interfaces <*> unit <*> family inet6 dhcpv6-client prefix-delegating preferred-prefix-length
+COMPARED	interfaces <*> unit <*> family inet6 dhcpv6-client prefix-delegating sub-prefix-length
+COMPARED	interfaces <*> unit <*> family inet6 dhcpv6-client req-option
+COMPARED	interfaces <*> unit <*> family inet6 dhcpv6-client update-router-advertisement interface
+COMPARED	interfaces <*> unit <*> family inet6 dynamic-dns address-source
+COMPARED	interfaces <*> unit <*> family inet6 dynamic-dns hostname
+COMPARED	interfaces <*> unit <*> family inet6 dynamic-dns provider
+COMPARED	interfaces <*> unit <*> family inet6 dynamic-dns source-address
+COMPARED	interfaces <*> unit <*> family inet6 dynamic-dns ttl
+COMPARED	interfaces <*> unit <*> family inet6 filter input
+COMPARED	interfaces <*> unit <*> family inet6 filter output
+COMPARED	interfaces <*> unit <*> family inet6 mtu
+flag (read, but value-less)	interfaces <*> unit <*> family inet6 sampling input
+flag (read, but value-less)	interfaces <*> unit <*> family inet6 sampling output
+COMPARED	interfaces <*> unit <*> inner-vlan-id
+flag (read, but value-less)	interfaces <*> unit <*> point-to-point
+COMPARED	interfaces <*> unit <*> tunnel destination
+COMPARED	interfaces <*> unit <*> tunnel keepalive
+COMPARED	interfaces <*> unit <*> tunnel keepalive-retry
+COMPARED	interfaces <*> unit <*> tunnel key
+COMPARED	interfaces <*> unit <*> tunnel mode
+COMPARED	interfaces <*> unit <*> tunnel routing-instance destination
+COMPARED	interfaces <*> unit <*> tunnel source
+COMPARED	interfaces <*> unit <*> tunnel ttl
+COMPARED	interfaces <*> unit <*> tunnel wireguard listen-port
+COMPARED	interfaces <*> unit <*> tunnel wireguard peer <*> allowed-ips
+COMPARED	interfaces <*> unit <*> tunnel wireguard peer <*> endpoint
+COMPARED	interfaces <*> unit <*> tunnel wireguard peer <*> persistent-keepalive
+COMPARED	interfaces <*> unit <*> tunnel wireguard peer <*> preshared-key
+COMPARED	interfaces <*> unit <*> tunnel wireguard private-key
+COMPARED	interfaces <*> unit <*> vlan-id
+flag (read, but value-less)	interfaces <*> vlan-tagging
+COMPARED	policy-options community <*> members
+COMPARED	policy-options policy-statement <*> term <*> from as-path
+COMPARED	policy-options policy-statement <*> term <*> from community
+COMPARED	policy-options policy-statement <*> term <*> from prefix-list
+COMPARED	policy-options policy-statement <*> term <*> from protocol
+flag (read, but value-less)	policy-options policy-statement <*> term <*> then accept
+COMPARED	policy-options policy-statement <*> term <*> then as-path-prepend
+COMPARED	policy-options policy-statement <*> term <*> then community
+COMPARED	policy-options policy-statement <*> term <*> then load-balance
+COMPARED	policy-options policy-statement <*> term <*> then local-preference
+COMPARED	policy-options policy-statement <*> term <*> then metric
+COMPARED	policy-options policy-statement <*> term <*> then metric-type
+COMPARED	policy-options policy-statement <*> term <*> then next-hop
+COMPARED	policy-options policy-statement <*> term <*> then origin
+flag (read, but value-less)	policy-options policy-statement <*> term <*> then reject
+flag (read, but value-less)	policy-options policy-statement <*> then accept
+flag (read, but value-less)	policy-options policy-statement <*> then reject
+COMPARED	protocols bgp cluster-id
+COMPARED	protocols bgp damping half-life
+COMPARED	protocols bgp damping max-suppress
+COMPARED	protocols bgp damping reuse
+COMPARED	protocols bgp damping suppress
+COMPARED	protocols bgp export
+flag (read, but value-less)	protocols bgp graceful-restart
+COMPARED	protocols bgp group <*> authentication-key
+unreachable (leaf changed nothing)	protocols bgp group <*> bfd-liveness-detection minimum-interval
+unreachable (leaf changed nothing)	protocols bgp group <*> bfd-liveness-detection multiplier
+flag (read, but value-less)	protocols bgp group <*> default-originate
+COMPARED	protocols bgp group <*> description
+COMPARED	protocols bgp group <*> export
+unreachable (leaf changed nothing)	protocols bgp group <*> family inet unicast prefix-limit maximum
+unreachable (leaf changed nothing)	protocols bgp group <*> family inet6 unicast prefix-limit maximum
+COMPARED	protocols bgp group <*> hold-time
+COMPARED	protocols bgp group <*> import
+COMPARED	protocols bgp group <*> local-address
+COMPARED	protocols bgp group <*> local-as
+COMPARED	protocols bgp group <*> loops
+COMPARED	protocols bgp group <*> multihop
+COMPARED	protocols bgp group <*> neighbor <*> authentication-key
+COMPARED	protocols bgp group <*> neighbor <*> bfd-liveness-detection minimum-interval
+COMPARED	protocols bgp group <*> neighbor <*> bfd-liveness-detection multiplier
+flag (read, but value-less)	protocols bgp group <*> neighbor <*> default-originate
+COMPARED	protocols bgp group <*> neighbor <*> description
+COMPARED	protocols bgp group <*> neighbor <*> export
+COMPARED	protocols bgp group <*> neighbor <*> family inet unicast prefix-limit maximum
+COMPARED	protocols bgp group <*> neighbor <*> family inet6 unicast prefix-limit maximum
+COMPARED	protocols bgp group <*> neighbor <*> hold-time
+COMPARED	protocols bgp group <*> neighbor <*> import
+COMPARED	protocols bgp group <*> neighbor <*> local-address
+COMPARED	protocols bgp group <*> neighbor <*> local-as
+COMPARED	protocols bgp group <*> neighbor <*> loops
+COMPARED	protocols bgp group <*> neighbor <*> multihop
+flag (read, but value-less)	protocols bgp group <*> neighbor <*> passive
+COMPARED	protocols bgp group <*> neighbor <*> peer-as
+flag (read, but value-less)	protocols bgp group <*> neighbor <*> remove-private
+flag (read, but value-less)	protocols bgp group <*> neighbor <*> route-reflector-client
+flag (read, but value-less)	protocols bgp group <*> passive
+COMPARED	protocols bgp group <*> peer-as
+flag (read, but value-less)	protocols bgp group <*> remove-private
+COMPARED	protocols bgp import
+COMPARED	protocols bgp local-as
+flag (read, but value-less)	protocols bgp log-updown
+flag (read, but value-less)	protocols bgp multipath ibgp
+flag (read, but value-less)	protocols bgp multipath multiple-as
+COMPARED	protocols bgp router-id
+COMPARED	protocols isis authentication-key
+COMPARED	protocols isis authentication-type
+COMPARED	protocols isis export
+COMPARED	protocols isis interface <*> authentication-key
+COMPARED	protocols isis interface <*> authentication-type
+COMPARED	protocols isis interface <*> bfd-liveness-detection minimum-interval
+COMPARED	protocols isis interface <*> bfd-liveness-detection multiplier
+COMPARED	protocols isis interface <*> level
+COMPARED	protocols isis interface <*> metric
+flag (read, but value-less)	protocols isis interface <*> passive
+COMPARED	protocols isis is-type
+COMPARED	protocols isis level
+COMPARED	protocols isis net
+flag (read, but value-less)	protocols isis overload
+flag (read, but value-less)	protocols isis wide-metrics-only
+flag (read, but value-less)	protocols lldp disable
+COMPARED	protocols lldp hold-multiplier
+flag (read, but value-less)	protocols lldp interface <*> disable
+COMPARED	protocols lldp transmit-interval
+flag (read, but value-less)	protocols ospf area <*> area-type nssa no-summaries
+flag (read, but value-less)	protocols ospf area <*> area-type stub no-summaries
+COMPARED	protocols ospf area <*> interface <*> authentication md5 <*> key
+COMPARED	protocols ospf area <*> interface <*> authentication simple-password
+unreachable (leaf changed nothing)	protocols ospf area <*> interface <*> authentication-type
+COMPARED	protocols ospf area <*> interface <*> bfd-liveness-detection minimum-interval
+COMPARED	protocols ospf area <*> interface <*> bfd-liveness-detection multiplier
+COMPARED	protocols ospf area <*> interface <*> cost
+COMPARED	protocols ospf area <*> interface <*> dead-interval
+COMPARED	protocols ospf area <*> interface <*> hello-interval
+COMPARED	protocols ospf area <*> interface <*> interface-type
+flag (read, but value-less)	protocols ospf area <*> interface <*> no-passive
+flag (read, but value-less)	protocols ospf area <*> interface <*> passive
+COMPARED	protocols ospf area <*> interface <*> priority
+COMPARED	protocols ospf area <*> interface <*> retransmit-interval
+COMPARED	protocols ospf area <*> virtual-link <*> transit-area
+COMPARED	protocols ospf export
+flag (read, but value-less)	protocols ospf passive
+COMPARED	protocols ospf reference-bandwidth
+COMPARED	protocols ospf router-id
+COMPARED	protocols ospf3 area <*> interface <*> bfd-liveness-detection minimum-interval
+COMPARED	protocols ospf3 area <*> interface <*> bfd-liveness-detection multiplier
+COMPARED	protocols ospf3 area <*> interface <*> cost
+COMPARED	protocols ospf3 area <*> interface <*> dead-interval
+COMPARED	protocols ospf3 area <*> interface <*> hello-interval
+flag (read, but value-less)	protocols ospf3 area <*> interface <*> passive
+COMPARED	protocols ospf3 area <*> interface <*> priority
+COMPARED	protocols ospf3 area <*> interface <*> retransmit-interval
+COMPARED	protocols ospf3 export
+COMPARED	protocols ospf3 router-id
+COMPARED	protocols rip authentication-key
+COMPARED	protocols rip authentication-type
+COMPARED	protocols rip group <*> export
+COMPARED	protocols rip group <*> neighbor
+COMPARED	protocols rip neighbor
+COMPARED	protocols rip passive-interface
+COMPARED	protocols rip redistribute
+COMPARED	protocols router-advertisement interface <*> default-lifetime
+COMPARED	protocols router-advertisement interface <*> dns-server-address
+COMPARED	protocols router-advertisement interface <*> link-mtu
+flag (read, but value-less)	protocols router-advertisement interface <*> managed-configuration
+COMPARED	protocols router-advertisement interface <*> max-advertisement-interval
+COMPARED	protocols router-advertisement interface <*> min-advertisement-interval
+COMPARED	protocols router-advertisement interface <*> nat-prefix <*> lifetime
+COMPARED	protocols router-advertisement interface <*> nat64prefix <*> lifetime
+flag (read, but value-less)	protocols router-advertisement interface <*> other-stateful-configuration
+COMPARED	protocols router-advertisement interface <*> preference
+unreachable (leaf changed nothing)	protocols router-advertisement interface <*> prefix <*> autonomous
+flag (read, but value-less)	protocols router-advertisement interface <*> prefix <*> no-autonomous
+flag (read, but value-less)	protocols router-advertisement interface <*> prefix <*> no-onlink
+unreachable (leaf changed nothing)	protocols router-advertisement interface <*> prefix <*> on-link
+COMPARED	protocols router-advertisement interface <*> prefix <*> preferred-lifetime
+COMPARED	protocols router-advertisement interface <*> prefix <*> valid-lifetime
+COMPARED	protocols router-advertisement interface <*> reachable-time
+COMPARED	protocols router-advertisement interface <*> retransmit-timer
+COMPARED	routing-instances <*> description
+COMPARED	routing-instances <*> instance-type
+COMPARED	routing-instances <*> interface
+unreachable (leaf changed nothing)	routing-instances <*> interface-routes rib-group inet
+unreachable (leaf changed nothing)	routing-instances <*> interface-routes rib-group inet6
+COMPARED	routing-instances <*> protocols bgp cluster-id
+COMPARED	routing-instances <*> protocols bgp damping half-life
+COMPARED	routing-instances <*> protocols bgp damping max-suppress
+COMPARED	routing-instances <*> protocols bgp damping reuse
+COMPARED	routing-instances <*> protocols bgp damping suppress
+COMPARED	routing-instances <*> protocols bgp export
+flag (read, but value-less)	routing-instances <*> protocols bgp graceful-restart
+unreachable (leaf changed nothing)	routing-instances <*> protocols bgp group <*> authentication-key
+unreachable (leaf changed nothing)	routing-instances <*> protocols bgp group <*> bfd-liveness-detection minimum-interval
+unreachable (leaf changed nothing)	routing-instances <*> protocols bgp group <*> bfd-liveness-detection multiplier
+unreachable (leaf changed nothing)	routing-instances <*> protocols bgp group <*> default-originate
+unreachable (leaf changed nothing)	routing-instances <*> protocols bgp group <*> description
+unreachable (leaf changed nothing)	routing-instances <*> protocols bgp group <*> export
+unreachable (leaf changed nothing)	routing-instances <*> protocols bgp group <*> family inet unicast prefix-limit maximum
+unreachable (leaf changed nothing)	routing-instances <*> protocols bgp group <*> family inet6 unicast prefix-limit maximum
+unreachable (leaf changed nothing)	routing-instances <*> protocols bgp group <*> hold-time
+unreachable (leaf changed nothing)	routing-instances <*> protocols bgp group <*> import
+unreachable (leaf changed nothing)	routing-instances <*> protocols bgp group <*> local-address
+unreachable (leaf changed nothing)	routing-instances <*> protocols bgp group <*> local-as
+unreachable (leaf changed nothing)	routing-instances <*> protocols bgp group <*> loops
+unreachable (leaf changed nothing)	routing-instances <*> protocols bgp group <*> multihop
+COMPARED	routing-instances <*> protocols bgp group <*> neighbor <*> authentication-key
+COMPARED	routing-instances <*> protocols bgp group <*> neighbor <*> bfd-liveness-detection minimum-interval
+COMPARED	routing-instances <*> protocols bgp group <*> neighbor <*> bfd-liveness-detection multiplier
+flag (read, but value-less)	routing-instances <*> protocols bgp group <*> neighbor <*> default-originate
+COMPARED	routing-instances <*> protocols bgp group <*> neighbor <*> description
+COMPARED	routing-instances <*> protocols bgp group <*> neighbor <*> export
+COMPARED	routing-instances <*> protocols bgp group <*> neighbor <*> hold-time
+COMPARED	routing-instances <*> protocols bgp group <*> neighbor <*> import
+COMPARED	routing-instances <*> protocols bgp group <*> neighbor <*> local-address
+COMPARED	routing-instances <*> protocols bgp group <*> neighbor <*> local-as
+COMPARED	routing-instances <*> protocols bgp group <*> neighbor <*> loops
+COMPARED	routing-instances <*> protocols bgp group <*> neighbor <*> multihop
+flag (read, but value-less)	routing-instances <*> protocols bgp group <*> neighbor <*> passive
+COMPARED	routing-instances <*> protocols bgp group <*> neighbor <*> peer-as
+flag (read, but value-less)	routing-instances <*> protocols bgp group <*> neighbor <*> remove-private
+flag (read, but value-less)	routing-instances <*> protocols bgp group <*> neighbor <*> route-reflector-client
+unreachable (leaf changed nothing)	routing-instances <*> protocols bgp group <*> passive
+unreachable (leaf changed nothing)	routing-instances <*> protocols bgp group <*> peer-as
+unreachable (leaf changed nothing)	routing-instances <*> protocols bgp group <*> remove-private
+COMPARED	routing-instances <*> protocols bgp import
+COMPARED	routing-instances <*> protocols bgp local-as
+flag (read, but value-less)	routing-instances <*> protocols bgp log-updown
+flag (read, but value-less)	routing-instances <*> protocols bgp multipath ibgp
+flag (read, but value-less)	routing-instances <*> protocols bgp multipath multiple-as
+COMPARED	routing-instances <*> protocols bgp router-id
+COMPARED	routing-instances <*> protocols isis authentication-key
+COMPARED	routing-instances <*> protocols isis authentication-type
+COMPARED	routing-instances <*> protocols isis export
+COMPARED	routing-instances <*> protocols isis interface <*> authentication-key
+COMPARED	routing-instances <*> protocols isis interface <*> authentication-type
+COMPARED	routing-instances <*> protocols isis interface <*> bfd-liveness-detection minimum-interval
+COMPARED	routing-instances <*> protocols isis interface <*> bfd-liveness-detection multiplier
+COMPARED	routing-instances <*> protocols isis interface <*> level
+COMPARED	routing-instances <*> protocols isis interface <*> metric
+flag (read, but value-less)	routing-instances <*> protocols isis interface <*> passive
+COMPARED	routing-instances <*> protocols isis is-type
+COMPARED	routing-instances <*> protocols isis level
+COMPARED	routing-instances <*> protocols isis net
+flag (read, but value-less)	routing-instances <*> protocols isis overload
+flag (read, but value-less)	routing-instances <*> protocols isis wide-metrics-only
+flag (read, but value-less)	routing-instances <*> protocols ospf area <*> area-type nssa no-summaries
+flag (read, but value-less)	routing-instances <*> protocols ospf area <*> area-type stub no-summaries
+COMPARED	routing-instances <*> protocols ospf area <*> interface <*> authentication md5 <*> key
+COMPARED	routing-instances <*> protocols ospf area <*> interface <*> authentication simple-password
+unreachable (leaf changed nothing)	routing-instances <*> protocols ospf area <*> interface <*> authentication-type
+COMPARED	routing-instances <*> protocols ospf area <*> interface <*> bfd-liveness-detection minimum-interval
+COMPARED	routing-instances <*> protocols ospf area <*> interface <*> bfd-liveness-detection multiplier
+COMPARED	routing-instances <*> protocols ospf area <*> interface <*> cost
+COMPARED	routing-instances <*> protocols ospf area <*> interface <*> dead-interval
+COMPARED	routing-instances <*> protocols ospf area <*> interface <*> hello-interval
+COMPARED	routing-instances <*> protocols ospf area <*> interface <*> interface-type
+flag (read, but value-less)	routing-instances <*> protocols ospf area <*> interface <*> no-passive
+flag (read, but value-less)	routing-instances <*> protocols ospf area <*> interface <*> passive
+COMPARED	routing-instances <*> protocols ospf area <*> interface <*> priority
+COMPARED	routing-instances <*> protocols ospf area <*> interface <*> retransmit-interval
+COMPARED	routing-instances <*> protocols ospf area <*> virtual-link <*> transit-area
+COMPARED	routing-instances <*> protocols ospf export
+flag (read, but value-less)	routing-instances <*> protocols ospf passive
+COMPARED	routing-instances <*> protocols ospf reference-bandwidth
+COMPARED	routing-instances <*> protocols ospf router-id
+COMPARED	routing-instances <*> protocols ospf3 area <*> interface <*> bfd-liveness-detection minimum-interval
+COMPARED	routing-instances <*> protocols ospf3 area <*> interface <*> bfd-liveness-detection multiplier
+COMPARED	routing-instances <*> protocols ospf3 area <*> interface <*> cost
+COMPARED	routing-instances <*> protocols ospf3 area <*> interface <*> dead-interval
+COMPARED	routing-instances <*> protocols ospf3 area <*> interface <*> hello-interval
+flag (read, but value-less)	routing-instances <*> protocols ospf3 area <*> interface <*> passive
+COMPARED	routing-instances <*> protocols ospf3 area <*> interface <*> priority
+COMPARED	routing-instances <*> protocols ospf3 area <*> interface <*> retransmit-interval
+COMPARED	routing-instances <*> protocols ospf3 export
+COMPARED	routing-instances <*> protocols ospf3 router-id
+COMPARED	routing-instances <*> protocols rip authentication-key
+COMPARED	routing-instances <*> protocols rip authentication-type
+COMPARED	routing-instances <*> protocols rip group <*> export
+COMPARED	routing-instances <*> protocols rip group <*> neighbor
+COMPARED	routing-instances <*> protocols rip neighbor
+COMPARED	routing-instances <*> protocols rip passive-interface
+COMPARED	routing-instances <*> protocols rip redistribute
+unreachable (leaf changed nothing)	routing-instances <*> route-distinguisher
+COMPARED	routing-instances <*> routing-options interface-routes rib-group inet
+COMPARED	routing-instances <*> routing-options interface-routes rib-group inet6
+unreachable (leaf changed nothing)	routing-instances <*> routing-options rib <*> static route <*> discard
+unreachable (leaf changed nothing)	routing-instances <*> routing-options rib <*> static route <*> next-hop <*> interface
+unreachable (leaf changed nothing)	routing-instances <*> routing-options rib <*> static route <*> next-table
+unreachable (leaf changed nothing)	routing-instances <*> routing-options rib <*> static route <*> preference
+unreachable (leaf changed nothing)	routing-instances <*> routing-options rib <*> static route <*> qualified-next-hop <*> interface
+unreachable (leaf changed nothing)	routing-instances <*> routing-options rib <*> static route <*> qualified-next-hop <*> metric
+unreachable (leaf changed nothing)	routing-instances <*> routing-options rib <*> static route <*> qualified-next-hop <*> preference
+unreachable (leaf changed nothing)	routing-instances <*> routing-options rib <*> static route <*> reject
+flag (read, but value-less)	routing-instances <*> routing-options static route <*> discard
+COMPARED	routing-instances <*> routing-options static route <*> next-hop <*> interface
+COMPARED	routing-instances <*> routing-options static route <*> next-table
+COMPARED	routing-instances <*> routing-options static route <*> preference
+COMPARED	routing-instances <*> routing-options static route <*> qualified-next-hop <*> interface
+COMPARED	routing-instances <*> routing-options static route <*> qualified-next-hop <*> metric
+COMPARED	routing-instances <*> routing-options static route <*> qualified-next-hop <*> preference
+flag (read, but value-less)	routing-instances <*> routing-options static route <*> reject
+unreachable (leaf changed nothing)	routing-instances <*> vrf-table-label
+unreachable (leaf changed nothing)	routing-instances <*> vrf-target
+COMPARED	routing-options autonomous-system
+COMPARED	routing-options forwarding-table export
+flag (read, but value-less)	routing-options generate route <*> discard
+COMPARED	routing-options generate route <*> policy
+COMPARED	routing-options interface-routes rib-group inet
+COMPARED	routing-options interface-routes rib-group inet6
+unreachable (leaf changed nothing)	routing-options rib <*> static route <*> discard
+unreachable (leaf changed nothing)	routing-options rib <*> static route <*> next-hop <*> interface
+unreachable (leaf changed nothing)	routing-options rib <*> static route <*> next-table
+unreachable (leaf changed nothing)	routing-options rib <*> static route <*> preference
+unreachable (leaf changed nothing)	routing-options rib <*> static route <*> qualified-next-hop <*> interface
+unreachable (leaf changed nothing)	routing-options rib <*> static route <*> qualified-next-hop <*> metric
+unreachable (leaf changed nothing)	routing-options rib <*> static route <*> qualified-next-hop <*> preference
+unreachable (leaf changed nothing)	routing-options rib <*> static route <*> reject
+COMPARED	routing-options rib-groups <*> import-rib
+flag (read, but value-less)	routing-options static route <*> discard
+COMPARED	routing-options static route <*> next-hop <*> interface
+COMPARED	routing-options static route <*> next-table
+COMPARED	routing-options static route <*> preference
+COMPARED	routing-options static route <*> qualified-next-hop <*> interface
+COMPARED	routing-options static route <*> qualified-next-hop <*> metric
+COMPARED	routing-options static route <*> qualified-next-hop <*> preference
+flag (read, but value-less)	routing-options static route <*> reject
+flag (read, but value-less)	schedulers scheduler <*> daily all-day
+unreachable (leaf changed nothing)	schedulers scheduler <*> daily exclude
+COMPARED	schedulers scheduler <*> daily start-time
+COMPARED	schedulers scheduler <*> daily stop-time
+flag (read, but value-less)	schedulers scheduler <*> friday all-day
+flag (read, but value-less)	schedulers scheduler <*> friday exclude
+COMPARED	schedulers scheduler <*> friday start-time
+COMPARED	schedulers scheduler <*> friday stop-time
+flag (read, but value-less)	schedulers scheduler <*> monday all-day
+flag (read, but value-less)	schedulers scheduler <*> monday exclude
+COMPARED	schedulers scheduler <*> monday start-time
+COMPARED	schedulers scheduler <*> monday stop-time
+flag (read, but value-less)	schedulers scheduler <*> saturday all-day
+flag (read, but value-less)	schedulers scheduler <*> saturday exclude
+COMPARED	schedulers scheduler <*> saturday start-time
+COMPARED	schedulers scheduler <*> saturday stop-time
+COMPARED	schedulers scheduler <*> start-date
+COMPARED	schedulers scheduler <*> start-time
+COMPARED	schedulers scheduler <*> stop-date
+COMPARED	schedulers scheduler <*> stop-time
+flag (read, but value-less)	schedulers scheduler <*> sunday all-day
+flag (read, but value-less)	schedulers scheduler <*> sunday exclude
+COMPARED	schedulers scheduler <*> sunday start-time
+COMPARED	schedulers scheduler <*> sunday stop-time
+flag (read, but value-less)	schedulers scheduler <*> thursday all-day
+flag (read, but value-less)	schedulers scheduler <*> thursday exclude
+COMPARED	schedulers scheduler <*> thursday start-time
+COMPARED	schedulers scheduler <*> thursday stop-time
+flag (read, but value-less)	schedulers scheduler <*> tuesday all-day
+flag (read, but value-less)	schedulers scheduler <*> tuesday exclude
+COMPARED	schedulers scheduler <*> tuesday start-time
+COMPARED	schedulers scheduler <*> tuesday stop-time
+flag (read, but value-less)	schedulers scheduler <*> wednesday all-day
+flag (read, but value-less)	schedulers scheduler <*> wednesday exclude
+COMPARED	schedulers scheduler <*> wednesday start-time
+COMPARED	schedulers scheduler <*> wednesday stop-time
+COMPARED	security address-book global address-set <*> address
+COMPARED	security address-book global address-set <*> address-set
+unreachable (leaf changed nothing)	security address-book global address-set <*> description
+unreachable (leaf changed nothing)	security alg dns
+unreachable (leaf changed nothing)	security alg ftp
+unreachable (leaf changed nothing)	security alg sip
+unreachable (leaf changed nothing)	security alg tftp
+COMPARED	security dynamic-address address-name <*> profile feed-name
+COMPARED	security dynamic-address feed-server <*> feed-name <*> path
+COMPARED	security dynamic-address feed-server <*> hold-interval
+COMPARED	security dynamic-address feed-server <*> hostname
+COMPARED	security dynamic-address feed-server <*> update-interval
+COMPARED	security dynamic-address feed-server <*> url
+COMPARED	security flow aging early-ageout
+COMPARED	security flow aging high-watermark
+COMPARED	security flow aging low-watermark
+flag (read, but value-less)	security flow allow-dns-reply
+flag (read, but value-less)	security flow allow-embedded-icmp
+flag (read, but value-less)	security flow force-ip-reassembly
+flag (read, but value-less)	security flow gre-performance-acceleration
+COMPARED	security flow icmp-session timeout
+COMPARED	security flow multicast-session-lifetime
+flag (read, but value-less)	security flow power-mode-disable
+flag (read, but value-less)	security flow preserve-incoming-fragment-size
+COMPARED	security flow route-change-timeout
+flag (read, but value-less)	security flow sync-icmp-session
+unreachable (leaf changed nothing)	security flow tcp-mss
+COMPARED	security flow tcp-session closing-timeout
+COMPARED	security flow tcp-session established-timeout
+COMPARED	security flow tcp-session initial-timeout
+flag (read, but value-less)	security flow tcp-session no-sequence-check
+flag (read, but value-less)	security flow tcp-session no-syn-check
+flag (read, but value-less)	security flow tcp-session no-syn-check-in-tunnel
+flag (read, but value-less)	security flow tcp-session rst-invalidate-session
+flag (read, but value-less)	security flow tcp-session strict-syn-check
+COMPARED	security flow tcp-session time-wait-timeout
+COMPARED	security flow traceoptions file
+COMPARED	security flow traceoptions flag
+COMPARED	security flow traceoptions packet-filter <*> destination-prefix
+COMPARED	security flow traceoptions packet-filter <*> protocol
+COMPARED	security flow traceoptions packet-filter <*> source-prefix
+COMPARED	security flow udp-session timeout
+COMPARED	security ike gateway <*> address
+flag (read, but value-less)	security ike gateway <*> dead-peer-detection always-send
+COMPARED	security ike gateway <*> dead-peer-detection interval
+flag (read, but value-less)	security ike gateway <*> dead-peer-detection optimized
+flag (read, but value-less)	security ike gateway <*> dead-peer-detection probe-idle-tunnel
+COMPARED	security ike gateway <*> dead-peer-detection threshold
+COMPARED	security ike gateway <*> dynamic hostname
+COMPARED	security ike gateway <*> external-interface
+COMPARED	security ike gateway <*> ike-policy
+COMPARED	security ike gateway <*> local-address
+COMPARED	security ike gateway <*> local-certificate
+COMPARED	security ike gateway <*> nat-traversal
+flag (read, but value-less)	security ike gateway <*> no-nat-traversal
+COMPARED	security ike gateway <*> version
+COMPARED	security ike policy <*> mode
+COMPARED	security ike policy <*> proposal-set
+COMPARED	security ike policy <*> proposals
+COMPARED	security ike proposal <*> authentication-algorithm
+COMPARED	security ike proposal <*> authentication-method
+unreachable (leaf changed nothing)	security ike proposal <*> description
+COMPARED	security ike proposal <*> dh-group
+COMPARED	security ike proposal <*> encryption-algorithm
+COMPARED	security ike proposal <*> lifetime-seconds
+COMPARED	security ipsec gateway <*> address
+flag (read, but value-less)	security ipsec gateway <*> dead-peer-detection always-send
+COMPARED	security ipsec gateway <*> dead-peer-detection interval
+flag (read, but value-less)	security ipsec gateway <*> dead-peer-detection optimized
+flag (read, but value-less)	security ipsec gateway <*> dead-peer-detection probe-idle-tunnel
+COMPARED	security ipsec gateway <*> dead-peer-detection threshold
+COMPARED	security ipsec gateway <*> dynamic hostname
+COMPARED	security ipsec gateway <*> external-interface
+COMPARED	security ipsec gateway <*> ike-policy
+COMPARED	security ipsec gateway <*> local-address
+COMPARED	security ipsec gateway <*> local-certificate
+COMPARED	security ipsec gateway <*> nat-traversal
+flag (read, but value-less)	security ipsec gateway <*> no-nat-traversal
+COMPARED	security ipsec gateway <*> version
+COMPARED	security ipsec policy <*> perfect-forward-secrecy keys
+COMPARED	security ipsec policy <*> proposal-set
+COMPARED	security ipsec policy <*> proposals
+COMPARED	security ipsec proposal <*> authentication-algorithm
+unreachable (leaf changed nothing)	security ipsec proposal <*> description
+COMPARED	security ipsec proposal <*> dh-group
+COMPARED	security ipsec proposal <*> encryption-algorithm
+COMPARED	security ipsec proposal <*> lifetime-kilobytes
+COMPARED	security ipsec proposal <*> lifetime-seconds
+COMPARED	security ipsec proposal <*> protocol
+COMPARED	security ipsec vpn <*> bind-interface
+COMPARED	security ipsec vpn <*> df-bit
+COMPARED	security ipsec vpn <*> establish-tunnels
+COMPARED	security ipsec vpn <*> ike gateway
+COMPARED	security ipsec vpn <*> ike ipsec-policy
+COMPARED	security ipsec vpn <*> local-address
+COMPARED	security ipsec vpn <*> local-identity
+unreachable (leaf changed nothing)	security ipsec vpn <*> manual authentication
+unreachable (leaf changed nothing)	security ipsec vpn <*> manual authentication-algorithm
+unreachable (leaf changed nothing)	security ipsec vpn <*> manual encryption
+unreachable (leaf changed nothing)	security ipsec vpn <*> manual encryption-algorithm
+unreachable (leaf changed nothing)	security ipsec vpn <*> manual protocol
+unreachable (leaf changed nothing)	security ipsec vpn <*> manual spi
+COMPARED	security ipsec vpn <*> pre-shared-key
+COMPARED	security ipsec vpn <*> remote-identity
+COMPARED	security ipsec vpn <*> traffic-selector <*> local-ip
+COMPARED	security ipsec vpn <*> traffic-selector <*> remote-ip
+COMPARED	security ipsec vpn <*> vpn-monitor destination-ip
+flag (read, but value-less)	security ipsec vpn <*> vpn-monitor optimized
+COMPARED	security ipsec vpn <*> vpn-monitor source-interface
+COMPARED	security log format
+COMPARED	security log mode
+unreachable (leaf changed nothing)	security log profile <*> category session field-extra-name
+flag (read, but value-less)	security log profile <*> default-profile
+COMPARED	security log profile <*> stream-name
+COMPARED	security log source-interface
+COMPARED	security log stream <*> category
+COMPARED	security log stream <*> facility
+COMPARED	security log stream <*> format
+COMPARED	security log stream <*> host
+COMPARED	security log stream <*> port
+COMPARED	security log stream <*> severity
+COMPARED	security log stream <*> source-address
+COMPARED	security log stream <*> source-interface
+unreachable (leaf changed nothing)	security log stream <*> transport protocol
+advisory (read, value ignored, warning says so)	security log stream <*> transport tls-profile
+COMPARED	security nat destination pool <*> address
+COMPARED	security nat destination rule-set <*> from interface
+COMPARED	security nat destination rule-set <*> from routing-instance
+COMPARED	security nat destination rule-set <*> from zone
+COMPARED	security nat destination rule-set <*> rule <*> match application
+COMPARED	security nat destination rule-set <*> rule <*> match destination-address
+COMPARED	security nat destination rule-set <*> rule <*> match destination-address-name
+COMPARED	security nat destination rule-set <*> rule <*> match destination-port
+COMPARED	security nat destination rule-set <*> rule <*> match protocol
+COMPARED	security nat destination rule-set <*> rule <*> match source-address
+COMPARED	security nat destination rule-set <*> rule <*> match source-address-name
+flag (read, but value-less)	security nat destination rule-set <*> rule <*> then destination-nat off
+COMPARED	security nat destination rule-set <*> rule <*> then destination-nat pool
+COMPARED	security nat nat64 rule-set <*> prefix
+COMPARED	security nat nat64 rule-set <*> source-pool
+flag (read, but value-less)	security nat natv6v4 no-v6-frag-header
+COMPARED	security nat proxy-arp interface <*> address
+flag (read, but value-less)	security nat source address-persistent
+unreachable (leaf changed nothing)	security nat source interface port-overloading
+COMPARED	security nat source pool <*> address
+COMPARED	security nat source pool <*> persistent-nat inactivity-timeout
+unreachable (leaf changed nothing)	security nat source pool <*> persistent-nat permit
+err (parent stanza does not compile)	security nat source pool <*> port deterministic block-size
+err (parent stanza does not compile)	security nat source pool <*> port deterministic host address
+flag (read, but value-less)	security nat source pool <*> port no-translation
+COMPARED	security nat source pool <*> port-overloading-factor
+COMPARED	security nat source pool <*> routing-instance
+COMPARED	security nat source rule-set <*> from interface
+COMPARED	security nat source rule-set <*> from routing-instance
+COMPARED	security nat source rule-set <*> from zone
+COMPARED	security nat source rule-set <*> rule <*> match application
+COMPARED	security nat source rule-set <*> rule <*> match destination-address
+COMPARED	security nat source rule-set <*> rule <*> match destination-address-name
+COMPARED	security nat source rule-set <*> rule <*> match destination-port
+COMPARED	security nat source rule-set <*> rule <*> match source-address
+COMPARED	security nat source rule-set <*> rule <*> match source-address-name
+flag (read, but value-less)	security nat source rule-set <*> rule <*> then source-nat interface
+flag (read, but value-less)	security nat source rule-set <*> rule <*> then source-nat off
+COMPARED	security nat source rule-set <*> rule <*> then source-nat pool
+COMPARED	security nat source rule-set <*> to interface
+COMPARED	security nat source rule-set <*> to routing-instance
+COMPARED	security nat source rule-set <*> to zone
+COMPARED	security nat static rule-set <*> from interface
+COMPARED	security nat static rule-set <*> from routing-instance
+COMPARED	security nat static rule-set <*> from zone
+COMPARED	security nat static rule-set <*> rule <*> match destination-address
+COMPARED	security nat static rule-set <*> rule <*> match destination-port
+COMPARED	security nat static rule-set <*> rule <*> match source-address
+unreachable (leaf changed nothing)	security nat static rule-set <*> rule <*> then static-nat
+unreachable (leaf changed nothing)	security policies default-policy
+unreachable (leaf changed nothing)	security policies default-policy-log
+COMPARED	security policies from-zone <*> <*> <*> policy <*> description
+COMPARED	security policies from-zone <*> <*> <*> policy <*> match application
+COMPARED	security policies from-zone <*> <*> <*> policy <*> match destination-address
+flag (read, but value-less)	security policies from-zone <*> <*> <*> policy <*> match destination-address-excluded
+COMPARED	security policies from-zone <*> <*> <*> policy <*> match source-address
+flag (read, but value-less)	security policies from-zone <*> <*> <*> policy <*> match source-address-excluded
+unreachable (leaf changed nothing)	security policies from-zone <*> <*> <*> policy <*> scheduler-name
+flag (read, but value-less)	security policies from-zone <*> <*> <*> policy <*> then count
+flag (read, but value-less)	security policies from-zone <*> <*> <*> policy <*> then deny count
+flag (read, but value-less)	security policies from-zone <*> <*> <*> policy <*> then deny log
+flag (read, but value-less)	security policies from-zone <*> <*> <*> policy <*> then log
+flag (read, but value-less)	security policies from-zone <*> <*> <*> policy <*> then permit
+flag (read, but value-less)	security policies from-zone <*> <*> <*> policy <*> then reject
+COMPARED	security policies global policy <*> description
+COMPARED	security policies global policy <*> match application
+COMPARED	security policies global policy <*> match destination-address
+flag (read, but value-less)	security policies global policy <*> match destination-address-excluded
+COMPARED	security policies global policy <*> match from-zone
+COMPARED	security policies global policy <*> match source-address
+flag (read, but value-less)	security policies global policy <*> match source-address-excluded
+COMPARED	security policies global policy <*> match to-zone
+unreachable (leaf changed nothing)	security policies global policy <*> scheduler-name
+flag (read, but value-less)	security policies global policy <*> then count
+flag (read, but value-less)	security policies global policy <*> then deny count
+flag (read, but value-less)	security policies global policy <*> then deny log
+flag (read, but value-less)	security policies global policy <*> then log
+flag (read, but value-less)	security policies global policy <*> then permit
+flag (read, but value-less)	security policies global policy <*> then reject
+flag (read, but value-less)	security policies policy-rematch extensive
+unreachable (leaf changed nothing)	security policy-stats system-wide
+unreachable (leaf changed nothing)	security pre-id-default-policy then log
+COMPARED	security screen ids-option <*> icmp flood threshold
+COMPARED	security screen ids-option <*> ip ip-sweep threshold
+COMPARED	security screen ids-option <*> limit-session destination-ip-based
+COMPARED	security screen ids-option <*> limit-session source-ip-based
+COMPARED	security screen ids-option <*> tcp port-scan threshold
+COMPARED	security screen ids-option <*> tcp syn-flood alarm-threshold
+COMPARED	security screen ids-option <*> tcp syn-flood attack-threshold
+COMPARED	security screen ids-option <*> tcp syn-flood destination-threshold
+COMPARED	security screen ids-option <*> tcp syn-flood source-threshold
+COMPARED	security screen ids-option <*> tcp syn-flood timeout
+COMPARED	security screen ids-option <*> udp flood threshold
+unreachable (leaf changed nothing)	security ssh-known-hosts host
+COMPARED	security zones security-zone <*> address-book address-set <*> address
+COMPARED	security zones security-zone <*> address-book address-set <*> address-set
+unreachable (leaf changed nothing)	security zones security-zone <*> address-book address-set <*> description
+COMPARED	security zones security-zone <*> description
+COMPARED	security zones security-zone <*> host-inbound-traffic protocols
+COMPARED	security zones security-zone <*> host-inbound-traffic system-services
+COMPARED	security zones security-zone <*> interfaces <*> host-inbound-traffic protocols
+COMPARED	security zones security-zone <*> interfaces <*> host-inbound-traffic system-services
+COMPARED	security zones security-zone <*> screen
+flag (read, but value-less)	security zones security-zone <*> tcp-rst
+flag (read, but value-less)	services application-identification
+COMPARED	services flow-monitoring version-ipfix template <*> flow-active-timeout
+COMPARED	services flow-monitoring version-ipfix template <*> flow-inactive-timeout
+COMPARED	services flow-monitoring version-ipfix template <*> ipv4-template export-extension
+COMPARED	services flow-monitoring version-ipfix template <*> ipv6-template export-extension
+COMPARED	services flow-monitoring version-ipfix template <*> template-refresh-rate seconds
+COMPARED	services flow-monitoring version9 template <*> flow-active-timeout
+COMPARED	services flow-monitoring version9 template <*> flow-inactive-timeout
+COMPARED	services flow-monitoring version9 template <*> template-refresh-rate seconds
+err (parent stanza does not compile)	services ip-monitoring policy <*> hold-down
+err (parent stanza does not compile)	services ip-monitoring policy <*> match rpm-probe
+err (parent stanza does not compile)	services ip-monitoring policy <*> then preferred-route route <*> next-hop
+err (parent stanza does not compile)	services ip-monitoring policy <*> then preferred-route route <*> preferred-metric
+err (parent stanza does not compile)	services ip-monitoring policy <*> then preferred-route routing-instance <*> route <*> next-hop
+err (parent stanza does not compile)	services ip-monitoring policy <*> then preferred-route routing-instance <*> route <*> preferred-metric
+err (parent stanza does not compile)	services rpm probe <*> test <*> destination-interface
+err (parent stanza does not compile)	services rpm probe <*> test <*> destination-port
+err (parent stanza does not compile)	services rpm probe <*> test <*> next-hop
+err (parent stanza does not compile)	services rpm probe <*> test <*> probe-count
+err (parent stanza does not compile)	services rpm probe <*> test <*> probe-interval
+err (parent stanza does not compile)	services rpm probe <*> test <*> probe-limit
+err (parent stanza does not compile)	services rpm probe <*> test <*> probe-type
+err (parent stanza does not compile)	services rpm probe <*> test <*> routing-instance
+err (parent stanza does not compile)	services rpm probe <*> test <*> source-address
+err (parent stanza does not compile)	services rpm probe <*> test <*> target address
+err (parent stanza does not compile)	services rpm probe <*> test <*> target url
+err (parent stanza does not compile)	services rpm probe <*> test <*> test-interval
+err (parent stanza does not compile)	services rpm probe <*> test <*> thresholds successive-loss
+unreachable (leaf changed nothing)	services rpm probe-limit
+COMPARED	snmp community <*> authorization
+COMPARED	snmp community <*> clients
+COMPARED	snmp trap-group <*> categories
+COMPARED	snmp trap-group <*> targets
+COMPARED	snmp trap-group <*> version
+COMPARED	snmp v3 usm local-engine user <*> authentication-md5 authentication-password
+COMPARED	snmp v3 usm local-engine user <*> authentication-sha authentication-password
+COMPARED	snmp v3 usm local-engine user <*> authentication-sha256 authentication-password
+COMPARED	snmp v3 usm local-engine user <*> privacy-aes128 privacy-password
+COMPARED	snmp v3 usm local-engine user <*> privacy-des privacy-password
+COMPARED	system archival configuration archive-sites
+COMPARED	system archival configuration transfer-interval
+flag (read, but value-less)	system archival configuration transfer-on-commit
+COMPARED	system backup-router <*> destination
+COMPARED	system dataplane binary
+unreachable (leaf changed nothing)	system dataplane claim-host-tunables
+flag (read, but value-less)	system dataplane coalescence adaptive
+COMPARED	system dataplane coalescence rx-usecs
+COMPARED	system dataplane coalescence tx-usecs
+COMPARED	system dataplane control-socket
+advisory (read, value ignored, warning says so)	system dataplane cores
+COMPARED	system dataplane cpu-governor
+advisory (read, value ignored, warning says so)	system dataplane memory
+COMPARED	system dataplane netdev-budget
+unreachable (leaf changed nothing)	system dataplane poll-mode
+unreachable (leaf changed nothing)	system dataplane ports <*> cores
+unreachable (leaf changed nothing)	system dataplane ports <*> interface
+unreachable (leaf changed nothing)	system dataplane ports <*> rx-mode
+COMPARED	system dataplane ring-entries
+unreachable (leaf changed nothing)	system dataplane rss-indirection
+unreachable (leaf changed nothing)	system dataplane rx-mode idle-threshold
+unreachable (leaf changed nothing)	system dataplane rx-mode resume-threshold
+unreachable (leaf changed nothing)	system dataplane rx-mode sleep-timeout
+COMPARED	system dataplane shared-umem artifact-file
+COMPARED	system dataplane shared-umem interface
+COMPARED	system dataplane shared-umem mode
+COMPARED	system dataplane shared-umem phase0-artifact-file
+advisory (read, value ignored, warning says so)	system dataplane socket-mem
+COMPARED	system dataplane state-file
+COMPARED	system dataplane workers
+unreachable (leaf changed nothing)	system dataplane-type
+COMPARED	system domain-name
+COMPARED	system domain-search
+COMPARED	system host-name
+flag (read, but value-less)	system internet-options no-ipv6-reject-zero-hop-limit
+COMPARED	system license autoupdate url
+COMPARED	system login class <*> allow-commands
+unreachable (leaf changed nothing)	system login class <*> allow-commands-regexps
+COMPARED	system login class <*> allow-configuration
+unreachable (leaf changed nothing)	system login class <*> allow-configuration-regexps
+COMPARED	system login class <*> deny-commands
+unreachable (leaf changed nothing)	system login class <*> deny-commands-regexps
+COMPARED	system login class <*> deny-configuration
+unreachable (leaf changed nothing)	system login class <*> deny-configuration-regexps
+COMPARED	system login class <*> idle-timeout
+unreachable (leaf changed nothing)	system login class <*> login-alarms
+unreachable (leaf changed nothing)	system login class <*> login-tip
+COMPARED	system login class <*> permissions
+COMPARED	system login user <*> authentication encrypted-password
+COMPARED	system login user <*> authentication ssh-dsa
+COMPARED	system login user <*> authentication ssh-ed25519
+COMPARED	system login user <*> authentication ssh-rsa
+COMPARED	system login user <*> class
+COMPARED	system login user <*> uid
+COMPARED	system master-password pseudorandom-function
+COMPARED	system name-server
+flag (read, but value-less)	system no-redirects
+COMPARED	system ntp server <*> key
+flag (read, but value-less)	system ntp server <*> prefer
+COMPARED	system ntp server <*> routing-instance
+COMPARED	system ntp server <*> version
+COMPARED	system ntp threshold <*> action
+unreachable (leaf changed nothing)	system processes
+COMPARED	system root-authentication encrypted-password
+COMPARED	system root-authentication ssh-dsa
+COMPARED	system root-authentication ssh-ed25519
+COMPARED	system root-authentication ssh-rsa
+COMPARED	system services dhcp-local-server dhcp-socket-type
+COMPARED	system services dhcp-local-server dynamic-dns backend
+COMPARED	system services dhcp-local-server dynamic-dns conflict-policy
+COMPARED	system services dhcp-local-server dynamic-dns destination-interface
+COMPARED	system services dhcp-local-server dynamic-dns domain
+flag (read, but value-less)	system services dhcp-local-server dynamic-dns enable
+COMPARED	system services dhcp-local-server dynamic-dns hostname-source
+COMPARED	system services dhcp-local-server dynamic-dns routing-instance
+COMPARED	system services dhcp-local-server dynamic-dns source-address
+COMPARED	system services dhcp-local-server dynamic-dns tsig-algorithm
+COMPARED	system services dhcp-local-server dynamic-dns tsig-key
+COMPARED	system services dhcp-local-server dynamic-dns tsig-secret
+COMPARED	system services dhcp-local-server dynamic-dns ttl
+COMPARED	system services dhcp-local-server dynamic-dns update-server
+flag (read, but value-less)	system services dhcp-local-server expired-leases-processing enable
+COMPARED	system services dhcp-local-server expired-leases-processing flush-timer
+COMPARED	system services dhcp-local-server expired-leases-processing hold-time
+COMPARED	system services dhcp-local-server expired-leases-processing max-leases
+COMPARED	system services dhcp-local-server expired-leases-processing max-time
+COMPARED	system services dhcp-local-server expired-leases-processing reclaim-timer
+COMPARED	system services dhcp-local-server expired-leases-processing unwarned-cycles
+unreachable (leaf changed nothing)	system services dhcp-local-server group <*> interface <*> access-profile
+unreachable (leaf changed nothing)	system services dhcp-local-server group <*> interface <*> client-discover-match
+unreachable (leaf changed nothing)	system services dhcp-local-server group <*> interface <*> dynamic-profile
+unreachable (leaf changed nothing)	system services dhcp-local-server group <*> interface <*> exclude
+unreachable (leaf changed nothing)	system services dhcp-local-server group <*> interface <*> overrides
+unreachable (leaf changed nothing)	system services dhcp-local-server group <*> interface <*> service-profile
+unreachable (leaf changed nothing)	system services dhcp-local-server group <*> interface <*> short-cycle-protection-lockout-max-time
+unreachable (leaf changed nothing)	system services dhcp-local-server group <*> interface <*> short-cycle-protection-lockout-min-time
+unreachable (leaf changed nothing)	system services dhcp-local-server group <*> interface <*> trace
+unreachable (leaf changed nothing)	system services dhcp-local-server group <*> interface <*> upgrade-server
+COMPARED	system services dhcp-local-server group <*> pool <*> dns-server
+COMPARED	system services dhcp-local-server group <*> pool <*> static-binding <*> fixed-address
+COMPARED	system services dhcp-local-server group <*> pool <*> static-binding <*> host-name
+COMPARED	system services dhcpv6-local-server dynamic-dns backend
+COMPARED	system services dhcpv6-local-server dynamic-dns conflict-policy
+COMPARED	system services dhcpv6-local-server dynamic-dns destination-interface
+COMPARED	system services dhcpv6-local-server dynamic-dns domain
+flag (read, but value-less)	system services dhcpv6-local-server dynamic-dns enable
+COMPARED	system services dhcpv6-local-server dynamic-dns hostname-source
+COMPARED	system services dhcpv6-local-server dynamic-dns routing-instance
+COMPARED	system services dhcpv6-local-server dynamic-dns source-address
+COMPARED	system services dhcpv6-local-server dynamic-dns tsig-algorithm
+COMPARED	system services dhcpv6-local-server dynamic-dns tsig-key
+COMPARED	system services dhcpv6-local-server dynamic-dns tsig-secret
+COMPARED	system services dhcpv6-local-server dynamic-dns ttl
+COMPARED	system services dhcpv6-local-server dynamic-dns update-server
+flag (read, but value-less)	system services dhcpv6-local-server expired-leases-processing enable
+COMPARED	system services dhcpv6-local-server expired-leases-processing flush-timer
+COMPARED	system services dhcpv6-local-server expired-leases-processing hold-time
+COMPARED	system services dhcpv6-local-server expired-leases-processing max-leases
+COMPARED	system services dhcpv6-local-server expired-leases-processing max-time
+COMPARED	system services dhcpv6-local-server expired-leases-processing reclaim-timer
+COMPARED	system services dhcpv6-local-server expired-leases-processing unwarned-cycles
+unreachable (leaf changed nothing)	system services dhcpv6-local-server group <*> interface <*> access-profile
+unreachable (leaf changed nothing)	system services dhcpv6-local-server group <*> interface <*> client-discover-match
+unreachable (leaf changed nothing)	system services dhcpv6-local-server group <*> interface <*> dynamic-profile
+unreachable (leaf changed nothing)	system services dhcpv6-local-server group <*> interface <*> exclude
+unreachable (leaf changed nothing)	system services dhcpv6-local-server group <*> interface <*> overrides
+unreachable (leaf changed nothing)	system services dhcpv6-local-server group <*> interface <*> service-profile
+unreachable (leaf changed nothing)	system services dhcpv6-local-server group <*> interface <*> short-cycle-protection-lockout-max-time
+unreachable (leaf changed nothing)	system services dhcpv6-local-server group <*> interface <*> short-cycle-protection-lockout-min-time
+unreachable (leaf changed nothing)	system services dhcpv6-local-server group <*> interface <*> trace
+unreachable (leaf changed nothing)	system services dhcpv6-local-server group <*> interface <*> upgrade-server
+COMPARED	system services dhcpv6-local-server group <*> pool <*> dns-server
+COMPARED	system services dhcpv6-local-server group <*> pool <*> static-binding <*> fixed-address
+COMPARED	system services dhcpv6-local-server group <*> pool <*> static-binding <*> host-name
+flag (read, but value-less)	system services dns
+COMPARED	system services dynamic-dns error-backoff-max
+COMPARED	system services dynamic-dns forced-refresh
+COMPARED	system services dynamic-dns provider <*> api-token
+COMPARED	system services dynamic-dns provider <*> aws-access-key
+COMPARED	system services dynamic-dns provider <*> aws-region
+COMPARED	system services dynamic-dns provider <*> aws-secret-key
+COMPARED	system services dynamic-dns provider <*> backend
+COMPARED	system services dynamic-dns provider <*> checkip-allowlist
+COMPARED	system services dynamic-dns provider <*> checkip-url
+COMPARED	system services dynamic-dns provider <*> destination-interface
+COMPARED	system services dynamic-dns provider <*> hosted-zone-id
+COMPARED	system services dynamic-dns provider <*> ok-response
+COMPARED	system services dynamic-dns provider <*> password
+COMPARED	system services dynamic-dns provider <*> routing-instance
+COMPARED	system services dynamic-dns provider <*> server
+COMPARED	system services dynamic-dns provider <*> source-address
+COMPARED	system services dynamic-dns provider <*> tsig-algorithm
+COMPARED	system services dynamic-dns provider <*> tsig-key
+COMPARED	system services dynamic-dns provider <*> tsig-secret
+COMPARED	system services dynamic-dns provider <*> update-server
+COMPARED	system services dynamic-dns provider <*> url-template
+COMPARED	system services dynamic-dns provider <*> username
+COMPARED	system services dynamic-dns provider <*> zone
+unreachable (leaf changed nothing)	system services netconf ssh
+COMPARED	system services ssh ciphers
+COMPARED	system services ssh client-alive-count-max
+COMPARED	system services ssh client-alive-interval
+COMPARED	system services ssh connection-limit
+COMPARED	system services ssh key-exchange
+COMPARED	system services ssh macs
+COMPARED	system services ssh protocol-version
+advisory (read, value ignored, warning says so)	system services ssh rate-limit
+COMPARED	system services ssh root-login
+COMPARED	system services web-management api-auth api-key
+COMPARED	system services web-management api-auth user <*> password
+COMPARED	system services web-management http interface
+COMPARED	system services web-management https interface
+flag (read, but value-less)	system services web-management https system-generated-certificate
+unreachable (leaf changed nothing)	system syslog file <*> allow-duplicates
+flag (read, but value-less)	system syslog file <*> archive archive-sites
+flag (read, but value-less)	system syslog file <*> archive files
+flag (read, but value-less)	system syslog file <*> archive no-world-readable
+flag (read, but value-less)	system syslog file <*> archive size
+flag (read, but value-less)	system syslog file <*> archive start-time
+flag (read, but value-less)	system syslog file <*> archive transfer-interval
+flag (read, but value-less)	system syslog file <*> archive world-readable
+unreachable (leaf changed nothing)	system syslog file <*> explicit-priority
+unreachable (leaf changed nothing)	system syslog file <*> match
+unreachable (leaf changed nothing)	system syslog file <*> match-strings
+unreachable (leaf changed nothing)	system syslog file <*> structured-data brief
+flag (read, but value-less)	system syslog host <*> allow-duplicates
+unreachable (leaf changed nothing)	system syslog host <*> exclude-hostname
+unreachable (leaf changed nothing)	system syslog host <*> explicit-priority
+unreachable (leaf changed nothing)	system syslog host <*> facility-override
+unreachable (leaf changed nothing)	system syslog host <*> log-prefix
+unreachable (leaf changed nothing)	system syslog host <*> match
+unreachable (leaf changed nothing)	system syslog host <*> match-strings
+COMPARED	system syslog host <*> port
+unreachable (leaf changed nothing)	system syslog host <*> routing-instance
+COMPARED	system syslog host <*> source-address
+unreachable (leaf changed nothing)	system syslog host <*> structured-data brief
+unreachable (leaf changed nothing)	system syslog user <*> allow-duplicates
+unreachable (leaf changed nothing)	system syslog user <*> explicit-priority
+unreachable (leaf changed nothing)	system syslog user <*> match
+unreachable (leaf changed nothing)	system syslog user <*> match-strings
+unreachable (leaf changed nothing)	system syslog user <*> structured-data brief
+COMPARED	system time-zone
