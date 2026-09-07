@@ -380,6 +380,15 @@ type Config struct {
 	// enforced address set is frozen (retain-forever default). Optional; if
 	// nil, the feed gauges are omitted.
 	FeedsFn func() map[string]feeds.FeedInfo
+	// SyslogDropsFn surfaces per-collector remote-syslog drop counters for the
+	// xpf_syslog_messages_dropped_total family (#9165). Before it, all three
+	// SyslogClient drop accessors had ZERO production readers: a counted drop
+	// reached an operator only through the package's own ≤1/s slog.Warn, so a
+	// rate-limited warning left no trace at all. Syslog is where an operator
+	// looks AFTER an incident, and a dead collector means that record does not
+	// exist — while a `show` still renders the collector as configured.
+	// Optional; if nil, the family is omitted.
+	SyslogDropsFn func() []logging.SyslogDropStat
 	// DDNSStatsFn surfaces the DHCP dynamic-DNS counter snapshot for the
 	// xpf_dhcp_ddns_* metric family (#1387 inc-2). The daemon owns the
 	// always-on DDNS manager; the API reads it through this function so the
@@ -550,6 +559,7 @@ type Server struct {
 	eventActionStatsFn                   func() eventengine.Stats
 	rpmPinFailedFn                       func() float64
 	feedsFn                              func() map[string]feeds.FeedInfo
+	syslogDropsFn                        func() []logging.SyslogDropStat
 	ddnsStatsFn                          func() *dhcpserver.DDNSStats
 	surfaceAStatsFn                      func() *ddns.SurfaceAStats
 	flowCollectorHealthFn                func() []flowexport.ExporterCollectorHealth
@@ -670,6 +680,7 @@ func NewServer(cfg Config) *Server {
 		eventActionStatsFn:                   cfg.EventActionStatsFn,
 		rpmPinFailedFn:                       cfg.RPMPinFailedFn,
 		feedsFn:                              cfg.FeedsFn,
+		syslogDropsFn:                        cfg.SyslogDropsFn,
 		ddnsStatsFn:                          cfg.DDNSStatsFn,
 		surfaceAStatsFn:                      cfg.SurfaceAStatsFn,
 		flowCollectorHealthFn:                cfg.FlowCollectorHealthFn,

@@ -47,6 +47,26 @@ func runUniformGatesRoutingRibRPM(tree *ConfigTree, cfg *Config, opts compileOpt
 		}
 	}
 
+	// #9409: `protocols` under `instance-type forwarding`. The assembler clears
+	// VRFName for a forwarding instance (correct for statics, which render into
+	// `table <id>`) and the protocol renderer reads an empty VRFName as "the
+	// GLOBAL instance", so an instance-scoped OSPF/OSPFv3/IS-IS/RIP was
+	// activated in the global routing context and an instance-scoped BGP
+	// neighbor silently JOINED THE GLOBAL AS — on a commit all four channels
+	// accept with zero warnings. Strict on commit / commit-check (hard reject
+	// so the unsupported composition is operator-visible); lenient on load /
+	// peer-sync (warn — #1960; assembleFRRConfig drops a forwarding instance's
+	// protocols rather than merging them, so a leniently-loaded config is
+	// already inert). Mirrors validateNextTableTargetReferencesStrict.
+	if err := validateForwardingInstanceProtocolsStrict(cfg); err != nil {
+		if opts.lenientForwardingInstanceProtocols {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("forwarding-instance protocols (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #5854: next-table / interface-routes rib-group ip-rule WINDOW gate. The
 	// runtime applier programs these leaks into FIXED priority windows
 	// (pkg/routing/rules.go: 100 next-table rules, 1000 rib-group leak rules) and

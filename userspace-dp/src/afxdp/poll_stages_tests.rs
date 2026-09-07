@@ -4458,3 +4458,96 @@ fn ndp_na_learn_still_accepts_unicast_mac_9115() {
     );
 }
 
+
+/// #9425 member 1, END TO END through the real verdict consumer.
+///
+/// `ScreenState::alarm_without_drop` returning true is only half a claim — a
+/// guard whose name is in the file can be unreachable, and a source-level or
+/// state-level assertion cannot tell. This drives the actual `stage_screen_*`
+/// consumers with an INERT zone in audit mode and asserts the packet is
+/// FORWARDED with a log-only alarm counted, on BOTH the flow path and the
+/// flowless path — the two separate `None` branches that route into
+/// `missing_profile_verdict`.
+///
+/// Each leg carries its own baseline in the same run (the identical zone
+/// WITHOUT the modifier), because "audit mode forwarded it" and "the
+/// substitution never produced a verdict to suppress" otherwise read the same:
+/// a cell that only asserts `!dropped` is satisfied by a substitution that
+/// silently passes, which is the #7888 fail-open this must NOT reintroduce.
+///
+/// FAIL-ON-REVERT: drop the `inert_profile_refs` fallback from
+/// `ScreenState::alarm_without_drop` and the audit legs go back to dropping.
+#[test]
+fn inert_zone_audit_mode_forwards_the_substituted_default_9425() {
+    fn inert_screen(audit: bool) -> ScreenState {
+        let mut screen = ScreenState::new();
+        let mut inert = FxHashMap::default();
+        inert.insert(
+            "lan".to_string(),
+            crate::screen::InertProfileRef {
+                profile: "audit-only".to_string(),
+                alarm_without_drop: audit,
+            },
+        );
+        screen.update_inert_profiles(inert);
+        screen
+    }
+
+    // (1) Flowless: a teardrop-shaped fragment, which conservative_default()
+    //     enables and which #7888 hard-drops for an inert zone.
+    let frag = ipv4_fragment_frame(0x0001, FRAG_PROTO_UDP, 4);
+    let frag_meta = ipv4_fragment_meta(&frag, FRAG_PROTO_UDP);
+    let mut base = inert_screen(false);
+    let (d0, n0) = run_stage_screen(&mut base, &frag, frag_meta, None);
+    assert!(
+        d0 && n0 == 1,
+        "BASELINE: an inert zone with no audit modifier must still hard-drop the \
+         substituted default (#7888). Without this the audit leg below could be \
+         satisfied by a substitution that produced no verdict at all"
+    );
+    assert_eq!(base.substituted_default_drops(), 1);
+
+    let mut audit = inert_screen(true);
+    let (d1, n1) = run_stage_screen(&mut audit, &frag, frag_meta, None);
+    assert!(
+        !d1 && n1 == 0,
+        "an INERT zone whose DEFINED profile carries alarm-without-drop must FORWARD \
+         the substituted-default trip on the flowless path (#9425)"
+    );
+    assert_eq!(
+        audit.alarm_without_drop_events(),
+        1,
+        "and raise exactly one log-only alarm — audit mode ALARMS, it does not go quiet"
+    );
+    assert_eq!(
+        audit.substituted_default_drops(),
+        1,
+        "the substituted check still RAN and still counted; only the disposition changed"
+    );
+
+    // (2) Flow path: LAND (src == dst), also in conservative_default().
+    let land = tcp_v4_frame(
+        Ipv4Addr::new(203, 0, 113, 7),
+        Ipv4Addr::new(203, 0, 113, 7),
+        40000,
+        443,
+        TCP_FLAG_SYN,
+        1,
+        0,
+    );
+    let land_meta = tcp_v4_meta(&land, TCP_FLAG_SYN);
+    let land_flow = parse_session_flow_from_bytes(&land, land_meta)
+        .expect("non-fragmented TCP yields a session flow (flow path)");
+    let mut base2 = inert_screen(false);
+    let (d2, n2) = run_stage_screen(&mut base2, &land, land_meta, Some(&land_flow));
+    assert!(d2 && n2 == 1, "BASELINE: inert zone LAND must hard-drop");
+
+    let mut audit2 = inert_screen(true);
+    let (d3, n3) = run_stage_screen(&mut audit2, &land, land_meta, Some(&land_flow));
+    assert!(
+        !d3 && n3 == 0,
+        "an INERT zone in audit mode must FORWARD the substituted-default LAND trip on \
+         the flow path too — fixing one consumer leaves half the packets dropping"
+    );
+    assert_eq!(audit2.alarm_without_drop_events(), 1);
+}

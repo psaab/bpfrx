@@ -34,6 +34,30 @@ use rustc_hash::FxHashMap;
 /// default. They exist to select the WARN text, because "the profile does not
 /// exist" and "the profile exists and enforces nothing" send an operator to
 /// two different places.
+/// #9425: what an INERT screen reference carries beyond the profile name.
+///
+/// The map value was a bare `String` (the profile name). It is a struct now
+/// because the inert state must also carry the operator's `alarm-without-drop`
+/// request: an inert zone has no `zones` entry, so
+/// `ScreenState::alarm_without_drop`'s resolved lookup misses and the #7888
+/// substituted conservative default HARD-DROPS — the exact inverse of what an
+/// operator who wrote `alarm-without-drop` and nothing else asked for, and that
+/// is the single most likely way to reach the inert state at all.
+///
+/// Deliberately NOT a second parallel map keyed on zone: two structures keyed
+/// the same way can disagree about which zones they cover, and the disagreement
+/// is silent.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub(crate) struct InertProfileRef {
+    pub profile: String,
+    /// The profile IS defined and carries `alarm-without-drop`. Honouring it
+    /// changes only the terminal disposition: the substituted checks still RUN,
+    /// still count, and now ALARM instead of dropping. The #7888 posture (do
+    /// not silently pass an inert zone) is preserved — this is drop-vs-alarm,
+    /// not drop-vs-pass.
+    pub alarm_without_drop: bool,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum UnresolvedScreen {
     /// The referenced profile is not defined at all (#3082). Strict commit
@@ -109,7 +133,7 @@ impl ScreenState {
     /// `update_missing_profiles`). Retains only the WARN rate counters for
     /// zones still in the set, so a profile that gains a check stops warning
     /// and frees its counter.
-    pub fn update_inert_profiles(&mut self, inert: FxHashMap<String, String>) {
+    pub fn update_inert_profiles(&mut self, inert: FxHashMap<String, InertProfileRef>) {
         self.inert_profile_warn_counters
             .retain(|k, _| inert.contains_key(k));
         self.inert_profile_refs = inert;
@@ -219,7 +243,7 @@ impl ScreenState {
     /// actual cause (every statement under the profile is a modifier rather
     /// than a check), and gives a different remedy.
     fn maybe_warn_inert_profile(&mut self, zone: &str, now_secs: u64) {
-        let Some(profile) = self.inert_profile_refs.get(zone) else {
+        let Some(profile) = self.inert_profile_refs.get(zone).map(|r| r.profile.clone()) else {
             return;
         };
         let limited = self
@@ -229,7 +253,7 @@ impl ScreenState {
             .increment(now_secs, MISSING_PROFILE_WARN_RATE_LIMIT_PER_SEC);
         if !limited {
             self.inert_profile_warn_count = self.inert_profile_warn_count.wrapping_add(1);
-            eprintln!("{}", inert_profile_warn_message(zone, profile));
+            eprintln!("{}", inert_profile_warn_message(zone, &profile));
         }
     }
 

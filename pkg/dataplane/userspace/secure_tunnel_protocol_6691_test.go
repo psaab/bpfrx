@@ -62,7 +62,12 @@ const preSecureTunnelProtocolVersion = 4
 // bump is for `learned_route_import_capped`, not for secure_tunnel. A v9 helper
 // still handles secure_tunnel correctly, so MinProtocolSecureTunnelRefusal (7)
 // is again untouched.
-const secureTunnelSnapshotProtocolVersion = 10
+//
+// Issue 9425 moved it 10 -> 11, same reasoning again: the bump is for
+// `ScreenMissingProfileRef.alarm_without_drop`, not for secure_tunnel. A v10
+// helper still handles secure_tunnel correctly, so
+// MinProtocolSecureTunnelRefusal (7) is untouched a third time.
+const secureTunnelSnapshotProtocolVersion = 11
 
 // preV5HelperAcceptsSnapshot models the exact-equality version gate a pre-v5
 // helper applies before touching any dataplane state

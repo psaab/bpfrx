@@ -133,7 +133,22 @@ const (
 	// acceptable?" is no, and the bump is the only mechanism that refuses the
 	// mismatched pairing — the acceptance gate is exact equality, so an
 	// unbumped field is silently ignored rather than refused.
-	ProtocolVersion = 10
+	// v11 (issue 9425): `ScreenMissingProfileRef.alarm_without_drop`. A zone
+	// whose screen profile is DEFINED but enables no check is INERT: it gets no
+	// `screens` entry, so the helper's resolved `alarm_without_drop` lookup
+	// missed and the #7888 substituted conservative default HARD-DROPPED. The
+	// canonical way into that state is `set security screen ids-option p
+	// alarm-without-drop` and nothing else — an explicit request for audit mode
+	// producing its exact inverse. The flag now rides on the inert reference so
+	// the substituted checks alarm instead of dropping.
+	//
+	// BUMPED, by the same test the v10 note applies: an old helper that ignores
+	// the field decodes false and keeps hard-dropping, and hard-dropping IS the
+	// defect. "Purely additive needs no bump" is a true rule that would license
+	// exactly this regression — the acceptance gate is exact equality, so an
+	// unbumped field is silently ignored rather than refused, and the operator
+	// would see audit mode configured, committed clean, and inverted.
+	ProtocolVersion = 11
 
 	// MinProtocolMultiZoneScopedPolicy is the FIRST snapshot protocol version
 	// that can represent a multi-zone scoped global policy — the plural

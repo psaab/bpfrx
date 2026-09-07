@@ -142,13 +142,23 @@ pub(super) fn build_screen_missing_profiles(
 /// neither map" rather than a flag inside one.
 pub(super) fn build_screen_inert_profiles(
     snapshot: &ConfigSnapshot,
-) -> FxHashMap<String, String> {
+) -> FxHashMap<String, InertProfileRef> {
     let mut out = FxHashMap::default();
     for r in &snapshot.screen_inert_profile_zones {
         if r.zone.is_empty() {
             continue;
         }
-        out.insert(r.zone.clone(), r.profile.clone());
+        out.insert(
+            r.zone.clone(),
+            // #9425: the audit modifier travels WITH the reference. Reading it
+            // only here, on the INERT set, is what keeps the shared wire struct
+            // from leaking meaning into the UNDEFINED set, where the field is
+            // always false because there is no profile to read it from.
+            InertProfileRef {
+                profile: r.profile.clone(),
+                alarm_without_drop: r.alarm_without_drop,
+            },
+        );
     }
     out
 }

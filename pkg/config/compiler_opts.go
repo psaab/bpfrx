@@ -1253,6 +1253,21 @@ type compileOpts struct {
 	// applier's tableIDs !ok guard keeps it inert. Same doctrine as
 	// lenientRibGroupRefs.
 	lenientNextTableRefs bool
+	// lenientForwardingInstanceProtocols (#9409) downgrades the
+	// forwarding-instance protocols gate
+	// (validateForwardingInstanceProtocolsStrict) from a hard compile error to
+	// a cfg.Warnings entry. `protocols` under `instance-type forwarding` was
+	// accepted on all four config channels and then rendered into the GLOBAL
+	// FRR instance, because the assembler clears VRFName for a forwarding
+	// instance (correct for statics, which need `table <id>`) and the protocol
+	// renderer reads an empty VRFName as "the master table". The strict commit /
+	// commit-check path hard-rejects so the unsupported composition is
+	// operator-visible; the tolerant load / peer-sync paths warn so an
+	// already-persisted or peer-synced config carrying it still BOOTS (#1960) —
+	// assembleFRRConfig DROPS a forwarding instance's protocols rather than
+	// merging them, so a leniently-loaded config is already inert. Same
+	// doctrine as lenientNextTableRefs.
+	lenientForwardingInstanceProtocols bool
 	// lenientRoutingRuleWindows (#5854) downgrades the next-table / rib-group
 	// ip-rule window over-subscription gate (validateRoutingRuleWindowsStrict)
 	// from a hard compile error to a cfg.Warnings entry. The runtime applier
@@ -2721,6 +2736,7 @@ func lenientCompileOpts() compileOpts {
 		lenientPolicyMatchAddressSetMembers:    true,
 		lenientRibGroupRefs:                    true,
 		lenientNextTableRefs:                   true,
+		lenientForwardingInstanceProtocols:     true,
 		lenientRoutingRuleWindows:              true,
 		lenientPolicyRouteMapSeq:               true,
 		lenientRouteDispositionConflict:        true,
