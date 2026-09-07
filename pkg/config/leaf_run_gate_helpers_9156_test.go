@@ -87,3 +87,22 @@ func ratchetLeafRunDiffers9156(differed []string) (unrecorded, fixed []string) {
 	}
 	return unrecorded, fixed
 }
+
+// strictAdmitsLeafRun9156 reports whether the STRICT commit walk admits the
+// one-line spelling of a leaf run (#9391).
+//
+// This is the operator-reachability discriminator. A row the strict gate
+// REJECTS cannot be reached by committing: it needs a config file or an HA
+// sync, and Store.compileTreeLenient logs a warning naming the leaf and saying
+// the token would be dropped. A row the strict gate ADMITS is reachable by an
+// operator typing one line, with no warning anywhere.
+//
+// It walks the same SchemaValidateWithDefinitions the commit path runs, on the
+// braced rendering, so it is the gate's own verdict rather than a model of it.
+func strictAdmitsLeafRun9156(container []string, ctx, headStmt, tailStmt string) bool {
+	tree, errs := NewParser(nest(container, ctx+headStmt+" "+tailStmt+";")).Parse()
+	if len(errs) > 0 {
+		return false
+	}
+	return SchemaValidateWithDefinitions(tree, tree, nil) == nil
+}
