@@ -2076,17 +2076,56 @@ func (d *Daemon) filterDHCPConfigForMasterRGs(cfg *config.Config) *config.DHCPSe
 		return result
 	}
 
-	var result config.DHCPServerConfig
-	if dhcpCfg.DHCPLocalServer != nil {
-		filtered := filterGroups(dhcpCfg.DHCPLocalServer.Groups)
-		if len(filtered) > 0 {
-			result.DHCPLocalServer = &config.DHCPLocalServerConfig{Groups: filtered}
+	// #9348: COPY the source and swap only what this function narrows, rather
+	// than reconstructing the result field by field.
+	//
+	// The old shape was `var result config.DHCPServerConfig` plus
+	// `&config.DHCPLocalServerConfig{Groups: filtered}`, which names exactly the
+	// fields the author knew about and silently drops the rest. Six were being
+	// dropped, measured:
+	//
+	//	v4 SocketType    src="udp" filtered=""
+	//	v4 ExpiredLeases src=true  filtered=false
+	//	v6 SocketType    src="udp" filtered=""
+	//	v6 ExpiredLeases src=true  filtered=false
+	//	DynamicDNS       src=true  filtered=false
+	//	DynamicDNSv6     src=true  filtered=false
+	//
+	// The two that MATTER are the family-level Kea scalars: a clustered node
+	// rendered Kea WITHOUT the operator's `expired-leases-processing` (#1387,
+	// so Kea fell back to its built-in reclamation defaults) and WITHOUT
+	// `dhcp-socket-type` (#7318, so Kea fell back to `raw`) — while a
+	// standalone node rendered both. #7318 exists precisely because `raw` does
+	// not work on some substrates, so on a cluster that leaf read as applied and
+	// was not.
+	//
+	// The DDNS pair is harmless and was checked rather than assumed: this
+	// result goes only to dhcpserver.Manager (the Kea render), and the DDNS
+	// policy is read straight off the ACTIVE config by
+	// ddns.Manager.ReconcileScoped(ctx, &cfg.System.DHCPServer, opts) — pkg/
+	// dhcpserver never reads DynamicDNS at all. They ride along here anyway,
+	// because the point of the shape is that nobody has to make that judgement
+	// per field.
+	//
+	// The copy is the guard: a field added to either struct is carried by
+	// construction instead of needing someone to remember this site. Same shape
+	// as #9141's resolveDHCPRethInterfaces — copy the struct, freshly allocate
+	// only what is written.
+	result := dhcpCfg
+	result.DHCPLocalServer = nil
+	result.DHCPv6LocalServer = nil
+	if src := dhcpCfg.DHCPLocalServer; src != nil {
+		if filtered := filterGroups(src.Groups); len(filtered) > 0 {
+			cp := *src
+			cp.Groups = filtered
+			result.DHCPLocalServer = &cp
 		}
 	}
-	if dhcpCfg.DHCPv6LocalServer != nil {
-		filtered := filterGroups(dhcpCfg.DHCPv6LocalServer.Groups)
-		if len(filtered) > 0 {
-			result.DHCPv6LocalServer = &config.DHCPLocalServerConfig{Groups: filtered}
+	if src := dhcpCfg.DHCPv6LocalServer; src != nil {
+		if filtered := filterGroups(src.Groups); len(filtered) > 0 {
+			cp := *src
+			cp.Groups = filtered
+			result.DHCPv6LocalServer = &cp
 		}
 	}
 	if result.DHCPLocalServer == nil && result.DHCPv6LocalServer == nil {
