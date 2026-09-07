@@ -100,6 +100,17 @@ type Manager struct {
 	// production this holds at most one entry; it is a set rather than a
 	// single field so the bound does not depend on that staying true.
 	ctrlIOConns map[net.Conn]struct{}
+	// lastArmedControlDeadline is the deadline armControlIO last applied to a
+	// control-socket connection, guarded by ctrlIOMu (#9344).
+	//
+	// It exists so the WIRING is checkable. requestDetailedLocked's choice of
+	// sizing function was severable without a single test failing — a
+	// mutation swapped controlWorkDeadline back for controlRoundtripDeadline
+	// and the suite stayed green, because the cell that checks the floor calls
+	// the sizing function directly and nothing observed what the socket got.
+	// A behavioural alternative (a helper that sleeps past the base deadline)
+	// would work but makes the cell timing-dependent; this makes it exact.
+	lastArmedControlDeadline time.Duration
 	// ctrlShutdown latches once the PROCESS is stopping, and never clears.
 	// Only BeginControlShutdown sets it, and its only caller is the daemon's
 	// runShutdownSequence, which the process does not return from. Close and

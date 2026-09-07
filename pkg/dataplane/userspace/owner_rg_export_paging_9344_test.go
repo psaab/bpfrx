@@ -399,3 +399,61 @@ func TestExportOwnerRGSessionsGetsAWorkDeadlineFloor9344(t *testing.T) {
 			controlBaseDeadline+64*controlDeadlinePerMiB)
 	}
 }
+
+// TestRequestDetailedArmsTheWorkDeadline9344 binds the WIRING, not the sizing
+// function.
+//
+// The cell above (TestExportOwnerRGSessionsGetsAWorkDeadlineFloor9344) calls
+// controlWorkDeadline directly, and a mutation proved that is not enough:
+// swapping the call site in requestDetailedLocked back to
+// controlRoundtripDeadline left the whole suite GREEN. The floor was correct
+// and unreachable. This drives a real round trip and reads back what
+// armControlIO actually applied to the socket.
+//
+// Both arms are required. Without the control verb, a change that armed the
+// export floor on EVERY request would pass — and that is not a smaller mistake:
+// it slows the 1/s status poll and every session install on the same socket,
+// which is what the #182 contention discipline is about.
+func TestRequestDetailedArmsTheWorkDeadline9344(t *testing.T) {
+	arm := func(t *testing.T, verb string) time.Duration {
+		t.Helper()
+		dir, err := os.MkdirTemp("", "x9344d")
+		if err != nil {
+			t.Fatalf("mkdtemp: %v", err)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(dir) })
+		sock := filepath.Join(dir, "c.sock")
+		startPagingHelper9344(t, sock, []pageReply9344{{deltas: 0, more: false}})
+		m := New()
+		m.proc = &exec.Cmd{Process: &os.Process{Pid: os.Getpid()}}
+		m.cfg.ControlSocket = sock
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if _, err := m.requestDetailedLocked(ControlRequest{
+			Type:          verb,
+			SessionExport: &SessionExportRequest{OwnerRGs: []int{1}},
+		}); err != nil {
+			t.Fatalf("%s round trip: %v", verb, err)
+		}
+		m.ctrlIOMu.Lock()
+		defer m.ctrlIOMu.Unlock()
+		return m.lastArmedControlDeadline
+	}
+
+	// CONTROL: a small request on an ordinary verb must still get the base.
+	if got := arm(t, "status"); got != controlBaseDeadline {
+		t.Fatalf("status armed %v, want the %v base — a floor that leaks to the "+
+			"frequent verbs trades a rare timeout for a slow control plane",
+			got, controlBaseDeadline)
+	}
+	got := arm(t, "export_owner_rg_sessions")
+	if got < ownerRGExportAckWait {
+		t.Errorf("export_owner_rg_sessions armed %v on the socket, below the helper's "+
+			"own %v ack-wait. The sizing function may be right and still not be "+
+			"REACHED — that is what this cell exists to catch, and it is how the "+
+			"defect was found", got, ownerRGExportAckWait)
+	}
+	if want := controlVerbDeadlineFloors9344["export_owner_rg_sessions"]; got != want {
+		t.Errorf("export_owner_rg_sessions armed %v, want the declared floor %v", got, want)
+	}
+}
