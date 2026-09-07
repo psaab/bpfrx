@@ -27,11 +27,22 @@ func newAnsweringManager6785(t *testing.T, resp ControlResponse) *Manager {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		t.Skipf("RemoveMemlock: %v", err)
 	}
-	dir := t.TempDir()
-	sessionSock := filepath.Join(dir, "userspace-dp-sessions.sock")
-	ln, err := net.Listen("unix", sessionSock)
+	// #9337: NOT t.TempDir(). Its directory name embeds the full test and
+	// sub-test names, and this pair's are long enough that
+	// <tmp>/<Test+subtest+nonce>/001/userspace-dp-sessions.sock exceeds the
+	// 108-byte AF_UNIX sun_path limit — `bind: invalid argument`, which reads
+	// like a dataplane defect and is not one. Memlock-gated, so it only
+	// surfaced once #9337 ran these guards under CAP_BPF. A short prefix keeps
+	// the path bounded no matter how the test is renamed.
+	dir, err := os.MkdirTemp("", "x6785")
 	if err != nil {
-		t.Fatalf("listen session socket: %v", err)
+		t.Fatalf("mkdtemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	sessionSock := filepath.Join(dir, "userspace-dp-sessions.sock")
+	ln, lerr := net.Listen("unix", sessionSock)
+	if lerr != nil {
+		t.Fatalf("listen session socket: %v", lerr)
 	}
 	t.Cleanup(func() { ln.Close() })
 	go func() {

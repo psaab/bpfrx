@@ -883,7 +883,19 @@ func TestManager_ArmedGate_DetachRetainedClaims(t *testing.T) {
 	go func() {
 		detachDone <- m.DetachXDP(ifindex)
 	}()
-	<-probeArrived // the detach provably reached the contended registry lookup (r3-8)
+	// #9337: BOUNDED. This wait was bare, and when the probed surface stopped
+	// being the detach's first contended acquisition it stopped firing — the
+	// cell then hung for the package's whole 15-minute budget and voided every
+	// later cell in pkg/dataplane rather than failing. A hang leaves no trace;
+	// a named failure does.
+	select {
+	case <-probeArrived: // the detach provably reached a contended m.mu acquisition (r3-8)
+	case <-time.After(30 * time.Second):
+		t.Fatal("DetachXDP never fired muAcquireProbeHook: its first contended m.mu " +
+			"acquisition is not one of the probed surfaces, so the arrival proof below " +
+			"is vacuous. Add the pre-lock fire to the surface it actually blocks on " +
+			"(see the hook's doc comment in armed_gate.go).")
+	}
 	select {
 	case err := <-detachDone:
 		t.Fatalf("DetachXDP completed (%v) during the publication hold — its registry lookup did not block", err)

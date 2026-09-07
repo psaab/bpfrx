@@ -38,9 +38,38 @@
 // registry names every guard whose protection is conditional, in one place, and
 // the count cannot drift silently.
 //
-// And it makes the inertness LOUD where it matters: when memlock is
+// And it makes the inertness LOUD where it matters: when the privilege is
 // unavailable, TestMemlockGuardsAreInertHere reports exactly which guards did
-// not run, by name. Under XPF_REQUIRE_MEMLOCK_GUARDS=1 — for a privileged CI
-// leg — it FAILS instead, so an environment that is supposed to execute them
-// cannot silently stop.
+// not run, by name. Under XPF_REQUIRE_MEMLOCK_GUARDS=1 — for the privileged leg
+// — it FAILS instead, so an environment that is supposed to execute them cannot
+// silently stop.
+//
+// #9337, TWO CORRECTIONS.
+//
+// The leg it deferred to did not exist. `.github/` holds only `instructions/`;
+// there are no workflow files and no CI in this repository at all, and nothing
+// anywhere set XPF_REQUIRE_MEMLOCK_GUARDS. 42 guards were deferring to a name.
+// `make test-memlock-guards` is now that leg (and a prerequisite of
+// `make test-root`): it derives the package set FROM the registry, runs it
+// under the required privilege, and verifies BY NAME that every registered
+// Test... function actually produced a `=== RUN` line — a `-run` predicate is
+// a claim about names and fails silently in the only direction that matters.
+//
+// And the capability named here was the WRONG ONE. This package used to advise
+// "Run as root or with CAP_SYS_RESOURCE", and its readiness predicate was
+// `rlimit.RemoveMemlock()` succeeding. Neither is the capability the guards
+// consume. Measured, by raising only the memlock rlimit and dropping straight
+// back to the unprivileged user:
+//
+//	uid=1000  memlock cur=18446744073709551615
+//	RemoveMemlock: OK        <- the old predicate: "all 42 guards execute"
+//	ebpf.NewMap:   FAILED (map create: operation not permitted)
+//
+// Following the old advice exactly produces an environment the census calls
+// READY and the guards cannot run in: they stop skipping and start FAILING, at
+// map creation, with an error that looks nothing like the defects they exist to
+// catch. A gate that measures one dimension and reads as validation of another.
+// probeGuardReadiness therefore performs the first operation every guard
+// performs — a trivial BPF map create — and the report distinguishes the three
+// states rather than two.
 package memlockcensus

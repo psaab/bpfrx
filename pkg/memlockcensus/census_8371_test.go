@@ -1,6 +1,7 @@
 package memlockcensus
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
 )
 
@@ -160,6 +162,87 @@ func TestMemlockCensusMatchesTheTree(t *testing.T) {
 	}
 }
 
+// guardReadiness is what this environment can actually do, measured rather
+// than inferred (#9337).
+//
+// The census used to answer "can the guards run here?" with
+// `rlimit.RemoveMemlock() == nil` alone. That is a DIFFERENT question. Raising
+// the memlock rlimit needs CAP_SYS_RESOURCE (and on a modern kernel BPF objects
+// are charged to memcg, so it often succeeds unprivileged and means nothing);
+// what the guards need is to CREATE a BPF map, which needs CAP_BPF. Measured:
+// with only the memlock rlimit raised, the census reported "memlock is
+// available here — all 42 registered guards execute" and every guard then
+// failed at `map create: operation not permitted`.
+//
+// A CI leg built to that advice would set XPF_REQUIRE_MEMLOCK_GUARDS=1, be told
+// the environment was ready, and go red with 42 map-creation errors that look
+// nothing like the defects the guards exist to catch. So the probe now performs
+// the FIRST OPERATION EVERY GUARD PERFORMS, and reports three states rather
+// than two.
+type guardReadiness struct {
+	// memlockErr is rlimit.RemoveMemlock()'s result. Kept because a guard's
+	// own first line is still `if err := rlimit.RemoveMemlock(); err != nil {
+	// t.Skipf(...) }` — a non-nil value here is why they SKIP.
+	memlockErr error
+	// mapErr is a trivial ebpf.NewMap()'s result: the capability the guards
+	// actually consume. Non-nil with memlockErr nil is the trap above — the
+	// guards stop skipping and start FAILING.
+	mapErr error
+}
+
+func probeGuardReadiness() guardReadiness {
+	r := guardReadiness{memlockErr: rlimit.RemoveMemlock()}
+	m, err := ebpf.NewMap(&ebpf.MapSpec{
+		Type:       ebpf.Hash,
+		KeySize:    4,
+		ValueSize:  4,
+		MaxEntries: 1,
+	})
+	if err != nil {
+		r.mapErr = err
+		return r
+	}
+	_ = m.Close()
+	return r
+}
+
+// ready reports whether the registered guards will actually execute here.
+func (r guardReadiness) ready() bool { return r.memlockErr == nil && r.mapErr == nil }
+
+// guardCapabilityAdvice is the remedy line. CAP_BPF is named first because it
+// is the binding one: CAP_SYS_RESOURCE alone raises the rlimit and leaves every
+// map create failing with EPERM, which is strictly worse than skipping because
+// the census reports READY on the way in (#9337).
+const guardCapabilityAdvice = "Run as root, or with CAP_BPF (plus CAP_SYS_RESOURCE on kernels " +
+	"that still charge BPF memory to the memlock rlimit — pre-5.11). CAP_SYS_RESOURCE " +
+	"ALONE IS NOT ENOUGH: it raises the rlimit, so the guards stop skipping and start " +
+	"failing at `map create: operation not permitted`. `make test-memlock-guards` runs " +
+	"them under sudo."
+
+// describe renders the report for a NOT-ready environment. It is a method on
+// the measurement rather than inline prose so the two states that used to be
+// one — cannot raise memlock, and can raise memlock but cannot create a map —
+// are named differently in the output a reader acts on.
+func (r guardReadiness) describe() string {
+	var b strings.Builder
+	switch {
+	case r.memlockErr != nil:
+		fmt.Fprintf(&b, "#8371: memlock is NOT available here (%v), so the following %d "+
+			"guards SKIP and their packages still report ok:\n", r.memlockErr, len(Registry))
+	default:
+		fmt.Fprintf(&b, "#9337: memlock IS available here but BPF map creation is NOT "+
+			"(%v). This is the WORST of the three states: the following %d guards no "+
+			"longer skip — they FAIL, at map creation, with an error that looks nothing "+
+			"like the defect each one exists to catch:\n", r.mapErr, len(Registry))
+	}
+	for _, s := range Registry {
+		fmt.Fprintf(&b, "  %s -> %s\n", s.File, s.Test)
+	}
+	fmt.Fprintf(&b, "\nEach names a real defect it does not protect against in this "+
+		"environment. %s", guardCapabilityAdvice)
+	return b.String()
+}
+
 // TestMemlockGuardsAreInertHere reports, by name, which guards did not run in
 // THIS environment — and fails instead of reporting when the environment is
 // declared to be one that must execute them.
@@ -167,32 +250,98 @@ func TestMemlockCensusMatchesTheTree(t *testing.T) {
 // It deliberately does not fail by default. Turning every developer's
 // `make test-go` red for an environment property they cannot change produces a
 // gate everyone learns to ignore, which is worse than the silence it replaces.
-// XPF_REQUIRE_MEMLOCK_GUARDS=1 is for a privileged CI leg, where a run that
-// stops executing them IS a regression.
+// XPF_REQUIRE_MEMLOCK_GUARDS=1 is for a privileged leg (`make
+// test-memlock-guards`), where a run that stops executing them IS a regression.
 func TestMemlockGuardsAreInertHere(t *testing.T) {
-	err := rlimit.RemoveMemlock()
+	r := probeGuardReadiness()
 	required := os.Getenv("XPF_REQUIRE_MEMLOCK_GUARDS") == "1"
 
-	if err == nil {
-		t.Logf("#8371: memlock is available here — all %d registered guards execute.",
-			len(Registry))
+	if r.ready() {
+		t.Logf("#8371: memlock AND BPF map creation are available here — all %d "+
+			"registered guards execute.", len(Registry))
 		return
 	}
 
-	var b strings.Builder
-	fmt.Fprintf(&b, "#8371: memlock is NOT available here (%v), so the following %d "+
-		"guards SKIP and their packages still report ok:\n", err, len(Registry))
-	for _, s := range Registry {
-		fmt.Fprintf(&b, "  %s -> %s\n", s.File, s.Test)
-	}
-	fmt.Fprintf(&b, "\nEach names a real defect it does not protect against in this "+
-		"environment. Run as root or with CAP_SYS_RESOURCE to execute them.")
-
+	report := r.describe()
 	if required {
 		t.Fatalf("%s\n\nXPF_REQUIRE_MEMLOCK_GUARDS=1 declared this environment must "+
-			"execute them, and it did not.", b.String())
+			"execute them, and it did not.", report)
 	}
-	t.Log(b.String())
+	t.Log(report)
+}
+
+// TestReadinessIsNotMemlockAlone9337 is the cell the old predicate fails.
+//
+// It is a unit test on the measurement, not on the machine, deliberately: the
+// state it pins — memlock raised, CAP_BPF absent — cannot be produced from
+// inside a test process that does not have CAP_SETPCAP, and a check that can
+// only run where the defect is absent is not a check.
+func TestReadinessIsNotMemlockAlone9337(t *testing.T) {
+	mapEPERM := errors.New("map create: operation not permitted")
+
+	cases := []struct {
+		name      string
+		r         guardReadiness
+		wantReady bool
+		why       string
+	}{
+		{
+			name: "memlock_and_map_create_both_available",
+			r:    guardReadiness{}, wantReady: true,
+			why: "the only state in which the registered guards actually execute",
+		},
+		{
+			name: "memlock_raised_but_no_CAP_BPF",
+			r:    guardReadiness{mapErr: mapEPERM}, wantReady: false,
+			why: "MEASURED (#9337): raising only the memlock rlimit made the census " +
+				"report READY and every guard then failed at map creation. A readiness " +
+				"predicate that cannot see this sends a privileged leg into 42 failures " +
+				"that look nothing like the defects the guards catch",
+		},
+		{
+			name: "no_memlock",
+			r:    guardReadiness{memlockErr: errors.New("operation not permitted")}, wantReady: false,
+			why: "the guards skip; this is the state the census was built for",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.r.ready(); got != tc.wantReady {
+				t.Fatalf("ready() = %v, want %v — %s", got, tc.wantReady, tc.why)
+			}
+		})
+	}
+
+	// The report for the map-create state must not read like the memlock one:
+	// "they SKIP" and "they FAIL" call for different actions, and the census's
+	// whole value is that the message names what is actually wrong.
+	skipReport := guardReadiness{memlockErr: errors.New("operation not permitted")}.describe()
+	failReport := guardReadiness{mapErr: mapEPERM}.describe()
+	if !strings.Contains(skipReport, "SKIP") {
+		t.Errorf("the no-memlock report does not say the guards SKIP:\n%s", skipReport)
+	}
+	if !strings.Contains(failReport, "FAIL") {
+		t.Errorf("the no-CAP_BPF report does not say the guards FAIL — a reader told "+
+			"they SKIP will look for silence and find 42 red cells:\n%s", failReport)
+	}
+}
+
+// TestRemedyTextNamesTheCapabilityTheGuardsNeed9337 pins the correction itself.
+//
+// The census used to say "Run as root or with CAP_SYS_RESOURCE to execute
+// them." That advice is not merely incomplete — followed exactly, it produces
+// an environment the census calls READY and the guards cannot run in. A wrong
+// diagnostic is worse than a missing one.
+func TestRemedyTextNamesTheCapabilityTheGuardsNeed9337(t *testing.T) {
+	if !strings.Contains(guardCapabilityAdvice, "CAP_BPF") {
+		t.Fatalf("the remedy text does not name CAP_BPF, which is the capability BPF "+
+			"map creation actually requires:\n%s", guardCapabilityAdvice)
+	}
+	if !strings.Contains(guardCapabilityAdvice, "ALONE IS NOT ENOUGH") {
+		t.Fatalf("the remedy text does not record that CAP_SYS_RESOURCE alone is "+
+			"insufficient. That is the half a reader acts on and gets wrong:\n%s",
+			guardCapabilityAdvice)
+	}
 }
 
 // TestTheScannerExcludesItselfAndOnlyItself pins the exclusion that unbroke

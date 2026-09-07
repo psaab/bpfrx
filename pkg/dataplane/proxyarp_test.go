@@ -458,16 +458,63 @@ func TestReconcileProxyARP_V6InstallsPneighLive(t *testing.T) {
 		})
 	})
 
-	neighs, err := netlink.NeighList(lo.Index, unix.AF_INET6)
-	if err != nil {
-		t.Skipf("NeighList(lo, AF_INET6) needs privileges: %v", err)
-	}
+	// #9337: NeighProxyList, not NeighList. A plain RTM_GETNEIGH dump carries
+	// ndm_flags == 0, and the kernel answers that by walking the NEIGHBOUR
+	// tables; it walks the PNEIGH table only when the request sets NTF_PROXY
+	// (neigh_dump_info). So NeighList could never return the entry this cell
+	// looks for — it was RED against correct code as surely as against the
+	// pre-#2197 code it names, which means it asserted nothing. Measured on
+	// this host: after installing a v6 proxy entry on lo, NeighList returned
+	// 2 rows and none of them was it, while NeighProxyList returned exactly it
+	// with Flags=0x8.
+	//
+	// This is privilege-gated, so it never ran under `make test-go`; and until
+	// #9337 unhung TestManager_ArmedGate_DetachRetainedClaims it never ran
+	// under root either — the hang consumed the package's whole timeout budget
+	// before reaching this file.
 	want := net.ParseIP(v6)
+
+	// POSITIVE CONTROL, first. A prober that cannot see proxy entries at all
+	// reports the same thing as a reconcile that installed nothing, and the
+	// wrong-channel defect above is exactly that reading. Install a pneigh
+	// entry this test owns and require the probe to find IT; only then does a
+	// miss on `want` mean the reconcile did not install.
+	const control = "2001:db8:2197::ffff"
+	controlIP := net.ParseIP(control)
+	controlNeigh := &netlink.Neigh{
+		LinkIndex: lo.Index,
+		IP:        controlIP,
+		Flags:     unix.NTF_PROXY,
+		Family:    unix.AF_INET6,
+		State:     unix.NUD_PERMANENT,
+	}
+	if err := netlink.NeighAdd(controlNeigh); err != nil {
+		t.Skipf("install the positive-control pneigh entry: %v", err)
+	}
+	t.Cleanup(func() { _ = netlink.NeighDel(controlNeigh) })
+
+	neighs, err := netlink.NeighProxyList(lo.Index, unix.AF_INET6)
+	if err != nil {
+		t.Skipf("NeighProxyList(lo, AF_INET6) needs privileges: %v", err)
+	}
+	var sawControl, sawWant bool
 	for _, n := range neighs {
-		if n.Flags&unix.NTF_PROXY != 0 && n.IP.Equal(want) {
-			return // found — the v6 pneigh entry was installed
+		switch {
+		case n.IP.Equal(controlIP):
+			sawControl = true
+		case n.IP.Equal(want):
+			sawWant = true
 		}
 	}
-	t.Fatalf("no AF_INET6 NTF_PROXY entry for %s on lo after reconcile "+
-		"(pre-#2197 behavior — v6 sysctl enabled but pneigh entry never installed)", v6)
+	if !sawControl {
+		t.Fatalf("the positive control %s is missing from NeighProxyList(lo, AF_INET6) "+
+			"(%d entries). The PROBE is broken, not the code — a verdict about %s "+
+			"read off this dump would be a claim about the instrument.",
+			control, len(neighs), v6)
+	}
+	if !sawWant {
+		t.Fatalf("no AF_INET6 NTF_PROXY entry for %s on lo after reconcile, though the "+
+			"positive control at %s IS visible in the same dump (pre-#2197 behavior — "+
+			"v6 sysctl enabled but pneigh entry never installed)", v6, control)
+	}
 }

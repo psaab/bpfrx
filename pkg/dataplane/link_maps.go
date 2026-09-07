@@ -144,6 +144,19 @@ func (m *Manager) markVLANSubInterfaces(result *CompileResult) {
 }
 
 func (m *Manager) xdpLinkFor(ifindex int) (link.Link, bool) {
+	// #9337: DetachXDP's FIRST contended m.mu acquisition. It was not always:
+	// before the link maps were guarded (01409c1f, 2026-08-22) DetachXDP read
+	// m.xdpLinks unlocked and its first block was the PROBED lookupMapLocked
+	// inside setXDPAttachedFlag. Moving the acquisition ahead of that surface
+	// silently invalidated TestManager_ArmedGate_DetachRetainedClaims' arrival
+	// proof: the detach blocked here, the probe never fired, and the test's
+	// `<-probeArrived` waited forever. It needs a real BPF map, so it SKIPS
+	// unprivileged and the deadlock only appears under CAP_BPF — where it burnt
+	// the whole 15-minute package budget and voided every later cell in
+	// pkg/dataplane.
+	if muAcquireProbeHook != nil {
+		muAcquireProbeHook("xdpLinkFor")
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	l, ok := m.xdpLinks[ifindex]
