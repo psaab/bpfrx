@@ -1447,6 +1447,12 @@ type Daemon struct {
 	// by proxyARPEnabledMu.
 	proxyARPUnresolved []string
 
+	// proxyARPNudgeCh wakes proxyARPReassertLoop on an RG ownership change
+	// (#9087). Depth 1, coalescing; see nudgeProxyARPReassert for why the send
+	// must stay non-blocking. Nil on a Daemon built without the loop, which the
+	// nudge tolerates.
+	proxyARPNudgeCh chan struct{}
+
 	// archiveTransfer performs the transfer-on-commit upload of one
 	// serialized active-config file to an archive site. nil ⇒ the default
 	// scp transport (scpArchiveTransfer). Overridable so tests can capture
@@ -1656,6 +1662,7 @@ func New(opts Options) (*Daemon, error) {
 		surfaceA:                   surfaceAState{reconcileNowCh: make(chan struct{}, 1)},
 		dhcpLeaseSync:              dhcpLeaseSyncState{nowCh: make(chan struct{}, 1)},
 		ipsecSANudgeCh:             make(chan struct{}, 1),
+		proxyARPNudgeCh:            make(chan struct{}, 1),
 		syncReadyTimeout:           5 * time.Second,
 		linkByNameFn:               netlink.LinkByName,
 		neighListFn:                netlink.NeighList,

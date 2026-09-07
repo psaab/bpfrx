@@ -464,6 +464,21 @@ func diffProxyResponders(prev, cur map[string]map[int]struct{}) map[string]map[i
 // Each tick runs the reconcile under d.applySem (see reassertProxyARPOnce) so a
 // re-assert can never interleave with a concurrent commit/config reconcile
 // (#4001).
+//
+// #9087: the loop also wakes on an RG OWNERSHIP CHANGE, and without that the
+// ticker alone is the whole latency budget. Proxy-ARP ownership is decided per
+// redundancy group, but nothing drove the reconcile when that ownership MOVED —
+// the apply path runs on a commit, and a failover is not a commit. So for up to
+// proxyARPReassertInterval after a failover the new owner had not installed the
+// entry and the old owner had not swept it: measured on the loss cluster
+// immediately after a crash-failover plus manual failback as `fw0=0 fw1=1`, the
+// only answerer being the node that no longer owns the address. That is a
+// pool-mode NAT mis-steer for the length of the window, not a cosmetic lag.
+//
+// The nudge is edge-driven from both sides of the transition
+// (applyRethServicesForRG on MASTER, clearRethServicesForRG on BACKUP) because
+// the two halves fix different ends of the same window: the promote side
+// installs, the demote side sweeps.
 func (d *Daemon) proxyARPReassertLoop(ctx context.Context) {
 	t := time.NewTicker(proxyARPReassertInterval)
 	defer t.Stop()
@@ -473,7 +488,27 @@ func (d *Daemon) proxyARPReassertLoop(ctx context.Context) {
 			return
 		case <-t.C:
 			d.reassertProxyARPOnce(ctx)
+		case <-d.proxyARPNudgeCh:
+			d.reassertProxyARPOnce(ctx)
 		}
+	}
+}
+
+// nudgeProxyARPReassert requests an immediate proxy-ARP re-assert (#9087).
+//
+// Non-blocking depth-1 send that coalesces a burst, and non-blocking is
+// load-bearing rather than tidy: the callers are on the VRRP event loop, and
+// reassertProxyARPOnce acquires applySem. A synchronous reconcile there would
+// block every subsequent VRRP event behind a commit, and the RG transition that
+// needs the reconcile is exactly when the apply path is busiest. Safe before the
+// loop starts and safe on a nil channel (a Daemon built without the loop).
+func (d *Daemon) nudgeProxyARPReassert() {
+	if d.proxyARPNudgeCh == nil {
+		return
+	}
+	select {
+	case d.proxyARPNudgeCh <- struct{}{}:
+	default:
 	}
 }
 
