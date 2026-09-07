@@ -101,4 +101,28 @@ type ScreenProfileSnapshot struct {
 type ScreenMissingProfileRef struct {
 	Zone    string `json:"zone"`
 	Profile string `json:"profile,omitempty"`
+	// AlarmWithoutDrop is the referenced profile's `alarm-without-drop`
+	// modifier (#9425). It is MEANINGFUL ONLY on the ScreenInertProfiles set:
+	// there the profile IS defined, so the operator's audit request is a real
+	// statement the dataplane must honour when it substitutes the conservative
+	// default. On the ScreenMissingProfiles (UNDEFINED) set there is no profile
+	// to read it from and it is always false — the Rust side consults it only
+	// on the inert arm, so the two sets cannot pick up each other's meaning
+	// from this shared struct.
+	//
+	// Why it must travel: an inert zone gets NO `screens` entry, so
+	// ScreenState::alarm_without_drop's `zones` lookup misses and returns
+	// false — and since #7888 that zone hard-drops the substituted
+	// conservative default's malformed-packet set. The single most likely way
+	// to reach the inert state is `set security screen ids-option p
+	// alarm-without-drop` and nothing else, i.e. an explicit request for audit
+	// mode is precisely the configuration that turned audit mode off and
+	// started dropping.
+	//
+	// Additive + omitempty, per the rolling-upgrade rule (ADD a field, never
+	// redefine one): an old helper missing the field decodes false, which is
+	// exactly today's hard-drop behaviour; an old Go binary that does not emit
+	// it leaves the Rust side false, likewise. Neither direction is worse than
+	// the status quo and no existing field changes meaning.
+	AlarmWithoutDrop bool `json:"alarm_without_drop,omitempty"`
 }

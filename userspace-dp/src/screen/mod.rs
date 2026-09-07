@@ -186,6 +186,7 @@ mod zone;
 
 pub(crate) use extract::extract_screen_info;
 pub(crate) use packet::{ScreenPacketInfo, ScreenProfile, ScreenVerdict};
+pub(crate) use unresolved::InertProfileRef;
 // `ScreenParseError` is named only by `extract.rs` (via the `packet`
 // path) and by the test module. Production call sites in `afxdp/`
 // consume the error by calling `.screen_reason()` on the value returned
@@ -325,7 +326,12 @@ pub(crate) struct ScreenState {
     /// other's case. Should a malformed or future sender ever put a zone in
     /// both, `unresolved_screen_kind` resolves Undefined first -- the verdict
     /// is the same either way, so only the WARN wording is affected.
-    inert_profile_refs: FxHashMap<String, String>,
+    ///
+    /// #9425: the value carries the profile's `alarm-without-drop` alongside
+    /// its name (see `InertProfileRef`), because an inert zone has no `zones`
+    /// entry and this map is the ONLY place the operator's audit request
+    /// survives for it.
+    inert_profile_refs: FxHashMap<String, InertProfileRef>,
     /// #3082: per-zone rate counter that bounds the missing-profile WARN to
     /// `MISSING_PROFILE_WARN_RATE_LIMIT_PER_SEC` per zone so a flood of packets
     /// to a misconfigured zone cannot spam the log (CLAUDE.md log-flood rule).
@@ -502,11 +508,36 @@ impl ScreenState {
     /// packet drop and raise a log-only alarm instead. An absent profile (no
     /// screen configured for the zone) returns false — a zone with no profile
     /// never produces a drop verdict in the first place.
+    ///
+    /// #9425: the `zones` lookup is NOT sufficient on its own. A zone whose
+    /// profile is DEFINED but enables no check is INERT: it gets no `zones`
+    /// entry (`buildScreenSnapshots`'s `enforcesAnyCheck` gate skips it), yet
+    /// since #7888 it DOES produce drop verdicts — `missing_profile_verdict`
+    /// substitutes `conservative_default()` and drops the malformed-packet set.
+    /// So the resolved lookup missed exactly where a verdict existed to
+    /// suppress, and an operator who wrote
+    /// `set security screen ids-option p alarm-without-drop` and nothing else
+    /// — the single most likely route into the inert state, and an explicit
+    /// request for audit mode — received the exact inverse of what they asked
+    /// for, on a commit that reported success with zero warnings.
+    ///
+    /// Honouring the flag here changes only the TERMINAL DISPOSITION. The
+    /// substituted checks still run and still count (`substituted_default_drops`
+    /// is incremented before the verdict is returned), and the consumers turn
+    /// the Drop into a log-only alarm plus a forward. #7888's decision — do not
+    /// silently PASS an inert zone — is untouched; that was drop-over-pass, and
+    /// this is alarm-over-drop.
+    ///
+    /// The UNDEFINED set is deliberately not consulted: there is no profile to
+    /// have carried the modifier, so there is no operator statement to honour.
     #[inline]
     pub(crate) fn alarm_without_drop(&self, zone: &str) -> bool {
-        self.zones
+        if let Some(z) = self.zones.get(zone) {
+            return z.profile.alarm_without_drop;
+        }
+        self.inert_profile_refs
             .get(zone)
-            .is_some_and(|z| z.profile.alarm_without_drop)
+            .is_some_and(|r| r.alarm_without_drop)
     }
 
     /// Record one screen drop SUPPRESSED by `alarm-without-drop` mode (the

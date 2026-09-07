@@ -1064,6 +1064,7 @@
     "table": ""
   },
   "screen_missing_profile_ref": {
+    "alarm_without_drop": false,
     "profile": "",
     "zone": ""
   },
