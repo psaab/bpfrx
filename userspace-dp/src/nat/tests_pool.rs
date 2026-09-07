@@ -7123,6 +7123,16 @@ fn retire_worker_frees_only_when_it_was_the_last_holder_7092() {
     //    path returns the existing translation without taking a second bit — so
     //    an allocate-twice fixture cannot create the state this cell is about
     //    and would fail in the flattering direction (#7094 hit exactly that).
+    //
+    //    #9145 UPDATE — THIS PARAGRAPH IS NOW HISTORICAL, and it is left rather
+    //    than deleted because it records why THIS fixture uses the reserve path.
+    //    The allocate-path reuse returns now DO take a second bit, so an
+    //    allocate-twice fixture would today create two holders. The reasoning
+    //    above was true when written and is the reason this cell was built the
+    //    way it was; it is no longer a statement about the current allocator.
+    //    A rationale that stops being true and is not marked becomes a false
+    //    justification that looks freshly confirmed by whatever is edited beside
+    //    it.
     // 2. The first assertion below is SELF-VERIFYING in the direction that
     //    matters: with only ONE holder, `retire_worker(0)` would empty the mask
     //    and free, returning 1, and `assert_eq!(.., 0)` would fail. It passing
@@ -11064,5 +11074,180 @@ fn pool_snat_separates_identical_tuples_across_routing_domains_9062() {
         (a.rewrite_src, a.rewrite_src_port),
         (a2.rewrite_src, a2.rewrite_src_port),
         "the same 5-tuple in the SAME domain must reuse its translation"
+    );
+}
+
+// #9145: the idempotent-reuse early return in the ALLOCATE paths did not record
+// the caller as a holder, so a worker-0 release freed a (pool_addr, port) that
+// worker 1 was still forwarding through — the NAT source collision the holder
+// mask exists to prevent.
+//
+// `reserve_flow_maybe_persistent` and `reserve_address_only_maybe_persistent`
+// already did this and say why (#6211 F2): the early return is where workers
+// 2..N land, so it is exactly where a new holder must be recorded. The eight
+// allocate-path reuse returns did not.
+//
+// REACHABILITY, stated honestly: the only production route ever demonstrated
+// for two workers reaching this on ONE flow was #9062's aliasing — two
+// rule-sets scoped to different routing instances sharing a pool, so their
+// identical 5-tuples collapsed onto one `live_by_flow` record. **#9062 is
+// fixed**: `SourceNatFlowKey` now carries `routing_scope`, so the two tenants
+// no longer alias. This is therefore a BACKSTOP, not a live-defect fix, and it
+// is landed on the direction argument rather than a reachability claim: ORing
+// on reuse can only ever cause an UNDER-release, never an over-release, which
+// is the direction `drop_holder_locked`'s own doc prefers.
+fn holder_flow_9145(src_port: u16) -> SourceNatFlowKey {
+    SourceNatFlowKey {
+        protocol: 6,
+        src_ip: "10.0.61.50".parse().unwrap(),
+        dst_ip: "8.8.8.8".parse().unwrap(),
+        src_port,
+        dst_port: 443,
+        routing_scope: 0,
+    }
+}
+
+fn allocate_for_holder_9145(
+    alloc: &PortAllocator,
+    addrs: &[std::net::Ipv4Addr],
+    flow: SourceNatFlowKey,
+    holder: NatHolder,
+) -> TranslatedTuple {
+    alloc
+        .allocate_translation(
+            flow,
+            PoolAddressFamily::V4(addrs),
+            0,
+            false,
+            false,
+            PersistentNatPermit::TargetHostPort,
+            0,
+            1_000,
+            holder,
+        )
+        .expect("allocation must succeed on a free range")
+}
+
+// THE SUBJECT. Two workers allocate the SAME flow; the second takes the
+// idempotent-reuse return. A worker-0 release must then free NOTHING, because
+// worker 1 still holds that translation.
+//
+// Fail-on-revert: drop `slot.holders |= holder.bit()` from the reuse returns and
+// this reds — worker 1's bit is never taken, worker 0 is the sole holder, and
+// the release frees a port that is still on the wire.
+#[test]
+fn allocate_reuse_records_the_second_worker_as_a_holder_9145() {
+    let pool_ip: std::net::Ipv4Addr = "203.0.113.1".parse().unwrap();
+    let addrs = vec![pool_ip];
+    let alloc = PortAllocator::new(1, 1024, 1027);
+    let flow = holder_flow_9145(40000);
+
+    let first = allocate_for_holder_9145(&alloc, &addrs, flow, NatHolder::Worker(0));
+    let second = allocate_for_holder_9145(&alloc, &addrs, flow, NatHolder::Worker(1));
+    assert_eq!(
+        first, second,
+        "fixture: both workers must receive the SAME translation, or the second \
+         call took a fresh allocation and never reached the reuse return this \
+         cell is about"
+    );
+    assert!(
+        alloc.debug_is_port_occupied(0, first.port),
+        "fixture: the port must be occupied before the release, or every \
+         assertion below passes against an allocator that never held it"
+    );
+
+    alloc.release_flow(flow, first, 2_000, NatHolder::Worker(0));
+
+    assert!(
+        alloc.debug_is_port_occupied(0, first.port),
+        "worker 0 released and the port was FREED while worker 1 still holds \
+         that translation — the next flow to allocate it collides with a live \
+         one (#9145)"
+    );
+}
+
+// NARROWNESS CONTROL. The LAST holder releasing must still free the port.
+// Without this, the assertion above is satisfied by a release path that never
+// frees anything, which would leak every translation the box ever made — a
+// strictly worse defect than the one being fixed.
+#[test]
+fn the_last_holder_releasing_still_frees_the_port_9145() {
+    let pool_ip: std::net::Ipv4Addr = "203.0.113.1".parse().unwrap();
+    let addrs = vec![pool_ip];
+    let alloc = PortAllocator::new(1, 1024, 1027);
+    let flow = holder_flow_9145(40001);
+
+    let t = allocate_for_holder_9145(&alloc, &addrs, flow, NatHolder::Worker(0));
+    allocate_for_holder_9145(&alloc, &addrs, flow, NatHolder::Worker(1));
+
+    alloc.release_flow(flow, t, 2_000, NatHolder::Worker(0));
+    alloc.release_flow(flow, t, 2_000, NatHolder::Worker(1));
+
+    assert!(
+        !alloc.debug_is_port_occupied(0, t.port),
+        "both holders released and the port stayed occupied — the allocator \
+         leaks a translation per flow, which is worse than the over-release \
+         this change prevents"
+    );
+}
+
+// A SINGLE holder releasing must still free immediately. This is the
+// pre-#6211-F2 contract and the case that proves the fix did not turn every
+// release into a no-op by making the mask never empty.
+#[test]
+fn a_single_holder_release_still_frees_immediately_9145() {
+    let pool_ip: std::net::Ipv4Addr = "203.0.113.1".parse().unwrap();
+    let addrs = vec![pool_ip];
+    let alloc = PortAllocator::new(1, 1024, 1027);
+    let flow = holder_flow_9145(40002);
+
+    let t = allocate_for_holder_9145(&alloc, &addrs, flow, NatHolder::Worker(0));
+    alloc.release_flow(flow, t, 2_000, NatHolder::Worker(0));
+
+    assert!(
+        !alloc.debug_is_port_occupied(0, t.port),
+        "the sole holder released and the port stayed occupied"
+    );
+}
+
+// THE ORDER MATTERS, and this cell exists because a mutation found that the
+// three above cannot see it.
+//
+// Writing `slot.holders = holder.bit()` instead of `|=` SURVIVED them all. It
+// drops the FIRST worker's bit on reuse, and the cells above happen to release
+// in the order that hides it: with the mask reduced to {w1}, releasing w0 is a
+// no-op and releasing w1 last frees — which is what they assert.
+//
+// Release the REUSING worker first and the difference is observable: under the
+// assignment the mask empties immediately and frees a translation worker 0 is
+// still forwarding through. OR is not a stylistic choice over assignment here;
+// it is the whole mechanism, and a bitmask that can be overwritten is a
+// single-holder field wearing a mask's shape.
+#[test]
+fn releasing_the_reusing_worker_first_must_not_free_9145() {
+    let pool_ip: std::net::Ipv4Addr = "203.0.113.1".parse().unwrap();
+    let addrs = vec![pool_ip];
+    let alloc = PortAllocator::new(1, 1024, 1027);
+    let flow = holder_flow_9145(40003);
+
+    let t = allocate_for_holder_9145(&alloc, &addrs, flow, NatHolder::Worker(0));
+    allocate_for_holder_9145(&alloc, &addrs, flow, NatHolder::Worker(1));
+
+    // The REUSING worker leaves first.
+    alloc.release_flow(flow, t, 2_000, NatHolder::Worker(1));
+
+    assert!(
+        alloc.debug_is_port_occupied(0, t.port),
+        "the reusing worker released and the port was FREED while worker 0 — \
+         which allocated it — is still forwarding through it. The reuse return \
+         overwrote the holder mask instead of ORing into it (#9145)"
+    );
+
+    // And it must still free once the original holder goes too, or this cell is
+    // satisfied by a release path that never frees.
+    alloc.release_flow(flow, t, 2_000, NatHolder::Worker(0));
+    assert!(
+        !alloc.debug_is_port_occupied(0, t.port),
+        "both holders released and the port stayed occupied"
     );
 }
