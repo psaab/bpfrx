@@ -237,6 +237,63 @@ mechanism — `SetPath` nests the tokens into a chain before any pass runs, so
 there is no packed tail to split and `normalizeCompactStanzas` correctly folds
 nothing. That is a grammar-side question, tracked separately as issue 8939.
 
+### Normalising ONE depth is not normalising the stanza (9421)
+
+`packedBody(node, schema)` normalises the tail of the node it is handed and
+**nothing below it**. #6683 applied it to the `ids-option` node and every reader
+underneath kept looping `node.Children`, so the identical class re-appeared one
+level in, at the FAMILY node:
+
+```
+ids-option s1 { icmp { ping-death; } }              nested   -> [icmp]->[ping-death]
+ids-option s1 { icmp ping-death; }                  elided   -> [icmp ping-death]
+ids-option s1 { icmp [ ping-death fragment ]; }     bracketed-> [icmp ping-death fragment]
+```
+
+The elided and bracketed nodes have ZERO children, so `for _, opt := range
+icmpNode.Children` ran zero times: the check compiled **disabled** and — the
+part that is easy to miss — nothing reached `ScreenProfile.UnknownLeaves`, so the
+#3318 gate that exists to refuse an unsupported screen leaf was never ARMED
+either. An unsupported leaf (`tcp bogus-check;`) was accepted in silence at that
+depth for the same reason a supported one was lost.
+
+**The FLAT spelling of the same statement did not lose it**, because `SetPath`
+nests the tokens into a chain before any compiler runs. So one statement had
+three observables that depended only on how it was typed:
+
+| AST shape | strict `CompileConfig` | `ICMP.PingDeath` | `UnknownLeaves` |
+|---|---|---|---|
+| hierarchical `icmp [ ping-death fragment ];` | ACCEPT | `false` | `[]` |
+| flat `set … icmp [ ping-death fragment ]` | REJECT (#1960 msg) | `true` | `[icmp ping-death fragment]` |
+
+**A gate that fires in one AST shape only is a reachability defect in its own
+right**, separate from the value the other shape lost — and it is the harder half
+to notice, because the shape that rejects looks like proof the gate works.
+
+The rule this leaves: **when you add a packed-tail reader, name the DEPTH it
+covers, and check the depth below it.** `compileScreen` now normalises the family
+node too (`screenNormalizeFamilies` / `screenFamilyBody`,
+`compiler_security_screen_family_9421.go`), and the acceptance table asserts both
+AST shapes reach the same strict verdict AND the same compiled profile, per
+family and per spelling.
+
+**Where that normalisation deliberately differs from `packedBodyChildren`.** The
+shared expander abandons the whole expansion at the first tail token the schema
+does not model, and returns the node's real children — right for its callers,
+which have no backstop, since inventing an unmodelled shape drops configuration
+a different way. At this site every unresolved token becomes a node the family's
+`default:` arm records on `UnknownLeaves`, so continuing the chain is what makes
+the token VISIBLE rather than a guess about its meaning: the commit is refused
+with the same message the flat path already produced (the #9246
+refuse-rather-than-drop precedent). The chain built is the one `SetPath` builds
+for the same tokens, which is why the two shapes come out identical afterwards.
+
+This is site-local in `compileScreen` and is deliberately NOT an admission into
+`compactNormalizeInScope`: that table's stated precondition is that a site first
+appear in the measured `testdata/compact_block_divergences_2419.txt` inventory,
+and a valueless boolean flag cannot appear there at all — which is issue 9056's
+whole finding. 9056 owns that general class (83 sites) and is not closed by this.
+
 ### Which flat runs an operator can actually COMMIT (8939)
 
 A compiler that drops the tail of a flat run is a defect at every container, but
