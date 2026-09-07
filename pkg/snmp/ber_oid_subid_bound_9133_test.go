@@ -3,6 +3,7 @@ package snmp
 import (
 	"bytes"
 	"math"
+	"strings"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -320,27 +321,26 @@ func TestACraftedOIDNeverProducesAnUnparseableReply9133(t *testing.T) {
 	}
 }
 
-// PINS A PRE-EXISTING BEHAVIOUR THIS FIX NEWLY EXERCISES, and says so.
+// #9333 RESOLVED THIS PIN, and it is updated deliberately rather than deleted —
+// which is what its own failure message demanded when the behaviour changed.
 //
-// `decodePDUFields` SKIPS (`continue`) a varbind whose OID fails to decode
-// rather than failing the PDU, so a two-varbind GET with one undecodable OID
-// gets a noError response carrying ONE varbind — an RFC 1157 §4.1.2 arity
-// violation (the response's variable-bindings must name the same variables the
-// request did).
+// It used to pin the OPPOSITE: `decodePDUFields` SKIPPED a varbind whose OID
+// failed to decode, so a two-varbind GET with one bad OID got a `noError`
+// response carrying ONE varbind — an RFC 1157 §4.1.2 arity violation, because a
+// manager that pairs values to requests by position then reads the wrong value
+// for every varbind after the dropped one.
 //
-// It is NOT introduced by #9133 and it is NOT a #9133 regression: the skip is
-// already reachable at master through the same function's OTHER error, which
-// the vector `06 02 2b 80` (a dangling continuation octet with nothing after
-// it) triggers there and here alike — that vector is in this cell precisely so
-// the "pre-existing" claim is measured rather than argued. What #9133 changes
-// is that an OVERFLOWING sub-identifier now takes this path too, instead of
-// being echoed back as malformed BER.
+// #9333 makes an undecodable varbind an ERROR, so the whole PDU is DISCARDED —
+// what RFC 1157 §4.1 and RFC 3416 §4.1 both prescribe for a message that cannot
+// be parsed, and what this function already did for a malformed request-id,
+// error-status, error-index or varbind-list header.
 //
-// Pinned rather than fixed because the remedy is a decision about every
-// malformed-varbind class in that loop (bad tag, bad length, short body all
-// `continue` the same way), not about OID bounds, and making one of the five
-// behave differently would be the worse outcome. Tracked as #9333.
-func TestAnUndecodableVarbindIsSkippedNotRejected9133(t *testing.T) {
+// BOTH vectors are kept, and the split between them is still the measurement
+// that mattered: `truncated-continuation` reaches this path at master too,
+// while `overflowing-subidentifier` reaches it only because of #9133's decoder
+// bound. That is what made "pre-existing" a measured claim rather than an
+// argument, and it is worth keeping now that the remedy has landed.
+func TestAnUndecodableVarbindDiscardsThePDU9333(t *testing.T) {
 	a := agent9133(t)
 
 	build := func(rawOID []byte) []byte {
@@ -359,39 +359,126 @@ func TestAnUndecodableVarbindIsSkippedNotRejected9133(t *testing.T) {
 		return berEncodeTLV(tagSequence, msg)
 	}
 
+	// POSITIVE CONTROL, first: the same two-varbind shape with BOTH OIDs
+	// well-formed must still be answered, and with TWO varbinds. Without it a
+	// "no response" below would be satisfied by an agent that answers nothing.
+	twoGood := func() []byte {
+		vb := func(oid []int) []byte {
+			return berEncodeTLV(tagSequence,
+				append(berEncodeTLV(tagObjectIdentifier, berEncodeOID(oid)),
+					berEncodeTLV(tagNull, nil)...))
+		}
+		vbList := berEncodeTLV(tagSequence, append(append([]byte{}, vb(oidSysDescr)...), vb(oidSysDescr)...))
+		pduBody := berEncodeIntegerTLV(7)
+		pduBody = append(pduBody, berEncodeIntegerTLV(0)...)
+		pduBody = append(pduBody, berEncodeIntegerTLV(0)...)
+		pduBody = append(pduBody, vbList...)
+		msg := berEncodeIntegerTLV(snmpVersion1)
+		msg = append(msg, berEncodeTLV(tagOctetString, []byte("public"))...)
+		msg = append(msg, berEncodeTLV(pduGetRequest, pduBody)...)
+		return berEncodeTLV(tagSequence, msg)
+	}()
+	resp := a.handlePacket(twoGood)
+	if resp == nil {
+		t.Fatal("positive control: a two-varbind GET with two GOOD OIDs got no response, " +
+			"so a nil answer below would prove nothing")
+	}
+	if _, _, vbs := decodeV1Response(t, resp); len(vbs) != 2 {
+		t.Fatalf("positive control: response carried %d varbinds, want 2 — the arity "+
+			"this cell is about is not observable otherwise", len(vbs))
+	}
+
 	for _, tc := range []struct {
 		name   string
 		rawOID []byte
 	}{
-		// Reachable at master AND here: the pre-existing path.
+		// Reachable at master AND here: the path was already live.
 		{"truncated-continuation", []byte{0x2b, 0x80}},
-		// New to this path as of #9133; echoed as malformed BER at master.
+		// Reaches this path only because of #9133's decoder bound.
 		{"overflowing-subidentifier", []byte{0x2b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f}},
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := berDecodeOID(tc.rawOID); err == nil {
 				t.Fatalf("fixture: berDecodeOID(% x) must fail for this cell to be "+
-					"about the skip path at all", tc.rawOID)
+					"about the undecodable-varbind path at all", tc.rawOID)
 			}
-			resp := a.handlePacket(build(tc.rawOID))
-			if resp == nil {
-				t.Fatalf("the PDU was dropped; if that is now the behaviour, this " +
-					"pin is stale and the arity concern is resolved — update it " +
-					"deliberately rather than deleting it")
-			}
-			errStatus, _, vbs := decodeV1Response(t, resp)
-			if errStatus != errNoError {
-				t.Fatalf("error-status = %d; the pinned behaviour is a noError "+
-					"response, not an error one", errStatus)
-			}
-			if len(vbs) != 1 {
-				t.Fatalf("response carried %d varbinds; the pinned behaviour is 1 "+
-					"(the request had 2 and the undecodable one is skipped)", len(vbs))
-			}
-			if !oidsEqual(vbs[0].oid, oidSysDescr) {
-				t.Fatalf("surviving varbind is %v, want sysDescr %v", vbs[0].oid, oidSysDescr)
+			if resp := a.handlePacket(build(tc.rawOID)); resp != nil {
+				_, _, vbs := decodeV1Response(t, resp)
+				t.Fatalf("the PDU was ANSWERED with %d varbind(s) for a 2-varbind "+
+					"request. An undecodable varbind makes the message unparseable, "+
+					"and RFC 1157 §4.1 / RFC 3416 §4.1 both discard such a message; "+
+					"answering with a short list is the #9333 arity violation",
+					len(vbs))
 			}
 		})
+	}
+}
+
+// The six arms, at the function boundary. Each malformed shape must produce an
+// ERROR naming what was wrong, not a silently shorter OID list.
+//
+// The `unreadable length` arm was a `break` rather than a `continue`, which is
+// strictly worse: it dropped that varbind AND every one after it, so the
+// response could be short by an arbitrary number.
+func TestEveryMalformedVarbindShapeIsAnError9333(t *testing.T) {
+	pdu := func(vbList []byte) []byte {
+		body := berEncodeIntegerTLV(1)
+		body = append(body, berEncodeIntegerTLV(0)...)
+		body = append(body, berEncodeIntegerTLV(0)...)
+		return append(body, berEncodeTLV(tagSequence, vbList)...)
+	}
+	goodVB := berEncodeTLV(tagSequence,
+		append(berEncodeTLV(tagObjectIdentifier, berEncodeOID([]int{1, 3})),
+			berEncodeTLV(tagNull, nil)...))
+
+	for _, tc := range []struct {
+		name string
+		vb   []byte
+		want string
+	}{
+		{"body too short", []byte{tagSequence, 0x01, tagObjectIdentifier}, "too short"},
+		{"first element not an OID", berEncodeTLV(tagSequence,
+			berEncodeTLV(tagOctetString, []byte("x"))), "not an OBJECT IDENTIFIER"},
+		{"OID value truncated", []byte{tagSequence, 0x03, tagObjectIdentifier, 0x7f, 0x2b}, "truncated"},
+		// The OID LENGTH-DECODE arm, which is a different arm from the one
+		// above: 0x7f is a VALID short length that overruns the body, while
+		// these three are lengths berDecodeLength itself refuses. Mutant U6
+		// SURVIVED until these existed — the gap was in the table, not in the
+		// code, which is what distinguishes it from U5 (proved unreachable).
+		{"OID length numBytes 0", []byte{tagSequence, 0x02, tagObjectIdentifier, 0x80}, "OID length"},
+		{"OID length numBytes 5", []byte{tagSequence, 0x02, tagObjectIdentifier, 0x85}, "OID length"},
+		{"OID length truncated", []byte{tagSequence, 0x03, tagObjectIdentifier, 0x82, 0x00}, "OID length"},
+		{"undecodable OID", berEncodeTLV(tagSequence,
+			berEncodeTLV(tagObjectIdentifier, []byte{0x2b, 0x80})), "OID"},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			// ALONE: the malformed varbind is the only one.
+			if _, _, _, oids, err := decodePDUFields(pdu(tc.vb)); err == nil {
+				t.Errorf("accepted, decoding to %v; want an error mentioning %q", oids, tc.want)
+			} else if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error = %v, want it to mention %q", err, tc.want)
+			}
+			// AFTER a good one: the arity violation's actual shape. The good OID
+			// must NOT be delivered on its own.
+			if _, _, _, oids, err := decodePDUFields(pdu(append(append([]byte{}, goodVB...), tc.vb...))); err == nil {
+				t.Errorf("a good varbind followed by a malformed one was accepted, "+
+					"delivering %v — that is the short list #9333 is about", oids)
+			}
+		})
+	}
+
+	// REFERENCE ARM: a varbind carrying NO value TLV is well-formed and must
+	// still be accepted, with its OID delivered. #6551's densest-packing bound
+	// depends on it, and a gate that rejected it would be levelling down.
+	valueless := []byte{tagSequence, 0x03, tagObjectIdentifier, 0x01, 0x2b}
+	_, _, _, oids, err := decodePDUFields(pdu(valueless))
+	if err != nil {
+		t.Fatalf("a value-less varbind was REJECTED: %v. It is well-formed — #9333 "+
+			"discards UNDECODABLE varbinds, not unusual ones", err)
+	}
+	if len(oids) != 1 || !oidEqual(oids[0], []int{1, 3}) {
+		t.Fatalf("value-less varbind decoded to %v, want exactly [1 3]", oids)
 	}
 }

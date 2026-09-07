@@ -591,14 +591,30 @@ packet handlers, and MIB view that call into them.
   above 2 — invalid ASN.1 that nonetheless round-trips byte for byte, and
   rejecting it would replace a faithful echo of the client's own OID with an
   empty one.
-- **A varbind whose OID fails to decode is SKIPPED, not rejected — an RFC 1157
-  §4.1.2 arity violation.** `decodePDUFields` `continue`s past it, so a
-  two-varbind GET with one undecodable OID gets a `noError` response carrying
-  ONE varbind. Measured, pre-existing (reachable at master via the same
-  function's "sub-identifier truncated" error, e.g. `06 02 2b 80`), pinned by
-  `TestAnUndecodableVarbindIsSkippedNotRejected9133` and tracked as #9333: the
-  remedy is a decision about all five `continue` arms in that loop, not about
-  OID bounds.
+- **A varbind that cannot be decoded DISCARDS THE WHOLE PDU (#9333).** It used
+  to be SKIPPED: `decodePDUFields` `continue`d past five malformed shapes and
+  `break`ed out of a sixth, so the handler received a shorter OID list than the
+  client sent and answered `noError` with it. Measured: a two-varbind v1 GET
+  with one undecodable OID returned a response carrying ONE varbind,
+  indistinguishable from a request that only ever asked for one. That violates
+  RFC 1157 §4.1.2 — the GetResponse's variable-bindings must name the same
+  variables the request did — and a manager pairing values to requests BY
+  POSITION, which is the normal implementation, then reads the wrong value for
+  every varbind after the dropped one. The `break` arm was the worst of the six:
+  it dropped that varbind AND every one after it.
+
+  Discarding is what RFC 1157 §4.1 and RFC 3416 §4.1 both prescribe for a
+  message that cannot be parsed, and what this function ALREADY did for a
+  malformed request-id, error-status, error-index or varbind-list header — the
+  six varbind arms were the only inconsistent ones. Every caller turns an error
+  from `decodePDUFields` into a dropped datagram.
+
+  **A varbind carrying NO value TLV is NOT affected and is still accepted**
+  (`SEQUENCE { OID }`, 5 bytes). It is well-formed, it reaches none of the six
+  arms, and #6551's densest-packing bound depends on it —
+  `TestWireVarbindByteFloors_6551` and the reference arm in
+  `TestEveryMalformedVarbindShapeIsAnError9333` both pin it, because a gate that
+  rejected it would be levelling down rather than fixing anything.
 - Exception values: `noSuchObject` (0x80), `noSuchInstance` (0x81),
   `endOfMibView` (0x82) — emitted for missing OIDs in walks.
 - GETNEXT walking order is driven by a static OID list; it must stay in
