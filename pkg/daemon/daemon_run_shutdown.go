@@ -264,6 +264,11 @@ func (d *Daemon) runShutdownSequence(wg *sync.WaitGroup, stop func(), runErr err
 	// also the safety-net for the Run()-returns path via the defers in Run.
 	d.stopPolicySchedulerLoop()
 	d.stopPinRetryLoop()
+	// #9166: the flow-export build retry runs reconciles that dial the
+	// configured collectors and swap exporter generations, so a late tick must
+	// not land after the exporters are torn down below. Idempotent / nil-safe
+	// and bounded, like its two neighbours.
+	d.stopFlowExportRetryLoop()
 
 	// #5523 C179-093: cancel + join the two remaining background loops that do
 	// NOT bind to the run WaitGroup and were previously leaked at shutdown:
