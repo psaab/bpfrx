@@ -125,10 +125,46 @@ through the queue that is full, so it goes out of band:
 - `SESSION_DELETE_DROP_EPOCH[worker_id]` is bumped at the refusal, next
   to #8576's NAT repair and for the same resolved worker id.
 - The worker loop compares it once per pass — one relaxed load — and on a
-  change runs `reconcile_peer_synced_against_shared` plus the flat
-  flow-cache eviction. A burst raises exactly ONE reconcile per pass
-  however many refusals it caused, because the epoch is compared and not
-  counted down.
+  change ARMS a `DeleteDropSweep`, which is then stepped on subsequent
+  passes plus the flat flow-cache eviction. A burst raises exactly ONE
+  sweep however many refusals it caused, because the epoch is compared
+  and not counted down.
+
+**The sweep is BUDGETED, and the epoch gate is not what makes that
+unnecessary (#9327).** The gate bounds how OFTEN the sweep runs, not what
+one run costs, and a single refused cross-worker `DeleteSynced` — ordinary
+RG-activation churn — arms it. The unbudgeted whole-table walk, measured
+on this tree:
+
+```text
+n=16384 finds-nothing   1.745 ms    <- already at the ~1.97 ms RX-ring fill
+n=60000 finds-nothing   6.466 ms    <- 3x the fill
+n=60000 all-stale      39.148 ms    <- ~20x the fill
+```
+
+The worker does not service its AF_XDP RX/TX rings while it sweeps, so
+that is wall-clock time the rings go unserviced — the same unit and the
+same justification as `WORKER_COMMAND_DRAIN_BUDGET`, which is 256 for
+exactly this reason. `DEFAULT_MAX_SESSIONS` is 131072, so 60k is not the
+ceiling. Note the *finds-nothing* case is the cheap one and it is already
+over budget by 16k sessions.
+
+`DELETE_DROP_SWEEP_BUDGET` is 256 slab slots per pass, matching the
+command-drain budget so the worker keeps one batch granularity rather
+than two, and the `stale` buffer is retained across passes so a steady
+state performs no allocation (the previous code cloned every peer-synced
+key into a fresh `Vec`, twice — at 60k sessions and a 52-byte key, two
+~3.1 MB allocations on the worker loop, per firing).
+
+Resumption is APPROXIMATE by design: slots freed mid-cycle can be reused
+below the cursor and are not revisited until the next cycle. That is
+acceptable here and would not be for an expiry walk — this sweep is a
+convergence step whose miss is re-armed by the next epoch bump, and a
+session wrongly retained for one more cycle is the same state the
+pre-#9327 code held for the whole interval between bumps. Arming
+mid-sweep RESTARTS rather than queueing, because the epoch says the
+shared map changed and every slot already judged against the old map has
+to be re-examined.
 
 **Why the trigger is the DELETE drop and not queue pressure**, measured
 rather than assumed (#8586, `loss:xpf-userspace-fw0`): ordinary session

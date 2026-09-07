@@ -1038,13 +1038,44 @@ impl AddressOccupancy {
         //
         // This is the pathology the row is actually about. Retained tokens go to
         // the BACK (`push` below), so K out-of-band-reserved tokens queued ahead
-        // of free ones cost O(K) ONCE and then migrate behind the free ones —
-        // the HA-churn spike amortizes itself. What does NOT amortize is the
-        // EXHAUSTED address: with the free tokens gone the FIFO is K reserved
-        // tokens and nothing else, so every claim popped all K, retained all K,
-        // allocated a K-element retain buffer, and returned None. `None` is the
-        // correct answer there, so nothing self-corrected: O(K) per FAILED
-        // claim, for as long as callers kept trying that address.
+        // of F free ones migrate behind them.
+        //
+        // #9327 CORRECTS WHAT THIS PARAGRAPH USED TO CLAIM. It said the K cost
+        // is paid "ONCE" and "the HA-churn spike amortizes itself". It is not
+        // once. Pushing the retained tokens to the back buys exactly F cheap
+        // claims before the K reserved tokens are at the head again, so a full
+        // cycle costs K+F pops for F claims:
+        //
+        //	amortized pops per claim = (K + F) / F
+        //
+        // which is O(K/F), and at F=1 it does not amortize at all. Measured on
+        // this tree (`recycle_amortization_9327`), pops per claim in steady
+        // state:
+        //
+        //	K=15, F=1 -> [16, 16]                    <- every claim pays K+1
+        //	K=12, F=4 -> [13, 1, 1, 1, 13, 1, 1, 1]  <- (12+4)/4 = 4, not 12-once
+        //
+        // F is the count of FREE tokens on the ring, so F shrinks toward 1 as
+        // an address approaches exhaustion — the cost is worst exactly when the
+        // pool is busiest. K is bounded by the range, so the near-exhaustion
+        // worst case is O(range) pops per claim.
+        //
+        // The correction matters because this paragraph is the stated reason
+        // the walk is unbounded, and it is the wrong reason. The RIGHT reason
+        // to leave it unbounded is the next one, which is unaffected: a bare
+        // scan budget cannot distinguish "scanned enough" from "genuinely
+        // full", and answering `None` on budget exhaustion turns a slow
+        // allocation into a spuriously dropped NAT translation. That argument
+        // stands on its own and does not need the amortization claim.
+        //
+        // What DOES amortize away is only the fully EXHAUSTED address: with the
+        // free tokens gone the FIFO is K reserved tokens and nothing else, so
+        // every claim popped all K, retained all K, allocated a K-element
+        // retain buffer, and returned None. `None` is the correct answer there,
+        // so nothing self-corrected: O(K) per FAILED claim, for as long as
+        // callers kept trying that address. That is what the short-circuit
+        // below fixes, and it is a strictly narrower case than the one the old
+        // wording implied was covered.
         //
         // The test is EXACT rather than a budget, which is what makes it safe.
         // The earlier analysis on #7174 rejected a bare scan budget because

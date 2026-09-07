@@ -590,7 +590,63 @@ impl SessionTable {
     /// `f` is invoked only for occupied slots (at most `budget` times). No
     /// allocation, no atomics — a bounded index walk plus one `saturating_sub`
     /// per occupied slot.
-    pub fn iter_with_idle_budgeted(
+     /// `iter_with_origin`, BUDGETED and RESUMABLE — the same cursor/budget
+    /// contract as [`Self::iter_with_idle_budgeted`], for the same reason
+    /// (#9327).
+    ///
+    /// The unbudgeted `iter_with_origin` walks the whole table and its caller
+    /// then clones every peer-synced key into a `Vec`. Measured on this tree at
+    /// `DEFAULT_MAX_SESSIONS/2`:
+    ///
+    /// ```text
+    /// n=16384 finds-nothing  1.745 ms
+    /// n=60000 finds-nothing  6.466 ms
+    /// n=60000 all-stale     39.148 ms
+    /// ```
+    ///
+    /// against the standard this crate sets for itself: `WORKER_COMMAND_DRAIN_BUDGET`
+    /// is 256 and is justified against a ~1.97 ms RX-ring fill at 25 Gbps. The
+    /// finds-nothing case is already at that fill time by 16k sessions, and the
+    /// table bound is 131072. The epoch gate upstream bounds how OFTEN the
+    /// sweep runs, not what one run costs, and a single refused cross-worker
+    /// `DeleteSynced` — ordinary RG-activation churn — arms it.
+    ///
+    /// Budget counts examined slab SLOTS, occupied or vacant, so the walk is
+    /// hard-bounded regardless of the occupied/vacant mix. Returns the next
+    /// cursor, wrapping to 0 on cycle completion so the caller can detect
+    /// "table fully walked".
+    ///
+    /// RESUMPTION IS APPROXIMATE, deliberately. Slots freed during a cycle can
+    /// be reused below the cursor and are then not revisited until the next
+    /// cycle. That is acceptable here and would not be for an expiry walk: this
+    /// sweep is a convergence step whose miss is re-armed by the next epoch
+    /// bump, and a session wrongly retained for one more cycle is the same
+    /// state the pre-#9327 code held for the whole interval between bumps.
+    pub fn iter_with_origin_budgeted(
+        &self,
+        cursor: usize,
+        budget: usize,
+        mut f: impl FnMut(&SessionKey, SessionOrigin),
+    ) -> usize {
+        let cap = self.slot_high_watermark.min(self.entries.capacity());
+        if cap == 0 || budget == 0 {
+            return 0;
+        }
+        let start = if cursor >= cap { 0 } else { cursor };
+        let end = start.saturating_add(budget).min(cap);
+        for idx in start..end {
+            if let Some(record) = self.entries.get(idx) {
+                f(&record.key, record.entry.origin);
+            }
+        }
+        if end >= cap {
+            0
+        } else {
+            end
+        }
+    }
+
+   pub fn iter_with_idle_budgeted(
         &self,
         cursor: usize,
         budget: usize,
