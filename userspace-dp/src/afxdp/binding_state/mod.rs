@@ -30,6 +30,11 @@ mod session_delta;
 #[cfg(test)]
 #[path = "delta_high_water_8108_tests.rs"]
 mod delta_high_water_8108_tests;
+// #9168: the kernel XDP-statistics publisher (`publish_kernel_xdp_statistics`).
+mod kernel_stats;
+#[cfg(test)]
+#[path = "kernel_stats_9168_tests.rs"]
+mod kernel_stats_9168_tests;
 mod snapshot;
 mod tx_inbox;
 
