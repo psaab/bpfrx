@@ -52,19 +52,20 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 	if ospfNode != nil {
 		proto.OSPF = &OSPFConfig{}
 
+		// #9408: expand a FLAT-SET CHAIN before reading the leaves, and read
+		// the SAME expanded slice from both loops below (compiler_protocols_ospf_flat_run_9408.go).
+		ospfChildren := expandFlatRun(ospfNode.Children, ospfSchema9408())
+		ospfExpanded := &Node{Keys: ospfNode.Keys, Children: ospfChildren}
+
 		// Router ID, passive-default, and export policies at the ospf level
-		for _, child := range ospfNode.Children {
+		for _, child := range ospfChildren {
 			switch child.Name() {
 			case "router-id":
 				if len(child.Keys) >= 2 {
 					proto.OSPF.RouterID = child.Keys[1]
 				}
 			case "reference-bandwidth":
-				if v := nodeVal(child); v != "" {
-					if n, err := strconv.Atoi(v); err == nil {
-						proto.OSPF.ReferenceBandwidth = n
-					}
-				}
+				applyOSPFReferenceBandwidth9408(proto.OSPF, child)
 			case "passive":
 				proto.OSPF.PassiveDefault = true
 			case "export":
@@ -76,7 +77,7 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 			}
 		}
 
-		for _, areaInst := range namedInstances(ospfNode.FindChildren("area")) {
+		for _, areaInst := range namedInstances(ospfExpanded.FindChildren("area")) {
 			area := &OSPFArea{ID: areaInst.name}
 
 			for _, ifInst := range bracketedGroupInstances8794(areaInst.node.FindChildren("interface")) {

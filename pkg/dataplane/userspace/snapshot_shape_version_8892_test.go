@@ -114,8 +114,29 @@ func shapeDigest8892(t *testing.T) (string, int) {
 // struct lands on the helper wire via ConfigSnapshot, so it is answerable to
 // this cell whether or not the author was thinking about the helper -- and the
 // gate that catches it is `go test ./...`, not the packages the diff touched.
+// v10 STANDS (issue 9408): `OSPFConfig.ReferenceBandwidth` was RENAMED to
+// `ReferenceBandwidthMbps` so the compiled field carries the unit that separates
+// the Junos leaf (bits/s) from the FRR directive it feeds (Mbps). A rename is a
+// stronger change than the two additions above -- the field has NO json tag, so
+// its Go name IS its wire key, and an old helper looking for the old key would
+// find nothing. It is nonetheless invisible to every helper, and this was
+// MEASURED rather than assumed:
+//
+//   - the Rust side models this whole subtree as ONE opaque value --
+//     `pub config: serde_json::Value` in userspace-dp/src/protocol/snapshot.rs.
+//     It names no field inside it, so no deserialization can break and
+//     `deny_unknown_fields` cannot bite;
+//   - `grep -rn "reference_bandwidth\|ReferenceBandwidth" userspace-dp/src/`
+//     returns ZERO hits. Nothing in the dataplane reads it, of any vintage;
+//   - the field's only consumer is pkg/frr, which renders the FRR managed
+//     section Go-side. Every Go reader is compiler-checked by the rename.
+//
+// So bumping ProtocolVersion here would make a mixed-base pair REFUSE to apply
+// any snapshot (the handler gates on exact equality) in exchange for a wire
+// change no helper can observe -- spending the one signal that says the wire
+// really moved. Fourth field to reach this cell, third to take this arm.
 const (
-	snapshotShapeGolden8892  = "55f649e57165590eccb5ae4b07f439b4bbd3f67e1d059334d599d01e551e0ff2"
+	snapshotShapeGolden8892  = "59c6b4651bd205a117ee01fd333b2011af38c79117ee2d0c8cbc84ca286a2347"
 	snapshotShapeVersion8892 = 10
 )
 

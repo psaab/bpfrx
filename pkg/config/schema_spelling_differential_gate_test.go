@@ -429,6 +429,16 @@ var gateValuePairs = []struct{ name, v1, v2 string }{
 	// for, and the same remedy: give the gate a valid pair rather than raise a
 	// blind-spot ceiling over a leaf that is genuinely comparable.
 	{"ospfnet", "point-to-point", "broadcast"},
+	// #9408 typed `protocols ospf reference-bandwidth` as a Junos bandwidth in
+	// BITS PER SECOND and range-gated it to the window FRR's Mbps
+	// `auto-cost reference-bandwidth (1-4294967)` can express. Every pair above
+	// is below the 1 Mbps floor (the largest is 40962 bits/s), so both
+	// reference-bandwidth leaves compile to 0 under all of them and fall out of
+	// `compared` into `unreachable` — the same shape the `pcp` and `ospfnet`
+	// pairs were added for, and the same remedy: give the gate a valid pair
+	// rather than raise a blind-spot ceiling over a leaf that is genuinely
+	// comparable.
+	{"refbw", "100m", "1g"},
 }
 
 type gateLeaf struct {
