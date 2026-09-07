@@ -454,6 +454,20 @@ type FullConfig struct {
 	// route (AD 5 or 200) always takes priority when present.
 	ClusterMode bool
 
+	// IfNameResolver resolves an AUTHORED protocol interface reference
+	// (`ge-0/0/1.0`, `reth0.50`) to the kernel netdev name the managed
+	// section must emit (#9405). The daemon wires it to
+	// Config.ResolveKernelIfName — the canonical resolver, which owns the
+	// slash->dash rewrite, the RETH->local-member map, the unit-0 collapse
+	// and the `.<vlan-id>` arm (#5107).
+	//
+	// nil means IDENTITY, which is the pre-#9405 rendering: it keeps every
+	// direct generateProtocols caller and any FullConfig built without a
+	// *config.Config in hand byte-identical. The token belt
+	// (validFRRInterfaceOperand) is applied either way — see
+	// protocol_ifname_9405.go.
+	IfNameResolver func(string) string
+
 	// PreferredRoutes is the ip-monitoring effective-route overlay
 	// (#1827 PR-1b): winner-resolved injected routes rendered as
 	// DISTANCE-1 statics (Static/1 — beats static AD 5 and DHCP AD
@@ -669,8 +683,31 @@ func (m *Manager) buildManagedSection(fc *FullConfig) string {
 	// as a side effect when the policy uses "load-balance consistent-hash".
 	ecmpMaxPaths := resolveECMP(fc)
 
-	// 10. Interface-level settings (bandwidth, point-to-point)
-	b.WriteString(m.generateInterfaceSettings(fc))
+	// #9405: resolve every protocol interface reference to its kernel netdev
+	// name and belt it as a single FRR token BEFORE anything renders it. The
+	// compiled value is the AUTHORED Junos reference (`ge-0/0/1.0`), which
+	// Linux dev_valid_name() rejects, so the pre-#9405 managed section carried
+	// `interface ge-0/0/1.0` blocks no IGP could ever attach to. Copies, never
+	// in-place: these pointers are the daemon's ACTIVE compiled config (#9141).
+	resolveIfName := fc.ifNameResolver()
+	rOSPF := resolveOSPFIfNames(resolveIfName, fc.OSPF)
+	rOSPFv3 := resolveOSPFv3IfNames(resolveIfName, fc.OSPFv3)
+	rRIP := resolveRIPIfNames(resolveIfName, fc.RIP)
+	rISIS := resolveISISIfNames(resolveIfName, fc.ISIS)
+
+	// 10. Interface-level settings (bandwidth, point-to-point).
+	//
+	// Fed the RESOLVED OSPF set: its ospfNetworkType suppression keys on the
+	// OSPF interface name and compares it against InterfaceBandwidths /
+	// InterfacePointToPoint, which the daemon keys by KERNEL name. Before
+	// #9405 a slash-spelled OSPF interface could never match, so the
+	// suppression silently did nothing; now that both sides name the same
+	// netdev, feeding the raw set would emit `ip ospf network point-to-point`
+	// here AND the operator's explicit network-type in the OSPF block, on one
+	// interface.
+	ifSettings := *fc
+	ifSettings.OSPF = rOSPF
+	b.WriteString(m.generateInterfaceSettings(&ifSettings))
 
 	// BFD profiles/peers are accumulated across the default instance AND
 	// every VRF into ONE section, then emitted as a single top-level `bfd`
@@ -681,13 +718,19 @@ func (m *Manager) buildManagedSection(fc *FullConfig) string {
 
 	// 11. Global dynamic protocols
 	if fc.OSPF != nil || fc.OSPFv3 != nil || fc.BGP != nil || fc.RIP != nil || fc.ISIS != nil {
-		b.WriteString(m.generateProtocols(fc.OSPF, fc.OSPFv3, fc.BGP, fc.RIP, fc.ISIS, "", ecmpMaxPaths, fc.PolicyOptions, bgpAcceptDefault, bfdSec))
+		b.WriteString(m.generateProtocols(rOSPF, rOSPFv3, fc.BGP, rRIP, rISIS, "", ecmpMaxPaths, fc.PolicyOptions, bgpAcceptDefault, bfdSec))
 	}
 
 	// 12. Per-VRF dynamic protocols
 	for _, inst := range fc.Instances {
 		if inst.OSPF != nil || inst.OSPFv3 != nil || inst.BGP != nil || inst.RIP != nil || inst.ISIS != nil {
-			b.WriteString(m.generateProtocols(inst.OSPF, inst.OSPFv3, inst.BGP, inst.RIP, inst.ISIS, inst.VRFName, ecmpMaxPaths, fc.PolicyOptions, bgpAcceptDefault, bfdSec))
+			b.WriteString(m.generateProtocols(
+				resolveOSPFIfNames(resolveIfName, inst.OSPF),
+				resolveOSPFv3IfNames(resolveIfName, inst.OSPFv3),
+				inst.BGP,
+				resolveRIPIfNames(resolveIfName, inst.RIP),
+				resolveISISIfNames(resolveIfName, inst.ISIS),
+				inst.VRFName, ecmpMaxPaths, fc.PolicyOptions, bgpAcceptDefault, bfdSec))
 		}
 	}
 
