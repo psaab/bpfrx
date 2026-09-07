@@ -1380,6 +1380,46 @@ snap`, and there are two of them — one per acceptance path).
   (`BatchDeleteSessions{,V6}`) keeps the #5096 best-effort contract — the
   periodic session sync and GC delta reconcile a transient helper miss — so it
   discards the helper-delete error; only the operator clear-all propagates it.
+- **A helper delete names the session's ROUTING DOMAIN (#9146).**
+  `userspace.Manager.DeleteSession{,V6}` used to send
+  `syncSessionV4Locked("delete", key, nil)`. A nil value builds a request with
+  `routing_domain = 0`, which the helper reads as WIRE_ABSENT and resolves by
+  PROBING every routing instance for the bare 5-tuple; when two match it REFUSES
+  the delete (#8636 `ambiguous-routing-domain`). The INSTALL that created the row
+  had named its domain, so install and delete named different rows. Measured on
+  the built wire request:
+
+  ```
+  upsert tenant A: 10.0.0.5:1234->10.0.0.9:443/6 routing_domain=100007
+  upsert tenant B: 10.0.0.5:1234->10.0.0.9:443/6 routing_domain=100008
+  DELETE         : 10.0.0.5:1234->10.0.0.9:443/6 routing_domain=0
+  ```
+
+  The ambiguity is reachable without any exotic race. The Go mirror is
+  bare-keyed so it remembers ONE row per 5-tuple, but swapping the tenant behind
+  that key emits two upserts and **zero** deletes (measured), and the standby
+  keys synced sessions BY domain — so it accumulates both rows and a later bare
+  delete matches two. Two tenants sharing a 5-tuple is the ordinary case for
+  overlapping VRF address space.
+
+  Why it matters more on a standby than the #8636 acceptance assumed: that
+  acceptance is *"a refused delete leaks for ONE PACKET, not until idle
+  timeout"*, because #8356 re-derives zone policy on the established-session hit
+  path. A synced session on a STANDBY receives no packets, so nothing re-judges
+  it — it leaks to its idle timeout and is then promoted on failover. An
+  acceptance scope written for the operator `clear security flow session` caller
+  was silently inherited by the cluster-sync delete.
+
+  The value is already in hand at the delete site (it is fetched for the
+  `ReverseKey`), so `deleteScopeVal` carries just its domain onto the request and
+  the ambiguity probe never runs. A default-instance session still sends domain
+  0, byte-identical to before. **Residual:** the BATCH path
+  (`BatchDeleteSessions{,V6}` → `deleteHelperSessionsV4/V6`) still sends a bare
+  delete, and that is the path the conntrack GC uses
+  (`pkg/conntrack/gc.go` → `DeleteBatchKnownV4`); its values exist at the caller
+  but the `DataPlane` interface drops them. Tracked separately.
+  `ClearAllSessions` is deliberately left bare — it has no values by
+  construction and is exactly the caller #8636's refusal was written for.
 - Session domain adapters: `SessionStoreOf`, `TelemetryOf`, and
   `NewDataPlaneSessionStore`. The generic `DataPlane` adapter preserves the
   batch-iteration fast path and centralizes cluster/GC companion ownership:

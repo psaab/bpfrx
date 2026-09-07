@@ -295,6 +295,25 @@ func shouldMirrorUserspaceSession(isReverse uint8) bool {
 	return isReverse == 0
 }
 
+// deleteScopeVal returns the minimal SessionValue that carries ONLY a routing
+// domain onto a "delete" sync request, or nil when there is no domain to name.
+//
+// #9146: a delete built with a nil value carries routing_domain 0, which the
+// helper reads as WIRE_ABSENT and resolves by PROBING every routing instance for
+// the bare 5-tuple. When two tenants hold that tuple the probe is ambiguous and
+// the helper REFUSES the delete (#8636). Naming the domain the session was
+// installed under makes the exact delete land, so the probe never runs.
+//
+// It is deliberately minimal rather than the whole value: a delete needs the key
+// and the domain, and forwarding a full value would put zone/NAT/ifindex fields
+// on a request that has no use for them.
+func deleteScopeVal(routingDomain uint32) *dataplane.SessionValue {
+	if routingDomain == 0 {
+		return nil
+	}
+	return &dataplane.SessionValue{RoutingDomain: routingDomain}
+}
+
 func (m *Manager) DeleteSession(key dataplane.SessionKey) error {
 	// Look up the session value BEFORE deleting from the BPF map so we
 	// can retrieve the ReverseKey for the pre-installed companion (#351).
@@ -305,12 +324,48 @@ func (m *Manager) DeleteSession(key dataplane.SessionKey) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	_ = m.syncSessionV4Locked("delete", key, nil)
-	// Also delete the reverse companion that SetSessionV4 pre-installed.
-	if valErr == nil && val.ReverseKey.Protocol != 0 {
-		_ = m.syncSessionV4Locked("delete", val.ReverseKey, nil)
-	}
+	// #9146: the value is already in hand — it was fetched above for the
+	// ReverseKey — and its routing domain used to be discarded here, so the
+	// delete went out naming a bare 5-tuple while the INSTALL that created the
+	// row had named its domain. Measured on the wire:
+	//
+	//	upsert tenant A: 10.0.0.5:1234->10.0.0.9:443/6 routing_domain=100007
+	//	upsert tenant B: 10.0.0.5:1234->10.0.0.9:443/6 routing_domain=100008
+	//	DELETE         : 10.0.0.5:1234->10.0.0.9:443/6 routing_domain=0
+	//
+	// The standby keys synced sessions BY domain, so it holds both tenants'
+	// rows; a bare delete then matches two and the helper refuses it
+	// (#8636 ambiguous-routing-domain). #8636's acceptance for refusing — "a
+	// refused delete leaks for ONE PACKET, not until idle timeout", because
+	// #8356 re-derives zone policy on the established-session hit path — was
+	// written for the operator `clear security flow session` caller. It does not
+	// transfer to a STANDBY, where a synced session receives no packets and
+	// nothing re-judges it: it leaks until its idle timeout and is then promoted
+	// on failover.
+	m.syncDeleteV4Locked(key, val, valErr == nil)
 	return nil
+}
+
+// syncDeleteV4Locked sends the helper deletes for a removed v4 session: the
+// forward key, and the reverse companion SetSessionV4 pre-installed. Both name
+// the session's routing domain when one is known.
+//
+// It is a named function rather than four lines inside DeleteSession so the
+// scope derivation can be DRIVEN by a cell. DeleteSession itself reads and
+// writes real BPF maps, so a cell for it skips wherever CAP_BPF is unavailable —
+// and a skipping cell scores a mutation as survived, which is the reading that
+// argues for deleting a guard doing its job.
+func (m *Manager) syncDeleteV4Locked(key dataplane.SessionKey, val dataplane.SessionValue, haveVal bool) {
+	scope := (*dataplane.SessionValue)(nil)
+	if haveVal {
+		scope = deleteScopeVal(val.RoutingDomain)
+	}
+	_ = m.syncSessionV4Locked("delete", key, scope)
+	// The reverse companion is the same flow in the same tenant, so it carries
+	// the same domain.
+	if haveVal && val.ReverseKey.Protocol != 0 {
+		_ = m.syncSessionV4Locked("delete", val.ReverseKey, scope)
+	}
 }
 
 func (m *Manager) DeleteSessionV6(key dataplane.SessionKeyV6) error {
@@ -323,12 +378,22 @@ func (m *Manager) DeleteSessionV6(key dataplane.SessionKeyV6) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	_ = m.syncSessionV6Locked("delete", key, nil)
-	// Also delete the reverse companion that SetSessionV6 pre-installed.
-	if valErr == nil && val.ReverseKey.Protocol != 0 {
-		_ = m.syncSessionV6Locked("delete", val.ReverseKey, nil)
-	}
+	// #9146: same as DeleteSession — name the domain the row was installed
+	// under instead of sending a bare tuple the standby has to guess at.
+	m.syncDeleteV6Locked(key, val, valErr == nil)
 	return nil
+}
+
+// syncDeleteV6Locked is the IPv6 analogue of syncDeleteV4Locked (#9146).
+func (m *Manager) syncDeleteV6Locked(key dataplane.SessionKeyV6, val dataplane.SessionValueV6, haveVal bool) {
+	scope := (*dataplane.SessionValueV6)(nil)
+	if haveVal && val.RoutingDomain != 0 {
+		scope = &dataplane.SessionValueV6{RoutingDomain: val.RoutingDomain}
+	}
+	_ = m.syncSessionV6Locked("delete", key, scope)
+	if haveVal && val.ReverseKey.Protocol != 0 {
+		_ = m.syncSessionV6Locked("delete", val.ReverseKey, scope)
+	}
 }
 
 // sessionHelperDeleteChunk bounds how many per-session helper "delete" IPCs the
