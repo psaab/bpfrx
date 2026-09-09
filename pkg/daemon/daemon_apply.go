@@ -258,7 +258,39 @@ func (d *Daemon) applyCancelCtx() context.Context {
 // Commit callers pass the daemon-lifetime context (applyCancelCtx); the boot /
 // DHCP / feed and confirmed-rollback callers pass a non-cancellable context so
 // their applies always complete (see applyConfig / executeConfirmedRollback).
-func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) error {
+func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) (retErr error) {
+	// #9175: a FAILED apply must un-record the #4957 applied marker.
+	//
+	// MarkActiveApplied / MarkAppliedDigest were the marker's ONLY writers, so it
+	// recorded a success and nothing ever unrecorded one. The store's field
+	// comment justified that with "the marker is keyed on the config text, so a
+	// stale value can only make the shortcut MORE conservative" — true for a
+	// FORWARD sequence, where each promotion moves the active text away from the
+	// stamped digest, and false for RE-PROMOTION:
+	//
+	//	A applied            -> ActiveApplied() true
+	//	B promoted, apply FAILS -> false   (correct: the digest no longer matches)
+	//	A re-promoted, apply FAILS -> TRUE (the step-1 digest matches again)
+	//
+	// At step 3 handleConfigSync takes its converged shortcut, returns nil, and
+	// the HA config high-water advances past a config the dataplane never took —
+	// the #4957 fail-open, re-entered through the remedy #4957 itself prescribed,
+	// and only observable at failover.
+	//
+	// This sits in a deferred close over the NAMED return rather than at each
+	// caller's failure branch, and that is the point: applyConfigLocked is the one
+	// choke point every apply in this daemon goes through (the boot / background
+	// path, the commit path, the peer config-sync path and the commit-confirmed
+	// auto-rollback all call it), and every early return inside it — the context
+	// abort, the factory-reset refusal, the test seam — is covered without anyone
+	// having to remember. A per-caller clear would be four sites today and a fifth
+	// silently missing tomorrow.
+	defer func() {
+		if retErr != nil && d.store != nil {
+			d.store.InvalidateAppliedDigest()
+		}
+	}()
+
 	// Reset VIP warning suppression so the new config gets fresh warnings.
 	//
 	// #7532: through the accessor. This runs under applySem while the VRRP
