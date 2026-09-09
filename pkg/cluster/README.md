@@ -423,6 +423,61 @@ still promotes once the grace elapses (`neverSeenConfirmed` returns true at
 sets `peerEverSeen` and runs `electSingleNode`; `election.go` bypasses the
 readiness gate when `!peerAlive`, so the surviving node takes over.
 
+### The gate's third case: the peer has YIELDED (#9452)
+
+The readiness gate had a two-case taxonomy and needed three. `electSingleNode`'s
+own comment states the two it knew about, and both are right:
+
+| case | discriminator | verdict | why |
+|------|---------------|---------|-----|
+| peer LOSS | `peerEverSeen && !peerAlive` | fail OPEN | an established cluster had a working primary and it died; a survivor that refuses takeover is a total outage |
+| cold BOOT | `!peerEverSeen` | HOLD | no established forwarding to preserve, and a not-ready node that promotes forwards nothing anyway while denying the peer a clean takeover |
+| **peer YIELDED** | **peer alive and reports non-ownership** | **fail OPEN (degraded)** | **the cold-boot argument does not apply — there IS established forwarding and it stops the instant the peer steps down — and unlike peer loss there is no split-brain to weigh, because the peer is not claiming the RG** |
+
+`peerYieldedOwnership` (`election.go`) is the third row's predicate. It is TRUE
+for exactly the two ways a live peer reports it is not the owner:
+
+- `StateSecondaryHold` — an explicit transfer-out, which is what
+  `ManualFailover` writes.
+- `Weight <= 0` — a resignation. `electRG`'s `localWeight <= 0` branch forces a
+  weight-0 node SECONDARY unconditionally, so a peer advertising it *cannot* be
+  primary.
+
+It is FALSE for a peer that is merely `StateSecondary` with weight > 0 (that is
+the cold-boot shape, where the gate must still hold) and for `peerGroup == nil`
+(peer loss or an unreported RG: a partitioned peer may still be forwarding as
+primary, so promoting a not-ready node there risks a dual-active).
+
+**What the missing row cost, measured.** `request chassis cluster failover
+redundancy-group N` demotes the local primary immediately and the peer's
+promotion then went through the bare gate. Issued inside the bounded #7162 30s
+startup promotion hold on a node that had just rejoined after a crash, that left
+RG0/RG1/RG2 owned by **neither** node for the remainder of the hold — 19s on the
+#9452 reproduction, up to the full 30s — while the CLI had already printed
+`Manual failover triggered for redundancy group N`. Nothing answered proxy-ARP
+for the pool-NAT address in that window.
+
+**The throughput fall in the same run is a SEPARATE signal, and the arithmetic
+that says otherwise is a trap.** The iperf3 average went 22.5 -> 18.1 Gbit/s, and
+~20-25s of a 120s stream carrying nothing is about that shortfall — so "the same
+defect measured a second way" reads as established. It is refuted by the fix:
+with the ownership gap closed to 0-1s, two consecutive runs on the same build
+came back at **18.9** and **20.3**, against
+`make harness-compare GATE=test-failover`'s `[21.375, 23.625]` green band.
+Closing the gap bought far less than the ~4.4 Gbit/s the theory predicted, and
+the 1.4 Gbit/s spread between two identical runs is itself a third of the
+remaining gap — which is why harness-compare reads it `flake-candidate` rather
+than a regression. Tracked on its own as #9484.
+
+Note the 30s hold is IN CONTRACT — `daemon_ha_noreth_hold.go` states it releases
+on its own timer regardless of sync or peer state — so this is not a
+hold-duration bug that a faster bulk sync removes. With everything healthy, a
+manual failover issued within 30s of a peer restart still blackholed the RG.
+
+A promotion taken on this row sets `DegradedPromoted` and records its reason in
+the RG event history, the same as the #7161/#7939 timeout fallback, so
+`show chassis cluster status` distinguishes it from a normal promotion.
+
 ## Duplicate node-id (invalid cluster, #4549 F11)
 
 Two chassis sharing a node-id is an invalid cluster: the HA protocol
