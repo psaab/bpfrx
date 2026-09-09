@@ -1068,6 +1068,76 @@ impl super::Coordinator {
     /// re-imports the synced sessions and re-reserves, and no forwarding happens
     /// in between, so the interval where a port is free while its session still
     /// exists has no packet path through it.
+    /// #9367: release the worker's slots in every shared_exact CoS V_min
+    /// floor.
+    ///
+    /// THE DEFECT. `PaddedVtimeSlot` has no TTL, generation or liveness input:
+    /// `participating_v_min_snapshot` counts every non-sentinel peer slot and
+    /// takes the MIN, and both production `vacate()` call sites are executed by
+    /// the OWNING worker (its last flow bucket on the queue drained, or a
+    /// binding reset / HA demotion). A worker that exits by PANIC executes
+    /// neither, so its frozen `queue_vtime` pins the cross-worker V_min while
+    /// the survivors' own vtimes keep advancing. `cos_queue_v_min_continue`
+    /// then never passes, and because the window is restored to full only on a
+    /// PASSING check the survivors decay 1000 -> 64 batches and settle into the
+    /// minimum-window duty cycle: 8 throttled + 64 suspended, i.e. the fairness
+    /// brake is off for 64/72 = 88.9% of drain opportunities. A standing ~11%
+    /// drain-opportunity tax on one exact class, additive to the RX capacity
+    /// the panic itself already cost.
+    ///
+    /// It is not "for the life of the process": a coordinator teardown discards
+    /// the floors map, a worker-count change fails the
+    /// `f.slots.len() == num_workers` reuse filter in `cos_leases.rs` and
+    /// builds a fresh all-sentinel floor, and removing plus re-adding the exact
+    /// queue drops the key. Under UNCHANGED operation none of those happen, so
+    /// the poison can last indefinitely.
+    ///
+    /// #4254 (R-7) closed the REJOIN door — a worker whose runtime was rebuilt
+    /// restarting `queue_vtime` at 0 — by seeding a rejoiner to the peer
+    /// frontier. The dead / never-returning door reaches the identical state
+    /// and is not closed by that fix.
+    ///
+    /// SINGLE-WRITER, still. `vacate()` is documented as owner-only because
+    /// two writers racing on one slot could interleave a stale publish after a
+    /// vacate. This call happens under the one-shot `holders_retired` CAS in
+    /// [`Self::retire_worker_holders_where`], and there it is gated on
+    /// `atomics.dead` rather than on that sweep's own predicate — a worker the
+    /// supervisor has already recorded as `dead` has exited and nothing
+    /// respawns it, so the owning writer is gone and this is the only writer
+    /// left. The gate is load-bearing and not belt-and-braces:
+    /// `retire_all_worker_holders` selects `|_| true` for the #7092 teardown
+    /// reclaim and runs while those workers are still RUNNING, so an ungated
+    /// vacate would race a live `publish()`. The Release store is unchanged, so
+    /// a peer's Acquire read still pairs.
+    ///
+    /// Reads the floors map through `load_full()`, so a concurrent
+    /// `queue_vtime_floors.store(..)` from a reconcile cannot be torn by this
+    /// walk. A floor built AFTER this call starts all-sentinel, so the
+    /// interleaving cannot leave a stale participating slot behind.
+    ///
+    /// Returns the number of slots that were actually participating and are
+    /// now vacated, so the caller can say something happened rather than
+    /// logging unconditionally.
+    fn vacate_worker_v_min_slots(&self, worker_id: u32) -> usize {
+        let floors = self.cos.queue_vtime_floors.load_full();
+        let mut vacated = 0usize;
+        for floor in floors.values() {
+            let Some(slot) = floor.slots.get(worker_id as usize) else {
+                continue;
+            };
+            if slot.read().is_none() {
+                // Already NOT_PARTICIPATING — the worker had no flows on this
+                // queue when it died, which is the case that was never poisoned
+                // in the first place. Not counted, so the log line above means
+                // "a pinned frontier was released" and not "the sweep ran".
+                continue;
+            }
+            slot.vacate();
+            vacated += 1;
+        }
+        vacated
+    }
+
     pub(crate) fn retire_all_worker_holders(&self) -> usize {
         self.retire_worker_holders_where(|_| true)
     }
@@ -1107,9 +1177,32 @@ impl super::Coordinator {
                 now_ns,
             );
             freed += self.forwarding.nat64.retire_worker(id, now_ns);
+            // #9367: the V_min vacate is gated on the PANIC flag, not on this
+            // sweep's own `select`. `retire_all_worker_holders` passes
+            // `|_| true` — it retires every registered id, LIVE ones included,
+            // because the #7092 teardown reclaim has to name them before
+            // `stop_and_clear` drops the records. Those workers are still
+            // RUNNING at that point, so vacating their slots there would make
+            // the coordinator a SECOND writer to a slot whose contract is
+            // single-writer, and it would buy nothing: the same teardown
+            // discards `cos.queue_vtime_floors` outright a few statements
+            // later (`coordinator/mod.rs`). Only a worker the supervisor has
+            // already recorded as `dead` has no owning writer left, which is
+            // exactly the case #9367 is about.
+            let vacated = if atomics.dead.load(Ordering::Relaxed) {
+                self.vacate_worker_v_min_slots(id)
+            } else {
+                0
+            };
             if freed > 0 {
                 eprintln!(
                     "xpf-dp: reclaimed {freed} NAT reservation(s) stranded by dead worker {id}"
+                );
+            }
+            if vacated > 0 {
+                eprintln!(
+                    "xpf-dp: vacated {vacated} cross-worker CoS V_min slot(s) stranded by \
+                     dead worker {id}"
                 );
             }
         }

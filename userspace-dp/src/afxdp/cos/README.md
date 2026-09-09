@@ -141,6 +141,34 @@ mod.rs for further file-level breakdown.
   bounded and self-healing, never incorrect. Same warmed-path allocation
   class as #4972 / #4973 / #5189; these two sites were simply never
   enumerated there.
+- **A DEAD worker's V_min slot is vacated by the coordinator, not by the
+  worker (#9367).** `PaddedVtimeSlot` has no TTL, generation or liveness
+  input — `participating_v_min_snapshot` counts every non-sentinel peer slot
+  and takes the MIN — and both worker-side `vacate()` sites (last flow bucket
+  drained in `queue_ops/accounting.rs`, binding reset / HA demotion in
+  `worker/cos/mod.rs`) are executed by the OWNING worker. A worker that exits
+  by PANIC executes neither: the supervisor catches the unwind, sets `dead`,
+  and lets the thread go, and the floor `Arc` survives because
+  `coordinator/cos_leases.rs` reuses a floor while
+  `f.slots.len() == num_workers`, which a panic does not change. The frozen
+  `queue_vtime` then pins the cross-worker V_min while survivors' vtimes
+  advance, `cos_queue_v_min_continue` never passes, and — because the
+  suspension window is restored to full ONLY on a PASSING check — the window
+  decays 1000 -> 64 and sticks: steady state is 8 throttled + 64 suspended,
+  i.e. the fairness brake off for 64/72 = 88.9% of drain opportunities on
+  that exact class. `Coordinator::vacate_worker_v_min_slots`, called from the
+  same one-shot `holders_retired` CAS that reclaims NAT holder bits
+  (`coordinator/status.rs`) and gated there on `atomics.dead`, releases the
+  slot. It is then the only remaining writer — the owning thread has exited and
+  nothing respawns it — so the single-writer contract still holds. The gate is
+  not redundant with the sweep's own predicate: the sibling
+  `retire_all_worker_holders` selects every id, live ones included, and runs
+  while those workers are still publishing. #4254 (R-7) closed the sibling REJOIN
+  door by seeding a rebuilt worker to the peer frontier; the never-returning
+  door reaches the identical state and is not closed by that fix. A worker
+  that STALLS without panicking is NOT covered: the poison is a property of
+  the SLOT VALUE, nothing in the V_min reduction reads liveness, and the
+  sweep selects on the panic `dead` flag.
 - **V_min cadence persists across drain calls (#2624).** The
   cross-worker V_min sync (`cos_queue_v_min_continue` → the expensive
   `participating_v_min_snapshot` Acquire-load scan of every peer

@@ -8621,3 +8621,357 @@ fn a_non_exact_high_rate_queue_gets_no_vtime_floor_8428() {
          explicitly did not take (#8428)"
     );
 }
+
+// ===========================================================================
+// #9367 — a PANICKED worker's V_min slot must be vacated by the dead-worker
+// sweep.
+//
+// `PaddedVtimeSlot` has no TTL, generation or liveness input:
+// `participating_v_min_snapshot` counts every non-sentinel peer slot and takes
+// the MIN. Both production `vacate()` sites are executed by the OWNING worker
+// (`cos/queue_ops/accounting.rs` when its last flow bucket on the queue
+// drained, `worker/cos/mod.rs` on binding reset / HA demotion), and a worker
+// that exits by panic executes neither. The supervisor catches the unwind,
+// sets `dead`, and lets the thread go; nothing respawns it, and the floor Arc
+// survives because `cos_leases.rs` reuses a floor while
+// `f.slots.len() == num_workers` and a panic does not change `num_workers`.
+//
+// The frozen slot pins the cross-worker V_min, `cos_queue_v_min_continue`
+// never passes, and the suspension window — restored to full only on a PASSING
+// check — decays 1000 -> 64 and sticks. Steady state is 8 throttled + 64
+// suspended: the fairness brake is off for 64/72 = 88.9% of drain
+// opportunities on that exact class, additive to the RX capacity the panic
+// already cost.
+//
+// The sweep that should own this ALREADY EXISTS. `retire_worker_holders_where`
+// walks every `.dead` worker under a one-shot `holders_retired` CAS and
+// reclaimed NAT holder bits only — #7092 fixed that class for NAT and did not
+// enroll V_min.
+//
+// NOTHING EXISTING IS CLOSE. `v_min_tests/hard_cap.rs` and
+// `v_min_tests/prepared_drain.rs` call `vacate()` themselves (the happy path);
+// `v_min_tests/rejoiner.rs` covers the #4254 door, which was fixed.
+// ===========================================================================
+
+/// A floors map with one shared_exact queue and `num_workers` slots, matching
+/// what `build_shared_cos_queue_vtime_floors_reusing_existing` produces.
+fn v_min_floor_map_9367(
+    num_workers: usize,
+) -> std::collections::BTreeMap<
+    (i32, u8),
+    Arc<SharedCoSQueueVtimeFloor>,
+> {
+    let mut map = std::collections::BTreeMap::new();
+    map.insert(
+        (7, 3u8),
+        Arc::new(SharedCoSQueueVtimeFloor::new(num_workers)),
+    );
+    map
+}
+
+/// THE BINDER. A dead worker's participating slot must be vacated; a LIVE
+/// worker's and a surviving PEER's must not.
+///
+/// FAIL-ON-REVERT: remove the `vacate_worker_v_min_slots` call from
+/// `retire_worker_holders_where` and the dead worker's slot still reads
+/// `Some(..)`, which is the state that pins the frontier.
+///
+/// Three controls, because a sweep that vacated everything would satisfy the
+/// positive case while destroying the fairness coordination it exists to
+/// protect:
+///   - worker 3 is ALIVE for the first sweep — its slot must survive;
+///   - worker 4 is a surviving PEER throughout — its slot must survive BOTH
+///     sweeps;
+///   - the dead worker's slot must be participating before the sweep, or the
+///     assertion after it would pass on a slot that was never poisoned.
+#[test]
+fn retire_dead_worker_holders_vacates_the_dead_workers_v_min_slot_9367() {
+    use std::sync::atomic::Ordering;
+
+    let mut coordinator = Coordinator::new();
+    let dead_rec = WorkerRuntimeRecord::for_test(gre1881_fake_worker_handle());
+    let dead_atomics = dead_rec.handle.runtime_atomics.clone();
+    coordinator.workers.register(3, dead_rec, None);
+    let peer_rec = WorkerRuntimeRecord::for_test(gre1881_fake_worker_handle());
+    coordinator.workers.register(4, peer_rec, None);
+
+    let floors = v_min_floor_map_9367(6);
+    let floor = floors.get(&(7, 3u8)).expect("fixture floor").clone();
+    coordinator
+        .cos
+        .queue_vtime_floors
+        .store(Arc::new(floors.clone()));
+
+    // Both workers are participating with a committed vtime. Worker 3's is the
+    // LOWER one, so it is the cross-worker V_min the survivors obey — the exact
+    // value that gets frozen when it dies.
+    floor.slots[3].publish(1_000);
+    floor.slots[4].publish(9_000);
+    assert_eq!(
+        floor.slots[3].read(),
+        Some(1_000),
+        "fixture: the worker that is about to die must be PARTICIPATING, or the \
+         assertion after the sweep would pass on a slot that was never poisoned",
+    );
+    assert_eq!(
+        floor.participating_v_min_snapshot(4),
+        (1, Some(1_000)),
+        "fixture: worker 3's slot must be the frontier worker 4 obeys, or this \
+         cell is not exercising the pin at all",
+    );
+
+    // NEGATIVE CONTROL: worker 3 is still ALIVE. The sweep must not touch it —
+    // vacating a live worker's slot would remove it from the V_min reduction
+    // while it is still serving, which is the opposite fairness defect.
+    coordinator.retire_dead_worker_holders();
+    assert_eq!(
+        floor.slots[3].read(),
+        Some(1_000),
+        "a LIVE worker's V_min slot must not be vacated",
+    );
+
+    // The worker panics: the supervisor sets `dead` and the thread exits.
+    dead_atomics.dead.store(true, Ordering::Relaxed);
+    coordinator.retire_dead_worker_holders();
+
+    assert_eq!(
+        floor.slots[3].read(),
+        None,
+        "a dead worker's V_min slot must be vacated. Left participating, its \
+         frozen queue_vtime pins the cross-worker V_min, cos_queue_v_min_continue \
+         never passes, and every survivor on this shared_exact queue decays into \
+         the minimum suspension window — the brake off for 64/72 of drain \
+         opportunities (#9367)",
+    );
+    assert_eq!(
+        floor.slots[4].read(),
+        Some(9_000),
+        "the SURVIVING peer's slot must be untouched — a sweep that vacated \
+         every slot would satisfy the assertion above while deleting the \
+         cross-worker coordination entirely",
+    );
+    assert_eq!(
+        floor.participating_v_min_snapshot(4),
+        (0, None),
+        "with the dead peer gone, worker 4 must see no participating peer and \
+         run unthrottled rather than obeying a frozen frontier",
+    );
+}
+
+/// WIRING BIND. The vacate must be REACHED from the production status path.
+///
+/// The cell above drives `retire_dead_worker_holders` by hand, which binds
+/// what the sweep DOES and says nothing about whether anything calls it — the
+/// #6979 note on the sibling NAT pair records that deleting the call from
+/// `server/helpers/status.rs` left the direct cell green. So this enters
+/// through `refresh_status`, the real 1 Hz entry point.
+///
+/// THE FIXTURE IS BUILT BY THE PRODUCTION ALLOCATOR, not stored by hand.
+/// `refresh_status`'s FIRST statement is `refresh_bindings`, which runs
+/// `refresh_cos_runtime_maps` and rebuilds `cos.queue_vtime_floors` from the
+/// plan. A hand-stored floor for a queue the plan does not contain is therefore
+/// discarded before the sweep ever runs — measured: an earlier draft of this
+/// cell stored `(7, 3)` into an otherwise-empty coordinator and the map was
+/// EMPTY by the time `retire_dead_worker_holders` walked it, so the retained
+/// Arc still read `Some(4242)`. Building the floor from
+/// `exact_queue_forwarding_fixture` puts the queue in the plan, which is also
+/// the only shape in which the reuse filter is exercised.
+///
+/// AND THAT IS WHY THE Arc CONTROL BELOW IS LOAD-BEARING. A REBUILT floor is
+/// all-sentinel, so `read() == None` is bit-identical to the vacate having
+/// worked. `Arc::ptr_eq` is the only thing that distinguishes "the sweep
+/// released a poisoned slot" from "the plan handed us a fresh floor" — without
+/// it this cell would pass just as happily on a tree where the vacate does not
+/// exist but the reuse filter happens to miss.
+#[test]
+fn refresh_status_vacates_a_dead_workers_v_min_slot_9367() {
+    use std::sync::atomic::Ordering;
+
+    let mut coordinator = Coordinator::new();
+    let dead_rec = WorkerRuntimeRecord::for_test(gre1881_fake_worker_handle());
+    let dead_atomics = dead_rec.handle.runtime_atomics.clone();
+    coordinator.workers.register(2, dead_rec, None);
+    coordinator
+        .workers
+        .register(3, WorkerRuntimeRecord::for_test(gre1881_fake_worker_handle()), None);
+    // An EXACT queue at or above COS_SHARED_EXACT_MIN_RATE_BYTES is the only
+    // shape the V_min-floor allocator admits (#8428 pins that containment), and
+    // six slots so worker id 2 is indexable and the reuse filter has a stable
+    // `num_workers` to compare against. `exact_queue_forwarding_fixture`
+    // defaults to 50 MB/s, which is BELOW the 2.5 Gb/s floor — measured: the
+    // fixture assertion below caught that as "the plan produced no floor"
+    // rather than passing on an empty map, which is what it is there for.
+    coordinator.forwarding = exact_queue_forwarding_fixture();
+    coordinator
+        .forwarding
+        .cos
+        .interfaces
+        .get_mut(&80)
+        .expect("fixture iface")
+        .queues[0]
+        .transmit_rate_bytes = 500_000_000;
+    coordinator.workers.last_planned_worker_slots = 6;
+
+    let mut state = crate::server::state::ServerState {
+        status: Default::default(),
+        snapshot: None,
+        afxdp: coordinator,
+        state_writer: std::sync::Arc::new(crate::state_writer::StateWriter::new()),
+    };
+
+    // TICK 1 — the production path builds the floor.
+    crate::server::helpers::status::refresh_status(&mut state);
+    let floor = state
+        .afxdp
+        .cos
+        .queue_vtime_floors
+        .load()
+        .get(&(80, 4))
+        .cloned()
+        .expect(
+            "fixture: the exact-queue plan must produce a V_min floor. Without \
+             one this cell measures nothing, and the assertion below would pass \
+             on an empty map",
+        );
+    assert_eq!(
+        floor.slots.len(),
+        6,
+        "fixture: six slots, so worker id 2 is indexable and the rebuild's \
+         `slots.len() == num_workers` reuse filter holds across tick 2",
+    );
+
+    // Worker 2 commits a vtime and then panics; worker 3 survives and keeps
+    // advancing. Worker 2's is the LOWER value, so it is the cross-worker V_min
+    // worker 3 obeys — the exact value that freezes.
+    floor.slots[2].publish(4_242);
+    floor.slots[3].publish(9_000);
+    assert_eq!(
+        floor.participating_v_min_snapshot(3),
+        (1, Some(4_242)),
+        "fixture: worker 2's slot must be the frontier worker 3 obeys, or this \
+         cell is not exercising the pin at all",
+    );
+    dead_atomics.dead.store(true, Ordering::Relaxed);
+
+    // TICK 2 — the real 1 Hz status path.
+    crate::server::helpers::status::refresh_status(&mut state);
+
+    let after = state
+        .afxdp
+        .cos
+        .queue_vtime_floors
+        .load()
+        .get(&(80, 4))
+        .cloned()
+        .expect("the floor must still exist after the second refresh");
+    assert!(
+        std::sync::Arc::ptr_eq(&floor, &after),
+        "the rebuild must REUSE the same floor Arc (`slots.len() == num_workers`). \
+         If it built a fresh one, every slot reads None for a reason that has \
+         nothing to do with the sweep, and the verdict below would be vacuous",
+    );
+    assert_eq!(
+        after.slots[2].read(),
+        None,
+        "a status refresh must vacate a dead worker's V_min slot — if this \
+         passes only when retire_dead_worker_holders is called by hand, the \
+         vacate is unwired and the frontier stays pinned (#9367)",
+    );
+    assert_eq!(
+        after.slots[3].read(),
+        Some(9_000),
+        "the SURVIVING peer's slot must be untouched — a sweep that cleared \
+         every slot would satisfy the assertion above while deleting the \
+         cross-worker coordination entirely",
+    );
+    assert!(
+        dead_atomics.holders_retired.load(Ordering::Relaxed),
+        "the status path must latch the worker as retired",
+    );
+}
+
+/// The sweep is ONE-SHOT, and the vacate must not resurrect a slot.
+///
+/// `holders_retired` is a CAS, so the second observation of `dead` skips the
+/// whole body. This pins that the vacate rides that latch rather than running
+/// on every 1 Hz tick — a per-tick walk of every floor would be a new cost on
+/// the status path, and (worse) it would keep re-vacating a slot index that a
+/// LATER generation could legitimately hand to a live worker.
+#[test]
+fn dead_worker_v_min_vacate_is_one_shot_9367() {
+    use std::sync::atomic::Ordering;
+
+    let mut coordinator = Coordinator::new();
+    let rec = WorkerRuntimeRecord::for_test(gre1881_fake_worker_handle());
+    let atomics = rec.handle.runtime_atomics.clone();
+    coordinator.workers.register(1, rec, None);
+
+    let floors = v_min_floor_map_9367(6);
+    let floor = floors.get(&(7, 3u8)).expect("fixture floor").clone();
+    coordinator.cos.queue_vtime_floors.store(Arc::new(floors));
+    floor.slots[1].publish(77);
+    atomics.dead.store(true, Ordering::Relaxed);
+
+    coordinator.retire_dead_worker_holders();
+    assert_eq!(floor.slots[1].read(), None, "first sweep vacates");
+
+    // A later generation legitimately re-uses slot index 1 for a LIVE worker.
+    // The second sweep must not touch it: the latch means the body never runs
+    // again for this record.
+    floor.slots[1].publish(555);
+    coordinator.retire_dead_worker_holders();
+    assert_eq!(
+        floor.slots[1].read(),
+        Some(555),
+        "the one-shot `holders_retired` CAS must gate the V_min vacate too — a \
+         sweep that re-ran every tick would keep clearing a slot index a later \
+         generation handed to a live worker (#9367)",
+    );
+}
+
+/// The vacate is gated on `dead`, NOT on the sweep's own predicate.
+///
+/// `retire_all_worker_holders` passes `|_| true`: it retires every registered
+/// worker id, LIVE ones included, because the #7092 teardown reclaim has to
+/// name them before `stop_and_clear` drops the records. At that moment those
+/// workers are still RUNNING, so an ungated vacate would make the coordinator a
+/// SECOND writer to a slot whose documented contract is single-writer — racing
+/// a live `publish()` — and it would buy nothing, because the same teardown
+/// discards `cos.queue_vtime_floors` outright a few statements later.
+///
+/// This is the cell the first draft of #9367 would have failed: the vacate call
+/// sat unconditionally in the shared body, and the prose on it claimed the
+/// single-writer contract held "because the sweep runs only for a dead worker",
+/// which is true of `retire_dead_worker_holders` and false of its sibling.
+#[test]
+fn retire_all_worker_holders_does_not_vacate_a_live_workers_v_min_slot_9367() {
+    let mut coordinator = Coordinator::new();
+    let rec = WorkerRuntimeRecord::for_test(gre1881_fake_worker_handle());
+    let atomics = rec.handle.runtime_atomics.clone();
+    coordinator.workers.register(5, rec, None);
+
+    let floors = v_min_floor_map_9367(6);
+    let floor = floors.get(&(7, 3u8)).expect("fixture floor").clone();
+    coordinator.cos.queue_vtime_floors.store(Arc::new(floors));
+    floor.slots[5].publish(31_337);
+
+    // The all-ids sweep DOES do its NAT work for this live worker — that is the
+    // #7092 contract and this cell must not weaken it.
+    coordinator.retire_all_worker_holders();
+    assert!(
+        atomics
+            .holders_retired
+            .load(std::sync::atomic::Ordering::Relaxed),
+        "the all-ids sweep must still retire this worker's NAT holder bits — \
+         this cell constrains the V_min vacate only",
+    );
+    assert_eq!(
+        floor.slots[5].read(),
+        Some(31_337),
+        "a LIVE worker's V_min slot must survive the all-ids teardown sweep. \
+         The worker is still running there (stop_and_clear has not been called), \
+         so vacating makes the coordinator a second writer to a single-writer \
+         slot, and the teardown discards the floors map moments later anyway \
+         (#9367)",
+    );
+}
