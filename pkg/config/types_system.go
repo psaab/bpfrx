@@ -632,6 +632,13 @@ type SNMPConfig struct {
 	Communities map[string]*SNMPCommunity
 	TrapGroups  map[string]*SNMPTrapGroup
 	V3Users     map[string]*SNMPv3User
+	// ClientLists holds the `snmp client-list <name> { <prefix> [restrict]; }`
+	// definitions, keyed by list name (#9416). It is the DEFINITION surface;
+	// enforcement happens through each referencing community's resolved
+	// Clients, so nothing reads this at serve time. Retained so
+	// `show configuration` and the API render what the operator wrote, and so a
+	// list that no community references is still visible rather than dropped.
+	ClientLists map[string][]SNMPClient
 }
 
 // MarshalJSON redacts the SNMPv1/v2c community strings on the JSON surface
@@ -654,6 +661,12 @@ func (s SNMPConfig) MarshalJSON() ([]byte, error) {
 		Communities []*SNMPCommunity
 		TrapGroups  map[string]*SNMPTrapGroup
 		V3Users     map[string]*SNMPv3User
+		// #9416: the alias enumerates fields EXPLICITLY, so a field added to
+		// SNMPConfig and not added here silently vanishes from the API surface.
+		// A client-list name and its prefixes are not secrets (the community
+		// string is), and an operator inspecting why a community is restricted
+		// needs to see the list it names.
+		ClientLists map[string][]SNMPClient `json:",omitempty"`
 	}
 	a := snmpAlias{
 		Location:    s.Location,
@@ -661,6 +674,7 @@ func (s SNMPConfig) MarshalJSON() ([]byte, error) {
 		Description: s.Description,
 		TrapGroups:  s.TrapGroups,
 		V3Users:     s.V3Users,
+		ClientLists: s.ClientLists,
 	}
 	if len(s.Communities) > 0 {
 		names := make([]string, 0, len(s.Communities))
@@ -690,6 +704,12 @@ func (s SNMPConfig) MarshalYAML() (any, error) {
 		Communities []*SNMPCommunity
 		TrapGroups  map[string]*SNMPTrapGroup
 		V3Users     map[string]*SNMPv3User
+		// #9416: the alias enumerates fields EXPLICITLY, so a field added to
+		// SNMPConfig and not added here silently vanishes from the API surface.
+		// A client-list name and its prefixes are not secrets (the community
+		// string is), and an operator inspecting why a community is restricted
+		// needs to see the list it names.
+		ClientLists map[string][]SNMPClient `json:",omitempty"`
 	}
 	a := snmpAlias{
 		Location:    s.Location,
@@ -697,6 +717,7 @@ func (s SNMPConfig) MarshalYAML() (any, error) {
 		Description: s.Description,
 		TrapGroups:  s.TrapGroups,
 		V3Users:     s.V3Users,
+		ClientLists: s.ClientLists,
 	}
 	if len(s.Communities) > 0 {
 		names := make([]string, 0, len(s.Communities))
@@ -742,6 +763,25 @@ type SNMPCommunity struct {
 	// AllowsSource (snmp_clients.go).
 	Clients []SNMPClient
 
+	// ClientListNames holds the `client-list-name` references this community
+	// authored, in document order and de-duplicated (#9416).
+	//
+	// It is NOT the enforcement input -- a referenced list's prefixes are
+	// RESOLVED into Clients at compile time, so AllowsSource, compileClientNets
+	// and the API surface all keep working on one field. This exists for two
+	// reasons that Clients cannot serve:
+	//
+	//  1. the reconcile HASH (daemon_snmp_reconcile.go). A community with an
+	//     UNRESOLVABLE reference has an empty Clients and is quarantined to
+	//     deny-all via clientNets, which the hash does not see -- so adding
+	//     such a reference to a previously-unrestricted community would hash
+	//     EQUAL, the reconcile would take the no-op path, and the running
+	//     agent would keep serving every source. That is the #5105 class
+	//     reached through a new door;
+	//  2. `show configuration` / the API must render what the operator wrote,
+	//     not only what it resolved to.
+	ClientListNames []string
+
 	// clientNets is Clients pre-parsed into an allocation-free match set
 	// (#4711). The compiler populates it via compileClientNets after Clients
 	// is finalized, before the config reaches the SNMP agent, so AllowsSource
@@ -769,8 +809,13 @@ func (c SNMPCommunity) MarshalJSON() ([]byte, error) {
 		Name          Secret
 		Authorization string
 		Clients       []SNMPClient `json:",omitempty"`
+		// #9416: a client-list NAME is not a secret (the community string is),
+		// and hiding it would make an unresolvable reference invisible on the
+		// API surface -- which is the one case where the community is
+		// quarantined to deny-all and the operator needs to see why.
+		ClientListNames []string `json:",omitempty"`
 	}
-	return json.Marshal(alias{Name: Secret(c.Name), Authorization: c.Authorization, Clients: c.Clients})
+	return json.Marshal(alias{Name: Secret(c.Name), Authorization: c.Authorization, Clients: c.Clients, ClientListNames: c.ClientListNames})
 }
 
 // MarshalYAML mirrors MarshalJSON for the gopkg.in/yaml.v3 marshaller
@@ -780,7 +825,9 @@ func (c SNMPCommunity) MarshalYAML() (any, error) {
 		Name          Secret
 		Authorization string
 		Clients       []SNMPClient `yaml:",omitempty"`
-	}{Name: Secret(c.Name), Authorization: c.Authorization, Clients: c.Clients}, nil
+		// #9416: kept in sync with MarshalJSON above, per this type's own rule.
+		ClientListNames []string `yaml:",omitempty"`
+	}{Name: Secret(c.Name), Authorization: c.Authorization, Clients: c.Clients, ClientListNames: c.ClientListNames}, nil
 }
 
 // SNMPCommunityDisplayName returns the token an operator-facing TEXT renderer

@@ -155,7 +155,30 @@ func TestMultiLeafAbsorptionPopulation9206(t *testing.T) {
 	//
 	// so the absorption is read, and it is read identically at both sites —
 	// which is the point of #9351, since it is now literally the same node.
-	const wantAbsorbing, wantDistinct = 23, 19
+	// #9416: 23 -> 25 absorbing, 19 -> 20 distinct. `snmp community <c>
+	// routing-instance <ri>` was declared with closedWorld (its body is
+	// leaf-complete and every keyword it could absorb is a SOURCE RESTRICTION),
+	// which brings its `clients` multi leaf into this population; the second
+	// absorbing row is the `groups <name>` rehost of the same node.
+	//
+	// The GREW note below says to check whether the new absorption reaches the
+	// COMPILER too. MEASURED, against the community-level sibling as a control:
+	//
+	//	set snmp community c routing-instance ri clients [ 10.0.0.0/8 172.16.0.0/12 ]
+	//	  -> Clients = [10.0.0.0/8, 172.16.0.0/12]
+	//	set snmp community c routing-instance ri clients 10.0.0.0/8
+	//	set snmp community c routing-instance ri clients 172.16.0.0/12
+	//	  -> Clients = [10.0.0.0/8, 172.16.0.0/12]
+	//	CONTROL, community level:
+	//	set snmp community c clients [ 10.0.0.0/8 172.16.0.0/12 ]
+	//	  -> Clients = [10.0.0.0/8, 172.16.0.0/12]
+	//
+	// so the absorption is read, and read identically to the sibling. The
+	// closed world is doing work rather than decorating: a bogus keyword under
+	// `routing-instance` is REJECTED ("unknown configuration keyword ... under
+	// closed-world subtree") while the SAME keyword one level up, at the
+	// open-world community, still commits clean and compiles to nothing.
+	const wantAbsorbing, wantDistinct = 25, 20
 	if absorbing != wantAbsorbing || distinct != wantDistinct {
 		t.Errorf("#9206: %d sites absorb at the schema walk (%d excluding `groups` "+
 			"rehosts), want %d (%d).\n  %s\n\n"+

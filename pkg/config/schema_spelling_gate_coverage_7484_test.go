@@ -316,7 +316,19 @@ func gateLeafChangesWarnings(g gateLeaf, pre string, epath []string) bool {
 // leaves were simply unreachable to a flat-set walk that had nothing to descend
 // into, so their tokens packed onto the container key. Same movement as #9323
 // and #9151: an already-read leaf becoming VISIBLE to the enumeration.
-const gateCoverageFloor = 742
+// #9416 raises it 742 -> 743. Declaring `snmp community <c> routing-instance
+// <ri>` — the per-routing-instance spelling of the SNMP source restriction —
+// made its `clients` leaf COMPARABLE, and it lands in the compared bucket, not
+// a blind one. The two other leaves this change declares (`snmp client-list`
+// and `client-list-name`) are registered in notAValueList and are therefore
+// excluded from the enumeration rather than added to it, which is why the floor
+// moves by ONE and not by three.
+//
+// This IS new compiler behaviour, unlike #9323/#9351 which only made
+// already-read leaves visible: before #9416 that restriction compiled to
+// nothing and the community was answerable from every source. The floor moving
+// is a side effect of fixing it, not the point of the change.
+const gateCoverageFloor = 743
 
 var gateBlindCeiling = map[gateBlindClass]int{
 	// #7492 moved leaves out of `unreachable` in two rounds. The parent

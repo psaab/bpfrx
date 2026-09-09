@@ -1240,7 +1240,40 @@ var schemaSNMP = &schemaNode{desc: "SNMP configuration", children: map[string]*s
 		// trailing optional `restrict` deny modifier rides on the same run and
 		// is paired to its prefix by parseSNMPClients.
 		"clients": {desc: "Source-IP allowlist for this community (<prefix> [restrict])", args: 1, multi: true, placeholder: "<prefix>", children: nil},
+		// #9416: the NAMED spelling of the same source restriction. Junos
+		// expresses one allowlist two ways -- inline `clients`, or a reusable
+		// `snmp client-list <name>` referenced from here -- and only the inline
+		// one was modelled, so the named form committed clean, compiled to
+		// nothing, and left the community ALLOW-ALL. Five prior fixes (#4289,
+		// #5472, #5833, #5898, #8778) all landed on the inline sibling; every
+		// one of them assumed the restriction is spelled inline.
+		"client-list-name": {desc: "Name of an `snmp client-list` whose prefixes restrict this community", args: 1, placeholder: "<client-list-name>", children: nil},
+		// #9416, the SIXTH spelling, found by censusing the family rather than
+		// fixing the fifth. `community <c> routing-instance <ri> { clients ... }`
+		// / `{ client-list-name ... }` is the per-routing-instance form of the
+		// same control, and it was measured fail-open exactly like the named
+		// list. xpf's SNMP agent has no routing-instance awareness, so the
+		// SCOPING is not enforced (compileSNMP emits an advisory saying so) --
+		// but the source restriction inside it IS applied to the community,
+		// because leaving it out means allow-all.
+		// closedWorld (#9091/#4313): this body is LEAF-COMPLETE — Junos puts
+		// exactly `clients` and `client-list-name` under a community's
+		// routing-instance — and every keyword it could otherwise absorb is a
+		// SOURCE RESTRICTION. An unmodelled keyword here would commit clean and
+		// leave the community answering every source, which is the defect this
+		// whole change is about; a typo must be told to the operator instead.
+		"routing-instance": {desc: "Routing-instance scope for this community (the scoping is NOT enforced; its source restriction IS applied)", args: 1, placeholder: "<instance-name>", closedWorld: true, children: map[string]*schemaNode{
+			"clients":          {desc: "Source-IP allowlist for this community in this routing instance (<prefix> [restrict])", args: 1, multi: true, placeholder: "<prefix>", children: nil},
+			"client-list-name": {desc: "Name of an `snmp client-list` whose prefixes restrict this community in this routing instance", args: 1, placeholder: "<client-list-name>", children: nil},
+		}},
 	}},
+	// #9416: `snmp client-list <name> { <prefix> [restrict]; }` -- a reusable
+	// named source-IP allowlist that one or more communities reference by name.
+	// `multi: true` so the flat spelling `set snmp client-list trusted 10.0.0.0/8`
+	// collapses its prefixes onto the node's Keys, matching how `clients` is
+	// declared; the braced body lands on Children. parseSNMPClientListPrefixes
+	// reads BOTH shapes (the #2419 dual-shape class).
+	"client-list": {desc: "Named source-IP client list (<prefix> [restrict])", args: 1, multi: true, placeholder: "<client-list-name>", children: nil},
 	// packedStatements (#8768): compileSNMP reads `targets` and `version` as
 	// separate statements, and the packed spelling
 	// `trap-group tg1 targets 10.0.0.1 version v2;` used to collapse both into

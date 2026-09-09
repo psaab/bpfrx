@@ -100,6 +100,28 @@ func snmpConfigHash(cfg *config.Config) uint64 {
 					write("allow")
 				}
 			}
+			// #9416: the authored `client-list-name` references, and this is
+			// NOT redundant with the resolved Clients above.
+			//
+			// A community whose ONLY restriction is an UNRESOLVABLE reference
+			// has an EMPTY Clients — the referenced list does not exist, or is
+			// empty — and is quarantined to deny-all through clientNets, which
+			// this hash cannot see (the #5833 quarantine deliberately overrides
+			// only the derived cache, never the config surface). So without
+			// this line, adding such a reference to a previously-unrestricted
+			// community hashes EQUAL, the reconcile takes the idempotent no-op
+			// path, and the running agent keeps serving every source while the
+			// commit reports success. That is exactly the #5105 class this
+			// block exists to close, reached through a new door.
+			//
+			// Document order, de-duplicated by the compiler, for the same
+			// reason the allowlist above is hashed in document order: it is a
+			// conservative superset that can reconcile spuriously on a
+			// reshuffle but can never MISS an authorization change.
+			write("client-list-names")
+			for _, ref := range c.ClientListNames {
+				write(ref)
+			}
 		}
 	}
 
