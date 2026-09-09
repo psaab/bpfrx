@@ -343,6 +343,27 @@ type ProcessStatus struct {
 	SessionReplicationLockContendedTotal      uint64 `json:"session_replication_lock_contended_total,omitempty"`
 	SessionReplicationQueueDepthSum           uint64 `json:"session_replication_queue_depth_sum,omitempty"`
 	SessionReplicationQueueDepthMax           uint64 `json:"session_replication_queue_depth_max,omitempty"`
+	// #9169: the FOURTH #4800 site. Every session delta -- Open as well as
+	// Close -- allocates its wire sequence number and encodes its frame inside
+	// the helper's process-global producer_seq_lock, because #3878 F-152
+	// requires the allocation and the channel enqueue to be atomic together.
+	// That makes it a cross-worker serialization point on the new-flow path,
+	// and it was absent from docs/userspace-newflow-ceiling.md's three-site
+	// model -- so a run that saturated here would have reported a plateau with
+	// every named site cold and nothing to attribute it to. (Counterfactual:
+	// that harness has not been run. The bound is static.)
+	//
+	// A pair, always read together: a contended count without its denominator
+	// is not interpretable, and "never taken" is a different finding from
+	// "taken but never blocked". The helper's I/O-thread replay-gap allocation
+	// takes the same mutex and is deliberately excluded from the denominator
+	// (not a producer, once per reconnect); its blocking effect still shows up
+	// as producer contention.
+	//
+	// Omitempty for wire compat with older helpers; JSON tags MUST match the
+	// Rust serde rename(...) exactly (protocol/status.rs).
+	EventStreamProducerSeqLockAcquisitionsTotal uint64 `json:"event_stream_producer_seq_lock_acquisitions_total,omitempty"`
+	EventStreamProducerSeqLockContendedTotal    uint64 `json:"event_stream_producer_seq_lock_contended_total,omitempty"`
 	// DnatPublishErrorsTotal counts failed dnat_table reverse-SNAT BPF-map
 	// publishes across userspace workers (#2244). The dnat_table is the
 	// reverse lookup the embedded-ICMP NAT path consults to map an inbound

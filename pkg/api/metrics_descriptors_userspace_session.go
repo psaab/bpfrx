@@ -180,6 +180,36 @@ func (c *xpfCollector) initUserspaceSessionDescriptors() {
 			"the publish lock counters below (#4800).",
 		nil, nil,
 	)
+	// #9169: the FOURTH #4800 contention site. Every session delta — Open as
+	// well as Close — allocates its wire sequence number and encodes its frame
+	// inside the helper's process-global producer_seq_lock, because #3878 F-152
+	// requires the seq allocation and the channel enqueue to be atomic
+	// together. docs/userspace-newflow-ceiling.md named three sites and not
+	// this one, so a run that saturated here would have reported a plateau with
+	// every named site cold -- a counterfactual, not a measured result; that
+	// harness has not been run.
+	c.userspaceEventStreamProducerSeqLockAcquired = prometheus.NewDesc(
+		"xpf_userspace_event_stream_producer_seq_lock_acquisitions_total",
+		"Acquisitions of the helper's process-global event-stream "+
+			"producer_seq_lock taken by a PRODUCER — one per session delta "+
+			"(Open and Close alike) and one per lossless-retry attempt. The "+
+			"denominator for the contention counter below. The I/O thread's "+
+			"replay-gap FullResync allocation takes the same mutex and is "+
+			"deliberately excluded: it is not a producer and fires once per "+
+			"reconnect, so counting it would dilute the ratio with the "+
+			"observer (#9169 / #4800).",
+		nil, nil,
+	)
+	c.userspaceEventStreamProducerSeqLockBlocked = prometheus.NewDesc(
+		"xpf_userspace_event_stream_producer_seq_lock_contended_total",
+		"Subset of event-stream producer_seq_lock acquisitions that found "+
+			"the mutex already held and had to block. The frame ENCODE runs "+
+			"inside this critical section, so the hold time is not just an "+
+			"atomic; divided by ..._acquisitions_total this is the "+
+			"session-delta leg's share of new-flow-install serialization "+
+			"(#9169 / #4800).",
+		nil, nil,
+	)
 	c.userspaceSharedSessionPublishLockAcquired = prometheus.NewDesc(
 		"xpf_userspace_shared_session_publish_lock_acquisitions_total",
 		"Shared-session map mutex acquisitions taken by the helper's "+

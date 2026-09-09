@@ -137,3 +137,5 @@ mod backpressure;
 mod control_frames;
 mod drain;
 mod write_backlog;
+// #9169: the producer-seq lock instrumentation (#4800 site 4).
+mod producer_seq_lock_9169;

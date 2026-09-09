@@ -891,6 +891,8 @@
     "event_stream_connected": false,
     "event_stream_dropped": 0,
     "event_stream_invalid_acks": 0,
+    "event_stream_producer_seq_lock_acquisitions_total": 0,
+    "event_stream_producer_seq_lock_contended_total": 0,
     "event_stream_replay_evictions": 0,
     "event_stream_sent": 0,
     "event_stream_seq": 0,

@@ -486,6 +486,8 @@ pub(crate) fn run() -> Result<(), String> {
             event_stream_write_stalls: 0,
             event_stream_replay_evictions: 0,
             event_stream_invalid_acks: 0,
+            event_stream_producer_seq_lock_acquisitions_total: 0,
+            event_stream_producer_seq_lock_contended_total: 0,
             event_stream_session_close_sent: 0,
             event_stream_session_close_dropped: 0,
             event_stream_session_create_sent: 0,

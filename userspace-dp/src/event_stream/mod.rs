@@ -67,7 +67,7 @@ use producer::{DataplaneEventCounters, DataplaneEventQueueBudget, DataplaneEvent
 use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 // std types consumed by the connection / control / drain / replay submodules
@@ -165,6 +165,13 @@ pub(crate) struct EventStreamStats {
     pub(crate) invalid_acks: u64,
     #[allow(dead_code)] // stats field for future reporting
     pub(crate) replayed: u64,
+    /// #9169 / #4800 site 4: acquisitions of the process-global
+    /// `producer_seq_lock` taken by a producer, and the blocked subset. Read as
+    /// a pair — a contended count without its denominator is not interpretable,
+    /// and a site with zero acquisitions is "never taken", which is a different
+    /// finding from "taken but never blocked".
+    pub(crate) producer_seq_lock_acquisitions: u64,
+    pub(crate) producer_seq_lock_contended: u64,
     #[allow(dead_code)] // producer-call-site wiring will surface these fields
     pub(crate) dataplane_events: DataplaneEventStats,
 }
@@ -195,6 +202,37 @@ struct EventStreamShared {
     /// (`handle_drain_request`, which has no live caller) still allocates
     /// outside this lock; the rollback CAS below tolerates that rare interleave.
     producer_seq_lock: Mutex<()>,
+    /// #9169 / #4800 SITE 4: acquisitions of `producer_seq_lock` taken by a
+    /// PRODUCER — the denominator.
+    ///
+    /// `docs/userspace-newflow-ceiling.md` named three cross-worker
+    /// synchronization points on the new-flow install path and this was not one
+    /// of them, so a run that saturated here could not be attributed: the
+    /// harness would report a new-flows/sec plateau with every named site cold.
+    /// Every session delta, Open as well as Close, passes through this mutex
+    /// with the frame ENCODE inside the critical section, and the mutex lives
+    /// on `shared` — it is process-global across every producer thread.
+    ///
+    /// SCOPE, and it is load-bearing exactly as the sibling sites' is. Only the
+    /// two PRODUCER acquisitions are counted (`send_sequenced`, and each
+    /// attempt of `send_lossless_encoded`'s retry loop). The I/O thread's
+    /// replay-gap FullResync allocation (`connection.rs`, #5267) takes the same
+    /// mutex and is deliberately EXCLUDED: it is not a producer, it fires once
+    /// per reconnect, and folding it into the denominator would dilute the
+    /// ratio with the observer — the same reasoning that keeps
+    /// `remove_shared_session` out of the publish denominator. Its blocking
+    /// effect on producers is still visible, because it shows up as producer
+    /// CONTENTION, which is the number that matters.
+    producer_seq_lock_acquisitions: AtomicU64,
+    /// The subset of [`Self::producer_seq_lock_acquisitions`] that found the
+    /// mutex held and had to block.
+    ///
+    /// `try_lock()` first — on an uncontended mutex that is the same single CAS
+    /// `lock()` already cost, so the LOCK ITSELF is unchanged. The acquisition
+    /// counter above it is unconditional, so an uncontended acquisition is 2
+    /// relaxed RMWs where it was 1; a failed CAS pays one more increment on top
+    /// of a block that was going to happen anyway.
+    producer_seq_lock_contended: AtomicU64,
     /// Updated by I/O thread from Ack frames.
     acked_seq: AtomicU64,
     /// Set by Pause, cleared by Resume.
@@ -274,6 +312,8 @@ impl EventStreamShared {
         Self {
             next_seq: AtomicU64::new(0),
             producer_seq_lock: Mutex::new(()),
+            producer_seq_lock_acquisitions: AtomicU64::new(0),
+            producer_seq_lock_contended: AtomicU64::new(0),
             acked_seq: AtomicU64::new(0),
             paused: AtomicBool::new(false),
             session_evicted_while_paused: AtomicBool::new(false),
@@ -289,6 +329,34 @@ impl EventStreamShared {
             dataplane_event_limiter: DataplaneEventRateLimiter::new(config),
             dataplane_event_queue: DataplaneEventQueueBudget::new(channel_capacity),
         }
+    }
+
+    /// #9169: acquire `producer_seq_lock` WITH contention accounting.
+    ///
+    /// The poison policy is reproduced from the call sites this replaced, not
+    /// changed: a poisoned mutex is recovered with `into_inner()` and the
+    /// producer continues. `producer_seq_lock` guards a `()` — there is no
+    /// invariant a panicking holder could have left half-written — so refusing
+    /// the lock would turn a survivable panic into a permanently mute event
+    /// stream.
+    ///
+    /// `try_lock()` reports `Poisoned` only when the mutex is FREE, so the
+    /// poisoned arm is handled on both branches, exactly as
+    /// `lock_shared_publish` does for the #4800 publish site.
+    #[inline]
+    fn lock_producer_seq(&self) -> MutexGuard<'_, ()> {
+        self.producer_seq_lock_acquisitions
+            .fetch_add(1, Ordering::Relaxed);
+        match self.producer_seq_lock.try_lock() {
+            Ok(guard) => return guard,
+            Err(TryLockError::Poisoned(poisoned)) => return poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => {}
+        }
+        self.producer_seq_lock_contended
+            .fetch_add(1, Ordering::Relaxed);
+        self.producer_seq_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -353,6 +421,14 @@ impl EventStreamSender {
             replay_evictions: self.shared.frames_replay_evicted.load(Ordering::Relaxed),
             invalid_acks: self.shared.frames_invalid_acks.load(Ordering::Relaxed),
             replayed: self.shared.frames_replayed.load(Ordering::Relaxed),
+            producer_seq_lock_acquisitions: self
+                .shared
+                .producer_seq_lock_acquisitions
+                .load(Ordering::Relaxed),
+            producer_seq_lock_contended: self
+                .shared
+                .producer_seq_lock_contended
+                .load(Ordering::Relaxed),
             dataplane_events: self.shared.dataplane_event_counters.snapshot(),
         }
     }
@@ -516,11 +592,7 @@ impl EventStreamWorkerHandle {
     where
         F: FnOnce(u64) -> EventFrame,
     {
-        let _guard = self
-            .shared
-            .producer_seq_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = self.shared.lock_producer_seq();
         let seq = self.next_seq();
         let frame = encode(seq);
         match self.try_send_frame(frame) {
@@ -578,11 +650,7 @@ impl EventStreamWorkerHandle {
             // lossless per-worker, so >=2 concurrent flushers on a Full channel
             // is the normal recovery-churn regime).
             let outcome = {
-                let _guard = self
-                    .shared
-                    .producer_seq_lock
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let _guard = self.shared.lock_producer_seq();
                 let (frame, rollback_seq) = encode();
                 let reported_seq = frame.seq;
                 match self.tx.try_send(frame) {

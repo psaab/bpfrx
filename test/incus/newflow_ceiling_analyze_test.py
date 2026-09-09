@@ -50,6 +50,8 @@ def snap(
     rep_blocked=0,
     rep_depth_sum=0,
     rep_depth=0,
+    es_acq=0,
+    es_blocked=0,
     workers=None,
     helper_pid=4242,
 ):
@@ -73,6 +75,11 @@ def snap(
             "lock_contended_total": rep_blocked,
             "queue_depth_sum": rep_depth_sum,
             "queue_depth_max": rep_depth,
+        },
+        # #9169 site 4: the event-stream producer-seq lock pair.
+        "event_stream": {
+            "lock_acquisitions_total": es_acq,
+            "lock_contended_total": es_blocked,
         },
         "workers": workers if workers is not None else {},
     }
@@ -162,6 +169,8 @@ class AttributionNamesEverySaturatedSite(unittest.TestCase):
                 rep_upserts=600_000,
                 rep_enqueued=3_600_000,
                 rep_blocked=2_160_000,
+                es_acq=1_200_000,
+                es_blocked=6_000,
                 workers=six_even_workers(600_000),
             ),
         )
@@ -172,11 +181,85 @@ class AttributionNamesEverySaturatedSite(unittest.TestCase):
                 "nat_allocator_live_mutex",
                 "publish_shared_session",
                 "replicate_session_upsert",
+                # #9169: the fourth site. The claim this cell makes — a cold
+                # site stays in the table with its ratio, so "never blocked" is
+                # evidenced rather than inferred from an omission — is
+                # unchanged; the table it holds the analyzer to is not.
+                "event_stream_producer_seq",
             ],
         )
+        es = next(s for s in a.sites if s.name == "event_stream_producer_seq")
+        self.assertAlmostEqual(es.ratio, 0.005)
+        self.assertFalse(es.saturated)
         nat = next(s for s in a.sites if s.name == "nat_allocator_live_mutex")
         self.assertAlmostEqual(nat.ratio, 0.01)
         self.assertFalse(nat.saturated)
+
+    def test_event_stream_producer_seq_is_named_when_it_alone_saturates(self):
+        """#9169 — THE cell this issue exists for.
+
+        Before #9169 the model had three sites and the event-stream producer
+        lock was not one of them. A run bound by that mutex would therefore
+        produce the worst possible output: a new-flows/sec plateau with every
+        named site COLD, which reads as "the firewall is not lock-bound" and
+        sends the next person to look somewhere else. That is a counterfactual
+        about the instrument, not a measurement -- which is exactly why this
+        cell drives the shape synthetically.
+
+        So this cell drives exactly that shape — the three original sites quiet
+        (<= 0.1% blocked), site 4 hot (30%) — and asserts the analyzer names
+        it, and names ONLY it. The three quiet sites are the control: a fourth
+        row that fired on any loaded run would carry no information.
+
+        FAIL-ON-REVERT: drop the `event_stream_producer_seq` row from
+        `LOCK_SITES` and `culprits` comes back empty, which is the pre-#9169
+        answer.
+        """
+        a = analyze(
+            snap(0.0, workers=six_even_workers(0)),
+            snap(
+                10.0,
+                allocations=300_000,
+                nat_acq=600_000,
+                nat_blocked=600,  # 0.1%
+                pub_acq=900_000,
+                pub_blocked=450,  # 0.05%
+                rep_upserts=300_000,
+                rep_enqueued=1_800_000,
+                rep_blocked=1_800,  # 0.1%
+                es_acq=600_000,
+                es_blocked=180_000,  # 30%
+                workers=six_even_workers(300_000),
+            ),
+        )
+        self.assertEqual(a.verdict, VALID, a.reasons)
+        self.assertTrue(a.saturated)
+        self.assertEqual(a.culprits, ["event_stream_producer_seq"])
+        es = next(s for s in a.sites if s.name == "event_stream_producer_seq")
+        self.assertAlmostEqual(es.ratio, 0.3)
+        self.assertTrue(es.saturated)
+
+    def test_a_helper_without_the_site_4_counters_raises_not_scores_clean(self):
+        """A build that predates #9169 must REFUSE, not report a quiet site 4.
+
+        `_scalar` raises on an absent series, and that is the whole defence
+        here: scoring a missing counter as zero would give the fourth site a
+        `contended = 0` over an `acquisitions = 0` denominator — reported as
+        `ratio: None`, "never taken" — for a run in which it was taken on every
+        single delta. The instrument would look present and say nothing.
+        """
+        before = snap(0.0, workers=six_even_workers(0))
+        after = snap(
+            10.0,
+            allocations=1_000,
+            nat_acq=2_000,
+            es_acq=2_000,
+            es_blocked=1_000,
+            workers=six_even_workers(1_000),
+        )
+        del after["event_stream"]["lock_contended_total"]
+        with self.assertRaises(SnapshotError):
+            analyze(before, after)
 
     def test_all_three_can_be_named_together(self):
         """Nothing structurally caps the culprit list at two."""
@@ -228,6 +311,8 @@ class NegativeControl(unittest.TestCase):
                 rep_enqueued=1_800_000,
                 rep_blocked=1_800,  # 0.1%
                 rep_depth=3,
+                es_acq=600_000,
+                es_blocked=300,  # 0.05% — #9169 site 4, exercised and quiet
                 workers=six_even_workers(300_000),
             ),
         )
@@ -792,6 +877,8 @@ xpf_userspace_session_replication_enqueued_total 6000000
 xpf_userspace_session_replication_lock_contended_total 1200000
 xpf_userspace_session_replication_queue_depth_sum 2500000
 xpf_userspace_session_replication_queue_depth_max 17
+xpf_userspace_event_stream_producer_seq_lock_acquisitions_total 2000000
+xpf_userspace_event_stream_producer_seq_lock_contended_total 500000
 xpf_userspace_worker_new_flow_installs_total{worker_id="0"} 170000
 xpf_userspace_worker_new_flow_installs_total{worker_id="1"} 166000
 xpf_userspace_worker_new_flow_installs_total{worker_id="2"} 164000
@@ -814,6 +901,9 @@ class ScrapeParsing(unittest.TestCase):
         self.assertEqual(s["publish"]["lock_contended_total"], 900_000)
         self.assertEqual(s["replicate"]["queue_depth_sum"], 2_500_000)
         self.assertEqual(s["replicate"]["queue_depth_max"], 17)
+        # #9169 site 4 is scraped from the same text as the other three.
+        self.assertEqual(s["event_stream"]["lock_acquisitions_total"], 2_000_000)
+        self.assertEqual(s["event_stream"]["lock_contended_total"], 500_000)
         self.assertEqual(s["workers"], {"0": 170000, "1": 166000, "2": 164000})
         self.assertEqual(s["helper_pid"], 7)
 

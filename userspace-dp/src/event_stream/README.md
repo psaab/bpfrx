@@ -322,6 +322,27 @@ cluster-scoped.
   drops it before every sleep so a backpressured export never stalls the other
   producers, and re-allocates (rolling back the failed attempt) on each retry so
   the eventual wire seq matches the successful enqueue position.
+- **`producer_seq_lock` is the #4800 model's FOURTH contention site (#9169).**
+  Because seq allocation and the channel enqueue must be atomic together
+  (F-152 above), the frame ENCODE runs inside that critical section, for every
+  session delta — Open as well as Close — on a mutex that lives on `shared`
+  and is therefore process-global across every producer thread. That makes it
+  a cross-worker serialization point on the new-flow install path, and
+  `docs/userspace-newflow-ceiling.md` named three sites and not this one, so a
+  run bound here WOULD report a new-flows/sec plateau with every named site
+  cold, which reads as "not lock-bound". That is a counterfactual and not a
+  result — no such run has been performed (the harness doc's own status line
+  says so); the static bound and the missing counter are what is established.
+  `EventStreamShared::lock_producer_seq`
+  counts acquisitions and the blocked subset (`try_lock()` first, so the
+  uncontended lock costs the single CAS it always did) and the pair is exported
+  as `xpf_userspace_event_stream_producer_seq_lock_{acquisitions,contended}_total`.
+  Only the two PRODUCER sites are counted; the I/O thread's replay-gap
+  allocation below takes the same mutex and is deliberately excluded from the
+  denominator so the ratio is not diluted with the observer. #9169 is an
+  INSTRUMENT, not a remedy — the bound is static and proven, no benchmark is
+  claimed, and "encode outside the lock" is not directly available because the
+  encode closure consumes the sequence number.
 - **The replay-gap FullResync is ordered under the same lock (#5267).** The I/O
   thread's replay-gap barrier (`replay_buffered`) used to allocate its seq with
   a bare `fetch_add` and write it DIRECTLY to the socket, bypassing the channel.

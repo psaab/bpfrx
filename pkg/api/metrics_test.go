@@ -1245,6 +1245,18 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 			[]string{"binding_slot", "queue_id", "worker_id", "iface"},
 			nil,
 		),
+		userspaceEventStreamProducerSeqLockAcquired: prometheus.NewDesc(
+			"xpf_userspace_event_stream_producer_seq_lock_acquisitions_total",
+			"event stream producer seq lock acquisitions",
+			nil,
+			nil,
+		),
+		userspaceEventStreamProducerSeqLockBlocked: prometheus.NewDesc(
+			"xpf_userspace_event_stream_producer_seq_lock_contended_total",
+			"event stream producer seq lock contended",
+			nil,
+			nil,
+		),
 	}
 	status := dpuserspace.ProcessStatus{
 		// #8447: distinct values so a swapped emission fails rather than passing.
@@ -1269,6 +1281,11 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 		SessionReplicationLockContendedTotal:      127,
 		SessionReplicationQueueDepthSum:           137,
 		SessionReplicationQueueDepthMax:           131,
+		// #9169: the FOURTH #4800 site. Two more distinct primes, for the
+		// same reason as the seven above — a collector that crossed the
+		// denominator and the contended wire would otherwise pass.
+		EventStreamProducerSeqLockAcquisitionsTotal: 139,
+		EventStreamProducerSeqLockContendedTotal:    149,
 		// #2244: dnat_table reverse-NAT publish-error counter emitted
 		// unconditionally.
 		DnatPublishErrorsTotal: 7,
@@ -1432,8 +1449,13 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	// this one means it was not published at all while still being answered
 	// to Go as installed.
 	// +4 for the #8447 source-NAT rule-match quartet.
-	if len(got) != 58 {
-		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 58 metrics, got %d", len(got))
+	// +2 for the #9169 event-stream producer_seq_lock pair (#4800 SITE 4).
+	// RE-ANCHORED, not relaxed: this count is a deliberate gate — it catches a
+	// series that is emitted but never asserted, which is how a collector grows
+	// an unverified metric. The two new series ARE asserted below, so the
+	// original claim still holds and the number moves with the population.
+	if len(got) != 60 {
+		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 60 metrics, got %d", len(got))
 	}
 
 	// #8447: DISTINCT values, so a collector that emitted one of the quartet
@@ -1482,6 +1504,12 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	// replication backlog.
 	assertCounterClose(t, got, c.userspaceSessionReplicationQueueDepthSum, nil, 137)
 	assertGaugeClose(t, got, c.userspaceSessionReplicationQueueDepthMax, nil, 131)
+	// #9169: site 4's pair. Emitted unconditionally and together, like the
+	// three above — the connection-rate analyzer refuses a ratio whose
+	// denominator is missing, so half a pair is a site that reports "never
+	// taken" for a mutex every session delta passes through.
+	assertCounterClose(t, got, c.userspaceEventStreamProducerSeqLockAcquired, nil, 139)
+	assertCounterClose(t, got, c.userspaceEventStreamProducerSeqLockBlocked, nil, 149)
 	// #2244: dnat_table reverse-NAT publish-error counter emitted
 	// unconditionally.
 	assertCounterClose(t, got, c.userspaceDnatPublishErrors, nil, 7)
