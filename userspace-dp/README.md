@@ -405,6 +405,24 @@ logging rules, not these specific hot-path constants.
     and takes the full admission path, which emits the reject reply and
     the RT_FLOW deny record from the one site that owns them.
 
+  - **The evaluated DESTINATION is the POST-translation one (#9382).**
+    Admission judges the post-translation destination tuple (#2345/#2358);
+    this derivation must ask the SAME question or a translated session is
+    judged by two standards. The forward entry is keyed on the WIRE
+    tuple, so reading the destination off `flow` gives the VIP — the
+    address admission REFUSES to match a rule against. Until #9382 that
+    made a permit naming the real server contribute nothing: the
+    derivation matched no rule, fell to the default policy, and revoked a
+    session whose policy had not changed at all. Fail-CLOSED, and it
+    needed no crafted config: `PublishRouteOverlaySnapshot` bumps the
+    generation for a ROUTE-ONLY publish, so ordinary BGP/OSPF churn tore
+    down every live DNAT/NPTv6 service. The destination now comes from
+    the entry's `decision.nat` (`rewrite_dst` / `rewrite_dst_port`),
+    which is the same quantity admission folds into `policy_dst_ip` /
+    `policy_dst_port` for DNAT, static-DNAT, NPTv6 and NAT64 alike. The
+    SOURCE stays pre-translation in both places — Junos evaluates after
+    destination NAT and before source NAT.
+
   `security policies policy-rematch` is the COMMIT-time mitigation for
   the same class, and it is off by default
   (`pkg/config/types_security.go`), so on a stock box this module is the

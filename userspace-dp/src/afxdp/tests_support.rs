@@ -1429,6 +1429,24 @@ pub(super) fn build_txn_tcp_syn_frame_v6(
     src_port: u16,
     dst_port: u16,
 ) -> Vec<u8> {
+    build_txn_tcp_frame_v6(src, dst, src_port, dst_port, TCP_FLAG_SYN)
+}
+
+/// #9382: `build_txn_tcp_syn_frame_v6` with the TCP FLAGS as a parameter, for a
+/// multi-phase pin that needs a second, ESTABLISHED packet of the same v6 flow.
+///
+/// A parameter rather than patching the flags byte in the caller: the TCP
+/// checksum covers that byte, so an in-place edit leaves a frame whose checksum
+/// contradicts its flags — which is not a shape any real arrival has, and the
+/// next reader cannot tell whether a failure came from the flags or the
+/// checksum.
+pub(super) fn build_txn_tcp_frame_v6(
+    src: Ipv6Addr,
+    dst: Ipv6Addr,
+    src_port: u16,
+    dst_port: u16,
+    tcp_flags: u8,
+) -> Vec<u8> {
     let mut frame = Vec::new();
     write_eth_header(
         &mut frame,
@@ -1446,7 +1464,7 @@ pub(super) fn build_txn_tcp_syn_frame_v6(
     frame.extend_from_slice(&dst_port.to_be_bytes());
     frame.extend_from_slice(&1u32.to_be_bytes());
     frame.extend_from_slice(&0u32.to_be_bytes());
-    frame.extend_from_slice(&[0x50, TCP_FLAG_SYN, 0xfa, 0xf0, 0x00, 0x00, 0x00, 0x00]);
+    frame.extend_from_slice(&[0x50, tcp_flags, 0xfa, 0xf0, 0x00, 0x00, 0x00, 0x00]);
     let csum = checksum16_ipv6(src, dst, PROTO_TCP, &frame[tcp_start..]);
     frame[tcp_start + 16] = (csum >> 8) as u8;
     frame[tcp_start + 17] = csum as u8;

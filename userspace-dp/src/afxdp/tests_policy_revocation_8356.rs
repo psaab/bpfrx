@@ -42,7 +42,7 @@ use crate::{
     FirewallFilterSnapshot, FirewallTermSnapshot, InterfaceSnapshot, PolicyRuleSnapshot,
     RouteSnapshot,
 };
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use crate::tcp_flags::TCP_ACK;
 
 const LAN_IFINDEX: i32 = 24;
@@ -695,4 +695,367 @@ fn a_type_constrained_deny_does_not_suppress_the_icmp_re_derivation_8618() {
         "a type-constrained DENY must not suppress the re-derivation — the \
          residual would stay open on configs that never needed it"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #9382: the re-derivation must judge the POST-TRANSLATION destination, the
+// same tuple admission judges (#2345/#2358).
+//
+// Admission evaluates zone policy on `policy_dst_ip` / `policy_dst_port` —
+// `effective_resolution_target` plus the pre-routing DNAT's rewritten port —
+// whose own comment states it "carries the correct post-translation tuple for
+// all inbound destination translations (DNAT/static-DNAT/NPTv6/NAT64)". The
+// re-derivation evaluated `flow.dst_ip` / `flow.forward_key.dst_port`, i.e. the
+// WIRE tuple, because the forward session is installed on the WIRE key. For any
+// session with an inbound destination translation the two sites therefore asked
+// DIFFERENT QUESTIONS about the same session.
+//
+// The dominant consequence is FAIL-CLOSED and needs no crafted config: a
+// published service whose permit names the real server is revoked and its packet
+// dropped on the first flow-cache miss, with the policy completely unchanged.
+// Flow-cache misses are not rare — `PublishRouteOverlaySnapshot` bumps the
+// config generation for a ROUTE-ONLY publish, and the rtnetlink route listener
+// calls it on kernel route changes, so ordinary BGP/OSPF churn is enough. A
+// session also installs with `policy_revalidated_gen: 0`, so an eviction alone
+// suffices with no generation change at all.
+//
+// WHY THESE ARE TWO-PHASE. The pre/post-translation distinction only exists for
+// a session that HAS a translation, and the only honest way to get one is to let
+// the production path admit it: phase 1 drives the real SYN through
+// `txn_run_descriptor` (session MISS -> policy -> NAT -> forward+reverse
+// install), phase 2 drives one more packet of that same flow on a FRESH binding.
+// A fresh binding is an EMPTY FLOW CACHE, which is exactly what a generation
+// bump leaves behind, and it is what makes phase 2 reach the session-hit path at
+// all rather than replaying a cached descriptor.
+//
+// WHY THE SHIPPED #8356 CELLS COULD NOT SEE IT: every one of them installs
+// `NatDecision::default()` and writes `destination_addresses: vec!["any"]`, so
+// the pre/post-translation destination is unobservable twice over. The survival
+// cell even asserts it is "preserving NAT" in a fixture with no translation to
+// preserve.
+
+struct TranslatedOutcome {
+    revoked: u64,
+    sessions: usize,
+    session_hit_phase2: u64,
+    tx_phase2: u64,
+}
+
+/// Phase 1 admits the translated flow through the production path. Phase 2
+/// drives one more packet of the SAME flow, under `snapshot_phase2`, on a FRESH
+/// binding.
+///
+/// `snapshot_phase2` is the whole point of the shape: passing the SAME snapshot
+/// models "nothing about the policy changed", which is the state in which this
+/// derivation must do NOTHING, and passing a different one models a real commit.
+fn admit_then_one_more_packet(
+    snapshot_phase1: crate::ConfigSnapshot,
+    snapshot_phase2: crate::ConfigSnapshot,
+    ifindex: i32,
+    iface: &str,
+    frame_admit: &[u8],
+    meta_admit: UserspaceDpMeta,
+    frame_established: &[u8],
+    meta_established: UserspaceDpMeta,
+) -> TranslatedOutcome {
+    let ha_state = txn_ha_state();
+    let mut sessions = SessionTable::new();
+
+    let forwarding1 = build_forwarding_state(&snapshot_phase1);
+    let mut binding1 = BindingWorker::new_for_mirror_test(0, 0, ifindex, 0);
+    binding1.interface = Arc::<str>::from(iface);
+    let (_b1, dbg1) = txn_run_descriptor(
+        &mut binding1,
+        &mut sessions,
+        &forwarding1,
+        &ha_state,
+        frame_admit,
+        meta_admit,
+    );
+    assert_eq!(
+        dbg1.tx, 1,
+        "PHASE 1 must ADMIT and forward the translated flow, or every phase-2 \
+         assertion is vacuous — nothing would be installed to re-derive (#9382)"
+    );
+    assert_eq!(
+        session_count(&sessions),
+        2,
+        "PHASE 1 must install the forward + reverse pair (#9382)"
+    );
+
+    // A FRESH binding: an empty flow cache, which is what a generation bump
+    // leaves behind and what makes phase 2 take the session-hit path.
+    let forwarding2 = build_forwarding_state(&snapshot_phase2);
+    let mut binding2 = BindingWorker::new_for_mirror_test(0, 0, ifindex, 0);
+    binding2.interface = Arc::<str>::from(iface);
+    let (_b2, dbg2) = txn_run_descriptor(
+        &mut binding2,
+        &mut sessions,
+        &forwarding2,
+        &ha_state,
+        frame_established,
+        meta_established,
+    );
+    TranslatedOutcome {
+        revoked: dbg2.policy_revoked_sessions,
+        sessions: session_count(&sessions),
+        session_hit_phase2: dbg2.session_hit,
+        tx_phase2: dbg2.tx,
+    }
+}
+
+const DNAT_CLIENT: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 10);
+const DNAT_VIP: Ipv4Addr = Ipv4Addr::new(172, 16, 80, 8);
+/// The DNAT fixture translates `172.16.80.8:443` -> `10.0.61.102:8443`, so BOTH
+/// the address and the PORT differ pre/post translation. That matters: a fix
+/// that carried the translated ADDRESS but left the wire PORT would pass an
+/// address-only cell.
+const DNAT_REAL: &str = "10.0.61.102/32";
+const DNAT_VIP_CIDR: &str = "172.16.80.8/32";
+const WAN_INGRESS_IFINDEX: i32 = 12;
+
+fn dnat_frames() -> (Vec<u8>, UserspaceDpMeta, Vec<u8>, UserspaceDpMeta) {
+    let syn = build_txn_tcp_syn_frame_v4(DNAT_CLIENT, DNAT_VIP, 54321, 443, TCP_FLAG_SYN);
+    let meta_syn = txn_meta_v4(WAN_INGRESS_IFINDEX as u32, TCP_FLAG_SYN, syn.len() as u16);
+    let ack = build_txn_tcp_syn_frame_v4(DNAT_CLIENT, DNAT_VIP, 54321, 443, TCP_ACK);
+    let meta_ack = txn_meta_v4(WAN_INGRESS_IFINDEX as u32, TCP_ACK, ack.len() as u16);
+    (syn, meta_syn, ack, meta_ack)
+}
+
+/// THE DOMINANT, ORDINARY-OPERATIONS CASE, and it is FAIL-CLOSED. The policy is
+/// byte-identical across the generation bump — the SAME permit that admitted the
+/// flow, naming the real server — so nothing may be revoked.
+///
+/// Before the fix this revoked and dropped the packet: the re-derivation asked
+/// whether policy permits traffic to the VIP `172.16.80.8:443`, which is
+/// precisely the rule admission REFUSES to match
+/// (`policy_inbound_dnat_denies_when_only_original_dst_permitted`), found
+/// nothing, and fell to `default_policy: deny`. Every published DNAT service on
+/// the box lost its live sessions on the next route event.
+#[test]
+fn an_unchanged_dnat_policy_does_not_revoke_the_established_session_9382() {
+    let (syn, meta_syn, ack, meta_ack) = dnat_frames();
+    let out = admit_then_one_more_packet(
+        inbound_dnat_snapshot(wan_to_lan_permit(DNAT_REAL, "permit-internal")),
+        inbound_dnat_snapshot(wan_to_lan_permit(DNAT_REAL, "permit-internal")),
+        WAN_INGRESS_IFINDEX,
+        "reth0.80",
+        &syn,
+        meta_syn,
+        &ack,
+        meta_ack,
+    );
+    assert_eq!(
+        out.session_hit_phase2, 1,
+        "phase 2 must HIT the installed session, or the revoke assertion below \
+         is vacuous (#9382)"
+    );
+    assert_eq!(
+        out.revoked, 0,
+        "the policy is UNCHANGED and names the real server 10.0.61.102 — the \
+         same rule that admitted this flow. A non-zero count means the \
+         re-derivation judged the PRE-translation VIP 172.16.80.8, which is the \
+         rule admission refuses, so it found nothing and fell to default-deny: \
+         every published DNAT/NPTv6 service loses its live sessions on the next \
+         route event, with the policy untouched (#9382)"
+    );
+    assert_eq!(
+        out.sessions, 2,
+        "the forward + reverse pair must survive an unchanged policy"
+    );
+    assert_eq!(out.tx_phase2, 1, "and the packet must still be forwarded");
+}
+
+/// THE LOAD-BEARING CONTROL. Same phase 1, but phase 2's policy genuinely no
+/// longer covers the flow — the permit now names an unrelated internal host.
+///
+/// Without this cell, "never revoke a session that has a destination
+/// translation" passes the cell above perfectly while silently exempting every
+/// DNAT'd service from zone-policy re-derivation altogether. That is a worse bug
+/// than the one #9382 fixes, and this is the only cell that can see it.
+#[test]
+fn a_genuinely_narrowed_dnat_policy_still_revokes_9382() {
+    let (syn, meta_syn, ack, meta_ack) = dnat_frames();
+    let out = admit_then_one_more_packet(
+        inbound_dnat_snapshot(wan_to_lan_permit(DNAT_REAL, "permit-internal")),
+        inbound_dnat_snapshot(wan_to_lan_permit("10.0.61.200/32", "permit-someone-else")),
+        WAN_INGRESS_IFINDEX,
+        "reth0.80",
+        &syn,
+        meta_syn,
+        &ack,
+        meta_ack,
+    );
+    assert_eq!(out.session_hit_phase2, 1, "phase 2 must hit the session");
+    assert_eq!(
+        out.revoked, 1,
+        "the live policy no longer covers 10.0.61.102, so the session MUST be \
+         revoked. 0 here means the translated-destination fix degenerated into \
+         'translated sessions are never re-derived' (#9382)"
+    );
+    assert_eq!(out.sessions, 0, "the revoked pair must be torn down");
+}
+
+/// THE FAIL-OPEN DIRECTION, closed. A DENY naming the REAL server, ahead of a
+/// permit-any, must revoke.
+///
+/// Before the fix this was missed: the re-derivation compared the VIP against a
+/// deny written for `10.0.61.102`, did not match, fell through to the permit-any
+/// and kept the session — so an operator's deny against a published service's
+/// real address did not take effect on live traffic.
+#[test]
+fn a_deny_naming_the_translated_destination_revokes_9382() {
+    let (syn, meta_syn, ack, meta_ack) = dnat_frames();
+    let mut deny_real = wan_to_lan_permit(DNAT_REAL, "deny-internal");
+    deny_real.action = "deny".to_string();
+    let mut phase2 = inbound_dnat_snapshot(deny_real);
+    // A trailing permit-any so the ONLY thing that can revoke is the deny
+    // matching the POST-translation destination — not the default policy.
+    phase2.policies.push(wan_to_lan_permit("any", "permit-rest"));
+    let out = admit_then_one_more_packet(
+        inbound_dnat_snapshot(wan_to_lan_permit(DNAT_REAL, "permit-internal")),
+        phase2,
+        WAN_INGRESS_IFINDEX,
+        "reth0.80",
+        &syn,
+        meta_syn,
+        &ack,
+        meta_ack,
+    );
+    assert_eq!(out.session_hit_phase2, 1, "phase 2 must hit the session");
+    assert_eq!(
+        out.revoked, 1,
+        "a deny naming the REAL server 10.0.61.102, ahead of a permit-any, must \
+         revoke. 0 means the derivation compared the VIP, missed the deny and \
+         fell through to the permit — the fail-OPEN half of #9382"
+    );
+    assert_eq!(out.sessions, 0, "the denied pair must be torn down");
+}
+
+/// THE CELL THAT PINS THE EVALUATED TUPLE EXACTLY, and it is the inverse of the
+/// one above. A DENY naming ONLY the PRE-translation VIP must NOT revoke,
+/// because the VIP is not the address policy judges — admission refuses a rule
+/// written against it, so a deny written against it must be equally inert.
+///
+/// This is the sharpest cell in the group: it fails in OPPOSITE directions
+/// before and after the fix (before: revoked 1, because the wire dst IS the VIP;
+/// after: revoked 0), so it cannot be satisfied by any constant.
+#[test]
+fn a_deny_naming_only_the_pre_translation_vip_does_not_revoke_9382() {
+    let (syn, meta_syn, ack, meta_ack) = dnat_frames();
+    let mut deny_vip = wan_to_lan_permit(DNAT_VIP_CIDR, "deny-public-vip");
+    deny_vip.action = "deny".to_string();
+    let mut phase2 = inbound_dnat_snapshot(deny_vip);
+    phase2
+        .policies
+        .push(wan_to_lan_permit(DNAT_REAL, "permit-internal"));
+    let out = admit_then_one_more_packet(
+        inbound_dnat_snapshot(wan_to_lan_permit(DNAT_REAL, "permit-internal")),
+        phase2,
+        WAN_INGRESS_IFINDEX,
+        "reth0.80",
+        &syn,
+        meta_syn,
+        &ack,
+        meta_ack,
+    );
+    assert_eq!(out.session_hit_phase2, 1, "phase 2 must hit the session");
+    assert_eq!(
+        out.revoked, 0,
+        "a deny naming only the PRE-translation VIP must be inert, exactly as \
+         admission treats a permit written against it. A non-zero count means \
+         the evaluated destination is still the wire tuple (#9382)"
+    );
+    assert_eq!(out.sessions, 2, "the session must survive an inert deny");
+}
+
+/// A SECOND TRANSLATION KIND and a second address family: NPTv6 maps the
+/// external prefix `2602:fd41:70::/48` to the internal `fd35:1940:27::/48`. The
+/// policy is unchanged and names the INTERNAL prefix — the one admission
+/// matches — so nothing may be revoked.
+///
+/// Not redundant with the DNAT cells: NPTv6 arrives at `decision.nat` by a
+/// different route (`nptv6_nat`, a prefix rewrite with NO port rewrite), so a fix
+/// that read only the DNAT decision would pass the DNAT cells and fail here.
+#[test]
+fn an_unchanged_nptv6_policy_does_not_revoke_the_established_session_9382() {
+    let src: Ipv6Addr = "2001:559:8585:80::200".parse().expect("ext client");
+    let dst: Ipv6Addr = "2602:fd41:70:100::102".parse().expect("external prefix dst");
+    let syn = build_txn_tcp_frame_v6(src, dst, 54321, 443, TCP_FLAG_SYN);
+    let mut meta_syn = txn_meta_v6(WAN_INGRESS_IFINDEX as u32, syn.len());
+    meta_syn.tcp_flags = TCP_FLAG_SYN;
+    let ack = build_txn_tcp_frame_v6(src, dst, 54321, 443, TCP_ACK);
+    let mut meta_ack = txn_meta_v6(WAN_INGRESS_IFINDEX as u32, ack.len());
+    meta_ack.tcp_flags = TCP_ACK;
+
+    let out = admit_then_one_more_packet(
+        inbound_nptv6_snapshot(wan_to_lan_permit("fd35:1940:27::/48", "permit-internal-prefix")),
+        inbound_nptv6_snapshot(wan_to_lan_permit("fd35:1940:27::/48", "permit-internal-prefix")),
+        WAN_INGRESS_IFINDEX,
+        "reth0.80",
+        &syn,
+        meta_syn,
+        &ack,
+        meta_ack,
+    );
+    assert_eq!(out.session_hit_phase2, 1, "phase 2 must hit the session");
+    assert_eq!(
+        out.revoked, 0,
+        "the policy is unchanged and names the INTERNAL prefix admission \
+         matches. A non-zero count means the re-derivation judged the EXTERNAL \
+         prefix the packet carried on the wire (#9382)"
+    );
+    assert_eq!(out.sessions, 2, "the NPTv6 pair must survive");
+}
+
+/// NAT64, AND IT MUST BE THE MIXED-FAMILY DESTINATION SET. This is the cell the
+/// issue insists on, because the v4-only shape passes TODAY FOR THE WRONG
+/// REASON: a destination set with no IPv6 member compiles to IPv6-match-any (the
+/// legacy address-set convention), so the synthetic v6 wire destination matches
+/// on the match-any path and the broken derivation looks correct.
+///
+/// Giving the rule a v6 member that does NOT cover `64:ff9b::/96` removes that
+/// accident. The rule then names the REAL IPv4 server `8.8.8.8` — which is
+/// exactly what #2358 tells operators to write — so admission matches it on the
+/// cross-family (V6 src, V4 dst) arm, and the re-derivation must reach the same
+/// verdict through `decision.nat.rewrite_dst`, the extracted IPv4 target.
+#[test]
+fn an_unchanged_nat64_policy_with_a_mixed_family_destination_set_does_not_revoke_9382() {
+    let src: Ipv6Addr = "2001:559:8585:ef00::102".parse().expect("v6 client");
+    let dst: Ipv6Addr = "64:ff9b::808:808".parse().expect("nat64 synthetic dst");
+    let syn = build_txn_tcp_frame_v6(src, dst, 12345, 443, TCP_FLAG_SYN);
+    let mut meta_syn = txn_meta_v6(LAN_IFINDEX as u32, syn.len());
+    meta_syn.tcp_flags = TCP_FLAG_SYN;
+    let ack = build_txn_tcp_frame_v6(src, dst, 12345, 443, TCP_ACK);
+    let mut meta_ack = txn_meta_v6(LAN_IFINDEX as u32, ack.len());
+    meta_ack.tcp_flags = TCP_ACK;
+
+    let mixed = || {
+        let mut rule = lan_to_wan_permit("8.8.8.8/32", "permit-real-v4-server");
+        // The v6 member is what defeats the IPv6-match-any accident. It must
+        // NOT cover 64:ff9b::/96 — if it did, the synthetic wire destination
+        // would match it and the cell would pass whether the fix exists or not.
+        rule.destination_addresses
+            .push("2001:db8::/32".to_string());
+        nat64_snapshot(rule)
+    };
+    let out = admit_then_one_more_packet(
+        mixed(),
+        mixed(),
+        LAN_IFINDEX,
+        "reth1.0",
+        &syn,
+        meta_syn,
+        &ack,
+        meta_ack,
+    );
+    assert_eq!(out.session_hit_phase2, 1, "phase 2 must hit the session");
+    assert_eq!(
+        out.revoked, 0,
+        "the rule names the REAL IPv4 server 8.8.8.8 — the tuple #2358 has \
+         admission match — and carries a v6 member so the destination set is no \
+         longer IPv6-match-any. A non-zero count means the re-derivation judged \
+         the SYNTHETIC v6 destination, which matches nothing here (#9382)"
+    );
+    assert_eq!(out.sessions, 2, "the NAT64 pair must survive");
 }
