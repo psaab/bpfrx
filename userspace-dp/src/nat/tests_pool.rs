@@ -11938,3 +11938,196 @@ fn v6_pool_change_retaining_an_address_does_not_reissue_its_live_tuple_9163() {
         first.rewrite_src_port.unwrap_or_default(),
     );
 }
+
+// ---------------------------------------------------------------------------
+// #9392 — the recycled-phase walk cost must be readable from a RUNNING
+// firewall, not only from a test.
+//
+// #9327 measured that the recycled phase of `PortAllocator::claim` does not
+// amortize: retained tokens go to the BACK of the FIFO, so K
+// out-of-band-occupied tokens ahead of F free ones cost (K+F)/F pops per claim,
+// degrading to K+1 as F -> 1 — worst exactly as an address approaches
+// exhaustion, i.e. when the pool is busiest. What it could NOT establish is
+// whether a production pool ever reaches K-large / F-small, because
+// `recycle_scan_pops` was `#[cfg(test)]`: there was no signal from a running
+// firewall at all.
+//
+// #9392 promotes the counter and adds the DENOMINATOR it needs. The cells below
+// read `PortAllocator::snapshot()` — the production surface that reaches
+// `ProcessStatus` — and not `debug_recycle_scan_pops`, which is the per-address
+// test seam and would have passed unchanged on the pre-#9392 tree.
+// ---------------------------------------------------------------------------
+
+/// Build a single-address pool whose recycled FIFO holds `k` occupied tokens
+/// ahead of `f` free ones, with the fresh cursor exhausted so every claim goes
+/// through the recycled phase. Mirrors the #9327 fixture.
+fn recycle_cliff_allocator_9392(k: usize, f: usize, pool_ip: Ipv4Addr) -> PortAllocator {
+    let range_lo = 1024u16;
+    let alloc = PortAllocator::new(1, range_lo, range_lo + (k + f) as u16 - 1);
+    alloc.debug_set_cursor(0, (k + f) as u32);
+    let mut queue: Vec<u16> = (0..k).map(|i| range_lo + i as u16).collect();
+    for i in 0..f {
+        queue.push(range_lo + (k + i) as u16);
+    }
+    alloc.debug_set_recycled(0, queue);
+    for i in 0..k {
+        alloc.debug_seed_owner(0, IpAddr::V4(pool_ip), range_lo + i as u16);
+    }
+    alloc
+}
+
+/// Drive `claims` recycled-phase claims, freeing each translation so the token
+/// returns to the ring and the steady state repeats.
+fn drive_recycled_claims_9392(alloc: &PortAllocator, pool_ip: Ipv4Addr, claims: usize) {
+    let addrs = [pool_ip];
+    for c in 0..claims {
+        let flow = SourceNatFlowKey {
+            protocol: 6,
+            src_ip: "10.0.61.51".parse().unwrap(),
+            dst_ip: "8.8.8.8".parse().unwrap(),
+            src_port: 40000 + c as u16,
+            dst_port: 443,
+            routing_scope: 0,
+        };
+        let got = alloc.allocate_translation(
+            flow,
+            PoolAddressFamily::V4(&addrs),
+            0,
+            false,
+            false,
+            PersistentNatPermit::TargetHostPort,
+            0,
+            1_000,
+            NatHolder::Untracked,
+        );
+        if let Ok(t) = got {
+            alloc.debug_free_recycle(0, t.port);
+        }
+    }
+}
+
+/// THE ACCEPTANCE CELL. The production pair must SEPARATE the cliff from the
+/// healthy case.
+///
+/// A counter that always reads 0, or always reads large, answers nothing — so
+/// this drives both shapes through the same code with the same number of claims
+/// and requires the RATIO to differ by a wide margin in the predicted direction.
+/// The healthy allocator is the in-cell control: it is not a second assertion
+/// about the same reading, it is the reading that would have to move for the
+/// instrument to be measuring load rather than pathology.
+///
+/// FAIL-ON-REVERT, two ways: put `#[cfg(test)]` back on `recycle_scan_pops` and
+/// this does not compile (the field is gone from `snapshot()`); drop the
+/// `recycle_scan_walks` increment and the denominator is 0, which the ratio
+/// computation below refuses outright rather than dividing by zero.
+#[test]
+fn the_production_recycle_scan_pair_separates_the_cliff_from_healthy_9392() {
+    const CLAIMS: usize = 8;
+    let (k, f) = (15usize, 1usize);
+
+    // CONTROL FIRST: no occupied tokens ahead of the free ones, so each claim
+    // pops exactly one. This is the shape a healthy pool is in, and it must NOT
+    // look like the cliff.
+    let healthy_ip: Ipv4Addr = "203.0.113.2".parse().unwrap();
+    let healthy = recycle_cliff_allocator_9392(0, 8, healthy_ip);
+    let healthy_before = healthy.snapshot();
+    assert_eq!(
+        healthy_before.recycle_scan_walks_total, 0,
+        "setup: a fresh allocator has walked nothing, so the readings below \
+         cannot be carried-over values",
+    );
+    assert_eq!(healthy_before.recycle_scan_pops_total, 0, "setup: no pops yet");
+    drive_recycled_claims_9392(&healthy, healthy_ip, CLAIMS);
+    let healthy_after = healthy.snapshot();
+
+    assert!(
+        healthy_after.recycle_scan_walks_total >= CLAIMS as u64,
+        "the DENOMINATOR must move: {CLAIMS} claims all went through the \
+         recycled phase (the fresh cursor is exhausted), so at least that many \
+         walks must be counted. Got {}. A pop count without a walk count is not \
+         interpretable — a large cumulative number is equally consistent with a \
+         busy pool doing cheap walks and an idle one doing pathological ones \
+         (#9392)",
+        healthy_after.recycle_scan_walks_total,
+    );
+    let healthy_ratio = healthy_after.recycle_scan_pops_total as f64
+        / healthy_after.recycle_scan_walks_total as f64;
+    assert!(
+        healthy_ratio < 2.0,
+        "a HEALTHY pool must read ~1 pop per scan, got {healthy_ratio:.2} \
+         ({} pops over {} scans). If the healthy case also reads large, the \
+         counter reports load rather than the #9327 cliff and cannot answer the \
+         reachability question #9392 exists for",
+        healthy_after.recycle_scan_pops_total,
+        healthy_after.recycle_scan_walks_total,
+    );
+
+    // THE CLIFF: K occupied tokens ahead of F=1 free one. Retained tokens go to
+    // the BACK, so they are at the head again on the very next claim.
+    let cliff_ip: Ipv4Addr = "203.0.113.1".parse().unwrap();
+    let cliff = recycle_cliff_allocator_9392(k, f, cliff_ip);
+    drive_recycled_claims_9392(&cliff, cliff_ip, CLAIMS);
+    let cliff_after = cliff.snapshot();
+
+    assert!(
+        cliff_after.recycle_scan_walks_total >= CLAIMS as u64,
+        "the cliff fixture must have walked too, or the ratio below is about \
+         nothing. Got {} walks",
+        cliff_after.recycle_scan_walks_total,
+    );
+    let cliff_ratio =
+        cliff_after.recycle_scan_pops_total as f64 / cliff_after.recycle_scan_walks_total as f64;
+    assert!(
+        cliff_ratio >= k as f64,
+        "with K={k} occupied tokens ahead of F={f} free one, the PRODUCTION pair \
+         must report ~K+1 pops per scan, got {cliff_ratio:.2} ({} pops over {} \
+         scans). This is the reading that says the #9327 non-amortizing cliff is \
+         REACHED, and it is the whole point of promoting the counter out of \
+         #[cfg(test)] (#9392)",
+        cliff_after.recycle_scan_pops_total,
+        cliff_after.recycle_scan_walks_total,
+    );
+    assert!(
+        cliff_ratio > healthy_ratio * 4.0,
+        "the cliff ({cliff_ratio:.2}) must be unmistakable beside the healthy \
+         control ({healthy_ratio:.2}). If the two readings are close, the pair \
+         does not DISCRIMINATE and an operator cannot act on it",
+    );
+}
+
+/// The pair must survive the SHORT-CIRCUIT without inventing a walk.
+///
+/// A fully exhausted address returns `None` from the `occupied >= range` gate
+/// before the FIFO walk. Counting that as a walk would drag the pops-per-scan
+/// ratio toward zero on exactly the pools closest to the cliff — the fabricated
+/// healthy reading, arrived at by a denominator that grew without a numerator.
+#[test]
+fn a_short_circuited_claim_counts_no_recycle_walk_9392() {
+    let pool_ip: Ipv4Addr = "203.0.113.3".parse().unwrap();
+    let range_lo = 1024u16;
+    let k = 4usize;
+    // Every port occupied out-of-band: occupied == range, so the short-circuit
+    // fires.
+    let alloc = PortAllocator::new(1, range_lo, range_lo + k as u16 - 1);
+    alloc.debug_set_cursor(0, k as u32);
+    alloc.debug_set_recycled(0, (0..k).map(|i| range_lo + i as u16).collect());
+    for i in 0..k {
+        alloc.debug_seed_owner(0, IpAddr::V4(pool_ip), range_lo + i as u16);
+    }
+    let before = alloc.snapshot();
+    assert_eq!(before.recycle_scan_walks_total, 0, "setup");
+
+    drive_recycled_claims_9392(&alloc, pool_ip, 3);
+    let after = alloc.snapshot();
+    assert_eq!(
+        after.recycle_scan_walks_total, 0,
+        "a claim short-circuited by `occupied >= range` walked nothing and must \
+         count no scan. Counting it would add denominator without numerator, \
+         pulling pops/scan toward zero on the most exhausted pools — the exact \
+         reading that hides the cliff (#9392)",
+    );
+    assert_eq!(
+        after.recycle_scan_pops_total, 0,
+        "and no pops either — the short-circuit returns before the walk",
+    );
+}

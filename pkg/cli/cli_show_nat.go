@@ -468,6 +468,28 @@ func (c *CLI) showNATSourcePool(cfg *config.Config, poolName string) error {
 					fmt.Printf("  Utilization: %.1f%%\n",
 						float64(used)/float64(totalPorts)*100)
 				}
+				// #9392: the recycled-phase walk cost. #9327 measured that the
+				// port allocator's recycled phase does NOT amortize -- K
+				// out-of-band-occupied tokens ahead of F free ones cost (K+F)/F
+				// pops per claim, degrading to K+1 as F -> 1, i.e. worst exactly
+				// as this pool approaches exhaustion -- and could not say
+				// whether production ever reaches that shape, because the
+				// counter was a Rust test seam. It is a production counter as of
+				// #9392 and this is where an operator reads it, beside the
+				// utilisation the cliff is a function of.
+				//
+				// GATED ON THE DENOMINATOR, not on the numerator. A helper that
+				// predates the counters decodes both as 0, and printing
+				// "1.0 pops/scan" (or "0.0") for a build that reported nothing
+				// would be the fabricated healthy zero #7473/#8606 refused
+				// twice on this very view. Zero WALKS means either "no claim has
+				// entered the recycled phase" or "this helper does not report
+				// it"; both are correctly rendered by saying nothing.
+				if rp.RecycleScanWalksTotal > 0 {
+					fmt.Printf("  Recycled-scan pops: %d over %d scans (%.2f per scan)\n",
+						rp.RecycleScanPopsTotal, rp.RecycleScanWalksTotal,
+						float64(rp.RecycleScanPopsTotal)/float64(rp.RecycleScanWalksTotal))
+				}
 			} else {
 				fmt.Printf("  Ports allocated: unknown (dataplane helper not reporting)\n")
 			}

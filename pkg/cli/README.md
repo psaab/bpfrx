@@ -157,6 +157,26 @@ presenter's rendered output is byte-identical:
 
 ## Gotchas
 
+- **`show security nat source pool` reports the allocator's recycled-scan cost,
+  and it is gated on the DENOMINATOR (#9392).** #9327 measured that the Rust
+  port allocator's recycled phase does not amortize: retained tokens are pushed
+  to the BACK of the per-address FIFO, so K out-of-band-occupied tokens ahead of
+  F free ones cost `(K+F)/F` pops per claim, degrading to `K+1` as `F -> 1` —
+  worst exactly as the pool approaches exhaustion. It could not say whether a
+  production pool reaches that shape, because `recycle_scan_pops` was Rust-side
+  `#[cfg(test)]`. #9392 promoted it, added the WALK counter it needs as a
+  denominator, and this view renders `Recycled-scan pops: <pops> over <scans>
+  (<ratio> per scan)` beside the utilisation the cliff is a function of.
+
+  The render is gated on `RecycleScanWalksTotal > 0`, never on the pop count. An
+  older helper omits both keys and they decode 0, and a pool whose recycled phase
+  has not run reports 0 honestly — printing a ratio from a zero denominator would
+  state a measurement nobody made, which is the fabricated healthy zero this
+  exact view already had refused out of it twice (#7473 for a disarmed pool,
+  #8606 for a pool the helper has no entry for). ~1 per scan is the healthy
+  reading and it is still printed: the baseline is what makes a large ratio
+  legible as a cliff rather than as a busy pool.
+
 - **A session-derived view runs IN xpfd, so its memory is the control
   plane's (#8597).** `showTopTalkers` used to append one formatted row per
   SESSION, sort the whole slice, and print twenty. `MaxSessions` is dynamic

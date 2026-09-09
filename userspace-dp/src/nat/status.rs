@@ -45,6 +45,12 @@ pub(crate) fn source_nat_pool_statuses(rules: &[SourceNatRule]) -> Vec<SourceNat
                 // ceiling harness.
                 live_lock_acquisitions_total: snap.live_lock_acquisitions_total,
                 live_lock_contended_total: snap.live_lock_contended_total,
+                // #9392: the recycled-phase walk cost, so an operator can see
+                // whether the #9327 non-amortizing cliff is REACHED on a real
+                // pool. Published as a complete pair — the pop count alone
+                // answers nothing.
+                recycle_scan_pops_total: snap.recycle_scan_pops_total,
+                recycle_scan_walks_total: snap.recycle_scan_walks_total,
             }
         })
         .collect()
