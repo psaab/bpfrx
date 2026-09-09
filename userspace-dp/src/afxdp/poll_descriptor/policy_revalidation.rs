@@ -65,6 +65,31 @@
 //! handle (`policy_counter_idx`) for the caller to bump; it cannot count, log or
 //! meter by itself. This module simply never bumps what it is handed.
 //!
+//! # The revoke predicate is PERMIT-or-not, and `reject` tears down SILENTLY (#9381)
+//!
+//! `PolicyAction` is THREE-valued: `Permit` / `Deny` / `Reject` (`policy.rs`).
+//! Admission requires `Permit` and treats `Reject` as terminal non-forwarding,
+//! so this arm must too — it tests for `Permit` POSITIVELY rather than for
+//! `Deny` negatively. Spelled `!matches!(.., Deny)` (as it was until #9381) the
+//! third action silently joined the permit arm and was re-STAMPED, so a commit
+//! narrowing `permit` -> `reject` enforced the new verdict on new flows while
+//! every established session admitted by that rule kept forwarding until idle
+//! timeout — and a later packet of the same generation never re-asked. The
+//! positive spelling also fails CLOSED for any fourth action added later.
+//!
+//! **A revoked-by-reject session is torn down SILENTLY: no ICMP unreachable, no
+//! TCP RST, no log, no counter — identical to the `Deny` teardown.** That is a
+//! decision, not an omission, for two reasons. First, this derivation is
+//! side-effect-free by contract (see item 3 below): minting a reject reply needs
+//! the frame, the TX pipeline and the deny-event emitter, which is the whole
+//! class of side effect the contract excludes. Second, it is not a loss of
+//! operator-visible behaviour: the teardown also evicts both directions'
+//! flow-cache slots, so the NEXT packet of that 5-tuple is a session MISS and
+//! takes the full admission path, which evaluates `Reject` and emits the
+//! reject reply + RT_FLOW deny record from the site that owns them
+//! (`reject_reply.rs`). The reject semantics arrive one packet later, from one
+//! place, rather than being duplicated here.
+//!
 //! # What it does NOT cover, stated so this does not read as more than it is
 //!
 //! `to_id` is derived from the egress interface resolved at install/import
@@ -79,7 +104,8 @@ use super::*;
 use crate::policy::evaluate_policy_result_with_icmp;
 use crate::session::{PolicyRevalidationTarget, SessionKey};
 
-/// A zone-policy re-derivation that came back DENY. Carries the CANONICAL key —
+/// A zone-policy re-derivation that came back NON-PERMIT (`Deny` or `Reject`,
+/// #9381). Carries the CANONICAL key —
 /// the primary-index key, which on the NAT reverse-translated alias path is NOT
 /// the wire tuple that found it — so the teardown acts on the session that was
 /// actually judged.
@@ -90,9 +116,9 @@ pub(super) struct PolicyRevocation {
 /// Re-derive zone policy for an established-session HIT, at most once per
 /// session per `config_generation`.
 ///
-/// Returns `Some` only when the live policy DENIES a flow this node is still
-/// forwarding — the caller revokes. `None` is the answer for every packet but
-/// one per session per generation.
+/// Returns `Some` only when the live policy does NOT PERMIT a flow this node is
+/// still forwarding — `Deny` or `Reject`, #9381 — and the caller revokes. `None`
+/// is the answer for every packet but one per session per generation.
 pub(super) fn revalidate_zone_policy_on_session_hit(
     forwarding: &ForwardingState,
     sessions: &mut SessionTable,
@@ -184,12 +210,13 @@ pub(super) fn revalidate_zone_policy_on_session_hit(
 /// on a DIFFERENT translated port and breaks — and must not re-derive the same
 /// verdict on every later packet of this generation.
 ///
-/// On DENY the caller REVOKES, so normally there is no entry left to stamp. A
-/// stamp would matter only if the teardown did NOT take, and in exactly that
-/// case it is a fail-OPEN: the session would read "already judged under the live
-/// generation" and be FORWARDED for the rest of the generation under a policy
-/// that denies it. Unstamped, the next packet re-derives the same DENY and
-/// drops. Same failure, fail-CLOSED instead of fail-OPEN.
+/// On a non-PERMIT verdict (`Deny` or `Reject`, #9381) the caller REVOKES, so
+/// normally there is no entry left to stamp. A stamp would matter only if the
+/// teardown did NOT take, and in exactly that case it is a fail-OPEN: the
+/// session would read "already judged under the live generation" and be
+/// FORWARDED for the rest of the generation under a policy that does not permit
+/// it. Unstamped, the next packet re-derives the same verdict and drops. Same
+/// failure, fail-CLOSED instead of fail-OPEN.
 #[cold]
 #[inline(never)]
 fn zone_policy_deny_on_session_hit(
@@ -254,13 +281,24 @@ fn zone_policy_deny_on_session_hit(
         // side-effect-free derivation touches.
         0,
     );
-    if !matches!(result.action, crate::policy::PolicyAction::Deny) {
+    // #9381: the revoke predicate is PERMIT-or-not, mirroring admission
+    // (`poll_descriptor/mod.rs`: `if let PolicyAction::Permit = policy_result.action`).
+    // `PolicyAction` is THREE-valued and `Reject` is a terminal non-forwarding
+    // verdict, not a softer permit: the first-packet path drops it
+    // (`reject_reply.rs`) and `policy.rs`'s own terminal-action test spells the
+    // pair `Deny | Reject`. Spelled as `Deny` alone, this arm re-stamped every
+    // `Reject` session as revalidated, so an operator narrowing `permit` ->
+    // `reject` got the new verdict for NEW flows while every ESTABLISHED session
+    // admitted by that rule kept forwarding in both directions until idle
+    // timeout. Spelling it POSITIVELY (match `Permit`) also means a fourth
+    // action added later fails CLOSED here instead of inheriting the permit arm.
+    if matches!(result.action, crate::policy::PolicyAction::Permit) {
         // Still permitted. Nothing counted, nothing logged, the session and its
         // NAT translation untouched. Re-stamp so no later packet of this
         // generation re-derives the same verdict.
         sessions.mark_policy_revalidated(&canonical_key);
         return None;
     }
-    // DENY: deliberately NOT re-stamped — see the header.
+    // DENY or REJECT: deliberately NOT re-stamped — see the header.
     Some(PolicyRevocation { canonical_key })
 }
