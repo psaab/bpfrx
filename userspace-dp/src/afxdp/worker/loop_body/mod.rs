@@ -1539,14 +1539,23 @@ pub(crate) fn worker_loop(
                             .dbg_cos_queue_overflow
                             .fetch_add(b.telemetry.dbg_cos_queue_overflow, Ordering::Relaxed);
                     }
-                    // #802: kernel xdp_statistics.rx_fill_ring_empty_descs is
-                    // already absolute (kernel-cumulative), so publish with
-                    // store() not fetch_add. Sampling failures are silently
-                    // ignored — the atomic simply retains its last good value.
+                    // #802: kernel xdp_statistics are already absolute
+                    // (kernel-cumulative), so they are published with store()
+                    // not fetch_add. Sampling failures are silently ignored —
+                    // the atomics simply retain their last good value.
+                    //
+                    // #9168: this site used to store ONE of the six counters
+                    // `statistics_v2()` returns and discard the other five, two
+                    // of which (`rx_dropped`, `rx_invalid_descs`) were plumbed
+                    // all the way to the operator's `Kernel RX dropped:` /
+                    // `Kernel RX invalid:` lines and therefore reported a
+                    // permanent hard 0 — the healthy value, on the instrument
+                    // that exists to reveal a NIC dropping every packet. The
+                    // whole sample now goes to one publisher, which destructures
+                    // it exhaustively so a future field cannot be dropped here
+                    // silently.
                     if let Ok(stats) = b.xsk.device.statistics_v2() {
-                        b.live
-                            .rx_fill_ring_empty_descs
-                            .store(stats.rx_fill_ring_empty_descs, Ordering::Relaxed);
+                        b.live.publish_kernel_xdp_statistics(stats);
                     }
                     // #802: outstanding_tx is a transient gauge on
                     // BindingWorker.tx_pipeline (current in-flight TX).

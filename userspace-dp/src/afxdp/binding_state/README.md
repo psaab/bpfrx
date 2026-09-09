@@ -22,6 +22,7 @@ orderings and `#[inline]` attributes moved byte-identical, and the
 | `latency.rs` | `bucket_index_for_ns` + the histogram bucket-count wire-contract constants (`DRAIN_HIST_BUCKETS`, `TX_SUBMIT_LAT_BUCKETS`), the producer-local redirect-sample TLS (`REDIRECT_SAMPLE_SEQ` + `REDIRECT_SAMPLE_MASK`), and `TX_SIDECAR_UNSTAMPED`. |
 | `session_delta.rs` | The HA session-delta RPC-fallback buffer (`pending_session_deltas`) + the #5290 `delta_loss_pending` loss-of-sync latch that drives the full owner-RG resync. |
 | `snapshot.rs` | `BindingLiveState::snapshot()` — the operator-facing `BindingLiveSnapshot` render (~120 Relaxed loads, bounded read-skew contract). |
+| `kernel_stats.rs` | `BindingLiveState::publish_kernel_xdp_statistics` — the ONE site that turns a `statistics_v2()` sample into per-binding atomics. Destructures `XdpStatisticsV2` exhaustively, so a new kernel counter is a compile error here rather than a field that reaches the wire unwritten (#9168). `UNPLUMBED_KERNEL_STAT_FIELDS` names the counters deliberately not carried. |
 | `debug_state.rs` | The ~65ms debug-state publish cadence (`update_binding_debug_state` / idle variant) that flushes worker-local scratches into the binding atomics. |
 | `profile.rs` | `OwnerProfileOwnerWrites` / `OwnerProfilePeerWrites` — cacheline-isolated (`#[repr(align(64))]`) telemetry blocks, split by writer. |
 | `tests/` | Co-located unit tests, per-concern split (#4667, relocated from `umem/tests/` in #6436): `mod.rs` (shared `use` header + the cross-concern `test_tx_request_for_inbox` fixture), `tx_inbox.rs`, `latency_buckets.rs`, `snapshot_propagation.rs`, `tx_submit_latency.rs`, `tx_kick_latency.rs`, `debug_state.rs`. |
@@ -33,6 +34,18 @@ orderings and `#[inline]` attributes moved byte-identical, and the
   orderings are part of the contract. Owner-written telemetry is
   cacheline-isolated from peer-written telemetry (`profile.rs`,
   enforced by compile-time align/size asserts).
+- **Kernel XDP statistics have ONE publisher, and it destructures
+  exhaustively** (#9168): `statistics_v2()` returns six counters. Before
+  #9168 the worker loop stored one of them inline and dropped the rest,
+  two of which (`rx_dropped`, `rx_invalid_descs`) had a complete consumer
+  chain all the way to the operator's `Kernel RX dropped:` /
+  `Kernel RX invalid:` lines — so those lines reported a permanent hard
+  `0`, the healthy value, on the instrument that exists to reveal a NIC
+  dropping every packet. `publish_kernel_xdp_statistics` is now the only
+  site that converts a sample, it binds every field by name, and a
+  counter it deliberately does not carry must be listed in
+  `UNPLUMBED_KERNEL_STAT_FIELDS`. Kernel counters are ABSOLUTE per
+  socket, so they are published with `store()`, never `fetch_add()`.
 - **Redirect inbox admission is linearizable via
   `pending_tx_admitted`, not `pending_tx.len()`** — the atomic
   acquire/release pair brackets the MPSC push, and the
