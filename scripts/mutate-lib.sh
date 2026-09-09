@@ -97,8 +97,32 @@ mutation_uncovered() {
 # mutation_infra_broken LOG -> 0 when the run was invalidated by the machine
 # rather than by the mutation (full disk is the one that has bitten; it reds
 # NAMED tests and reads as a real regression).
+#
+# #9500: the `injected:` exclusion is LOAD-BEARING, not defensive.
+# pkg/configstore/persist_failure_test.go declares
+#
+#	var errDiskFull = errors.New("injected: no space left on device")
+#
+# and TestSyncApply_DegradesNotFails deliberately returns it while EXPECTING
+# SyncApply to succeed; store.go routes it to noteActivePersistFailureLocked,
+# which slog.Errors it. mutate.sh runs its Go gate as
+# `GOTESTJSON=... make test-go` with 2>&1 into the cell log, and GOTESTJSON
+# selects `go test -json`, which implies -v — so a PASSING run streams that
+# literal into the very log this predicate greps.
+#
+# The consequence was total and silent. mutation_verdict tests infra FIRST, so
+# it outranks both KILLED and ESCAPED, and every Go cell scored
+# VOID(infrastructure) — turning ESCAPED, the verdict that says "this code is
+# untested", into "go look at your disk", which is fine. A detector for a
+# broken machine matched a string the healthy machine prints.
+#
+# Excluding the whole LINE is deliberate: a real ENOSPC arrives on its own line
+# (a compiler or linker diagnostic), so dropping fixture lines cannot mask one.
+# The memory half has no such collision today — `cannot allocate memory` appears
+# in no fixture in this tree — but it is filtered through the same pass so a
+# future injected-OOM fixture does not reintroduce this defect.
 mutation_infra_broken() {
-	grep -qiE 'no space left on device|cannot allocate memory' "$1"
+	grep -viE 'injected:' "$1" | grep -qiE 'no space left on device|cannot allocate memory'
 }
 
 # mutation_timed_out LOG -> 0 when the run did not FINISH.
