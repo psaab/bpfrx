@@ -515,7 +515,11 @@ func compileDHCPLocalServer(node *Node, dhcp *DHCPServerConfig, isV6 bool) error
 							// children in both shapes.
 							for _, sbInst := range namedInstances([]*Node{pp}) {
 								sb := &DHCPStaticBinding{MACAddress: sbInst.name}
-								for _, leaf := range sbInst.node.Children {
+								// #9235: `static-binding <mac> fixed-address <ip>
+								// host-name <n>` nests host-name under
+								// fixed-address, so this loop read the address and
+								// dropped the name. Lenient path only.
+								for _, leaf := range expandRunChildren9235(sbInst.node.Children, dhcpStaticBindingSchema9235()) {
 									switch leaf.Name() {
 									case "fixed-address":
 										sb.FixedAddress = nodeVal(leaf)
@@ -1334,7 +1338,12 @@ func compileFlowMonitoring(node *Node, svc *ServicesConfig) error {
 			if !found || tmpl == nil {
 				tmpl = &NetFlowV9Template{Name: tmplInst.name}
 			}
-			for _, prop := range tmplInst.node.Children {
+			// #9235: `template t1 flow-active-timeout 60 flow-inactive-timeout 15`
+			// is ONE command nested into a chain, so this loop read the active
+			// timeout and left the inactive one at 0 -- the exporter never aged an
+			// idle flow out and the collector saw flows that had already ended.
+			// Lenient path only.
+			for _, prop := range expandRunChildren9235(tmplInst.node.Children, version9TemplateSchema9235()) {
 				switch prop.Name() {
 				case "flow-active-timeout":
 					if v := nodeVal(prop); v != "" {
@@ -1392,7 +1401,8 @@ func compileFlowMonitoring(node *Node, svc *ServicesConfig) error {
 			if !found || tmpl == nil {
 				tmpl = &NetFlowIPFIXTemplate{Name: tmplInst.name}
 			}
-			for _, prop := range tmplInst.node.Children {
+			// #9235: same chain loss as the version9 template above.
+			for _, prop := range expandRunChildren9235(tmplInst.node.Children, ipfixTemplateSchema9235()) {
 				switch prop.Name() {
 				case "flow-active-timeout":
 					if v := nodeVal(prop); v != "" {

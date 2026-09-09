@@ -8255,6 +8255,96 @@ it is now pinned by an end-to-end measurement in BOTH states. The two witnesses
 remaining on the blind side (`/security/ike/gateway`, `/security/ipsec/vpn`) are
 deep containers, so criterion 1 keeps them blind for the foreseeable future and
 makes them durable anchors.
+## The #8939 residue: flat-run losses on the LENIENT path (#9235)
+
+#8939 drove the operator-typed flat-run losses to zero. The residue was eighteen
+census rows at twelve containers, and **the channel is the whole finding rather
+than a caveat on it**:
+
+| channel | the packed spelling |
+|---|---|
+| `config.SchemaValidate` | REJECTS at ten of the twelve, so an operator cannot type it |
+| `config.CompileConfig` (strict) | never sees the tree there — the schema gate ran first |
+| `config.CompileConfigLenient` | **loses the value** — this is the defect's channel |
+| `configstore.CheckText` | REJECTS (it is `compileTreeStrict`) |
+
+So the loss is reachable through `Store.Load` (boot from the persisted DB) and
+`Store.SyncApply` (HA config sync), which call `compileTreeLenient` and downgrade
+the same gate to a `slog.Warn` under the #1960 no-brick doctrine. A warning on a
+booting firewall is not a channel anyone reads in time.
+
+### The reachability question, answered from shipped code rather than measured
+
+The issue's first task was *"how does a packed run get into a persisted tree at
+all, if commit rejects it?"* — and the tree already carries two SHIPPED migrations
+whose only reason to exist is that situation: `rewriteRetiredDataplaneType`
+(#1373/#1525, "a node may boot with `system dataplane-type ebpf` persisted from
+before the retirement-strict validator landed") and `SanitizeTreeControlChars`
+(#1798, "a persisted free-text value ... committed before the strict commit-time
+gate landed"). `compileTreeLenient`'s own doc comment states both candidate
+mechanisms as design premises: an older binary's persisted tree, and a config
+pushed from a possibly-un-upgraded cluster primary.
+
+### TWO of the eighteen rows were mislabelled, by the #9265 `xpfarg` mechanism
+
+Measured with REAL instance names, `protocols router-advertisement interface <if>
+prefix <p>` and `routing-options static route <r> qualified-next-hop <gw>` are
+**OPERATOR-reachable**: the packed spelling commits clean through
+`configstore.CheckText` and then enforces less than it says — the #9088 class, not
+a fidelity question.
+
+The #8939 census scored them `lenient-only` because it synthesises the instance
+name as the literal token `arg1`, so the fixture it hands the gate is
+`… interface arg1 prefix arg1 autonomous no-autonomous`; `arg1` is not a valid
+IPv6 prefix, the typed KEY validator rejects the fixture, and
+`flatSetAdmittedAnyOrder` reads any rejection as "the packed spelling is refused".
+**The row scored rejected because its NAME was invalid, not because its BODY was
+checked.** That is the hazard #9265 says any census here owes a control for,
+observed on a shipped column rather than predicted. The channel is now recorded
+per row and asserted in BOTH directions, so a row silently becoming
+operator-reachable reds.
+
+### The remedy is `hoistAndSplitRun8939`, and that is measured
+
+`SetPath` builds a flat-set line as a NESTED CHAIN, so the trailing statements are
+not on the container's children at all:
+
+```
+set security flow aging early-ageout 10 high-watermark 80 low-watermark 60
+  [aging] > [early-ageout 10] > [high-watermark 80] > [low-watermark 60]
+```
+
+`expandFlatRun` splits a run carried on ONE node's Keys and cannot see that chain.
+`hoistAndSplitRun8939` does both operations and carries the #9234 ambiguity bound
+(a head legal in BOTH the container and the body it sits in stays where it was
+authored).
+
+Census after the twelve sites: **losers 19 -> 1, walked 85 -> 103**. The single
+remaining row is the artifact the issue itself documents — `services rpm probe <p>
+test <t> target [address | url]`, two mutual ALTERNATIVES that both write
+`test.Target`, so a fixture setting both is malformed input and the census cannot
+see mutual exclusion.
+
+### `unmeasured` is not a placeholder problem
+
+The 76 `unmeasured` rows were diagnosed before being deprioritised, because the
+issue's scope correction asserts *"the answer is a better placeholder, not a
+smarter classifier"*. Bucketed by the compile error that made each row
+unmeasurable, the dominant causes are missing CROSS-REFERENCE scaffolding — a
+filter that requires a term, a CoS interface that references an undefined
+scheduler-map, a policer that requires a positive rate — across 35 distinct
+buckets. So the remedy is a per-container fixture PRELUDE satisfying the
+container's referents, which is a larger instrument-building task than picking an
+acceptable value. `unmeasured` is unchanged by this change (77 at the time of writing; the
+issue body records 76, moved since by another lane), consistent with none of those
+rows being a flat-run question.
+
+### The load-bearing acceptance row
+
+"The packed spelling is refused" is satisfiable by refusing EVERYTHING, which
+would make all twelve containers unconfigurable — the #4191 over-rejection class,
+and worse than the truncation being fixed. Every channel row therefore asserts the
+PER-LEAF spelling is still ACCEPTED first, and fatally.
 
 ## Firewall-filter cross-family name collision fail-closed gate (#3884)
 

@@ -328,7 +328,38 @@ func gateLeafChangesWarnings(g gateLeaf, pre string, epath []string) bool {
 // already-read leaves visible: before #9416 that restriction compiled to
 // nothing and the community was answerable from every source. The floor moving
 // is a side effect of fixing it, not the point of the change.
-const gateCoverageFloor = 743
+// #9235 LOWERS it 743 -> 740, and a lowering needs a stronger argument than a
+// raise, so here it is.
+//
+// The three `security flow aging` thresholds (early-ageout, high-watermark,
+// low-watermark) are registered in notAValueList by #9235 and are therefore
+// EXCLUDED from the enumeration rather than added to it — the same mechanism the
+// #9416 paragraph above records for `snmp client-list` and `client-list-name`,
+// which is why that change moved the floor by one and not by three.
+//
+// THE COVERAGE LOST IS NOT A HIDING PLACE, which is the part that distinguishes
+// this from the regression this floor exists to catch. That regression is a leaf
+// that STOPPED COMPILING: it could still exhibit the #2419 class and now carries
+// no verdict, so the class has more room to hide. These three cannot exhibit it
+// at all. The class is "a two-element LIST authored in one spelling compiles
+// differently from the same list in another", and each of these leaves is
+// `args: 1` with a `smallint` value pair — there is no list. Measured rather than
+// argued from the arity, as notAValueList's contract requires:
+//
+//	aging { early-ageout 10 20; }      early=10   20 DISCARDED
+//	aging { early-ageout [ 10 20 ]; }  early=10   20 DISCARDED
+//	aging { early-ageout { 10; 20; } } early=0    block form not read at all
+//
+// and the typed schema walk REJECTS every one of those spellings, so no operator
+// can author a two-element list here in the first place.
+//
+// They became comparable at all only because #9235 taught compileFlow to expand
+// `aging`'s flat run — before it, the run sat unsplit on the container's Keys and
+// the enumeration could not reach the individual leaves. So the floor is
+// returning to a population that never included them, rather than shrinking past
+// one that did. Identical in shape to the #8939 registration recorded in
+// notAValueList, which cost 14 sites (1098/706 -> 1076/692) for the same reason.
+const gateCoverageFloor = 740
 
 var gateBlindCeiling = map[gateBlindClass]int{
 	// #7492 moved leaves out of `unreachable` in two rounds. The parent

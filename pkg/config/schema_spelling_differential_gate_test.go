@@ -269,6 +269,32 @@ var mixedChildIsAModifierBlock = map[string]string{
 // entries create a second object rather than a second value.
 // ---------------------------------------------------------------------------
 var notAValueList = map[string]string{
+	// #9235: the three `security flow aging` thresholds. These became comparable
+	// to this gate for the FIRST TIME when #9235 taught compileFlow to expand
+	// `aging`'s flat run — previously the run sat unsplit on the node's Keys and
+	// the gate could not reach the individual leaves at all. So the gate is asking
+	// a question here that was never askable before, and the answer is the same as
+	// for #8939's filter-term `then` actions above: none of these is a value list.
+	// Each is `args: 1` with a `smallint` value pair — exactly ONE value.
+	//
+	// VERIFIED WHERE THE EXTRA TOKENS LAND, as this map's contract requires,
+	// rather than asserted from the arity:
+	//
+	//	aging { early-ageout 10 20; }      early=10   20 DISCARDED
+	//	aging { high-watermark 90 95; }    high=90    95 DISCARDED
+	//	aging { low-watermark 60 65; }     low=60     65 DISCARDED
+	//	aging { early-ageout [ 10 20 ]; }  early=10   20 DISCARDED
+	//	aging { early-ageout { 10; 20; } } early=0    the block form is not read
+	//
+	// and the typed schema walk REJECTS every one of those spellings, so no
+	// operator can author a two-element list here; the tolerant path compiles one
+	// value and emits a warning naming the leaf. A second threshold is not a
+	// second value of the same setting — it is malformed input — which is exactly
+	// the distinction this map exists to record.
+	"security flow aging early-ageout":   "args:1 smallint threshold; a second token is malformed input, DISCARDED, and the schema walk rejects it (#9235)",
+	"security flow aging high-watermark": "args:1 smallint threshold; a second token is malformed input, DISCARDED, and the schema walk rejects it (#9235)",
+	"security flow aging low-watermark":  "args:1 smallint threshold; a second token is malformed input, DISCARDED, and the schema walk rejects it (#9235)",
+
 	// issue 8939: the filter-term `then` ACTIONS. These became comparable to
 	// this gate for the first time when `packedStatements` was declared on the
 	// two `then` nodes -- previously a run sat unsplit on the node's Keys and

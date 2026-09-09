@@ -85,6 +85,15 @@ func compileLog(node *Node, sec *SecurityConfig) error {
 		sec.Log.Streams = make(map[string]*SyslogStream)
 	}
 
+	// #9235: `security log mode event format sd-syslog source-interface fxp0` is
+	// ONE command nested into a chain, so the FindChild reads below saw `mode`
+	// and missed `format` and `source-interface` -- the box logged in the wrong
+	// format from the wrong source address. Expanded ONCE here rather than at
+	// each lookup, for the same reason compileFlow does it once: a per-lookup fix
+	// is one chance to miss each lookup, and the next leaf added is the next miss.
+	// Lenient path only (the schema gate refuses this spelling at commit).
+	node = expandRun9235(node, securityLogSchema9235())
+
 	// Top-level log settings
 	if modeNode := node.FindChild("mode"); modeNode != nil {
 		sec.Log.Mode = nodeVal(modeNode)
