@@ -228,9 +228,6 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		// carry it.
 		priorInc := s.PeerBootIncarnation()
 		switched := s.notePeerBootIncarnation(inc)
-		s.stats.BulkSyncStartTime.Store(time.Now().UnixNano())
-		s.stats.BulkSyncEndTime.Store(0)
-		s.stats.BulkSyncSessions.Store(0)
 		// #2198 F2: the peer is re-priming its authoritative live set. Reset
 		// our stored generations so a rebooted peer's bulk (whose genCounter
 		// restarted lower) is accepted by the install guard instead of being
@@ -294,6 +291,24 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		// recvGenMu edge to the lock graph as a side effect of a correctness
 		// fix -- a change nothing here needs and nobody would look for.
 		s.resetRecvGen()
+		// #9177 V052: the bulk TELEMETRY belongs on the accepted path too, and
+		// it used to run above the accept. A REFUSED BulkStart -- the reordered
+		// one #8966's own text calls "the ordinary case" with two fabric
+		// streams -- re-stamped BulkSyncStartTime and zeroed BulkSyncEndTime on
+		// its way to being rejected. `show chassis cluster information` then
+		// read "Bulk sync in progress since ..." indefinitely, because the
+		// BulkEnd that would set an end time belongs to a bulk that was never
+		// accepted; and the session handlers' `StartTime > 0 && EndTime == 0`
+		// test read TRUE, so every subsequent INCREMENTAL install was counted
+		// as bulk traffic.
+		//
+		// This is a statement-ORDERING defect, not an epoch-validation one: the
+		// accept itself is correct. The #8966 author moved `resetRecvGen` below
+		// the accept for exactly this reason and left these three where they
+		// were, which is why they now sit beside it.
+		s.stats.BulkSyncStartTime.Store(time.Now().UnixNano())
+		s.stats.BulkSyncEndTime.Store(0)
+		s.stats.BulkSyncSessions.Store(0)
 		// #6910: ACT on the switch, do not merely report it. Until now
 		// `switched` reached only this log line, so a reboot whose replacement
 		// primed on the alternate fabric left the corpse installed, stamped
@@ -419,7 +434,19 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		stats := s.Stats()
 		slog.Info("cluster sync: bulk ack received", "epoch", epoch, "local", connLocalAddrString(conn), "remote", connRemoteAddrString(conn), "sessions_sent", stats.SessionsSent, "sessions_received", stats.SessionsReceived, "sessions_installed", stats.SessionsInstalled, "queue_len", len(s.sendCh), "queue_cap", cap(s.sendCh))
 		pending := s.pendingBulkAckEpoch.Load()
-		if pending == 0 || epoch < pending {
+		// #9177 V053: `!=`, not `<`. The authority here is LOCAL --
+		// pendingBulkAckEpoch is set by our OWN send path under bulkSendMu
+		// (sync_bulk.go, record-then-send) BEFORE the BulkEnd write, so it is by
+		// construction the largest epoch this node has ever put on the wire. A
+		// conforming peer cannot echo a larger one, so a FUTURE epoch is not an
+		// ack for anything; accepting it cleared `pending`, latched
+		// bulkEverCompleted / outboundBulkAcked and fired OnBulkSyncAckReceived,
+		// releasing the #3912 failover gate on a bulk that never completed.
+		// Reachability is honest: this needs a non-conforming or compromised
+		// peer past the #5303 pre-auth admission. It is fixed because the
+		// comparator has no reason to be loose and the tightening costs one
+		// operator and no new input.
+		if pending == 0 || epoch != pending {
 			// #5272: a BulkAck with no matching pending outbound bulk (we
 			// never sent a bulk we are awaiting the ack for, or this ack is
 			// for a stale/older epoch) is spurious or replayed. Setting

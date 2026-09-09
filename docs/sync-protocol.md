@@ -975,6 +975,62 @@ In the `BulkStart` handler the incarnation is recorded **before**
 zeroed while the current incarnation is still the dead one, so a prior-boot
 payload dequeued in that window passes the fence and records its generation.
 
+### Statement ordering in the `BulkStart` handler is a contract (#9177 V052)
+
+Everything that MUTATES receiver state on a `BulkStart` must sit **below** the
+`bulkMu` accept decision, not above it. #8966 made the accept itself correct and
+moved `resetRecvGen` below it; the three bulk-telemetry stores
+(`stats.BulkSyncStartTime`, `stats.BulkSyncEndTime`, `stats.BulkSyncSessions`)
+were left above and have now been moved down beside it.
+
+What being above cost, and why the accept's correctness did not cover it: a
+**refused** `BulkStart` — the reordered one #8966's own text calls *"the ordinary
+case"* with two fabric streams — still re-stamped `BulkSyncStartTime` and zeroed
+`BulkSyncEndTime` on its way to rejection. Two observable consequences:
+
+- `show chassis cluster information` reported `Bulk sync in progress since …`
+  **indefinitely**. Nothing could clear it: the `BulkEnd` that sets an end time
+  belongs to a bulk that was never accepted.
+- The session handlers test `BulkSyncStartTime > 0 && BulkSyncEndTime == 0` to
+  decide whether an arriving session is bulk traffic, so every subsequent
+  **incremental** install was counted into `BulkSyncSessions` and reported as
+  part of a bulk that was not running.
+
+The observable is the STATUS, not the accept decision, so an assertion on the
+accept path cannot see this at all. `pkg/cluster/sync_bulk_stat_and_ack_9177_test.go`
+reads `Manager.FormatInformation` — what the operator reads — and carries the
+control that matters: an **accepted** `BulkStart` must still stamp all three,
+because "move them below the accept" is also satisfied by deleting them, which
+would leave the status unable to report a bulk at all.
+
+Note what is NOT a defect here, recorded because it was filed as one and refuted:
+the `len(payload) >= 8` read is the deliberate #5084 legacy-compat path, and a
+short frame is read as epoch 0 and accepted only when no bulk is in progress — a
+state in which any epoch is accepted, since the guard requires `bulkInProgress`.
+A malformed short frame grants nothing a well-formed one does not.
+
+### `BulkAck` epoch comparison is `!=`, not `<` (#9177 V053)
+
+The authority for `pendingBulkAckEpoch` is **local**: our own send path sets it
+under `bulkSendMu` (record-then-send, `sync_bulk.go`) **before** writing the
+`BulkEnd`, so it is by construction the largest epoch this node has ever put on
+the wire. A conforming peer cannot echo a larger one, so an ack for a FUTURE
+epoch is not an ack for anything.
+
+`epoch < pending` admitted it, and accepting it cleared `pending`, latched
+`bulkEverCompleted` / `outboundBulkAcked` and fired `OnBulkSyncAckReceived` —
+releasing the #3912 failover gate on a bulk that never completed, and suppressing
+the #4090/#4360 stranded-bulk re-drive. `epoch != pending` is strictly tighter,
+costs one operator and needs no new input.
+
+Reachability is honest: this needs a non-conforming or compromised peer past the
+#5303 pre-auth admission, which is why it is Low rather than High. It is fixed
+because the comparator has no reason to be loose. #5272's `pending == 0` arm is
+unchanged, and the control cell pins that the EXACT epoch is still accepted —
+refusing the real ack would latch a phantom pending epoch nothing ever clears,
+permanently blocking manual failover, which is the #3912 defect this comparator
+sits in the middle of.
+
 ### Fail-open across the mixed-version window
 
 `len(payload) < 24` ⇒ no incarnation ⇒ exactly today's generation-only
