@@ -90,6 +90,21 @@
 //! (`reject_reply.rs`). The reject semantics arrive one packet later, from one
 //! place, rather than being duplicated here.
 //!
+//! # The evaluated DESTINATION is the POST-translation one (#9382)
+//!
+//! Admission evaluates zone policy on the POST-translation destination tuple
+//! (#2345/#2358) and this derivation must ask the SAME question, or a session
+//! with an inbound destination translation is judged by two different standards.
+//! The forward entry is keyed on the WIRE tuple, so reading the destination off
+//! `flow` gives the VIP — the address admission REFUSES to match a rule against.
+//! Until #9382 that made a permit naming the real server contribute nothing:
+//! the derivation matched no rule, fell to the default policy, and revoked a
+//! session whose policy had not changed at all. The destination now comes from
+//! the entry's `decision.nat` (`rewrite_dst` / `rewrite_dst_port`), which is the
+//! same quantity admission folds into `policy_dst_ip` / `policy_dst_port` for
+//! DNAT, static-DNAT, NPTv6 and NAT64 alike. The SOURCE stays pre-translation
+//! in both places: Junos evaluates after destination NAT and before source NAT.
+//!
 //! # What it does NOT cover, stated so this does not read as more than it is
 //!
 //! `to_id` is derived from the egress interface resolved at install/import
@@ -261,15 +276,55 @@ fn zone_policy_deny_on_session_hit(
     if to_id == 0 || from_id == 0 {
         return None;
     }
+    // #9382: judge the POST-TRANSLATION destination, the tuple admission judges
+    // (#2345/#2358) — NOT the wire tuple the forward session is keyed on.
+    //
+    // The forward entry is installed on the WIRE key (`flow.forward_key`), so a
+    // later forward packet of a DNAT'd flow legitimately carries the VIP. Reading
+    // the destination off that key asked a DIFFERENT QUESTION from the one
+    // admission answered: admission passes `policy_dst_ip` / `policy_dst_port`
+    // (`poll_descriptor/mod.rs`), whose comment states they carry "the correct
+    // post-translation tuple for all inbound destination translations
+    // (DNAT/static-DNAT/NPTv6/NAT64)". So for every session with an inbound
+    // destination translation, a permit naming the REAL server — the only rule
+    // admission will match — contributed NOTHING here: the derivation compared
+    // the VIP, matched nothing, fell to the default policy and REVOKED, with the
+    // policy completely unchanged. That is fail-CLOSED and needs no crafted
+    // config. The fail-OPEN direction exists too: a deny narrowed against the
+    // real server was missed because the VIP still matched a broader permit.
+    //
+    // The entry's own `decision.nat` is the right source and is already in hand.
+    // Only `.resolution` is re-resolved on a session hit (`session_glue/mod.rs`);
+    // `.nat` is the translation the flow was ADMITTED with, which is exactly the
+    // quantity admission folded into `policy_dst_ip`:
+    //
+    //   * DNAT / static-DNAT — `rewrite_dst` / `rewrite_dst_port` ARE the
+    //     `pre_routing_dnat` values admission read;
+    //   * NPTv6 inbound — `nptv6_nat` carries `rewrite_dst = internal_dst` and no
+    //     port rewrite, matching `effective_resolution_target` and the wire port;
+    //   * NAT64 — `Nat64State::forward_decision` carries
+    //     `rewrite_dst = extracted IPv4 target`, i.e. admission's
+    //     `effective_resolution_target`, and no port rewrite.
+    //
+    // With no destination translation both `unwrap_or` arms collapse to the wire
+    // values, so every non-translated session is byte-identical to pre-#9382.
+    // The SOURCE deliberately stays pre-translation (`flow.src_ip`): Junos
+    // evaluates policy after destination NAT and BEFORE source NAT, and admission
+    // passes `flow.src_ip` for the same reason.
+    let policy_dst_ip = decision.nat.rewrite_dst.unwrap_or(flow.dst_ip);
+    let policy_dst_port = decision
+        .nat
+        .rewrite_dst_port
+        .unwrap_or(flow.forward_key.dst_port);
     let result = evaluate_policy_result_with_icmp(
         &forwarding.policy,
         from_id,
         to_id,
         flow.src_ip,
-        flow.dst_ip,
+        policy_dst_ip,
         meta.protocol,
         flow.forward_key.src_port,
-        flow.forward_key.dst_port,
+        policy_dst_port,
         // Frame-INDEPENDENT, like #7212's static walk: no ICMP type/code is
         // supplied. #8618: an ICMP flow only reaches here when the snapshot has
         // no type-constrained PERMIT term, so `None` is not a loss of
