@@ -95,7 +95,7 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 		validator:     ValidateIPAddress,
 		children:      nil,
 	},
-	"backup-router": {desc: "Backup router", args: 1, placeholder: "<address>", children: map[string]*schemaNode{
+	"backup-router": {desc: "Backup router", args: 1, placeholder: "<address>", closedWorld: true, children: map[string]*schemaNode{
 		"destination": {desc: "Destination network", args: 1, placeholder: "<network>", children: nil},
 	}},
 	// packedStatements (issue 8858): SSHKeys is a []string, so a packed
@@ -284,7 +284,7 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 		// acceptance is deliberate: the schema must still parse the leaf so
 		// the compiler can produce the actionable rejection rather than an
 		// opaque "unknown statement".
-		"class": {desc: "Login class definition", args: 1, placeholder: "<class-name>", children: map[string]*schemaNode{
+		"class": {desc: "Login class definition", args: 1, placeholder: "<class-name>", closedWorld: true, children: map[string]*schemaNode{
 			"permissions":         {desc: "Permission bits granted to the class", args: 1, multi: true, placeholder: "<permission>", children: nil},
 			"idle-timeout":        {desc: "Idle timeout (minutes)", args: 1, placeholder: "<minutes>", valueType: ValueInteger, validator: ValidateInteger(0, 4294967295), children: nil},
 			"allow-commands":      {desc: "Regex of operational commands to allow", args: 1, placeholder: "<regex>", children: nil},
@@ -1201,6 +1201,7 @@ func dhcpStaticBindingSchema() *schemaNode {
 		placeholder:      "<mac-address>",
 		keyValueType:     ValueMAC,
 		keyValueDesc:     "Client hardware (MAC) address (xx:xx:xx:xx:xx:xx)",
+		closedWorld:      true, // #9265
 		keyValueExamples: []string{"00:11:22:33:44:55"},
 		keyValidator:     ValidateMAC,
 		children: map[string]*schemaNode{

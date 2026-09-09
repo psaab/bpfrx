@@ -8091,6 +8091,171 @@ lenient mark + warning; single-range unchanged) and
 single-range byte-identical). Removing the aggregation, the strict gate, or the
 wire poison arm turns the matching test RED.
 
+## Arming fourteen instance-name containers (#9265, narrowing #9091)
+
+#9091 landed a RATCHET over the schema-blind instance-name containers: a
+container with `args >= 1`, declared children and no wildcard, outside an armed
+`closedWorld` subtree, accepts an unknown keyword in its body at commit. That
+bounds the population so a new one cannot be added silently. It narrows nothing.
+This section is the first narrowing batch.
+
+```
+system login class c1 { xpfbogus 5; }            -> ACCEPTED   (before)
+system login class c1 { idle-timeout notanum; }  -> REJECTED   (declared leaf, bad value)
+```
+
+So a mistyped KEYWORD was silent while a bad VALUE on a correctly-spelled leaf
+was still caught — #8928's shape, reached by schema blindness.
+
+### The population number, and whose change moved it
+
+#9265 was filed against **156**. The population is **158** at the time of this
+batch, and the delta is NOT this work: commit `5724b2442` ("config: make the
+per-instance protocols grammar the global one") moved #9091 blind 156 -> 158 and
+armed 7 -> 8 when it made `routing-instances <n> protocols` the global
+`protocols` node, and its own message records both numbers and the reason. A
+shared ratchet's movement may be another lane's merge, so the delta is attributed
+before the baseline is touched rather than folded into this change's
+justification. After this batch: **blind 144, armed 23** (9 upstream, including #9416's
+`/snmp/community/routing-instance`, plus my 14).
+
+### Two selection criteria, and both are load-bearing
+
+**1. `closedWorld` INHERITS, so only ALL-TERMINAL containers are armed.**
+`childClosed := closed || childSchema.closedWorld` (`schema_walk.go`), so arming
+a container closes its ENTIRE subtree. That is measured, not theoretical: the
+#9017 note above records arming `firewall family` closing the whole filter
+grammar beneath it and rejecting `from source-prefix-list trusted`, which is
+valid and shipped. Every container armed here declares only TERMINAL children
+(`children == nil && wildcard == nil`), so the inheritance reaches nothing past
+its own body. Of the 158 blind containers **63** have that shape; this batch
+takes 14 of them, leaving 49 for later batches and 95 deep containers that need
+a different approach entirely.
+
+**2. Armed only where the container is fail-open END TO END, not merely
+schema-blind.** #9265's core point is that the schema-side set is a strict
+SUPERSET of the fail-open set, because a later compiler gate catches some of
+them — so work driven by the superset arms containers that were never fail-open
+and spends the #1960 no-brick budget for nothing. Measured at
+`configstore.CheckText` (which is `compileTreeStrict` — the operator commit
+path), two of the eighteen containers considered are exactly that case and are
+deliberately NOT armed:
+
+| container | undeclared keyword at `CheckText` | armed |
+|---|---|---|
+| `/snmp/trap-group` | REJECTED — `snmp trap-group "tg1": unknown statement "xpfbogus" (valid: targets, version, categories)` | no |
+| `/system/ntp/server` | REJECTED — `system ntp server: unknown modifier "xpfbogus"` | no |
+| the other 16 | ACCEPTED | yes |
+
+Both are kept as rows in
+`pkg/configstore/instance_name_armed_9265_test.go` with `armed: false`, so the
+upper-bound evidence is asserted rather than described. If the downstream gate
+that covers one of them ever goes away, that row goes red.
+
+### The armed set
+
+Fourteen paths, from twelve `closedWorld: true` edits — two schema nodes are
+shared, so `track-interface` arms both the inet and inet6 VRRP positions and
+`dhcpStaticBindingSchema()` arms both the DHCPv4 and DHCPv6 static bindings.
+Both twins were measured independently (fail-open before, closed after, declared
+body still committing) rather than assumed from the shared node.
+
+```
+/chassis/cluster/control-ports/fpc
+/chassis/cluster/redundancy-group/node
+/chassis/device-map/interface
+/class-of-service/scheduler-maps/forwarding-class
+/interfaces/*/unit/family/inet/address/vrrp-group/track-interface
+/interfaces/*/unit/family/inet6/address/vrrp-group/track-interface
+/policy-options/community
+/security/address-book/global/address-set
+/security/nat/proxy-arp/interface
+/security/zones/security-zone/address-book/address-set
+/system/backup-router
+/system/login/class
+/system/services/dhcp-local-server/group/pool/static-binding
+/system/services/dhcpv6-local-server/group/pool/static-binding
+```
+
+### The acceptance row that matters is the one that must still COMMIT
+
+"The container refuses an unknown keyword" is satisfiable by refusing
+EVERYTHING, and that is a worse defect than the silent drop being closed: a
+container that stops committing is an outage at the next commit, and under #1960
+it still BOOTS, because `Store.Load` is lenient — so the operator gets a config
+that loads, warns and truncates. The #4191 over-rejection class. Every row
+therefore asserts the container's own DECLARED body still commits FIRST, and
+fatally; and the rejection assertion checks the error MESSAGE names the
+undeclared keyword, so a fixture that broke for an unrelated reason cannot score
+as a working guard.
+
+**3. Arming must not change any SPELLING's acceptance, and the container must
+DECLARE every keyword it deliberately accepts.** This criterion is not reasoned —
+it comes from `go test ./...` rejecting a first pass that armed sixteen, and two
+containers were dropped:
+
+- **`/snmp/community`** fails twice: #4306 S-5 deliberately ACCEPTS an undeclared
+  `view` knob with an advisory, and #9416's supported packed spelling
+  `community <c> client-list-name <n> authorization read-only` puts a legal
+  community-level keyword under the TERMINAL `client-list-name` leaf via the
+  flat-set chain, where the inherited closed world refuses it.
+- **`/protocols/router-advertisement/interface/prefix`**: the packed flag spelling
+  `prefix <p> no-autonomous no-onlink` is accepted today and arming refuses it.
+
+**So criterion 1 is necessary and not sufficient.** All-terminal stops arming from
+closing a declared sub-container, but a flat-set chain NESTS the next statement
+under a terminal leaf and the inherited closed world refuses a sibling that is
+legal one level up. Both dropped containers are all-terminal, and the first
+acceptance fixture could not see it because it used the BRACED spelling only.
+Every armed row now asserts the PACKED spelling as well, and both declined
+containers keep a row whose packed line is the fail-on-revert guard for the
+decline.
+
+### The #9206 population grew, and the four sites it exposed are PRE-EXISTING
+
+Arming brings seven more `multi: true` leaves inside a closed world, so
+`TestMultiLeafAbsorptionPopulation9206` moves 25 -> 39 absorbing (20 -> 27
+distinct; each new site has a `groups` rehost of the same node). Its own failure
+text says to check whether the new absorption reaches the COMPILER, and the answer
+splits them:
+
+| new site | absorbed garbage |
+|---|---|
+| `security nat proxy-arp interface <if> address` | strict compile REJECTS (not a valid IP/CIDR) |
+| `policy-options community <c> members` | COMMITS -> `Members:[65000:1 xpfbogus9206 v1]` |
+| `system login class <c> permissions` | COMMITS -> `Permissions:[view xpfbogus9206 v1]` |
+| `address-set <s> address` (global and zone-local) | COMMITS -> `Addresses:[a1 xpfbogus9206 v1]` |
+| `address-set <s> address-set` (global) | COMMITS |
+
+That is #9206's own discriminator holding: the two that reject are the two whose
+value type has a downstream validator.
+
+**Arming did not create the four that commit.** Re-measured on a pristine
+`origin/master` worktree with no arming applied, the compiled output is
+BYTE-IDENTICAL and all six spellings commit clean at `configstore.CheckText`
+there too — including the BRACKETED-LIST form
+(`members [ 65000:1 xpfbogus9206 v1 ]`), which is not a flat-run question at all.
+Absorption is a property of the `multi` leaf and `SetPath`, not of `closedWorld`;
+what arming changed is only that these containers now fall inside that census's
+DEFINITION. Before it, the same garbage was accepted as a plain sibling statement
+as well, so arming is a strict improvement that simply does not close the
+multi-leaf route. Filed as #9490 — the remedy there is a per-leaf validator for
+`validateMultiValueLeaf` to run (#2497), a different change from arming a
+container's keyword world.
+
+### The #9091 instrument control was re-anchored, not shortened
+
+`TestInstanceNameBlindInstrumentStillDiscriminates9091` pinned
+`/system/login/class` as a known-BLIND witness. Arming it reds that cell by
+design, and the cell's own failure text prescribes the move ("Either it was armed
+(then lower the ceiling and say so) or the instrument stopped detecting
+blindness"). It moves to the known-ARMED direction rather than being deleted, so
+both directions stay populated — and it is the strongest entry in either, because
+it is now pinned by an end-to-end measurement in BOTH states. The two witnesses
+remaining on the blind side (`/security/ike/gateway`, `/security/ipsec/vpn`) are
+deep containers, so criterion 1 keeps them blind for the foreseeable future and
+makes them durable anchors.
+
 ## Firewall-filter cross-family name collision fail-closed gate (#3884)
 
 Junos namespaces firewall filters **per family**, so `family inet filter blockX`

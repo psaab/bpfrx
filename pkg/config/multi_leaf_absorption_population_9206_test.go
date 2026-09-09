@@ -178,7 +178,49 @@ func TestMultiLeafAbsorptionPopulation9206(t *testing.T) {
 	// `routing-instance` is REJECTED ("unknown configuration keyword ... under
 	// closed-world subtree") while the SAME keyword one level up, at the
 	// open-world community, still commits clean and compiles to nothing.
-	const wantAbsorbing, wantDistinct = 25, 20
+	// #9265: 25 -> 39 absorbing, 20 -> 27 distinct. Arming fourteen instance-name
+	// containers' `closedWorld` brings seven more multi leaves inside a closed
+	// world (each with a `groups` rehost of the same node, so +14 structural for
+	// +7 distinct):
+	//
+	//	policy-options community <c> multi=members
+	//	security address-book global address-set <s> multi=address
+	//	security address-book global address-set <s> multi=address-set
+	//	security nat proxy-arp interface <if> multi=address
+	//	security zones security-zone <z> address-book address-set <s> multi=address
+	//	security zones security-zone <z> address-book address-set <s> multi=address-set
+	//	system login class <c> multi=permissions
+	//
+	// THE GREW NOTE BELOW SAYS TO CHECK WHETHER THE NEW ABSORPTION REACHES THE
+	// COMPILER. Measured, and it splits the eight exactly along #9206's own
+	// discriminator — whether the absorbing leaf's value type has a downstream
+	// validator (`snmp community <c> clients` was measured the same way and rejects
+	// too, but `snmp community` was dropped from the arming batch, so its only
+	// armed position remains #9416's `routing-instance` child):
+	//
+	//	nat proxy-arp interface <if> address   STRICT COMPILE REJECT (not a valid
+	//	                                      IP address or CIDR prefix)
+	//	policy-options community members       COMMITS -> Members:[65000:1 xpfbogus9206 v1]
+	//	system login class permissions         COMMITS -> Permissions:[view xpfbogus9206 v1]
+	//	address-set <s> address (both books)   COMMITS -> Addresses:[a1 xpfbogus9206 v1]
+	//	address-set <s> address-set (global)   COMMITS
+	//
+	// ARMING DID NOT CREATE THE FOUR THAT COMMIT, and that was measured rather
+	// than argued. On a PRISTINE origin/master worktree with no arming applied the
+	// compiled output is BYTE-IDENTICAL, and all six spellings commit clean at
+	// configstore.CheckText there too — including the BRACKETED-LIST form
+	// (`members [ 65000:1 xpfbogus9206 v1 ]`), which is not a flat-run question at
+	// all. Absorption is a property of the `multi` leaf and SetPath, not of
+	// closedWorld; what arming changed is only that these containers now fall
+	// inside this census's DEFINITION. Before it, the same garbage was accepted as
+	// a plain SIBLING statement as well, so arming is a strict improvement that
+	// simply does not close the multi-leaf route.
+	//
+	// Filed as #9490 rather than fixed here: the remedy is a per-leaf validator for
+	// validateMultiValueLeaf to run (#2497), a different change from arming a
+	// container's keyword world, and `system login class permissions` needs its
+	// MappedPermissions semantics settled before anyone picks a direction.
+	const wantAbsorbing, wantDistinct = 39, 27
 	if absorbing != wantAbsorbing || distinct != wantDistinct {
 		t.Errorf("#9206: %d sites absorb at the schema walk (%d excluding `groups` "+
 			"rehosts), want %d (%d).\n  %s\n\n"+

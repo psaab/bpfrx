@@ -194,7 +194,7 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			// then falls back to the global book.
 			"address-book": {desc: "Zone-local address book", packedStatements: true, children: map[string]*schemaNode{
 				"address": {desc: "Named address (name and prefix)", args: 2, multi: true, placeholder: "<address-name>", children: nil},
-				"address-set": {desc: "Address set name", args: 1, valueHint: ValueHintAddressName, placeholder: "<address-set-name>", children: map[string]*schemaNode{
+				"address-set": {desc: "Address set name", args: 1, valueHint: ValueHintAddressName, placeholder: "<address-set-name>", closedWorld: true, children: map[string]*schemaNode{
 					"address":     {desc: "Address to include in this set", args: 1, multi: true, placeholder: "<address-name>", children: nil},
 					"address-set": {desc: "Nested address set to include", args: 1, multi: true, valueHint: ValueHintAddressName, placeholder: "<address-set-name>", children: nil},
 					// NOT tagged scalar:true (#3332): AddressSet has no Description
@@ -711,7 +711,7 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			"no-v6-frag-header": {desc: "Omit the IPv6 fragment header in translated packets", children: nil},
 		}},
 		"proxy-arp": {desc: "Proxy ARP for NAT pool addresses", children: map[string]*schemaNode{
-			"interface": {desc: "Interface to answer proxy ARP on", args: 1, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: map[string]*schemaNode{
+			"interface": {desc: "Interface to answer proxy ARP on", args: 1, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", closedWorld: true, children: map[string]*schemaNode{
 				"address": {desc: "Address, prefix or range to answer ARP for", args: 1, multi: true, placeholder: "<address>", children: nil},
 			}},
 		}},
@@ -719,7 +719,7 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 	"address-book": {desc: "Address books", children: map[string]*schemaNode{
 		"global": {desc: "Global address book", packedStatements: true, children: map[string]*schemaNode{
 			"address": {desc: "Named address (name and prefix)", args: 2, multi: true, placeholder: "<address-name>", children: nil},
-			"address-set": {desc: "Address set name", args: 1, valueHint: ValueHintAddressName, placeholder: "<address-set-name>", children: map[string]*schemaNode{
+			"address-set": {desc: "Address set name", args: 1, valueHint: ValueHintAddressName, placeholder: "<address-set-name>", closedWorld: true, children: map[string]*schemaNode{
 				"address":     {desc: "Address to include in this set", args: 1, multi: true, placeholder: "<address-name>", children: nil},
 				"address-set": {desc: "Nested address set to include", args: 1, multi: true, valueHint: ValueHintAddressName, placeholder: "<address-set-name>", children: nil},
 				// NOT tagged scalar:true (#3332): AddressSet has no Description

@@ -135,7 +135,7 @@ var schemaChassis = &schemaNode{desc: "Chassis configuration", children: map[str
 		// control-ports fpc/port: NOT typed — compileChassis never
 		// reads control-ports (compiled-leaf-only invariant).
 		"control-ports": {desc: "Control port assignments (accepted for Junos compatibility; ignored)", children: map[string]*schemaNode{
-			"fpc": {desc: "FPC slot for the control port (ignored)", args: 1, placeholder: "<slot>", children: map[string]*schemaNode{
+			"fpc": {desc: "FPC slot for the control port (ignored)", args: 1, placeholder: "<slot>", closedWorld: true, children: map[string]*schemaNode{
 				"port": {desc: "Control port number on the FPC (ignored)", args: 1, placeholder: "<port>", children: nil},
 			}},
 		}},
@@ -219,7 +219,7 @@ var schemaChassis = &schemaNode{desc: "Chassis configuration", children: map[str
 		"private-rg-election":    {desc: "Elect RG primaries over the control link without RETH VRRP (default)", children: nil},
 		"no-private-rg-election": {desc: "Disable private RG election (use legacy RETH VRRP election)", children: nil},
 		"redundancy-group": {desc: "Redundancy group", args: 1, placeholder: "<group-id>", children: map[string]*schemaNode{
-			"node": {desc: "Per-node settings for this redundancy group", args: 1, placeholder: "<node-id>", children: map[string]*schemaNode{
+			"node": {desc: "Per-node settings for this redundancy group", args: 1, placeholder: "<node-id>", closedWorld: true, children: map[string]*schemaNode{
 				// Junos vSRX: 1..254. Runtime-binding: the priority
 				// feeds VRRP and is truncated to uint8 on the wire
 				// (pkg/vrrp/instance.go:918); 255 is the RFC 5798
@@ -369,6 +369,7 @@ var schemaChassis = &schemaNode{desc: "Chassis configuration", children: map[str
 			keyValueDesc:     "xpf logical interface name (e.g. ge-0/0/3, fxp0)",
 			keyValueExamples: []string{"ge-0/0/3", "fxp0"},
 			keyValidator:     ValidateDeviceMapLogicalName,
+			closedWorld:      true, // #9265
 			children: map[string]*schemaNode{
 				"pci": {
 					desc:          "PCI bus address of the host NIC (primary identity key)",

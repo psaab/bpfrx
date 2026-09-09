@@ -184,7 +184,7 @@ var schemaClassOfService = &schemaNode{desc: "Class of service configuration", c
 		},
 	}},
 	"scheduler-maps": {desc: "Scheduler map assigning schedulers to forwarding classes", args: 1, multi: true, placeholder: "<map-name>", children: map[string]*schemaNode{
-		"forwarding-class": {desc: "Forwarding class entry in this map", args: 1, multi: true, placeholder: "<class-name>", keyValidator: ValidateForwardingClassName, children: map[string]*schemaNode{
+		"forwarding-class": {desc: "Forwarding class entry in this map", args: 1, multi: true, placeholder: "<class-name>", keyValidator: ValidateForwardingClassName, closedWorld: true, children: map[string]*schemaNode{
 			"scheduler": {desc: "Scheduler to apply to this forwarding class", args: 1, placeholder: "<scheduler-name>", children: nil},
 		}},
 	}},
