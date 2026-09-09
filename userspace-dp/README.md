@@ -369,6 +369,48 @@ logging rules, not these specific hot-path constants.
   is an ordinary breaking change and the compile error at each site is
   review pressure worth keeping.
 
+- **Zone-policy re-derivation on the established-session hit path (#8356 /
+  #8618 / #9381)** — `src/afxdp/poll_descriptor/policy_revalidation.rs`
+  re-asks zone policy for a session that was admitted under an older
+  config generation, at most once per session per generation, on the
+  forward direction only. It is the zone-policy sibling of #7212's
+  input-filter revalidation, and it exists because #5858/#7212 already
+  tears down a live flow when a commit narrows an input FILTER — not
+  doing the same when a commit narrows ZONE POLICY is the asymmetry, not
+  a safe default.
+
+  The module header owns the full contract. Two parts of it belong here
+  because a reader outside that file can get them wrong:
+
+  - **The revoke predicate is PERMIT-or-not, not "is it Deny".**
+    `PolicyAction` is three-valued (`Permit` / `Deny` / `Reject`), and
+    `Reject` is a TERMINAL NON-FORWARDING verdict everywhere else in the
+    crate — admission requires `Permit` (`poll_descriptor/mod.rs`,
+    `flowless_verdict.rs`, `host_inbound_policy.rs`,
+    `forwarding/fabric.rs`), the first-packet path drops it
+    (`poll_descriptor/reject_reply.rs`), and `policy.rs`'s own
+    terminal-action test spells the pair `Deny | Reject`. Until #9381 this
+    one arm spelled the same intent as `Deny` ALONE, so a commit narrowing
+    a rule `permit` -> `reject` enforced the new verdict on NEW flows
+    while every ESTABLISHED session admitted by that rule kept forwarding
+    in both directions until idle timeout — and was stamped "revalidated",
+    so no later packet of that generation re-asked. Test the POSITIVE
+    `Permit` here: a fourth action added later then fails CLOSED instead
+    of inheriting the permit arm.
+  - **A revoked session is torn down SILENTLY, `Reject` included.** No
+    ICMP unreachable, no TCP RST, no log record, no counter — the
+    derivation is side-effect-free by contract. That loses nothing
+    operator-visible: the teardown also evicts both directions'
+    flow-cache slots, so the next packet of the 5-tuple is a session MISS
+    and takes the full admission path, which emits the reject reply and
+    the RT_FLOW deny record from the one site that owns them.
+
+  `security policies policy-rematch` is the COMMIT-time mitigation for
+  the same class, and it is off by default
+  (`pkg/config/types_security.go`), so on a stock box this module is the
+  only mechanism — which is why the `Reject` gap was a real enforcement
+  hole rather than a cosmetic one.
+
 ## Subdir READMEs
 
 See `src/afxdp/README.md`, `src/server/README.md`, `src/session/README.md`,

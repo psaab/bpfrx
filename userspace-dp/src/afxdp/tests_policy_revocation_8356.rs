@@ -58,7 +58,15 @@ const DPORT: u16 = 443;
 /// deny`. Adding a `lan -> wan` permit is the "policy admits this flow" state;
 /// leaving it out is the "a commit narrowed policy" state. The ASYMMETRY is
 /// load-bearing — see the header.
-fn forwarding_with_lan_permit(permit_lan: bool) -> ForwardingState {
+///
+/// #9381: the rule's ACTION is a parameter, not a bool. `None` = no `lan -> wan`
+/// rule at all (the narrowed-to-nothing state); `Some(action)` = the rule is
+/// present carrying exactly that action. The bool form sampled the
+/// TERMINAL-ACTION axis at two points — *present as `permit`* and *absent* — and
+/// both agree with a revoke arm spelled `!matches!(.., Deny)`. `reject` is the
+/// third point, and it is the one the collapsed arm got wrong: a non-forwarding
+/// verdict that was re-stamped as revalidated and kept forwarding.
+fn forwarding_with_lan_rule(lan_action: Option<&str>) -> ForwardingState {
     let mut snapshot = policy_deny_snapshot();
     snapshot.generation = 7;
     snapshot.fib_generation = 9;
@@ -86,7 +94,7 @@ fn forwarding_with_lan_permit(permit_lan: bool) -> ForwardingState {
         next_table: String::new(),
         preference: 0,
     });
-    if permit_lan {
+    if let Some(action) = lan_action {
         snapshot.policies.push(PolicyRuleSnapshot {
             name: "lan-out".into(),
             from_zone: "lan".into(),
@@ -95,7 +103,7 @@ fn forwarding_with_lan_permit(permit_lan: bool) -> ForwardingState {
             destination_addresses: vec!["any".into()],
             applications: vec!["any".into()],
             application_terms: Vec::new(),
-            action: "permit".into(),
+            action: action.into(),
             ..Default::default()
         });
     }
@@ -180,7 +188,19 @@ fn drive_one_packet_to(
     egress_ifindex: i32,
     dst: Ipv4Addr,
 ) -> Outcome {
-    let forwarding = forwarding_with_lan_permit(permit_lan);
+    drive_one_packet_with_action(permit_lan.then_some("permit"), is_reverse, egress_ifindex, dst)
+}
+
+/// #9381: the same driver, taking the `lan -> wan` rule's ACTION rather than a
+/// present/absent bool, so the three terminal actions are reachable from one
+/// path through the REAL poll body.
+fn drive_one_packet_with_action(
+    lan_action: Option<&str>,
+    is_reverse: bool,
+    egress_ifindex: i32,
+    dst: Ipv4Addr,
+) -> Outcome {
+    let forwarding = forwarding_with_lan_rule(lan_action);
     let mut binding = BindingWorker::new_for_mirror_test(0, 0, LAN_IFINDEX, 0);
     binding.interface = Arc::<str>::from("reth1.0");
     let ha_state = txn_ha_state();
@@ -289,6 +309,83 @@ fn a_re_derivation_leaves_the_reverse_companion_alone_8356() {
         1,
         "the reverse companion must survive"
     );
+}
+
+/// #9381: THE THIRD TERMINAL ACTION. `PolicyAction` is `Permit`/`Deny`/`Reject`,
+/// and the revoke arm used to be spelled `!matches!(result.action, Deny)` — so a
+/// `Reject` verdict took the PERMIT exit, re-stamped the session as revalidated,
+/// and every established session admitted by the rule the operator just narrowed
+/// to `reject` kept forwarding in both directions until idle timeout.
+///
+/// Its control is the cell BELOW, not the `permit` cell above: `permit` and
+/// *absent* are the two points the old bool fixture already sampled, and both
+/// agree with the collapsed arm. The pair that binds the DIRECTION is
+/// `reject` -> revoked and `permit` -> survives, driven through the SAME
+/// `drive_one_packet_with_action` path so the only thing that differs between
+/// them is the rule's action string.
+///
+/// Reverting to `!matches!(.., Deny)` reds this cell and nothing else.
+#[test]
+fn a_narrowed_to_reject_zone_policy_revokes_the_established_session_9381() {
+    let out = drive_one_packet_with_action(Some("reject"), false, WAN_IFINDEX, DST);
+    assert_eq!(
+        out.revoked, 1,
+        "a `reject` verdict is TERMINAL NON-FORWARDING, exactly as admission \
+         treats it (`reject_reply.rs` drops the first packet). 0 here means the \
+         revoke arm collapsed `Reject` into the permit exit and RE-STAMPED the \
+         session, so every flow admitted by a rule the operator just narrowed \
+         `permit` -> `reject` keeps forwarding until idle timeout and no later \
+         packet of the generation re-asks (#9381)"
+    );
+    assert_eq!(
+        session_count(&out.sessions),
+        0,
+        "a reject-narrowed session must actually be torn down, not merely counted"
+    );
+}
+
+/// THE CONTROL for the cell above, and the one that has to stay green: the SAME
+/// driver, the SAME packet, the rule present as `permit`.
+///
+/// Without it, widening the arm to "revoke on anything that is not Deny" — or to
+/// "revoke unconditionally" — would satisfy the `reject` cell perfectly while
+/// tearing down every permitted session in the box on the first packet after any
+/// commit. That is a strictly worse bug than the one #9381 fixes, so the pair is
+/// what makes the fix falsifiable rather than the reject cell alone.
+#[test]
+fn a_permit_rule_still_survives_the_widened_revoke_predicate_9381() {
+    let out = drive_one_packet_with_action(Some("permit"), false, WAN_IFINDEX, DST);
+    assert_eq!(
+        out.revoked, 0,
+        "the rule is `permit`; widening the revoke predicate must not touch it. \
+         A non-zero count means the predicate now revokes on a PERMIT, i.e. every \
+         established session dies on the first packet after any commit (#9381)"
+    );
+    assert_eq!(
+        session_count(&out.sessions),
+        1,
+        "the permitted session and its NAT translation must be untouched"
+    );
+}
+
+/// The `deny` point of the same three-way axis, driven through the action-taking
+/// path rather than the bool one.
+///
+/// It is not redundant with `a_narrowed_zone_policy_revokes_the_established_
+/// session_8356`: that cell narrows the rule to ABSENT and revokes via the
+/// implicit `default_policy: deny`, which is a different code path through
+/// `evaluate_policy_result_with_icmp` (the default-counter exit, not
+/// `try_match_rule`). This one revokes on an EXPLICIT matched `deny` rule, so the
+/// three actions are all sampled on the matched-rule path.
+#[test]
+fn an_explicit_deny_rule_revokes_the_established_session_9381() {
+    let out = drive_one_packet_with_action(Some("deny"), false, WAN_IFINDEX, DST);
+    assert_eq!(
+        out.revoked, 1,
+        "an explicitly matched `deny` rule must revoke, the same as the \
+         implicit default-deny does"
+    );
+    assert_eq!(session_count(&out.sessions), 0);
 }
 
 /// An egress that does not resolve to a zone yields the sentinel 0, against
