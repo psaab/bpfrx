@@ -1232,6 +1232,8 @@
     "pool_name": "",
     "port_high": 0,
     "port_low": 0,
+    "recycle_scan_pops_total": 0,
+    "recycle_scan_walks_total": 0,
     "reuses_total": 0,
     "rule_name": "",
     "used_ports": 0

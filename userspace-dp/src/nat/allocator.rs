@@ -904,10 +904,34 @@ struct AddressOccupancy {
     /// is the ONLY externally visible difference between walking a full
     /// address's FIFO and short-circuiting it, because both return `None`. A
     /// test that asserted only the return value would be satisfied by no fix at
-    /// all. Same shape as `gc_lock_acquisitions`, including its `#[cfg(test)]`
-    /// gating: a pure test seam owes the production claim path nothing.
-    #[cfg(test)]
+    /// all.
+    ///
+    /// #9392 PROMOTED THIS OUT OF `#[cfg(test)]`. #9327 measured that the
+    /// recycled phase does NOT amortize: retained tokens go to the BACK, so K
+    /// out-of-band-occupied tokens ahead of F free ones cost (K+F)/F pops per
+    /// claim, degrading to K+1 per claim as F -> 1 — worst exactly as an address
+    /// approaches exhaustion, i.e. when the pool is busiest. What #9327 could
+    /// NOT establish is whether a production pool ever reaches K-large /
+    /// F-small, because the counter that would answer it was a test seam. The
+    /// fixture proves the mechanism; only a running firewall can answer the
+    /// reachability, and it could not be asked.
+    ///
+    /// COST. The increment is NOT per pop: `claim` accumulates in a local and
+    /// does ONE `Relaxed` `fetch_add` after the walk, so a healthy single-pop
+    /// claim pays one relaxed RMW on a line it already owns (the walk runs
+    /// under `recycle`), and the pathological walk pays the same one.
     recycle_scan_pops: AtomicU64,
+    /// #9392: recycled-phase FIFO walks — the DENOMINATOR for
+    /// [`Self::recycle_scan_pops`].
+    ///
+    /// Counted once per walk that is actually entered, i.e. after the
+    /// `occupied >= range` short-circuit, so `pops / walks` is pops per walk:
+    /// ~1 when a freed token is claimable at the head (healthy) and ~K+1 under
+    /// the #9327 cliff. Without it the pop count answers nothing — a large
+    /// cumulative number is equally consistent with a busy pool doing cheap
+    /// walks and an idle one doing pathological ones, which is exactly the
+    /// reading #9392 exists to make possible.
+    recycle_scan_walks: AtomicU64,
     port_low: u16,
     range: u32,
 }
@@ -924,8 +948,8 @@ impl AddressOccupancy {
             cursor: AtomicU32::new(0),
             recycle: Mutex::new(RecycleRing::new(range)),
             occupied: AtomicU32::new(0),
-            #[cfg(test)]
             recycle_scan_pops: AtomicU64::new(0),
+            recycle_scan_walks: AtomicU64::new(0),
             port_low,
             range,
         }
@@ -1095,9 +1119,15 @@ impl AddressOccupancy {
 
         let mut retained: Vec<(u16, u32)> = Vec::new();
         let mut claimed = None;
+        // #9392: one walk, counted once. This is the denominator, and it is
+        // incremented AFTER the `occupied >= range` short-circuit above on
+        // purpose — a short-circuited claim walks nothing, so folding it in
+        // would drag the pops-per-walk ratio toward zero and hide the cliff the
+        // ratio exists to expose.
+        self.recycle_scan_walks.fetch_add(1, Ordering::Relaxed);
+        let mut pops = 0u64;
         while let Some(port) = recycle.queue.pop_front() {
-            #[cfg(test)]
-            self.recycle_scan_pops.fetch_add(1, Ordering::Relaxed);
+            pops += 1;
             // An out-of-range (stale) port yields None and is DROPPED: it owns
             // no bit, so it was never marked and there is nothing to unmark.
             if let Some(offset) = self.offset_of(port) {
@@ -1111,6 +1141,13 @@ impl AddressOccupancy {
                 retained.push((port, offset));
             }
         }
+        // #9392: ONE relaxed RMW for the whole walk rather than one per pop.
+        // `pops == 0` still stores, because the store is unconditional in the
+        // walks counter above and a walk that popped nothing (an empty FIFO) is
+        // a real observation — pops/walks == 0 says "the recycled phase ran and
+        // found nothing to recycle", which is a different reading from a walk
+        // that never happened.
+        self.recycle_scan_pops.fetch_add(pops, Ordering::Relaxed);
         for (port, offset) in retained {
             recycle.push(port, Some(offset));
         }
@@ -1625,10 +1662,15 @@ impl PortAllocator {
         }
     }
 
-    /// Test-only: tokens popped by the recycled phase of `claim` on pool
-    /// address `addr_index` since construction (#7174 M13). The seam that makes
-    /// the exhausted-address short-circuit MEASURABLE — the return value is
-    /// `None` with or without it.
+    /// Test-only VIEW of a PRODUCTION counter (#7174 M13, promoted in #9392).
+    /// Tokens popped by the recycled phase of `claim` on pool address
+    /// `addr_index` since construction. The seam that makes the
+    /// exhausted-address short-circuit MEASURABLE — the return value is `None`
+    /// with or without it.
+    ///
+    /// The accessor stays `#[cfg(test)]` because it is PER-ADDRESS and the
+    /// production surface is per POOL (`PortAllocatorSnapshot`); the field it
+    /// reads is now compiled into release builds.
     #[cfg(test)]
     pub(super) fn debug_recycle_scan_pops(&self, addr_index: usize) -> u64 {
         match self.shared.occupancy.get(addr_index) {
@@ -4354,6 +4396,26 @@ impl PortAllocator {
                 .live_lock_acquisitions
                 .load(Ordering::Relaxed),
             live_lock_contended_total: self.shared.live_lock_contended.load(Ordering::Relaxed),
+            // #9392: the recycled-phase walk cost, summed over the pool's
+            // addresses. A POOL-level pair rather than per-address: the
+            // operator surface is per pool, and the reachability question
+            // ("does any address in this pool reach K-large / F-small") is
+            // answered by the ratio crossing 1, which a sum preserves. A pool
+            // where one address is pathological and nine are healthy shows a
+            // ratio above 1, which is the signal; the per-address breakdown is
+            // a follow-up an operator asks for only after that fires.
+            recycle_scan_pops_total: self
+                .shared
+                .occupancy
+                .iter()
+                .map(|occ| occ.recycle_scan_pops.load(Ordering::Relaxed))
+                .sum(),
+            recycle_scan_walks_total: self
+                .shared
+                .occupancy
+                .iter()
+                .map(|occ| occ.recycle_scan_walks.load(Ordering::Relaxed))
+                .sum(),
         }
     }
 
@@ -4587,6 +4649,24 @@ pub(crate) struct PortAllocatorSnapshot {
     /// allocations/sec curve. See `PortAllocator::lock_live`.
     pub(crate) live_lock_acquisitions_total: u64,
     pub(crate) live_lock_contended_total: u64,
+    /// #9392: tokens popped by the recycled phase of `claim`, and the number of
+    /// recycled-phase FIFO WALKS that popped them, summed across the pool's
+    /// addresses.
+    ///
+    /// Read as `pops / walks` — pops per walk. ~1 means a freed token was
+    /// claimable at the head, which is the healthy shape. Materially above 1
+    /// means the #9327 cliff is REACHED in production: K out-of-band-occupied
+    /// tokens sit ahead of F free ones and retained tokens go to the BACK, so
+    /// the cost is (K+F)/F per claim and degrades to K+1 as F -> 1 — worst
+    /// exactly as an address approaches exhaustion. #9327 proved the mechanism
+    /// on a fixture and could not answer the reachability, because the counter
+    /// was `#[cfg(test)]`.
+    ///
+    /// A PAIR, always: a cumulative pop count on its own cannot distinguish a
+    /// busy pool doing cheap walks from an idle one doing pathological ones,
+    /// and that distinction IS the question.
+    pub(crate) recycle_scan_pops_total: u64,
+    pub(crate) recycle_scan_walks_total: u64,
 }
 
 pub(crate) fn allocator_capacity(num_addresses: usize, port_low: u16, port_high: u16) -> usize {

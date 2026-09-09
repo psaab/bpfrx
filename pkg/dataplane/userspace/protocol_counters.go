@@ -39,6 +39,26 @@ type SourceNATPoolStatus struct {
 	// rename(...) exactly (protocol/nat.rs).
 	LiveLockAcquisitionsTotal uint64 `json:"live_lock_acquisitions_total,omitempty"`
 	LiveLockContendedTotal    uint64 `json:"live_lock_contended_total,omitempty"`
+	// #9392: the recycled-phase walk cost of the helper's port allocator,
+	// summed over this pool's addresses -- tokens POPPED off the per-address
+	// FIFO and the number of recycled-phase WALKS that popped them.
+	//
+	// Read as pops/walks. ~1 is healthy: a freed token was claimable at the
+	// head. Materially above 1 means the #9327 cliff is REACHED on this pool --
+	// K out-of-band-occupied tokens sit ahead of F free ones and retained
+	// tokens are pushed to the BACK, so a full cycle costs (K+F)/F pops per
+	// claim and degrades to K+1 as F -> 1, i.e. worst exactly as an address
+	// approaches exhaustion. #9327 proved that mechanism on a fixture and could
+	// not answer whether production reaches it, because the pop counter was
+	// Rust-side `#[cfg(test)]`.
+	//
+	// ADDED, never redefined: the helper and the daemon roll independently.
+	// Zero from an older helper that predates the counters -- and `show
+	// security nat source pool` distinguishes that from a measured zero by
+	// requiring a non-zero WALK count before printing a ratio. JSON tags MUST
+	// match the Rust serde rename(...) exactly (protocol/nat.rs).
+	RecycleScanPopsTotal  uint64 `json:"recycle_scan_pops_total,omitempty"`
+	RecycleScanWalksTotal uint64 `json:"recycle_scan_walks_total,omitempty"`
 }
 
 type CoSInterfaceStatus struct {

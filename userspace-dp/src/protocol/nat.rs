@@ -441,4 +441,25 @@ pub(crate) struct SourceNatPoolStatus {
     pub live_lock_acquisitions_total: u64,
     #[serde(rename = "live_lock_contended_total", default)]
     pub live_lock_contended_total: u64,
+    /// #9392: the recycled-phase walk cost of `PortAllocator::claim`, summed
+    /// across this pool's addresses — tokens POPPED and the number of FIFO
+    /// WALKS that popped them.
+    ///
+    /// `pops / walks` is pops per walk: ~1 when a freed token is claimable at
+    /// the head (healthy), materially above 1 when the #9327 cliff is reached
+    /// (K out-of-band-occupied tokens ahead of F free ones, retained tokens
+    /// pushed to the BACK, so (K+F)/F per claim degrading to K+1 as F -> 1 —
+    /// worst exactly as an address approaches exhaustion).
+    ///
+    /// #9327 measured the mechanism on a fixture and could not answer whether
+    /// a production pool ever gets there, because the pop counter was
+    /// `#[cfg(test)]`. ADDED as new keys, never by redefining an existing one:
+    /// the helper and the daemon roll independently, so a redefined field is a
+    /// rolling-upgrade break. `default` so an older helper decodes 0 — and the
+    /// render side distinguishes that from a measured zero by requiring a
+    /// non-zero WALK count before it prints a ratio at all.
+    #[serde(rename = "recycle_scan_pops_total", default)]
+    pub recycle_scan_pops_total: u64,
+    #[serde(rename = "recycle_scan_walks_total", default)]
+    pub recycle_scan_walks_total: u64,
 }
