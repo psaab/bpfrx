@@ -124,9 +124,32 @@ func FromPCIAddr(pciAddr string, multifunction bool) string {
 	if err != nil {
 		return ""
 	}
-	// Function is parsed base 16: sysfs prints it in hex, and an ARI device
-	// can carry functions above 9 (up to 255), which a base-10 parse rejects
-	// outright — returning "" where a name was derivable.
+	// Function is parsed base 16, and THE BASE IS UNOBSERVABLE — not a
+	// correctness requirement in either direction (#9458).
+	//
+	// The comment that stood here claimed an ARI device "can carry functions
+	// above 9 (up to 255), which a base-10 parse rejects outright". That is
+	// false. Linux formats the address as
+	// dev_set_name(..., "%04x:%02x:%02x.%d", ..., PCI_SLOT(devfn), PCI_FUNC(devfn))
+	// and PCI_FUNC(devfn) is devfn & 0x07 — bits 7:3 are the slot. So the
+	// FUNCTION FIELD IS ALWAYS 0-7, on ARI hardware included, and 0-7 parse
+	// identically in base 10 and base 16. Measured on the ARI development
+	// host: 175 PCI devices, every final field in {0..7}. This is a
+	// structural bound, not a sampling result; TestPCIFunctionFieldIsThreeBits
+	// (pci_function_domain_9458_test.go) re-measures it and goes RED if it
+	// ever stops holding, which is the only condition under which the base
+	// would start to matter.
+	//
+	// ARI does NOT widen this field; it reinterprets slot and function
+	// TOGETHER as one 8-bit function, which systemd reconstructs as
+	// `func += slot << 3` when ari_enabled is set. That divergence is real
+	// (#6677) and is why the pre-rename kernel name is now read FROM THE
+	// KERNEL rather than derived arithmetically (PR #7420, 3c49cabd7) — this
+	// helper stays best-effort last-resort. #6204 and its two closed PRs
+	// (#6320, #6671) both tried to reach that gap by changing this parse
+	// base; a base change cannot reach it.
+	//
+	// Do not "fix" the base, and do not treat it as protection either.
 	fn, err := strconv.ParseUint(sf[1], 16, 8)
 	if err != nil {
 		return ""
