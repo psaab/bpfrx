@@ -131,6 +131,38 @@ ck "a full disk is VOID even though it reds a NAMED test" \
 	"yes 1 1 VOID(infrastructure: disk or memory)" \
 	"$(mutation_score_log go "$W/disk.log" yes)"
 
+# #9500: the infra detector matched a string a HEALTHY run prints.
+# pkg/configstore's persist-failure fixture is `injected: no space left on
+# device`, and it reaches the cell log because mutate.sh runs its Go gate with
+# GOTESTJSON set, which selects `go test -json` (implies -v) and streams a
+# PASSING test's output. Because mutation_verdict tests infra FIRST, every Go
+# cell scored VOID(infrastructure) and ESCAPED became unreachable — the harness
+# reported "your disk is broken" instead of "this code is untested".
+cat > "$W/injected-only.log" <<'EOF'
+{"Action":"output","Test":"TestSyncApply_DegradesNotFails","Output":"level=ERROR msg=\"active config persist failed\" err=\"injected: no space left on device\"\n"}
+{"Action":"pass","Test":"TestSyncApply_DegradesNotFails"}
+ok  	github.com/psaab/xpf/pkg/configstore	0.04s
+EOF
+ck "the configstore ENOSPC FIXTURE on a green run is not infrastructure (#9500)" \
+	"yes 1 0 ESCAPED" \
+	"$(mutation_score_log go "$W/injected-only.log" yes)"
+
+# THE CONTROL, and the reason the exclusion is a filter rather than a deletion:
+# "stop detecting ENOSPC entirely" satisfies the cell above. A REAL full disk
+# arriving in the SAME log as the fixture must still be VOID, or the repair has
+# bought a false ESCAPED — a claim that code is untested — for a run that
+# measured the machine.
+cat > "$W/injected-plus-real.log" <<'EOF'
+{"Action":"output","Test":"TestSyncApply_DegradesNotFails","Output":"level=ERROR msg=\"active config persist failed\" err=\"injected: no space left on device\"\n"}
+{"Action":"pass","Test":"TestSyncApply_DegradesNotFails"}
+--- FAIL: TestSomething (0.01s)
+    write /tmp/go-build123/b001/x.o: no space left on device
+FAIL	github.com/psaab/xpf/pkg/natshow	0.02s
+EOF
+ck "a REAL full disk alongside the fixture is still VOID (#9500 control)" \
+	"yes 1 1 VOID(infrastructure: disk or memory)" \
+	"$(mutation_score_log go "$W/injected-plus-real.log" yes)"
+
 echo "== not-applied =="
 ck "a mutation that did not apply is VOID, whatever the log says" \
 	"yes 2 0 VOID(mutation not applied)" \
