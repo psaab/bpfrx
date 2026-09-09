@@ -493,6 +493,15 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
         state.status.event_stream_write_stalls = es_stats.write_stalls;
         state.status.event_stream_replay_evictions = es_stats.replay_evictions;
         state.status.event_stream_invalid_acks = es_stats.invalid_acks;
+        // #9169 / #4800 site 4: the producer-seq lock pair. Published
+        // unconditionally and always as a COMPLETE pair — a denominator without
+        // its contended half (or the reverse) is not interpretable, and the
+        // #4800 analyzer refuses a ratio when the denominator is zero rather
+        // than reporting 0.0.
+        state.status.event_stream_producer_seq_lock_acquisitions_total =
+            es_stats.producer_seq_lock_acquisitions;
+        state.status.event_stream_producer_seq_lock_contended_total =
+            es_stats.producer_seq_lock_contended;
         // #2512: surface the per-kind SESSION_CLOSE / SESSION_CREATE
         // producer-side sent/dropped counters so a rate-limited or
         // budget-shed close/create is observable in `show` / Prometheus.

@@ -917,6 +917,33 @@ pub(crate) struct ProcessStatus {
     /// impossible ACK watermarks.
     #[serde(rename = "event_stream_invalid_acks", default)]
     pub event_stream_invalid_acks: u64,
+    /// #9169 / #4800 SITE 4: acquisitions of the helper's process-global
+    /// `producer_seq_lock` taken by a PRODUCER, and the blocked subset.
+    ///
+    /// Every session delta — Open as well as Close — allocates its wire
+    /// sequence number and encodes its frame inside this mutex (#3878 F-152
+    /// requires the allocation and the channel enqueue to be atomic together),
+    /// so it is a cross-worker serialization point on the new-flow path. It was
+    /// absent from `docs/userspace-newflow-ceiling.md`'s three-site model, so a
+    /// run that saturated here reported a plateau with every named site cold.
+    ///
+    /// A pair, always emitted together: a contended count without its
+    /// denominator is not interpretable, and "never taken" (zero acquisitions)
+    /// is a different finding from "taken but never blocked".
+    ///
+    /// The I/O thread's replay-gap FullResync allocation takes the same mutex
+    /// and is deliberately NOT counted — it is not a producer and fires once
+    /// per reconnect, so folding it in would dilute the ratio with the
+    /// observer. Its blocking effect is still visible as producer contention.
+    ///
+    /// `default` so an older helper that does not send these decodes 0. Read
+    /// that as "this build does not report the site", which the analyzer
+    /// distinguishes from a measured zero by requiring a non-zero denominator
+    /// before it reports a ratio at all.
+    #[serde(rename = "event_stream_producer_seq_lock_acquisitions_total", default)]
+    pub event_stream_producer_seq_lock_acquisitions_total: u64,
+    #[serde(rename = "event_stream_producer_seq_lock_contended_total", default)]
+    pub event_stream_producer_seq_lock_contended_total: u64,
     /// #2512: per-kind producer-side accounting for the RT_FLOW SESSION_CLOSE
     /// (type 14) and SESSION_CREATE (type 15) frames. Before #2512 these used
     /// a bare `try_send` that did not pass through the per-kind rate limiter,

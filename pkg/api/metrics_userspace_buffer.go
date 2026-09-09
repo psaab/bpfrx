@@ -109,6 +109,22 @@ func (c *xpfCollector) emitUserspaceDynamicBufferMetrics(ch chan<- prometheus.Me
 		prometheus.CounterValue,
 		float64(status.SharedSessionPublishLockAcquisitionsTotal),
 	)
+	// #9169: site 4. Emitted here rather than beside the other event-stream
+	// series because it belongs to the #4800 contention surface, and that
+	// surface's rule is that every (denominator, contended) pair is emitted
+	// unconditionally and together — a contended series without its
+	// denominator is not interpretable, and a missing series is
+	// indistinguishable from a scrape failure.
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceEventStreamProducerSeqLockAcquired,
+		prometheus.CounterValue,
+		float64(status.EventStreamProducerSeqLockAcquisitionsTotal),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceEventStreamProducerSeqLockBlocked,
+		prometheus.CounterValue,
+		float64(status.EventStreamProducerSeqLockContendedTotal),
+	)
 	ch <- prometheus.MustNewConstMetric(
 		c.userspaceSharedSessionPublishLockBlocked,
 		prometheus.CounterValue,

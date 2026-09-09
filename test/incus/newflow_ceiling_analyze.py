@@ -7,13 +7,18 @@ buried in shell arithmetic that nothing tests.
 
 Why the attribution matters more than the rate
 ----------------------------------------------
-A number that says "new flows/sec plateaued at N" settles nothing. Three
+A number that says "new flows/sec plateaued at N" settles nothing. Four
 cross-worker synchronization points sit on every transit install:
 
 * the SNAT pool allocator's residual `live` map mutex (#2852 Phase 1),
 * `publish_shared_session` (up to three shared-map mutexes per flow),
 * the N-way `replicate_session_upsert` fan-out (one sibling queue mutex per
-  worker, per flow).
+  worker, per flow),
+* the event stream's process-global `producer_seq_lock` (#9169), held across
+  the frame ENCODE for every session delta -- Open as well as Close. It was
+  absent from this model until #9169, so a run bound by it would report a
+  plateau with all three other sites cold, which reads as "not lock-bound".
+  (Counterfactual: no such run has been performed. The bound is static.)
 
 #2852 Phase-2 sharding targets only the first. If publish and replication
 saturate before the allocator does, sharding the allocator alone moves
@@ -146,6 +151,18 @@ LOCK_SITES = (
         "replicate.lock_contended_total",
         "replicate.enqueued_total",
     ),
+    # #9169 — the FOURTH site. Every session delta (Open as well as Close)
+    # allocates its wire sequence number and encodes its frame inside the
+    # helper's process-global `producer_seq_lock`: #3878 F-152 requires the
+    # allocation and the channel enqueue to be atomic together, so the encode
+    # is INSIDE the critical section. It was absent from this model, which
+    # meant a run that saturated here would have reported a plateau with all
+    # three named sites cold and nothing to attribute it to.
+    (
+        "event_stream_producer_seq",
+        "event_stream.lock_contended_total",
+        "event_stream.lock_acquisitions_total",
+    ),
 )
 
 #: Every counter that must never go backwards. A decrease means the helper
@@ -164,6 +181,9 @@ MONOTONIC_FIELDS = (
     "replicate.lock_contended_total",
     "replicate.queue_depth_sum",
     "replicate.queue_depth_max",
+    # #9169 site 4.
+    "event_stream.lock_acquisitions_total",
+    "event_stream.lock_contended_total",
 )
 
 #: Snapshot keys that are REQUIRED to be present and usable, over and above
@@ -641,6 +661,21 @@ def parse_prometheus_text(
             ),
             "lock_contended_total": _scalar(
                 text, "xpf_userspace_shared_session_publish_lock_contended_total"
+            ),
+        },
+        # #9169 site 4: the event-stream producer-seq lock pair. `_scalar`
+        # raises when the series is absent, which is the intended behaviour —
+        # a helper built before #9169 does not emit these, and scoring that
+        # build as "never contended" would report a clean fourth site for a
+        # run that could not have measured one.
+        "event_stream": {
+            "lock_acquisitions_total": _scalar(
+                text,
+                "xpf_userspace_event_stream_producer_seq_lock_acquisitions_total",
+            ),
+            "lock_contended_total": _scalar(
+                text,
+                "xpf_userspace_event_stream_producer_seq_lock_contended_total",
             ),
         },
         "replicate": {

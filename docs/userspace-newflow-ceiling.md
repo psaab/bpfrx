@@ -15,13 +15,34 @@ a completely different regime: every new transit flow allocates a SNAT
 translation, publishes into the cross-worker shared session maps, and fans a
 replica out to every sibling worker's command queue.
 
-Three cross-worker synchronization points sit on that path:
+Four cross-worker synchronization points sit on that path:
 
 | Site | What serializes | Scope |
 |---|---|---|
 | SNAT pool allocator `live` mutex | flow-map insert + persistent-lease lifecycle (the residual after the #2852 Phase-1 lock-free port claim) | per pool |
 | `publish_shared_session` | up to three shared-map mutexes **per publish call** (`sessions`, `nat_sessions`, `forward_wire_sessions`) | process |
 | `replicate_session_upsert` | one sibling command-queue mutex **per worker, per replication call** | process |
+| `event_stream` `producer_seq_lock` (#9169) | wire-seq allocation **and the frame ENCODE** for every session delta, Open as well as Close — #3878 F-152 requires the allocation and the channel enqueue to be atomic together, so the encode is inside the critical section | process |
+
+**The fourth row was added in #9169 and its absence was the expensive kind of
+gap.** A run bound by that mutex WOULD report a real new-flows/sec plateau with
+all three named sites COLD, which reads as "not lock-bound" and sends the next
+reader somewhere else. That sentence is a COUNTERFACTUAL, not a result: no such
+run has been performed, here or for any other site — see the status line at the
+top of this document. What IS established is the static bound and the absence of
+a counter. This document's own standard is that a measurement "has to say
+*which* site saturated"; a site with no counter cannot be named, and a model
+missing a site does not report a hole — it reports innocence.
+
+#9169 is deliberately an INSTRUMENT and not a remedy. The bound is static and
+proven; no benchmark is offered and none is claimed. "Encode outside the lock"
+is not directly available (`F: FnOnce(u64) -> EventFrame` consumes the sequence
+number, so encoding first means allocating first, which reintroduces the #3878
+F-152 ordering and F-153 rollback hazards the lock exists to close), so the
+remedy needs design and the measurement comes first. Candidate designs:
+reserve the sequence under the lock and encode outside it with an
+ordered-commit ring, or shard the sequence per producer with a merge at the
+reader.
 
 **Read those two rows as per CALL, not per connection.** A normal connection
 does not perform one publish and one replication: the forward flow and its
@@ -82,6 +103,8 @@ Process-global, on `ProcessStatus`:
 
 | Series | Meaning |
 |---|---|
+| `xpf_userspace_event_stream_producer_seq_lock_acquisitions_total` | producer acquisitions of `producer_seq_lock` — one per session delta plus one per lossless-retry attempt — the **denominator** for site 4 |
+| `xpf_userspace_event_stream_producer_seq_lock_contended_total` | the subset that found the mutex held and blocked |
 | `xpf_userspace_shared_session_publishes_total` | publish calls — the publish-leg new-flow rate |
 | `xpf_userspace_shared_session_publish_lock_acquisitions_total` | shared-map acquisitions **scoped to publish only** |
 | `xpf_userspace_shared_session_publish_lock_contended_total` | the blocked subset |
@@ -107,6 +130,16 @@ Scoping choices that are load-bearing:
 * The tunnel, TX-drain, HA and cross-binding CoS enqueues take the same
   sibling-queue mutexes and are likewise excluded from the replication
   contention count.
+* **Site 4 counts PRODUCERS only.** The I/O thread's replay-gap `FullResync`
+  seq allocation (#5267, `event_stream/connection.rs`) takes the same
+  `producer_seq_lock` and is deliberately excluded: it is not a producer and
+  fires once per reconnect, so folding it into the denominator would dilute
+  the ratio with the observer — the same reasoning that keeps
+  `remove_shared_session` out of the publish denominator. Its blocking effect
+  on producers is still visible, because it appears as producer CONTENTION,
+  which is the number that matters. The dormant drain-poison resync
+  (`handle_drain_request`, no live caller) allocates outside the lock and is
+  not an acquisition at all.
 * The per-worker install counter excludes reverse companions, peer-synced
   imports, promotes and local-delivery caches, so it stays directly
   comparable to the offered connection rate.
@@ -149,6 +182,18 @@ Verdicts, and the exit codes the harness propagates:
 | `VALID` | 0 | the window measured the install path |
 | `INCONCLUSIVE` | 2 | something else bound first (see below) |
 | `INVALID` | 1 | the window measured nothing usable |
+
+**Site 4 needs a helper built with #9169, and a zero denominator there is a
+BUILD statement, not a measurement.** `producer_seq_lock` is on the
+unconditional path of every session delta, so a window that installed flows
+through a connected event stream cannot have taken it zero times. If
+`event_stream_producer_seq` reports `n/a (never taken)` on a loaded run, read
+that as "this helper does not report the site" (or "the event stream was down
+for the whole window") and re-deploy both halves — never as innocence. The
+analyzer refuses outright when the two series are ABSENT from the scrape,
+which is the pre-#9169 helper paired with a pre-#9169 daemon; the mixed case
+(new daemon, old helper) emits the pair as a hard zero, and only this sentence
+distinguishes it.
 
 `INVALID`: non-positive or sub-minimum window; helper restarted mid-window
 (pid change or a backwards counter); **zero pool-mode SNAT allocations** —

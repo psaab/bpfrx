@@ -50,6 +50,12 @@ func TestNewFlowContentionMetricNamesAreStable_4800(t *testing.T) {
 		{"xpf_userspace_session_replication_lock_contended_total", c.userspaceSessionReplicationLockBlocked},
 		{"xpf_userspace_session_replication_queue_depth_sum", c.userspaceSessionReplicationQueueDepthSum},
 		{"xpf_userspace_session_replication_queue_depth_max", c.userspaceSessionReplicationQueueDepthMax},
+		// #9169 — SITE 4: the event-stream producer-seq lock pair. Named here
+		// with the other three because the analyzer keys its site table on
+		// these exact strings, and a rename is a silent attribution loss: the
+		// site would report `ratio: None` ("never taken") rather than an error.
+		{"xpf_userspace_event_stream_producer_seq_lock_acquisitions_total", c.userspaceEventStreamProducerSeqLockAcquired},
+		{"xpf_userspace_event_stream_producer_seq_lock_contended_total", c.userspaceEventStreamProducerSeqLockBlocked},
 	} {
 		if tc.desc == nil {
 			t.Errorf("%s: descriptor is nil — it is not initialised by newCollector", tc.want)

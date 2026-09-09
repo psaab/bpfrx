@@ -480,11 +480,15 @@ type xpfCollector struct {
 	userspaceSessionReplicationLockBlocked    *prometheus.Desc
 	userspaceSessionReplicationQueueDepthSum  *prometheus.Desc
 	userspaceSessionReplicationQueueDepthMax  *prometheus.Desc
-	userspaceSessionCreateDrops               *prometheus.Desc
-	userspaceSessionInstallAdmissionRefused   *prometheus.Desc
-	userspaceSessionInstallPartial            *prometheus.Desc
-	userspaceSessionTableEntries              *prometheus.Desc
-	userspaceSessionTableCapacity             *prometheus.Desc
+	// #9169: the FOURTH #4800 site — the helper's process-global
+	// producer_seq_lock, held across frame encode for every session delta.
+	userspaceEventStreamProducerSeqLockAcquired *prometheus.Desc
+	userspaceEventStreamProducerSeqLockBlocked  *prometheus.Desc
+	userspaceSessionCreateDrops                 *prometheus.Desc
+	userspaceSessionInstallAdmissionRefused     *prometheus.Desc
+	userspaceSessionInstallPartial              *prometheus.Desc
+	userspaceSessionTableEntries                *prometheus.Desc
+	userspaceSessionTableCapacity               *prometheus.Desc
 	// #8447: source-NAT rule-match outcome quartet.
 	userspaceSourceNATMatchConsulted            *prometheus.Desc
 	userspaceSourceNATMatchMatched              *prometheus.Desc
@@ -990,6 +994,8 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.workerSessionInstallPartial
 	ch <- c.workerNewFlowInstalls
 	ch <- c.userspaceSharedSessionPublishes
+	ch <- c.userspaceEventStreamProducerSeqLockAcquired
+	ch <- c.userspaceEventStreamProducerSeqLockBlocked
 	ch <- c.userspaceSharedSessionPublishLockAcquired
 	ch <- c.userspaceSharedSessionPublishLockBlocked
 	ch <- c.userspaceSessionReplicationUpserts
