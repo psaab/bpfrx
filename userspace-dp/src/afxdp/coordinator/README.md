@@ -259,6 +259,26 @@ Differences that matter (#1881):
   no split-brain (validation ahead of a stale forwarding table), no
   deleted-neighbor blackhole, no `ok=true` on a rejected snapshot.
   Distinct from #2484 (full-apply teardown) and #2916 (queue replan).
+- **The dead-worker sweep reclaims NAT holder bits AND the CoS V_min slot
+  (#7092 / #6979 / #9367).** `retire_worker_holders_where` walks every worker
+  its predicate selects, under a one-shot `holders_retired` CAS, and is driven
+  from the 1 Hz `refresh_status` path. It reclaims the three NAT allocator
+  families for every worker the predicate selects and — since #9367 — calls
+  `vacate_worker_v_min_slots` for those whose `atomics.dead` is set, releasing
+  the worker's slot in every `cos.queue_vtime_floors` entry. The `dead` gate is
+  load-bearing: `retire_all_worker_holders` selects `|_| true` for the #7092
+  teardown reclaim and runs BEFORE `workers.stop_and_clear`, i.e. while those
+  workers are still running, so an ungated vacate would race a live `publish()`
+  — and it would buy nothing, because that same teardown stores an empty
+  `queue_vtime_floors` a few statements later.
+  Without it a PANICKED worker's frozen `queue_vtime` pins the cross-worker
+  V_min indefinitely and taxes every survivor on that shared_exact queue about
+  11% of drain opportunities (see `cos/README.md`). The vacate is safe from
+  this thread precisely because it runs only for a worker the supervisor
+  already marked `dead`: the owning writer has exited and nothing respawns it,
+  so `PaddedVtimeSlot`'s single-writer contract still holds. It
+  rides the same one-shot CAS rather than running per tick, so a slot index a
+  LATER generation hands to a live worker is never re-cleared.
 - **CoS maps are published BEFORE forwarding becomes worker-visible
   (#5166).** In the same-plan refresh the workers KEEP RUNNING (no
   teardown), so a live worker observes the coordinator's ArcSwap stores
