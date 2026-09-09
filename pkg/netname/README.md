@@ -76,10 +76,27 @@ edge is a larger commitment than a zero-import leaf.
 
 ## Gotchas
 
-- **The function is parsed base 16.** sysfs prints it in hex and an ARI device
-  can carry functions above 9 (up to 255); a base-10 parse rejects those and
-  returns `""` where a name was derivable. Latent on the development host, whose
-  maximum observed function is 7 — verified, not assumed.
+- **The function is parsed base 16, and the base is UNOBSERVABLE (#9458).** The
+  bullet that stood here said an ARI device "can carry functions above 9 (up to
+  255); a base-10 parse rejects those", and called the max-7 observation on this
+  host "latent ... but not hypothetical". That reading was backwards. The bound
+  is STRUCTURAL, not a sampling result: Linux formats the address as
+  `"%04x:%02x:%02x.%d"` with `PCI_FUNC(devfn) = devfn & 0x07`, so bits 7:3 are
+  the slot and **the function field is always 0-7**, ARI hardware included
+  (measured: 175 PCI devices on this host, every final field in `{0..7}`).
+  Functions 0-7 parse identically in both bases, so neither base is more correct
+  and no input the kernel can produce distinguishes them.
+  `TestPCIFunctionFieldIsThreeBits` re-measures the bound each run and reds if it
+  ever stops holding — the only condition under which the base would matter.
+  So: do not "fix" the base (#6204, and PRs #6320 / #6671, both closed as no-ops
+  for exactly this reason), and do not treat it as protection either.
+- **ARI does not widen the function field — it reinterprets slot+function.**
+  systemd computes `func += slot << 3` when `ari_enabled` is set, so
+  `0000:03:01.2` on an ARI device is combined function 10 and udev names it
+  `...f10` where this helper derives `enp3s1f2`. That divergence is real
+  (#6677); the fix was to read the pre-rename name FROM THE KERNEL instead of
+  deriving it (PR #7420, `3c49cabd7`), which is why `FromPCIAddr` is documented
+  best-effort last-resort above. A parse-base change cannot reach it.
 - **`altNamePrefixOrder` in pkg/daemon is an ALIAS of `NamePolicyPrefixOrder`,
   not a copy.** A separate literal would leave `derive_kernel_name_6677_test.go`
   pinning a variable production no longer reads — a test that still passes while

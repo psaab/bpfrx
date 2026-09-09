@@ -75,11 +75,17 @@ func TestFromPCIAddrCarriesMultifunctionF0(t *testing.T) {
 		{"nonzero function always carries a suffix", "0000:03:00.1", false, "enp3s0f1"},
 		{"non-zero slot", "0000:b7:02.0", false, "enp183s2"},
 		{"non-zero domain", "0001:03:00.1", false, "enP1p3s0f1"},
-		// The function is parsed base 16, matching sysfs. An ARI device can
-		// carry functions above 9; a base-10 parse rejects those outright and
-		// returns "" where a name was derivable. Latent on the development
-		// host (max function observed there is 7) but not hypothetical.
-		{"ARI hex function", "0000:b7:00.a", false, "enp183s0f10"},
+		// #9458: this row is a CHANGE DETECTOR, not a correctness claim, and
+		// the comment that stood here made it read as the latter. ".a" is a
+		// spelling sysfs CANNOT produce — PCI_FUNC(devfn) is devfn & 0x07, so
+		// the field is always 0-7 (see the netname.go rationale and
+		// TestPCIFunctionFieldIsThreeBits). systemd therefore assigns no name
+		// for this input at all, so "enp183s0f10" is not the right answer in
+		// any spec sense; it is merely the answer today's base-16 parse gives.
+		// Keep the row so a change to the parse base is DELIBERATE rather than
+		// silent — but do not read a red here as a broken guarantee, and do
+		// not cite it as evidence that the base-16 parse protects anything.
+		{"function spelling sysfs cannot emit — change detector only", "0000:b7:00.a", false, "enp183s0f10"},
 		{"malformed", "not-a-pci-address", false, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
