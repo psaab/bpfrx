@@ -154,6 +154,51 @@ yet. Here is what is true today:
   degraded because sync never arrived — which is precisely the explanation for a
   flow reset after a boot. While the hold is active it also appears in the RG's
   `Takeover ready: no (...)` reasons.
+- A manual failover into a node inside its startup promotion hold no longer
+  leaves the RG owned by NEITHER node (#9452). `request chassis cluster failover
+  redundancy-group N` demotes the local primary immediately; the peer's promotion
+  then went through the bare readiness gate, so a request issued inside the
+  bounded #7162 30s hold on a just-rejoined node was DEFERRED rather than
+  refused — for 19s on the reproduction, up to the full 30s — with the CLI having
+  already reported `Manual failover triggered`. Measured consequences in one
+  `make test-failover` run: fw0 primary for none of RG0/1/2 at the check, and
+  `ip neigh show proxy` EMPTY on both nodes for the pool-NAT address.
+
+  The iperf3 average in the same run also fell from 22.5 to 18.1 Gbit/s, and that
+  is a SEPARATE signal despite how well the arithmetic fits (~20-25s of a 120s
+  stream carrying nothing). The fix refuted it: with the ownership gap closed to
+  0-1s, two consecutive runs came back at 18.9 and 20.3, against
+  `make harness-compare GATE=test-failover`'s `[21.375, 23.625]` green band — so
+  closing the gap bought far less than the theory predicted, and the spread
+  between two identical runs is a third of what is left. Tracked as #9484.
+
+  The gate now has the third case it was missing, beside peer LOSS and cold
+  BOOT: a peer that is ALIVE and reports NON-OWNERSHIP — `secondary-hold` (an
+  explicit transfer-out) or weight 0 (a resignation, which election forces to
+  secondary unconditionally). That case fails OPEN like peer loss, because the
+  cold-boot argument does not apply (there IS established forwarding and it stops
+  when the peer steps down) and there is no split-brain to weigh against it (the
+  peer is not claiming the RG). A peer that is merely SECONDARY with weight > 0
+  still HOLDS — that is the cold-boot shape. The promotion is marked
+  `DegradedPromoted` and names its reason in the RG event history.
+
+  **The 30s hold is in contract and was not changed.**
+  `daemon_ha_noreth_hold.go` states it releases on its own timer regardless of
+  sync or peer state, so this was never a hold-duration bug: with perfect NTP and
+  a fast bulk sync, a manual failover within 30s of a peer restart still
+  blackholed the RG.
+
+  `test/incus/test-failover.sh` also stopped hiding the difference. The
+  assertion was a fixed `sleep 5` plus a boolean, which cannot tell a REFUSED
+  transfer from one still in flight — and lengthening the sleep would have
+  reported a 30s blackhole as a pass. It is now a bounded poll that reports the
+  elapsed seconds per RG, its failure text carries `rg_ownership_diagnosis`
+  (both nodes' `Takeover ready:` / `Transfer ready:` / `Forwarding:` lines, the
+  peer's view, and the election journal tail), and the `request` command's stderr
+  is captured instead of discarded. Note which readiness term was false: on #9452
+  `Transfer ready` was `yes` on both nodes for all three RGs and `Takeover ready`
+  was the blocker, so a message carrying only the transfer-readiness reason would
+  still have said nothing.
 - Blackhole routes skipped in userspace mode (#354)
 - Helper watchdog threshold aligned with sync cadence (#349)
 - Reverse companions pre-installed via sync path (#310)

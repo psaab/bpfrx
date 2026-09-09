@@ -236,6 +236,47 @@ check_proxy_arp_ownership() {
 	fi
 }
 
+# rg_ownership_diagnosis renders WHY a redundancy group did not move, not merely
+# that it did not (#9452).
+#
+# THREE channels, because no one of them is sufficient and the issue's own
+# acceptance named only the first:
+#
+#   - the per-RG readiness lines from BOTH nodes. `Transfer ready: no (<reason>)`
+#     names a refusal on the node GIVING the RG up — a pending outbound bulk
+#     (#3912) or the #2082 peer-priority gate. `Takeover ready: no (<reason>)`
+#     names the readiness gate on the node TAKING it. Which one is false matters:
+#     measured on #9452, `Transfer ready` was `yes` on both nodes for all three
+#     RGs and `Takeover ready` was the false one, so a message carrying only the
+#     transfer-readiness reason would still have said nothing.
+#
+#   - the PEER's view of the same RG. A transfer-out the peer never observed and
+#     one it observed and declined are the same picture from one side.
+#
+#   - the election's own journal lines. The status lines are a SNAPSHOT, and the
+#     #7162 startup promotion hold that blocked #9452 expires on its own after
+#     30s — so by the time a failing cell reads status the gate can already read
+#     `yes` and the only surviving record of the refusal is the log. This is the
+#     channel that actually named the #9452 cause:
+#       cluster: election blocked by readiness gate rg=0 ready=false
+#         reasons="[session sync startup hold: bulk sync not yet complete]"
+rg_ownership_diagnosis() {
+	local rg="$1" node
+	printf '    ---- RG%s ownership diagnosis ----\n' "$rg"
+	for node in "$FW0" "$FW1"; do
+		printf '    [%s] show chassis cluster status, redundancy group %s:\n' "$node" "$rg"
+		incus exec "$node" -- cli -c 'show chassis cluster status' 2>&1 |
+			awk -v rg="$rg" '
+				$0 ~ ("^Redundancy group: " rg "[ ,]") { p = 1; print "      " $0; next }
+				p && /^Redundancy group: / { p = 0 }
+				p { print "      " $0 }' || true
+	done
+	printf '    [%s] election / transfer / promotion-hold journal tail:\n' "$FW0"
+	incus exec "$FW0" -- journalctl -u xpfd -n 5000 --no-pager 2>/dev/null |
+		grep -E "readiness gate|transfer out|transfer-out|manual failover|promotion hold|primary transition|degraded" |
+		tail -10 | sed 's/^/      /' || true
+}
+
 # ── Preflight ────────────────────────────────────────────────────────
 
 info "Preflight checks"
@@ -661,22 +702,58 @@ info "Manual failover: requesting fw1 to failover all RGs to fw0"
 # Each RG must be explicitly failed over — RG0 alone doesn't move RG1/RG2
 # because per-RG election is independent with non-preempt.
 for rg in 0 1 2; do
-	incus exec "$FW1" -- cli -c "request chassis cluster failover redundancy-group $rg" 2>/dev/null || true
+	# stderr is CAPTURED, not discarded. `2>/dev/null` here hid every refusal
+	# this command can return, so a run that printed "Manual failover triggered"
+	# and a run that printed nothing at all were the same transcript (#9452).
+	incus exec "$FW1" -- cli -c "request chassis cluster failover redundancy-group $rg" 2>&1 |
+		sed 's/^/    /' || true
 done
 
-# Wait for failover to complete
-sleep 5
-
-# Verify fw0 is now primary for ALL RGs
+# Verify fw0 is now primary for ALL RGs.
+#
+# A BOUNDED POLL, not a fixed `sleep 5`. The fixed sleep could not tell "the
+# transfer was refused" from "the transfer is still in flight", and #9452 was the
+# second: all three RGs DID move, 19-30s later, when the rejoining node's bounded
+# #7162 startup promotion hold expired. So the cell was reading a real outage —
+# fw1 has already demoted, so for that whole window the RG is owned by NEITHER
+# node — and reporting it as a refusal, while simply lengthening the sleep would
+# have reported a 30s blackhole as a pass.
+#
+# Polling gives the cell the ELAPSED time, which is the number that separates the
+# two, and the bound stays tight enough that the blackhole #9452 fixed still
+# reds. Each RG is polled in turn, so the later RGs are not charged the earlier
+# ones' wait.
+MANUAL_FAILOVER_DEADLINE="${MANUAL_FAILOVER_DEADLINE:-10}"
 all_primary=true
+slowest=0
 for rg in 0 1 2; do
-	if ! incus exec "$FW0" -- cli -c 'show chassis cluster status' 2>/dev/null | grep -A1 "Redundancy group: $rg" | grep -q "node0.*primary"; then
+	fo_start=$(date +%s)
+	moved=0
+	while :; do
+		if incus exec "$FW0" -- cli -c 'show chassis cluster status' 2>/dev/null |
+			grep -A1 "Redundancy group: $rg" | grep -q "node0.*primary"; then
+			moved=1
+			break
+		fi
+		if (($(date +%s) - fo_start >= MANUAL_FAILOVER_DEADLINE)); then
+			break
+		fi
+		sleep 1
+	done
+	fo_elapsed=$(($(date +%s) - fo_start))
+	if ((moved)); then
+		if ((fo_elapsed > slowest)); then
+			slowest=$fo_elapsed
+		fi
+		info "RG$rg moved to fw0 in ${fo_elapsed}s"
+	else
 		all_primary=false
-		fail "fw0 is not primary for RG$rg after manual failover"
+		fail "fw0 is not primary for RG$rg ${MANUAL_FAILOVER_DEADLINE}s after manual failover. fw1 has ALREADY demoted, so for this whole window RG$rg is owned by NEITHER node: transit is blackholed and nothing answers proxy-ARP for the pool-NAT address. That is an outage, not a declined request — read the elapsed time and the readiness reasons below rather than assuming a refusal (#9452)
+$(rg_ownership_diagnosis "$rg")"
 	fi
 done
 if $all_primary; then
-	pass "fw0 became primary for all RGs after manual failover"
+	pass "fw0 became primary for all RGs after manual failover (slowest ${slowest}s of ${MANUAL_FAILOVER_DEADLINE}s budget)"
 fi
 
 # Verify iperf3 survived manual failover

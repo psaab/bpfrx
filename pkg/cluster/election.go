@@ -332,7 +332,19 @@ func (m *Manager) runElection() {
 			// readiness term here left the RG secondary on both nodes with no
 			// way out — see readinessGateVerdictLocked.
 			promote, degReason := m.readinessGateVerdictLocked(rg)
-			if !promote {
+			if promote {
+				degradedReason = degReason
+			} else if yieldReason, unowned := peerYieldedOwnership(peerGroup); unowned {
+				// #9452: the peer is ALIVE and reports it is NOT the owner, so
+				// holding this RG secondary leaves it owned by NEITHER node.
+				// Promote DEGRADED and say so loudly — see
+				// peerYieldedOwnership for why this is not the cold-boot case
+				// the gate exists for.
+				degradedReason = fmt.Sprintf(
+					"Promoted DEGRADED: %s while this node is not ready (%s); "+
+						"holding secondary would leave redundancy group %d owned by neither node",
+					yieldReason, readinessReasonText(rg), rg.GroupID)
+			} else {
 				slog.Info("cluster: election blocked by readiness gate",
 					"rg", rg.GroupID, "ready", rg.Ready,
 					"readySince", rg.ReadySince,
@@ -340,7 +352,6 @@ func (m *Manager) runElection() {
 					"reasons", rg.ReadinessReasons)
 				continue
 			}
-			degradedReason = degReason
 		}
 
 		oldState := rg.State
@@ -410,7 +421,13 @@ func (m *Manager) runElection() {
 			if degradedReason != "" && rg.State == StatePrimary {
 				rg.DegradedPromoted = true
 				reason = degradedReason
-				slog.Warn("cluster: promoting NOT-READY RG after degraded timeout",
+				// #9452: NOT "after degraded timeout". This site now has two
+				// causes — the #7161/#7939 timeout, and a live peer that has
+				// yielded the RG — and naming one of them in the message makes
+				// the message wrong half the time. The CAUSE is in `reason`,
+				// which is the field that actually varies. electSingleNode's
+				// twin still has exactly one cause and still names it.
+				slog.Warn("cluster: promoting NOT-READY RG",
 					"rg", rg.GroupID, "reason", degradedReason)
 			}
 			m.sendEvent(rg.GroupID, oldState, rg.State, reason)
@@ -877,6 +894,80 @@ func (m *Manager) readinessGateVerdictLocked(rg *RedundancyGroupState) (bool, st
 	return false, ""
 }
 
+// peerYieldedOwnership reports whether the peer is ALIVE and telling us it is
+// NOT the owner of this redundancy group, plus the operator-facing phrasing for
+// why. When it is true, holding the local node secondary leaves the RG owned by
+// NEITHER node.
+//
+// #9452: this is the THIRD case in the readiness gate's taxonomy and it was
+// missing. electSingleNode's own comment already distinguishes the two the gate
+// knew about, and the distinction is sound:
+//
+//   - peer LOSS: fail OPEN. An established cluster had a working primary and it
+//     died; a survivor that refuses takeover is a total outage.
+//   - cold BOOT: HOLD. There is no established forwarding to preserve, and a
+//     not-ready node that promotes forwards nothing anyway while denying the
+//     peer a clean takeover.
+//
+// Neither describes a peer that is up, reachable, and has just DEMOTED ITSELF.
+// The cold-boot argument does not apply — there IS established forwarding, and
+// it stops the instant the peer steps down. And unlike peer LOSS there is no
+// split-brain hazard to weigh against promoting: the peer is not claiming the
+// RG, it is telling us it gave it up. So this case fails OPEN like peer loss,
+// not shut like a cold boot.
+//
+// MEASURED, not derived. `request chassis cluster failover redundancy-group N`
+// demotes the local primary immediately and the peer's promotion then went
+// through the bare gate. Issued inside the bounded #7162 30s startup promotion
+// hold on a node that had just rejoined after a crash, that left RG0/RG1/RG2
+// owned by NEITHER node for the REMAINDER of the hold — 19s on the #9452
+// reproduction, and up to the full 30s — while the CLI had already reported
+// "Manual failover triggered for redundancy group N". Nothing answered
+// proxy-ARP for the pool-NAT address in that window.
+//
+// The iperf3 average over the same run also fell from 22.5 to 18.1 Gbit/s, and
+// that is NOT this defect. The arithmetic invited the conclusion — ~25s of a
+// 120s stream carrying nothing is about the right shortfall — and the fix
+// refuted it: with the ownership gap closed to 0-1s, two runs came back at 18.9
+// and 20.3 against a [21.4, 23.6] green band. Closing the gap bought well under
+// what the theory predicted, and the 1.4 spread between two identical runs is
+// itself a third of the remaining gap. A separate signal, tracked as #9484,
+// and recorded here because the coincidence is convincing.
+//
+// Note the two arms are the two ways a live peer can report non-ownership, and
+// both are safe for the same reason. StateSecondaryHold is an explicit
+// transfer-out. Weight 0 is a resignation, and election forces a weight-0 node
+// SECONDARY unconditionally (see the localWeight <= 0 branch in electRG), so a
+// peer advertising it cannot be primary. A peer that is merely SECONDARY with
+// weight > 0 is NOT included: that is the cold-boot shape, where both nodes are
+// coming up and the gate must still hold.
+func peerYieldedOwnership(peerGroup *PeerGroupState) (string, bool) {
+	if peerGroup == nil {
+		// No peer group info is peer LOSS or a peer that has not reported this
+		// RG. Both are the electSingleNode / degraded-timer domain, not this
+		// one — and a partitioned peer may still be forwarding as primary, so
+		// promoting a not-ready node here would risk a dual-active.
+		return "", false
+	}
+	if peerGroup.State == StateSecondaryHold {
+		return "peer transferred out (secondary-hold)", true
+	}
+	if peerGroup.Weight <= 0 {
+		return "peer resigned (weight 0)", true
+	}
+	return "", false
+}
+
+// readinessReasonText renders an RG's readiness reasons for an operator-facing
+// message, with a non-empty fallback so a promotion reason never reads as an
+// empty parenthesis when readiness was never reported at all.
+func readinessReasonText(rg *RedundancyGroupState) string {
+	if len(rg.ReadinessReasons) > 0 {
+		return strings.Join(rg.ReadinessReasons, ", ")
+	}
+	return "readiness not reported"
+}
+
 // degradedPromoteDueLocked reports whether the #7161 cold-boot readiness gate
 // has held this RG secondary for longer than degradedPromoteTimeout, and the
 // operator-facing reason if so.
@@ -896,10 +987,7 @@ func (m *Manager) degradedPromoteDueLocked(rg *RedundancyGroupState) (string, bo
 	if held < m.degradedPromoteTimeout {
 		return "", false
 	}
-	why := "readiness not reported"
-	if len(rg.ReadinessReasons) > 0 {
-		why = strings.Join(rg.ReadinessReasons, ", ")
-	}
+	why := readinessReasonText(rg)
 	return fmt.Sprintf(
 		"Promoted DEGRADED after %s not ready (%s); forwarding may be impaired",
 		held.Round(time.Second), why), true
