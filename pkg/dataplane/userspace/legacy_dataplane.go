@@ -697,6 +697,46 @@ func (a *LegacyDataPlaneAdapter) ExportOwnerRGSessions(rgIDs []int, max uint32) 
 	return m.ExportOwnerRGSessions(rgIDs, max)
 }
 
+// ExportOwnerRGSessionsPaged forwards the #9344 paged owner-RG export.
+//
+// #9482: this method was MISSING, and its absence disabled the HA cold-prime
+// bulk sync entirely. `pkg/daemon`'s `userspaceSessionExporter` names exactly
+// one method, and #9344 changed which one — from the unpaged form above to this
+// one. `userspaceBulkSnapshot` resolves it by RUNTIME TYPE ASSERTION against
+// `d.dataplane()`, and the value the daemon publishes for the userspace backend
+// is `*LegacyDataPlaneAdapter` (`Boot()` in manager.go returns
+// `NewLegacyDataPlaneAdapter(New())`), not the `*Manager` that grew the new
+// method. So the assertion failed on the only type it is ever handed, and
+// `doBulkSync` — which fails CLOSED, correctly — framed no window at all.
+//
+// Measured on the loss userspace cluster before the fix: BOTH nodes logged
+//
+//	cluster sync: owed cold-prime re-drive failed, will retry
+//	  err="bulk sync table-truth snapshot: dataplane does not export owner-RG sessions"
+//
+// once a minute, indefinitely, and every cold-start edge logged
+// `cluster sync: bulk sync failed` with the same cause. A rejoining node
+// therefore received NO bulk window — only the incremental deltas that arrived
+// afterwards.
+//
+// WHY A ONE-LINE FORWARDER NEEDED A COMPILE-TIME BELT. Nothing linked the two
+// sides: the interface is unexported in `pkg/daemon` and satisfied by runtime
+// assertion, so removing or re-signing a method here is invisible until a
+// cluster rejoins. The existing coverage could not see it either — every
+// `pkg/daemon` bulk-snapshot test supplies its OWN exporter fake
+// (`wiringExporterDP`, `recordingExporter`), which proves the resolver correct
+// for a type that satisfies the interface and says nothing about the type the
+// daemon actually publishes. The assertion in `bulk_snapshot_published_type_9482.go`
+// binds the real interface to the real published types, so either side drifting
+// breaks the BUILD.
+func (a *LegacyDataPlaneAdapter) ExportOwnerRGSessionsPaged(rgIDs []int) ([]SessionDeltaInfo, ProcessStatus, error) {
+	m, err := a.managerOrErr()
+	if err != nil {
+		return nil, ProcessStatus{}, err
+	}
+	return m.ExportOwnerRGSessionsPaged(rgIDs)
+}
+
 func (a *LegacyDataPlaneAdapter) SessionSyncSweepProfile() (bool, time.Duration, time.Duration) {
 	m, err := a.managerOrErr()
 	if err != nil {
