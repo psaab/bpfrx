@@ -1673,6 +1673,11 @@ pub(super) fn resolve_flow_session_decision(
     protocol: u8,
     tcp_flags: u8,
     ingress_ifindex: i32,
+    // #9383: the arrival frame's VLAN id, needed ONLY to resolve
+    // `ingress_ifindex` (a physical bind port) to the LOGICAL unit ifindex the
+    // zone ledger is keyed by. A caller with no VLAN context passes 0, which
+    // resolves logical == physical for every untagged port.
+    ingress_vlan_id: u16,
     fabric_ingress: bool,
     ha_startup_grace_until_secs: u64,
     // #6211 F2: THIS worker's id, threaded from `WorkerLaunchPlan::worker_id`
@@ -1812,7 +1817,39 @@ pub(super) fn resolve_flow_session_decision(
     let reverse_ingress = if fabric_ingress {
         crate::afxdp::shared_ops::ReverseIngress::Unconstrained
     } else {
-        match forwarding.ifindex_to_zone_id.get(&ingress_ifindex).copied() {
+        // #9383: key the zone ledger on the LOGICAL (VLAN unit) arrival ifindex,
+        // not the raw physical one `meta.ingress_ifindex` carries.
+        //
+        // `ifindex_to_zone_id` deliberately PROPAGATES a zoned child unit's zone
+        // onto its parent's ifindex (#921/#3618), so on a trunk whose units sit
+        // in different zones the physical key answers with whichever unit won the
+        // propagation. Measured on a `build_forwarding_state` trunk with unit 42
+        // in `lan` and unit 43 UNZONED, both `parent_ifindex = 41`:
+        // `ifindex_to_zone_id[41] = Some(lan)` while
+        // `resolve_ingress_logical_ifindex(41, vlan 20) = Some(43)` and
+        // `ifindex_to_zone_id[43] = None`. The physical lookup answers
+        // `Zone(lan)` where the logical resolution answers "unzoned" — a
+        // different ANSWER, not a different spelling of the same one.
+        //
+        // That matters here more than at most sites: a match admitted by a wrong
+        // arrival zone makes `install_reverse_session_from_forward_match` MINT a
+        // reverse session, and reverse entries are exempt from zone-policy
+        // re-derivation by design (`policy_revalidation.rs` gate 1), so the
+        // synthesized session then rides the established fast path with no
+        // further adjudication. Every zone / filter / pre-routing-NAT admission
+        // site already resolves the logical unit first (#3021/#5802).
+        //
+        // `.unwrap_or(ingress_ifindex)` is the same fallback those sites use: an
+        // untagged port, and any arrival with no `(parent, vlan)` mapping,
+        // resolves logical == physical and is byte-identical to pre-#9383.
+        let arrival_logical =
+            crate::afxdp::forwarding::resolve_ingress_logical_ifindex(
+                forwarding,
+                ingress_ifindex,
+                ingress_vlan_id,
+            )
+            .unwrap_or(ingress_ifindex);
+        match forwarding.ifindex_to_zone_id.get(&arrival_logical).copied() {
             Some(z) => crate::afxdp::shared_ops::ReverseIngress::Zone(z),
             // Fail CLOSED. An unmapped arrival interface gives nothing to
             // revalidate against, and treating that as "no constraint" would

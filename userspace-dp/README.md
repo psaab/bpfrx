@@ -429,6 +429,45 @@ logging rules, not these specific hot-path constants.
   only mechanism — which is why the `Reject` gap was a real enforcement
   hole rather than a cosmetic one.
 
+- **`ifindex_to_zone_id` is keyed by the LOGICAL (VLAN unit) ifindex, and
+  the map deliberately lies about the parent (#921/#3618, #9383).** The
+  build propagates a zoned child unit's zone onto its parent's ifindex so
+  that untagged traffic on a trunk parent is attributed to its unit's
+  zone. The consequence every reader must hold: on a trunk whose units
+  sit in different zones, the RAW PHYSICAL key and the LOGICAL key return
+  **different answers** for the same frame — not two spellings of one
+  answer. Measured on a `build_forwarding_state` trunk with unit 42 in
+  `lan`, unit 43 unzoned, both `parent_ifindex = 41`:
+  `ifindex_to_zone_id[41] = Some(lan)` while
+  `resolve_ingress_logical_ifindex(41, vlan 20) = Some(43)` and
+  `ifindex_to_zone_id[43] = None`.
+
+  So **resolve the logical unit before reading this map**:
+  `resolve_ingress_logical_ifindex(fw, physical, vlan).unwrap_or(physical)`.
+  The `unwrap_or` is the established spelling (`poll_descriptor/filter.rs`,
+  `prerouting_scope.rs`, `poll_stages.rs`, `neighbor_dispatch.rs`,
+  `forwarding/mss.rs`, `forwarding/local_delivery.rs`) and keeps an
+  untagged port byte-identical, because `populate_egress` inserts a
+  `(bind_ifindex, vlan_id)` row for every snapshot interface — including
+  MAC-less ones, since the insert precedes the `src_mac` `continue`.
+
+  Two sites read the PHYSICAL index on purpose and say so in place —
+  `afxdp/icmp.rs` (the socket-bind port is the identity it needs) and
+  `afxdp/tx/dispatch/mod.rs`. Anywhere else, physical is a defect. #9383
+  fixed three: the #7169 reverse-session synthesis in
+  `session_glue/mod.rs` (a wrong arrival zone MINTS a reverse session,
+  and reverse entries are exempt from zone-policy re-derivation by
+  design, so it then rides the established fast path unadjudicated), the
+  fabric zone stamp in `poll_descriptor/mod.rs` (the id selects the PEER
+  node's ingress zone for a redirected packet), and the filter-log
+  source-zone attribution in `afxdp/forward_request.rs`.
+
+  GRE/WireGuard decap is unaffected and that is by construction, not by
+  luck: `afxdp/logical_ingress.rs` builds the inner meta with
+  `ingress_ifindex = logical_ifindex` and `ingress_vlan_id = 0`, and a
+  tunnel row has no parent so it keys itself — the resolution is the
+  identity.
+
 ## Subdir READMEs
 
 See `src/afxdp/README.md`, `src/server/README.md`, `src/session/README.md`,
