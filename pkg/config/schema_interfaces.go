@@ -435,7 +435,7 @@ func vrrpGroupSchemaNode(v6 bool) *schemaNode {
 		// compiler already strict-rejects out-of-range costs with curated
 		// errors (validateVRRPTrackInterfaceAST / parseTrackCost,
 		// compiler_interfaces.go:791); typing it here would shadow them.
-		"track-interface": {desc: "Interface to track", args: 1, placeholder: "<interface>", children: map[string]*schemaNode{
+		"track-interface": {desc: "Interface to track", args: 1, placeholder: "<interface>", closedWorld: true, children: map[string]*schemaNode{
 			"priority-cost": {desc: "Priority cost subtracted while the tracked interface is down", args: 1, placeholder: "<1..254>", children: nil},
 		}},
 		"track-priority-cost": {desc: "Priority cost when tracked interface fails", args: 1, placeholder: "<cost>", children: nil},

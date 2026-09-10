@@ -119,10 +119,7 @@ func instanceNameBlind9091() (blind, armed []string) {
 var instanceNameBlindBaseline9091 = []string{
 	"/applications/application",
 	"/applications/application-set",
-	"/chassis/cluster/control-ports/fpc",
 	"/chassis/cluster/redundancy-group",
-	"/chassis/cluster/redundancy-group/node",
-	"/chassis/device-map/interface",
 	"/class-of-service/classifiers/dscp",
 	"/class-of-service/classifiers/dscp/forwarding-class",
 	"/class-of-service/classifiers/dscp/forwarding-class/loss-priority",
@@ -151,7 +148,6 @@ var instanceNameBlindBaseline9091 = []string{
 	"/class-of-service/rewrite-rules/inet-precedence/forwarding-class",
 	"/class-of-service/rewrite-rules/inet-precedence/forwarding-class/loss-priority",
 	"/class-of-service/scheduler-maps",
-	"/class-of-service/scheduler-maps/forwarding-class",
 	"/class-of-service/schedulers",
 	"/class-of-service/schedulers/buffer-size",
 	"/class-of-service/schedulers/transmit-rate",
@@ -178,12 +174,9 @@ var instanceNameBlindBaseline9091 = []string{
 	"/interfaces/*/unit",
 	"/interfaces/*/unit/family/inet/address",
 	"/interfaces/*/unit/family/inet/address/vrrp-group",
-	"/interfaces/*/unit/family/inet/address/vrrp-group/track-interface",
 	"/interfaces/*/unit/family/inet6/address",
 	"/interfaces/*/unit/family/inet6/address/vrrp-group",
-	"/interfaces/*/unit/family/inet6/address/vrrp-group/track-interface",
 	"/interfaces/*/unit/tunnel/wireguard/peer",
-	"/policy-options/community",
 	"/policy-options/policy-statement",
 	"/policy-options/policy-statement/term",
 	"/protocols/bgp/group",
@@ -199,16 +192,6 @@ var instanceNameBlindBaseline9091 = []string{
 	"/protocols/router-advertisement/interface/nat-prefix",
 	"/protocols/router-advertisement/interface/nat64prefix",
 	"/protocols/router-advertisement/interface/prefix",
-	// #9351 added these two, and they are recorded as blind rather than armed
-	// DELIBERATELY: they are the same nodes as `/protocols/bgp/group` and
-	// `/protocols/bgp/group/neighbor`, shared by pointer, and those two have
-	// always been blind. Arming here would arm the GLOBAL BGP grammar as a side
-	// effect — a new commit rejection for every mistyped keyword in any BGP
-	// group body on any box — which is exactly the all-at-once flip the note at
-	// the top of this file says to stage rather than take. Neither entry is a
-	// NEW blind surface: before #9351 the same tokens were silently dropped by
-	// packing instead of silently ignored by an open world, which is strictly
-	// worse. Arming both (globally, once) is the follow-up.
 	"/routing-instances/*/protocols/bgp/group",
 	"/routing-instances/*/protocols/bgp/group/neighbor",
 	"/routing-instances/*/protocols/isis/interface",
@@ -233,7 +216,6 @@ var instanceNameBlindBaseline9091 = []string{
 	"/routing-options/static/route/next-hop",
 	"/routing-options/static/route/qualified-next-hop",
 	"/schedulers/scheduler",
-	"/security/address-book/global/address-set",
 	"/security/dynamic-address/address-name",
 	"/security/dynamic-address/feed-server",
 	"/security/dynamic-address/feed-server/feed-name",
@@ -248,7 +230,6 @@ var instanceNameBlindBaseline9091 = []string{
 	"/security/nat/destination/pool",
 	"/security/nat/destination/rule-set",
 	"/security/nat/destination/rule-set/rule",
-	"/security/nat/proxy-arp/interface",
 	"/security/nat/source/pool",
 	"/security/nat/source/rule-set",
 	"/security/nat/source/rule-set/rule",
@@ -259,7 +240,6 @@ var instanceNameBlindBaseline9091 = []string{
 	"/security/policies/global/policy",
 	"/security/screen/ids-option",
 	"/security/zones/security-zone",
-	"/security/zones/security-zone/address-book/address-set",
 	"/services/flow-monitoring/version-ipfix/template",
 	"/services/flow-monitoring/version9/template",
 	"/services/ip-monitoring/policy",
@@ -271,19 +251,15 @@ var instanceNameBlindBaseline9091 = []string{
 	"/snmp/community",
 	"/snmp/trap-group",
 	"/snmp/v3/usm/local-engine/user",
-	"/system/backup-router",
-	"/system/login/class",
 	"/system/login/user",
 	"/system/ntp/server",
 	"/system/ntp/threshold",
 	"/system/services/dhcp-local-server/group",
 	"/system/services/dhcp-local-server/group/interface",
 	"/system/services/dhcp-local-server/group/pool",
-	"/system/services/dhcp-local-server/group/pool/static-binding",
 	"/system/services/dhcpv6-local-server/group",
 	"/system/services/dhcpv6-local-server/group/interface",
 	"/system/services/dhcpv6-local-server/group/pool",
-	"/system/services/dhcpv6-local-server/group/pool/static-binding",
 	"/system/services/dynamic-dns/provider",
 }
 
@@ -308,15 +284,29 @@ var instanceNameBlindCeiling9091 = len(instanceNameBlindBaseline9091)
 // defect #9416 exists to close, one level deeper — so the body was declared
 // leaf-complete and armed rather than added to the blind baseline.
 var instanceNameArmedBaseline9091 = []string{
+	"/chassis/cluster/control-ports/fpc",
+	"/chassis/cluster/redundancy-group/node",
+	"/chassis/device-map/interface",
+	"/class-of-service/scheduler-maps/forwarding-class",
+	"/interfaces/*/unit/family/inet/address/vrrp-group/track-interface",
+	"/interfaces/*/unit/family/inet6/address/vrrp-group/track-interface",
+	"/policy-options/community",
 	"/protocols/ospf/area/interface/authentication/md5",
 	"/protocols/rip/group",
 	"/routing-instances/*/protocols/ospf/area/interface/authentication/md5",
 	"/routing-instances/*/protocols/rip/group",
+	"/security/address-book/global/address-set",
 	"/security/ike/proposal",
 	"/security/ipsec/proposal",
 	"/security/ipsec/vpn/traffic-selector",
 	"/security/nat/nat64/rule-set",
+	"/security/nat/proxy-arp/interface",
+	"/security/zones/security-zone/address-book/address-set",
 	"/snmp/community/routing-instance",
+	"/system/backup-router",
+	"/system/login/class",
+	"/system/services/dhcp-local-server/group/pool/static-binding",
+	"/system/services/dhcpv6-local-server/group/pool/static-binding",
 }
 
 var instanceNameArmedFloor9091 = len(instanceNameArmedBaseline9091)
@@ -393,10 +383,17 @@ func TestInstanceNameBlindInstrumentStillDiscriminates9091(t *testing.T) {
 
 	// Direction 1 — known BLIND. #9091 measured each of these accepting a bogus
 	// keyword at CheckText.
+	// #9265 re-anchored this list rather than shortening it. `/system/login/class`
+	// was here as a third known-BLIND witness and is now ARMED, so it moves to
+	// direction 2 below — the move this cell's own failure message prescribes
+	// ("Either it was armed (then lower the ceiling and say so) or the instrument
+	// stopped detecting blindness"). Both witnesses that remain are DEEP
+	// containers, and `closedWorld` INHERITS, so arming either would close its
+	// whole subtree (the measured #9017 lesson). That is why they are still blind,
+	// and it makes them durable anchors rather than the next ones to go.
 	for _, p := range []string{
 		"/security/ike/gateway", // security ike gateway g1 { bogus-token 5; } -> ACCEPTED
 		"/security/ipsec/vpn",   // security ipsec vpn v1   { bogus-token 5; } -> ACCEPTED
-		"/system/login/class",   // system login class c1   { xpfbogus 5; }    -> ACCEPTED
 	} {
 		if !blindSet[p] {
 			t.Errorf("#9091: %s is no longer classified blind. Either it was armed "+
@@ -410,6 +407,13 @@ func TestInstanceNameBlindInstrumentStillDiscriminates9091(t *testing.T) {
 	for _, p := range []string{
 		"/protocols/rip/group",   // armed by #9206
 		"/security/ike/proposal", // armed by an earlier closed-world flip
+		// #9265, and it carries the cross-check this direction needs: #9091
+		// measured `system login class c1 { xpfbogus 5; }` ACCEPTED at
+		// configstore.CheckText, and #9265 re-measured it REJECTED there after
+		// arming, with the same container's declared body still committing. So
+		// this entry is pinned by an end-to-end measurement in BOTH states, not
+		// by re-reading the schema flag this function already reads.
+		"/system/login/class",
 	} {
 		if !armedSet[p] {
 			t.Errorf("#9091: %s is no longer classified armed. If a closed world was "+
