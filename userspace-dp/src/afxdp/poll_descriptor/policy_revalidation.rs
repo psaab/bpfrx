@@ -56,8 +56,13 @@
 //! **2. GENERATION-ONLY stamp.** `FilterRevalidationStamp` is keyed
 //! `(generation, logical ingress ifindex)` because an input filter is a
 //! per-INTERFACE object. A zone-policy verdict is keyed on the (from, to) zone
-//! PAIR and both come from the ENTRY, never from the interface this packet
-//! arrived on. See `SessionEntry::policy_revalidated_gen`.
+//! PAIR, which is a property of the FLOW rather than of any one interface, so
+//! the stamp does not vary with the arrival interface. (#9384: the from-zone is
+//! now RESOLVED from the arrival interface, which is a different statement —
+//! the KEY is still the generation alone, deliberately, because a flow has one
+//! zone pair and re-deriving it per arrival interface would let a multi-homed
+//! arrival re-ask once per interface.) See
+//! `SessionEntry::policy_revalidated_gen`.
 //!
 //! **3. Side-effect freedom is STRUCTURAL, not a flag.** The filter needed
 //! `NonRoutingCountPolicy::Never` because its evaluator counts internally.
@@ -107,10 +112,17 @@
 //!
 //! # What it does NOT cover, stated so this does not read as more than it is
 //!
-//! `to_id` is derived from the egress interface resolved at install/import
-//! time, read through the LIVE zone ledger. So a commit that moves an interface
-//! BETWEEN ZONES is caught; a commit that changes a ROUTE so the flow would now
-//! leave a DIFFERENT interface is NOT. Catching that needs a fresh routing
+//! #9384: BOTH zones are now read through the LIVE ledger — `to_id` from the
+//! egress interface resolved at install/import time, `from_id` from the
+//! interface THIS packet arrived on (fabric ingress excepted, see below). So a
+//! commit that moves an interface between zones is caught on either side. Until
+//! #9384 the from-zone came from the session ENTRY, so the sentence below was
+//! true of the EGRESS half only and the claim above it was not qualified:
+//! moving an interface OUT of a permitted zone did not tear down its live
+//! sessions.
+//!
+//! What is still NOT covered: a commit that changes a ROUTE so the flow would
+//! now leave a DIFFERENT interface. Catching that needs a fresh routing
 //! evaluation on the established-hit path, which is exactly what #2620 forbids
 //! (that path is the sole counter for its packet precisely because it never
 //! calls the routing evaluator). #8356 does not re-open #2620.
@@ -143,6 +155,14 @@ pub(super) fn revalidate_zone_policy_on_session_hit(
     decision: crate::session::SessionDecision,
     flow: Option<&SessionFlow>,
     meta: UserspaceDpMeta,
+    // #9384: did THIS packet arrive over the fabric link? A fabric-ingress
+    // packet's arrival interface is the fabric, NOT the flow's logical ingress,
+    // so its live arrival zone is structurally not the flow's and the entry's
+    // recorded zone is the only honest answer. It is a property of the PACKET,
+    // not of the session: `metadata.fabric_ingress` says the session was
+    // INSTALLED from a fabric-punted packet, which tells you nothing about where
+    // this one arrived.
+    packet_fabric_ingress: bool,
 ) -> Option<PolicyRevocation> {
     let flow = flow?;
     // GATE 1, and it is free: the reverse companion is never independently
@@ -210,7 +230,16 @@ pub(super) fn revalidate_zone_policy_on_session_hit(
         PolicyRevalidationTarget::NoLocalEntry => return None,
         PolicyRevalidationTarget::Stale(k) => k,
     };
-    zone_policy_deny_on_session_hit(forwarding, sessions, canonical_key, metadata, decision, flow, meta)
+    zone_policy_deny_on_session_hit(
+        forwarding,
+        sessions,
+        canonical_key,
+        metadata,
+        decision,
+        flow,
+        meta,
+        packet_fabric_ingress,
+    )
 }
 
 /// The cold half. `#[cold] #[inline(never)]` because it runs at most once per
@@ -242,15 +271,52 @@ fn zone_policy_deny_on_session_hit(
     decision: crate::session::SessionDecision,
     flow: &SessionFlow,
     meta: UserspaceDpMeta,
+    packet_fabric_ingress: bool,
 ) -> Option<PolicyRevocation> {
     let egress_ifindex = decision.resolution.egress_ifindex;
-    let (from_id, to_id) = zone_pair_ids_for_flow_with_override(
+    // #9384: resolve the FROM-zone LIVE from this packet's arrival interface,
+    // symmetric with the to-zone, which has always been resolved live from
+    // `decision.resolution.egress_ifindex`.
+    //
+    // It used to be handed `Some(metadata.ingress_zone)` — the ENTRY's zone,
+    // which the override makes win over the live ingress map
+    // (`forwarding/mod.rs`) and which also made the ifindex argument dead. The
+    // asymmetry is exactly the one the module header promised was absent: *"a
+    // commit that moves an interface BETWEEN ZONES is caught"* was true of the
+    // EGRESS side only. An operator moving an interface OUT of a permitted zone
+    // to cut off access got the new verdict for new flows while every live
+    // session kept being judged under the zone it was admitted in, was stamped
+    // fresh, and kept forwarding. Go's commit-time invalidation cannot cover it
+    // either: it compares policy match/action text and referenced-object
+    // fingerprints and never diffs zone MEMBERSHIP.
+    //
+    // Two things make this safe rather than a revoke storm:
+    //
+    // 1. FABRIC INGRESS keeps the entry's zone. A fabric-punted packet arrives
+    //    on the fabric link from the peer, so its arrival zone is structurally
+    //    not the flow's — resolving live there would evaluate (fabric -> X) and
+    //    revoke every cross-chassis flow, which is a correctness break, not a
+    //    hardening. The discriminator is the PACKET's fabric ingress, not the
+    //    session's `metadata.fabric_ingress`: a session installed from a
+    //    fabric-punted packet whose later packets arrive locally should be
+    //    judged on where THEY arrived.
+    // 2. An arrival that resolves to NO zone falls to the existing `from_id == 0`
+    //    DECLINE below, not to a revocation. See the residual noted there.
+    //
+    // #9383: the live resolution goes through `resolve_ingress_logical_ifindex`.
+    // Keying `ifindex_to_zone_id` on the raw physical index would reintroduce the
+    // logical-vs-physical defect on a trunk, and this is the site that would make
+    // it a revocation rather than a mis-attribution.
+    let arrival_logical = resolve_ingress_logical_ifindex(
         forwarding,
         meta.ingress_ifindex as i32,
-        // The from-zone comes from the ENTRY, not from this packet's arrival
-        // interface — the same override the input-filter revalidation is handed
-        // at its call site.
-        Some(metadata.ingress_zone),
+        meta.ingress_vlan_id,
+    )
+    .unwrap_or(meta.ingress_ifindex as i32);
+    let (from_id, to_id) = zone_pair_ids_for_flow_with_override(
+        forwarding,
+        arrival_logical,
+        packet_fabric_ingress.then_some(metadata.ingress_zone),
         egress_ifindex,
     );
     // DECLINE on an unknown zone. `egress_zone_id` is `unwrap_or(0)` and policy
@@ -273,6 +339,18 @@ fn zone_policy_deny_on_session_hit(
     // a mutation showed nothing could red it — the established-hit arm never
     // sees an unresolved decision, because the poll path re-resolves it and a
     // flow with no route exits before this point.
+    //
+    // #9384 RESIDUAL, stated because the from-zone is now live and this arm now
+    // catches a case it could not before: an interface moved out of every zone
+    // (to NO zone) DECLINES rather than revoking. That is deliberate. `from_id`
+    // 0 is a LOOKUP FAILURE, and this arm exists precisely because revoking on a
+    // lookup failure is the mass-teardown risk (#6722's MAC-less egress is the
+    // reachable case). An ingress in no zone is also not an ordinary
+    // configuration — every interface in the config is expected to carry a zone
+    // — whereas an unresolvable EGRESS is. Closing the residual would mean
+    // distinguishing "this interface is deliberately unzoned" from "the ledger
+    // has no row yet", which the snapshot does not currently express. Pinned by
+    // `an_ingress_moved_to_no_zone_declines_rather_than_revoking_9384`.
     if to_id == 0 || from_id == 0 {
         return None;
     }

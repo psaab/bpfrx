@@ -423,6 +423,39 @@ logging rules, not these specific hot-path constants.
     SOURCE stays pre-translation in both places — Junos evaluates after
     destination NAT and before source NAT.
 
+  - **BOTH zones are resolved LIVE, and fabric ingress is the one
+    exemption (#9384).** `to_id` has always come from the egress
+    interface read through the live ledger; the FROM-zone used to come
+    from the session ENTRY, which the override makes win, so the module's
+    claim that "a commit that moves an interface BETWEEN ZONES is caught"
+    was true of the EGRESS half only. Moving an interface OUT of a
+    permitted zone therefore cut off new flows and left every live
+    session being judged under the zone it was admitted in, stamped fresh
+    and forwarding. Go's commit-time invalidation cannot cover it either:
+    it diffs policy text and referenced-object fingerprints, never zone
+    MEMBERSHIP.
+
+    The from-zone is now resolved from the interface THIS packet arrived
+    on, through `resolve_ingress_logical_ifindex` (#9383 — keying the raw
+    physical index here would turn a trunk mis-attribution into a
+    revocation). Two guards keep it from being a revoke storm:
+
+    * **Fabric ingress keeps the entry's zone**, and the discriminator is
+      the PACKET's fabric ingress, not the session's
+      `metadata.fabric_ingress` — the latter says the session was
+      installed from a punt, which says nothing about where this packet
+      arrived. This is load-bearing on the SHIPPED config, not
+      hypothetical: `docs/ha-cluster-userspace.conf` puts `fab0` in the
+      `control` zone and the ledger propagates that onto `ge-0-0-0`, so a
+      live resolution there gives `control -> wan`, which nothing
+      permits. Without the exemption every established cross-chassis
+      session is revoked on the first packet after any commit — TCP death
+      on VRRP failback, which the fabric redirect exists to prevent.
+    * **An arrival that resolves to NO zone DECLINES**, via the
+      pre-existing `from_id == 0` arm, because a zone lookup failure is
+      not a verdict. That is a stated residual: an interface moved out of
+      every zone is not torn down.
+
   `security policies policy-rematch` is the COMMIT-time mitigation for
   the same class, and it is off by default
   (`pkg/config/types_security.go`), so on a stock box this module is the

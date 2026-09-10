@@ -1059,3 +1059,433 @@ fn an_unchanged_nat64_policy_with_a_mixed_family_destination_set_does_not_revoke
     );
     assert_eq!(out.sessions, 2, "the NAT64 pair must survive");
 }
+
+// ---------------------------------------------------------------------------
+// #9384: the FROM-zone is resolved LIVE from this packet's arrival interface.
+// ---------------------------------------------------------------------------
+//
+// The re-derivation used to be handed `Some(metadata.ingress_zone)` as the
+// from-zone override, which WINS over the live ingress map
+// (`forwarding/mod.rs`). So it resolved the to-zone live and the from-zone from
+// the ENTRY, and the module header's coverage claim — "a commit that moves an
+// interface BETWEEN ZONES is caught" — was true of the EGRESS half only. An
+// operator moving an interface OUT of a permitted zone to cut off access got the
+// new verdict for NEW flows while every live session kept being judged under the
+// zone it was admitted in, was stamped fresh, and kept forwarding.
+//
+// The generation question is settled and is not what was missing: every commit
+// goes through `Compile`, which takes its generation from `m.bumpGeneration()`
+// unconditionally, so a zone-membership edit DOES bump the generation and the
+// re-derivation DOES run — with the stale from-zone. Go's commit-time
+// invalidation cannot cover it either: it compares policy match/action text and
+// referenced-object fingerprints and never diffs zone MEMBERSHIP.
+//
+// WHY THE SHIPPED #8356 CELLS COULD NOT SEE IT. `metadata(is_reverse)` hard-codes
+// `ingress_zone: TEST_LAN_ZONE_ID` AND leaves `reth1.0` in `lan` in the snapshot.
+// Entry zone and live interface zone were never allowed to DISAGREE, so the
+// override was unobservable.
+//
+// THE SHAPE OF THE GROUP. Two axes, varied independently: where the ENTRY says
+// the session came from, and where the live config says the arrival interface
+// now is. The cell that matters is the one where they DISAGREE and the live zone
+// is not permitted. The two cells where they AGREE are what stop the fix from
+// degenerating into "always revoke", and the cell where they disagree but the
+// live zone IS permitted is what stops it degenerating into "revoke on any
+// disagreement".
+
+/// `policy_deny_snapshot` with its built-in `dmz -> wan` permit REMOVED, the
+/// ingress interface `reth1.0` placed in `ingress_zone`, and `lan -> wan`
+/// permitted iff `permit_lan`.
+///
+/// The built-in `dmz -> wan` permit has to go: with it, moving `reth1.0` into
+/// `dmz` lands in a zone that IS permitted, so the live pair would be admitted
+/// and the cell could not observe the move at all. Removing it is what makes
+/// `dmz` the "moved somewhere with no permit" zone.
+fn forwarding_with_ingress_zone_9384(ingress_zone: &str, permit_lan: bool) -> ForwardingState {
+    let mut snapshot = policy_deny_snapshot();
+    snapshot.generation = 7;
+    snapshot.fib_generation = 9;
+    snapshot.policies.clear();
+    for iface in snapshot.interfaces.iter_mut() {
+        if iface.ifindex == LAN_IFINDEX {
+            iface.zone = ingress_zone.to_string();
+        }
+    }
+    if permit_lan {
+        snapshot.policies.push(PolicyRuleSnapshot {
+            name: "lan-out".into(),
+            from_zone: "lan".into(),
+            to_zone: "wan".into(),
+            source_addresses: vec!["any".into()],
+            destination_addresses: vec!["any".into()],
+            applications: vec!["any".into()],
+            application_terms: Vec::new(),
+            action: "permit".into(),
+            ..Default::default()
+        });
+    }
+    build_forwarding_state(&snapshot)
+}
+
+/// Install ONE established session whose ENTRY records `entry_ingress_zone`, then
+/// drive one packet of it arriving on `reth1.0` — which the live config now
+/// places in `live_ingress_zone`.
+fn drive_moved_interface_9384(
+    entry_ingress_zone: u16,
+    live_ingress_zone: &str,
+    permit_lan: bool,
+) -> Outcome {
+    let forwarding = forwarding_with_ingress_zone_9384(live_ingress_zone, permit_lan);
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, LAN_IFINDEX, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let ha_state = txn_ha_state();
+
+    let mut sessions = SessionTable::new();
+    let metadata = SessionMetadata {
+        ingress_zone: entry_ingress_zone,
+        egress_zone: TEST_WAN_ZONE_ID,
+        ..metadata(false)
+    };
+    assert!(
+        sessions.install_with_protocol_with_origin(
+            flow_key_to(DST),
+            decision(WAN_IFINDEX),
+            metadata,
+            SessionOrigin::ForwardFlow,
+            122_000_000_000,
+            PROTO_TCP,
+            0,
+        ),
+        "the fixture must install the session, or every assertion below is vacuous"
+    );
+
+    let frame = build_txn_tcp_syn_frame_v4(SRC, DST, SPORT, DPORT, TCP_ACK);
+    let meta = txn_meta_v4(LAN_IFINDEX as u32, TCP_ACK, frame.len() as u16);
+    let (_batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+    assert_eq!(
+        dbg.session_hit, 1,
+        "the packet must HIT the installed session, or the revoke assertion is \
+         vacuous (#9384)"
+    );
+    Outcome {
+        sessions,
+        revoked: dbg.policy_revoked_sessions,
+    }
+}
+
+/// THE DEFECT. The session was admitted when `reth1.0` was in `lan`; the operator
+/// has since MOVED it into `dmz`, and only `lan -> wan` is permitted.
+///
+/// Before #9384 the entry's `lan` won as the from-zone override, the pair
+/// evaluated was still `lan -> wan`, the session was judged permitted and
+/// re-stamped, and it kept forwarding — so a security-intent operation silently
+/// did not take effect on live traffic.
+#[test]
+fn an_ingress_side_interface_zone_move_revokes_the_established_session_9384() {
+    let out = drive_moved_interface_9384(TEST_LAN_ZONE_ID, "dmz", true);
+    assert_eq!(
+        out.revoked, 1,
+        "the arrival interface now lives in `dmz` and only `lan -> wan` is \
+         permitted, so the live pair `dmz -> wan` is not admitted and the session \
+         MUST be revoked. 0 means the from-zone still came from the session ENTRY, \
+         so an operator who moved an interface out of a permitted zone to cut off \
+         access cut off new flows only (#9384)"
+    );
+    assert_eq!(
+        session_count(&out.sessions),
+        0,
+        "the moved interface's session must be torn down, not merely counted"
+    );
+}
+
+/// CONTROL 1, and it is the one that stops "revoke on any disagreement". The
+/// interface moved, entry and live zone DISAGREE exactly as above, but the zone
+/// it moved INTO is permitted — `lan -> wan` is gone and `dmz -> wan` is the
+/// permit. Nothing may be revoked.
+#[test]
+fn a_move_into_a_still_permitted_zone_does_not_revoke_9384() {
+    let forwarding = {
+        let mut snapshot = policy_deny_snapshot();
+        snapshot.generation = 7;
+        snapshot.fib_generation = 9;
+        snapshot.policies.clear();
+        for iface in snapshot.interfaces.iter_mut() {
+            if iface.ifindex == LAN_IFINDEX {
+                iface.zone = "dmz".to_string();
+            }
+        }
+        snapshot.policies.push(PolicyRuleSnapshot {
+            name: "dmz-out".into(),
+            from_zone: "dmz".into(),
+            to_zone: "wan".into(),
+            source_addresses: vec!["any".into()],
+            destination_addresses: vec!["any".into()],
+            applications: vec!["any".into()],
+            application_terms: Vec::new(),
+            action: "permit".into(),
+            ..Default::default()
+        });
+        build_forwarding_state(&snapshot)
+    };
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, LAN_IFINDEX, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let ha_state = txn_ha_state();
+    let mut sessions = SessionTable::new();
+    // The ENTRY still says `lan` — the session predates the move.
+    let metadata = SessionMetadata {
+        ingress_zone: TEST_LAN_ZONE_ID,
+        egress_zone: TEST_WAN_ZONE_ID,
+        ..metadata(false)
+    };
+    assert!(sessions.install_with_protocol_with_origin(
+        flow_key_to(DST),
+        decision(WAN_IFINDEX),
+        metadata,
+        SessionOrigin::ForwardFlow,
+        122_000_000_000,
+        PROTO_TCP,
+        0,
+    ));
+    let frame = build_txn_tcp_syn_frame_v4(SRC, DST, SPORT, DPORT, TCP_ACK);
+    let meta = txn_meta_v4(LAN_IFINDEX as u32, TCP_ACK, frame.len() as u16);
+    let (_batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+    assert_eq!(dbg.session_hit, 1, "the packet must hit the session");
+    assert_eq!(
+        dbg.policy_revoked_sessions, 0,
+        "the interface moved, so entry and live zone DISAGREE — but the zone it \
+         moved into IS permitted, so the live pair `dmz -> wan` is admitted and \
+         nothing may be revoked. A non-zero count means the fix revokes on \
+         DISAGREEMENT rather than on the live VERDICT (#9384)"
+    );
+    assert_eq!(
+        session_count(&sessions),
+        1,
+        "a session whose new zone is still permitted must survive"
+    );
+}
+
+/// CONTROL 2: entry and live zone AGREE and the pair is permitted. Nothing may be
+/// revoked. This is what "always revoke" fails.
+#[test]
+fn an_unmoved_interface_in_a_permitted_zone_survives_9384() {
+    let out = drive_moved_interface_9384(TEST_LAN_ZONE_ID, "lan", true);
+    assert_eq!(
+        out.revoked, 0,
+        "entry and live zone agree and `lan -> wan` is permitted; nothing may be \
+         revoked. A non-zero count means the live-from-zone resolution revokes \
+         unconditionally (#9384)"
+    );
+    assert_eq!(session_count(&out.sessions), 1);
+}
+
+/// CONTROL 3, the harness control: entry and live zone AGREE on a zone that is
+/// NOT permitted. This is the row that proves the fixture and the harness can
+/// observe a revocation for this zone pair at all — without it, the defect cell's
+/// `revoked == 1` could be read as "something else in this fixture revokes".
+#[test]
+fn an_unmoved_interface_in_an_unpermitted_zone_revokes_9384() {
+    let out = drive_moved_interface_9384(TEST_DMZ_ZONE_ID, "dmz", true);
+    assert_eq!(
+        out.revoked, 1,
+        "entry and live zone agree on `dmz`, which is not permitted — the \
+         harness must see a revocation for this pair"
+    );
+    assert_eq!(session_count(&out.sessions), 0);
+}
+
+/// THE RESIDUAL, pinned as a DECISION rather than left to be discovered. An
+/// interface moved out of EVERY zone resolves to the unknown-zone sentinel 0, and
+/// the pre-existing `from_id == 0` arm DECLINES rather than revoking.
+///
+/// That arm exists because a zone lookup failure is not a verdict, and revoking
+/// on one is the mass-teardown risk (#6722's MAC-less egress is the reachable
+/// case). An ingress in no zone is also not an ordinary configuration. This cell
+/// is a CHANGE DETECTOR, not a defect guard: it states what the tree does today
+/// so that a future change to it is deliberate and visible.
+#[test]
+fn an_ingress_moved_to_no_zone_declines_rather_than_revoking_9384() {
+    let out = drive_moved_interface_9384(TEST_LAN_ZONE_ID, "", true);
+    assert_eq!(
+        out.revoked, 0,
+        "an arrival interface in NO zone resolves to the unknown-zone sentinel, \
+         which is a LOOKUP FAILURE and not a verdict, so the derivation DECLINES. \
+         This is the documented #9384 residual, not an accident — see the \
+         `from_id == 0` arm's comment (#9384)"
+    );
+    assert_eq!(
+        session_count(&out.sessions),
+        1,
+        "the session survives an unzoned arrival"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #9381 relay: does `default-policy reject` make the revoke arm INERT?
+// ---------------------------------------------------------------------------
+//
+// A concern was raised on #9381 that the defect might be WIDER than its title —
+// that a box configured `set security policies default-policy reject` could make
+// the whole revoke arm inert appliance-wide — with the counter-intuition that
+// under default-reject one would expect OVER-revocation, not inertness.
+//
+// Both halves of that are right, about different tenses, and the cell below is
+// what settles it rather than arguing it:
+//
+//   * `default_policy` is parsed by the SAME `parse_action` as a rule's action
+//     (`policy.rs`), so `"reject"` yields `PolicyAction::Reject` as
+//     `state.default_action`. Every flow matching no rule therefore gets a
+//     REJECT verdict, not a DENY one.
+//   * PRE-#9381, the arm read `!matches!(result.action, Deny)`, so every one of
+//     those sessions took the PERMIT exit and was STAMPED revalidated. On a
+//     default-reject box that is the entire default-verdict population — which
+//     IS strictly wider than #9381's title, which named only a rule narrowed
+//     `permit` -> `reject`.
+//   * POST-#9381 the predicate is `matches!(.., Permit)`, so the same sessions
+//     revoke exactly as they do under default-DENY. That is the over-revocation
+//     the counter-intuition expected, and it is the correct verdict: nothing
+//     permits those flows.
+//
+// So the concern describes a real, larger consequence of the SAME one-token
+// defect, already closed by #9381 — not a residual and not a separate defect.
+// This cell exists because #9381's own cells sampled the terminal-action axis
+// only through an explicit RULE, and the default-verdict path reaches
+// `evaluate_policy_result_with_icmp`'s default-counter exit rather than
+// `try_match_rule`. Those are two different code paths to the same predicate.
+
+/// The `default-policy reject` shape. No `lan -> wan` rule at all, and the
+/// implicit default is REJECT rather than DENY, so the live verdict for this
+/// established session is a default-policy `Reject`.
+///
+/// FAIL-ON-REVERT for #9381 through the DEFAULT path: restore
+/// `!matches!(result.action, PolicyAction::Deny)` and this goes red alongside
+/// the explicit-rule cell, which is the measurement that says the two paths
+/// share one predicate.
+#[test]
+fn a_default_policy_of_reject_still_revokes_the_established_session_9381() {
+    let forwarding = {
+        let mut snapshot = policy_deny_snapshot();
+        snapshot.generation = 7;
+        snapshot.fib_generation = 9;
+        // The whole point: the IMPLICIT default is reject, not deny.
+        snapshot.default_policy = "reject".to_string();
+        snapshot.policies.clear();
+        build_forwarding_state(&snapshot)
+    };
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, LAN_IFINDEX, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let ha_state = txn_ha_state();
+    let mut sessions = SessionTable::new();
+    assert!(sessions.install_with_protocol_with_origin(
+        flow_key_to(DST),
+        decision(WAN_IFINDEX),
+        metadata(false),
+        SessionOrigin::ForwardFlow,
+        122_000_000_000,
+        PROTO_TCP,
+        0,
+    ));
+    let frame = build_txn_tcp_syn_frame_v4(SRC, DST, SPORT, DPORT, TCP_ACK);
+    let meta = txn_meta_v4(LAN_IFINDEX as u32, TCP_ACK, frame.len() as u16);
+    let (_batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+    assert_eq!(
+        dbg.session_hit, 1,
+        "the packet must HIT the session, or the assertion below is vacuous"
+    );
+    assert_eq!(
+        dbg.policy_revoked_sessions, 1,
+        "an IMPLICIT default-policy verdict of `reject` is terminal \
+         non-forwarding exactly as an explicit rule's `reject` is, and must \
+         revoke. 0 here is the pre-#9381 state, and on a `default-policy reject` \
+         box that is not one rule's worth of sessions — it is the whole \
+         default-verdict population, which is strictly wider than #9381's title \
+         claimed (#9381)"
+    );
+    assert_eq!(
+        session_count(&sessions),
+        0,
+        "the session must be torn down, not merely counted"
+    );
+}
+
+/// The CONTROL for the cell above. Same `default-policy reject` snapshot, but
+/// `lan -> wan` IS permitted, so the default is never reached.
+///
+/// Without it, "revoked == 1" above is satisfied by a box that revokes every
+/// session whenever the default action is non-permit, regardless of whether a
+/// rule admits the flow — which would tear down every permitted session on a
+/// default-reject appliance.
+#[test]
+fn a_default_policy_of_reject_does_not_revoke_a_permitted_flow_9381() {
+    let forwarding = {
+        let mut snapshot = policy_deny_snapshot();
+        snapshot.generation = 7;
+        snapshot.fib_generation = 9;
+        snapshot.default_policy = "reject".to_string();
+        snapshot.policies.clear();
+        snapshot.policies.push(PolicyRuleSnapshot {
+            name: "lan-out".into(),
+            from_zone: "lan".into(),
+            to_zone: "wan".into(),
+            source_addresses: vec!["any".into()],
+            destination_addresses: vec!["any".into()],
+            applications: vec!["any".into()],
+            application_terms: Vec::new(),
+            action: "permit".into(),
+            ..Default::default()
+        });
+        build_forwarding_state(&snapshot)
+    };
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, LAN_IFINDEX, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let ha_state = txn_ha_state();
+    let mut sessions = SessionTable::new();
+    assert!(sessions.install_with_protocol_with_origin(
+        flow_key_to(DST),
+        decision(WAN_IFINDEX),
+        metadata(false),
+        SessionOrigin::ForwardFlow,
+        122_000_000_000,
+        PROTO_TCP,
+        0,
+    ));
+    let frame = build_txn_tcp_syn_frame_v4(SRC, DST, SPORT, DPORT, TCP_ACK);
+    let meta = txn_meta_v4(LAN_IFINDEX as u32, TCP_ACK, frame.len() as u16);
+    let (_batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+    assert_eq!(dbg.session_hit, 1, "the packet must hit the session");
+    assert_eq!(
+        dbg.policy_revoked_sessions, 0,
+        "an explicit permit matches, so the `reject` default is never reached \
+         and nothing may be revoked. A non-zero count means a default-reject \
+         appliance tears down every established session on the first packet \
+         after any commit (#9381)"
+    );
+    assert_eq!(session_count(&sessions), 1);
+}

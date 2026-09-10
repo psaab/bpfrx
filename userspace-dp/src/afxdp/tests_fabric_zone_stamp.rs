@@ -1435,3 +1435,171 @@ fn should_seed_fabric_punt_binds_each_condition_7770() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// #9384: the FABRIC-INGRESS exemption from the live from-zone resolution.
+// ---------------------------------------------------------------------------
+//
+// #9384 made the #8356 zone-policy re-derivation resolve the FROM-zone live from
+// the interface the packet arrived on, symmetric with the to-zone. A
+// fabric-punted packet must be EXEMPT and keep the session entry's recorded zone:
+// it arrives on the fabric link from the peer node, so its arrival zone is
+// structurally not the flow's.
+//
+// THIS CELL IS THE REASON THE EXEMPTION IS NOT OPTIONAL, and the fixture detail
+// that makes it non-vacuous is that the fabric parent is ZONED. On the shipped
+// cluster config (`docs/ha-cluster-userspace.conf`) `fab0` sits in the `control`
+// zone, and `ifindex_to_zone_id` PROPAGATES a zoned child unit's zone onto its
+// parent (#921/#3618) — so a fabric arrival on `ge-0-0-0` resolves live to
+// `control`, for which no policy permits `-> wan`. Without the exemption the
+// re-derivation would evaluate `control -> wan`, find nothing, fall to
+// `default_policy: deny` and REVOKE every established cross-chassis session on
+// the first packet after any commit. That is a correctness break, not a
+// hardening — it is TCP death on VRRP failback, which the fabric redirect exists
+// to prevent.
+//
+// An UNZONED fabric parent would make this cell pass either way: the live
+// resolution would yield the unknown-zone sentinel 0 and the pre-existing
+// `from_id == 0` DECLINE arm would return None. So the zone on the parent is
+// load-bearing fixture state, not decoration.
+
+/// `nat_snapshot_with_fabric` with the fabric parent placed in a `control` zone
+/// that has no policy to `wan` — the shipped cluster's actual posture.
+fn fabric_snapshot_with_zoned_parent_9384() -> ConfigSnapshot {
+    let mut snapshot = nat_snapshot_with_fabric();
+    snapshot.zones.push(ZoneSnapshot {
+        name: "control".to_string(),
+        id: TEST_SFMIX_ZONE_ID,
+        host_inbound_configured: true,
+        host_inbound_system_services: vec!["any-service".to_string()],
+        ..Default::default()
+    });
+    for iface in snapshot.interfaces.iter_mut() {
+        if iface.ifindex == 21 {
+            iface.zone = "control".to_string();
+        }
+    }
+    snapshot
+}
+
+/// THE CROSS-CHASSIS REGRESSION CONTROL. An established session imported from
+/// the peer (entry `ingress_zone = lan`, `fabric_ingress: true`) receives another
+/// fabric-punted packet. The entry's zone must win, so `lan -> wan` is still the
+/// pair evaluated and nothing is revoked.
+///
+/// FAIL-ON-REVERT: drop the fabric exemption — resolve the from-zone live for a
+/// fabric arrival too — and this goes RED with `revoked == 1`, because the
+/// fabric parent resolves to `control` and nothing permits `control -> wan`.
+/// Passing `false` for `packet_fabric_ingress` at the call site reds it the same
+/// way, which is what binds the WIRING rather than the function.
+#[test]
+fn a_fabric_punted_packet_keeps_the_entrys_ingress_zone_9384() {
+    let forwarding = build_forwarding_state(&fabric_snapshot_with_zoned_parent_9384());
+    // Non-vacuity: the fabric parent must really resolve to a ZONE. With zone 0
+    // the pre-existing unknown-zone DECLINE would carry this cell for free.
+    assert_eq!(
+        forwarding.ifindex_to_zone_id.get(&21).copied(),
+        Some(TEST_SFMIX_ZONE_ID),
+        "the fabric parent must be ZONED for this cell to distinguish the \
+         exemption from the unknown-zone decline (#9384)"
+    );
+    let now_secs = monotonic_nanos() / 1_000_000_000;
+    // Split placement: WAN RG (1) local, LAN RG (2) the peer's — the placement
+    // in which a #6458-validated stamp survives.
+    let ha_state = BTreeMap::from([(1, active_rg(now_secs))]);
+
+    let mut sessions = SessionTable::new();
+    let key = crate::session::SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+        src_port: 12345,
+        dst_port: 443,
+        discriminator: Default::default(),
+        routing_domain: 0,
+    };
+    let metadata = SessionMetadata {
+        ingress_zone: TEST_LAN_ZONE_ID,
+        egress_zone: TEST_WAN_ZONE_ID,
+        ingress_ifindex: 21,
+        ingress_vlan_id: 0,
+        owner_rg_id: 1,
+        // The session was imported from the peer over the fabric.
+        fabric_ingress: true,
+        is_reverse: false,
+        nat64_reverse: None,
+        log_session_init: false,
+        log_session_close: false,
+        policy_id: 0,
+        inactivity_timeout_ns: None,
+        policy_counter_idx: 0,
+        policy_counter: None,
+    };
+    assert!(
+        sessions.install_with_protocol_with_origin(
+            key,
+            SessionDecision {
+                resolution: ForwardingResolution {
+                    disposition: ForwardingDisposition::ForwardCandidate,
+                    local_ifindex: 0,
+                    egress_ifindex: 12,
+                    tx_ifindex: 11,
+                    tunnel_endpoint_id: 0,
+                    next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 1))),
+                    neighbor_mac: Some([0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]),
+                    src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+                    tx_vlan_id: 80,
+                },
+                nat: NatDecision::default(),
+            },
+            metadata,
+            SessionOrigin::SyncImport,
+            122_000_000_000,
+            PROTO_TCP,
+            0,
+        ),
+        "the imported session must install, or the assertion below is vacuous"
+    );
+
+    let mut frame = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(8, 8, 8, 8),
+        12345,
+        443,
+        TCP_FLAG_ACK,
+    );
+    let [hi, lo] = TEST_LAN_ZONE_ID.to_be_bytes();
+    frame[0..6].copy_from_slice(&[0x02, 0xbf, 0x72, 0xff, 0x00, 0x01]);
+    frame[6..12].copy_from_slice(&[0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, hi, lo]);
+    let meta = txn_meta_v4(21, TCP_FLAG_ACK, frame.len() as u16);
+
+    let mut binding = fabric_binding();
+    let (_batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+    assert_eq!(
+        dbg.session_hit, 1,
+        "the fabric-punted packet must HIT the imported session, or the \
+         revoke assertion is vacuous (#9384)"
+    );
+    assert_eq!(
+        dbg.policy_revoked_sessions, 0,
+        "a FABRIC-punted packet must keep the session entry's recorded ingress \
+         zone. Resolving the from-zone live here evaluates (control -> wan) — the \
+         fabric parent's own zone — which nothing permits, so every established \
+         cross-chassis session would be revoked on the first packet after any \
+         commit. That is TCP death on VRRP failback, which the fabric redirect \
+         exists to prevent (#9384)"
+    );
+    assert_eq!(
+        sessions.len(),
+        1,
+        "the imported cross-chassis session must survive"
+    );
+}
