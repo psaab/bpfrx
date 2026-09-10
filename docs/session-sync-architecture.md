@@ -702,6 +702,57 @@ That control request is synchronous — the helper enqueues the export to every
 worker, waits for their acks, and returns the drained delta set in the response
 (`afxdp/ha/export.rs`, `OwnerRgExportWait::wait_and_collect`).
 
+**The resolver reaches that method by RUNTIME TYPE ASSERTION, and that seam
+silently broke the whole cold prime once (#9482).** `userspaceBulkSnapshot` does:
+
+```go
+exporter, ok := d.dataplane().(userspaceSessionExporter)
+if !ok { return ..., errors.New("dataplane does not export owner-RG sessions") }
+```
+
+`userspaceSessionExporter` (unexported, `pkg/daemon`) names exactly one method,
+and #9344 changed WHICH one — from `ExportOwnerRGSessions(rgIDs, max)` to
+`ExportOwnerRGSessionsPaged(rgIDs)` — adding the new method to
+`*dpuserspace.Manager`. But the value the daemon publishes for the userspace
+backend is `*LegacyDataPlaneAdapter` (`dpuserspace.Boot()` returns
+`NewLegacyDataPlaneAdapter(New())`), a hand-written forwarding subset of the
+Manager, and the new method was not added to it. The assertion then failed on the
+ONLY type it is ever handed. Measured on the loss userspace cluster: BOTH nodes
+logged
+
+```
+cluster sync: owed cold-prime re-drive failed, will retry
+  err="bulk sync table-truth snapshot: dataplane does not export owner-RG sessions"
+```
+
+once a minute, indefinitely, and every cold-start edge logged `bulk sync failed`
+with the same cause. `doBulkSync` fails CLOSED — correctly — so a rejoining node
+received **no bulk window at all**, only whatever incremental deltas arrived
+afterwards.
+
+Three things about that seam are worth keeping:
+
+- **A runtime type assertion has no compile-time edge.** The two sides drifted and
+  nothing said so until a cluster rejoined in production. The belt is now
+  `pkg/daemon/bulk_snapshot_published_type_9482.go`, which spells the real
+  interface and the real published types in one expression, so either side
+  drifting breaks the BUILD. It asserts BOTH `*LegacyDataPlaneAdapter` and
+  `*Manager`, because `pkg/dataplane/userspace` declares exactly those two as
+  `dataplane.RuntimeDataPlane` — asserting only the one that broke would leave the
+  identical hole in its already-publishable sibling.
+- **Every pre-existing test was blind to it by construction.** `wiringExporterDP`
+  (#7259) and `recordingExporter` (#6031) each declare
+  `ExportOwnerRGSessionsPaged` on themselves, so the family proves the resolver
+  correct *for a type that satisfies the interface* and says nothing about the type
+  production publishes. Deleting the adapter's forwarder leaves all of them green.
+  The #9482 cells go through `dpuserspace.Boot()` instead of a fake.
+- **Scope, because it is easy to misread.** This is why the #7162 startup
+  promotion hold always ran its full 30s and always released `timeout-degraded`
+  (the `bulk-sync-complete` edge it prefers could never fire). It is NOT why a
+  manual failover left an RG owned by neither node — that was #9452's readiness
+  gate, which is fixed separately, and which is documented as releasing on its own
+  timer regardless of sync state. #9452 was not incompletely fixed.
+
 **The window is PAGED, and it has a terminating bound (#9344).** Until #9344 the
 caller asked for `max = 0`, the UNBOUNDED set, because a capped export truncated
 the window and the peer deleted the remainder — so the one knob the call
