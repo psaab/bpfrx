@@ -545,6 +545,7 @@ fn resolve_flow_session_decision_promotes_stale_fabric_shared_hit_to_local_owner
         PROTO_TCP,
         0x18,
         21,
+        0, // #9383: arrival VLAN (untagged in this fixture)
         true,
         0,
         0,
@@ -1368,6 +1369,7 @@ fn resolve_flow_session_decision_uses_canonical_key_for_translated_forward_hit()
         PROTO_TCP,
         0x10,
         0,
+        0, // #9383: arrival VLAN (untagged in this fixture)
         false,
         0,
         0,
@@ -1460,6 +1462,7 @@ fn resolve_flow_session_decision_promotes_translated_shared_hit_on_active_fabric
         PROTO_TCP,
         0x18,
         21,
+        0, // #9383: arrival VLAN (untagged in this fixture)
         true,
         0,
         0,
@@ -1553,6 +1556,7 @@ fn resolve_flow_session_decision_promotes_local_synced_translated_hit_on_active_
         PROTO_TCP,
         0x18,
         21,
+        0, // #9383: arrival VLAN (untagged in this fixture)
         true,
         0,
         0,
@@ -1648,6 +1652,7 @@ fn resolve_flow_session_decision_keeps_translated_shared_hit_transient_on_inacti
         PROTO_TCP,
         0x18,
         21,
+        0, // #9383: arrival VLAN (untagged in this fixture)
         true,
         0,
         0,
@@ -1734,6 +1739,7 @@ fn resolve_flow_session_decision_keeps_translated_shared_hit_transient_on_inacti
         PROTO_TCP,
         0x18,
         12,
+        0, // #9383: arrival VLAN (untagged in this fixture)
         false,
         0,
         0,
@@ -1811,6 +1817,7 @@ fn resolve_flow_session_decision_keeps_local_synced_translated_hit_transient_on_
         PROTO_TCP,
         0x18,
         12,
+        0, // #9383: arrival VLAN (untagged in this fixture)
         false,
         0,
         0,
@@ -2220,6 +2227,7 @@ fn demoted_local_session_promotes_as_synced_on_failback_lookup() {
         PROTO_TCP,
         0x10,
         6,
+        0, // #9383: arrival VLAN (untagged in this fixture)
         false,
         0,
         0,
@@ -4606,6 +4614,7 @@ fn synced_session_hit_recomputes_local_resolution_after_failover() {
         PROTO_TCP,
         0x10,
         5,
+        0, // #9383: arrival VLAN (untagged in this fixture)
         false,
         0,
         0,
@@ -4725,6 +4734,7 @@ fn reverse_materialized_shared_hit_adopts_replica_session_id_6313() {
             PROTO_TCP,
             TCP_FLAG_ACK,
             5,
+            0, // #9383: arrival VLAN (untagged in this fixture)
             false,
             0,
             0,
@@ -8001,9 +8011,13 @@ fn a_synthesized_reverse_records_no_ingress_ifindex_7169() {
 /// Changing that one argument to `Unconstrained` reopens the hole completely
 /// and leaves every cell above green.
 ///
-/// Source-shape because a behavioural cell would need to drive a ~20-argument
-/// function through a full session install; the property here is which argument
-/// the call site passes, which is exactly what source shape can state.
+/// Source-shape for the call-site SHAPE only. #9383 added the behavioural half —
+/// `a_reply_on_an_unzoned_trunk_unit_installs_no_reverse_session_9383` drives this
+/// function with a trunk arrival and asserts the reverse install, with a
+/// zoned-sibling positive control — so this cell is no longer the only thing
+/// standing behind the invariant, and its old claim that "a behavioural cell
+/// would need to drive a ~20-argument function through a full session install"
+/// was an argument for not writing the cell that mattered.
 /// Comments are stripped: this file names the symbols, and an unstripped scan
 /// would match the prose describing the invariant rather than the invariant.
 #[test]
@@ -8029,11 +8043,33 @@ fn the_main_path_passes_a_resolved_arrival_zone_7169() {
         "session_glue/mod.rs no longer calls lookup_forward_nat_across_scopes — \
          this guard is scanning for something that no longer exists"
     );
+    // #9383: this used to assert the literal substring
+    // `ifindex_to_zone_id.get(&ingress_ifindex)` — i.e. the RAW PHYSICAL key,
+    // which was the defect. A literal-source assertion cannot tell "the call
+    // site changed because someone broke it" from "the call site changed because
+    // someone FIXED it": it only knows the bytes moved. So the correct fix reddened
+    // this cell with a message saying the fix REOPENED the hole it was closing,
+    // which is about the strongest possible signal to stop and revert.
+    //
+    // Re-anchored to the two properties that are actually invariant: a zone IS
+    // resolved from the arrival, and it is resolved from the LOGICAL unit. The
+    // BEHAVIOUR is bound by `a_reply_on_an_unzoned_trunk_unit_installs_no_reverse_session_9383`
+    // and its zoned-sibling positive control, which is where a reader should go;
+    // this cell only keeps the call-site shape honest.
     assert!(
-        code.contains("ifindex_to_zone_id.get(&ingress_ifindex)"),
-        "the main path must resolve the ARRIVAL interface to a zone. Without \
-         this the reverse-canonical match is decided by tuple equality alone \
-         (#7169)"
+        code.contains("resolve_ingress_logical_ifindex("),
+        "the main path must resolve the arrival's LOGICAL (VLAN unit) ifindex \
+         before reading the zone ledger. `ifindex_to_zone_id` propagates a zoned \
+         child unit's zone onto its PARENT (#921/#3618), so keying it on the raw \
+         physical `meta.ingress_ifindex` returns a DIFFERENT ANSWER on a trunk \
+         whose units sit in different zones — and a wrong arrival zone here MINTS \
+         a reverse session that is then exempt from policy re-derivation (#9383)"
+    );
+    assert!(
+        code.contains("ifindex_to_zone_id.get(&arrival_logical)"),
+        "the resolved LOGICAL ifindex must be what keys the zone ledger. \
+         Resolving it and then looking up the physical index anyway is the \
+         defect with an extra line (#9383)"
     );
     assert!(
         code.contains("ReverseIngress::Unzoned"),
@@ -9503,5 +9539,329 @@ fn arming_restarts_an_in_flight_sweep_9327() {
         0,
         "#9327: an epoch bump must restart the sweep. The shared map changed, so \
          every slot already judged against the previous map has to be re-examined."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #9383: the #7169 reverse-session synthesis resolves the LOGICAL arrival unit.
+// ---------------------------------------------------------------------------
+//
+// `ForwardingState::ifindex_to_zone_id` deliberately PROPAGATES a zoned child
+// unit's zone onto its parent's ifindex (#921/#3618) so that untagged traffic on
+// a trunk parent is attributed to its unit's zone. The consequence is that the
+// RAW PHYSICAL key and the LOGICAL (VLAN unit) key can return DIFFERENT ANSWERS
+// for the same frame — not two spellings of one answer — and until #9383 this
+// site used the physical one while every zone / filter / pre-routing-NAT
+// admission site resolved the logical unit first (#3021/#5802).
+//
+// WHY THIS SITE AND NOT ANOTHER. A match admitted against a wrong arrival zone
+// makes `install_reverse_session_from_forward_match` MINT a reverse session, and
+// reverse entries are exempt from zone-policy re-derivation by design
+// (`poll_descriptor/policy_revalidation.rs`, gate 1), so the synthesized session
+// then rides the established fast path with no further adjudication.
+//
+// THE PAIR IS THE CELL. `..._installs_no_reverse_session_9383` alone is
+// satisfied by "never synthesize a reverse session", which would break the
+// reply of every NAT'd flow in the box; `..._still_installs_one_9383` is the
+// positive control that rules that out, and it differs from its partner in ONE
+// byte of input — the arrival VLAN id. Without it, "no reverse session" and "the
+// harness never had a forward match to find" are the same observation.
+
+const TRUNK_PARENT_IFINDEX: i32 = 41;
+const TRUNK_ZONED_UNIT_IFINDEX: i32 = 42;
+const TRUNK_UNZONED_UNIT_IFINDEX: i32 = 43;
+const TRUNK_ZONED_VLAN: u16 = 50;
+const TRUNK_UNZONED_VLAN: u16 = 80;
+
+/// A trunk whose two units EACH own a netdev under one parent: unit 42 in `wan`
+/// (the zone the forward flow egresses to) and unit 43 in NO zone, both
+/// `parent_ifindex = 41`. The forward flow ingresses on `reth1.0` in `lan`.
+fn trunk_snapshot_9383() -> crate::ConfigSnapshot {
+    crate::ConfigSnapshot {
+        generation: 7,
+        fib_generation: 9,
+        default_policy: "deny".to_string(),
+        zones: vec![
+            crate::ZoneSnapshot {
+                name: "lan".to_string(),
+                id: TEST_LAN_ZONE_ID,
+                ..Default::default()
+            },
+            crate::ZoneSnapshot {
+                name: "wan".to_string(),
+                id: TEST_WAN_ZONE_ID,
+                ..Default::default()
+            },
+        ],
+        interfaces: vec![
+            crate::InterfaceSnapshot {
+                name: "reth1.0".to_string(),
+                zone: "lan".to_string(),
+                linux_name: "ge-0-0-1".to_string(),
+                ifindex: 6,
+                mtu: 1500,
+                hardware_addr: "02:bf:72:01:00:01".to_string(),
+                addresses: vec![crate::InterfaceAddressSnapshot {
+                    family: "inet".to_string(),
+                    address: "10.0.61.1/24".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            // The ZONED trunk unit. Its zone is what propagates onto parent 41.
+            crate::InterfaceSnapshot {
+                name: "reth0.50".to_string(),
+                zone: "wan".to_string(),
+                linux_name: "ge-0-0-2.50".to_string(),
+                ifindex: TRUNK_ZONED_UNIT_IFINDEX,
+                parent_ifindex: TRUNK_PARENT_IFINDEX,
+                vlan_id: TRUNK_ZONED_VLAN as i32,
+                mtu: 1500,
+                hardware_addr: "02:bf:72:00:80:08".to_string(),
+                addresses: vec![crate::InterfaceAddressSnapshot {
+                    family: "inet".to_string(),
+                    address: "172.16.50.8/24".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            // The UNZONED trunk unit, on its OWN netdev. An EMPTY zone is the
+            // legitimate "no zone" case (#2391), not a snapshot error.
+            crate::InterfaceSnapshot {
+                name: "reth0.80".to_string(),
+                zone: String::new(),
+                linux_name: "ge-0-0-2.80".to_string(),
+                ifindex: TRUNK_UNZONED_UNIT_IFINDEX,
+                parent_ifindex: TRUNK_PARENT_IFINDEX,
+                vlan_id: TRUNK_UNZONED_VLAN as i32,
+                mtu: 1500,
+                hardware_addr: "02:bf:72:00:80:50".to_string(),
+                addresses: vec![crate::InterfaceAddressSnapshot {
+                    family: "inet".to_string(),
+                    address: "172.16.80.8/24".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    }
+}
+
+/// THE PREMISE, measured rather than assumed. The disputed question in #9383 was
+/// whether a Go-shaped snapshot can put a zone on the PARENT while the ARRIVAL
+/// unit has none. It can, and this is the row shape that makes the two lookups
+/// disagree.
+///
+/// If this cell ever fails, the behavioural pair below is testing nothing: both
+/// arrivals would resolve to the same zone and the cells would pass for free.
+#[test]
+fn a_trunk_parent_carries_its_zoned_units_zone_while_a_sibling_has_none_9383() {
+    let forwarding =
+        crate::afxdp::forwarding_build::build_forwarding_state(&trunk_snapshot_9383());
+    assert_eq!(
+        forwarding
+            .ifindex_to_zone_id
+            .get(&TRUNK_PARENT_IFINDEX)
+            .copied(),
+        Some(TEST_WAN_ZONE_ID),
+        "the zoned unit's zone must PROPAGATE onto the trunk parent (#921/#3618) \
+         — this is what makes the raw-physical key answer `wan`"
+    );
+    assert_eq!(
+        forwarding
+            .ifindex_to_zone_id
+            .get(&TRUNK_UNZONED_UNIT_IFINDEX)
+            .copied(),
+        None,
+        "the unzoned sibling unit must carry NO zone — this is what makes the \
+         LOGICAL key answer `unzoned` for the same frame"
+    );
+    assert_eq!(
+        crate::afxdp::forwarding::resolve_ingress_logical_ifindex(
+            &forwarding,
+            TRUNK_PARENT_IFINDEX,
+            TRUNK_UNZONED_VLAN,
+        ),
+        Some(TRUNK_UNZONED_UNIT_IFINDEX),
+        "a frame tagged with the unzoned unit's VLAN must resolve to that UNIT, \
+         not to the parent (#3021/#5802)"
+    );
+    assert_eq!(
+        crate::afxdp::forwarding::resolve_ingress_logical_ifindex(
+            &forwarding,
+            TRUNK_PARENT_IFINDEX,
+            TRUNK_ZONED_VLAN,
+        ),
+        Some(TRUNK_ZONED_UNIT_IFINDEX),
+        "and the zoned unit's VLAN must resolve to the zoned unit — the control's \
+         precondition"
+    );
+}
+
+/// Drive the #7169 reverse-synthesis path with a reply arriving on the trunk
+/// PARENT carrying `arrival_vlan`. Returns `(resolved.is_some(), session count)`.
+///
+/// One forward NAT'd session is pre-installed, egressing to `wan`, so
+/// `find_forward_nat_match` HAS a candidate to revalidate — which is what makes
+/// a "no reverse session" outcome attributable to the zone check rather than to
+/// an empty table.
+fn drive_trunk_reply_9383(arrival_vlan: u16) -> (bool, usize) {
+    let forwarding =
+        crate::afxdp::forwarding_build::build_forwarding_state(&trunk_snapshot_9383());
+    let mut sessions = SessionTable::new();
+    let fwd_key = SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 5)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)),
+        src_port: 40000,
+        dst_port: 443,
+        discriminator: Default::default(),
+        routing_domain: 0,
+    };
+    let nat = NatDecision {
+        rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 50, 8))),
+        rewrite_src_port: Some(40001),
+        ..NatDecision::default()
+    };
+    let decision = SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: TRUNK_ZONED_UNIT_IFINDEX,
+            tx_ifindex: TRUNK_PARENT_IFINDEX,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 50, 1))),
+            neighbor_mac: Some([0, 1, 2, 3, 4, 5]),
+            src_mac: Some([6, 7, 8, 9, 10, 11]),
+            tx_vlan_id: TRUNK_ZONED_VLAN,
+        },
+        nat,
+    };
+    // The forward flow: lan -> wan. `egress_zone` is what the #7169 arrival-zone
+    // check compares against.
+    let metadata = SessionMetadata {
+        ingress_zone: TEST_LAN_ZONE_ID,
+        egress_zone: TEST_WAN_ZONE_ID,
+        ..test_metadata()
+    };
+    assert!(
+        sessions.install_with_protocol_with_origin(
+            fwd_key.clone(),
+            decision,
+            metadata,
+            SessionOrigin::ForwardFlow,
+            1_000_000,
+            PROTO_TCP,
+            0,
+        ),
+        "the forward NAT'd session must install, or there is nothing for the \
+         reverse synthesis to find and both cells are vacuous (#9383)"
+    );
+    let installed = sessions.len();
+    assert_eq!(installed, 1, "exactly one forward session is pre-installed");
+
+    let reply_key = reverse_session_key(&fwd_key, nat);
+    assert!(
+        sessions.find_forward_nat_match(&reply_key).is_some(),
+        "the reply tuple must find the forward NAT match BEFORE the arrival-zone \
+         check runs — otherwise a `None` result says nothing about the zone (#9383)"
+    );
+
+    let flow = SessionFlow {
+        src_ip: reply_key.src_ip,
+        dst_ip: reply_key.dst_ip,
+        forward_key: reply_key.clone(),
+    };
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let peer_worker_commands = Vec::new();
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+    let ha_state = BTreeMap::new();
+
+    let resolved = resolve_flow_session_decision(
+        &mut sessions,
+        -1,
+        &shared_sessions,
+        &shared_nat_sessions,
+        &shared_forward_wire_sessions,
+        &shared_owner_rg_indexes,
+        &peer_worker_commands,
+        &forwarding,
+        &ha_state,
+        &dynamic_neighbors,
+        &flow,
+        1_000_000,
+        1,
+        PROTO_TCP,
+        TCP_FLAG_ACK,
+        // The reply arrives on the trunk PARENT — the physical bind port — which
+        // is exactly what `meta.ingress_ifindex` carries for a tagged frame.
+        TRUNK_PARENT_IFINDEX,
+        arrival_vlan,
+        false,
+        0,
+        0,
+    );
+    (resolved.is_some(), sessions.len())
+}
+
+/// THE DEFECT. The reply arrives on the UNZONED trunk unit. The logical
+/// resolution answers "this unit is in no zone", so there is nothing to
+/// revalidate the match against and #7169's fail-CLOSED arm must refuse it — no
+/// reverse session is minted.
+///
+/// Before #9383 this site keyed `ifindex_to_zone_id` on the raw physical parent,
+/// which carries the ZONED sibling's `wan` by propagation, so the match was
+/// accepted and a reverse session carrying the forward flow's zone pair was
+/// installed for a packet that arrived in no zone at all.
+///
+/// FAIL-ON-REVERT: restore `ifindex_to_zone_id.get(&ingress_ifindex)` and this
+/// goes RED while its control below stays green.
+#[test]
+fn a_reply_on_an_unzoned_trunk_unit_installs_no_reverse_session_9383() {
+    let (resolved, sessions) = drive_trunk_reply_9383(TRUNK_UNZONED_VLAN);
+    assert!(
+        !resolved,
+        "the reply arrived on a trunk unit in NO zone, so the reverse-canonical \
+         match has nothing to revalidate against and must be REFUSED. A `Some` \
+         here means the arrival zone was read from the raw physical parent, which \
+         carries its zoned SIBLING's zone by propagation (#921/#3618) — so a \
+         packet that arrived in no zone mints a reverse session carrying the \
+         forward flow's zone pair, and reverse entries are exempt from \
+         zone-policy re-derivation (#9383)"
+    );
+    assert_eq!(
+        sessions, 1,
+        "no reverse session may be installed for an unzoned arrival — only the \
+         pre-installed forward session remains"
+    );
+}
+
+/// THE POSITIVE CONTROL, and it differs from the cell above in ONE byte of input:
+/// the arrival VLAN id. The reply arrives on the ZONED trunk unit, whose zone IS
+/// the zone the forward flow egressed to, so the match is accepted and the
+/// reverse session IS installed.
+///
+/// Without this, "no reverse session" above is indistinguishable from "the
+/// synthesis path was never reached" or "the fix broke reverse synthesis
+/// outright" — which would kill the reply of every NAT'd flow in the box.
+#[test]
+fn a_reply_on_the_zoned_trunk_unit_still_installs_one_9383() {
+    let (resolved, sessions) = drive_trunk_reply_9383(TRUNK_ZONED_VLAN);
+    assert!(
+        resolved,
+        "the reply arrived on the trunk unit in `wan`, the zone the forward flow \
+         egressed to, so the reverse-canonical match must be ACCEPTED. A `None` \
+         here means the logical resolution broke reverse synthesis for a \
+         legitimate reply — strictly worse than the defect #9383 fixes (#9383)"
+    );
+    assert_eq!(
+        sessions, 2,
+        "forward + synthesized reverse: the #7169 install must still happen for a \
+         correctly-zoned arrival"
     );
 }

@@ -556,6 +556,10 @@ pub(super) fn poll_binding_process_descriptor(
                         meta.protocol,
                         meta.tcp_flags,
                         meta.ingress_ifindex as i32,
+                        // #9383: the arrival VLAN, so the #7169 reverse-session
+                        // synthesis can resolve the LOGICAL unit rather than
+                        // keying `ifindex_to_zone_id` on the raw physical index.
+                        meta.ingress_vlan_id,
                         packet_fabric_ingress,
                         ha_startup_grace_until_secs,
                         worker_id,
@@ -4438,11 +4442,31 @@ pub(super) fn poll_binding_process_descriptor(
                     // skips the name round-trip.
                     // #921: direct ifindex → u16 (was a two-hop
                     // name round-trip).
+                    // #9383: resolve the LOGICAL (VLAN unit) arrival ifindex
+                    // before reading `ifindex_to_zone_id`. That map deliberately
+                    // PROPAGATES a zoned child unit's zone onto its parent's
+                    // ifindex (#921/#3618), so on a trunk whose units sit in
+                    // distinct zones the RAW PHYSICAL key answers with whichever
+                    // unit won the propagation — a different ANSWER, not a
+                    // different spelling of the same one. Every zone / filter /
+                    // pre-routing-NAT admission site resolves the logical unit
+                    // first (#3021/#5802); this one did not, and the id it
+                    // produces is encoded into the fabric redirect and therefore
+                    // selects the PEER NODE's ingress zone for the redirected
+                    // packet. `.unwrap_or(physical)` keeps an untagged port and
+                    // any arrival with no `(parent, vlan)` mapping byte-identical
+                    // to pre-#9383, exactly as the other sites do.
+                    let arrival_logical = resolve_ingress_logical_ifindex(
+                        worker_ctx.forwarding,
+                        meta.ingress_ifindex as i32,
+                        meta.ingress_vlan_id,
+                    )
+                    .unwrap_or(meta.ingress_ifindex as i32);
                     let zone_id = session_ingress_zone.or_else(|| {
                         worker_ctx
                             .forwarding
                             .ifindex_to_zone_id
-                            .get(&(meta.ingress_ifindex as i32))
+                            .get(&arrival_logical)
                             .copied()
                     });
                     if let Some(redirect) = zone_id

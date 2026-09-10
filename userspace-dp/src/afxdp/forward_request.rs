@@ -513,12 +513,26 @@ pub(super) fn apply_cos_drop_side_effects(
     };
     let log_flow = tx_selection_flow.or(flowless_log_flow.as_ref());
     if let (Some(filter_log), Some(flow)) = (cos.filter_log, log_flow) {
+        // #9383: the THIRD site found by the `ifindex_to_zone_id` census, and the
+        // only remaining one keyed on the raw physical index without a stated
+        // reason. This is the filter-log `source-zone` attribution, so the cost is
+        // forensic rather than enforcement — but a wrong zone in a security log is
+        // exactly what an operator later reasons from, and the arrival VLAN is
+        // already in `ctx.meta`. Resolve the LOGICAL unit first, the way the
+        // sibling `filter_log_ingress_zone_id` does; `.unwrap_or(physical)` keeps
+        // an untagged port byte-identical.
+        let ingress_logical = resolve_ingress_logical_ifindex(
+            ctx.forwarding,
+            ctx.meta.ingress_ifindex as i32,
+            ctx.meta.ingress_vlan_id,
+        )
+        .unwrap_or(ctx.meta.ingress_ifindex as i32);
         let ingress_zone_id = ctx.fabric_ingress_zone
             .filter(|id| ctx.forwarding.zone_id_to_name.contains_key(id))
             .or_else(|| {
                 ctx.forwarding
                     .ifindex_to_zone_id
-                    .get(&(ctx.meta.ingress_ifindex as i32))
+                    .get(&ingress_logical)
                     .copied()
             })
             .unwrap_or(0);
