@@ -239,15 +239,16 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 		// container whose bracket tail mis-nested session-close under session-init
 		// and dropped it — losing the most security-relevant fallback-path audit.
 		"default-policy-log": sessionLogModeLeaf("RT_FLOW session logging for the implicit default-policy verdict"),
-		// #4233: `policy-rematch [extensive]` re-evaluates in-progress
-		// sessions against the changed policy set on commit in Junos. xpf
-		// records the knob (compiler_security_policy.go) but does not yet
-		// enforce it — commit emits an accepted-only advisory
-		// (compiler_validate_warn.go), and enforcement is tracked as #4234.
-		// Modeled so the leaf gains structural/`?` completion and the
-		// optional `extensive` sub-token is grouped rather than mis-parsed.
-		"policy-rematch": {desc: "Re-evaluate in-progress sessions on policy change (accepted-only; unenforced)", children: map[string]*schemaNode{
-			"extensive": {desc: "Also re-evaluate sessions matched by an unchanged policy when referenced objects change", children: nil},
+		// #4233/#4234/#8993: `policy-rematch [extensive]` re-evaluates in-progress
+		// sessions on commit, and xpf ENFORCES BOTH — see the PolicyRematch field
+		// doc in types_security.go for the mechanism and #9387 for why these two
+		// `desc` strings used to deny it. Modeled so the leaf gains
+		// structural/`?` completion and the optional `extensive` sub-token is
+		// grouped rather than mis-parsed. Guarded by pkg/daemon's
+		// TestPolicyRematchHelpDoesNotDenyTheShippedEnforcement_9387, which couples
+		// this text to changedPolicyRuntimeIDs actually running.
+		"policy-rematch": {desc: "Re-evaluate in-progress sessions on commit when a policy's match or action changed", children: map[string]*schemaNode{
+			"extensive": {desc: "Also re-evaluate sessions of an unchanged policy when a referenced address or application definition changed", children: nil},
 		}},
 		"from-zone": {desc: "From zone", args: 3, valueHint: ValueHintZoneName, midKeyword: "to-zone", midKeywordAt: 2, placeholder: "<zone-name>", children: map[string]*schemaNode{
 			"policy": {desc: "Policy name", args: 1, valueHint: ValueHintPolicyName, placeholder: "<policy-name>", children: map[string]*schemaNode{

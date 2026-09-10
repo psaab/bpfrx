@@ -174,16 +174,39 @@ type SecurityConfig struct {
 	DefaultPolicyLogSessionInit  bool
 	DefaultPolicyLogSessionClose bool
 	// PolicyRematch / PolicyRematchExtensive carry `security policies
-	// policy-rematch [extensive]` (#4233). In Junos this re-evaluates
-	// in-progress sessions against the changed policy set on commit; xpf
-	// does not yet perform any session invalidation on commit (tracked as
-	// the enforcement feature #4234). The knob is accepted and recorded so
-	// it no longer commits-clean-and-is-silently-dropped, and commit emits
-	// an accepted-only advisory (validateConfig, mirroring the #2078 /
-	// #2008 H13 doctrine). Extensive is the Junos sub-mode that additionally
-	// re-evaluates sessions matched by an unchanged policy when referenced
-	// address-book/application objects change; it is recorded for the same
-	// advisory and future enforcement.
+	// policy-rematch [extensive]` (#4233), and both are ENFORCED.
+	//
+	// #9387: this comment used to say xpf "does not yet perform any session
+	// invalidation on commit (tracked as the enforcement feature #4234)" and
+	// that "commit emits an accepted-only advisory". Both statements were false
+	// by the time they were read. `changedPolicyRuntimeIDs`
+	// (pkg/daemon/daemon_policy_invalidate.go) gates on PolicyRematch and clears
+	// the sessions of every surviving policy whose match or action changed —
+	// plus, since #4343, one whose scheduler binding went active -> inactive.
+	// PolicyRematchExtensive adds the #8993 arm: the sessions of an UNCHANGED
+	// policy are cleared too when a referenced address-book / application
+	// object's DEFINITION changed, compared through
+	// dpuserspace.PolicyResolvedFingerprints rather than the policy's own text.
+	// No commit advisory is emitted for either knob (compiler_validate_warn.go
+	// records why: telling an operator a capability is missing when it exists is
+	// the failure, not the fix).
+	//
+	// #9387: the `?`-completion `desc` for this leaf (schema_security.go) said
+	// "(accepted-only; unenforced)" for BOTH the core knob and `extensive` long
+	// after each shipped. `desc` is the text `?` puts in front of an operator, so
+	// it is the one place where a stale capability claim does real damage. The
+	// doctrine was already written down in compiler_validate_warn.go, in the very
+	// commit that REMOVED the matching advisory: "Leaving the old one would tell
+	// an operator a capability is missing when it exists ... and would do it in
+	// operator-facing text rather than in a comment." The advisory was removed
+	// under that rule; the `?` help was not.
+	//
+	// Both are OFF BY DEFAULT — there is no defaulting code, the zero value IS
+	// the default, matching Junos where `policy-rematch` is opt-in. So on a stock
+	// box commit-time invalidation does not run at all, which is what makes the
+	// `?`-help text for this leaf load-bearing rather than cosmetic: an operator
+	// who is told the knob does nothing will not set it, and then has neither
+	// mechanism.
 	PolicyRematch          bool
 	PolicyRematchExtensive bool
 }
