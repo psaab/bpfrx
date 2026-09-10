@@ -2492,3 +2492,237 @@ fn dnat_6899_both_unparseable_still_drops() {
     );
     assert!(counters.parse_errors() > 0, "#4718 drop stopped being surfaced");
 }
+
+// ---------------------------------------------------------------------------
+// #9159 - a PREFIX-scoped `destination-nat off` inside a broader translate
+// prefix was never withdrawn from that prefix's firewall-local registration.
+//
+// #6025 fixed this class for EXACT-HOST exemptions. All four of its tests use
+// `/32`, so the prefix arm was never exercised: `exact_off` is built from
+// `self.entries` (the exact-host map) and a prefix `off` lives in
+// `prefix_entries`, where the loop only `continue`s - suppressing that slot's own
+// registration and withdrawing nothing from an enclosing translate prefix.
+//
+// The result is the #6025 blackhole at a different container: the `/26 off` wins
+// the DNAT match (longest-prefix-wins), so those hosts are NOT translated, while
+// the `/24`'s host expansion still registers them as firewall-local proxy-ARP
+// targets. Inbound traffic is LocalDelivered instead of routed to the real host,
+// and the operator's `show` of the NAT rules looks correct.
+//
+// WHY THE REMEDY IS NOT "WITHDRAW ANYTHING THE `off` CONTAINS". Withdrawal is
+// only correct for an `off` that WINS the match. `match_prefix_slots` decides
+// prefix-vs-prefix by (a) zone tier - the zone-SPECIFIC tier runs to exhaustion
+// before the zone-wildcard tier - and (b) longest prefix within a tier. An `off`
+// that loses leaves its addresses genuinely translated, and withdrawing them
+// breaks the DNAT they were configured for. The last two cells below are that
+// direction, and they are the ones a careless fix reds.
+// ---------------------------------------------------------------------------
+
+/// THE DEFECT: a `/26 off` strictly inside a `/24` translate prefix.
+///
+/// FAIL-ON-REVERT: drop the `prefix_off` arm from `shadowed` and the exempt-host
+/// assertion reds with the whole `/24` expansion registered.
+#[test]
+fn dnat_prefix_off_inside_broad_translate_prefix_not_local_9159() {
+    let table = DnatTable::from_snapshots(
+        &[
+            // The exemption, written on a PREFIX rather than a host - the shape
+            // #6025's four `/32` tests never reached.
+            DestinationNATRuleSnapshot {
+                name: "exempt-subnet".to_string(),
+                destination_prefix: "203.0.113.64/26".to_string(),
+                protocol: "tcp".to_string(),
+                destination_port: 80,
+                from_zone: "untrust".to_string(),
+                off: true,
+                ..DestinationNATRuleSnapshot::default()
+            },
+            DestinationNATRuleSnapshot {
+                name: "web-pool".to_string(),
+                destination_prefix: "203.0.113.0/24".to_string(),
+                protocol: "tcp".to_string(),
+                destination_port: 80,
+                from_zone: "untrust".to_string(),
+                pool_address: "192.168.1.10".to_string(),
+                pool_port: 8080,
+                ..DestinationNATRuleSnapshot::default()
+            },
+        ],
+        &crate::nat::NatCounterStore::default(),
+    );
+
+    // PREMISE: the `/26 off` really does win the match (longest-prefix-wins), so
+    // the exempt host is NOT translated. Without this the locals assertion below
+    // would be about a host the firewall legitimately owns.
+    assert_eq!(
+        table.lookup(
+            PROTO_TCP,
+            "198.51.100.1".parse().unwrap(),
+            "203.0.113.65".parse().unwrap(),
+            80,
+            "untrust",
+        ),
+        None,
+        "premise: the /26 `off` must win the DNAT match for a host inside it"
+    );
+    // THE CONTROL: a host in the /24 but OUTSIDE the /26 must still translate.
+    assert!(
+        table
+            .lookup(
+                PROTO_TCP,
+                "198.51.100.1".parse().unwrap(),
+                "203.0.113.200".parse().unwrap(),
+                80,
+                "untrust",
+            )
+            .is_some(),
+        "control: a host outside the exempt /26 must still be DNAT-translated"
+    );
+
+    let locals: std::collections::HashSet<IpAddr> = table.destination_ips().collect();
+    for exempt in ["203.0.113.65", "203.0.113.100", "203.0.113.126"] {
+        assert!(
+            !locals.contains(&exempt.parse::<IpAddr>().unwrap()),
+            "exempt host {exempt} (won by the /26 `destination-nat off`) is \
+             registered FIREWALL-LOCAL, so its inbound traffic is LocalDelivered \
+             instead of routed to the real host - the #6025 blackhole at the \
+             prefix container. locals_len={}",
+            locals.len()
+        );
+    }
+    // And the surgical half: the non-exempt host must REMAIN local, or the fix
+    // withdrew the whole /24 and broke the DNAT it was configured for.
+    assert!(
+        locals.contains(&"203.0.113.200".parse::<IpAddr>().unwrap()),
+        "a host outside the exempt /26 must remain firewall-local: it is still \
+         translated, and dropping its proxy-ARP/ND registration breaks that \
+         translation. A fix that withdraws everything the `off` prefix encloses \
+         satisfies the assertions above and reds here (#9159)"
+    );
+}
+
+/// OVER-WITHDRAWAL CONTROL - a BROADER `off` must not withdraw from a NARROWER
+/// translate prefix.
+///
+/// This is the cell that a naive `off_slot.contains(addr)` fix reds, and it is
+/// the reason the predicate requires a STRICTLY LONGER `off`.
+/// `match_prefix_slots` is longest-wins, so a `/24 off` LOSES to a `/26`
+/// translate: those hosts really are translated, and withdrawing their
+/// registration blackholes working DNAT - the exact defect #9159 reports, with
+/// the sign flipped.
+#[test]
+fn a_broader_prefix_off_does_not_withdraw_a_narrower_translate_9159() {
+    let table = DnatTable::from_snapshots(
+        &[
+            DestinationNATRuleSnapshot {
+                name: "broad-off".to_string(),
+                destination_prefix: "203.0.113.0/24".to_string(),
+                protocol: "tcp".to_string(),
+                destination_port: 80,
+                from_zone: "untrust".to_string(),
+                off: true,
+                ..DestinationNATRuleSnapshot::default()
+            },
+            DestinationNATRuleSnapshot {
+                name: "narrow-pool".to_string(),
+                destination_prefix: "203.0.113.64/26".to_string(),
+                protocol: "tcp".to_string(),
+                destination_port: 80,
+                from_zone: "untrust".to_string(),
+                pool_address: "192.168.1.10".to_string(),
+                pool_port: 8080,
+                ..DestinationNATRuleSnapshot::default()
+            },
+        ],
+        &crate::nat::NatCounterStore::default(),
+    );
+
+    // PREMISE: longest-wins means the /26 TRANSLATE wins inside its range.
+    assert!(
+        table
+            .lookup(
+                PROTO_TCP,
+                "198.51.100.1".parse().unwrap(),
+                "203.0.113.65".parse().unwrap(),
+                80,
+                "untrust",
+            )
+            .is_some(),
+        "premise: the narrower /26 translate must win over the broader /24 \
+         `off`, or this cell is not about over-withdrawal"
+    );
+
+    let locals: std::collections::HashSet<IpAddr> = table.destination_ips().collect();
+    assert!(
+        locals.contains(&"203.0.113.65".parse::<IpAddr>().unwrap()),
+        "203.0.113.65 is TRANSLATED by the /26 rule, so it must stay \
+         firewall-local. A withdrawal predicate that only asked whether the \
+         `off` prefix CONTAINS the address would drop it here and blackhole a \
+         working DNAT; the predicate requires the `off` to be strictly longer, \
+         i.e. to actually win the match (#9159). locals_len={}",
+        locals.len()
+    );
+}
+
+/// ZONE-TIER CONTROL - a zone-WILDCARD `off` prefix must not withdraw from a
+/// zone-SPECIFIC translate prefix, even though it is longer.
+///
+/// `match_prefix_slots` runs `best_in_tier(true)` (zone-specific) to exhaustion
+/// before `best_in_tier(false)` (zone-wildcard), so the zone-specific translate
+/// wins regardless of prefix length. This is precisely where
+/// `off_scope_superset`'s zone clause - `off.from_zone.is_empty() || ==` - is
+/// sound for an EXACT host (probed ahead of every prefix) and unsound for a
+/// prefix. Reusing it here would red this cell.
+#[test]
+fn a_zone_wildcard_prefix_off_does_not_withdraw_a_zone_scoped_translate_9159() {
+    let table = DnatTable::from_snapshots(
+        &[
+            DestinationNATRuleSnapshot {
+                name: "any-zone-off".to_string(),
+                destination_prefix: "203.0.113.64/26".to_string(),
+                protocol: "tcp".to_string(),
+                destination_port: 80,
+                off: true,
+                ..DestinationNATRuleSnapshot::default()
+            },
+            DestinationNATRuleSnapshot {
+                name: "zoned-pool".to_string(),
+                destination_prefix: "203.0.113.0/24".to_string(),
+                protocol: "tcp".to_string(),
+                destination_port: 80,
+                from_zone: "untrust".to_string(),
+                pool_address: "192.168.1.10".to_string(),
+                pool_port: 8080,
+                ..DestinationNATRuleSnapshot::default()
+            },
+        ],
+        &crate::nat::NatCounterStore::default(),
+    );
+
+    // PREMISE: the zone-SPECIFIC /24 translate beats the longer zone-wildcard
+    // /26 `off`, because its tier is evaluated first.
+    assert!(
+        table
+            .lookup(
+                PROTO_TCP,
+                "198.51.100.1".parse().unwrap(),
+                "203.0.113.65".parse().unwrap(),
+                80,
+                "untrust",
+            )
+            .is_some(),
+        "premise: the zone-specific translate must win its tier over a longer \
+         zone-wildcard `off`, or this cell is not about the tier rule"
+    );
+
+    let locals: std::collections::HashSet<IpAddr> = table.destination_ips().collect();
+    assert!(
+        locals.contains(&"203.0.113.65".parse::<IpAddr>().unwrap()),
+        "203.0.113.65 is TRANSLATED from zone `untrust` (the zone-specific tier \
+         is evaluated before the zone-wildcard one), so it must stay \
+         firewall-local. A predicate that accepted a zone-wildcard `off` - as \
+         `off_scope_superset` does, correctly, for exact hosts - would withdraw \
+         it and blackhole the translation (#9159). locals_len={}",
+        locals.len()
+    );
+}

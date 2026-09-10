@@ -1147,6 +1147,20 @@ impl DnatTable {
             .iter()
             .flat_map(|(key, entries)| entries.iter().filter(|e| e.off).map(move |e| (key, e)))
             .collect();
+        // #9159: PREFIX-scoped `off` exemptions that can shadow a BROADER
+        // translate prefix. The loop below already declines to register an `off`
+        // slot's OWN addresses (`continue`), but that withdraws nothing from an
+        // enclosing translate prefix whose expansion covers the same hosts - so a
+        // `/26 destination-nat off` inside a `/24` translate rule left all 62
+        // exempt hosts registered firewall-local while the DNAT match correctly
+        // selected `off` for them. The two views disagreed and the exception
+        // became a blackhole. #6025 fixed this for exact hosts; all four of its
+        // tests use `/32`, which is why the prefix arm was never exercised.
+        let prefix_off: Vec<(&DnatProtoPortKey, &DnatPrefixSlot)> = self
+            .prefix_entries
+            .iter()
+            .flat_map(|(key, slots)| slots.iter().filter(|s| s.entry.off).map(move |s| (key, s)))
+            .collect();
         for (proto_port, slots) in &self.prefix_entries {
             for slot in slots {
                 if slot.entry.off {
@@ -1165,6 +1179,19 @@ impl DnatTable {
                         off_key.dst_ip == addr
                             && off_scope_superset(off_key, off, proto_port, &slot.entry)
                     })
+                        // #9159: or a PREFIX-scoped `off` that CONTAINS this
+                        // address and wins the match against this slot. Winning
+                        // is the load-bearing half: an `off` that loses leaves
+                        // the address genuinely translated, and withdrawing it
+                        // would break the DNAT it was configured for. See
+                        // `off_prefix_scope_superset` for the two match rules
+                        // (same zone tier, strictly longer prefix).
+                        || prefix_off.iter().any(|(off_key, off_slot)| {
+                            off_slot.contains(addr)
+                                && off_prefix_scope_superset(
+                                    off_key, off_slot, proto_port, slot,
+                                )
+                        })
                 };
                 if let Some(net) = slot.network() {
                     // #5658: never register the UNSPECIFIED address (0.0.0.0 / ::)
@@ -1273,14 +1300,41 @@ fn off_scope_superset(
     slot_key: &DnatProtoPortKey,
     slot: &DnatEntry,
 ) -> bool {
+    // Zone: the exemption is zone-wildcard or shares the slot's from-zone.
+    //
+    // #9159: this clause is sound for an EXACT-HOST exemption and is NOT sound
+    // for a prefix-scoped one, which is why the prefix arm uses
+    // `off_prefix_scope_superset` rather than this function. An exact-host entry
+    // is probed before ANY prefix (`lookup_with_counter_scoped`), so it wins the
+    // match whatever tier the translate slot is in. Prefix-vs-prefix is decided
+    // by `match_prefix_slots`, which runs the zone-SPECIFIC tier to exhaustion
+    // before the zone-wildcard tier -- so a zone-wildcard `off` LOSES to a
+    // zone-specific translate prefix and must not withdraw from it.
+    (off.from_zone.is_empty() || off.from_zone == slot.from_zone)
+        && off_scope_superset_common(off_key.protocol, off_key.dst_port, off, slot_key, slot)
+}
+
+/// #9159: the protocol / port / interface / routing-instance / source / L4
+/// clauses shared by the exact-host and prefix-scoped `off` predicates.
+///
+/// Factored rather than duplicated on purpose. A hand-copied second list is a
+/// third artifact that can drift from both, and this predicate is the one that
+/// decides whether an address is withdrawn from firewall-local registration --
+/// a clause missing on one side is either a blackhole (#9159) or a broken DNAT
+/// (over-withdrawal), depending on which side lost it.
+fn off_scope_superset_common(
+    off_protocol: u16,
+    off_dst_port: u16,
+    off: &DnatEntry,
+    slot_key: &DnatProtoPortKey,
+    slot: &DnatEntry,
+) -> bool {
     // Protocol: the exemption is keyed on the protocol wildcard (PROTO_ANY) or
     // exactly the slot's protocol.
-    (off_key.protocol == PROTO_ANY || off_key.protocol == slot_key.protocol)
+    (off_protocol == PROTO_ANY || off_protocol == slot_key.protocol)
         // Port: the exemption is keyed on the wildcard port (0) or exactly the
         // slot's port.
-        && (off_key.dst_port == 0 || off_key.dst_port == slot_key.dst_port)
-        // Zone: the exemption is zone-wildcard or shares the slot's from-zone.
-        && (off.from_zone.is_empty() || off.from_zone == slot.from_zone)
+        && (off_dst_port == 0 || off_dst_port == slot_key.dst_port)
         // Interface: interface-wildcard or the same from-interface (#3096).
         && (off.from_interface.is_empty() || off.from_interface == slot.from_interface)
         // Routing-instance: RI-wildcard or the same from-routing-instance.
@@ -1295,4 +1349,43 @@ fn off_scope_superset(
         && off.match_src_ports.is_empty()
         && off.match_dst_ports.is_empty()
         && off.match_icmp_type.is_none()
+}
+
+/// #9159: does a PREFIX-scoped `destination-nat off` slot win the DNAT match for
+/// the addresses it covers, against this translate slot?
+///
+/// Only an `off` that WINS may withdraw an address from firewall-local
+/// registration. Withdrawing one it loses is the opposite defect: the address is
+/// genuinely translated, and dropping its proxy-ARP/ND registration breaks the
+/// DNAT it was configured for. So the two match rules `match_prefix_slots`
+/// implements are reproduced here, and both are necessary:
+///
+///   * SAME TIER. `best_in_tier(true)` (zone-specific) is run to exhaustion
+///     before `best_in_tier(false)` (zone-wildcard), so a zone-wildcard `off`
+///     never beats a zone-specific translate prefix. Equality of the zone
+///     strings is the condition -- both empty, or both the same zone -- and it
+///     is STRICTER than `off_scope_superset`'s zone clause, which is correct for
+///     exact hosts (probed ahead of every prefix) and not for prefixes.
+///   * STRICTLY LONGER. Within a tier the longest prefix wins, and
+///     `match_prefix_slots` keeps the FIRST slot among equal lengths. An `off`
+///     of equal length therefore may or may not win, depending on insertion
+///     order, so it is not withdrawn. That under-withdrawal leaves the #9159
+///     blackhole standing only for an ambiguous overlap, which is the safe
+///     direction: over-withdrawal breaks working DNAT for every host in the
+///     range.
+fn off_prefix_scope_superset(
+    off_key: &DnatProtoPortKey,
+    off_slot: &DnatPrefixSlot,
+    slot_key: &DnatProtoPortKey,
+    slot: &DnatPrefixSlot,
+) -> bool {
+    off_slot.entry.from_zone == slot.entry.from_zone
+        && off_slot.prefix_len() > slot.prefix_len()
+        && off_scope_superset_common(
+            off_key.protocol,
+            off_key.dst_port,
+            &off_slot.entry,
+            slot_key,
+            &slot.entry,
+        )
 }
