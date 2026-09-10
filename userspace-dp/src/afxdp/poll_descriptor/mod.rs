@@ -916,6 +916,12 @@ pub(super) fn poll_binding_process_descriptor(
                             resolved.decision,
                             Some(flow),
                             meta,
+                            // #9384: THIS packet's fabric ingress. The from-zone
+                            // is resolved live from the arrival interface, and a
+                            // fabric-punted packet arrives on the fabric link —
+                            // not in the flow's zone — so it keeps the entry's
+                            // recorded zone instead.
+                            packet_fabric_ingress,
                         ) {
                             // The live zone policy denies this FLOW. Same
                             // pair-aware teardown the filter revocation uses
