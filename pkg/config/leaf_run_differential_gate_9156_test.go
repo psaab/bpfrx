@@ -568,29 +568,39 @@ func TestTunnelSchemaResolvesBothPositions9156(t *testing.T) {
 // starts agreeing while still listed — so the register cannot outlive the
 // defect it describes.
 var leafRunKnownDiffer9156 = map[string]bool{
-	"bridge-domains xpfname [domain-type -> routing-interface] {braced+flat} {lenient-only}":                                                       true,
-	"class-of-service interfaces xpfarg [output-traffic-control-profile -> priority-low-min-share] {braced+flat} {lenient-only}":                   true,
-	"forwarding-options sampling instance xpfarg family inet output flow-server xpfarg [source-address -> port] {braced+flat} {lenient-only}":      true,
-	"forwarding-options sampling instance xpfarg family inet6 output flow-server xpfarg [source-address -> port] {braced+flat} {lenient-only}":     true,
-	"interfaces xpfname [bandwidth -> description] {braced+flat} {lenient-only}":                                                                   true,
-	"interfaces xpfname aggregated-ether-options [link-speed -> minimum-links] {braced+flat} {lenient-only}":                                       true,
-	"interfaces xpfname gigether-options [802.3ad -> redundant-parent] {braced+flat} {lenient-only}":                                               true,
-	"interfaces xpfname tunnel wireguard [private-key -> listen-port] {braced+flat} {lenient-only}":                                                true,
-	"interfaces xpfname tunnel wireguard peer xpfarg [endpoint -> persistent-keepalive] {braced+flat} {lenient-only}":                              true,
-	"protocols bgp group xpfarg neighbor xpfarg [authentication-key -> description] {braced+flat} {lenient-only}":                                  true,
-	"protocols ospf3 area xpfarg interface xpfarg [cost -> dead-interval] {braced+flat} {lenient-only}":                                            true,
-	"routing-instances xpfname [description -> instance-type] {braced+flat} {lenient-only}":                                                        true,
-	"routing-instances xpfname protocols bgp group xpfarg neighbor xpfarg [authentication-key -> description] {braced+flat} {lenient-only}":        true,
-	"routing-instances xpfname protocols ospf3 area xpfarg interface xpfarg [cost -> dead-interval] {braced+flat} {lenient-only}":                  true,
-	"security dynamic-address feed-server xpfarg [hostname -> hold-interval] {braced+flat} {lenient-only}":                                         true,
-	"security flow traceoptions packet-filter xpfarg [destination-prefix -> protocol] {braced+flat} {lenient-only}":                                true,
-	"security nat nat64 rule-set xpfarg [prefix -> source-pool] {braced+flat} {lenient-only}":                                                      true,
-	"security screen ids-option xpfarg limit-session [destination-ip-based -> source-ip-based] {braced+flat} {lenient-only}":                       true,
-	"security screen ids-option xpfarg tcp syn-flood [alarm-threshold -> attack-threshold] {braced+flat} {lenient-only}":                           true,
-	"security zones security-zone xpfarg [description -> screen] {braced+flat} {lenient-only}":                                                     true,
-	"system ntp server xpfarg [routing-instance -> key] {braced} {lenient-only}":                                                                   true,
-	"system services dhcp-local-server group xpfarg pool xpfarg static-binding xpfarg [host-name -> fixed-address] {braced+flat} {lenient-only}":   true,
-	"system services dhcpv6-local-server group xpfarg pool xpfarg static-binding xpfarg [host-name -> fixed-address] {braced+flat} {lenient-only}": true,
+	"bridge-domains xpfname [domain-type -> routing-interface] {braced+flat} {lenient-only}":                                                   true,
+	"class-of-service interfaces xpfarg [output-traffic-control-profile -> priority-low-min-share] {braced+flat} {lenient-only}":               true,
+	"forwarding-options sampling instance xpfarg family inet output flow-server xpfarg [source-address -> port] {braced+flat} {lenient-only}":  true,
+	"forwarding-options sampling instance xpfarg family inet6 output flow-server xpfarg [source-address -> port] {braced+flat} {lenient-only}": true,
+	"interfaces xpfname [bandwidth -> description] {braced+flat} {lenient-only}":                                                               true,
+	"interfaces xpfname aggregated-ether-options [link-speed -> minimum-links] {braced+flat} {lenient-only}":                                   true,
+	"interfaces xpfname gigether-options [802.3ad -> redundant-parent] {braced+flat} {lenient-only}":                                           true,
+	"interfaces xpfname tunnel wireguard [private-key -> listen-port] {braced+flat} {lenient-only}":                                            true,
+	"interfaces xpfname tunnel wireguard peer xpfarg [endpoint -> persistent-keepalive] {braced+flat} {lenient-only}":                          true,
+	"protocols bgp group xpfarg neighbor xpfarg [authentication-key -> description] {braced+flat} {lenient-only}":                              true,
+	"protocols ospf3 area xpfarg interface xpfarg [cost -> dead-interval] {braced+flat} {lenient-only}":                                        true,
+	"routing-instances xpfname [description -> instance-type] {braced+flat} {lenient-only}":                                                    true,
+	"routing-instances xpfname protocols bgp group xpfarg neighbor xpfarg [authentication-key -> description] {braced+flat} {lenient-only}":    true,
+	"routing-instances xpfname protocols ospf3 area xpfarg interface xpfarg [cost -> dead-interval] {braced+flat} {lenient-only}":              true,
+	"security dynamic-address feed-server xpfarg [hostname -> hold-interval] {braced+flat} {lenient-only}":                                     true,
+	"security flow traceoptions packet-filter xpfarg [destination-prefix -> protocol] {braced+flat} {lenient-only}":                            true,
+	"security nat nat64 rule-set xpfarg [prefix -> source-pool] {braced+flat} {lenient-only}":                                                  true,
+	"security screen ids-option xpfarg limit-session [destination-ip-based -> source-ip-based] {braced+flat} {lenient-only}":                   true,
+	"security screen ids-option xpfarg tcp syn-flood [alarm-threshold -> attack-threshold] {braced+flat} {lenient-only}":                       true,
+	"security zones security-zone xpfarg [description -> screen] {braced+flat} {lenient-only}":                                                 true,
+	"system ntp server xpfarg [routing-instance -> key] {braced} {lenient-only}":                                                               true,
+	// #9235 REMOVED the two `static-binding` rows that stood here:
+	//
+	//	system services dhcp-local-server   group <g> pool <p> static-binding <m>
+	//	system services dhcpv6-local-server group <g> pool <p> static-binding <m>
+	//	  both [host-name -> fixed-address] {braced+flat} {lenient-only}
+	//
+	// They no longer differ, which is the direction this register wants, and the
+	// gate's own failure text prescribes removing them in the same change: "a
+	// register left above reality stops being a ratchet — it silently re-admits
+	// every container it still lists." One `closedWorld`-free schema node
+	// (dhcpStaticBindingSchema) serves both positions, so one expansion cleared
+	// both rows.
 }
 
 // TestLeafRunRegisterIsNotVacuous9156 pins that the register is a REGISTER and

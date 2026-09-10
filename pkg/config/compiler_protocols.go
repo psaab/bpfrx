@@ -1028,7 +1028,12 @@ func compileRouterAdvertisement(node *Node, proto *ProtocolsConfig) error {
 					if len(prop.Keys) < 2 && len(prop.Children) > 0 {
 						pfxChildren = prop.Children[0].Children
 					}
-					for _, child := range pfxChildren {
+					// #9235: `prefix 2001:db8::/64 no-onlink no-autonomous` packs
+					// the flags into a nested chain, so this loop read `no-onlink`
+					// and left Autonomous at its `true` default -- the RA told hosts
+					// to SLAAC-configure a prefix the operator had explicitly
+					// marked no-autonomous. Lenient path only.
+					for _, child := range expandRunChildren9235(pfxChildren, raPrefixSchema9235()) {
 						switch child.Name() {
 						case "on-link":
 							pfx.OnLink = true

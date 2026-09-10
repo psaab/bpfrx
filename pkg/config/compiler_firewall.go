@@ -26,7 +26,13 @@ func compileFirewall(node *Node, fw *FirewallConfig) error {
 
 		ifExceeding := polInst.node.FindChild("if-exceeding")
 		if ifExceeding != nil {
-			for _, child := range ifExceeding.Children {
+			// #9235: `if-exceeding bandwidth-limit 1m burst-size-limit 15k` is ONE
+			// flat-set command, and SetPath nests the second leaf under the first,
+			// so this loop saw bandwidth-limit and nothing else -- the policer was
+			// installed with BurstSizeLimit 0. Lenient-path only
+			// (CompileConfigLenient via Store.Load / Store.SyncApply); the schema
+			// gate refuses the spelling on the operator's commit path.
+			for _, child := range expandRunChildren9235(ifExceeding.Children, policerIfExceedingSchema9235()) {
 				switch child.Name() {
 				case "bandwidth-limit":
 					if v := nodeVal(child); v != "" {

@@ -437,16 +437,24 @@ func compileStaticRoutes(staticNode *Node, existing []*StaticRoute) []*StaticRou
 					}
 				}
 				// Child nodes (flat-set separate lines + hierarchical brace form).
-				if ifNode := prop.FindChild("interface"); ifNode != nil {
+				//
+				// #9235: a flat `qualified-next-hop <gw> interface <if> metric <m>`
+				// whose tokens did NOT all land on this node's Keys arrives as a
+				// nested chain ([interface <if>] > [metric <m>]), so FindChild
+				// found `interface` and missed `metric`. A floating backup's METRIC
+				// is what orders two equal-preference backups, so losing it
+				// silently reorders failover. Lenient path only.
+				qnh := expandRun9235(prop, staticQualifiedNextHopSchema9235())
+				if ifNode := qnh.FindChild("interface"); ifNode != nil {
 					nh.Interface = nodeVal(ifNode)
 				}
-				if pNode := prop.FindChild("preference"); pNode != nil {
+				if pNode := qnh.FindChild("preference"); pNode != nil {
 					if n, err := strconv.Atoi(nodeVal(pNode)); err == nil {
 						nh.Preference = n
 						nh.HasPreference = true
 					}
 				}
-				if mNode := prop.FindChild("metric"); mNode != nil {
+				if mNode := qnh.FindChild("metric"); mNode != nil {
 					if n, err := strconv.Atoi(nodeVal(mNode)); err == nil {
 						nh.Metric = n
 						nh.HasMetric = true

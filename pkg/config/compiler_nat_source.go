@@ -754,7 +754,12 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 				}
 				// Hierarchical / schema-grouped shape: permit and
 				// inactivity-timeout arrive as child leaves.
-				for _, pnProp := range prop.Children {
+				//
+				// #9235: when the tokens do NOT all collapse onto this node's
+				// Keys they arrive as a nested chain, so this loop read `permit`
+				// and missed `inactivity-timeout` (or vice versa) and the binding
+				// kept the 300s default. Lenient path only.
+				for _, pnProp := range expandRunChildren9235(prop.Children, persistentNATSchema9235()) {
 					switch pnProp.Name() {
 					case "permit":
 						if v := nodeVal(pnProp); v != "" {

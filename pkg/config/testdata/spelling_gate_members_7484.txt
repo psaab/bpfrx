@@ -721,9 +721,6 @@ COMPARED	security dynamic-address feed-server <*> hold-interval
 COMPARED	security dynamic-address feed-server <*> hostname
 COMPARED	security dynamic-address feed-server <*> update-interval
 COMPARED	security dynamic-address feed-server <*> url
-COMPARED	security flow aging early-ageout
-COMPARED	security flow aging high-watermark
-COMPARED	security flow aging low-watermark
 flag (read, but value-less)	security flow allow-dns-reply
 flag (read, but value-less)	security flow allow-embedded-icmp
 flag (read, but value-less)	security flow force-ip-reassembly

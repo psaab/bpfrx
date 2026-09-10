@@ -683,6 +683,12 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 				sys.Services = &SystemServicesConfig{}
 			}
 			sys.Services.SSH = &SSHServiceConfig{}
+			// #9235: `ssh client-alive-interval 30 client-alive-count-max 3
+			// connection-limit 10` is ONE command nested into a chain, so the
+			// FindChild reads below saw the first knob and missed the rest --
+			// sshd kept its defaults for hardening knobs the config declared.
+			// Expanded once, for the same reason compileLog does. Lenient path only.
+			sshNode = expandRun9235(sshNode, systemServicesSSHSchema9235())
 			if rl := sshNode.FindChild("root-login"); rl != nil && len(rl.Keys) >= 2 {
 				sys.Services.SSH.RootLogin = rl.Keys[1]
 			}
@@ -1216,7 +1222,11 @@ func compileUserspaceDataplane(node *Node, cfg *UserspaceConfig, warnings *[]str
 			// rx-usecs <n>`, `coalescence tx-usecs <n>`. All three keys
 			// live under the same node to mirror the Junos shape
 			// (`set system dataplane coalescence <knob> <val>`).
-			for _, sub := range child.Children {
+			// #9235: `coalescence adaptive disable rx-usecs 8 tx-usecs 8` is ONE
+			// command nested into a chain, so this loop applied `adaptive` and
+			// dropped both usec knobs -- the NIC kept its driver defaults while
+			// the config said otherwise. Lenient path only.
+			for _, sub := range expandRunChildren9235(child.Children, dataplaneCoalescenceSchema9235()) {
 				switch sub.Name() {
 				case "adaptive":
 					// `enable` → operator opt-out of the "disable by
@@ -2557,7 +2567,12 @@ func compileSchedulers(node *Node, cfg *Config) error {
 			cfg.Schedulers[inst.name] = sched
 		}
 
-		for _, prop := range inst.node.Children {
+		// #9235: `scheduler s1 start-date D start-time T stop-date E` is ONE
+		// command nested into a chain, so this loop read `start-date` and left
+		// the window empty -- and an empty window makes isWithinWindow fall OPEN
+		// (always-active), so a scheduled policy that should have been inactive
+		// enforced around the clock. Lenient path only.
+		for _, prop := range expandRunChildren9235(inst.node.Children, schedulerSchema9235()) {
 			name := prop.Name()
 			switch {
 			case name == "start-time":

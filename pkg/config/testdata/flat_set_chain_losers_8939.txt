@@ -1,21 +1,3 @@
-# counts: losers=19 walked=85 vacuous=44 unmeasured=77
+# counts: losers=1 walked=103 vacuous=44 unmeasured=77
 # collector reach: 370 containers walked, 136 reached the census (137 dropped: no eligible leaf, 97 dropped: only one)
-firewall policer arg1 if-exceeding  [bandwidth-limit | burst-size-limit]  total  lenient-only
-protocols router-advertisement interface arg1 prefix arg1  [autonomous | no-autonomous | no-onlink]  total  lenient-only
-protocols router-advertisement interface arg1 prefix arg1  [autonomous | no-autonomous]  total  lenient-only
-routing-options static route arg1 qualified-next-hop arg1  [interface | metric | preference]  total  lenient-only
-routing-options static route arg1 qualified-next-hop arg1  [interface | metric]  total  lenient-only
-schedulers scheduler arg1  [start-date | start-time | stop-date]  total  lenient-only
-schedulers scheduler arg1  [start-date | start-time]  total  lenient-only
-security flow aging  [early-ageout | high-watermark | low-watermark]  total  lenient-only
-security flow aging  [early-ageout | high-watermark]  total  lenient-only
-security log  [format | mode | source-interface]  total  lenient-only
-security log  [format | mode]  total  lenient-only
-security nat source pool arg1 persistent-nat  [inactivity-timeout | permit]  total  lenient-only
-services flow-monitoring version-ipfix template arg1  [flow-active-timeout | flow-inactive-timeout]  total  lenient-only
-services flow-monitoring version9 template arg1  [flow-active-timeout | flow-inactive-timeout]  total  lenient-only
 services rpm probe arg1 test arg1 target  [address | url]  total  OPERATOR
-system dataplane coalescence  [adaptive | rx-usecs | tx-usecs]  total  lenient-only
-system dataplane coalescence  [adaptive | rx-usecs]  total  lenient-only
-system services dhcp-local-server group arg1 pool arg1 static-binding arg1  [fixed-address | host-name]  total  lenient-only
-system services ssh  [client-alive-count-max | client-alive-interval | connection-limit]  total  lenient-only

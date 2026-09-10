@@ -555,7 +555,12 @@ func compileFlow(node *Node, sec *SecurityConfig) error {
 
 	// Aggressive session aging
 	if agingNode := node.FindChild("aging"); agingNode != nil {
-		for _, opt := range agingNode.Children {
+		// #9235: the `security flow` expansion above covers `flow`'s OWN
+		// children; `aging`'s are a separate container and were never expanded,
+		// so `aging early-ageout 10 high-watermark 80 low-watermark 60` set
+		// early-ageout and left both watermarks at 0 (aggressive aging disabled).
+		// Lenient path only.
+		for _, opt := range expandRunChildren9235(agingNode.Children, flowAgingSchema9235()) {
 			name := opt.Name()
 			switch name {
 			case "early-ageout", "high-watermark", "low-watermark":
